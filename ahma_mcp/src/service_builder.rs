@@ -25,7 +25,7 @@ use crate::{
     mcp_service::{AhmaMcpService, GuidanceConfig},
     operation_monitor::{MonitorConfig, OperationMonitor},
     sandbox::Sandbox,
-    shell::cli::AppConfig,
+    shell::cli::{AppConfig, StartupProfile},
     shell_pool::{ShellPoolConfig, ShellPoolManager},
     tool_availability::{AvailabilitySummary, evaluate_tool_availability, format_install_guidance},
 };
@@ -183,6 +183,13 @@ impl<'a> ServiceBuilder<'a> {
         let loaded_tools_count = configs.len();
         let configs_for_output = configs.clone();
 
+        // Compute the effective progressive-disclosure flag.
+        // StartupProfile::Full disables PD entirely (all tools visible from the start).
+        let pd_flag = match config.reveal_profile {
+            StartupProfile::Full => false,
+            _ => self.progressive_disclosure,
+        };
+
         let mut service = AhmaMcpService::new(
             adapter.clone(),
             operation_monitor.clone(),
@@ -190,17 +197,26 @@ impl<'a> ServiceBuilder<'a> {
             Arc::new(self.guidance),
             self.force_synchronous,
             self.defer_sandbox,
-            self.progressive_disclosure,
+            pd_flag,
         )
         .await?;
 
         service.monitor_rate_limit_seconds = self.monitor_rate_limit;
 
-        // Pre-disclose bundles explicitly requested via --tools CLI flags so
-        // their tools appear immediately in tools/list without an activate_tools
-        // call.
-        let cli_bundles = crate::config::cli_flagged_bundle_names(config);
-        service.pre_disclose(&cli_bundles);
+        // Apply the reveal profile:
+        //   Minimal  — no pre-disclosure; LLM must call `activate_tools reveal` explicitly.
+        //   Balanced — auto-reveal bundles that were requested via CLI --tools flags.
+        //   Full     — PD is already disabled above; nothing further needed.
+        match config.reveal_profile {
+            StartupProfile::Balanced => {
+                let cli_bundles = crate::config::cli_flagged_bundle_names(config);
+                service.pre_disclose(&cli_bundles);
+            }
+            StartupProfile::Minimal | StartupProfile::Full => {
+                // Minimal: keep all bundles hidden; LLM uses activate_tools or sandboxed_shell.
+                // Full: PD disabled, everything visible already.
+            }
+        }
 
         Ok(BuiltService {
             service,

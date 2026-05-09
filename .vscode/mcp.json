@@ -7,7 +7,7 @@
                 "serve",
                 "stdio",
                 "--tools",
-                "rust,git,fileutils",
+                "rust,git",
                 "--tmp",
                 "--log-monitor"
             ]

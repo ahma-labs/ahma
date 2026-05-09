@@ -33,6 +33,46 @@ use std::{io::IsTerminal, path::PathBuf, sync::Arc};
 // Never mutated after startup.
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Controls the initial tool-visibility profile for the MCP session.
+///
+/// In all profiles, built-in tools (`sandboxed_shell`, `await`, `status`,
+/// `activate_tools`) are always visible.  The profile determines whether
+/// CLI-flagged bundles are auto-revealed at startup or kept hidden until an
+/// explicit `activate_tools reveal` call.
+///
+/// Controlled by the `AHMA_REVEAL_PROFILE` environment variable:
+///
+/// | Value      | Profile          |
+/// |------------|------------------|
+/// | `minimal`  | [`Minimal`]      |
+/// | `balanced` | [`Balanced`]     |
+/// | `full`     | [`Full`]         |
+/// | (absent)   | [`Minimal`]      |
+///
+/// [`Minimal`]: StartupProfile::Minimal
+/// [`Balanced`]: StartupProfile::Balanced
+/// [`Full`]: StartupProfile::Full
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StartupProfile {
+    /// **Default.** Only built-in tools visible initially; CLI-flagged bundles
+    /// remain hidden until the LLM calls `activate_tools reveal <bundle>`.
+    ///
+    /// Best for local/small LLMs (Gemma, Qwen) and context-sensitive workflows.
+    #[default]
+    Minimal,
+    /// Built-in tools visible; CLI-flagged bundles auto-revealed at startup.
+    /// Other bundles still require an `activate_tools reveal` call.
+    ///
+    /// Equivalent to the previous default behaviour (`--tools rust` immediately
+    /// exposed cargo tools in the tool list).
+    Balanced,
+    /// All loaded tools visible immediately; progressive disclosure disabled.
+    ///
+    /// Equivalent to `AHMA_PROGRESSIVE_DISCLOSURE_OFF=1`.  Useful when the
+    /// client is a large-context model and tool-count does not matter.
+    Full,
+}
+
 /// Unified, immutable application configuration.
 ///
 /// Constructed once at startup from CLI flags and environment variables.
@@ -59,6 +99,8 @@ pub struct AppConfig {
     pub skip_availability_probes: bool,
     /// Show all tools without progressive disclosure (AHMA_PROGRESSIVE_DISCLOSURE=0).
     pub progressive_disclosure: bool,
+    /// Startup visibility profile (AHMA_REVEAL_PROFILE: minimal|balanced|full).
+    pub reveal_profile: StartupProfile,
 
     // ── Sandbox ─────────────────────────────────────────────────────────────
     /// Disable the kernel sandbox entirely (AHMA_DISABLE_SANDBOX=1).
@@ -125,6 +167,7 @@ impl Default for AppConfig {
             hot_reload_tools: false,
             skip_availability_probes: false,
             progressive_disclosure: true,
+            reveal_profile: StartupProfile::Minimal,
             no_sandbox: false,
             sandbox_scopes: vec![],
             defer_sandbox: false,
@@ -1015,6 +1058,14 @@ fn build_app_config(cli: &Cli) -> AppConfig {
         hot_reload_tools: AppConfig::env_flag("AHMA_HOT_RELOAD"),
         skip_availability_probes: AppConfig::env_flag("AHMA_SKIP_PROBES"),
         progressive_disclosure: !AppConfig::env_flag("AHMA_PROGRESSIVE_DISCLOSURE_OFF"),
+        reveal_profile: match std::env::var("AHMA_REVEAL_PROFILE")
+            .as_deref()
+            .unwrap_or("")
+        {
+            "balanced" => StartupProfile::Balanced,
+            "full" => StartupProfile::Full,
+            _ => StartupProfile::Minimal,
+        },
         no_sandbox: cli_no_sandbox || AppConfig::env_flag("AHMA_DISABLE_SANDBOX"),
         sandbox_scopes,
         defer_sandbox: AppConfig::env_flag("AHMA_SANDBOX_DEFER"),
@@ -1417,6 +1468,7 @@ mod tests {
             hot_reload_tools: false,
             skip_availability_probes: false,
             progressive_disclosure: true,
+            reveal_profile: StartupProfile::Minimal,
             no_sandbox: false,
             sandbox_scopes: vec![],
             defer_sandbox: false,
