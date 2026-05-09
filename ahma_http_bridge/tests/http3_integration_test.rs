@@ -34,6 +34,11 @@ fn build_http3_client(cert_der: &[u8]) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .http3_prior_knowledge()
         .add_root_certificate(cert)
+        // Explicitly bind the QUIC UDP socket to an IPv4 address.
+        // Without this, reqwest 0.13 defaults to an IPv6 Quinn endpoint on
+        // macOS; its internal address filter then drops the IPv4 server
+        // address (127.0.0.1), returning "no addresses available".
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         .timeout(Duration::from_secs(30));
 
     // Workaround: reqwest HTTP/3 path ignores custom root certs on Windows
