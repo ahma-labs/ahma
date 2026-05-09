@@ -1,9 +1,13 @@
 mod conversion;
+pub mod checkstyle;
 pub mod detekt;
+pub mod detekt_cli;
 mod exclusion;
 pub mod external;
+pub mod lizard;
 pub mod paths;
 mod pipeline;
+pub mod swiftlint;
 pub mod workspace;
 
 pub use external::{AnalyzerRegistry, ExternalMetrics};

@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.6.2
+version: 0.6.3
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma-mcp) as an AI agent. USE THIS SKILL when you need
@@ -523,6 +523,8 @@ A trailing integer sets the `ai_fix` issue number (default: 1).
 |------|------------|
 | `rust` | `.rs` |
 | `kotlin` | `.kt`, `.kts` |
+| `swift` | `.swift` |
+| `objc` / `objective-c` | `.m`, `.mm` |
 | `python` | `.py` |
 | `javascript` | `.js`, `.jsx` |
 | `typescript` | `.ts`, `.tsx` |
@@ -532,6 +534,10 @@ A trailing integer sets the `ai_fix` issue number (default: 1).
 | `go` | `.go` |
 | `html` | `.html`, `.htm` |
 | `css` | `.css` |
+
+**Kotlin analyzer cascade:** detekt-cli (standalone, preferred) → Gradle detekt (plugin required) → Lizard (universal fallback). Install `brew install detekt` or `pip install lizard` for zero-config Kotlin analysis.
+
+**Swift analyzer cascade:** SwiftLint (cyclomatic + cognitive) → Lizard (cyclomatic only). Install `brew install swiftlint` for full Swift complexity analysis. `pip install lizard` as a lighter-weight alternative.
 
 ### Prerequisites
 
