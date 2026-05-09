@@ -257,7 +257,13 @@ fn handle_ai_fix_to_stdout(
 fn build_registry(no_external: bool) -> AnalyzerRegistry {
     let mut registry = AnalyzerRegistry::new();
     if !no_external {
+        // Kotlin: try standalone detekt-cli first (no Gradle needed), then Gradle detekt.
+        registry.register(Box::new(analysis::detekt_cli::DetektCliAnalyzer));
         registry.register(Box::new(analysis::detekt::DetektAnalyzer));
+        // Universal fallback for Kotlin, Swift, Java, Go, C#, ObjC, JS, TS.
+        registry.register(Box::new(analysis::lizard::LizardAnalyzer));
+        // Swift: dedicated SwiftLint for richer cognitive + cyclomatic metrics.
+        registry.register(Box::new(analysis::swiftlint::SwiftLintAnalyzer));
     }
     registry
 }

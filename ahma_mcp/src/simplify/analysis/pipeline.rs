@@ -89,6 +89,7 @@ fn file_language(path: &Path) -> Option<Language> {
         "js" | "mjs" | "cjs" => Some(Language::JavaScript),
         "ts" | "tsx" => Some(Language::TypeScript),
         "swift" => Some(Language::Swift),
+        "m" | "mm" => Some(Language::ObjectiveC),
         "go" => Some(Language::Go),
         "cpp" | "cc" | "cxx" => Some(Language::Cpp),
         "c" | "h" => Some(Language::C),
