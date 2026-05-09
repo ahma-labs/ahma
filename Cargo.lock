@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ahma_common"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "opentelemetry",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_http_bridge"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "ahma_common",
  "ahma_mcp",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_http_mcp_client"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "ahma_common",
  "anyhow",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_llm_monitor"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "reqwest 0.13.3",
  "serde",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_mcp"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "ahma_common",
  "ahma_http_bridge",
@@ -992,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "generate_tool_schema"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "ahma_mcp",
  "schemars",

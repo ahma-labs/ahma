@@ -545,10 +545,11 @@ async fn test_non_flagged_bundles_remain_hidden_with_auto_reveal() {
     );
 }
 
-/// Verifies that `--tools rust` reveals bundles immediately (the default behavior).
-/// This is the regression test for the old R1.5.6 regression where --tools hid bundles.
+/// Verifies Balanced profile: CLI-flagged bundles are auto-revealed at startup,
+/// matching the behaviour of `StartupProfile::Balanced` (and the old default before Minimal).
+/// This is a regression guard for the R1.5.6 regression where --tools hid bundles.
 #[tokio::test]
-async fn test_tools_reveal_bundles_by_default() {
+async fn test_balanced_profile_reveals_cli_bundles() {
     init_test_logging();
 
     let monitor_config =
@@ -562,9 +563,10 @@ async fn test_tools_reveal_bundles_by_default() {
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
 
-    // Load rust bundle (as --tools rust would).
+    // Load rust bundle (as --tools rust would with Balanced profile).
     let config = ahma_mcp::shell::cli::AppConfig {
         tool_bundles: vec!["rust".to_string()],
+        reveal_profile: ahma_mcp::shell::cli::StartupProfile::Balanced,
         ..ahma_mcp::shell::cli::AppConfig::default()
     };
     let tool_configs = load_tool_configs(&config, None).await.unwrap_or_default();
@@ -583,16 +585,16 @@ async fn test_tools_reveal_bundles_by_default() {
     .await
     .unwrap();
 
-    // Simulate server.rs: always pre-disclose CLI-flagged bundles.
+    // Simulate Balanced profile: pre-disclose CLI-flagged bundles.
     let cli_bundles = ahma_mcp::config::cli_flagged_bundle_names(&config);
     service.pre_disclose(&cli_bundles);
 
     let tool_names = service.list_tool_names();
 
-    // cargo tools should be visible (--tools rust pre-discloses the rust bundle)
+    // cargo tools should be visible (Balanced profile reveals --tools rust)
     assert!(
         tool_names.contains(&"cargo".to_string()),
-        "cargo should be visible when --tools rust was passed, got: {:?}",
+        "cargo should be visible in Balanced profile when --tools rust was passed, got: {:?}",
         tool_names
     );
 
@@ -600,6 +602,76 @@ async fn test_tools_reveal_bundles_by_default() {
     assert!(
         tool_names.contains(&"sandboxed_shell".to_string()),
         "sandboxed_shell must always be visible, got: {:?}",
+        tool_names
+    );
+}
+
+/// Verifies Minimal profile (the default): CLI-flagged bundles are NOT auto-revealed.
+/// Only the 4 built-in tools are visible; bundles must be explicitly revealed via activate_tools.
+#[tokio::test]
+async fn test_minimal_profile_hides_cli_bundles() {
+    init_test_logging();
+
+    let monitor_config =
+        ahma_mcp::operation_monitor::MonitorConfig::with_timeout(Duration::from_secs(300));
+    let operation_monitor = Arc::new(ahma_mcp::operation_monitor::OperationMonitor::new(
+        monitor_config,
+    ));
+    let shell_config = ahma_mcp::shell_pool::ShellPoolConfig::default();
+    let shell_pool = Arc::new(ahma_mcp::shell_pool::ShellPoolManager::new(shell_config));
+    let sandbox = Arc::new(ahma_mcp::sandbox::Sandbox::new_test());
+    let adapter =
+        Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
+
+    // Load rust + git bundles with Minimal profile (the default).
+    let config = ahma_mcp::shell::cli::AppConfig {
+        tool_bundles: vec!["rust".to_string(), "git".to_string()],
+        reveal_profile: ahma_mcp::shell::cli::StartupProfile::Minimal,
+        ..ahma_mcp::shell::cli::AppConfig::default()
+    };
+    let tool_configs = load_tool_configs(&config, None).await.unwrap_or_default();
+    let configs = Arc::new(tool_configs);
+    let guidance = Arc::new(None::<GuidanceConfig>);
+
+    let service = AhmaMcpService::new(
+        adapter,
+        operation_monitor,
+        configs,
+        guidance,
+        false,
+        false,
+        true, // progressive_disclosure = true
+    )
+    .await
+    .unwrap();
+
+    // Minimal profile: do NOT call pre_disclose — simulates service_builder Minimal behaviour.
+
+    let tool_names = service.list_tool_names();
+
+    // Bundle tools must remain hidden despite --tools flags
+    assert!(
+        !tool_names.contains(&"cargo".to_string()),
+        "cargo should be hidden in Minimal profile even when --tools rust was passed, got: {:?}",
+        tool_names
+    );
+    assert!(
+        !tool_names.contains(&"git".to_string()),
+        "git should be hidden in Minimal profile even when --tools git was passed, got: {:?}",
+        tool_names
+    );
+
+    // Built-in tools must be visible
+    assert!(tool_names.contains(&"sandboxed_shell".to_string()));
+    assert!(tool_names.contains(&"activate_tools".to_string()));
+    assert!(tool_names.contains(&"await".to_string()));
+    assert!(tool_names.contains(&"status".to_string()));
+
+    // Exactly 4 tools
+    assert_eq!(
+        tool_names.len(),
+        4,
+        "Minimal profile should show exactly 4 built-in tools, got: {:?}",
         tool_names
     );
 }
