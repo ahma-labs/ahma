@@ -2,7 +2,7 @@
     "servers": {
         "ahma": {
             "type": "stdio",
-            "command": "ahma-mcp",
+            "command": "ahma",
             "args": [
                 "serve",
                 "stdio",
@@ -17,9 +17,8 @@
             "url": "http://localhost:3000/mcp"
         },
         "ahma-unix": {
-            "description": "Ahma MCP server (Unix socket mode, faster IPC for shared instances). Start with: ahma-mcp serve http --socket-path /tmp/ahma-mcp.sock --tools rust,git,fileutils --tmp --log-monitor",
             "type": "http",
-            "url": "unix:///tmp/ahma-mcp.sock#/mcp"
+            "url": "unix:///tmp/ahma.sock#/mcp"
         }
     }
 }

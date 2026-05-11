@@ -5,7 +5,7 @@
 //!
 //! * **In-process** — `InProcessMcp` wired over a `tokio::io::duplex` channel.
 //! * **Subprocess** — a `RunningService<RoleClient, ()>` connected to a spawned
-//!   `ahma-mcp` binary via stdio transport.
+//!   `ahma` binary via stdio transport.
 //!
 //! ## Usage
 //!

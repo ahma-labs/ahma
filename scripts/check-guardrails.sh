@@ -140,7 +140,7 @@ echo "=== Guardrail: lint recurring test patterns ==="
 echo "=== Guardrail: workspace cargo check ==="
 cargo check --workspace --locked
 
-echo "=== Guardrail: cargo smoke test scope (ahma-mcp package) ==="
+echo "=== Guardrail: cargo smoke test scope (ahma package) ==="
 cargo test -p ahma_mcp --test tool_tests tool_execution_integration_test::test_cargo_check_dry_run -- --nocapture
 
 echo "=== Guardrail: nextest diagnostics config ==="

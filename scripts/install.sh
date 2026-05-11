@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-liner installer for ahma-mcp
+# One-liner installer for ahma
 # Usage: curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
 #
 # Supported platforms:
@@ -15,7 +15,7 @@ set -euo pipefail
 
 # Skill version — keep in sync with [workspace.package] version in Cargo.toml.
 # CI guardrails verify this matches. Bump alongside Cargo.toml on every release.
-AHMA_VERSION="0.6.4"
+AHMA_VERSION="0.6.5"
 
 # Detect OS and Architecture
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -121,10 +121,10 @@ fetch_release_json() {
 
 # Check for existing installation and compare versions
 EXISTING_BIN=""
-if command -v ahma-mcp >/dev/null 2>&1; then
-    EXISTING_BIN="$(command -v ahma-mcp)"
-elif [ -x "$INSTALL_DIR/ahma-mcp" ]; then
-    EXISTING_BIN="$INSTALL_DIR/ahma-mcp"
+if command -v ahma >/dev/null 2>&1; then
+    EXISTING_BIN="$(command -v ahma)"
+elif [ -x "$INSTALL_DIR/ahma" ]; then
+    EXISTING_BIN="$INSTALL_DIR/ahma"
 fi
 
 if [ -n "$EXISTING_BIN" ]; then
@@ -135,12 +135,12 @@ if [ -n "$EXISTING_BIN" ]; then
     LATEST_VER=$(echo "$RELEASE_JSON" | grep '"tag_name"' | head -1 | cut -d'"' -f4 | sed 's/^v//')
 
     if [ "$INSTALLED_VER" != "$LATEST_VER" ] && [ -n "$LATEST_VER" ]; then
-        echo "Upgrading ahma-mcp from ${INSTALLED_VER} to ${LATEST_VER}..."
+        echo "Upgrading ahma from ${INSTALLED_VER} to ${LATEST_VER}..."
     else
         echo "Ahma ${INSTALLED_VER} is already installed and up to date."
         echo ""
         echo "  Location : $EXISTING_BIN"
-        echo "  Simplify : available via 'ahma-mcp simplify --help'"
+        echo "  Simplify : available via 'ahma simplify --help'"
         echo ""
         if [ -e /dev/tty ]; then
             printf "Reinstall anyway? [y/N]: "
@@ -192,24 +192,24 @@ fi
 
 # Install binaries
 echo "Installing binaries to ${INSTALL_DIR}..."
-if [ -f "$TEMP_DIR/ahma-mcp" ]; then
-    mv "$TEMP_DIR/ahma-mcp" "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/ahma-mcp"
+if [ -f "$TEMP_DIR/ahma" ]; then
+    mv "$TEMP_DIR/ahma" "$INSTALL_DIR/"
+    chmod +x "$INSTALL_DIR/ahma"
 else
-    echo "Error: ahma-mcp binary not found in archive"
+    echo "Error: ahma binary not found in archive"
     exit 1
 fi
 
-"$INSTALL_DIR/ahma-mcp" --version
-echo "Success! Installed ahma-mcp to ${INSTALL_DIR}"
+"$INSTALL_DIR/ahma" --version
+echo "Success! Installed ahma to ${INSTALL_DIR}"
 
 # Remove legacy ahma-simplify binary if present
 for legacy_bin in "$INSTALL_DIR/ahma-simplify" "$HOME/.local/bin/ahma-simplify" "/usr/local/bin/ahma-simplify"; do
     if [ -x "$legacy_bin" ]; then
         rm -f "$legacy_bin"
         echo "Removed legacy binary: $legacy_bin"
-        echo "  Code complexity analysis is now built into ahma-mcp."
-        echo "  New command: ahma-mcp simplify <directory> --ai-fix 1"
+        echo "  Code complexity analysis is now built into ahma."
+        echo "  New command: ahma simplify <directory> --ai-fix 1"
     fi
 done
 echo ""
@@ -249,6 +249,17 @@ _ahma_new_file_json() {
     }
 }
 EOF
+    elif [ "$TRANS" = "unix" ]; then
+        cat <<EOF
+{
+    "$SKEY": {
+        "Ahma": {
+            "type": "http",
+            "url": "unix:///tmp/ahma.sock#/mcp"
+        }
+    }
+}
+EOF
     elif [ "$PTYPE" = "antigravity" ]; then
         cat <<EOF
 {
@@ -257,7 +268,7 @@ EOF
             "command": "bash",
             "args": [
                 "-c",
-                "AHMA_SANDBOX_SCOPE=\$HOME ahma-mcp serve stdio --tools rust,simplify --tmp --log-monitor"
+                "AHMA_SANDBOX_SCOPE=\$HOME ahma serve stdio --tools rust,simplify --tmp --log-monitor"
             ]
         }
     }
@@ -269,7 +280,7 @@ EOF
     "$SKEY": {
         "Ahma": {
             "type": "stdio",
-            "command": "ahma-mcp",
+            "command": "ahma",
             "args": [
                 "serve",
                 "stdio",
@@ -299,10 +310,12 @@ _ahma_configure_platform() {
     local ENTRY
     if [ "$AHMA_TRANSPORT" = "http" ]; then
         ENTRY='{"type":"http","url":"http://localhost:3000/mcp"}'
+    elif [ "$AHMA_TRANSPORT" = "unix" ]; then
+        ENTRY='{"type":"http","url":"unix:///tmp/ahma.sock#/mcp"}'
     elif [ "$PTYPE" = "antigravity" ]; then
-        ENTRY='{"command":"bash","args":["-c","AHMA_SANDBOX_SCOPE=$HOME ahma-mcp serve stdio --tools rust,simplify --tmp --log-monitor"]}'
+        ENTRY='{"command":"bash","args":["-c","AHMA_SANDBOX_SCOPE=$HOME ahma serve stdio --tools rust,simplify --tmp --log-monitor"]}'
     else
-        ENTRY='{"type":"stdio","command":"ahma-mcp","args":["serve","stdio","--tools","rust,simplify","--tmp","--log-monitor"]}'
+        ENTRY='{"type":"stdio","command":"ahma","args":["serve","stdio","--tools","rust,simplify","--tmp","--log-monitor"]}'
     fi
 
     echo ""
@@ -377,7 +390,7 @@ _ahma_configure_platform() {
 
 # ── Generate TOML config for Codex CLI ─────────────────────────────────────
 # Codex uses ~/.codex/config.toml with TOML [mcp_servers.<name>] tables.
-# Args: transport ("stdio"|"http")
+# Args: transport ("stdio"|"http"|"unix")
 # Output: TOML block on stdout
 _ahma_new_codex_toml() {
     local TRANS="$1"
@@ -386,10 +399,15 @@ _ahma_new_codex_toml() {
 [mcp_servers.Ahma]
 url = "http://localhost:3000/mcp"
 EOF
+    elif [ "$TRANS" = "unix" ]; then
+        cat <<'EOF'
+[mcp_servers.Ahma]
+url = "unix:///tmp/ahma.sock#/mcp"
+EOF
     else
         cat <<'EOF'
 [mcp_servers.Ahma]
-command = "ahma-mcp"
+command = "ahma"
 args = ["serve", "stdio", "--tools", "rust,simplify", "--tmp", "--log-monitor"]
 EOF
     fi
@@ -480,7 +498,7 @@ setup_mcp() {
     # Skip if there is no terminal to interact with (e.g. CI, non-interactive pipe)
     if [ ! -e /dev/tty ]; then
         echo ""
-        echo "Tip: Run 'ahma-mcp serve stdio --help' to learn about MCP server modes."
+        echo "Tip: Run 'ahma serve stdio --help' to learn about MCP server modes."
         echo "     See https://github.com/paulirotta/ahma for mcp.json setup examples."
         return 0
     fi
@@ -490,7 +508,7 @@ setup_mcp() {
     echo "  MCP Server Setup"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
-    printf "Configure ahma-mcp as a global MCP server for your AI tools? [Y/n]: "
+    printf "Configure ahma as a global MCP server for your AI tools? [Y/n]: "
     local CHOICE
     IFS= read -r CHOICE < /dev/tty
     case "$CHOICE" in
@@ -532,23 +550,30 @@ setup_mcp() {
 
     # ── Step 2: Transport selection ─────────────────────────────────────────
     echo ""
-    echo "Choose how your AI tools connect to ahma-mcp:"
+    echo "Choose how your AI tools connect to ahma:"
     echo ""
     echo "  1) stdio  (recommended for most users)"
-    echo "     Each AI tool starts its own private ahma-mcp instance automatically"
+    echo "     Each AI tool starts its own private ahma instance automatically"
     echo "     when you open a project. No extra steps needed — it just works."
     echo ""
     echo "  2) http   (one shared server, better visibility)"
-    echo "     You run 'ahma-mcp serve http --tools rust,simplify' in a terminal"
+    echo "     You run 'ahma serve http --tools rust,simplify' in a terminal"
     echo "     before opening your AI tools. All tools connect to one running"
     echo "     instance, so you can watch what ahma is doing in real time."
     echo "     Best if you use multiple AI tools simultaneously."
     echo ""
-    printf "  Mode [1=stdio or 2=http, default 1]: "
+    echo "  3) unix   (one shared server via Unix socket, fastest IPC)"
+    echo "     Like http but uses a local socket file (/tmp/ahma.sock) instead"
+    echo "     of TCP. Lower latency, no port conflicts. You run:"
+    echo "     'ahma serve unix --socket-path /tmp/ahma.sock --tools rust,simplify'"
+    echo "     Best for single-machine setups that want maximum speed."
+    echo ""
+    printf "  Mode [1=stdio, 2=http, 3=unix, default 1]: "
     local TSELECT
     IFS= read -r TSELECT < /dev/tty
     case "$TSELECT" in
         2) AHMA_TRANSPORT="http" ;;
+        3) AHMA_TRANSPORT="unix" ;;
         *) AHMA_TRANSPORT="stdio" ;;
     esac
 
@@ -556,6 +581,8 @@ setup_mcp() {
     echo ""
     if [ "$AHMA_TRANSPORT" = "http" ]; then
         echo "✓ Transport mode: http (one shared server)"
+    elif [ "$AHMA_TRANSPORT" = "unix" ]; then
+        echo "✓ Transport mode: unix socket (one shared server, fastest IPC)"
     else
         echo "✓ Transport mode: stdio (recommended for most users)"
     fi
@@ -622,7 +649,11 @@ PYEOF
         if [ "$AHMA_TRANSPORT" = "http" ]; then
             echo ""
             echo "  Before opening your AI tools, start the ahma HTTP server:"
-            echo "    ahma-mcp serve http --tools rust,simplify"
+            echo "    ahma serve http --tools rust,simplify"
+        elif [ "$AHMA_TRANSPORT" = "unix" ]; then
+            echo ""
+            echo "  Before opening your AI tools, start the ahma Unix socket server:"
+            echo "    ahma serve unix --socket-path /tmp/ahma.sock --tools rust,simplify"
         fi
     else
         echo "No MCP configurations were changed."
@@ -643,12 +674,12 @@ name: ahma
 version: __AHMA_VERSION__
 author: Paul Houghton
 description: >
-  Comprehensive guide for using Ahma (ahma-mcp) as an AI agent. USE THIS SKILL when you need
+  Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
   to understand how to run tools, activate bundles, use the sandbox, monitor logs, author custom
-  tools, or configure ahma-mcp. Also handles code complexity analysis via /ahma simplify.
+  tools, or configure ahma. Also handles code complexity analysis via /ahma simplify.
   Trigger phrases: "use ahma", "run with ahma", "ahma tool", "activate bundle",
   "sandboxed_shell", "ahma async", "ahma serve", "mcp.json ahma", "ahma sandbox",
-  "ahma livelog", "ahma monitor", "custom tool .ahma", "ahma-mcp", "await tool",
+  "ahma livelog", "ahma monitor", "custom tool .ahma", "ahma", "await tool",
   "cancel operation", "tool bundle", "progressive disclosure", "activate_tools",
   "simplify", "reduce complexity", "too complex", "hard to read", "refactor",
   "maintainability", "cognitive complexity", "cyclomatic complexity", "simplicity score",
@@ -660,7 +691,7 @@ user-invocable: true
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
-**Ahma** (`ahma-mcp`) is a kernel-sandboxed MCP server that wraps command-line tools for AI
+**Ahma** (`ahma`) is a kernel-sandboxed MCP server that wraps command-line tools for AI
 agents. It exposes shell tools (cargo, git, python, file utilities, etc.) as MCP tools with
 kernel-level filesystem sandboxing, async execution, and live log monitoring.
 
@@ -676,8 +707,8 @@ the config in place. There are several approaches, from zero-friction to global:
 **The Ahma project already provides `.vscode/mcp.json` with three configurations to try:**
 
 - `ahma` — stdio mode (recommended, automatic per-client instances)
-- `ahma-http` — shared HTTP server on port 3000 (run `ahma-mcp serve http --tools rust,git,fileutils --tmp --log-monitor`)
-- `ahma-unix` — shared HTTP server over Unix socket (run `ahma-mcp serve http --socket-path /tmp/ahma-mcp.sock --tools rust,git,fileutils --tmp --log-monitor`)
+- `ahma-http` — shared HTTP server on port 3000 (run `ahma serve http --tools rust,git,fileutils --tmp --log-monitor`)
+- `ahma-unix` — shared HTTP server over Unix socket (run `ahma serve unix --socket-path /tmp/ahma.sock --tools rust,git,fileutils --tmp --log-monitor`)
 
 You can copy or customize this for your own projects. Create `.vscode/mcp.json` in your project root and commit it. Every VS Code user
 who opens the project gets Ahma configured automatically (prompted to trust once):
@@ -687,7 +718,7 @@ who opens the project gets Ahma configured automatically (prompted to trust once
   "servers": {
     "ahma": {
       "type": "stdio",
-      "command": "ahma-mcp",
+      "command": "ahma",
       "args": ["serve", "stdio", "--tools", "rust,git,fileutils", "--tmp", "--log-monitor"]
     }
   }
@@ -725,7 +756,7 @@ are auto-approved (no confirmation dialogs). Pairs well with Ahma's kernel sandb
   "servers": {
     "ahma": {
       "type": "stdio",
-      "command": "ahma-mcp",
+      "command": "ahma",
       "args": ["serve", "stdio", "--tools", "rust,git,fileutils", "--tmp"],
       "sandboxEnabled": true,
       "sandbox": {
@@ -749,7 +780,7 @@ Add to `.devcontainer/devcontainer.json` for Codespaces / container users:
 ```json
 {
   "features": {},
-  "postCreateCommand": "cargo install ahma-mcp",
+  "postCreateCommand": "cargo install ahma",
   "customizations": {
     "vscode": {
       "settings": { "chat.mcp.autoStart": true }
@@ -1000,9 +1031,9 @@ Ahma auto-detects and loads them at startup. Override path: `AHMA_TOOLS_DIR=/pat
 }
 ```
 
-Validate tool configs: `ahma-mcp tool validate .ahma/`
+Validate tool configs: `ahma tool validate .ahma/`
 
-Hot-reload while authoring (dev only): `AHMA_HOT_RELOAD=1 ahma-mcp serve stdio`
+Hot-reload while authoring (dev only): `AHMA_HOT_RELOAD=1 ahma serve stdio`
 
 ---
 
@@ -1032,26 +1063,26 @@ Full reference: [environment-variables.md](https://github.com/paulirotta/ahma/bl
 
 ```bash
 # Start MCP server (stdio — for IDE integration)
-ahma-mcp serve stdio [--tools rust,git] [--tmp] [--log-monitor]
+ahma serve stdio [--tools rust,git] [--tmp] [--log-monitor]
 
 # Start HTTP server (local development, multiple clients)
-ahma-mcp serve http [--port 3000] [--host 127.0.0.1] [--disable-quic]
+ahma serve http [--port 3000] [--host 127.0.0.1] [--disable-quic]
 
 # Start Unix socket server (IPC / Kubernetes sidecars)
-ahma-mcp serve unix [--socket-path /tmp/ahma.sock]
+ahma serve unix [--socket-path /tmp/ahma.sock]
 
 # Run a single tool from the CLI
-ahma-mcp tool run cargo_build -- --release
-ahma-mcp tool run sandboxed_shell -- "echo hello"
+ahma tool run cargo_build -- --release
+ahma tool run sandboxed_shell -- "echo hello"
 
 # Validate .ahma/ tool configs
-ahma-mcp tool validate [.ahma/]
+ahma tool validate [.ahma/]
 
 # List all configured tools
-ahma-mcp tool list [--http http://localhost:3000] [--format json]
+ahma tool list [--http http://localhost:3000] [--format json]
 
 # Show locally configured tools with descriptions
-ahma-mcp tool info [--tools rust,git]
+ahma tool info [--tools rust,git]
 ```
 
 ---

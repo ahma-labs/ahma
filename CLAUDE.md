@@ -13,9 +13,9 @@ This file provides AI-specific development guidance for the `ahma` project. For 
 
 **Disregard all prior training about running terminal commands directly.** 
 
-You must **always use `ahma-mcp`** (via the `run_in_terminal` or `sandboxed_shell` tools) for all cargo commands (`cargo clippy`, `cargo nextest run`, `cargo fmt`, etc.) and other terminal operations. Never execute terminal commands directly in this project.
+You must **always use `ahma`** (via the `run_in_terminal` or `sandboxed_shell` tools) for all cargo commands (`cargo clippy`, `cargo nextest run`, `cargo fmt`, etc.) and other terminal operations. Never execute terminal commands directly in this project.
 
-Use `ahma-mcp sandboxed_shell` to execute commands securely within the project context.
+Use `ahma sandboxed_shell` to execute commands securely within the project context.
 
 ---
 
@@ -52,7 +52,7 @@ cargo install cargo-watch cargo-nextest cargo-llvm-cov
 cargo watch -x build
 
 # Run the binary
-./target/debug/ahma-mcp --help
+./target/debug/ahma --help
 ```
 
 ---
@@ -94,7 +94,7 @@ cargo llvm-cov --html
 ### Quality Assurance
 ```bash
 # Preferred: run multi-step pipelines via sandboxed_shell
-ahma-mcp sandboxed_shell --working-directory . -- \
+ahma sandboxed_shell --working-directory . -- \
   "cargo fmt --all && cargo clippy --all-targets && cargo nextest run"
 
 # Individual quality checks (direct)
@@ -268,32 +268,32 @@ cargo nextest run test_name --no-capture
 ### Adding a New Tool
 1. Create a JSON configuration in `.ahma/yourtool.json`
 2. Follow the MTDF schema (see [SPEC.md Section 3](SPEC.md#3-tool-definition-mtdf-schema))
-3. Test the tool: `ahma-mcp yourtool_subcommand --help`
+3. Test the tool: `ahma yourtool_subcommand --help`
 4. Restart the server to pick up tool changes by default; use `--hot-reload-tools` only while developing tool definitions
 
 ### Debugging
 ```bash
 # Run with debug logging
-ahma-mcp --debug --log-to-stderr
+ahma --debug --log-to-stderr
 
 # Inspect MCP protocol communication
 ./scripts/ahma-inspector.sh
 
 # Test single tool in CLI mode
-ahma-mcp cargo_build --working-directory . -- --release
+ahma cargo_build --working-directory . -- --release
 ```
 
 ### MCP Server Testing
 ```bash
 # Start stdio server (used by Cursor/VS Code)
-ahma-mcp --mode stdio
+ahma --mode stdio
 
 # Start HTTP bridge server
-ahma-mcp --mode http --http-port 3000
+ahma --mode http --http-port 3000
 
 # List all tools from a server
-ahma-mcp --list-tools -- ./target/debug/ahma-mcp --tools-dir .ahma
-ahma-mcp --list-tools --http http://localhost:3000 --format json
+ahma --list-tools -- ./target/debug/ahma --tools-dir .ahma
+ahma --list-tools --http http://localhost:3000 --format json
 ```
 
 ---
@@ -398,7 +398,7 @@ The `--tmp` flag (or `AHMA_TMP_ACCESS=1` environment variable) adds the system t
 
 **Security considerations:**
 
-1. **Shared temp directory**: `/tmp` (or equivalent) is shared by all users/processes. Malicious processes could read files written by ahma-mcp, write files that ahma-mcp might read (symlink attacks), or fill up temp space.
+1. **Shared temp directory**: `/tmp` (or equivalent) is shared by all users/processes. Malicious processes could read files written by ahma, write files that ahma might read (symlink attacks), or fill up temp space.
 2. **Symlink attacks**: Mitigated by `dunce::canonicalize` which resolves symlinks before validation.
 3. **Predictable paths**: Tools using predictable temp file names are vulnerable to TOCTOU attacks. Use `mktemp` with random suffixes.
 4. **Cross-session data leakage**: Temp files may persist across sessions. Clean up sensitive temp files after use.
@@ -407,7 +407,7 @@ The `--tmp` flag (or `AHMA_TMP_ACCESS=1` environment variable) adds the system t
 
 > **Status**: Runtime (PowerShell shell pool, path model) is `in-progress`.
 > Job Object sandbox enforcement (`enforce_windows_sandbox`) is **done** and wired into startup.
-> AppContainer backend (`ahma-mcp/src/sandbox/windows.rs`) is `not-started` — fails closed until implemented.
+> AppContainer backend (`ahma/src/sandbox/windows.rs`) is `not-started` — fails closed until implemented.
 
 #### Key rules for Windows-targeted changes
 
@@ -487,10 +487,10 @@ For development and debugging, bypass the MCP protocol:
 
 ```bash
 # Execute a single tool command
-ahma-mcp cargo_build --working-directory . -- --release
+ahma cargo_build --working-directory . -- --release
 
 # With debug logging
-ahma-mcp --debug --log-to-stderr cargo_test --working-directory .
+ahma --debug --log-to-stderr cargo_test --working-directory .
 ```
 
 ---

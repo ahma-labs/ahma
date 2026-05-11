@@ -39,12 +39,12 @@ fn synth_config() -> Value {
             "ahma_mcp": {
                 "type": "stdio",
                 "cwd": "${workspaceFolder}",
-                "command": "target/release/ahma-mcp",
+                "command": "target/release/ahma",
                 "args": ["--tools-dir", ".ahma"],
                 "dev": {
                     "command": "cargo",
                     "args": ["run", "--release", "--", "--tools-dir", ".ahma"],
-                    "watch": ["target/release/ahma-mcp"]
+                    "watch": ["target/release/ahma"]
                 }
             }
         }
@@ -67,7 +67,7 @@ async fn test_vscode_mcp_config_watches_binary_only() -> Result<()> {
         pattern
             .as_str()
             .unwrap_or("")
-            .contains("target/release/ahma-mcp")
+            .contains("target/release/ahma")
     });
 
     let has_json_pattern = watch_patterns
@@ -81,7 +81,7 @@ async fn test_vscode_mcp_config_watches_binary_only() -> Result<()> {
     // This should pass: we should be watching the binary
     assert!(
         has_binary_pattern,
-        "VS Code MCP config should watch the binary target/release/ahma-mcp"
+        "VS Code MCP config should watch the binary target/release/ahma"
     );
 
     // This should pass: we should NOT be watching JSON files (causes too many restarts)
@@ -117,7 +117,7 @@ async fn test_vscode_mcp_config_has_valid_command_structure() -> Result<()> {
         "Should set working directory"
     );
     assert_eq!(
-        server_config["command"], "target/release/ahma-mcp",
+        server_config["command"], "target/release/ahma",
         "Default command should run the release ahma_mcp binary"
     );
 

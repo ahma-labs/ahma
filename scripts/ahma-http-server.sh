@@ -54,7 +54,7 @@ fi
 TOOLS_DIR="${AHMA_TOOLS_DIR:-$PROJECT_ROOT/.ahma}"
 
 echo
-echo "Starting ahma-mcp HTTP server..."
+echo "Starting ahma HTTP server..."
 echo "  Tools dir:     $TOOLS_DIR"
 echo "  Sandbox scope: $SANDBOX_SCOPE"
 echo "  Port:          3000"
@@ -67,7 +67,7 @@ echo "    Do not expose to untrusted networks."
 echo "-----------------------------------------------"
 echo
 
-(cd "$PROJECT_ROOT" && cargo run $RELEASE_FLAG -p ahma_mcp --bin ahma-mcp -- \
+(cd "$PROJECT_ROOT" && cargo run $RELEASE_FLAG -p ahma_mcp --bin ahma -- \
     --mode http \
     --http-port 3000 \
     --tools-dir "$TOOLS_DIR" \

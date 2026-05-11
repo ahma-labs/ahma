@@ -1,6 +1,6 @@
 # Installation
 
-The installation scripts detect your OS and architecture, download the latest release from GitHub, and install `ahma-mcp` to your local bin directory.
+The installation scripts detect your OS and architecture, download the latest release from GitHub, and install `ahma` to your local bin directory.
 
 ## Install with the script
 
@@ -39,7 +39,7 @@ If you want the optional skill setup details, see [docs/agent-skills.md](agent-s
 git clone https://github.com/paulirotta/ahma.git
 cd ahma
 cargo build --release
-mv target/release/ahma-mcp /usr/local/bin/
+mv target/release/ahma /usr/local/bin/
 ```
 
 **Windows (PowerShell)**
@@ -48,7 +48,7 @@ mv target/release/ahma-mcp /usr/local/bin/
 git clone https://github.com/paulirotta/ahma.git
 cd ahma
 cargo build --release
-Copy-Item target\release\ahma-mcp.exe "$HOME\.local\bin\"
+Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 ```
 
 ## After installation

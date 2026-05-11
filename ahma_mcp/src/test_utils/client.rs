@@ -65,7 +65,7 @@ fn get_test_binary_path() -> PathBuf {
                 return path;
             }
             let workspace = get_workspace_dir();
-            let bin_name = format!("ahma-mcp{}", std::env::consts::EXE_SUFFIX);
+            let bin_name = format!("ahma{}", std::env::consts::EXE_SUFFIX);
             find_first_existing_path(collect_binary_candidates(&workspace, &bin_name))
         })
         .clone()
@@ -79,7 +79,7 @@ fn build_cargo_run_command(workspace_dir: &Path) -> Command {
         .arg("--package")
         .arg("ahma_mcp")
         .arg("--bin")
-        .arg("ahma-mcp")
+        .arg("ahma")
         .arg("--");
     cmd
 }

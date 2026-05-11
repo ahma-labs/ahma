@@ -1,6 +1,6 @@
 # Code Complexity Analysis
 
-Ahma includes a built-in code complexity analyzer (`ahma-mcp simplify`) that scores every source
+Ahma includes a built-in code complexity analyzer (`ahma simplify`) that scores every source
 file in your project, identifies the worst hotspot functions, and returns a structured AI prompt
 to fix them with minimal, targeted changes.
 
@@ -12,13 +12,13 @@ Supports: **Rust, Python, JavaScript, TypeScript, Kotlin, C, C++, Java, C#, Go, 
 
 ```bash
 # Analyze the current directory and get fix instructions for the worst file
-ahma-mcp simplify . --ai-fix 1
+ahma simplify . --ai-fix 1
 
 # Rust files only
-ahma-mcp simplify . --extensions rust --ai-fix 1
+ahma simplify . --extensions rust --ai-fix 1
 
 # Verify improvement after editing
-ahma-mcp simplify . --verify src/my_module.rs
+ahma simplify . --verify src/my_module.rs
 ```
 
 Or via the `simplify` MCP tool (requires `--tools simplify` or `--tools rust,simplify` at
@@ -32,7 +32,7 @@ simplify(directory=".", ai_fix=1)
 
 ## Installation
 
-`ahma-mcp simplify` is built into the `ahma-mcp` binary — no separate install needed.
+`ahma simplify` is built into the `ahma` binary — no separate install needed.
 
 **Quick install (Linux/macOS):**
 ```bash
@@ -62,27 +62,27 @@ cargo build --release -p ahma_mcp --no-default-features
 
 ```bash
 # Analyze all supported files, get fix prompt for the worst file
-ahma-mcp simplify <directory> --ai-fix 1
+ahma simplify <directory> --ai-fix 1
 
 # Get fix prompt for the 2nd worst file
-ahma-mcp simplify <directory> --ai-fix 2
+ahma simplify <directory> --ai-fix 2
 
 # Show top 20 issues in the report (default: 50)
-ahma-mcp simplify <directory> --limit 20
+ahma simplify <directory> --limit 20
 ```
 
 ### Language filtering
 
 ```bash
 # Single language (name or raw extension)
-ahma-mcp simplify . --extensions rust
-ahma-mcp simplify . --extensions rs
+ahma simplify . --extensions rust
+ahma simplify . --extensions rs
 
 # Multiple languages
-ahma-mcp simplify . --extensions rust,python
+ahma simplify . --extensions rust,python
 
 # Kotlin only
-ahma-mcp simplify . --extensions kotlin
+ahma simplify . --extensions kotlin
 ```
 
 | Language name | Extensions scanned |
@@ -104,7 +104,7 @@ ahma-mcp simplify . --extensions kotlin
 After editing a file, re-analyze it to confirm improvement:
 
 ```bash
-ahma-mcp simplify <directory> --verify src/my_module.rs
+ahma simplify <directory> --verify src/my_module.rs
 ```
 
 Output shows before/after metrics with a verdict:
@@ -120,13 +120,13 @@ Output shows before/after metrics with a verdict:
 
 ```bash
 # Write report to a directory (CODE_SIMPLICITY.md + CODE_SIMPLICITY.html)
-ahma-mcp simplify <directory> --output-path ./reports
+ahma simplify <directory> --output-path ./reports
 
 # Generate HTML report
-ahma-mcp simplify <directory> --html
+ahma simplify <directory> --html
 
 # Exclude generated code
-ahma-mcp simplify <directory> --exclude '**/generated/**,**/vendor/**'
+ahma simplify <directory> --exclude '**/generated/**,**/vendor/**'
 ```
 
 ---
@@ -160,7 +160,7 @@ A project score below 70% is a signal to run `--ai-fix` on the top 3–5 files.
 
 ## MCP Tool Reference
 
-Tool name: `simplify` (requires `--tools simplify` at ahma-mcp startup).
+Tool name: `simplify` (requires `--tools simplify` at ahma startup).
 
 | Argument | Type | Default | Purpose |
 |----------|------|---------|---------|
@@ -217,7 +217,7 @@ To add simplify to your own CI pipeline:
 
 ```yaml
 - name: Code Simplicity Report
-  run: ahma-mcp simplify . --limit 20 --html --output-path ./simplicity-report
+  run: ahma simplify . --limit 20 --html --output-path ./simplicity-report
 ```
 
 ---

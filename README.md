@@ -29,7 +29,7 @@ curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install
 irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
 ```
 
-The installer downloads `ahma-mcp`, offers to configure your MCP client, and can install optional extras. See [docs/installation.md](docs/installation.md) for platform details, source installation, and what the setup wizard changes.
+The installer downloads `ahma`, offers to configure your MCP client, and can install optional extras. See [docs/installation.md](docs/installation.md) for platform details, source installation, and what the setup wizard changes.
 
 ### Example workflow
 
@@ -84,7 +84,7 @@ If you prefer to build from source:
 git clone https://github.com/paulirotta/ahma.git
 cd ahma
 cargo build --release
-mv target/release/ahma-mcp /usr/local/bin/
+mv target/release/ahma /usr/local/bin/
 ```
 
 **Windows (PowerShell)**
@@ -93,7 +93,7 @@ mv target/release/ahma-mcp /usr/local/bin/
 git clone https://github.com/paulirotta/ahma.git
 cd ahma
 cargo build --release
-Copy-Item target\release\ahma-mcp.exe "$HOME\.local\bin\"
+Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 ```
 
 See [docs/installation.md](docs/installation.md) for supported binary platforms and installer behavior.
@@ -118,11 +118,11 @@ See [docs/live-log-monitoring.md](docs/live-log-monitoring.md) for setup, the An
 
 - **Custom tools**: If you want to expose your own command-line tools through ahma, start with [docs/custom-tools.md](docs/custom-tools.md).
 - **Agent skills**: Optional agent-specific setup is documented in [docs/agent-skills.md](docs/agent-skills.md).
-- **Code complexity analysis**: `ahma-mcp simplify` analyzes source files and returns structured AI fix instructions. See [SIMPLIFY.md](SIMPLIFY.md).
+- **Code complexity analysis**: `ahma simplify` analyzes source files and returns structured AI fix instructions. See [SIMPLIFY.md](SIMPLIFY.md).
 
 ## MCP Server Connection Modes
 
-`ahma-mcp` supports **STDIO** (default — IDE spawns a subprocess per workspace), **HTTP Bridge** (proxy for web clients and debugging), and **HTTP Streaming** (MCP Streamable HTTP with event replay and full-duplex).
+`ahma` supports **STDIO** (default — IDE spawns a subprocess per workspace), **HTTP Bridge** (proxy for web clients and debugging), and **HTTP Streaming** (MCP Streamable HTTP with event replay and full-duplex).
 
 See [docs/connection-modes.md](docs/connection-modes.md) for `mcp.json` examples for VS Code, Cursor, Claude Code, and Antigravity, plus HTTP streaming usage.
 

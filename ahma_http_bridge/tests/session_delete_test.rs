@@ -60,7 +60,7 @@ fn find_available_port() -> u16 {
 
 /// Build the ahma_mcp binary if needed and return the path
 fn get_ahma_mcp_binary() -> PathBuf {
-    ahma_mcp::test_utils::cli::build_binary_cached("ahma_mcp", "ahma-mcp")
+    ahma_mcp::test_utils::cli::build_binary_cached("ahma_mcp", "ahma")
 }
 
 /// Start the HTTP bridge server and return the process

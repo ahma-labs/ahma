@@ -21,7 +21,7 @@ async fn test_freeform_argument_passing_ls() -> Result<()> {
     println!("Direct ls output:\n{}", direct_ls_output);
 
     // Run prebuilt binary directly to avoid nested Cargo lock contention.
-    let binary = common::cli::build_binary_cached("ahma_mcp", "ahma-mcp");
+    let binary = common::cli::build_binary_cached("ahma_mcp", "ahma");
     let mut cmd = tokio::process::Command::new(&binary);
     cmd.env("AHMA_TOOLS_DIR", temp_dir.path().join(".ahma"))
         .env("AHMA_DISABLE_SANDBOX", "1")
@@ -81,7 +81,7 @@ edition = "2021"
     // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     // Run prebuilt binary directly to avoid nested Cargo lock contention.
-    let binary = common::cli::build_binary_cached("ahma_mcp", "ahma-mcp");
+    let binary = common::cli::build_binary_cached("ahma_mcp", "ahma");
     let mut cmd = tokio::process::Command::new(&binary);
     cmd.env("AHMA_TOOLS_DIR", temp_dir.path().join(".ahma"))
         .env("AHMA_DISABLE_SANDBOX", "1")

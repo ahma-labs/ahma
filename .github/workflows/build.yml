@@ -611,16 +611,16 @@ jobs:
           mkdir -p dist
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             archive_name="ahma-release-${platform}.zip"
-            cp "target/${{ matrix.target }}/release/ahma-mcp.exe" dist/
+            cp "target/${{ matrix.target }}/release/ahma.exe" dist/
             cp README.md dist/
-            (cd dist && sha256sum ahma-mcp.exe > SHA256SUMS)
-            (cd dist && 7z a "../${archive_name}" ahma-mcp.exe SHA256SUMS README.md)
+            (cd dist && sha256sum ahma.exe > SHA256SUMS)
+            (cd dist && 7z a "../${archive_name}" ahma.exe SHA256SUMS README.md)
           else
             archive_name="ahma-release-${platform}.tar.gz"
-            cp target/${{ matrix.target }}/release/ahma-mcp dist/
+            cp target/${{ matrix.target }}/release/ahma dist/
             cp README.md dist/
-            (cd dist && shasum -a 256 ahma-mcp > SHA256SUMS)
-            tar -czf "$archive_name" -C dist ahma-mcp SHA256SUMS README.md
+            (cd dist && shasum -a 256 ahma > SHA256SUMS)
+            tar -czf "$archive_name" -C dist ahma SHA256SUMS README.md
           fi
           echo "archive_name=$archive_name" >> "$GITHUB_OUTPUT"
           echo "platform=$platform" >> "$GITHUB_OUTPUT"

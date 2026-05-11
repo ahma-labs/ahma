@@ -69,21 +69,21 @@ impl Client {
             Command::new(binary)
         } else {
             eprintln!(
-                "Warning: Using slow 'cargo run' path. Run 'cargo build -p ahma_mcp --bin ahma-mcp' first for faster tests."
+                "Warning: Using slow 'cargo run' path. Run 'cargo build -p ahma_mcp --bin ahma' first for faster tests."
             );
             let mut cmd = Command::new("cargo");
             cmd.arg("run")
                 .arg("--package")
                 .arg("ahma_mcp")
                 .arg("--bin")
-                .arg("ahma-mcp")
+                .arg("ahma")
                 .arg("--");
             cmd
         };
 
         let client = ()
             .serve(TokioChildProcess::new(command.configure(|cmd| {
-                // New CLI: ahma-mcp serve stdio [--tools-dir PATH]
+                // New CLI: ahma serve stdio [--tools-dir PATH]
                 // Behaviour flags (--disable-sandbox, etc.) are now env vars.
                 cmd.args(["serve", "stdio"]);
                 cmd.env("AHMA_DISABLE_SANDBOX", "1");
@@ -194,7 +194,7 @@ async fn resolve_prebuilt_ahma_mcp_binary() -> Option<PathBuf> {
     }
 
     let workspace = workspace_dir();
-    let bin_name = format!("ahma-mcp{}", std::env::consts::EXE_SUFFIX);
+    let bin_name = format!("ahma{}", std::env::consts::EXE_SUFFIX);
 
     if let Ok(target_dir_raw) = std::env::var("CARGO_TARGET_DIR") {
         let target_dir = PathBuf::from(target_dir_raw);

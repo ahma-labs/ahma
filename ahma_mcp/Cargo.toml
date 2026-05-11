@@ -12,7 +12,7 @@ name = "ahma_mcp"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ahma-mcp"
+name = "ahma"
 path = "src/shell/bin.rs"
 
 

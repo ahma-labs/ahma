@@ -1,6 +1,6 @@
 //! Safe stdout notification delivery for the subprocess-to-bridge protocol.
 //!
-//! In HTTP bridge mode, per-session `ahma-mcp` subprocesses communicate with
+//! In HTTP bridge mode, per-session `ahma` subprocesses communicate with
 //! the bridge via stdin/stdout pipes.  Sandbox lifecycle notifications
 //! (`configured`, `failed`, `terminated`) are written as raw JSON-RPC to
 //! stdout so the bridge can intercept and broadcast them.

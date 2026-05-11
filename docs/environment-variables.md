@@ -1,6 +1,6 @@
 # Ahma Environment Variables
 
-All non-essential runtime options in `ahma-mcp` are controlled via environment variables.
+All non-essential runtime options in `ahma` are controlled via environment variables.
 The CLI itself handles subcommand selection and frequently changed options (tool bundles,
 HTTP host/port). Everything else — sandbox policy, logging, execution tuning — lives here.
 
@@ -28,15 +28,15 @@ On Windows, use semicolons (`;`) as separators.
 
 ```bash
 # Use a shared tools directory
-AHMA_TOOLS_DIR=/shared/ahma-tools ahma-mcp serve stdio
+AHMA_TOOLS_DIR=/shared/ahma-tools ahma serve stdio
 
 # Extend the default timeout for slow builds (env var or CLI flag)
-AHMA_TIMEOUT=600 ahma-mcp serve stdio
-ahma-mcp serve stdio --timeout 600
+AHMA_TIMEOUT=600 ahma serve stdio
+ahma serve stdio --timeout 600
 
 # Force synchronous execution (env var or CLI flag)
-AHMA_SYNC=1 ahma-mcp serve stdio
-ahma-mcp serve stdio --sync
+AHMA_SYNC=1 ahma serve stdio
+ahma serve stdio --sync
 ```
 
 ---
@@ -49,7 +49,7 @@ detection, and example `mcp.json` configurations.
 | Variable | CLI equivalent | Default | Description |
 |---|---|---|---|
 | `AHMA_DISABLE_SANDBOX` | `--no-sandbox` | off | Disable the kernel sandbox entirely. **UNSAFE** — the AI can read and write anywhere on the filesystem. Use only in environments that provide their own containment (Docker, CI containers) or on hardware where the kernel sandbox is unsupported (e.g. Raspberry Pi with kernel < 5.13). |
-| `AHMA_SANDBOX_SCOPE` | — | current working directory | Colon-separated list of absolute paths that define the sandbox boundary. The AI can read and write only within these directories. If not set, the sandbox scope is the directory from which `ahma-mcp` was launched. |
+| `AHMA_SANDBOX_SCOPE` | — | current working directory | Colon-separated list of absolute paths that define the sandbox boundary. The AI can read and write only within these directories. If not set, the sandbox scope is the directory from which `ahma` was launched. |
 | `AHMA_SANDBOX_DEFER` | — | off | Defer sandbox lock until the MCP client sends a `roots/list` response. Use when the client supplies workspace roots at connection time and you want those roots to become the sandbox scope automatically. |
 | `AHMA_WORKING_DIRS` | — | — | Colon-separated fallback working directories used when `AHMA_SANDBOX_DEFER=1` is set but the client does not provide roots. Has no effect when `AHMA_SANDBOX_DEFER` is off. |
 | `AHMA_TMP_ACCESS` | `--tmp` | off | Add the system temp directory (`/tmp` or equivalent) to the sandbox scope. Useful for workflows that need scratch space (compilers, build systems). See [security-sandbox.md](security-sandbox.md) for security trade-offs. |
@@ -57,21 +57,21 @@ detection, and example `mcp.json` configurations.
 
 ```bash
 # Sandbox scoped to two project directories
-AHMA_SANDBOX_SCOPE=/projects/backend:/projects/frontend ahma-mcp serve stdio
+AHMA_SANDBOX_SCOPE=/projects/backend:/projects/frontend ahma serve stdio
 
 # Defer sandbox scope to whatever the IDE declares as the workspace root
-AHMA_SANDBOX_DEFER=1 ahma-mcp serve stdio
+AHMA_SANDBOX_DEFER=1 ahma serve stdio
 
 # Defer with a fallback if the client doesn't provide roots
-AHMA_SANDBOX_DEFER=1 AHMA_WORKING_DIRS=/home/user/projects ahma-mcp serve stdio
+AHMA_SANDBOX_DEFER=1 AHMA_WORKING_DIRS=/home/user/projects ahma serve stdio
 
 # Disable sandbox in a Docker container that provides its own isolation (env var or CLI flag)
-AHMA_DISABLE_SANDBOX=1 ahma-mcp serve stdio
-ahma-mcp serve stdio --no-sandbox
+AHMA_DISABLE_SANDBOX=1 ahma serve stdio
+ahma serve stdio --no-sandbox
 
 # Allow build tools to write to the temp directory (env var or CLI flag)
-AHMA_TMP_ACCESS=1 ahma-mcp serve stdio
-ahma-mcp serve stdio --tmp
+AHMA_TMP_ACCESS=1 ahma serve stdio
+ahma serve stdio --tmp
 ```
 
 ---
@@ -87,18 +87,18 @@ ahma-mcp serve stdio --tmp
 
 ```bash
 # Debug logging to stderr (ideal for development)
-RUST_LOG=debug AHMA_LOG_TARGET=stderr ahma-mcp serve stdio
+RUST_LOG=debug AHMA_LOG_TARGET=stderr ahma serve stdio
 
 # Enable live log monitoring with reduced rate limiting (env var or CLI flags)
-AHMA_LOG_MONITOR=1 AHMA_MONITOR_RATE_LIMIT=30 ahma-mcp serve stdio
-ahma-mcp serve stdio --log-monitor --monitor-rate-limit 30
+AHMA_LOG_MONITOR=1 AHMA_MONITOR_RATE_LIMIT=30 ahma serve stdio
+ahma serve stdio --log-monitor --monitor-rate-limit 30
 ```
 
 ---
 
 ## HTTP Transport
 
-These variables apply only when running `ahma-mcp serve http`. Most have equivalent CLI flags
+These variables apply only when running `ahma serve http`. Most have equivalent CLI flags
 on the `serve http` subcommand; the environment variable and CLI flag can be used together
 (either enables the feature).
 
@@ -113,10 +113,10 @@ examples, and streaming transport details.
 
 ```bash
 # HTTP bridge on port 8080, TCP only, strict HTTP/2+
-AHMA_DISABLE_QUIC=1 AHMA_DISABLE_HTTP1_1=1 ahma-mcp serve http --port 8080
+AHMA_DISABLE_QUIC=1 AHMA_DISABLE_HTTP1_1=1 ahma serve http --port 8080
 
 # Extend handshake timeout for slow clients
-AHMA_HANDSHAKE_TIMEOUT=120 ahma-mcp serve http
+AHMA_HANDSHAKE_TIMEOUT=120 ahma serve http
 ```
 
 ---
@@ -124,7 +124,7 @@ AHMA_HANDSHAKE_TIMEOUT=120 ahma-mcp serve http
 ## Install Script
 
 The following variable is only read by the install script (`scripts/install.sh`) and has no
-effect on the `ahma-mcp` binary itself.
+effect on the `ahma` binary itself.
 
 | Variable | Description |
 |---|---|

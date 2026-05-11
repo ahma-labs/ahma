@@ -80,7 +80,7 @@ echo
 
 # Step 1: Build the project
 echo -e "${CYAN}Building project (release mode)...${NC}"
-cargo build --release -p ahma_mcp --bin ahma-mcp 2>&1 | tail -5
+cargo build --release -p ahma_mcp --bin ahma 2>&1 | tail -5
 echo -e "${GREEN}OK Build complete${NC}"
 echo
 
@@ -97,7 +97,7 @@ SANDBOX_SCOPE="$PROJECT_ROOT"
 # Start server in background, capturing output
 if $VERBOSE; then
     # Verbose: show all server output
-    "$PROJECT_ROOT/target/release/ahma-mcp" \
+    "$PROJECT_ROOT/target/release/ahma" \
         --mode http \
         --http-port 0 \
         --sync \
@@ -107,7 +107,7 @@ if $VERBOSE; then
         2>&1 | tee "$TEMP_PORT_FILE" &
 else
     # Normal: only capture, don't show
-    "$PROJECT_ROOT/target/release/ahma-mcp" \
+    "$PROJECT_ROOT/target/release/ahma" \
         --mode http \
         --http-port 0 \
         --sync \

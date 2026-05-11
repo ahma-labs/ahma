@@ -2,7 +2,7 @@
 //!
 //! Ahma (Finnish for wolverine) is the foundational engine for building high-performance,
 //! secure Model Context Protocol (MCP) servers. This crate provides the core library that
-//! powers all Ahma interfaces, including the standard `ahma-mcp` binary (Stdio/CLI) and
+//! powers all Ahma interfaces, including the standard `ahma` binary (Stdio/CLI) and
 //! the `ahma-http-bridge`.
 //!
 //! ## Foundational Philosophy
@@ -71,7 +71,7 @@
 //!
 //! ## Environment Variables
 //!
-//! The `ahma-mcp` binary (and any binary built on this library) reads the following
+//! The `ahma` binary (and any binary built on this library) reads the following
 //! environment variables at startup to configure runtime behaviour. All `AHMA_*`
 //! boolean flags accept `1`, `true`, `yes`, or `on` as truthy values.
 //!

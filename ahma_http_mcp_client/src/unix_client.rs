@@ -19,8 +19,8 @@ mod unix_impl {
 
     /// Create an MCP Streamable HTTP transport that connects via a Unix domain socket.
     ///
-    /// The socket path may be a filesystem path (e.g. `/tmp/ahma-mcp.sock`) or
-    /// a Linux abstract socket with the `@` prefix (e.g. `@ahma-mcp`).
+    /// The socket path may be a filesystem path (e.g. `/tmp/ahma.sock`) or
+    /// a Linux abstract socket with the `@` prefix (e.g. `@ahma`).
     ///
     /// The `uri` is the HTTP URI used inside the socket connection, e.g.
     /// `http://localhost/mcp` (the host portion is used for HTTP `Host` headers

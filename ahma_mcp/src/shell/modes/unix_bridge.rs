@@ -21,7 +21,7 @@ use std::env;
 /// Returns an error if the bridge fails to start.
 pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
     let socket_path = if config.unix_socket_path.is_empty() {
-        "/tmp/ahma-mcp.sock".to_string()
+        "/tmp/ahma.sock".to_string()
     } else {
         config.unix_socket_path.clone()
     };
