@@ -39,6 +39,10 @@ Ask your agent to run a normal project task such as:
 
 With ahma, that workflow stays inside the repo boundary and the long-running steps can begin immediately as background operations. The agent can inspect results, continue other work, or start additional safe commands without waiting on one giant terminal session.
 
+![Ahma usage example](./assets/ahma-example.png)
+
+_Ahma coordinating concurrent repo work._
+
 ### Without ahma / with ahma
 
 | Workflow detail | Without ahma | With ahma |

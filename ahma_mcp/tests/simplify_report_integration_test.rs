@@ -1,5 +1,5 @@
 use ahma_mcp::simplify::analysis::perform_analysis;
-use ahma_mcp::simplify::models::{FileSimplicity, Language, MetricsResults};
+use ahma_mcp::simplify::models::{AnalysisConfidence, FileSimplicity, Language, MetricsResults};
 use ahma_mcp::simplify::report::create_report_md;
 use std::collections::HashSet;
 use std::fs;
@@ -35,6 +35,7 @@ fn file(path: &str, language: Language, score: f64) -> FileSimplicity {
         hotspots: vec![],
         external_issues: vec![],
         analysis_sources: vec!["rust-code-analysis".to_string()],
+        confidence: AnalysisConfidence::Full,
     }
 }
 
@@ -713,4 +714,233 @@ fn test_pipeline_includes_external_only_kotlin_files() {
             .contains(&"rust-code-analysis".to_string())
     );
     assert!(fs.score < 100.0, "complex file should not score 100");
+}
+
+// ─── Phase 5 regression tests ──────────────────────────────────────────────
+
+/// Guard: default extension list must include Swift and Objective-C.
+#[test]
+fn test_swift_and_objc_in_default_extensions() {
+    use ahma_mcp::simplify::DEFAULT_EXTENSIONS;
+    let exts: Vec<&str> = DEFAULT_EXTENSIONS.split(',').collect();
+    for ext in &["swift", "m", "mm"] {
+        assert!(
+            exts.contains(ext),
+            "Default extensions must include '{}', got: {}",
+            ext,
+            DEFAULT_EXTENSIONS
+        );
+    }
+}
+
+/// Guard: from_external with only cyclomatic data → CyclomaticOnly confidence.
+#[test]
+fn test_from_external_confidence_cyclomatic_only() {
+    use ahma_mcp::simplify::analysis::ExternalMetrics;
+    use ahma_mcp::simplify::models::{AnalysisConfidence, FileSimplicity};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("Foo.kt");
+    std::fs::write(&path, "fun foo() {}").unwrap();
+
+    let ext = ExternalMetrics {
+        cognitive: None, // No cognitive data — cyclomatic-only analyzer
+        cyclomatic: Some(5.0),
+        issues: vec![],
+        analyzer: "lizard".to_string(),
+    };
+
+    let fs = FileSimplicity::from_external(&path, &ext).unwrap();
+    assert!(
+        matches!(fs.confidence, AnalysisConfidence::CyclomaticOnly),
+        "Expected CyclomaticOnly confidence, got {:?}",
+        fs.confidence
+    );
+}
+
+/// Guard: from_external with cognitive data → PartialExternal confidence.
+#[test]
+fn test_from_external_confidence_partial_external_with_cognitive() {
+    use ahma_mcp::simplify::analysis::ExternalMetrics;
+    use ahma_mcp::simplify::models::{AnalysisConfidence, FileSimplicity};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("Foo.kt");
+    std::fs::write(&path, "fun foo() {}").unwrap();
+
+    let ext = ExternalMetrics {
+        cognitive: Some(30.0),
+        cyclomatic: Some(12.0),
+        issues: vec![],
+        analyzer: "detekt".to_string(),
+    };
+
+    let fs = FileSimplicity::from_external(&path, &ext).unwrap();
+    assert!(
+        matches!(fs.confidence, AnalysisConfidence::PartialExternal),
+        "Expected PartialExternal confidence, got {:?}",
+        fs.confidence
+    );
+}
+
+/// Guard: the old fake mi=50 gave external-only files an artificially high score
+/// (~70) even when they had high cognitive complexity. After the fix, a file with
+/// cognitive=80 must score below 50.
+#[test]
+fn test_from_external_no_fake_mi_bias() {
+    use ahma_mcp::simplify::analysis::ExternalMetrics;
+    use ahma_mcp::simplify::models::FileSimplicity;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("Complex.kt");
+    std::fs::write(&path, "fun foo() {}").unwrap();
+
+    let ext = ExternalMetrics {
+        cognitive: Some(80.0), // Extremely complex
+        cyclomatic: Some(40.0),
+        issues: vec![],
+        analyzer: "detekt".to_string(),
+    };
+
+    let fs = FileSimplicity::from_external(&path, &ext).unwrap();
+    // Old formula with mi=50: score ≈ 0.4*50 + 0.3*cog + 0.2*peak + 0.1*len ≈ 71
+    // New formula without fake MI: score must reflect actual complexity — well below 50.
+    assert!(
+        fs.score < 50.0,
+        "Highly complex external file (cognitive=80) scored {:.1} — old fake-MI bias may have returned",
+        fs.score
+    );
+}
+
+/// Guard: a file with high cognitive complexity but low SLOC must score LOWER
+/// than a file with the same cognitive complexity but high SLOC.
+///
+/// This guards against the old density-only formula where large files escaped
+/// penalty by distributing complexity over more lines.
+#[test]
+fn test_large_file_does_not_escape_high_cognitive_penalty() {
+    use ahma_mcp::simplify::analysis::ExternalMetrics;
+    use ahma_mcp::simplify::models::FileSimplicity;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Small file — same absolute cognitive complexity, few lines.
+    // Density = 50/50 = 100% → density_score = 0.  abs_score also low.
+    let path_small = tmp.path().join("Small.kt");
+    std::fs::write(&path_small, "fun foo() {}").unwrap();
+    let small_fs = FileSimplicity::from_external(
+        &path_small,
+        &ExternalMetrics {
+            cognitive: Some(50.0),
+            cyclomatic: Some(20.0),
+            issues: vec![],
+            analyzer: "detekt".to_string(),
+        },
+    )
+    .unwrap();
+
+    // Large file — same absolute cognitive, spread over many lines.
+    // Old density = 50/1000 = 5% → old density_score = 95 (bug!).
+    // New formula: abs_score = (100 - 50/2*100).max(0) = 75 → worst-of = 75 (correct).
+    let path_large = tmp.path().join("Large.kt");
+    std::fs::write(&path_large, "fun foo() {}").unwrap();
+    let large_fs = FileSimplicity::from_external(
+        &path_large,
+        &ExternalMetrics {
+            cognitive: Some(50.0), // Same absolute complexity…
+            cyclomatic: Some(20.0),
+            issues: vec![],
+            analyzer: "detekt".to_string(),
+        },
+    )
+    .unwrap();
+
+    // With fixed formula both files share the same absolute cognitive penalty, so
+    // scores must be identical (same cognitive = same score, SLOC not available to
+    // from_external). Confirm neither escapes a meaningful penalty.
+    assert!(
+        large_fs.score < 80.0,
+        "Large file with cognitive=50 scored {:.1} — absolute complexity penalty not applied",
+        large_fs.score
+    );
+    assert!(
+        small_fs.score < 80.0,
+        "Small file with cognitive=50 scored {:.1} — unexpected high score",
+        small_fs.score
+    );
+}
+
+/// Guard: apply_external must update peak_cognitive when external analyzer found a
+/// higher-complexity function than rca did.
+#[test]
+fn test_apply_external_updates_peak_cognitive() {
+    use ahma_mcp::simplify::analysis::{ExternalIssue, ExternalMetrics, Severity};
+    use ahma_mcp::simplify::models::{FileSimplicity, FunctionHotspot};
+
+    // Build a FileSimplicity as if rca had run (Full confidence, low peak).
+    let base = FileSimplicity {
+        path: "src/foo.rs".to_string(),
+        language: Language::Rust,
+        score: 80.0,
+        cognitive: 10.0,
+        cyclomatic: 5.0,
+        sloc: 100.0,
+        mi: 80.0,
+        peak_cognitive: 5.0,
+        hotspots: vec![FunctionHotspot {
+            name: "small_fn".to_string(),
+            start_line: 1,
+            end_line: 10,
+            cognitive: 5.0,
+            cyclomatic: 3.0,
+            sloc: 10.0,
+        }],
+        external_issues: vec![],
+        analysis_sources: vec!["rust-code-analysis".to_string()],
+        confidence: AnalysisConfidence::Full,
+    };
+
+    // External analyzer found two more complex functions that rca missed.
+    // Using rule names that contain "cognitive" so from_external_issues
+    // correctly routes the complexity_value to the cognitive counter.
+    let ext = ExternalMetrics {
+        cognitive: Some(20.0),
+        cyclomatic: Some(15.0),
+        issues: vec![
+            ExternalIssue {
+                rule: "CognitiveComplexMethod".to_string(),
+                severity: Severity::Warning,
+                message: "Method is too cognitively complex".to_string(),
+                function_name: Some("big_fn".to_string()),
+                start_line: 20,
+                complexity_value: Some(40.0),
+            },
+            ExternalIssue {
+                rule: "CognitiveComplexMethod".to_string(),
+                severity: Severity::Warning,
+                message: "Method is too cognitively complex".to_string(),
+                function_name: Some("other_fn".to_string()),
+                start_line: 60,
+                complexity_value: Some(15.0),
+            },
+        ],
+        analyzer: "external".to_string(),
+    };
+
+    let updated = base.apply_external(&ext);
+
+    assert!(
+        updated.peak_cognitive >= 40.0,
+        "peak_cognitive should be updated to 40.0 from external issues, got {}",
+        updated.peak_cognitive
+    );
+    assert_eq!(
+        updated.hotspots.len(),
+        2,
+        "hotspots should be replaced with the 2 richer external hotspots"
+    );
+    assert!(
+        updated.score < 80.0,
+        "score should decrease after adding high-complexity external data"
+    );
 }

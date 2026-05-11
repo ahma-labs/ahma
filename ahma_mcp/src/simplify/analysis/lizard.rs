@@ -81,10 +81,7 @@ impl ExternalAnalyzer for LizardAnalyzer {
     }
 
     fn analyze(&self, project_dir: &Path) -> Result<HashMap<PathBuf, ExternalMetrics>> {
-        eprintln!(
-            "  [lizard] analyzing {} ...",
-            project_dir.display()
-        );
+        eprintln!("  [lizard] analyzing {} ...", project_dir.display());
 
         let output = Command::new("lizard")
             .arg(project_dir)
@@ -158,10 +155,7 @@ pub fn parse_lizard_json(json: &str) -> Result<HashMap<PathBuf, ExternalMetrics>
                 .get("cyclomatic_complexity")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(1.0);
-            let start_line = func
-                .get("start_line")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
+            let start_line = func.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let fn_name = func
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -176,8 +170,15 @@ pub fn parse_lizard_json(json: &str) -> Result<HashMap<PathBuf, ExternalMetrics>
                 entry.issues.push(ExternalIssue {
                     rule: "CyclomaticComplexity".to_string(),
                     severity: Severity::Warning,
-                    message: format!("Function '{}' has a cyclomatic complexity of {} (threshold = {})", fn_name, ccn as u32, CCN_THRESHOLD as u32),
-                    function_name: if fn_name.is_empty() { None } else { Some(fn_name) },
+                    message: format!(
+                        "Function '{}' has a cyclomatic complexity of {} (threshold = {})",
+                        fn_name, ccn as u32, CCN_THRESHOLD as u32
+                    ),
+                    function_name: if fn_name.is_empty() {
+                        None
+                    } else {
+                        Some(fn_name)
+                    },
                     start_line,
                     complexity_value: Some(ccn),
                 });
@@ -242,7 +243,10 @@ mod tests {
     fn test_parse_cognitive_always_none() {
         let result = parse_lizard_json(SAMPLE_JSON).unwrap();
         let manager = &result[&PathBuf::from("/project/src/main/kotlin/Manager.kt")];
-        assert!(manager.cognitive.is_none(), "Lizard does not produce cognitive complexity");
+        assert!(
+            manager.cognitive.is_none(),
+            "Lizard does not produce cognitive complexity"
+        );
     }
 
     #[test]
@@ -251,7 +255,10 @@ mod tests {
         let manager = &result[&PathBuf::from("/project/src/main/kotlin/Manager.kt")];
         // processData (12) → issue; simpleHelper (2) → below threshold
         assert_eq!(manager.issues.len(), 1);
-        assert_eq!(manager.issues[0].function_name.as_deref(), Some("processData"));
+        assert_eq!(
+            manager.issues[0].function_name.as_deref(),
+            Some("processData")
+        );
         assert_eq!(manager.issues[0].complexity_value, Some(12.0));
     }
 

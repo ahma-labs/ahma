@@ -22,6 +22,14 @@ use analysis::{
 use models::{FileSimplicity, MetricsResults, resolve_extensions};
 use report::{create_report_md, generate_ai_fix_prompt, generate_report};
 
+/// Default set of file extensions analyzed by `ahma-mcp simplify`.
+///
+/// Includes Rust (full AST), Kotlin, Swift, Objective-C (external analyzers), and
+/// all Lizard-supported languages. Exposed as a constant so tests can assert that
+/// new languages appear here without parsing the `--help` output.
+pub const DEFAULT_EXTENSIONS: &str =
+    "rs,py,js,ts,tsx,c,h,cpp,cc,hpp,hh,cs,java,go,css,html,kt,kts,swift,m,mm";
+
 /// Analyze source code complexity and generate a simplicity report.
 ///
 /// Scores are calibrated for AI-assisted maintenance. An AI agent making a change
@@ -49,7 +57,9 @@ use report::{create_report_md, generate_ai_fix_prompt, generate_report};
         Cognitive Density (30%) — cognitive complexity per SLOC; rewards focused functions.\n\
         Peak Cognitive (20%) — complexity of the single worst function; the primary hotspot signal.\n\
         Length Score (10%) — 100% at ≤300 SLOC, scaling down above; reflects context-window pressure.\n\
-        Cyclomatic — reported for context only; already embedded inside MI, not double-counted."
+        Cyclomatic — reported for context only; already embedded inside MI, not double-counted.\n\n\
+        Supported languages: Rust (full AST metrics), Kotlin (detekt-cli → Gradle detekt → Lizard),\n\
+        Swift (SwiftLint → Lizard), Python/JS/TS/C/C++/Java/Go/C#/ObjC/HTML/CSS (Lizard fallback)."
 )]
 pub struct SimplifyArgs {
     /// Directory to analyze (absolute or relative)
@@ -78,12 +88,12 @@ pub struct SimplifyArgs {
     /// File extensions or language names to analyze, comma-separated.
     /// Accepts raw extensions (e.g. rs,py,kt) or language names (e.g. rust,kotlin,python).
     /// Language names are case-insensitive and expand to all their extensions.
-    /// Supported languages: rust, python, javascript, typescript, kotlin, c, c++, java, c#, go, html, css.
+    /// Supported languages: rust, python, javascript, typescript, kotlin, swift, objc, c, c++, java, c#, go, html, css.
     /// Default: all supported extensions.
     #[arg(
         short,
         long,
-        default_value = "rs,py,js,ts,tsx,c,h,cpp,cc,hpp,hh,cs,java,go,css,html,kt,kts",
+        default_value = DEFAULT_EXTENSIONS,
         value_delimiter = ','
     )]
     pub extensions: Vec<String>,
@@ -416,6 +426,29 @@ fn run_verify(
     };
     let canonical_verify = dunce::canonicalize(&abs_verify)
         .with_context(|| format!("File not found: {}", verify_path.display()))?;
+
+    // External-only languages (Kotlin, Swift, Objective-C) have no rca TOML
+    // baseline because rust-code-analysis does not support them. Verify would
+    // silently fail with a confusing "No baseline metrics found" message. Fail
+    // clearly instead with an actionable message.
+    let file_ext = canonical_verify
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if matches!(file_ext.as_str(), "kt" | "kts" | "swift" | "m" | "mm") {
+        anyhow::bail!(
+            "Verify mode does not yet support .{} files.\n\
+             External-analyzer baselines (Detekt, SwiftLint, Lizard) are not \
+             persisted to the output directory, so before/after comparison is \
+             not possible for this file type.\n\
+             \n\
+             Workaround: run a full analysis (`ahma-mcp simplify --output-dir \
+             <DIR> <PROJECT>`) before and after your changes, then compare the \
+             two JSON reports manually.",
+            file_ext
+        );
+    }
 
     let baseline = find_baseline_metrics(output_dir, &canonical_verify)?;
     let baseline_simplicity = FileSimplicity::calculate(&baseline, true);

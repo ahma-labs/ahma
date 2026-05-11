@@ -1073,16 +1073,17 @@ async fn process_streaming_line(
     let safe_line = crate::log_monitor::redact_sensitive_line(line);
     collector.push(safe_line);
     if let Some(snapshot) = log_monitor.process_line(line, is_stderr)
-        && let Some(callback) = callback {
-            let alert = crate::callback_system::ProgressUpdate::LogAlert {
-                id: op_id.to_string(),
-                trigger_level: snapshot.trigger_level.to_string(),
-                context_snapshot: snapshot.format_for_notification(),
-                llm_summary: None,
-                trigger_lines: None,
-            };
-            let _ = callback.send_progress(alert).await;
-        }
+        && let Some(callback) = callback
+    {
+        let alert = crate::callback_system::ProgressUpdate::LogAlert {
+            id: op_id.to_string(),
+            trigger_level: snapshot.trigger_level.to_string(),
+            context_snapshot: snapshot.format_for_notification(),
+            llm_summary: None,
+            trigger_lines: None,
+        };
+        let _ = callback.send_progress(alert).await;
+    }
 }
 
 #[cfg(test)]
