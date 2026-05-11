@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("Debug mode detected - using local binary, colored output enabled");
                 (local_binary, true)
             } else {
-                ("ahma-mcp".to_string(), args.colored_output)
+                ("ahma".to_string(), args.colored_output)
             }
         }
     };
@@ -122,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn detect_local_debug_binary(base_dir: &Path) -> Option<String> {
-    let binary_path = base_dir.join("target").join("debug").join("ahma-mcp");
+    let binary_path = base_dir.join("target").join("debug").join("ahma");
     if binary_path.exists() {
         Some(binary_path.to_str()?.to_owned())
     } else {
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn detect_local_debug_binary_finds_existing_path() {
         let tmp = tempdir().unwrap();
-        let binary_path = tmp.path().join("target").join("debug").join("ahma-mcp");
+        let binary_path = tmp.path().join("target").join("debug").join("ahma");
         fs::create_dir_all(binary_path.parent().unwrap()).unwrap();
         fs::write(&binary_path, b"test").unwrap();
 

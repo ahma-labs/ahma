@@ -1,8 +1,8 @@
 //! CLI subcommand and library entry point for the `simplify` feature.
 //!
 //! Provides:
-//! - [`SimplifyArgs`]: clap `Args` definition used as `ahma-mcp simplify <args>`.
-//! - [`run`]: the main entry point called by the `ahma-mcp` binary.
+//! - [`SimplifyArgs`]: clap `Args` definition used as `ahma simplify <args>`.
+//! - [`run`]: the main entry point called by the `ahma` binary.
 
 use super::analysis;
 use super::models;
@@ -22,7 +22,7 @@ use analysis::{
 use models::{FileSimplicity, MetricsResults, resolve_extensions};
 use report::{create_report_md, generate_ai_fix_prompt, generate_report};
 
-/// Default set of file extensions analyzed by `ahma-mcp simplify`.
+/// Default set of file extensions analyzed by `ahma simplify`.
 ///
 /// Includes Rust (full AST), Kotlin, Swift, Objective-C (external analyzers), and
 /// all Lizard-supported languages. Exposed as a constant so tests can assert that
@@ -130,7 +130,7 @@ pub struct SimplifyArgs {
 
 /// Run the simplify analysis with the given arguments.
 ///
-/// This is the main entry point for the `ahma-mcp simplify` subcommand.
+/// This is the main entry point for the `ahma simplify` subcommand.
 pub fn run(mut args: SimplifyArgs) -> Result<()> {
     // If --heml is set, it triggers both --html and --open
     if args.heml {
@@ -443,7 +443,7 @@ fn run_verify(
              persisted to the output directory, so before/after comparison is \
              not possible for this file type.\n\
              \n\
-             Workaround: run a full analysis (`ahma-mcp simplify --output-dir \
+             Workaround: run a full analysis (`ahma simplify --output-dir \
              <DIR> <PROJECT>`) before and after your changes, then compare the \
              two JSON reports manually.",
             file_ext

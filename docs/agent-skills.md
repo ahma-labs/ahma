@@ -4,7 +4,7 @@ Agent skills are optional. They are not required to use ahma for normal build, t
 
 ## `ahma`
 
-The `ahma` skill teaches agents how to use `ahma-mcp` effectively: sandboxed shell execution, tool bundles, progressive disclosure, async/await patterns, code complexity analysis (`ahma-mcp simplify`), and more.
+The `ahma` skill teaches agents how to use `ahma` effectively: sandboxed shell execution, tool bundles, progressive disclosure, async/await patterns, code complexity analysis (`ahma simplify`), and more.
 
 The skill file at `skills/ahma/SKILL.md` follows the `.agents/skills/` format recognized by VS Code, Cursor, and Claude Code.
 

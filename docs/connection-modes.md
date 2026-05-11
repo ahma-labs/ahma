@@ -1,19 +1,19 @@
 # Connection Modes
 
-`ahma-mcp` supports:
-1. **STDIO Mode** (default): IDE spawns `ahma-mcp` as a subprocess and communicates via standard I/O. Recommended for development.
-2. **HTTP Mode**: Start `ahma-mcp --mode http` for HTTP/3 (QUIC) support.
+`ahma` supports:
+1. **STDIO Mode** (default): IDE spawns `ahma` as a subprocess and communicates via standard I/O. Recommended for development.
+2. **HTTP Mode**: Start `ahma --mode http` for HTTP/3 (QUIC) support.
 
 ## 1. STDIO Mode (Default)
 
-The IDE spawns `ahma-mcp` as a subprocess and communicates via standard I/O. This is the recommended mode for development because:
+The IDE spawns `ahma` as a subprocess and communicates via standard I/O. This is the recommended mode for development because:
 
 - The IDE sets `cwd` to `${workspaceFolder}`, so the sandbox scope is automatic.
 - Each workspace gets its own sandboxed server instance.
 - No network exposure.
 
 ```bash
-ahma-mcp --mode stdio
+ahma --mode stdio
 ```
 
 ### mcp.json examples
@@ -31,14 +31,14 @@ ahma-mcp --mode stdio
     "servers": {
         "Ahma": {
             "type": "stdio",
-            "command": "ahma-mcp",
+            "command": "ahma",
             "args": ["--tmp", "--livelog", "--simplify"]
         }
     }
 }
 ```
 
-Alternatively, in a terminal run `ahma-mcp --mode http` for visibility of all actions, and use:
+Alternatively, in a terminal run `ahma --mode http` for visibility of all actions, and use:
 
 ```json
 {
@@ -58,7 +58,7 @@ Alternatively, in a terminal run `ahma-mcp --mode http` for visibility of all ac
     "mcpServers": {
         "Ahma": {
             "type": "stdio",
-            "command": "ahma-mcp",
+            "command": "ahma",
             "args": ["--tmp", "--livelog", "--simplify"]
         }
     }
@@ -72,7 +72,7 @@ Alternatively, in a terminal run `ahma-mcp --mode http` for visibility of all ac
     "mcpServers": {
         "Ahma": {
             "type": "stdio",
-            "command": "ahma-mcp",
+            "command": "ahma",
             "args": ["--tmp", "--livelog", "--simplify"]
         }
     }
@@ -86,7 +86,7 @@ Alternatively, in a terminal run `ahma-mcp --mode http` for visibility of all ac
   "mcpServers": {
     "Ahma": {
       "command": "bash",
-      "args": ["-c", "ahma-mcp --simplify --rust --sandbox-scope $HOME/github"]
+      "args": ["-c", "ahma --simplify --rust --sandbox-scope $HOME/github"]
     }
   }
 }
@@ -99,7 +99,7 @@ Alternatively, in a terminal run `ahma-mcp --mode http` for visibility of all ac
 First start the server in a terminal with your preferred flags, defaulting to port 3000:
 
 ```bash
-ahma-mcp --mode http --tmp --livelog --simplify
+ahma --mode http --tmp --livelog --simplify
 ```
 
 The HTTP server requires **HTTP/2 or HTTP/3**. HTTP/1.1 connections are explicitly rejected.
@@ -134,17 +134,17 @@ HTTP server that proxies MCP protocol to a stdio subprocess. Used for web client
 
 ```bash
 # Start on default port 3000 (sandbox scope from roots/list)
-ahma-mcp --mode http
+ahma --mode http
 
 # Explicit sandbox scope (for clients that don't send roots/list)
-ahma-mcp --mode http --sandbox-scope /path/to/your/project
+ahma --mode http --sandbox-scope /path/to/your/project
 
 # Via environment variable
 export AHMA_SANDBOX_SCOPE=/path/to/your/project
-ahma-mcp --mode http
+ahma --mode http
 
 # Custom port and host
-ahma-mcp --mode http --http-port 8080 --http-host 127.0.0.1
+ahma --mode http --http-port 8080 --http-host 127.0.0.1
 ```
 
 | Feature | STDIO Mode | HTTP Mode |
@@ -199,6 +199,38 @@ curl -X GET http://localhost:3000/mcp \
 ## Session Isolation
 
 In HTTP mode, each MCP session gets its own sandbox scope derived from the `roots/list` response. See [docs/session-isolation.md](session-isolation.md) for details.
+
+## 3. Unix Socket Mode
+
+Serves MCP Streamable HTTP over a Unix domain socket instead of TCP. Lower latency than HTTP mode, no port conflicts, and access-controlled by filesystem permissions.
+
+```bash
+# Start on default socket path /tmp/ahma.sock
+ahma serve unix
+
+# Custom socket path
+ahma serve unix --socket-path /run/ahma/mcp.sock
+
+# Linux abstract socket (@ prefix, no filesystem entry)
+ahma serve unix --socket-path @ahma
+```
+
+### mcp.json configuration (VS Code)
+
+```json
+{
+    "servers": {
+        "ahma-unix": {
+            "type": "http",
+            "url": "unix:///tmp/ahma.sock#/mcp"
+        }
+    }
+}
+```
+
+**Why `#/mcp` in the URL?** VS Code uses the URL fragment (`#/subpath`) as the documented way to specify the HTTP endpoint path when connecting over a Unix socket. This is VS Code-specific syntax — the socket path is `/tmp/ahma.sock` and `/mcp` is the HTTP path to request on the socket. See the [VS Code MCP configuration reference](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration) for details.
+
+> Note: Unix socket mode is not available on Windows. Use `ahma serve http` instead.
 
 ## HTTP/3 (QUIC)
 

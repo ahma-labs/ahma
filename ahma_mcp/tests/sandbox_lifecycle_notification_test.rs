@@ -20,7 +20,7 @@ impl Drop for ChildGuard {
 
 #[test]
 fn test_sandbox_lifecycle_notifications() {
-    let binary = test_utils::cli::build_binary_cached("ahma_mcp", "ahma-mcp");
+    let binary = test_utils::cli::build_binary_cached("ahma_mcp", "ahma");
     let temp_dir = tempfile::tempdir().unwrap();
     let tools_dir = temp_dir.path().join("tools");
     std::fs::create_dir(&tools_dir).unwrap();

@@ -44,7 +44,7 @@ Or create `.ahma/android-logcat.json` with the content below.
     "servers": {
         "Ahma": {
             "type": "stdio",
-            "command": "ahma-mcp",
+            "command": "ahma",
             "args": ["--tmp", "--livelog"]
         }
     }

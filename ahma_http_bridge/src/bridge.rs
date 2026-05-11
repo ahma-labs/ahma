@@ -133,7 +133,7 @@ impl Default for BridgeConfig {
         let bind_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         Self {
             bind_addr,
-            server_command: "ahma-mcp".to_string(),
+            server_command: "ahma".to_string(),
             server_args: vec![],
             enable_colored_output: false,
             default_sandbox_scope: None,
@@ -899,7 +899,7 @@ mod tests {
     fn test_default_config() {
         let config = BridgeConfig::default();
         assert_eq!(config.bind_addr.to_string(), "127.0.0.1:3000");
-        assert_eq!(config.server_command, "ahma-mcp");
+        assert_eq!(config.server_command, "ahma");
         assert!(config.server_args.is_empty());
     }
 
@@ -939,7 +939,7 @@ mod tests {
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("BridgeConfig"));
         assert!(debug_str.contains("127.0.0.1:3000"));
-        assert!(debug_str.contains("ahma-mcp"));
+        assert!(debug_str.contains("ahma"));
     }
 
     fn create_app(state: Arc<BridgeState>) -> Router {

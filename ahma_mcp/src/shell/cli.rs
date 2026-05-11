@@ -4,15 +4,15 @@
 //!
 //! ## CLI Design
 //!
-//! `ahma-mcp` uses a subcommand model (git/docker style):
+//! `ahma` uses a subcommand model (git/docker style):
 //!
 //! ```text
-//! ahma-mcp serve stdio [--tools rust,python,git]
-//! ahma-mcp serve http  [--port 3000] [--host 127.0.0.1] [--disable-quic] [--disable-http1-1]
-//! ahma-mcp tool run <TOOL> [-- <TOOL_ARGS>...]
-//! ahma-mcp tool validate [TARGET]
-//! ahma-mcp tool list [--server NAME] [--http URL] [--format json|text] [--mcp-config PATH]
-//! ahma-mcp tool info [--tools rust,git] [--format json|text] [TOOL]
+//! ahma serve stdio [--tools rust,python,git]
+//! ahma serve http  [--port 3000] [--host 127.0.0.1] [--disable-quic] [--disable-http1-1]
+//! ahma tool run <TOOL> [-- <TOOL_ARGS>...]
+//! ahma tool validate [TARGET]
+//! ahma tool list [--server NAME] [--http URL] [--format json|text] [--mcp-config PATH]
+//! ahma tool info [--tools rust,git] [--format json|text] [TOOL]
 //! ```
 //!
 //! Niche options that rarely need changing are controlled via environment variables.
@@ -479,7 +479,7 @@ async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
             }
             #[cfg(unix)]
             ServeTransport::Unix(u) => {
-                let path = u.socket_path.as_deref().unwrap_or("/tmp/ahma-mcp.sock");
+                let path = u.socket_path.as_deref().unwrap_or("/tmp/ahma.sock");
                 tracing::info!("Running in Unix socket bridge mode on {}", path);
                 modes::run_unix_bridge_mode(cfg).await
             }
@@ -529,12 +529,12 @@ fn check_stdio_not_interactive() -> Result<()> {
     eprintln!("It cannot be run directly from an interactive terminal.\n");
     eprintln!("Usage options:");
     eprintln!("  1. Run as stdio MCP server (requires MCP client):");
-    eprintln!("     ahma-mcp serve stdio\n");
+    eprintln!("     ahma serve stdio\n");
     eprintln!("  2. Run as HTTP bridge server:");
-    eprintln!("     ahma-mcp serve http --port 3000\n");
+    eprintln!("     ahma serve http --port 3000\n");
     eprintln!("  3. Execute a single tool command:");
-    eprintln!("     ahma-mcp tool run <tool_name> [-- tool_arguments...]\n");
-    eprintln!("For more information, run: ahma-mcp --help\n");
+    eprintln!("     ahma tool run <tool_name> [-- tool_arguments...]\n");
+    eprintln!("For more information, run: ahma --help\n");
     std::process::exit(1);
 }
 
@@ -548,7 +548,7 @@ fn check_stdio_not_interactive() -> Result<()> {
 /// See docs/environment-variables.md for the full reference.
 #[derive(Parser, Debug)]
 #[command(
-    name = "ahma-mcp",
+    name = "ahma",
     author,
     version,
     about = "Ahma MCP: secure, config-driven adapter for CLI tools"
@@ -571,7 +571,7 @@ pub enum Subcommands {
 
 // ── serve ────────────────────────────────────────────────────────────────────
 
-/// Start the ahma-mcp MCP server.
+/// Start the ahma MCP server.
 ///
 /// Choose a transport that fits your integration:
 ///
@@ -590,31 +590,31 @@ pub enum Subcommands {
 #[derive(Parser, Debug)]
 #[command(after_help = "EXAMPLES:
   # Serve over stdio (typical mcp.json entry for Cursor / VS Code)
-  ahma-mcp serve stdio
+  ahma serve stdio
 
   # Serve over stdio and enable the rust + git tool bundles
-  ahma-mcp serve stdio --tools rust,git
+  ahma serve stdio --tools rust,git
 
   # Add temp directory to sandbox scope (for compilers / build tools)
-  ahma-mcp serve stdio --tools rust --tmp
+  ahma serve stdio --tools rust --tmp
 
   # Enable live log monitoring with a custom alert rate limit
-  ahma-mcp serve stdio --log-monitor --monitor-rate-limit 30
+  ahma serve stdio --log-monitor --monitor-rate-limit 30
 
   # Extend the default tool timeout to 10 minutes
-  ahma-mcp serve stdio --timeout 600
+  ahma serve stdio --timeout 600
 
   # Force all tools to run synchronously
-  ahma-mcp serve stdio --sync
+  ahma serve stdio --sync
 
   # Disable the kernel sandbox (only in isolated containers)
-  ahma-mcp serve stdio --no-sandbox
+  ahma serve stdio --no-sandbox
 
   # Serve over HTTP on the default address (127.0.0.1:3000)
-  ahma-mcp serve http
+  ahma serve http
 
   # Serve over HTTP on a custom port with HTTP/3 disabled
-  ahma-mcp serve http --port 8080 --disable-quic")]
+  ahma serve http --port 8080 --disable-quic")]
 pub struct ServeArgs {
     #[command(subcommand)]
     pub transport: ServeTransport,
@@ -684,37 +684,37 @@ pub enum ServeTransport {
     /// Serve over stdio — the standard transport for MCP clients.
     ///
     /// The MCP client (Cursor, VS Code, Claude Desktop, …) spawns
-    /// ahma-mcp as a child process and communicates over stdin/stdout.
+    /// ahma as a child process and communicates over stdin/stdout.
     /// No network port is opened; sandboxing is applied per-session.
     ///
-    /// To wire ahma-mcp into an MCP client add an entry like this to
+    /// To wire ahma into an MCP client add an entry like this to
     /// your `mcp.json` (exact key names vary by client):
     ///
     ///   "ahma": {
-    ///     "command": "ahma-mcp",
+    ///     "command": "ahma",
     ///     "args": ["serve", "stdio", "--tool", "rust,git"]
     ///   }
     #[command(after_help = "EXAMPLES:
   # Minimal stdio server
-  ahma-mcp serve stdio
+  ahma serve stdio
 
   # Enable specific tool bundles
-  ahma-mcp serve stdio --tools rust --tools python,git
+  ahma serve stdio --tools rust --tools python,git
 
   # Use a custom tools directory
-  ahma-mcp serve stdio --tools-dir /path/to/.ahma
+  ahma serve stdio --tools-dir /path/to/.ahma
 
   # Allow compilers / build tools access to the temp directory
-  ahma-mcp serve stdio --tools rust --tmp
+  ahma serve stdio --tools rust --tmp
 
   # Enable live log monitoring with reduced alert rate
-  ahma-mcp serve stdio --log-monitor --monitor-rate-limit 30
+  ahma serve stdio --log-monitor --monitor-rate-limit 30
 
   # Extend the default timeout to 10 minutes
-  ahma-mcp serve stdio --timeout 600
+  ahma serve stdio --timeout 600
 
   # Disable sandbox in a Docker container with its own isolation
-  ahma-mcp serve stdio --no-sandbox")]
+  ahma serve stdio --no-sandbox")]
     Stdio,
     /// Serve over HTTP — a persistent multi-session bridge.
     ///
@@ -739,16 +739,16 @@ pub enum ServeTransport {
     #[cfg(unix)]
     #[command(after_help = "EXAMPLES:
   # Filesystem socket (default path)
-  ahma-mcp serve unix
+  ahma serve unix
 
   # Custom path
-  ahma-mcp serve unix --socket-path /run/ahma/mcp.sock
+  ahma serve unix --socket-path /run/ahma/mcp.sock
 
   # Linux abstract socket (@ prefix)
-  ahma-mcp serve unix --socket-path @ahma-mcp
+  ahma serve unix --socket-path @ahma
 
   # Or set via environment variable
-  AHMA_UNIX_SOCKET=/tmp/ahma.sock ahma-mcp serve unix")]
+  AHMA_UNIX_SOCKET=/tmp/ahma.sock ahma serve unix")]
     Unix(UnixArgs),
 }
 
@@ -769,22 +769,22 @@ pub enum ServeTransport {
 #[derive(Parser, Debug)]
 #[command(after_help = "EXAMPLES:
   # Default: 127.0.0.1:3000, HTTP/2 + HTTP/3
-  ahma-mcp serve http
+  ahma serve http
 
   # Custom port, localhost only
-  ahma-mcp serve http --port 8080
+  ahma serve http --port 8080
 
   # Bind on all interfaces (use with care)
-  ahma-mcp serve http --host 0.0.0.0 --port 3000
+  ahma serve http --host 0.0.0.0 --port 3000
 
   # HTTP/2 over TCP only (disable QUIC/HTTP3)
-  ahma-mcp serve http --disable-quic
+  ahma serve http --disable-quic
 
   # Require at least HTTP/2 — reject HTTP/1.1 clients
-  ahma-mcp serve http --disable-http1-1
+  ahma serve http --disable-http1-1
 
   # Extended timeout, temp access, and log monitoring
-  ahma-mcp serve http --timeout 600 --tmp --log-monitor")]
+  ahma serve http --timeout 600 --tmp --log-monitor")]
 pub struct HttpArgs {
     /// Host to bind the HTTP server on.
     #[arg(long, default_value = "127.0.0.1")]
@@ -803,16 +803,16 @@ pub struct HttpArgs {
     pub disable_http1_1: bool,
 }
 
-/// Arguments for `ahma-mcp serve unix`.
+/// Arguments for `ahma serve unix`.
 #[cfg(unix)]
 #[derive(Parser, Debug)]
 pub struct UnixArgs {
     /// Path to the Unix domain socket to create.
     ///
     /// Supports filesystem paths (`/tmp/ahma.sock`) and Linux abstract sockets
-    /// using the `@` prefix (`@ahma-mcp`).
+    /// using the `@` prefix (`@ahma`).
     ///
-    /// Defaults to the value of `AHMA_UNIX_SOCKET`, or `/tmp/ahma-mcp.sock`
+    /// Defaults to the value of `AHMA_UNIX_SOCKET`, or `/tmp/ahma.sock`
     /// if neither the flag nor the env var is set.
     #[arg(long = "socket-path")]
     pub socket_path: Option<String>,
@@ -820,7 +820,7 @@ pub struct UnixArgs {
 
 // ── run ──────────────────────────────────────────────────────────────────────
 
-/// Arguments for `ahma-mcp run <TOOL> [-- <TOOL_ARGS>...]`.
+/// Arguments for `ahma run <TOOL> [-- <TOOL_ARGS>...]`.
 #[derive(Parser, Debug)]
 pub struct RunArgs {
     /// Name of the tool to execute.
@@ -834,7 +834,7 @@ pub struct RunArgs {
 
 // ── tool ─────────────────────────────────────────────────────────────────────
 
-/// Arguments for `ahma-mcp tool`.
+/// Arguments for `ahma tool`.
 #[derive(Parser, Debug)]
 pub struct ToolArgs {
     #[command(subcommand)]
@@ -855,13 +855,13 @@ pub enum ToolCommand {
     /// outside the MCP protocol.
     #[command(after_help = "EXAMPLES:
   # Run a cargo build in release mode
-  ahma-mcp tool run cargo_build -- --release
+  ahma tool run cargo_build -- --release
 
   # Run git status
-  ahma-mcp tool run git_status
+  ahma tool run git_status
 
   # Run with a custom tools directory
-  AHMA_TOOLS_DIR=/path/to/.ahma ahma-mcp tool run my_tool -- --flag value")]
+  AHMA_TOOLS_DIR=/path/to/.ahma ahma tool run my_tool -- --flag value")]
     Run(RunArgs),
     /// Show locally configured tools with descriptions and parameters.
     ///
@@ -870,20 +870,20 @@ pub enum ToolCommand {
     /// of each tool including its subcommands, parameters, and hints.
     #[command(after_help = "EXAMPLES:
   # Show all tools from the local .ahma/ directory
-  ahma-mcp tool info
+  ahma tool info
 
   # Include built-in bundles
-  ahma-mcp tool info --tools rust,git
+  ahma tool info --tools rust,git
 
   # JSON output for scripting
-  ahma-mcp tool info --tools rust --format json
+  ahma tool info --tools rust --format json
 
   # Show details for a specific tool
-  ahma-mcp tool info cargo")]
+  ahma tool info cargo")]
     Info(InfoArgs),
 }
 
-/// Arguments for `ahma-mcp tool validate [TARGET]`.
+/// Arguments for `ahma tool validate [TARGET]`.
 #[derive(Parser, Debug)]
 pub struct ValidateArgs {
     /// File, directory, or comma-separated list of paths to validate.
@@ -892,7 +892,7 @@ pub struct ValidateArgs {
     pub target: Option<String>,
 }
 
-/// Arguments for `ahma-mcp tool list`.
+/// Arguments for `ahma tool list`.
 #[derive(Parser, Debug)]
 pub struct ListArgs {
     /// Name of the server in mcp.json to connect to.
@@ -912,7 +912,7 @@ pub struct ListArgs {
     pub format: list_tools::OutputFormat,
 }
 
-/// Arguments for `ahma-mcp tool info`.
+/// Arguments for `ahma tool info`.
 #[derive(Parser, Debug)]
 pub struct InfoArgs {
     /// Tool bundles to include (e.g. --tools rust --tools python,git).
@@ -1089,7 +1089,7 @@ fn build_app_config(cli: &Cli) -> AppConfig {
                             .socket_path
                             .clone()
                             .or_else(|| std::env::var("AHMA_UNIX_SOCKET").ok())
-                            .unwrap_or_else(|| "/tmp/ahma-mcp.sock".to_string()),
+                            .unwrap_or_else(|| "/tmp/ahma.sock".to_string()),
                         _ => String::new(),
                     },
                     _ => String::new(),
@@ -1835,7 +1835,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_serve_stdio() {
-        let cli = Cli::try_parse_from(["ahma-mcp", "serve", "stdio"]).unwrap();
+        let cli = Cli::try_parse_from(["ahma", "serve", "stdio"]).unwrap();
         assert!(matches!(
             cli.command,
             Subcommands::Serve(ServeArgs {
@@ -1847,7 +1847,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_serve_http_defaults() {
-        let cli = Cli::try_parse_from(["ahma-mcp", "serve", "http"]).unwrap();
+        let cli = Cli::try_parse_from(["ahma", "serve", "http"]).unwrap();
         if let Subcommands::Serve(ServeArgs {
             transport: ServeTransport::Http(h),
             ..
@@ -1863,7 +1863,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_serve_http_custom_port() {
-        let cli = Cli::try_parse_from(["ahma-mcp", "serve", "http", "--port", "8080"]).unwrap();
+        let cli = Cli::try_parse_from(["ahma", "serve", "http", "--port", "8080"]).unwrap();
         if let Subcommands::Serve(ServeArgs {
             transport: ServeTransport::Http(h),
             ..
@@ -1878,7 +1878,7 @@ mod tests {
     #[test]
     fn test_cli_parse_run_tool() {
         let cli =
-            Cli::try_parse_from(["ahma-mcp", "tool", "run", "cargo_build", "--", "--release"])
+            Cli::try_parse_from(["ahma", "tool", "run", "cargo_build", "--", "--release"])
                 .unwrap();
         if let Subcommands::Tool(ToolArgs {
             command: ToolCommand::Run(r),
@@ -1893,7 +1893,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_tool_validate_default() {
-        let cli = Cli::try_parse_from(["ahma-mcp", "tool", "validate"]).unwrap();
+        let cli = Cli::try_parse_from(["ahma", "tool", "validate"]).unwrap();
         if let Subcommands::Tool(ToolArgs {
             command: ToolCommand::Validate(v),
         }) = cli.command
@@ -1906,7 +1906,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_tool_validate_with_target() {
-        let cli = Cli::try_parse_from(["ahma-mcp", "tool", "validate", ".ahma"]).unwrap();
+        let cli = Cli::try_parse_from(["ahma", "tool", "validate", ".ahma"]).unwrap();
         if let Subcommands::Tool(ToolArgs {
             command: ToolCommand::Validate(v),
         }) = cli.command
@@ -1919,7 +1919,7 @@ mod tests {
 
     #[test]
     fn test_cli_parse_tool_list() {
-        let cli = Cli::try_parse_from(["ahma-mcp", "tool", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["ahma", "tool", "list"]).unwrap();
         assert!(matches!(
             cli.command,
             Subcommands::Tool(ToolArgs {
@@ -1931,7 +1931,7 @@ mod tests {
     #[test]
     fn test_cli_parse_serve_with_tool_bundle() {
         let cli =
-            Cli::try_parse_from(["ahma-mcp", "serve", "stdio", "--tools", "rust,python"]).unwrap();
+            Cli::try_parse_from(["ahma", "serve", "stdio", "--tools", "rust,python"]).unwrap();
         if let Subcommands::Serve(s) = cli.command {
             assert!(s.tool_bundles.contains(&"rust".to_string()));
             assert!(s.tool_bundles.contains(&"python".to_string()));

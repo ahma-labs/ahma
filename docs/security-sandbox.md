@@ -39,7 +39,7 @@ cat /sys/kernel/security/lsm        # verify landlock is active
 
 ```bash
 export AHMA_DISABLE_SANDBOX=1
-ahma-mcp --mode stdio
+ahma --mode stdio
 ```
 
 or add `"--disable-sandbox"` to `mcp.json` args.
@@ -61,7 +61,7 @@ When running inside Cursor, VS Code, or Docker, the outer environment may preven
 **Manual override** (when you know the outer environment is safe):
 
 ```bash
-ahma-mcp --disable-sandbox
+ahma --disable-sandbox
 # or
 export AHMA_DISABLE_SANDBOX=1
 ```
@@ -73,7 +73,7 @@ Common `mcp.json` for nested environments (VS Code with workspace scoping):
     "servers": {
         "Ahma": {
             "type": "stdio",
-            "command": "ahma-mcp",
+            "command": "ahma",
             "args": ["--tmp", "--livelog", "--simplify"]
         }
     }

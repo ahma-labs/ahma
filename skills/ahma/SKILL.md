@@ -3,12 +3,12 @@ name: ahma
 version: 0.6.4
 author: Paul Houghton
 description: >
-  Comprehensive guide for using Ahma (ahma-mcp) as an AI agent. USE THIS SKILL when you need
+  Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
   to understand how to run tools, activate bundles, use the sandbox, monitor logs, author custom
-  tools, or configure ahma-mcp. Also handles code complexity analysis via `/ahma simplify`.
+  tools, or configure ahma. Also handles code complexity analysis via `/ahma simplify`.
   Trigger phrases: "use ahma", "run with ahma", "ahma tool", "activate bundle",
   "sandboxed_shell", "ahma async", "ahma serve", "mcp.json ahma", "ahma sandbox",
-  "ahma livelog", "ahma monitor", "custom tool .ahma", "ahma-mcp", "await tool",
+  "ahma livelog", "ahma monitor", "custom tool .ahma", "ahma", "await tool",
   "cancel operation", "tool bundle", "progressive disclosure", "activate_tools",
   "simplify", "reduce complexity", "too complex", "hard to read", "refactor",
   "maintainability", "cognitive complexity", "cyclomatic complexity", "simplicity score",
@@ -20,7 +20,7 @@ user-invocable: true
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
-**Ahma** (`ahma-mcp`) is a kernel-sandboxed MCP server that wraps command-line tools for AI
+**Ahma** (`ahma`) is a kernel-sandboxed MCP server that wraps command-line tools for AI
 agents. It exposes shell tools (cargo, git, python, file utilities, etc.) as MCP tools with
 kernel-level filesystem sandboxing, async execution, and live log monitoring.
 
@@ -36,8 +36,8 @@ the config in place. There are several approaches, from zero-friction to global:
 **The Ahma project already provides `.vscode/mcp.json` with three configurations to try:**
 
 - `ahma` — stdio mode (recommended, automatic per-client instances)
-- `ahma-http` — shared HTTP server on port 3000 (run `ahma-mcp serve http --tools rust,git,fileutils --tmp --log-monitor`)
-- `ahma-unix` — shared HTTP server over Unix socket (run `ahma-mcp serve http --socket-path /tmp/ahma-mcp.sock --tools rust,git,fileutils --tmp --log-monitor`)
+- `ahma-http` — shared HTTP server on port 3000 (run `ahma serve http --tools rust,git,fileutils --tmp --log-monitor`)
+- `ahma-unix` — shared HTTP server over Unix socket (run `ahma serve unix --socket-path /tmp/ahma.sock --tools rust,git,fileutils --tmp --log-monitor`)
 
 You can copy or customize this for your own projects. Create `.vscode/mcp.json` in your project root and commit it. Every VS Code user
 who opens the project gets Ahma configured automatically (prompted to trust once):
@@ -47,7 +47,7 @@ who opens the project gets Ahma configured automatically (prompted to trust once
   "servers": {
     "ahma": {
       "type": "stdio",
-      "command": "ahma-mcp",
+      "command": "ahma",
       "args": ["serve", "stdio", "--tools", "rust,git,fileutils", "--tmp", "--log-monitor"]
     }
   }
@@ -84,7 +84,7 @@ are auto-approved (no confirmation dialogs). Pairs well with Ahma's kernel sandb
   "servers": {
     "ahma": {
       "type": "stdio",
-      "command": "ahma-mcp",
+      "command": "ahma",
       "args": ["serve", "stdio", "--tools", "rust,git,fileutils", "--tmp"],
       "sandboxEnabled": true,
       "sandbox": {
@@ -108,7 +108,7 @@ Add to `.devcontainer/devcontainer.json` for Codespaces / container users:
 ```json
 {
   "features": {},
-  "postCreateCommand": "cargo install ahma-mcp",
+  "postCreateCommand": "cargo install ahma",
   "customizations": {
     "vscode": {
       "settings": { "chat.mcp.autoStart": true }
@@ -361,9 +361,9 @@ Ahma auto-detects and loads them at startup. Override path: `AHMA_TOOLS_DIR=/pat
 }
 ```
 
-Validate tool configs: `ahma-mcp tool validate .ahma/`
+Validate tool configs: `ahma tool validate .ahma/`
 
-Hot-reload while authoring (dev only): `AHMA_HOT_RELOAD=1 ahma-mcp serve stdio`
+Hot-reload while authoring (dev only): `AHMA_HOT_RELOAD=1 ahma serve stdio`
 
 ---
 
@@ -393,26 +393,26 @@ Full reference: [environment-variables.md](https://github.com/paulirotta/ahma/bl
 
 ```bash
 # Start MCP server (stdio — for IDE integration)
-ahma-mcp serve stdio [--tools rust,git] [--tmp] [--log-monitor]
+ahma serve stdio [--tools rust,git] [--tmp] [--log-monitor]
 
 # Start HTTP server (local development, multiple clients)
-ahma-mcp serve http [--port 3000] [--host 127.0.0.1] [--disable-quic]
+ahma serve http [--port 3000] [--host 127.0.0.1] [--disable-quic]
 
 # Start Unix socket server (IPC / Kubernetes sidecars)
-ahma-mcp serve unix [--socket-path /tmp/ahma.sock]
+ahma serve unix [--socket-path /tmp/ahma.sock]
 
 # Run a single tool from the CLI
-ahma-mcp tool run cargo_build -- --release
-ahma-mcp tool run sandboxed_shell -- "echo hello"
+ahma tool run cargo_build -- --release
+ahma tool run sandboxed_shell -- "echo hello"
 
 # Validate .ahma/ tool configs
-ahma-mcp tool validate [.ahma/]
+ahma tool validate [.ahma/]
 
 # List all configured tools
-ahma-mcp tool list [--http http://localhost:3000] [--format json]
+ahma tool list [--http http://localhost:3000] [--format json]
 
 # Show locally configured tools with descriptions
-ahma-mcp tool info [--tools rust,git]
+ahma tool info [--tools rust,git]
 ```
 
 ---
@@ -544,13 +544,13 @@ A trailing integer sets the `ai_fix` issue number (default: 1).
 **Via MCP tool (preferred):** The `simplify` tool must be active — start Ahma with `--tools simplify`
 or `--tools rust,simplify`.
 
-**Via CLI:** `ahma-mcp simplify` is the subcommand. Run `ahma-mcp simplify --help` to verify.
+**Via CLI:** `ahma simplify` is the subcommand. Run `ahma simplify --help` to verify.
 
 ### CRITICAL: Fail-Closed Rule
 
 **If the `simplify` MCP tool is not available:**
 1. Call `activate_tools(action="reveal", bundle="simplify")` to unlock it, OR
-2. Run `ahma-mcp simplify <directory> --ai-fix 1` directly via the sandboxed shell.
+2. Run `ahma simplify <directory> --ai-fix 1` directly via the sandboxed shell.
 
 **NEVER substitute shell heuristics** such as `find ... | wc -l` (line counts) or `wc -c` (file sizes) as a proxy for complexity. File length is not a complexity metric. Using it will produce incorrect rankings and mislead refactoring effort. If neither the tool nor the CLI is available, tell the user and stop — do not improvise.
 
@@ -565,7 +565,7 @@ simplify(directory="<project-root>", ai_fix=1)
 
 **Via CLI:**
 ```bash
-ahma-mcp simplify <project-root> --ai-fix 1
+ahma simplify <project-root> --ai-fix 1
 ```
 
 The output contains:
@@ -605,7 +605,7 @@ simplify(directory="<project-root>", verify="<path-to-edited-file>")
 
 **Via CLI:**
 ```bash
-ahma-mcp simplify <project-root> --verify <path-to-edited-file>
+ahma simplify <project-root> --verify <path-to-edited-file>
 ```
 
 | Verdict | Meaning |
@@ -654,28 +654,28 @@ Score = 0.4 × MI + 0.3 × Cognitive Density + 0.2 × Peak Cognitive + 0.1 × Le
 
 ```bash
 # Analyze and get fix prompt for worst file
-ahma-mcp simplify . --ai-fix 1
+ahma simplify . --ai-fix 1
 
 # Rust files only
-ahma-mcp simplify . --extensions rust --ai-fix 1
+ahma simplify . --extensions rust --ai-fix 1
 
 # Multiple languages
-ahma-mcp simplify . --extensions rust,python --ai-fix 1
+ahma simplify . --extensions rust,python --ai-fix 1
 
 # 2nd worst file
-ahma-mcp simplify . --ai-fix 2
+ahma simplify . --ai-fix 2
 
 # Verify improvement after editing
-ahma-mcp simplify . --verify src/my_module.rs
+ahma simplify . --verify src/my_module.rs
 
 # Full report to file
-ahma-mcp simplify . --output-path ./reports
+ahma simplify . --output-path ./reports
 
 # HTML report
-ahma-mcp simplify . --html
+ahma simplify . --html
 
 # Exclude generated code
-ahma-mcp simplify . --exclude '**/generated/**,**/vendor/**' --ai-fix 1
+ahma simplify . --exclude '**/generated/**,**/vendor/**' --ai-fix 1
 ```
 
 ### Anti-Patterns to Avoid

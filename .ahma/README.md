@@ -1,6 +1,6 @@
 # Ahma Tool Configurations
 
-This directory contains tool configuration files for the Ahma server (ahma-mcp). These configurations define how AI agents can interact with various command-line tools in a safe and structured way.
+This directory contains tool configuration files for the Ahma server (ahma). These configurations define how AI agents can interact with various command-line tools in a safe and structured way.
 
 ## How Tool Loading Works
 
@@ -15,7 +15,7 @@ AHMA has a three-tier tool model:
 These are implemented directly in Rust and cannot be overridden by JSON configurations. Their names are reserved.
 
 ### 2. Bundled Tool Configs (opt-in via CLI flags)
-Standard tool configurations are compiled into the `ahma-mcp` binary. They are only offered to MCP clients when explicitly enabled via a CLI flag:
+Standard tool configurations are compiled into the `ahma` binary. They are only offered to MCP clients when explicitly enabled via a CLI flag:
 
 | Flag | Tool Name | Description |
 |------|-----------|-------------|
@@ -27,7 +27,7 @@ Standard tool configurations are compiled into the `ahma-mcp` binary. They are o
 | `--kotlin` | `kotlin` | Kotlin/Android Gradle wrapper |
 | `--simplify` | `simplify` | Code complexity metrics |
 
-Example: `ahma-mcp --mode stdio --rust --git --fileutils`
+Example: `ahma --mode stdio --rust --git --fileutils`
 
 ### 3. Local `.ahma/` Overrides (automatic)
 If a `.ahma/` directory exists in the current working directory, all `*.json` files in it are loaded automatically at startup — no CLI flag needed.
@@ -53,20 +53,20 @@ cargo run --example python_tool
 cargo test --test tool_config_schema_validation_test
 
 # Or run all tests including execution tests
-cargo nextest run --package ahma-mcp --test tool_config_schema_validation_test
-cargo nextest run --package ahma-mcp --test tool_examples_execution_test
+cargo nextest run --package ahma --test tool_config_schema_validation_test
+cargo nextest run --package ahma --test tool_examples_execution_test
 ```
 
 ### 4. Verify Your Configuration Works
 
-After copying and enabling a configuration in `.ahma/`, restart the ahma-mcp server to load the new tool. If you are actively iterating on tool definitions, you can instead opt into runtime watching with `--hot-reload-tools`:
+After copying and enabling a configuration in `.ahma/`, restart the ahma server to load the new tool. If you are actively iterating on tool definitions, you can instead opt into runtime watching with `--hot-reload-tools`:
 
 ```bash
 # Safe default: load .ahma configs once at startup
-ahma-mcp --tools-dir .ahma
+ahma --tools-dir .ahma
 
 # Tool development only: watch for runtime changes
-ahma-mcp --tools-dir .ahma --hot-reload-tools
+ahma --tools-dir .ahma --hot-reload-tools
 ```
 
 ## Configuration Format
@@ -115,10 +115,10 @@ jq . .ahma/cargo.json
 
 ### Programmatic Validation
 
-Use the `MtdfValidator` from `ahma-mcp`:
+Use the `MtdfValidator` from `ahma`:
 
 ```rust
-use ahma-mcp::schema_validation::MtdfValidator;
+use ahma::schema_validation::MtdfValidator;
 use std::path::Path;
 
 let validator = MtdfValidator::new();
@@ -156,12 +156,12 @@ match validator.validate_tool_config(config_path, &content) {
 
 1. Run the corresponding example: `cargo run --example mytool`
 2. Check for schema violations in the error output
-3. Compare with working examples in `ahma-mcp/examples/configs/`
+3. Compare with working examples in `ahma/examples/configs/`
 4. Verify all required fields are present: `name`, `description`, `command`, `enabled`
 
 ### Tool Not Available in AI
 
-1. Restart the `ahma-mcp` server
+1. Restart the `ahma` server
 2. Verify tool is enabled: `grep enabled .ahma/mytool.json`
 3. Check server initialization logs
 4. Ensure the underlying command is installed: `which command-name`
@@ -170,17 +170,17 @@ match validator.validate_tool_config(config_path, &content) {
 
 Full MTDF schema documentation is available at:
 - `docs/mtdf-schema.json` - JSON Schema definition
-- `ahma-mcp/docs/mtdf-schema.json` - Core library schema
+- `ahma/docs/mtdf-schema.json` - Core library schema
 
 ## Contributing
 
 To add a new tool configuration:
 
-1. Create the JSON file in `ahma-mcp/examples/configs/`
-2. Add a corresponding example in `ahma-mcp/examples/toolname.rs`
-3. Add tests in `ahma-mcp/tests/tool_config_schema_validation_test.rs`
-4. Add execution tests in `ahma-mcp/tests/tool_examples_execution_test.rs`
-5. Update `ahma-mcp/Cargo.toml` with example declaration
+1. Create the JSON file in `ahma/examples/configs/`
+2. Add a corresponding example in `ahma/examples/toolname.rs`
+3. Add tests in `ahma/tests/tool_config_schema_validation_test.rs`
+4. Add execution tests in `ahma/tests/tool_examples_execution_test.rs`
+5. Update `ahma/Cargo.toml` with example declaration
 6. Run all tests: `cargo nextest run --workspace`
 
 ## License

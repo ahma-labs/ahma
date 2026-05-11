@@ -14,12 +14,12 @@
 # THROTTLING POLICY:
 #
 #   ahma_http_bridge
-#     ALL tests in this package spawn an ahma-mcp HTTP server subprocess.
+#     ALL tests in this package spawn an ahma HTTP server subprocess.
 #     Covered by: package(ahma_http_bridge)
 #
 #   ahma_mcp integration tests
 #     Integration test binaries have binary_id "ahma_mcp::<file-name>".
-#     Many of them spawn ahma-mcp subprocess. Throttle all of them.
+#     Many of them spawn ahma subprocess. Throttle all of them.
 #     Covered by: binary_id(~ahma_mcp::)
 #     NOT matched: the lib unit test binary "ahma_mcp" (no :: separator).
 #     That binary runs in parallel — it is in-process and fast.
@@ -59,7 +59,7 @@ filter = "package(ahma_http_bridge)"
 threads-required = 4
 slow-timeout = { period = "120s", terminate-after = 2 }
 
-# Many ahma_mcp integration test binaries spawn ahma-mcp subprocess.
+# Many ahma_mcp integration test binaries spawn ahma subprocess.
 # Throttle all integration tests (binary_id "ahma_mcp::*") to prevent
 # scheduler starvation when running concurrently with bridge tests.
 [[profile.default.overrides]]
@@ -86,7 +86,7 @@ filter = "package(ahma_http_bridge)"
 threads-required = 2
 slow-timeout = { period = "180s", terminate-after = 2 }
 
-# Many ahma_mcp integration test binaries spawn ahma-mcp subprocess.
+# Many ahma_mcp integration test binaries spawn ahma subprocess.
 # Throttle all integration tests (binary_id "ahma_mcp::*") to 1 at a time.
 # The main lib test binary ("ahma_mcp", no :: separator) is NOT matched and
 # runs in parallel with other non-subprocess tests.
