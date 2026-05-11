@@ -1,5 +1,41 @@
 use serde::{Deserialize, Serialize};
 
+/// Describes how complete the metric data is for a file.
+///
+/// Scores from different confidence tiers are not directly comparable:
+/// a `Full` score of 70 means something different from a `PartialExternal` score of 70.
+/// Reports and rankings should group or annotate files by tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisConfidence {
+    /// Full metrics: MI, cognitive, peak cognitive, and AST-level hotspots.
+    /// Produced by rust-code-analysis for Rust files. Rankings within this tier
+    /// are reliable and cross-file comparable.
+    Full,
+    /// Partial metrics: cognitive + cyclomatic from an external analyzer (Detekt,
+    /// SwiftLint, Lizard). No MI or AST-level hotspot data. SLOC is estimated.
+    /// Cross-language comparisons with `Full` files are unreliable.
+    PartialExternal,
+    /// Cyclomatic-only: only cyclomatic complexity from Lizard; cognitive complexity
+    /// is unavailable. Scoring is a rough proxy only.
+    CyclomaticOnly,
+}
+
+impl AnalysisConfidence {
+    /// Short label used in reports to indicate data quality.
+    pub fn label(self) -> &'static str {
+        match self {
+            AnalysisConfidence::Full => "full",
+            AnalysisConfidence::PartialExternal => "partial",
+            AnalysisConfidence::CyclomaticOnly => "cyclomatic-only",
+        }
+    }
+
+    /// Whether this tier has enough data for reliable ranking against other files.
+    pub fn is_reliable(self) -> bool {
+        self == AnalysisConfidence::Full
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MetricsResults {
     pub name: String,
@@ -311,6 +347,12 @@ pub struct FileSimplicity {
     /// Always contains at least `"rust-code-analysis"`. May also contain
     /// `"detekt"`, `"swiftlint"`, etc. when external analyzers ran.
     pub analysis_sources: Vec<String>,
+    /// How complete the metric data is for this file.
+    /// `Full` means MI + cognitive + hotspots are all available (rca-analyzed, e.g. Rust).
+    /// `PartialExternal` means only cognitive/cyclomatic from an external tool; no MI or AST hotspots.
+    /// `CyclomaticOnly` means only cyclomatic from Lizard; cognitive is absent.
+    /// Cross-tier score comparisons are unreliable; reports should annotate tier.
+    pub confidence: AnalysisConfidence,
 }
 
 impl FileSimplicity {
@@ -366,6 +408,7 @@ impl FileSimplicity {
             hotspots,
             external_issues: vec![],
             analysis_sources: vec!["rust-code-analysis".to_string()],
+            confidence: AnalysisConfidence::Full,
         }
     }
 
@@ -391,9 +434,7 @@ impl FileSimplicity {
             .unwrap_or(100.0)
             .max(1.0);
 
-        let sloc_factor = sloc;
-        let cog_score = (100.0 - (cognitive / sloc_factor) * 100.0).max(0.0);
-        // Build per-function hotspots from the individual Detekt issues.
+        // Build per-function hotspots from the individual Detekt/SwiftLint issues.
         let hotspots = FunctionHotspot::from_external_issues(&external.issues);
         // Use the per-function maximum when available; fall back to the file-level
         // total so the score remains conservative when no function names were found.
@@ -403,12 +444,24 @@ impl FileSimplicity {
             .fold(0.0_f64, f64::max)
             .max(if hotspots.is_empty() { cognitive } else { 0.0 });
         let peak_score = (100.0 - peak_cognitive).max(0.0);
-        // MI unknown → treat as 50 (neutral midpoint) so the score stays
-        // representative of the complexity components we do have.
-        let mi_score = 50.0_f64;
         let length_score = Self::length_score(sloc);
-        let score = (0.4 * mi_score + 0.3 * cog_score + 0.2 * peak_score + 0.1 * length_score)
-            .clamp(0.0, 100.0);
+
+        // Determine confidence tier and score honestly using only available metrics.
+        // We do NOT use a hidden neutral MI placeholder (mi_score = 50) because that
+        // would make external-only files appear comparable to rca-analyzed Rust files.
+        let (score, confidence) = if cognitive > 0.0 {
+            // We have cognitive data: use cog_density + peak + length, redistributing
+            // the MI weight (40%) equally to cognitive density (now 50%) and peak (30%).
+            let cog_score = Self::cognitive_density_score(cognitive, sloc, true);
+            let s = (0.5 * cog_score + 0.3 * peak_score + 0.2 * length_score).clamp(0.0, 100.0);
+            (s, AnalysisConfidence::PartialExternal)
+        } else {
+            // Cyclomatic only (e.g. Lizard without cognitive data).
+            // Use cyclomatic as a rough proxy: high cyclomatic → lower score.
+            let cyc_score = (100.0 - cyclomatic.min(100.0)).max(0.0);
+            let s = (0.6 * cyc_score + 0.4 * length_score).clamp(0.0, 100.0);
+            (s, AnalysisConfidence::CyclomaticOnly)
+        };
 
         let analyzer = if external.analyzer.is_empty() {
             "detekt".to_string()
@@ -428,6 +481,7 @@ impl FileSimplicity {
             hotspots,
             external_issues: external.issues.clone(),
             analysis_sources: vec![analyzer],
+            confidence,
         })
     }
 
@@ -438,6 +492,9 @@ impl FileSimplicity {
     /// value is used — a conservative approach that catches complexity either
     /// analyzer alone might miss. The score is recalculated only if the merged
     /// values differ from the rca values.
+    ///
+    /// Phase 2 fix: also updates per-function hotspots and peak_cognitive when
+    /// the external analyzer provides richer function-level data than rca found.
     pub fn apply_external(mut self, external: &super::analysis::ExternalMetrics) -> Self {
         let mut changed = false;
 
@@ -452,6 +509,24 @@ impl FileSimplicity {
         {
             self.cyclomatic = ext_cyc;
             changed = true;
+        }
+
+        // Propagate hotspots from the external analyzer when the external data is
+        // richer (has more hotspots) than what rca found. Also update peak_cognitive
+        // so the worst-function signal is as accurate as possible.
+        if !external.issues.is_empty() {
+            let ext_hotspots = FunctionHotspot::from_external_issues(&external.issues);
+            let ext_peak = ext_hotspots
+                .iter()
+                .map(|h| h.cognitive)
+                .fold(0.0_f64, f64::max);
+            if ext_hotspots.len() > self.hotspots.len() {
+                self.hotspots = ext_hotspots;
+            }
+            if ext_peak > self.peak_cognitive {
+                self.peak_cognitive = ext_peak;
+                changed = true;
+            }
         }
 
         if changed {
@@ -497,15 +572,28 @@ impl FileSimplicity {
         Self::weighted_function_mi(spaces).unwrap_or(file_mi)
     }
 
-    /// Cognitive density score: `(100 - cognitive/sloc×100).max(0)`.
+    /// Cognitive density score combining relative density with absolute complexity.
     ///
-    /// In `normalized` mode (default) density is relative to SLOC so files of
-    /// different sizes are compared on equal footing. In raw mode, absolute
-    /// cognitive complexity is used (mainly kept for backwards compat in tests).
+    /// In `normalized` mode the score is the **worst of** the density-based score
+    /// (cognitive/sloc) and the absolute-penalty score (scaled to match). This
+    /// prevents large files from escaping low scores purely by being large: a
+    /// 1000-SLOC file with 200 cognitive complexity has density 0.2 (fine), but
+    /// absolute complexity 200 (very high) — the absolute penalty kicks in.
+    ///
+    /// In raw mode (kept for test compatibility), absolute complexity is used directly.
     fn cognitive_density_score(cognitive: f64, sloc: f64, normalized: bool) -> f64 {
         if normalized {
+            // Density score: penalises tightly-packed complexity.
             let density = (cognitive / sloc.max(1.0)) * 100.0;
-            (100.0 - density).max(0.0)
+            let density_score = (100.0 - density).max(0.0);
+
+            // Absolute score: penalises high total cognitive burden regardless of file size.
+            // We map cognitive on a 0-200 scale so 200+ means worst possible.
+            let abs_score = (100.0 - cognitive.min(200.0) / 2.0).max(0.0);
+
+            // Take the worse (lower) of the two so that either high density OR high
+            // absolute complexity drives the score down.
+            density_score.min(abs_score)
         } else {
             (100.0 - cognitive).max(0.0)
         }
@@ -675,10 +763,13 @@ mod tests {
     #[test]
     fn test_file_simplicity_calculate_complex_large_file() {
         // No spaces → no function-weighted MI → falls back to file_mi=60.
-        // sloc=500: cog_density=50/500×100=10% → cog_score=90
+        // sloc=500, cognitive=50:
+        //   density_score = (100 - 50/500×100) = 90
+        //   abs_score     = (100 - 50.min(200)/2) = 75
+        //   cog_score     = min(90, 75) = 75  [absolute floor kicks in]
         // peak_cog=0 (no spaces) → peak_score=100
         // length=300/500×100=60
-        // Score = 0.4×60 + 0.3×90 + 0.2×100 + 0.1×60 = 24+27+20+6 = 77
+        // Score = 0.4×60 + 0.3×75 + 0.2×100 + 0.1×60 = 24+22.5+20+6 = 72.5
         let results = MetricsResults {
             name: "complex.rs".to_string(),
             metrics: Metrics {
@@ -692,7 +783,7 @@ mod tests {
             spaces: vec![],
         };
         let simplicity = FileSimplicity::calculate(&results, true);
-        assert_eq!(simplicity.score, 77.0);
+        assert_eq!(simplicity.score, 72.5);
     }
 
     #[test]

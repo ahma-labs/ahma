@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.6.3
+version: 0.6.4
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma-mcp) as an AI agent. USE THIS SKILL when you need
@@ -545,6 +545,14 @@ A trailing integer sets the `ai_fix` issue number (default: 1).
 or `--tools rust,simplify`.
 
 **Via CLI:** `ahma-mcp simplify` is the subcommand. Run `ahma-mcp simplify --help` to verify.
+
+### CRITICAL: Fail-Closed Rule
+
+**If the `simplify` MCP tool is not available:**
+1. Call `activate_tools(action="reveal", bundle="simplify")` to unlock it, OR
+2. Run `ahma-mcp simplify <directory> --ai-fix 1` directly via the sandboxed shell.
+
+**NEVER substitute shell heuristics** such as `find ... | wc -l` (line counts) or `wc -c` (file sizes) as a proxy for complexity. File length is not a complexity metric. Using it will produce incorrect rankings and mislead refactoring effort. If neither the tool nor the CLI is available, tell the user and stop — do not improvise.
 
 ### Workflow — Follow This Sequence
 

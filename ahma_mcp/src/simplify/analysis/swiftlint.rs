@@ -64,10 +64,7 @@ impl ExternalAnalyzer for SwiftLintAnalyzer {
     }
 
     fn analyze(&self, project_dir: &Path) -> Result<HashMap<PathBuf, ExternalMetrics>> {
-        eprintln!(
-            "  [swiftlint] linting {} ...",
-            project_dir.display()
-        );
+        eprintln!("  [swiftlint] linting {} ...", project_dir.display());
 
         // SwiftLint writes Checkstyle XML to stdout when --reporter checkstyle is used.
         // --quiet suppresses the default progress banner.
@@ -142,9 +139,7 @@ mod tests {
     fn test_parse_checkstyle_xml_cyclomatic() {
         let result = checkstyle::parse_checkstyle_xml_str(SAMPLE_XML, "swiftlint").unwrap();
         assert_eq!(result.len(), 1, "should find 1 file");
-        let vc = &result[&PathBuf::from(
-            "/project/Sources/MyApp/ViewController.swift",
-        )];
+        let vc = &result[&PathBuf::from("/project/Sources/MyApp/ViewController.swift")];
         // "currently 14" → cyclomatic = 14
         assert_eq!(vc.cyclomatic, Some(14.0));
     }
@@ -152,9 +147,7 @@ mod tests {
     #[test]
     fn test_parse_checkstyle_xml_cognitive() {
         let result = checkstyle::parse_checkstyle_xml_str(SAMPLE_XML, "swiftlint").unwrap();
-        let vc = &result[&PathBuf::from(
-            "/project/Sources/MyApp/ViewController.swift",
-        )];
+        let vc = &result[&PathBuf::from("/project/Sources/MyApp/ViewController.swift")];
         // "currently 9" → cognitive = 9
         assert_eq!(vc.cognitive, Some(9.0));
     }
@@ -162,9 +155,7 @@ mod tests {
     #[test]
     fn test_parse_checkstyle_xml_issue_count() {
         let result = checkstyle::parse_checkstyle_xml_str(SAMPLE_XML, "swiftlint").unwrap();
-        let vc = &result[&PathBuf::from(
-            "/project/Sources/MyApp/ViewController.swift",
-        )];
+        let vc = &result[&PathBuf::from("/project/Sources/MyApp/ViewController.swift")];
         // All 3 errors should be captured as issues.
         assert_eq!(vc.issues.len(), 3);
     }

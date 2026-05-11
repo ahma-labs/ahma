@@ -509,7 +509,7 @@ fn write_glossary(report: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::models::FunctionHotspot;
+    use super::super::models::{AnalysisConfidence, FunctionHotspot};
     use super::*;
 
     /// Helper to construct a FileSimplicity for tests without hotspots.
@@ -534,6 +534,7 @@ mod tests {
             hotspots: vec![],
             external_issues: vec![],
             analysis_sources: vec!["rust-code-analysis".to_string()],
+            confidence: AnalysisConfidence::Full,
         }
     }
 
@@ -561,6 +562,7 @@ mod tests {
             hotspots,
             external_issues: vec![],
             analysis_sources: vec!["rust-code-analysis".to_string()],
+            confidence: AnalysisConfidence::Full,
         }
     }
 
