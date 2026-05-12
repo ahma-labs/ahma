@@ -15,14 +15,12 @@
 mod common;
 
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
-use common::server::{ServerGuard, resolve_binary_path, spawn_server_guard_with_config};
+use common::server::{ServerGuard, spawn_server_guard_with_config};
 use common::uri::paths_equivalent;
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 use serial_test::serial;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::time::sleep;
@@ -588,8 +586,7 @@ async fn test_roots_uri_parsing_file_localhost() {
         .await
         .expect("Failed to create client root");
 
-    // Start server on dynamic port to avoid conflicts/flakiness
-    let (server, _stderr) = start_http_bridge_dynamic(&tools_dir, server_scope_dir.path()).await;
+    let server = start_http_bridge(&tools_dir, server_scope_dir.path()).await;
     let base_url = server.base_url();
     let client = common::make_h2_client();
 
@@ -713,122 +710,4 @@ async fn test_tool_call_without_initialize_returns_proper_error() {
         "BUG: HTTP response contains 'expect initialized request': {}",
         response_error_msg
     );
-}
-
-fn configure_sandbox_disable_env(cmd: &mut Command) {
-    #[cfg(target_os = "macos")]
-    if ahma_mcp::sandbox::test_sandbox_exec_available().is_err() {
-        cmd.env("AHMA_DISABLE_SANDBOX", "1");
-    }
-    #[cfg(target_os = "linux")]
-    if ahma_mcp::sandbox::check_sandbox_prerequisites().is_err() {
-        cmd.env("AHMA_DISABLE_SANDBOX", "1");
-    }
-    #[cfg(windows)]
-    cmd.env("AHMA_DISABLE_SANDBOX", "1");
-}
-
-fn spawn_stderr_port_reader(
-    stderr: std::process::ChildStderr,
-) -> (
-    std::sync::Arc<std::sync::Mutex<String>>,
-    std::sync::mpsc::Receiver<u16>,
-) {
-    let stderr_buffer = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let buffer_clone = stderr_buffer.clone();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader};
-        let reader = BufReader::new(stderr);
-        let mut port_found = false;
-        for line in reader.lines() {
-            let line = line.unwrap_or_default();
-            {
-                let mut buf = buffer_clone.lock().unwrap();
-                buf.push_str(&line);
-                buf.push('\n');
-            }
-            eprintln!("[server] {}", line);
-            if !port_found
-                && let Some(port_str) = line.trim().strip_prefix("AHMA_BOUND_PORT=")
-                && let Ok(port) = port_str.parse::<u16>()
-            {
-                let _ = tx.send(port);
-                port_found = true;
-            }
-        }
-    });
-    (stderr_buffer, rx)
-}
-
-/// Start HTTP bridge on random port (0) and parse the bound port from stderr.
-/// Returns (ServerGuard, stderr_receiver).
-/// Stderr is forwarded to test stderr and captured.
-async fn start_http_bridge_dynamic(
-    tools_dir: &std::path::Path,
-    sandbox_scope: &std::path::Path,
-) -> (ServerGuard, std::sync::Arc<std::sync::Mutex<String>>) {
-    let binary = resolve_binary_path();
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("Failed to get workspace dir")
-        .to_path_buf();
-    let mut cmd = Command::new(&binary);
-    cmd.args(["serve", "http", "--port", "0"])
-        .current_dir(&workspace)
-        .env("AHMA_SYNC", "1")
-        .env("AHMA_TOOLS_DIR", &*tools_dir.to_string_lossy())
-        .env("AHMA_SANDBOX_SCOPE", &*sandbox_scope.to_string_lossy())
-        .env("AHMA_LOG_TARGET", "stderr")
-        // Use a generous handshake timeout so slow CI runners (coverage, Windows)
-        // complete the SSE roots exchange before the server-side timer fires.
-        .env("AHMA_HANDSHAKE_TIMEOUT", "300")
-        .env_remove("NEXTEST")
-        .env_remove("NEXTEST_EXECUTION_MODE")
-        .env_remove("CARGO_TARGET_DIR")
-        .env_remove("RUST_TEST_THREADS");
-    configure_sandbox_disable_env(&mut cmd);
-
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to start HTTP bridge");
-
-    let stderr = child.stderr.take().expect("Failed to capture stderr");
-    let (stderr_buffer, rx) = spawn_stderr_port_reader(stderr);
-
-    let port = match rx.recv_timeout(TestTimeouts::get(TimeoutCategory::ProcessSpawn)) {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = child.kill();
-            let buf = stderr_buffer.lock().unwrap();
-            panic!(
-                "Failed to start server (timeout waiting for port). Stderr:\n{}",
-                *buf
-            );
-        }
-    };
-
-    let client = common::make_h2_client();
-    let health_url = format!("http://127.0.0.1:{}/health", port);
-    let deadline = Instant::now() + TestTimeouts::get(TimeoutCategory::HealthCheck);
-    loop {
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let buf = stderr_buffer.lock().unwrap();
-            panic!(
-                "Server started on port {} but health check failed. Stderr:\n{}",
-                port, *buf
-            );
-        }
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            break;
-        }
-        tokio::time::sleep(TestTimeouts::poll_interval()).await;
-    }
-
-    (ServerGuard::new(child, port), stderr_buffer)
 }
