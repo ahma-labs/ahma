@@ -17,7 +17,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5" }
 chrono.workspace = true
 clap = { workspace = true, features = ["derive"] }
-dashmap = "6.1"
+dashmap = "6.2"
 futures.workspace = true
 opentelemetry-otlp = { workspace = true }
 opentelemetry.workspace = true

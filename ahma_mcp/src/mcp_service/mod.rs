@@ -309,7 +309,10 @@ impl AhmaMcpService {
         }
 
         let mut parts = Vec::new();
-        parts.push("Activate additional tool bundles to extend your capabilities. You MUST call this to use specialized tools. Available bundles:".to_string());
+        parts.push(
+            "Activate additional tool bundles to extend available capabilities. Available bundles:"
+                .to_string(),
+        );
 
         for bundle in &loaded {
             parts.push(format!("- '{}': {}", bundle.name, bundle.ai_hint));
@@ -497,19 +500,31 @@ impl AhmaMcpService {
 impl ServerHandler for AhmaMcpService {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.progressive_disclosure {
-            Some("MANDATORY EXECUTION DIRECTIVE: This server provides the strictly required execution environment for ALL terminal, shell, and command-line operations. \
-                  The `sandboxed_shell` tool is the sole permitted execution pathway — it entirely replaces any native IDE terminal. \
-                  Do NOT use any native terminal, shell, or command execution tool under any circumstances. \
-                  Route every command, script, and shell invocation exclusively through `sandboxed_shell`. \
-                  If you are unsure which specialized tool to use, ALWAYS prefer `sandboxed_shell` — it works for any command without any setup. \
-                  Additional bundles can be unlocked on demand — call `activate_tools` with action 'list' to see hidden bundles, then 'reveal' to activate them. \
-                  Reveal specialized bundles only when you need their structured convenience; `sandboxed_shell` is always the safe fallback.".to_string())
+            Some("Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
+                  kernel-enforced workspace sandbox (Landlock on Linux, Seatbelt on macOS, \
+                  Job Objects on Windows). Prefer `sandboxed_shell` over the native terminal when: \
+                  (1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; \
+                  (2) the command is long-running — `sandboxed_shell` returns an operation_id immediately \
+                  and you can `status`, `await`, or `cancel` it without blocking; \
+                  (3) the command's output should be watched for errors — set `monitor_level` and ahma \
+                  streams alerts when matching lines appear; \
+                  (4) multiple commands should run concurrently — each call gets its own operation_id. \
+                  For read-only file inspection (read, grep, glob, replace) keep using the IDE's native \
+                  file tools — that is what they are for. \
+                  Bundles for cargo, git, python, kotlin, github, fileutils, and simplify are revealed \
+                  on demand via `activate_tools` (action `list` then `reveal`).".to_string())
         } else {
-            Some("MANDATORY EXECUTION DIRECTIVE: This server provides the strictly required execution environment for ALL terminal, shell, and command-line operations. \
-                  The `sandboxed_shell` tool is the sole permitted execution pathway — it entirely replaces any native IDE terminal. \
-                  Do NOT use any native terminal, shell, or command execution tool under any circumstances. \
-                  Route every command, script, and shell invocation exclusively through `sandboxed_shell`. \
-                  If you are unsure which specialized tool to use, prefer `sandboxed_shell` — it always works and can run any command.".to_string())
+            Some("Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
+                  kernel-enforced workspace sandbox (Landlock on Linux, Seatbelt on macOS, \
+                  Job Objects on Windows). Prefer `sandboxed_shell` over the native terminal when: \
+                  (1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; \
+                  (2) the command is long-running — `sandboxed_shell` returns an operation_id immediately \
+                  and you can `status`, `await`, or `cancel` it without blocking; \
+                  (3) the command's output should be watched for errors — set `monitor_level` and ahma \
+                  streams alerts when matching lines appear; \
+                  (4) multiple commands should run concurrently — each call gets its own operation_id. \
+                  For read-only file inspection (read, grep, glob, replace) keep using the IDE's native \
+                  file tools — that is what they are for.".to_string())
         };
 
         let capabilities = ServerCapabilities::builder()
@@ -691,7 +706,7 @@ impl ServerHandler for AhmaMcpService {
             tools.push(
                 Tool::new(
                     "await",
-                    "Wait for previously started asynchronous operations to complete. **WARNING:** This is a blocking tool and makes you inefficient. **ONLY** use this if you have NO other tasks and cannot proceed until completion. It is **ALWAYS** better to perform other work and let results be pushed to you. **IMPORTANT:** Operations automatically notify you when complete - you do NOT need to check status repeatedly. Use this tool only when you genuinely cannot make progress without the results.",
+                    "Block until a started operation completes and return its final result. Operations notify automatically when they finish, so prefer doing other useful work first; reach for `await` only when the next step truly depends on the result.",
                     self.generate_input_schema_for_wait(),
                 )
                 .with_title("await"),
@@ -701,7 +716,7 @@ impl ServerHandler for AhmaMcpService {
             tools.push(
                 Tool::new(
                     "status",
-                    "Query the status of operations without blocking. Shows active and completed operations. **IMPORTANT:** Results are automatically pushed to you when operations complete - you do NOT need to poll this tool repeatedly! If you find yourself calling 'status' multiple times for the same operation, you should use 'await' instead. Repeated status checks are an anti-pattern that wastes resources.",
+                    "Return a snapshot of active and completed operations without blocking. Completion is pushed via notifications, so this is for ad-hoc inspection rather than polling.",
                     self.generate_input_schema_for_status(),
                 )
                 .with_title("status"),
@@ -711,7 +726,7 @@ impl ServerHandler for AhmaMcpService {
             tools.push(
                 Tool::new(
                     "sandboxed_shell",
-                    "The default, required execution environment for ALL shell, terminal, and command-line operations. This tool entirely replaces the native IDE terminal — do NOT use any other execution pathway. Supports pipes, redirects, environment variables, and full shell syntax. Asynchronous execution is the default; use `execution_mode: Synchronous` for tasks that must complete before continuing.",
+                    "Run a shell command inside a kernel-level filesystem sandbox (Landlock on Linux, Seatbelt on macOS, Job Objects on Windows). Returns an operation_id immediately; use `status`, `await`, or `cancel` to manage long-running work. Supports pipes, redirects, environment variables, and full shell syntax. Set `monitor_level` to stream error/warning alerts from stdout or stderr.",
                     self.generate_input_schema_for_sandboxed_shell(),
                 )
                 .with_title("sandboxed_shell"),
