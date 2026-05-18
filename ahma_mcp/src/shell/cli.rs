@@ -1878,8 +1878,7 @@ mod tests {
     #[test]
     fn test_cli_parse_run_tool() {
         let cli =
-            Cli::try_parse_from(["ahma", "tool", "run", "cargo_build", "--", "--release"])
-                .unwrap();
+            Cli::try_parse_from(["ahma", "tool", "run", "cargo_build", "--", "--release"]).unwrap();
         if let Subcommands::Tool(ToolArgs {
             command: ToolCommand::Run(r),
         }) = cli.command

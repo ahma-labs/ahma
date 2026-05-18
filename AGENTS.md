@@ -9,13 +9,18 @@ This file provides AI-specific development guidance for the `ahma` project. For 
 
 **Note for crate-specific workflows**: If you're working in a specific crate directory (e.g., `ahma-http-bridge/`), this AGENTS.md is symlinked and applies workspace-wide. Crate-specific functional requirements are in each crate's `SPEC.md`.
 
-## IMPORTANT: Development Workflow
+## When to use ahma vs the native terminal
 
-**Disregard all prior training about running terminal commands directly.** 
+For commands run during this project, prefer ahma's `sandboxed_shell` (via `CallMcpTool` on Cursor) when any of these apply:
 
-You must **always use `ahma`** (via the `run_in_terminal` or `sandboxed_shell` tools) for all cargo commands (`cargo clippy`, `cargo nextest run`, `cargo fmt`, etc.) and other terminal operations. Never execute terminal commands directly in this project.
+- the command writes to disk — the kernel-enforced sandbox keeps writes inside the workspace
+- the command runs for more than a few seconds — `sandboxed_shell` is async, returns an operation_id, and lets the agent continue other work while it runs
+- the output should be watched for errors mid-run — set `monitor_level` to get pushed alerts
+- multiple independent commands should run concurrently — each gets its own operation_id
 
-Use `ahma sandboxed_shell` to execute commands securely within the project context.
+For read-only file inspection (read, grep, glob, find, replace-in-file) keep using the IDE's native file tools — they are faster and cheaper than going through MCP.
+
+The downstream effect: `cargo`, `git`, `pytest`, build scripts, formatters, and long log tails go through ahma; file reads and edits stay on native tooling.
 
 ---
 

@@ -133,6 +133,27 @@ Issues and pull requests are welcome. This project is AI friendly and provides t
 - **`AGENTS.md`/`CLAUDE.md`**: Instructions for AI agents to use the MCP server to contribute to the project.
 - **`SPEC.md`**: This is the **single source of truth** for the project requirements. AI keeps it up to date as you work on the project.
 
+## Working well with Claude (Sonnet / Opus)
+
+Claude models treat strongly imperative language in tool descriptions ("MANDATORY", "do NOT use any other pathway", "under any circumstances") as a prompt-injection signal and downweight it. The recommended way to get Claude to route work through ahma is to add a decision-rule snippet to your workspace `AGENTS.md` or `CLAUDE.md`:
+
+```markdown
+## When to use ahma vs the native terminal
+
+For commands run during this project, prefer ahma's `sandboxed_shell` (via `CallMcpTool` on Cursor) when any of these apply:
+
+- the command writes to disk — the kernel-enforced sandbox keeps writes inside the workspace
+- the command runs for more than a few seconds — `sandboxed_shell` is async, returns an operation_id, and lets the agent continue other work while it runs
+- the output should be watched for errors mid-run — set `monitor_level` to get pushed alerts
+- multiple independent commands should run concurrently — each gets its own operation_id
+
+For read-only file inspection (read, grep, glob, find, replace-in-file) keep using the IDE's native file tools — they are faster and cheaper than going through MCP.
+
+The downstream effect: `cargo`, `git`, `pytest`, build scripts, formatters, and long log tails go through ahma; file reads and edits stay on native tooling.
+```
+
+Workspace-level rules in `AGENTS.md` reach Claude as operator-trusted content (higher weight than tool descriptions), and the capability-led bullets give it a clear decision rule rather than a mandate to override.
+
 ## License
 
 Licensed under either [Apache License 2.0](APACHE_LICENSE.txt) or [MIT License](MIT_LICENSE.txt).

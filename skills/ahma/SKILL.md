@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.6.5
+version: 0.6.6
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -684,7 +684,7 @@ ahma simplify . --exclude '**/generated/**,**/vendor/**' --ai-fix 1
 2. **Do not add comments to improve scores** — structural change is needed.
 3. **Do not inline complex logic** — fewer functions with more complexity each makes scores worse.
 4. **Do not run `--ai-fix` without reading the structured prompt.**
-5. **Do not skip Step 4 (verify)** — complexity improvements must be confirmed by metrics.
+5. **Step 4 (verify) is required** — complexity improvements must be confirmed by metrics.
 
 ---
 
