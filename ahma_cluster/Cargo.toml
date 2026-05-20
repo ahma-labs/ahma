@@ -1,0 +1,27 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license = "AGPL-3.0-or-later"
+name = "ahma_cluster"
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Network-facing local cluster scheduler for ahma: mDNS/Tailscale peer discovery and signed task dispatch over QUIC. (AGPL-3.0-or-later)"
+
+[lib]
+name = "ahma_cluster"
+path = "src/lib.rs"
+
+[dependencies]
+ahma_decompose = { path = "../ahma_decompose" }
+ahma_worker = { path = "../ahma_worker" }
+anyhow.workspace = true
+dirs.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

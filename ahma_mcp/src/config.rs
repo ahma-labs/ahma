@@ -103,20 +103,32 @@ pub struct ToolConfig {
     pub monitor_stream: Option<String>,
     /// Tool type classifier. Defaults to `Command` for normal CLI tools.
     /// Set to `Livelog` for long-running log-streaming tools that pipe output through an LLM.
+    /// Tool types implemented in separate GPL-licensed crates (e.g. `decompose`, `worker`)
+    /// are deserialized as `Extension` and their configurations stored in the matching
+    /// opaque JSON fields below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_type: Option<ToolType>,
     /// Live log monitoring configuration. Required when `tool_type` is `Livelog`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub livelog: Option<LivelogConfig>,
-    /// Decompose orchestration configuration. Required when `tool_type` is `Decompose`.
+    /// Decompose orchestration configuration (opaque — parsed by `ahma_decompose` crate).
+    /// Required when `tool_type` is `decompose`; stored as raw JSON for GPL-crate consumption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decompose: Option<DecomposeConfig>,
-    /// Worker synthesis configuration. Required when `tool_type` is `Worker`.
+    pub decompose: Option<serde_json::Value>,
+    /// Worker synthesis configuration (opaque — parsed by `ahma_worker` crate).
+    /// Required when `tool_type` is `worker`; stored as raw JSON for GPL-crate consumption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker: Option<WorkerConfig>,
+    pub worker: Option<serde_json::Value>,
 }
 
 /// Classifier that determines how the MCP service routes a tool invocation.
+///
+/// The permissive `ahma_mcp` library handles `Command` and `Livelog` natively.
+/// Tool types implemented in the GPL-licensed sibling crates (`ahma_decompose`,
+/// `ahma_worker`, etc.) are serialised to their JSON names (e.g. `"decompose"`,
+/// `"worker"`) and round-trip correctly — they are just stored as `Extension`
+/// in this enum so the MIT library has no compile-time dependency on GPL code.
+/// `ahma_bin` routes those calls to the appropriate GPL crate at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolType {
@@ -125,11 +137,10 @@ pub enum ToolType {
     Command,
     /// Long-running log source piped through an LLM for issue detection.
     Livelog,
-    /// Decompose a complex question into sub-questions, dispatch to local LLMs,
-    /// and aggregate the answers with a deterministic reducer.
-    Decompose,
-    /// Synthesize and run ephemeral Rust or Python worker code in a sub-vault.
-    Worker,
+    /// Any tool type implemented outside this crate (e.g. `decompose`, `worker`).
+    /// The raw `tool_type` string is preserved for routing by the GPL binary crates.
+    #[serde(other)]
+    Extension,
 }
 
 /// Connection details for an OpenAI-compatible LLM provider.
@@ -195,79 +206,6 @@ fn default_cooldown_seconds() -> u64 {
 
 fn default_llm_timeout_seconds() -> u64 {
     30
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DecomposeConfig
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Configuration for a `tool_type: decompose` tool.
-///
-/// A decompose tool splits a complex business question into smaller sub-questions,
-/// dispatches each to a local LLM (e.g. `gemma:4b` via Ollama), and aggregates
-/// the results with a deterministic Rust reducer — no cloud egress required.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct DecomposeConfig {
-    /// LLM provider to use for both splitting and answering sub-questions.
-    /// Prefer a small local model (`gemma:4b`, `llama3.2:3b`) for privacy.
-    pub llm_provider: LlmProviderConfig,
-    /// Maximum number of sub-questions to generate from the parent question.
-    /// Defaults to 5.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_subtasks: Option<usize>,
-    /// Maximum number of sub-questions to run concurrently.
-    /// Keep this low (2–4) for single-machine Ollama deployments.  Defaults to 3.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_concurrent: Option<usize>,
-    /// How to combine sub-task results.
-    /// Values: `summarize` (default), `extract_fields`, `classify`, `concat`, `first`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reduce_mode: Option<crate::decompose::ReduceMode>,
-    /// System prompt injected when asking the LLM to answer each sub-question.
-    /// If absent, a generic "answer concisely" prompt is used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub answer_prompt: Option<String>,
-    /// Timeout in seconds for each individual LLM call.  Defaults to 30.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub llm_timeout_seconds: Option<u64>,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// WorkerConfig
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Language for an ephemeral synthesized worker.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerLanguage {
-    /// Compile and run a Rust program (`rustc` must be on PATH).
-    #[default]
-    Rust,
-    /// Run a Python 3 script (`python3` must be on PATH).
-    Python,
-}
-
-/// Configuration for a `tool_type: worker` tool.
-///
-/// A worker tool accepts synthesized source code, compiles or runs it inside a
-/// sub-vault, captures the output to `outputs/`, and by default deletes the
-/// source after execution.  Because the program is compiled deterministic code
-/// (not an LLM in the loop), it cannot be re-injected mid-run.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct WorkerConfig {
-    /// Programming language for the synthesized worker.
-    #[serde(default)]
-    pub language: WorkerLanguage,
-    /// Additional compiler / interpreter arguments.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extra_args: Option<Vec<String>>,
-    /// Keep the synthesized source file after execution (`--keep` flag semantic).
-    /// Defaults to `false` — source is deleted after the run.
-    #[serde(default)]
-    pub keep_source: bool,
-    /// Execution timeout in seconds.  Defaults to 60.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_seconds: Option<u64>,
 }
 
 /// Configuration for a subcommand, allowing for nested commands.

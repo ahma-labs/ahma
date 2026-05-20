@@ -3,6 +3,40 @@
 version = 4
 
 [[package]]
+name = "ahma_bin"
+version = "0.7.0"
+dependencies = [
+ "ahma_cluster",
+ "ahma_decompose",
+ "ahma_mcp",
+ "ahma_renewal",
+ "ahma_tui",
+ "ahma_vault",
+ "ahma_worker",
+ "anyhow",
+ "clap",
+ "dirs",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ahma_cluster"
+version = "0.7.0"
+dependencies = [
+ "ahma_decompose",
+ "ahma_worker",
+ "anyhow",
+ "dirs",
+ "reqwest 0.13.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ahma_common"
 version = "0.7.0"
 dependencies = [
@@ -26,6 +60,21 @@ dependencies = [
  "ahma_llm_monitor",
  "ahma_mcp",
  "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ahma_decompose"
+version = "0.7.0"
+dependencies = [
+ "ahma_llm_monitor",
+ "ahma_vault",
+ "anyhow",
+ "futures",
+ "schemars",
  "serde",
  "serde_json",
  "tokio",
@@ -163,6 +212,61 @@ dependencies = [
  "walkdir",
  "windows-sys 0.61.2",
  "wiremock",
+]
+
+[[package]]
+name = "ahma_renewal"
+version = "0.7.0"
+dependencies = [
+ "ahma_vault",
+ "anyhow",
+ "chrono",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "ahma_tui"
+version = "0.7.0"
+dependencies = [
+ "ahma_renewal",
+ "anyhow",
+ "chrono",
+ "reqwest 0.13.3",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ahma_vault"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ahma_worker"
+version = "0.7.0"
+dependencies = [
+ "ahma_vault",
+ "anyhow",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

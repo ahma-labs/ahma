@@ -469,7 +469,7 @@ fn check_powershell_available() {
     }
 }
 
-async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
+pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
     match cmd {
         Subcommands::Serve(serve_args) => match serve_args.transport {
             ServeTransport::Stdio => {
@@ -517,10 +517,17 @@ async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
                 run_tool_info_mode(info_args).await
             }
         },
-        Subcommands::Vault(vault_args) => dispatch_vault_command(vault_args),
-        Subcommands::Tui(tui_args) => {
-            tracing::info!("Starting TUI control plane");
-            crate::tui::run_tui(&tui_args.connect).await
+        Subcommands::Vault(_) => {
+            anyhow::bail!(
+                "vault commands are provided by the ahma_bin crate (includes ahma_vault). \
+                 If you are running a custom binary, implement vault dispatch using ahma_vault::TaskVault."
+            )
+        }
+        Subcommands::Tui(_) => {
+            anyhow::bail!(
+                "tui is provided by the ahma_bin crate (includes ahma_tui). \
+                 If you are running a custom binary, implement TUI dispatch using ahma_tui::run_tui."
+            )
         }
         Subcommands::Bundle(bundle_args) => dispatch_bundle_command(bundle_args),
         #[cfg(feature = "simplify")]
@@ -531,43 +538,6 @@ async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
     }
 }
 
-fn dispatch_vault_command(args: VaultArgs) -> Result<()> {
-    match args.command {
-        VaultCommand::Create(create_args) => {
-            let vault = crate::vault::TaskVault::create(&create_args.slug)
-                .context("Failed to create task vault")?;
-            println!("{}", vault.path().display());
-            tracing::info!(
-                "Task vault created: {} (sandbox scope: {})",
-                vault.path().display(),
-                vault.sandbox_scope().display()
-            );
-            Ok(())
-        }
-        VaultCommand::List => {
-            let home = dirs::home_dir().context("Cannot determine home directory")?;
-            let tasks_dir = home.join(".ahma").join("tasks");
-            if !tasks_dir.exists() {
-                println!("No vaults found ({})", tasks_dir.display());
-                return Ok(());
-            }
-            let mut entries: Vec<_> = std::fs::read_dir(&tasks_dir)?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .collect();
-            entries.sort_by_key(|e| e.path());
-            if entries.is_empty() {
-                println!("No task vaults found.");
-            } else {
-                println!("Task vaults in {}:", tasks_dir.display());
-                for entry in entries {
-                    println!("  {}", entry.file_name().to_string_lossy());
-                }
-            }
-            Ok(())
-        }
-    }
-}
 
 fn dispatch_bundle_command(args: BundleArgs) -> Result<()> {
     match args.command {
@@ -1160,7 +1130,7 @@ pub struct BundleSignArgs {
 // AppConfig construction from CLI + env vars
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn build_app_config(cli: &Cli) -> AppConfig {
+pub fn build_app_config(cli: &Cli) -> AppConfig {
     // Gather serve-level fields if present
     #[allow(clippy::type_complexity)]
     let (

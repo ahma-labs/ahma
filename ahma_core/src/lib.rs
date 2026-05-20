@@ -1,86 +1,64 @@
 //! # Ahma Core Library
 //!
-//! This crate exposes Ahma's secure execution primitives as an embeddable Rust
-//! library.  Use it to add kernel-enforced sandboxing, per-task vaults, and
-//! local-LLM orchestration to your own Rust application.
+//! This crate exposes Ahma's permissive secure execution primitives as an
+//! embeddable Rust library.  Use it to add kernel-enforced sandboxing and
+//! async operation tracking to your own Rust application.
+//!
+//! ## License
+//!
+//! This crate is licensed under **MIT OR Apache-2.0**.
 //!
 //! ## Key re-exports
 //!
 //! | Type | From | Purpose |
 //! |------|------|---------|
-//! | [`TaskVault`] | `ahma_mcp::vault` | Per-question isolated working directory |
-//! | [`AuditWriter`] | `ahma_mcp::vault::audit` | Append-only task audit log |
-//! | [`TrashManager`] | `ahma_mcp::vault::trash` | Two-phase delete |
-//! | [`EgressAllowlist`] | `ahma_mcp::egress` | Per-task network allowlist |
-//! | [`DecomposeOrchestrator`] | `ahma_mcp::decompose` | Local-LLM task decomposer |
-//! | [`Reducer`] / [`ReduceMode`] | `ahma_mcp::decompose` | Aggregation strategies |
-//! | [`WorkerRunner`] | `ahma_mcp::worker` | Ephemeral code synthesis & execution |
-//! | [`RenewalWatcher`] | `ahma_mcp::renewal` | Long-task renewal contract |
-//! | [`ClusterScheduler`] | `ahma_mcp::cluster` | Local peer scheduler |
 //! | [`Sandbox`] | `ahma_mcp::sandbox` | Kernel-level FS sandbox |
+//! | [`SandboxMode`] | `ahma_mcp::sandbox` | Sandbox enforcement mode |
 //! | [`OperationMonitor`] | `ahma_mcp::operation_monitor` | Async operation tracking |
+//! | [`OperationStatus`] | `ahma_mcp::operation_monitor` | Operation status enum |
+//! | [`MonitorConfig`] | `ahma_mcp::operation_monitor` | Monitor configuration |
 //! | [`AhmaMcpService`] | `ahma_mcp` | Full MCP server service |
+//! | [`LlmClient`] | `ahma_llm_monitor` | OpenAI-compatible LLM client |
+//!
+//! ## GPL-licensed sibling crates
+//!
+//! The following primitives were extracted into separate copyleft crates to
+//! allow this library to remain MIT OR Apache-2.0.  Embedders who need them
+//! must add those crates directly to their `Cargo.toml` and accept the
+//! applicable copyleft terms:
+//!
+//! | Crate | License | Primitives |
+//! |-------|---------|-----------|
+//! | `ahma_vault` | GPL-3.0-or-later | `TaskVault`, `AuditWriter`, `TrashManager` |
+//! | `ahma_decompose` | GPL-3.0-or-later | `DecomposeOrchestrator`, `ReduceMode`, `Reducer` |
+//! | `ahma_worker` | GPL-3.0-or-later | `WorkerRunner`, `WorkerConfig`, `WorkerLanguage` |
+//! | `ahma_renewal` | GPL-3.0-or-later | `RenewalWatcher`, `RenewalConfig` |
+//! | `ahma_tui` | GPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
+//! | `ahma_cluster` | **AGPL-3.0-or-later** | `ClusterScheduler`, `WorkerRegistry`, `TaskManifest` |
+//!
+//! Linking `ahma_cluster` (AGPL) into a binary means any modified version
+//! offered to remote users over a network must provide source access per
+//! AGPL-3.0 §13.
 //!
 //! ## Quickstart
 //!
 //! ```no_run
-//! use ahma_core::{TaskVault, AuditWriter, DecomposeOrchestrator};
-//! use ahma_core::decompose_config;
+//! use ahma_core::{Sandbox, SandboxMode, OperationMonitor, MonitorConfig};
+//! use std::time::Duration;
+//! use std::sync::Arc;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     // 1. Create an isolated task vault for this question.
-//!     let vault = TaskVault::create("summarise-invoice")?;
-//!
-//!     // 2. Record vault creation in the audit log.
-//!     let audit = vault.audit_writer();
-//!     audit.vault_created(&vault.path().display().to_string(), "summarise-invoice").await?;
-//!
-//!     // 3. (Optionally) run a decompose task against a local LLM.
-//!     // let orch = DecomposeOrchestrator::new(decompose_config!("http://localhost:11434/v1", "gemma:4b"));
-//!     // let answer = orch.run("Summarise the key line items in this invoice.").await?;
-//!
+//!     let sandbox = Arc::new(Sandbox::new(vec![], SandboxMode::Strict, false, false, false)?);
+//!     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+//!         Duration::from_secs(300),
+//!     )));
+//!     println!("Sandbox and monitor ready.");
 //!     Ok(())
 //! }
 //! ```
 
-// Re-export vault primitives
-pub use ahma_mcp::vault::{
-    TaskVault,
-    audit::{AuditEvent, AuditEventKind, AuditWriter},
-    trash::{StagedEntry, TrashManager},
-};
-
-// Re-export egress sandbox
-pub use ahma_mcp::egress::{EgressAllowlist, EgressProxy, EgressProxyConfig};
-
-// Re-export decompose orchestration
-pub use ahma_mcp::decompose::reducer::{ReduceMode, Reducer};
-pub use ahma_mcp::decompose::{DecomposeOrchestrator, SubTaskResult};
-
-// Re-export worker synthesis
-pub use ahma_mcp::config::{WorkerConfig, WorkerLanguage};
-pub use ahma_mcp::worker::WorkerRunner;
-
-// Re-export renewal contract
-pub use ahma_mcp::renewal::{RenewalConfig, RenewalHaltEvent, RenewalWatcher};
-
-// Re-export cluster scheduling
-pub use ahma_mcp::cluster::scheduler::TaskManifest;
-pub use ahma_mcp::cluster::{ClusterScheduler, PeerInfo, WorkerRegistry};
-
-// Re-export bundle management
-pub use ahma_mcp::bundle::signing::{BundleSigner, BundleVerifier, audit_bundle};
-pub use ahma_mcp::bundle::{BundleAuditResult, BundleAuditSeverity, BundleIndex};
-
-// Re-export artifact generation
-pub use ahma_mcp::artifact::{ArtifactBuilder, ArtifactHtml, ArtifactServer};
-
-// Re-export TUI
-pub use ahma_mcp::tui::{TuiApp, TuiEvent};
-
 // Re-export core MCP types for embedders
-pub use ahma_mcp::config::DecomposeConfig;
 pub use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor, OperationStatus};
 pub use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 pub use ahma_mcp::{Adapter, AhmaMcpService};

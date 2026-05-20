@@ -11,10 +11,6 @@ version.workspace = true
 name = "ahma_mcp"
 path = "src/lib.rs"
 
-[[bin]]
-name = "ahma"
-path = "src/shell/bin.rs"
-
 
 [dependencies]
 ahma_common = { path = "../ahma_common" }

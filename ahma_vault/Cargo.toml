@@ -1,0 +1,27 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "ahma_vault"
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Task vault primitives for ahma: per-question isolated working directories with audit log and two-phase trash."
+
+[lib]
+name = "ahma_vault"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono = { workspace = true }
+dirs.workspace = true
+rand = "0.10.1"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

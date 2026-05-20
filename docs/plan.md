@@ -26,14 +26,11 @@ todos:
   - id: t3-1-cluster
     content: T3.1 — Best-available-now local cluster scheduler (mDNS/Tailscale discovery, per-worker sandbox, signed task manifests over QUIC)
     status: pending
-  - id: t3-2-tauri
-    content: T3.2 — Tauri GUI shell wrapping the TUI core
-    status: pending
-  - id: t3-3-library
+  - id: t3-2-library
     content: T3.3 — ahma-core Rust crate for embedding
     status: pending
-  - id: t3-4-renewal
-    content: T3.4 — Renewal contract for long unattended tasks (checkpoint, halt, re-approve)
+  - id: t3-3-renewal
+    content: T3.3 — Renewal contract for long unattended tasks (checkpoint, halt, re-approve)
     status: pending
 isProject: false
 ---
@@ -168,16 +165,12 @@ Make Ahma the conductor, not the soloist.
 - Each remote worker runs in its own kernel sandbox with task-vault contents shipped over via local QUIC (Ahma already has HTTP/3 client preference per `SPEC.md` R8.7).
 - Important: the worker accepts only signed task manifests from a known peer — the task vault folder is the unit of work that travels.
 
-**T3.2 Tauri GUI shell**
-
-Wraps the TUI core. Adds drag-and-drop input, file picker for vault creation, native deletion confirmation dialog, per-task chat thread. Stays a thin shell so the core (Rust + sandbox + orchestrator + TUI) remains the source of truth.
-
-**T3.3 Library packaging: `ahma-core` crate**
+**T3.2 Library packaging: `ahma-core` crate**
 
 - `ahma-core` (Rust): exposes Sandbox, TaskVault, Orchestrator as a library so other Rust apps can embed them.
 - Mobile: out of scope for the next year. Mobile sandboxing primitives differ enough (App Sandbox on iOS, SELinux on Android) that they need separate design.
 
-**T3.4 Renewal contract for long unattended tasks**
+**T3.3 Renewal contract for long unattended tasks**
 
 Concrete mechanism for principle 4 above: a task that runs > `T_renew` minutes unattended produces a checkpoint to its vault, signals the user (TUI / push), and *halts* until re-approved. Schedules become approvable plans, not authorizations.
 

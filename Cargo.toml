@@ -1,5 +1,6 @@
 [workspace]
 default-members = [
+    # Permissive crates (MIT OR Apache-2.0)
     "ahma_mcp",
     "generate_tool_schema",
     "ahma_http_bridge",
@@ -7,9 +8,19 @@ default-members = [
     "ahma_common",
     "ahma_llm_monitor",
     "ahma_core",
+    # GPL-3.0-or-later crates (end-user product surface)
+    "ahma_vault",
+    "ahma_decompose",
+    "ahma_worker",
+    "ahma_renewal",
+    "ahma_tui",
+    "ahma_bin",
+    # AGPL-3.0-or-later (network-facing cluster scheduler)
+    "ahma_cluster",
 ]
 
 members = [
+    # Permissive crates (MIT OR Apache-2.0)
     "ahma_mcp",
     "generate_tool_schema",
     "ahma_http_bridge",
@@ -17,6 +28,15 @@ members = [
     "ahma_common",
     "ahma_llm_monitor",
     "ahma_core",
+    # GPL-3.0-or-later crates (end-user product surface)
+    "ahma_vault",
+    "ahma_decompose",
+    "ahma_worker",
+    "ahma_renewal",
+    "ahma_tui",
+    "ahma_bin",
+    # AGPL-3.0-or-later (network-facing cluster scheduler)
+    "ahma_cluster",
 ]
 
 resolver = "3"
