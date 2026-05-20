@@ -311,6 +311,7 @@ mod main_tests {
                 monitor_stream: None,
                 tool_type: None,
                 livelog: None,
+                ..Default::default()
             },
         );
 

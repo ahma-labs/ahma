@@ -154,6 +154,12 @@ pub struct AppConfig {
     pub run_tool: Option<String>,
     /// Arguments forwarded to the tool after `--`.
     pub run_tool_args: Vec<String>,
+
+    // ── task vault ───────────────────────────────────────────────────────────
+    /// Task vault root to use as sandbox scope (--task-vault <path>).
+    /// When set, the sandbox scope is set to <vault>/workdir/ and an audit
+    /// log is initialized at <vault>/audit.jsonl.
+    pub task_vault: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -189,6 +195,7 @@ impl Default for AppConfig {
             list_format: list_tools::OutputFormat::Text,
             run_tool: None,
             run_tool_args: vec![],
+            task_vault: None,
         }
     }
 }
@@ -510,10 +517,115 @@ async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
                 run_tool_info_mode(info_args).await
             }
         },
+        Subcommands::Vault(vault_args) => dispatch_vault_command(vault_args),
+        Subcommands::Tui(tui_args) => {
+            tracing::info!("Starting TUI control plane");
+            crate::tui::run_tui(&tui_args.connect).await
+        }
+        Subcommands::Bundle(bundle_args) => dispatch_bundle_command(bundle_args),
         #[cfg(feature = "simplify")]
         Subcommands::Simplify(args) => {
             tracing::info!("Running in simplify mode");
             crate::simplify::run(args)
+        }
+    }
+}
+
+fn dispatch_vault_command(args: VaultArgs) -> Result<()> {
+    match args.command {
+        VaultCommand::Create(create_args) => {
+            let vault = crate::vault::TaskVault::create(&create_args.slug)
+                .context("Failed to create task vault")?;
+            println!("{}", vault.path().display());
+            tracing::info!(
+                "Task vault created: {} (sandbox scope: {})",
+                vault.path().display(),
+                vault.sandbox_scope().display()
+            );
+            Ok(())
+        }
+        VaultCommand::List => {
+            let home = dirs::home_dir().context("Cannot determine home directory")?;
+            let tasks_dir = home.join(".ahma").join("tasks");
+            if !tasks_dir.exists() {
+                println!("No vaults found ({})", tasks_dir.display());
+                return Ok(());
+            }
+            let mut entries: Vec<_> = std::fs::read_dir(&tasks_dir)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .collect();
+            entries.sort_by_key(|e| e.path());
+            if entries.is_empty() {
+                println!("No task vaults found.");
+            } else {
+                println!("Task vaults in {}:", tasks_dir.display());
+                for entry in entries {
+                    println!("  {}", entry.file_name().to_string_lossy());
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn dispatch_bundle_command(args: BundleArgs) -> Result<()> {
+    match args.command {
+        BundleCommand::Audit(audit_args) => {
+            println!("Auditing bundle: {}", audit_args.path.display());
+            let result = crate::bundle::signing::audit_bundle(&audit_args.path)
+                .context("Bundle audit failed")?;
+
+            println!(
+                "Files checked: {} | Findings: {}",
+                result.files_checked,
+                result.findings.len()
+            );
+
+            for finding in &result.findings {
+                let sev = match finding.severity {
+                    crate::bundle::BundleAuditSeverity::Info => "INFO    ",
+                    crate::bundle::BundleAuditSeverity::Warning => "WARNING ",
+                    crate::bundle::BundleAuditSeverity::Critical => "CRITICAL",
+                };
+                println!("[{sev}] {}: {}", finding.file, finding.description);
+                println!("         Recommendation: {}", finding.recommendation);
+            }
+
+            if result.passed {
+                println!("PASS Bundle audit passed.");
+                Ok(())
+            } else if audit_args.strict && !result.findings.is_empty() {
+                anyhow::bail!("Bundle audit found issues (--strict mode).")
+            } else if !result.passed {
+                anyhow::bail!("Bundle audit found critical issues.")
+            } else {
+                Ok(())
+            }
+        }
+        BundleCommand::Verify(verify_args) => {
+            println!("Verifying bundle: {}", verify_args.path.display());
+            let verifier = crate::bundle::BundleVerifier::new(
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".ahma")
+                    .join("keys")
+                    .join("trusted"),
+            );
+            match verifier.verify(&verify_args.path)? {
+                true => {
+                    println!("PASS Bundle verification passed.");
+                    Ok(())
+                }
+                false => anyhow::bail!("FAIL Bundle verification failed."),
+            }
+        }
+        BundleCommand::Sign(sign_args) => {
+            println!("Signing bundle: {}", sign_args.path.display());
+            let digests = crate::bundle::BundleSigner::sign(&sign_args.path)
+                .context("Bundle signing failed")?;
+            println!("Manifest written with {} file hashes.", digests.len());
+            Ok(())
         }
     }
 }
@@ -564,6 +676,12 @@ pub enum Subcommands {
     Serve(ServeArgs),
     /// Tool management and execution utilities.
     Tool(ToolArgs),
+    /// Task vault management: create and inspect per-question working directories.
+    Vault(VaultArgs),
+    /// Start the TUI control plane (terminal dashboard for active tasks).
+    Tui(TuiArgs),
+    /// Bundle management: audit and verify MTDF tool bundles.
+    Bundle(BundleArgs),
     /// Analyze source code complexity and generate a simplicity report.
     #[cfg(feature = "simplify")]
     Simplify(crate::simplify::SimplifyArgs),
@@ -677,6 +795,14 @@ pub struct ServeArgs {
     /// Providing this flag enables tracing. Equivalent to OTEL_EXPORTER_OTLP_ENDPOINT.
     #[arg(long = "opentelemetry", value_name = "URL", global = true)]
     pub opentelemetry: Option<String>,
+
+    /// Run this server session inside an existing task vault.
+    ///
+    /// Sets the sandbox scope to <vault>/workdir/, initializes an audit log at
+    /// <vault>/audit.jsonl, and wires two-phase delete through <vault>/trash/.
+    /// The vault must exist (create with `ahma vault create <slug>` first).
+    #[arg(long = "task-vault", value_name = "PATH", global = true)]
+    pub task_vault: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -934,6 +1060,102 @@ pub struct InfoArgs {
     pub filter: Option<String>,
 }
 
+// ── vault ─────────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma vault`.
+#[derive(Parser, Debug)]
+pub struct VaultArgs {
+    #[command(subcommand)]
+    pub command: VaultCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VaultCommand {
+    /// Create a new task vault for a user question.
+    ///
+    /// Creates ~/.ahma/tasks/<date>-<slug>-<id>/ with inputs/, workdir/,
+    /// outputs/, trash/, and audit.jsonl.  Prints the vault root path to stdout.
+    #[command(after_help = "EXAMPLES:
+  ahma vault create summarise-q4-report
+  ahma vault create \"analyse customer data\"")]
+    Create(VaultCreateArgs),
+    /// List all existing task vaults.
+    List,
+}
+
+/// Arguments for `ahma vault create`.
+#[derive(Parser, Debug)]
+pub struct VaultCreateArgs {
+    /// A short human-readable slug describing the task (becomes part of the directory name).
+    #[arg(value_name = "SLUG")]
+    pub slug: String,
+}
+
+// ── tui ───────────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma tui`.
+#[derive(Parser, Debug)]
+#[command(after_help = "EXAMPLES:
+  # Connect to the default ahma HTTP bridge
+  ahma tui
+
+  # Connect to a custom address
+  ahma tui --connect http://localhost:8080")]
+pub struct TuiArgs {
+    /// URL of the ahma HTTP bridge to monitor.
+    #[arg(long = "connect", default_value = "http://localhost:3000")]
+    pub connect: String,
+}
+
+// ── bundle ────────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma bundle`.
+#[derive(Parser, Debug)]
+pub struct BundleArgs {
+    #[command(subcommand)]
+    pub command: BundleCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BundleCommand {
+    /// Audit a bundle directory for security issues.
+    ///
+    /// Scans all JSON files for embedded secrets, missing path validation,
+    /// prompt-injection payloads, and other supply-chain risks.
+    Audit(BundleAuditArgs),
+    /// Verify a bundle directory against its content manifest.
+    Verify(BundleVerifyArgs),
+    /// Create a content manifest for a bundle directory.
+    Sign(BundleSignArgs),
+}
+
+/// Arguments for `ahma bundle audit <path>`.
+#[derive(Parser, Debug)]
+pub struct BundleAuditArgs {
+    /// Path to the bundle directory to audit.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+    /// Exit with a non-zero code if any warnings are found (not just criticals).
+    #[arg(long)]
+    pub strict: bool,
+}
+
+/// Arguments for `ahma bundle verify <path>`.
+#[derive(Parser, Debug)]
+pub struct BundleVerifyArgs {
+    /// Path to the bundle directory to verify.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+}
+
+/// Arguments for `ahma bundle sign <path>`.
+#[derive(Parser, Debug)]
+pub struct BundleSignArgs {
+    /// Path to the bundle directory to sign.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AppConfig construction from CLI + env vars
 // ─────────────────────────────────────────────────────────────────────────────
@@ -994,6 +1216,13 @@ fn build_app_config(cli: &Cli) -> AppConfig {
             false,
             None::<String>,
         ),
+    };
+
+    // task-vault from CLI
+    let cli_task_vault: Option<PathBuf> = if let Subcommands::Serve(s) = &cli.command {
+        s.task_vault.clone()
+    } else {
+        None
     };
 
     // Tool list args
@@ -1108,6 +1337,8 @@ fn build_app_config(cli: &Cli) -> AppConfig {
         list_format,
         run_tool,
         run_tool_args,
+        task_vault: cli_task_vault
+            .or_else(|| std::env::var("AHMA_TASK_VAULT").ok().map(PathBuf::from)),
     }
 }
 
@@ -1490,6 +1721,7 @@ mod tests {
             run_tool: None,
             run_tool_args: vec![],
             observability: ahma_common::observability::ObservabilityConfig::default(),
+            task_vault: None,
         }
     }
 

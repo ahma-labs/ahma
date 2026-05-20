@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "bundles": [
+    {
+      "name": "rust",
+      "version": "1.0.0",
+      "description": "Rust/Cargo build and test tools",
+      "author": "ahma-project",
+      "url": null,
+      "sha256": "builtin"
+    },
+    {
+      "name": "python",
+      "version": "1.0.0",
+      "description": "Python 3 tooling",
+      "author": "ahma-project",
+      "url": null,
+      "sha256": "builtin"
+    },
+    {
+      "name": "git",
+      "version": "1.0.0",
+      "description": "Git version control tools",
+      "author": "ahma-project",
+      "url": null,
+      "sha256": "builtin"
+    },
+    {
+      "name": "fileutils",
+      "version": "1.0.0",
+      "description": "File system utility tools",
+      "author": "ahma-project",
+      "url": null,
+      "sha256": "builtin"
+    },
+    {
+      "name": "github",
+      "version": "1.0.0",
+      "description": "GitHub CLI (gh) tools",
+      "author": "ahma-project",
+      "url": null,
+      "sha256": "builtin"
+    }
+  ]
+}

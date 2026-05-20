@@ -38,6 +38,7 @@ fn make_tool_config(name: &str) -> ToolConfig {
         monitor_stream: None,
         tool_type: None,
         livelog: None,
+        ..Default::default()
     }
 }
 

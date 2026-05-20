@@ -291,6 +291,64 @@ impl AhmaMcpService {
             .is_some_and(|b| disclosed.contains(b.name))
     }
 
+    /// Names that are always hard-wired in the protocol layer and must not
+    /// appear in user/bundled configs (we skip duplicates here).
+    const HARDCODED_TOOLS: &'static [&'static str] = &[
+        "await",
+        "status",
+        "sandboxed_shell",
+        "cancel",
+        "activate_tools",
+    ];
+
+    /// Returns a snapshot of the disclosed-bundle set when progressive
+    /// disclosure is on, or `None` when every loaded tool is visible.
+    fn disclosed_snapshot(&self) -> Option<HashSet<String>> {
+        if self.progressive_disclosure {
+            Some(self.disclosed_bundles.read().unwrap().clone())
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if a configured tool should be exposed to the client
+    /// given the current disclosure state. Centralises the filter so
+    /// `list_tools()` and `list_tool_names()` cannot drift apart.
+    fn is_config_visible_to_client(
+        &self,
+        config: &ToolConfig,
+        disclosed: &Option<HashSet<String>>,
+    ) -> bool {
+        if Self::HARDCODED_TOOLS.contains(&config.name.as_str()) {
+            return false;
+        }
+        if !config.enabled {
+            tracing::debug!("Skipping disabled tool '{}'", config.name);
+            return false;
+        }
+        if let Some(set) = disclosed
+            && self.is_bundle_tool(&config.name)
+            && !self.is_tool_disclosed(&config.name, set)
+        {
+            tracing::debug!("Skipping undisclosed bundle tool '{}'", config.name);
+            return false;
+        }
+        true
+    }
+
+    /// Resolves a `tools/call` tool name to its config, returning the
+    /// owned config and (for flattened subcommand names) the resolved
+    /// subcommand path.
+    fn find_tool_config(&self, tool_name: &str) -> Option<(ToolConfig, Option<String>)> {
+        let configs_lock = self.configs.read().unwrap();
+        if let Some(config) = configs_lock.get(tool_name) {
+            Some((config.clone(), None))
+        } else {
+            Self::resolve_flattened_tool(tool_name, &configs_lock)
+                .map(|(parent, sub_path)| (parent.clone(), Some(sub_path)))
+        }
+    }
+
     /// Generates a rich, action-oriented description for the `activate_tools` meta-tool.
     ///
     /// The description dynamically lists all loaded bundles with their `ai_hint` text,
@@ -746,50 +804,15 @@ impl ServerHandler for AhmaMcpService {
                 );
             }
 
-            {
-                // Reserved names are already hard-wired above; skip them from
-                // user/bundled configs to avoid duplicates in `tools/list`.
-                const HARDCODED_TOOLS: &[&str] = &[
-                    "await",
-                    "status",
-                    "sandboxed_shell",
-                    "cancel",
-                    "activate_tools",
-                ];
-                let disclosed = if self.progressive_disclosure {
-                    Some(self.disclosed_bundles.read().unwrap().clone())
-                } else {
-                    None
-                };
-                let configs_lock = self.configs.read().unwrap();
-                for config in configs_lock.values() {
-                    if HARDCODED_TOOLS.contains(&config.name.as_str()) {
-                        continue;
-                    }
-                    if !config.enabled {
-                        tracing::debug!(
-                            "Skipping disabled tool '{}' during list_tools",
-                            config.name
-                        );
-                        continue;
-                    }
-
-                    // Progressive disclosure: only show tools whose bundle has been revealed
-                    if let Some(ref disclosed_set) = disclosed
-                        && self.is_bundle_tool(&config.name)
-                        && !self.is_tool_disclosed(&config.name, disclosed_set)
-                    {
-                        tracing::debug!(
-                            "Skipping undisclosed bundle tool '{}' during list_tools",
-                            config.name
-                        );
-                        continue;
-                    }
-
-                    let tools_from_config = self.create_tools_from_config(config);
-                    tools.extend(tools_from_config);
+            let disclosed = self.disclosed_snapshot();
+            let configs_lock = self.configs.read().unwrap();
+            for config in configs_lock.values() {
+                if !self.is_config_visible_to_client(config, &disclosed) {
+                    continue;
                 }
+                tools.extend(self.create_tools_from_config(config));
             }
+            drop(configs_lock);
 
             Ok(ListToolsResult {
                 meta: None,
@@ -806,186 +829,22 @@ impl ServerHandler for AhmaMcpService {
     ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
         let span = tracing::info_span!("call_tool", tool = params.name.as_ref());
         async move {
-            let tool_name = params.name.as_ref();
-
-            if tool_name == "status" {
-                return self
-                    .handle_status(params.arguments.unwrap_or_default())
-                    .await;
-            }
-
-            if tool_name == "await" {
-                return self.handle_await(params).await;
-            }
-
-            if tool_name == "sandboxed_shell" {
-                return self.handle_sandboxed_shell(params, context).await;
-            }
-
-            if tool_name == "cancel" {
-                return self
-                    .handle_cancel(params.arguments.unwrap_or_default())
-                    .await;
-            }
-
-            if tool_name == "activate_tools" {
-                return self
-                    .handle_discover_tools(params.arguments.unwrap_or_default())
-                    .await;
-            }
-
-            // Delay tool execution until sandbox is initialized from roots/list.
-            // This is critical in HTTP bridge mode with deferred sandbox initialization.
-            if !self.adapter.sandbox().is_ready_for_tool_calls() {
-                let error_message = "Sandbox initializing from client roots - retry tools/call after roots/list completes".to_string();
-                tracing::warn!("{}", error_message);
-                return Err(handlers::common::mcp_internal(error_message));
-            }
-
-            // Find tool configuration
-            // Acquire read lock for configs, clone the config, and drop the lock immediately.
-            // If the tool name contains '_', it may be a flattened subcommand name
-            // (e.g. "file-tools_hello" → parent "file-tools", subcommand "hello").
-            let (config, flattened_subcommand) = {
-                let configs_lock = self.configs.read().unwrap();
-                if let Some(config) = configs_lock.get(tool_name) {
-                    (config.clone(), None)
-                } else if let Some((parent, sub_path)) =
-                    Self::resolve_flattened_tool(tool_name, &configs_lock)
-                {
-                    (parent.clone(), Some(sub_path))
-                } else {
-                    let error_message = format!("Tool '{}' not found.", tool_name);
-                    tracing::error!("{}", error_message);
-                    return Err(McpError::invalid_params(
-                        error_message,
-                        Some(serde_json::json!({ "tool_name": tool_name })),
-                    ));
+            match params.name.as_ref() {
+                "status" => {
+                    self.handle_status(params.arguments.unwrap_or_default())
+                        .await
                 }
-            };
-
-            if !config.enabled {
-                let error_message = format!(
-                    "Tool '{}' is unavailable because its runtime availability probe failed",
-                    tool_name
-                );
-                tracing::error!("{}", error_message);
-                return Err(McpError::invalid_request(error_message, None));
-            }
-
-            // Check if this is a sequence tool
-            if config.sequence.is_some() {
-                return sequence::handle_sequence_tool(
-                    &self.adapter,
-                    &self.operation_monitor,
-                    &self.configs,
-                    &config,
-                    params,
-                    context,
-                )
-                .await;
-            }
-
-            // Check if this is a livelog tool (long-running LLM-monitored log source)
-            if config.tool_type == Some(crate::config::ToolType::Livelog) {
-                return self.handle_livelog_call(&config, &params, &context).await;
-            }
-
-            let mut arguments = params.arguments.clone().unwrap_or_default();
-            // Use flattened subcommand path if resolved, otherwise use the "subcommand" argument
-            let subcommand_name = flattened_subcommand.or_else(|| {
-                arguments
-                    .remove("subcommand")
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-            });
-
-            // Find the subcommand config and construct the command parts
-            let (subcommand_config, command_parts) =
-                match subcommand::find_subcommand_config_from_args(&config, subcommand_name.clone())
-                {
-                    Some(result) => result,
-                    None => {
-                        return Err(Self::subcommand_not_found_error(
-                            tool_name,
-                            &config,
-                            subcommand_name,
-                        ));
-                    }
-                };
-
-            // Check if the subcommand itself is a sequence
-            if subcommand_config.sequence.is_some() {
-                return sequence::handle_subcommand_sequence(
-                    &self.adapter,
-                    &config,
-                    subcommand_config,
-                    params,
-                    context,
-                )
-                .await;
-            }
-
-            let base_command = command_parts.join(" ");
-
-            let working_directory = arguments
-                .get("working_directory")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    if self.adapter.sandbox().is_test_mode() {
-                        None
-                    } else {
-                        self.adapter
-                            .sandbox()
-                            .scopes()
-                            .first()
-                            .map(|p| p.to_string_lossy().to_string())
-                    }
-                })
-                .unwrap_or_else(|| ".".to_string());
-
-            let timeout = arguments.get("timeout_seconds").and_then(|v| v.as_u64());
-            let execution_mode = self.determine_execution_mode(
-                subcommand_config,
-                &config,
-                arguments.get("execution_mode").and_then(|v| v.as_str()),
-            );
-
-            let id = format!("op_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
-            let progress_token = context.meta.get_progress_token();
-            let client_type = McpClientType::from_peer(&context.peer);
-
-            match execution_mode {
-                crate::adapter::ExecutionMode::Synchronous => {
-                    self.call_sync_tool(
-                        id,
-                        &base_command,
-                        &working_directory,
-                        arguments,
-                        timeout,
-                        subcommand_config,
-                        progress_token,
-                        client_type,
-                        context.peer.clone(),
-                    )
-                    .await
+                "await" => self.handle_await(params).await,
+                "sandboxed_shell" => self.handle_sandboxed_shell(params, context).await,
+                "cancel" => {
+                    self.handle_cancel(params.arguments.unwrap_or_default())
+                        .await
                 }
-                crate::adapter::ExecutionMode::AsyncResultPush => {
-                    self.call_async_tool(
-                        tool_name,
-                        id,
-                        &base_command,
-                        &working_directory,
-                        arguments,
-                        timeout,
-                        subcommand_config,
-                        &config,
-                        progress_token,
-                        client_type,
-                        context.peer.clone(),
-                    )
-                    .await
+                "activate_tools" => {
+                    self.handle_discover_tools(params.arguments.unwrap_or_default())
+                        .await
                 }
+                _ => self.dispatch_configured_tool(params, context).await,
             }
         }
         .instrument(span)
@@ -993,6 +852,173 @@ impl ServerHandler for AhmaMcpService {
 }
 
 impl AhmaMcpService {
+    /// Routes a `tools/call` for a configured (non-built-in) tool. Validates
+    /// the sandbox is locked, resolves the tool config, and dispatches by
+    /// tool type (sequence / livelog / subcommand).
+    async fn dispatch_configured_tool(
+        &self,
+        params: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool_name = params.name.as_ref();
+
+        // Delay tool execution until sandbox is initialized from roots/list.
+        // This is critical in HTTP bridge mode with deferred sandbox initialization.
+        if !self.adapter.sandbox().is_ready_for_tool_calls() {
+            let error_message = "Sandbox initializing from client roots - retry tools/call after roots/list completes".to_string();
+            tracing::warn!("{}", error_message);
+            return Err(handlers::common::mcp_internal(error_message));
+        }
+
+        // Resolve the tool name (handling flattened `parent_sub` subcommand names).
+        let (config, flattened_subcommand) = match self.find_tool_config(tool_name) {
+            Some(pair) => pair,
+            None => {
+                let error_message = format!("Tool '{}' not found.", tool_name);
+                tracing::error!("{}", error_message);
+                return Err(McpError::invalid_params(
+                    error_message,
+                    Some(serde_json::json!({ "tool_name": tool_name })),
+                ));
+            }
+        };
+
+        if !config.enabled {
+            let error_message = format!(
+                "Tool '{}' is unavailable because its runtime availability probe failed",
+                tool_name
+            );
+            tracing::error!("{}", error_message);
+            return Err(McpError::invalid_request(error_message, None));
+        }
+
+        if config.sequence.is_some() {
+            return sequence::handle_sequence_tool(
+                &self.adapter,
+                &self.operation_monitor,
+                &self.configs,
+                &config,
+                params,
+                context,
+            )
+            .await;
+        }
+
+        if config.tool_type == Some(crate::config::ToolType::Livelog) {
+            return self.handle_livelog_call(&config, &params, &context).await;
+        }
+
+        self.dispatch_subcommand_tool(params, context, config, flattened_subcommand)
+            .await
+    }
+
+    /// Resolves the subcommand from arguments, then dispatches either as a
+    /// subcommand sequence or a regular sync/async execution.
+    async fn dispatch_subcommand_tool(
+        &self,
+        params: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+        config: ToolConfig,
+        flattened_subcommand: Option<String>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool_name = params.name.as_ref().to_string();
+        let mut arguments = params.arguments.clone().unwrap_or_default();
+        let subcommand_name = flattened_subcommand.or_else(|| {
+            arguments
+                .remove("subcommand")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        });
+
+        let (subcommand_config, command_parts) =
+            match subcommand::find_subcommand_config_from_args(&config, subcommand_name.clone()) {
+                Some(result) => result,
+                None => {
+                    return Err(Self::subcommand_not_found_error(
+                        &tool_name,
+                        &config,
+                        subcommand_name,
+                    ));
+                }
+            };
+
+        if subcommand_config.sequence.is_some() {
+            return sequence::handle_subcommand_sequence(
+                &self.adapter,
+                &config,
+                subcommand_config,
+                params,
+                context,
+            )
+            .await;
+        }
+
+        let base_command = command_parts.join(" ");
+        let working_directory = self.resolve_working_directory(&arguments);
+        let timeout = arguments.get("timeout_seconds").and_then(|v| v.as_u64());
+        let execution_mode = self.determine_execution_mode(
+            subcommand_config,
+            &config,
+            arguments.get("execution_mode").and_then(|v| v.as_str()),
+        );
+
+        let id = format!("op_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
+        let progress_token = context.meta.get_progress_token();
+        let client_type = McpClientType::from_peer(&context.peer);
+
+        match execution_mode {
+            crate::adapter::ExecutionMode::Synchronous => {
+                self.call_sync_tool(
+                    id,
+                    &base_command,
+                    &working_directory,
+                    arguments,
+                    timeout,
+                    subcommand_config,
+                    progress_token,
+                    client_type,
+                    context.peer.clone(),
+                )
+                .await
+            }
+            crate::adapter::ExecutionMode::AsyncResultPush => {
+                self.call_async_tool(
+                    &tool_name,
+                    id,
+                    &base_command,
+                    &working_directory,
+                    arguments,
+                    timeout,
+                    subcommand_config,
+                    &config,
+                    progress_token,
+                    client_type,
+                    context.peer.clone(),
+                )
+                .await
+            }
+        }
+    }
+
+    /// Picks the working directory for a tool call: explicit argument first,
+    /// then the first sandbox scope (skipped in test mode), then ".".
+    fn resolve_working_directory(
+        &self,
+        arguments: &serde_json::Map<String, serde_json::Value>,
+    ) -> String {
+        if let Some(path) = arguments.get("working_directory").and_then(|v| v.as_str()) {
+            return path.to_string();
+        }
+        if self.adapter.sandbox().is_test_mode() {
+            return ".".to_string();
+        }
+        self.adapter
+            .sandbox()
+            .scopes()
+            .first()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string())
+    }
+
     async fn handle_livelog_call(
         &self,
         config: &ToolConfig,
@@ -1101,14 +1127,6 @@ impl AhmaMcpService {
     ///
     /// This is useful for testing and introspection.
     pub fn list_tool_names(&self) -> Vec<String> {
-        const HARDCODED_TOOLS: &[&str] = &[
-            "await",
-            "status",
-            "sandboxed_shell",
-            "cancel",
-            "activate_tools",
-        ];
-
         let mut names: Vec<String> =
             vec!["await".into(), "status".into(), "sandboxed_shell".into()];
 
@@ -1116,27 +1134,12 @@ impl AhmaMcpService {
             names.push("activate_tools".into());
         }
 
-        let disclosed = if self.progressive_disclosure {
-            Some(self.disclosed_bundles.read().unwrap().clone())
-        } else {
-            None
-        };
-
+        let disclosed = self.disclosed_snapshot();
         let configs_lock = self.configs.read().unwrap();
         for config in configs_lock.values() {
-            if HARDCODED_TOOLS.contains(&config.name.as_str()) {
-                continue;
+            if self.is_config_visible_to_client(config, &disclosed) {
+                names.push(config.name.clone());
             }
-            if !config.enabled {
-                continue;
-            }
-            if let Some(ref disclosed_set) = disclosed
-                && self.is_bundle_tool(&config.name)
-                && !self.is_tool_disclosed(&config.name, disclosed_set)
-            {
-                continue;
-            }
-            names.push(config.name.clone());
         }
         names
     }
@@ -1677,6 +1680,7 @@ mod tests {
             monitor_stream: None,
             tool_type: None,
             livelog: None,
+            ..Default::default()
         };
 
         let tools = service.create_tools_from_config(&tool_config);

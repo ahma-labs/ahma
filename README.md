@@ -120,6 +120,104 @@ See [docs/live-log-monitoring.md](docs/live-log-monitoring.md) for setup, the An
 - **Agent skills**: Optional agent-specific setup is documented in [docs/agent-skills.md](docs/agent-skills.md).
 - **Code complexity analysis**: `ahma simplify` analyzes source files and returns structured AI fix instructions. See [SIMPLIFY.md](SIMPLIFY.md).
 
+---
+
+## v0.7 Experimental Features
+
+The following capabilities were introduced in v0.7. They are functional and tested but their APIs and configuration formats may change before stabilisation. Each is opt-in — existing workflows are unaffected.
+
+### Security rationale
+
+Every v0.7 feature was designed around the principle that **the kernel sandbox is the trust boundary, not a classifier or a user-discipline rule**. The design was informed by documented weaknesses in cloud agent tools:
+
+- Prompt injection can bypass any filter with non-zero probability. Ahma's response is to make the *consequences* of a successful injection bounded by the kernel sandbox scope, not to prevent injection entirely.
+- Folder-level permission grants that survive a whole session give too much access for too long. Task vaults enforce the per-task folder discipline that responsible users already practice — but make it the only option.
+- Network egress from agent subprocesses is not controlled by filesystem sandboxing alone. The egress sandbox adds a deny-by-default HTTP proxy layer.
+- Long unattended sessions are the highest-risk usage pattern. The renewal contract halts them automatically.
+
+### Task Vaults — isolated per-question working directories
+
+```bash
+VAULT=$(ahma vault create my-question)
+ahma serve stdio --task-vault "$VAULT"
+ahma vault list
+```
+
+Each vault gets its own kernel sandbox scope (`workdir/`), input copies, output directory, two-phase delete staging (`trash/`), and append-only audit log. There is no "grant my whole Documents folder" option — the vault is the only scope.
+
+See [docs/task-vault.md](docs/task-vault.md).
+
+### Decompose — split complex questions across local LLMs
+
+```bash
+# .ahma/decompose.json ships pre-configured for gemma4 via Ollama
+ollama pull gemma4
+# Then ask your agent: use the decompose tool to answer "..."
+```
+
+The `decompose` MTDF tool type breaks a question into sub-questions, runs them concurrently against a local model, and aggregates results with a deterministic Rust reducer. No cloud egress required.
+
+See [docs/decompose.md](docs/decompose.md).
+
+### TUI — terminal dashboard and approval gates
+
+```bash
+ahma tui
+ahma tui --connect http://localhost:8080
+```
+
+A terminal dashboard for monitoring active operations and handling approval gates (renewal checkpoints, elevation requests, deletion confirmations).
+
+See [docs/tui.md](docs/tui.md).
+
+### Egress Sandbox — per-task outbound network control
+
+Every vault has an `egress.allowlist` file. An HTTP proxy enforces it for all subprocess traffic. Default: deny all outbound connections. Local Ollama (localhost) is always excluded from the proxy.
+
+See [docs/egress-sandbox.md](docs/egress-sandbox.md).
+
+### Interactive HTML Artifacts
+
+Tools can emit `outputs/result.html` — a self-contained artifact with embedded data, rendered tables, and a local-LLM chat widget. The user opens it in a browser and keeps iterating without re-engaging the agent.
+
+See [docs/artifacts.md](docs/artifacts.md).
+
+### Worker Code Synthesis — ephemeral Rust/Python programs
+
+The `worker` MTDF tool type compiles and runs synthesized code inside the vault sandbox. Because the program runs without an LLM in the execution loop, it cannot be re-injected mid-run. Source is deleted after execution unless `keep_source: true`.
+
+See [docs/worker-synthesis.md](docs/worker-synthesis.md).
+
+### Bundle Audit — supply-chain security for MTDF bundles
+
+```bash
+ahma bundle audit /path/to/bundle
+ahma bundle sign   /path/to/bundle
+ahma bundle verify /path/to/bundle
+```
+
+Scans for embedded secrets, missing path validation, and prompt-injection payloads in tool JSON files before they are loaded.
+
+See [docs/bundle-audit.md](docs/bundle-audit.md).
+
+### Local Cluster Scheduler
+
+Routes decompose sub-tasks to `ahma worker` peers on your LAN or Tailscale mesh. Each peer runs its own local model. Static peer configuration is functional; mDNS peer discovery is planned.
+
+See [docs/cluster-scheduler.md](docs/cluster-scheduler.md).
+
+### Renewal Contract — automatic halt for unattended sessions
+
+Any operation running unattended beyond `T_renew` seconds (default 5 minutes) is automatically halted, a checkpoint is written to the vault, and the TUI prompts for re-approval. This closes the "long unattended run" risk class.
+
+See [docs/renewal-contract.md](docs/renewal-contract.md).
+
+### ahma_core — embedding Ahma in Rust applications
+
+The `ahma_core` crate exposes vaults, orchestration, egress, workers, and the renewal contract as a library for embedding in other Rust applications.
+
+See [docs/ahma-core-library.md](docs/ahma-core-library.md).
+
 ## MCP Server Connection Modes
 
 `ahma` supports **STDIO** (default — IDE spawns a subprocess per workspace), **HTTP Bridge** (proxy for web clients and debugging), and **HTTP Streaming** (MCP Streamable HTTP with event replay and full-duplex).

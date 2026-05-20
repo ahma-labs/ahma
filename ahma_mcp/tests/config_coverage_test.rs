@@ -150,6 +150,7 @@ fn test_tool_config_serialization_roundtrip() {
         monitor_stream: None,
         tool_type: None,
         livelog: None,
+        ..Default::default()
     };
 
     let serialized = serde_json::to_string(&config).unwrap();

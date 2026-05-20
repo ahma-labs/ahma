@@ -91,6 +91,7 @@ fn base_tool(command: &str) -> ToolConfig {
         monitor_stream: None,
         tool_type: None,
         livelog: None,
+        ..Default::default()
     }
 }
 

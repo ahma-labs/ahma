@@ -1,0 +1,27 @@
+{
+    "name": "decompose",
+    "description": "Split a complex business question into smaller sub-questions, dispatch each to a local LLM (e.g. gemma4 via Ollama), and aggregate the results into a single answer. Returns immediately with an operation ID; the aggregated answer is pushed as a progress notification. Use `await` with the operation ID to retrieve the full result.",
+    "command": "decompose",
+    "tool_type": "decompose",
+    "enabled": true,
+    "synchronous": false,
+    "timeout_seconds": 300,
+    "decompose": {
+        "llm_provider": {
+            "base_url": "http://localhost:11434/v1",
+            "model": "gemma4"
+        },
+        "max_subtasks": 5,
+        "max_concurrent": 3,
+        "reduce_mode": "summarize",
+        "llm_timeout_seconds": 60
+    },
+    "hints": {
+        "custom": {
+            "usage": "Call with a complex question as the input. The tool will decompose it into sub-questions, run each against the local LLM, and return a summarized answer.",
+            "local_llm": "Requires Ollama running on port 11434 with gemma4 pulled. Run: ollama pull gemma4",
+            "models": "Change llm_provider.model in .ahma/decompose.json to use a different local model.",
+            "privacy": "All LLM calls stay on your machine — no data is sent to cloud providers."
+        }
+    }
+}

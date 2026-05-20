@@ -232,7 +232,9 @@ async fn test_sandboxed_shell_builtin_without_json_file() -> anyhow::Result<()> 
         sandboxed_shell
             .description
             .as_ref()
-            .map(|d| d.contains("sandboxed_shell") || d.contains("sandbox") || d.contains("operation_id"))
+            .map(|d| d.contains("sandboxed_shell")
+                || d.contains("sandbox")
+                || d.contains("operation_id"))
             .unwrap_or(false),
         "sandboxed_shell should have proper description. Got: {:?}",
         sandboxed_shell.description

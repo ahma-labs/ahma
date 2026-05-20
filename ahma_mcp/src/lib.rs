@@ -150,6 +150,35 @@ pub mod utils;
 /// Tool configuration validation.
 pub mod validation;
 
+// ── New modules (roadmap milestones) ─────────────────────────────────────────
+
+/// Task Vault: per-question isolated working directories with audit + trash (M1).
+pub mod vault;
+
+/// Decompose tool type: split questions → local LLM sub-tasks → reduce (M2).
+pub mod decompose;
+
+/// TUI control plane: ratatui-based terminal dashboard (M3).
+pub mod tui;
+
+/// Egress sandbox: per-task HTTP proxy with domain allowlist (M3).
+pub mod egress;
+
+/// HTML+WASM artifact channel: interactive output with embedded LLM chat (T2.1).
+pub mod artifact;
+
+/// Ephemeral worker code synthesis: compile+run Rust/Python in a sub-vault (T2.2).
+pub mod worker;
+
+/// Bundle signing and supply-chain auditor (T2.3).
+pub mod bundle;
+
+/// Local cluster scheduler: mDNS peer discovery + signed task dispatch (T3.1).
+pub mod cluster;
+
+/// Renewal contract for long-running tasks (T3.4).
+pub mod renewal;
+
 // Test utilities
 /// Test helpers for integration and unit tests.
 pub mod test_utils;

@@ -435,6 +435,91 @@ The `source_command` executes inside the same sandbox scope as all other tools (
 
 ---
 
+### 5.6 Decompose Tool Type
+
+Set `"tool_type": "decompose"` to split a complex business question into smaller sub-questions, dispatch each to a local LLM, and aggregate the results with a deterministic Rust reducer.  **No cloud egress required** — uses the same `LlmProviderConfig` as `livelog`.
+
+#### Fields
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `tool_type` | No | `"command"` | Set to `"decompose"` to activate |
+| `decompose` | Yes (when `tool_type=decompose`) | — | `DecomposeConfig` block |
+
+**`DecomposeConfig` fields:**
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `llm_provider` | Yes | — | `LlmProviderConfig` — prefer small local models (`gemma3:4b`, `llama3.2:3b`) |
+| `max_subtasks` | No | `5` | Maximum sub-questions to generate |
+| `max_concurrent` | No | `3` | Sub-questions to run concurrently (keep low for single-machine Ollama) |
+| `reduce_mode` | No | `"summarize"` | How to combine results: `summarize`, `extract_fields`, `classify`, `concat`, `first` |
+| `answer_prompt` | No | `"Answer concisely"` | System prompt for each sub-question LLM call |
+| `llm_timeout_seconds` | No | `30` | Timeout per LLM call |
+
+#### Pipeline
+
+1. `tools/call` returns an `operation_id` immediately.
+2. The orchestrator asks the LLM to split the question into up to `max_subtasks` sub-questions.
+3. Sub-questions are dispatched in batches of `max_concurrent` to the LLM.
+4. Results are aggregated by the deterministic `Reducer` (no additional LLM call).
+5. The aggregated answer is pushed as a `ProgressUpdate` notification.
+
+#### Example (`.ahma/decompose.json`)
+
+See the ready-to-use config in [`.ahma/decompose.json`](.ahma/decompose.json).
+
+---
+
+### 5.7 Worker Tool Type
+
+Set `"tool_type": "worker"` to compile and run synthesized Rust or Python code inside a sub-vault.  The synthesized program is deterministic code — it cannot be re-injected mid-run.
+
+#### Fields
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `tool_type` | No | `"command"` | Set to `"worker"` to activate |
+| `worker` | Yes (when `tool_type=worker`) | — | `WorkerConfig` block |
+
+**`WorkerConfig` fields:**
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `language` | No | `"rust"` | `"rust"` (requires `rustc`) or `"python"` (requires `python3`) |
+| `extra_args` | No | `[]` | Additional compiler / interpreter arguments |
+| `keep_source` | No | `false` | Retain the synthesized source file after execution |
+| `timeout_seconds` | No | `60` | Execution timeout |
+
+#### Security properties
+
+- Worker executes inside the vault's `workdir/` kernel sandbox scope.
+- Source hash (SHA-256-like digest) is recorded in `audit.jsonl`.
+- Source is deleted after execution unless `keep_source: true`.
+
+---
+
+### 5.8 Task Vault
+
+Each `ahma vault create <slug>` call produces a directory tree at
+`~/.ahma/tasks/<utc-date>-<slug>-<hex>/`:
+
+```
+inputs/       — copies of user-provided files (read intent)
+workdir/      — kernel sandbox scope root
+outputs/      — tool artifacts (HTML reports, CSV exports)
+trash/        — staged deletions (two-phase delete)
+audit.jsonl   — append-only event log
+egress.allowlist — per-task outbound domain allowlist
+```
+
+Use `--task-vault <path>` on `ahma serve http` or `ahma serve stdio` to set
+the sandbox scope to `<vault>/workdir/` and wire the audit log and trash.
+
+See [docs/security-sandbox.md](docs/security-sandbox.md) for full documentation.
+
+---
+
 ## 6. Usage Modes
 
 ### 6.1 STDIO Mode (Default)
@@ -527,6 +612,49 @@ ahma --list-tools --http http://localhost:3000
 ---
 
 ## 8. Development Workflow
+
+### 8.0 Documentation Requirements
+
+#### R-DOC: Feature Documentation Contract
+
+Every major feature in ahma **must** have a corresponding page in `docs/` and an entry in `README.md`. This applies to both stable and experimental features.
+
+**R-DOC.1 — Dedicated doc page**: Each major feature **must** have its own `docs/<feature>.md` file with:
+- A clear statement of whether the feature is stable or **Experimental** (version introduced).
+- A motivating "Why" paragraph explaining the security or usability rationale.
+- A practical quickstart with runnable commands or code.
+- A reference table of configuration options where applicable.
+- A "See also" section linking to related docs and the relevant SPEC.md section.
+
+**R-DOC.2 — README entry**: Each major feature **must** have a brief entry in `README.md` under the appropriate section (stable features) or the "vX.Y Experimental Features" section (new/unstable features). The entry **must** link to the dedicated doc page.
+
+**R-DOC.3 — SPEC.md accuracy**: When a feature's behaviour is changed, the corresponding SPEC.md section and its `docs/<feature>.md` page **must** be updated in the same commit or PR.
+
+**R-DOC.4 — Experimental graduation**: When an experimental feature is stabilised, its doc page **must** remove the "Experimental" notice, update SPEC.md status to `tests-pass`, and move its README entry from the "Experimental" section to the appropriate stable section.
+
+**R-DOC.5 — Removal**: When a feature is removed, its `docs/<feature>.md` **must** be deleted and all README and SPEC.md references **must** be removed in the same commit.
+
+**R-DOC.6 — No orphan docs**: Every file in `docs/` **must** be referenced from at least one of: `README.md`, `SPEC.md`, or another `docs/*.md` file. Orphan documentation is misleading and should not accumulate.
+
+| Feature area | Stable doc | SPEC.md section |
+|---|---|---|
+| Kernel sandbox | [docs/security-sandbox.md](docs/security-sandbox.md) | R5, R6 |
+| Connection modes | [docs/connection-modes.md](docs/connection-modes.md) | §6 |
+| Custom tools / MTDF | [docs/custom-tools.md](docs/custom-tools.md) | §5 |
+| Live log monitoring | [docs/live-log-monitoring.md](docs/live-log-monitoring.md) | §5.5 |
+| Environment variables | [docs/environment-variables.md](docs/environment-variables.md) | — |
+| Installation | [docs/installation.md](docs/installation.md) | — |
+| Session isolation | [docs/session-isolation.md](docs/session-isolation.md) | R10 |
+| Task vaults | [docs/task-vault.md](docs/task-vault.md) | §5.8 |
+| Decompose | [docs/decompose.md](docs/decompose.md) | §5.6 |
+| TUI | [docs/tui.md](docs/tui.md) | — |
+| Egress sandbox | [docs/egress-sandbox.md](docs/egress-sandbox.md) | — |
+| Artifacts | [docs/artifacts.md](docs/artifacts.md) | — |
+| Worker synthesis | [docs/worker-synthesis.md](docs/worker-synthesis.md) | §5.7 |
+| Bundle audit | [docs/bundle-audit.md](docs/bundle-audit.md) | — |
+| Cluster scheduler | [docs/cluster-scheduler.md](docs/cluster-scheduler.md) | — |
+| Renewal contract | [docs/renewal-contract.md](docs/renewal-contract.md) | — |
+| ahma_core library | [docs/ahma-core-library.md](docs/ahma-core-library.md) | — |
 
 ### 8.1 Core Principle: Use Ahma
 
