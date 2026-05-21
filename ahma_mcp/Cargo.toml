@@ -25,6 +25,7 @@ ctrlc.workspace = true
 directories.workspace = true
 dirs.workspace = true
 dunce.workspace = true
+flate2 = "1.1"
 futures.workspace = true
 notify = "8.2"
 opentelemetry-otlp = { workspace = true }
@@ -41,7 +42,10 @@ rust-code-analysis = { git = "https://github.com/paulirotta/rust-code-analysis.g
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2 = "0.10"
+tar = "0.4"
 tempfile.workspace = true
+zip = "2.2"
 thiserror.workspace = true
 tokio-util.workspace = true
 tokio = "1.52"

@@ -6,11 +6,7 @@
 #
 # Updates:
 #   - Cargo.toml                  [workspace.package] version = "X.Y.Z"
-#   - skills/ahma/SKILL.md        version: X.Y.Z
-#   - scripts/install.sh          AHMA_VERSION="X.Y.Z"
-#   - scripts/install.ps1         version: X.Y.Z (YAML frontmatter)
-#   - scripts/install.ps1         <!-- version: X.Y.Z | ... --> (HTML comment)
-#   - scripts/install.ps1         Install-OneSkill -Version 'X.Y.Z'
+#   - skills/ahma/SKILL.md        version: X.Y.Z (YAML frontmatter and HTML comment)
 #
 # After updating, runs the version-consistency test to verify.
 
@@ -54,22 +50,10 @@ replace() {
 replace "s|^(version = \")${CUR_VER}\"|\${1}${NEW_VER}\"|" Cargo.toml
 echo "  OK Cargo.toml"
 
-# 2. skills/ahma/SKILL.md: version: X.Y.Z
+# 2. skills/ahma/SKILL.md: version: X.Y.Z and HTML comment
 replace "s|^(version: )${CUR_VER}|\${1}${NEW_VER}|" skills/ahma/SKILL.md
+replace "s|(<!-- version: )${CUR_VER}( \|)|\${1}${NEW_VER}\${2}|" skills/ahma/SKILL.md
 echo "  OK skills/ahma/SKILL.md"
-
-# 3. scripts/install.sh: AHMA_VERSION="X.Y.Z"
-replace "s|^(AHMA_VERSION=\")${CUR_VER}\"|\${1}${NEW_VER}\"|" scripts/install.sh
-echo "  OK scripts/install.sh"
-
-# 4. scripts/install.ps1 — three patterns:
-#    a) YAML frontmatter line:  "    version: X.Y.Z"
-replace "s|(^\s+version: )${CUR_VER}|\${1}${NEW_VER}|" scripts/install.ps1
-#    b) HTML comment:           "<!-- version: X.Y.Z | ... -->"
-replace "s|(<!-- version: )${CUR_VER}( \|)|\${1}${NEW_VER}\${2}|" scripts/install.ps1
-#    c) Install-OneSkill call:  "Install-OneSkill -Name 'ahma' -Version 'X.Y.Z'"
-replace "s|(Install-OneSkill\b[^']*-Version ')${CUR_VER}'|\${1}${NEW_VER}'|" scripts/install.ps1
-echo "  OK scripts/install.ps1"
 
 echo ""
 echo "Verifying with nextest..."
@@ -77,5 +61,5 @@ cargo nextest run -E 'test(skill_versions)'
 echo ""
 echo "Done. Version bumped to $NEW_VER."
 echo "Suggested commit:"
-echo "  git add Cargo.toml skills/ahma/SKILL.md scripts/install.sh scripts/install.ps1"
+echo "  git add Cargo.toml skills/ahma/SKILL.md"
 echo "  git commit -m \"chore(release): bump version to $NEW_VER\""

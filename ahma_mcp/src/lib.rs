@@ -145,6 +145,8 @@ pub mod tool_availability;
 pub mod tool_hints;
 /// Transport patching for stdio MCP.
 pub mod transport_patch;
+/// Self-update: release downloads and Git branch installs.
+pub mod update;
 /// Shared utilities.
 pub mod utils;
 /// Tool configuration validation.

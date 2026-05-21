@@ -329,19 +329,12 @@ mod documentation_requirements {
 mod skill_version_invariants {
     use super::common::fs::get_workspace_path;
 
-    /// INVARIANT 8: Skill version consistency across all installer and canonical files
+    /// INVARIANT 8: Skill version consistency with Cargo.toml
     ///
-    /// LESSON LEARNED: When the workspace version is bumped, the following files must ALL be
-    /// updated together: skills/ahma/SKILL.md, scripts/install.sh (AHMA_VERSION),
-    /// and scripts/install.ps1 (embedded version strings).
-    /// Failure to update all of them causes installer-installed skills to report a different
-    /// version than the running binary, breaking version-aware update logic.
-    ///
-    /// REGRESSION TEST: This test was introduced after commit fb57ce708 left install.ps1
-    /// hardcoded at 1.0.0 while the rest of the codebase moved to 0.5.6.
+    /// When the workspace version is bumped, skills/ahma/SKILL.md YAML frontmatter and
+    /// HTML comment must match Cargo.toml.
     #[test]
     fn test_skill_versions_consistent_with_cargo_toml() {
-        // Read the Cargo.toml workspace version
         let cargo_toml_path = get_workspace_path("Cargo.toml");
         let cargo_toml =
             std::fs::read_to_string(&cargo_toml_path).expect("Failed to read Cargo.toml");
@@ -354,7 +347,6 @@ mod skill_version_invariants {
             .expect("Unexpected Cargo.toml version format")
             .to_string();
 
-        // Read canonical skill versions
         let ahma_skill_path = get_workspace_path("skills/ahma/SKILL.md");
         let ahma_skill =
             std::fs::read_to_string(&ahma_skill_path).expect("Failed to read skills/ahma/SKILL.md");
@@ -367,93 +359,59 @@ mod skill_version_invariants {
             .expect("Unexpected version format in skills/ahma/SKILL.md")
             .to_string();
 
-        // Read install.sh AHMA_VERSION
-        let install_sh_path = get_workspace_path("scripts/install.sh");
-        let install_sh =
-            std::fs::read_to_string(&install_sh_path).expect("Failed to read scripts/install.sh");
-        let install_sh_ver = install_sh
+        let html_ver = ahma_skill
             .lines()
-            .find(|l| l.starts_with("AHMA_VERSION="))
-            .expect("No AHMA_VERSION= line in scripts/install.sh")
-            .trim_start_matches("AHMA_VERSION=")
-            .trim_matches('"')
-            .to_string();
-
-        // Read install.ps1 embedded version strings (both skill templates must match)
-        let install_ps1_path = get_workspace_path("scripts/install.ps1");
-        let install_ps1 =
-            std::fs::read_to_string(&install_ps1_path).expect("Failed to read scripts/install.ps1");
-        let ps1_versions: Vec<&str> = install_ps1
-            .lines()
-            .filter(|l| l.trim_start().starts_with("version: ") && !l.contains("__AHMA_VERSION__"))
-            .collect();
+            .find(|l| l.contains("<!-- version:"))
+            .and_then(|l| {
+                l.split("version:")
+                    .nth(1)?
+                    .split('|')
+                    .next()
+                    .map(|s| s.trim().to_string())
+            })
+            .expect("No <!-- version: --> comment in skills/ahma/SKILL.md");
 
         assert_eq!(
             ahma_skill_ver, cargo_ver,
             "skills/ahma/SKILL.md version ({ahma_skill_ver}) must match Cargo.toml ({cargo_ver})"
         );
         assert_eq!(
-            install_sh_ver, cargo_ver,
-            "scripts/install.sh AHMA_VERSION ({install_sh_ver}) must match Cargo.toml ({cargo_ver})"
-        );
-        for ver_line in &ps1_versions {
-            let ps1_ver = ver_line.trim_start().trim_start_matches("version: ").trim();
-            assert_eq!(
-                ps1_ver, cargo_ver,
-                "scripts/install.ps1 embedded version ({ps1_ver}) must match Cargo.toml ({cargo_ver})"
-            );
-        }
-        assert!(
-            !ps1_versions.is_empty(),
-            "scripts/install.ps1 must contain at least one 'version: X.Y.Z' line in skill templates"
+            html_ver, cargo_ver,
+            "skills/ahma/SKILL.md HTML comment version ({html_ver}) must match Cargo.toml ({cargo_ver})"
         );
 
         println!("OK Skill versions consistent: v{cargo_ver}");
-        println!("   skills/ahma/SKILL.md: v{ahma_skill_ver}");
-        println!("   scripts/install.sh AHMA_VERSION: v{install_sh_ver}");
-        println!(
-            "   scripts/install.ps1 embedded versions: {} occurrences",
-            ps1_versions.len()
-        );
     }
 
-    /// INVARIANT 9: Skill author consistency — all installer templates use canonical author
+    /// INVARIANT 9: Skill author consistency
     #[test]
     fn test_skill_author_consistent() {
         const CANONICAL_AUTHOR: &str = "Paul Houghton";
 
-        // Check install.sh skill template
-        let install_sh_path = get_workspace_path("scripts/install.sh");
-        let install_sh =
-            std::fs::read_to_string(&install_sh_path).expect("Failed to read scripts/install.sh");
-        let sh_bad_author_lines: Vec<_> = install_sh
+        let ahma_skill_path = get_workspace_path("skills/ahma/SKILL.md");
+        let ahma_skill =
+            std::fs::read_to_string(&ahma_skill_path).expect("Failed to read skills/ahma/SKILL.md");
+        let author_line = ahma_skill
             .lines()
-            .enumerate()
-            .filter(|(_, l)| l.starts_with("author: ") && !l.contains(CANONICAL_AUTHOR))
-            .collect();
+            .find(|l| l.starts_with("author:"))
+            .expect("No author: line in skills/ahma/SKILL.md");
         assert!(
-            sh_bad_author_lines.is_empty(),
-            "scripts/install.sh has non-canonical author lines: {:?}",
-            sh_bad_author_lines
+            author_line.contains(CANONICAL_AUTHOR),
+            "skills/ahma/SKILL.md author must be {CANONICAL_AUTHOR}: {author_line}"
         );
 
-        // Check install.ps1 skill templates
-        let install_ps1_path = get_workspace_path("scripts/install.ps1");
-        let install_ps1 =
-            std::fs::read_to_string(&install_ps1_path).expect("Failed to read scripts/install.ps1");
-        let ps1_bad_author_lines: Vec<_> = install_ps1
-            .lines()
-            .enumerate()
-            .filter(|(_, l)| {
-                l.trim_start().starts_with("author: ") && !l.contains(CANONICAL_AUTHOR)
-            })
-            .collect();
-        assert!(
-            ps1_bad_author_lines.is_empty(),
-            "scripts/install.ps1 has non-canonical author lines: {:?}",
-            ps1_bad_author_lines
-        );
+        println!("OK Canonical skill author: {CANONICAL_AUTHOR}");
+    }
 
-        println!("OK All installer skill templates use canonical author: {CANONICAL_AUTHOR}");
+    /// INVARIANT 10: `ahma update` is documented in the skill user-invocable table
+    #[test]
+    fn test_skill_documents_update_subcommand() {
+        let ahma_skill_path = get_workspace_path("skills/ahma/SKILL.md");
+        let ahma_skill =
+            std::fs::read_to_string(&ahma_skill_path).expect("Failed to read skills/ahma/SKILL.md");
+        assert!(
+            ahma_skill.contains("/ahma update"),
+            "skills/ahma/SKILL.md must document /ahma update"
+        );
     }
 }

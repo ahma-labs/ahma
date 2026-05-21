@@ -1,45 +1,82 @@
 # Installation
 
-The installation scripts detect your OS and architecture, download the latest release from GitHub, and install `ahma` to your local bin directory.
+## Update (recommended)
 
-## Install with the script
-
-**Linux / macOS** — installs to `~/.local/bin`:
+If `ahma` is already installed:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
+ahma update                    # latest published release
+ahma update 0.6.7              # specific release tag
+ahma update main               # build from Git branch
+ahma update feature/my-branch  # build from feature branch
 ```
 
-**Windows (PowerShell 5.1+)** — installs to `$HOME\.local\bin`:
+Use `--force` to reinstall when the version already matches. Use `--dry-run` to preview actions.
+
+Custom install location: `--install-dir ~/.local/bin` or `AHMA_INSTALL_DIR`.
+
+## First-time install
+
+You need `ahma` on PATH before `ahma update` works.
+
+### Linux / macOS
+
+**Latest (build from GitHub main via Cargo — requires [Rust](https://rustup.rs/)):**
+
+```bash
+cargo install --git https://github.com/paulirotta/ahma ahma_mcp --bin ahma --root ~/.local --locked --force
+```
+
+**Specific branch:**
+
+```bash
+cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root ~/.local --locked --force
+```
+
+**Unpushed local checkout:**
+
+```bash
+cargo install --path ahma_mcp --bin ahma --root ~/.local --locked --force
+```
+
+Ensure `~/.local/bin` is on your PATH:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Windows (PowerShell 5.1+)
+
+**Latest release (prebuilt binary):**
 
 ```powershell
 irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
 ```
 
-Supported binary platforms: Linux x86_64, Linux ARM64, Linux ARMv7 (Raspberry Pi 2/3), macOS ARM64 (Apple Silicon), Windows x86_64 (in progress). Musl builds are available for Linux x86_64 and ARM64. Windows releases are distributed as `.zip` archives.
+**Specific branch (builds via Cargo — requires Rust):**
 
-## What the installer does
+```powershell
+# Save script locally, then:
+.\install.ps1 feature/update
+```
 
-After installation, the script offers an interactive MCP setup wizard that can configure ahma as a global MCP server for supported clients such as VS Code, Claude Code, Cursor, and Antigravity.
+Or invoke Cargo directly:
 
-The wizard:
+```powershell
+cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root $HOME\.local --locked --force
+```
 
-- lets you choose which clients to configure
-- lets you choose stdio or HTTP connection mode
-- shows the proposed `mcp.json` changes before writing them
-- can install the optional `ahma` skill
+Ensure `$HOME\.local\bin` is on your PATH.
 
-If you want the optional skill setup details, see [docs/agent-skills.md](agent-skills.md).
-
-## Build from source
+## Build from source (full checkout)
 
 **Linux / macOS**
 
 ```bash
 git clone https://github.com/paulirotta/ahma.git
 cd ahma
-cargo build --release
-mv target/release/ahma /usr/local/bin/
+cargo build --release -p ahma_mcp
+mv target/release/ahma ~/.local/bin/
 ```
 
 **Windows (PowerShell)**
@@ -47,12 +84,18 @@ mv target/release/ahma /usr/local/bin/
 ```powershell
 git clone https://github.com/paulirotta/ahma.git
 cd ahma
-cargo build --release
+cargo build --release -p ahma_mcp
 Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 ```
 
 ## After installation
 
-For client configuration examples, see [docs/connection-modes.md](connection-modes.md).
+- Configure your MCP client — see [connection-modes.md](connection-modes.md).
+- Optional agent skill — see [agent-skills.md](agent-skills.md).
+- Restart MCP clients or reload your IDE after updating the binary.
 
-For the practical day-to-day usage model and sandbox behavior, return to [README.md](../README.md) and [docs/security-sandbox.md](security-sandbox.md).
+## Platform notes
+
+Supported prebuilt release platforms: Linux x86_64/arm64/armv7, macOS Apple Silicon, Windows x86_64. Musl builds are available for Linux x86_64 and ARM64 (`AHMA_PREFER_MUSL=1` during platform detection in `ahma update`).
+
+For sandbox behavior and day-to-day usage, see [README.md](../README.md) and [security-sandbox.md](security-sandbox.md).

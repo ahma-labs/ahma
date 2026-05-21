@@ -17,19 +17,41 @@ Ahma is an MCP server for running real project work through existing CLI tools w
 
 ## Quickstart
 
-**Linux / macOS**
+**Linux / macOS — first-time install**
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
+cargo install --git https://github.com/paulirotta/ahma ahma_mcp --bin ahma --root ~/.local --locked --force
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+**Install a specific branch (first time or after `ahma` is on PATH):**
+
+```bash
+# First time (no ahma yet)
+cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root ~/.local --locked --force
+
+# After ahma is installed
+ahma update feature/update
 ```
 
 **Windows (PowerShell 5.1+)**
 
 ```powershell
+# Latest release
 irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
+
+# Branch (requires Rust)
+cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root $HOME\.local --locked --force
 ```
 
-The installer downloads `ahma`, offers to configure your MCP client, and can install optional extras. See [docs/installation.md](docs/installation.md) for platform details, source installation, and what the setup wizard changes.
+**Update an existing install:**
+
+```bash
+ahma update              # latest release
+ahma update main         # build from branch
+```
+
+See [docs/installation.md](docs/installation.md) for platform details, source builds, and branch installs from local checkouts.
 
 ### Example workflow
 
