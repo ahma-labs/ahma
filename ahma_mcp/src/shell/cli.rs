@@ -13,6 +13,7 @@
 //! ahma tool validate [TARGET]
 //! ahma tool list [--server NAME] [--http URL] [--format json|text] [--mcp-config PATH]
 //! ahma tool info [--tools rust,git] [--format json|text] [TOOL]
+//! ahma update [REF] [--force] [--dry-run] [--install-dir PATH]
 //! ```
 //!
 //! Niche options that rarely need changing are controlled via environment variables.
@@ -515,6 +516,10 @@ async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
             tracing::info!("Running in simplify mode");
             crate::simplify::run(args)
         }
+        Subcommands::Update(args) => {
+            tracing::info!("Running in update mode");
+            crate::update::run(args).await
+        }
     }
 }
 
@@ -567,6 +572,8 @@ pub enum Subcommands {
     /// Analyze source code complexity and generate a simplicity report.
     #[cfg(feature = "simplify")]
     Simplify(crate::simplify::SimplifyArgs),
+    /// Download or build and install ahma.
+    Update(crate::update::UpdateArgs),
 }
 
 // ── serve ────────────────────────────────────────────────────────────────────
@@ -1936,6 +1943,50 @@ mod tests {
             assert!(s.tool_bundles.contains(&"python".to_string()));
         } else {
             panic!("expected serve stdio");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_update_defaults() {
+        let cli = Cli::try_parse_from(["ahma", "update"]).unwrap();
+        if let Subcommands::Update(args) = cli.command {
+            assert!(args.reference.is_none());
+            assert!(!args.force);
+            assert!(!args.dry_run);
+        } else {
+            panic!("expected update subcommand");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_update_branch_ref() {
+        let cli = Cli::try_parse_from(["ahma", "update", "feature/update"]).unwrap();
+        if let Subcommands::Update(args) = cli.command {
+            assert_eq!(args.reference.as_deref(), Some("feature/update"));
+        } else {
+            panic!("expected update subcommand");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_update_with_flags() {
+        let cli = Cli::try_parse_from([
+            "ahma",
+            "update",
+            "main",
+            "--force",
+            "--dry-run",
+            "--install-dir",
+            "/tmp/ahma-bin",
+        ])
+        .unwrap();
+        if let Subcommands::Update(args) = cli.command {
+            assert_eq!(args.reference.as_deref(), Some("main"));
+            assert!(args.force);
+            assert!(args.dry_run);
+            assert_eq!(args.install_dir, Some("/tmp/ahma-bin".into()));
+        } else {
+            panic!("expected update subcommand");
         }
     }
 

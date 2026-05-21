@@ -31,8 +31,8 @@ mkdir -p .agents/skills/ahma
 cp skills/ahma/SKILL.md .agents/skills/ahma/SKILL.md
 ```
 
-Once installed, agents load the skill automatically when you ask about ahma, sandboxed execution, code complexity, or simplification. In Cursor you can also attach it explicitly with `@ahma`. Invoke sub-workflows with `/ahma simplify`, `/ahma help`, etc.
+Once installed, agents load the skill automatically when you ask about ahma, sandboxed execution, code complexity, or simplification. In Cursor you can also attach it explicitly with `@ahma`. Invoke sub-workflows with `/ahma simplify`, `/ahma update`, `/ahma help`, etc.
 
-The installation script can offer this automatically after the main MCP setup flow. See [docs/installation.md](installation.md).
+Install or upgrade the binary with `ahma update` (see [installation.md](installation.md)).
 
 For code complexity analysis details, see [SIMPLIFY.md](../SIMPLIFY.md).

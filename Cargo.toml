@@ -25,7 +25,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 rust-version = "1.95.0"
-version = "0.6.6"
+version = "0.6.7"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -38,7 +38,7 @@ dirs = "6.0"
 dunce = "1.0"
 futures = "0.3.32"
 landlock = "0.4.4"
-opentelemetry = { version = "0.31.0", features = ["trace"] }
+opentelemetry = { version = "0.32.0", features = ["trace"] }
 # Windows-only kernel binding crate (only fetched when compiling for Windows)
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
@@ -49,11 +49,11 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
-opentelemetry-otlp = { version = "0.31.1", features = [
+opentelemetry-otlp = { version = "0.32.0", features = [
     "http-proto",
     "reqwest-rustls",
 ] }
-opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32.0", features = ["rt-tokio"] }
 regex = "1.12"
 reqwest = { version = "0.13.3", default-features = false }
 rmcp = { version = "1.7", features = [
@@ -82,7 +82,7 @@ tokio-util = "0.7.18"
 toml = "1.1"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 url = "2.5"
 
