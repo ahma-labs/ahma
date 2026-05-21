@@ -111,7 +111,10 @@ fn detect_linux_musl() -> bool {
         .arg("--version")
         .output()
         .ok()
-        .and_then(|o| String::from_utf8(o.stderr.or(o.stdout).ok()?).ok())
+        .and_then(|o| {
+            let bytes = if !o.stderr.is_empty() { o.stderr } else { o.stdout };
+            String::from_utf8(bytes).ok()
+        })
         .map(|s| s.to_ascii_lowercase().contains("musl"))
         .unwrap_or(false)
 }
