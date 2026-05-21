@@ -281,6 +281,9 @@ mod tests {
         let log_path = tmp.path().join("sub").join("audit.jsonl");
         let writer = AuditWriter::new(&log_path);
         let result = writer.task_halted("op_1", "test").await;
-        assert!(result.is_err(), "missing parent dir should produce an error");
+        assert!(
+            result.is_err(),
+            "missing parent dir should produce an error"
+        );
     }
 }

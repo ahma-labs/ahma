@@ -84,9 +84,14 @@ impl WorkerRunner {
         }
 
         info!("Running compiled Rust worker");
-        let run_output =
-            run_with_timeout(bin_path.to_str().unwrap(), &[], &self.workdir, &None, timeout)
-                .await?;
+        let run_output = run_with_timeout(
+            bin_path.to_str().unwrap(),
+            &[],
+            &self.workdir,
+            &None,
+            timeout,
+        )
+        .await?;
 
         let output = combine_output(&run_output);
         let exit_code = run_output.status.code().unwrap_or(-1);
@@ -222,7 +227,10 @@ mod tests {
         assert_eq!(h1, h2);
         // A real SHA-256 hex digest is always 64 lowercase hex characters.
         assert_eq!(h1.len(), 64, "SHA-256 hex digest must be 64 chars");
-        assert!(h1.chars().all(|c| c.is_ascii_hexdigit()), "digest must be hex");
+        assert!(
+            h1.chars().all(|c| c.is_ascii_hexdigit()),
+            "digest must be hex"
+        );
     }
 
     #[test]

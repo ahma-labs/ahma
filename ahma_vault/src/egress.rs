@@ -152,10 +152,7 @@ impl Pattern {
 }
 
 fn is_loopback(host: &str) -> bool {
-    host == "localhost"
-        || host == "127.0.0.1"
-        || host == "::1"
-        || host.starts_with("127.")
+    host == "localhost" || host == "127.0.0.1" || host == "::1" || host.starts_with("127.")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -209,9 +206,8 @@ mod tests {
 
     #[test]
     fn comments_and_blank_lines_ignored() {
-        let policy = policy_from_str(
-            "# This is a comment\n\ngpu-node.internal\n# another comment\n",
-        );
+        let policy =
+            policy_from_str("# This is a comment\n\ngpu-node.internal\n# another comment\n");
         assert!(policy.allows("gpu-node.internal"));
         assert!(!policy.allows("other.internal"));
     }

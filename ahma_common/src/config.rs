@@ -171,7 +171,10 @@ impl AhmaConfig {
                     cfg
                 }
                 Err(e) => {
-                    warn!("Failed to parse {}: {e}; using empty AhmaConfig", path.display());
+                    warn!(
+                        "Failed to parse {}: {e}; using empty AhmaConfig",
+                        path.display()
+                    );
                     Self::default()
                 }
             },
@@ -180,7 +183,10 @@ impl AhmaConfig {
                 Self::default()
             }
             Err(e) => {
-                warn!("Failed to read {}: {e}; using empty AhmaConfig", path.display());
+                warn!(
+                    "Failed to read {}: {e}; using empty AhmaConfig",
+                    path.display()
+                );
                 Self::default()
             }
         }
@@ -226,10 +232,14 @@ mod tests {
 
     #[test]
     fn interpolate_set_variable() {
-        unsafe { std::env::set_var("AHMA_TEST_INTERP_VAR", "hello"); }
+        unsafe {
+            std::env::set_var("AHMA_TEST_INTERP_VAR", "hello");
+        }
         let result = interpolate_env_vars("prefix-${AHMA_TEST_INTERP_VAR}-suffix").unwrap();
         assert_eq!(result, "prefix-hello-suffix");
-        unsafe { std::env::remove_var("AHMA_TEST_INTERP_VAR"); }
+        unsafe {
+            std::env::remove_var("AHMA_TEST_INTERP_VAR");
+        }
     }
 
     #[test]
@@ -249,7 +259,9 @@ mod tests {
     #[test]
     fn interpolate_missing_variable_returns_err() {
         // Use a name very unlikely to be set in CI
-        unsafe { std::env::remove_var("AHMA_TEST_DEFINITELY_NOT_SET_XYZ"); }
+        unsafe {
+            std::env::remove_var("AHMA_TEST_DEFINITELY_NOT_SET_XYZ");
+        }
         let err = interpolate_env_vars("${AHMA_TEST_DEFINITELY_NOT_SET_XYZ}").unwrap_err();
         assert!(err.to_string().contains("AHMA_TEST_DEFINITELY_NOT_SET_XYZ"));
     }
@@ -272,7 +284,9 @@ mod tests {
 
     #[test]
     fn warn_clean_url_is_fine() {
-        assert!(!warn_if_looks_like_literal_secret("http://localhost:11434/v1"));
+        assert!(!warn_if_looks_like_literal_secret(
+            "http://localhost:11434/v1"
+        ));
     }
 
     #[test]
@@ -330,7 +344,9 @@ default_model = "llama3.2"
 
     #[test]
     fn resolve_provider_with_env_var_key() {
-        unsafe { std::env::set_var("AHMA_TEST_PROVIDER_KEY", "test-secret-value"); }
+        unsafe {
+            std::env::set_var("AHMA_TEST_PROVIDER_KEY", "test-secret-value");
+        }
         let toml_str = r#"
 [[providers]]
 name = "remote"
@@ -343,6 +359,8 @@ api_key = "${AHMA_TEST_PROVIDER_KEY}"
         let cfg = AhmaConfig::load_from(tmp.path());
         let resolved = cfg.resolve_provider("remote").unwrap();
         assert_eq!(resolved.api_key.as_deref(), Some("test-secret-value"));
-        unsafe { std::env::remove_var("AHMA_TEST_PROVIDER_KEY"); }
+        unsafe {
+            std::env::remove_var("AHMA_TEST_PROVIDER_KEY");
+        }
     }
 }

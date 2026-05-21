@@ -147,6 +147,9 @@ jobs:
       - name: Install cargo-nextest
         run: cargo binstall cargo-nextest --no-confirm --force --locked
 
+      - name: Build ahma binary (required by integration tests)
+        run: cargo build --locked --no-default-features -p ahma_bin
+
       - name: Cargo Nextest (excluding Android/Kotlin tests)
         timeout-minutes: 20
         run: |

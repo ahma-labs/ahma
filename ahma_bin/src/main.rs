@@ -99,9 +99,14 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
             let cfg = AhmaConfig::load();
             if cfg.providers.is_empty() {
                 println!("No providers configured.");
-                println!("Add one with: ahma llm add --name <name> --base-url <url> --model <model>");
+                println!(
+                    "Add one with: ahma llm add --name <name> --base-url <url> --model <model>"
+                );
             } else {
-                println!("{} provider(s) in ~/.ahma/config.toml:", cfg.providers.len());
+                println!(
+                    "{} provider(s) in ~/.ahma/config.toml:",
+                    cfg.providers.len()
+                );
                 for p in &cfg.providers {
                     let key_hint = match &p.api_key {
                         None => "no key".to_string(),
@@ -146,8 +151,7 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
 
             // Ensure the directory exists before writing
             if let Some(parent) = config_path.parent() {
-                std::fs::create_dir_all(parent)
-                    .context("Failed to create ~/.ahma/ directory")?;
+                std::fs::create_dir_all(parent).context("Failed to create ~/.ahma/ directory")?;
             }
             let toml_text =
                 toml::to_string_pretty(&cfg).context("Failed to serialize config to TOML")?;
@@ -160,7 +164,8 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
 
         LlmCommand::Test(test_args) => {
             let cfg = AhmaConfig::load();
-            let entry = cfg.providers
+            let entry = cfg
+                .providers
                 .iter()
                 .find(|p| p.name == test_args.name)
                 .with_context(|| {
@@ -172,10 +177,7 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
 
             // Resolve the key (expand ${VAR})
             let resolved = entry.resolve()?;
-            let models_url = format!(
-                "{}/models",
-                resolved.base_url.trim_end_matches('/')
-            );
+            let models_url = format!("{}/models", resolved.base_url.trim_end_matches('/'));
 
             print!("Testing '{}' at {} ... ", test_args.name, models_url);
 
@@ -183,7 +185,9 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
             if let Some(key) = &resolved.api_key {
                 req = req.bearer_auth(key);
             }
-            let resp = req.send().await
+            let resp = req
+                .send()
+                .await
                 .with_context(|| format!("Failed to reach {models_url}"))?;
 
             let status = resp.status();
@@ -241,21 +245,17 @@ fn read_peers() -> Result<Vec<ahma_cluster::PeerInfo>> {
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("Failed to parse {}", path.display()))
+    serde_json::from_str(&text).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
 /// Write the peers list to disk (creates directory if needed).
 fn write_peers(peers: &[ahma_cluster::PeerInfo]) -> Result<()> {
     let path = peers_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .context("Failed to create ~/.ahma/cluster/ directory")?;
+        std::fs::create_dir_all(parent).context("Failed to create ~/.ahma/cluster/ directory")?;
     }
-    let text = serde_json::to_string_pretty(peers)
-        .context("Failed to serialize peers to JSON")?;
-    std::fs::write(&path, text)
-        .with_context(|| format!("Failed to write {}", path.display()))
+    let text = serde_json::to_string_pretty(peers).context("Failed to serialize peers to JSON")?;
+    std::fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))
 }
 
 async fn dispatch_cluster(args: ahma_mcp::shell::ClusterArgs) -> Result<()> {

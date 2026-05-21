@@ -550,7 +550,6 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
     }
 }
 
-
 fn dispatch_bundle_command(args: BundleArgs) -> Result<()> {
     match args.command {
         BundleCommand::Audit(audit_args) => {
