@@ -36,8 +36,10 @@ simplify(directory=".", ai_fix=1)
 
 **Quick install (Linux/macOS):**
 ```bash
-curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
+cargo install --git https://github.com/paulirotta/ahma ahma_mcp --bin ahma --root ~/.local --locked --force
 ```
+
+Or after `ahma` is installed: `ahma update`
 
 **Windows (PowerShell 5.1+):**
 ```powershell

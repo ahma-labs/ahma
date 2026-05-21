@@ -121,14 +121,14 @@ AHMA_HANDSHAKE_TIMEOUT=120 ahma serve http
 
 ---
 
-## Install Script
+## Update / Install
 
-The following variable is only read by the install script (`scripts/install.sh`) and has no
-effect on the `ahma` binary itself.
+These variables apply to `ahma update` and the Windows bootstrap script (`scripts/install.ps1`).
 
 | Variable | Description |
 |---|---|
-| `AHMA_PREFER_MUSL` | Set to `1` to force the musl-linked Linux binary (auto-detected on Alpine / musl systems). |
+| `AHMA_INSTALL_DIR` | Install directory (default: `~/.local/bin` or `%USERPROFILE%\.local\bin`) |
+| `AHMA_PREFER_MUSL` | Set to `1` to prefer musl-linked Linux release binaries (auto-detected on Alpine) |
 
 ---
 

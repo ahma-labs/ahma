@@ -74,37 +74,22 @@ fi
 echo "OK No relative docs/ links in SKILL.md files"
 
 echo "=== Guardrail: skill version consistency with Cargo.toml ==="
-# AHMA_VERSION in install.sh and version: in skill files must match [workspace.package] version.
 CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-INSTALL_VER=$(grep '^AHMA_VERSION=' scripts/install.sh | head -1 | sed 's/AHMA_VERSION="\(.*\)"/\1/')
 AHMA_SKILL_VER=$(grep '^version:' skills/ahma/SKILL.md | head -1 | awk '{print $2}')
-# Extract unique versions from Install-OneSkill -Version calls in install.ps1
-PS1_INSTALL_VERS=$(grep "Install-OneSkill.*-Version" scripts/install.ps1 | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | sort -u)
+SKILL_HTML_VER=$(grep '<!-- version:' skills/ahma/SKILL.md | head -1 | sed -E 's/.*version: ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
 
 SKILL_VER_FAIL=0
-if [ "$INSTALL_VER" != "$CARGO_VER" ]; then
-  echo "FAIL install.sh AHMA_VERSION=\"${INSTALL_VER}\" != Cargo.toml version \"${CARGO_VER}\""
-  SKILL_VER_FAIL=1
-fi
 if [ "$AHMA_SKILL_VER" != "$CARGO_VER" ]; then
   echo "FAIL skills/ahma/SKILL.md version: ${AHMA_SKILL_VER} != Cargo.toml version ${CARGO_VER}"
   SKILL_VER_FAIL=1
 fi
-if [ -z "$PS1_INSTALL_VERS" ]; then
-  echo "FAIL scripts/install.ps1 has no Install-OneSkill -Version lines (expected at least one)"
+if [ "$SKILL_HTML_VER" != "$CARGO_VER" ]; then
+  echo "FAIL skills/ahma/SKILL.md HTML comment version: ${SKILL_HTML_VER} != Cargo.toml version ${CARGO_VER}"
   SKILL_VER_FAIL=1
-else
-  while IFS= read -r ps1_ver; do
-    if [ "$ps1_ver" != "$CARGO_VER" ]; then
-      echo "FAIL scripts/install.ps1 Install-OneSkill version: ${ps1_ver} != Cargo.toml version ${CARGO_VER}"
-      SKILL_VER_FAIL=1
-    fi
-  done <<< "$PS1_INSTALL_VERS"
 fi
 if [ "$SKILL_VER_FAIL" -ne 0 ]; then
   echo ""
-  echo "  Bump AHMA_VERSION in scripts/install.sh, version: in skills/*/SKILL.md,"
-  echo "  and -Version in Install-OneSkill calls in scripts/install.ps1"
+  echo "  Bump version: in skills/ahma/SKILL.md (YAML and HTML comment)"
   echo "  to match [workspace.package] version = \"${CARGO_VER}\" in Cargo.toml."
   exit 1
 fi
