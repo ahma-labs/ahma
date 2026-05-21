@@ -226,6 +226,15 @@ impl AuditWriter {
         .await
     }
 
+    /// Emit an egress-decision event.
+    pub async fn emit_egress_decision(&self, domain: &str, allowed: bool) -> Result<()> {
+        self.emit(AuditEventKind::EgressDecision {
+            domain: domain.to_string(),
+            allowed,
+        })
+        .await
+    }
+
     /// Return the path to the underlying audit log file.
     pub fn path(&self) -> &Path {
         &self.path

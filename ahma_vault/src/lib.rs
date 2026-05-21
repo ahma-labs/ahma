@@ -32,6 +32,7 @@
 //! ```
 
 pub mod audit;
+pub mod egress;
 pub mod trash;
 
 use std::path::{Path, PathBuf};
@@ -126,6 +127,13 @@ impl TaskVault {
     /// Return a [`trash::TrashManager`] bound to this vault's trash directory.
     pub fn trash_manager(&self) -> trash::TrashManager {
         trash::TrashManager::new(&self.trash)
+    }
+
+    /// Return the [`egress::EgressPolicy`] for this vault.
+    ///
+    /// Reads `<vault_root>/egress.allowlist` if present; defaults to loopback-only.
+    pub fn egress_policy(&self) -> egress::EgressPolicy {
+        egress::EgressPolicy::from_vault_path(&self.root)
     }
 
     // ── internal ─────────────────────────────────────────────────────────────

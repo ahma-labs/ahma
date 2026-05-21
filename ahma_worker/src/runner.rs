@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
 use crate::config::{WorkerConfig, WorkerLanguage};
@@ -186,12 +187,14 @@ async fn cleanup(src: &Path, bin: &Path, keep: bool) {
     let _ = tokio::fs::remove_file(bin).await;
 }
 
+/// Compute the SHA-256 hex digest of `data`.
 fn sha256_hex(data: &[u8]) -> String {
-    let mut h: u64 = 5381;
-    for &b in data {
-        h = h.wrapping_mul(33).wrapping_add(b as u64);
-    }
-    format!("{h:016x}")
+    let hash = Sha256::digest(data);
+    hash.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 #[cfg(test)]
@@ -217,6 +220,9 @@ mod tests {
         let h1 = sha256_hex(b"hello");
         let h2 = sha256_hex(b"hello");
         assert_eq!(h1, h2);
+        // A real SHA-256 hex digest is always 64 lowercase hex characters.
+        assert_eq!(h1.len(), 64, "SHA-256 hex digest must be 64 chars");
+        assert!(h1.chars().all(|c| c.is_ascii_hexdigit()), "digest must be hex");
     }
 
     #[test]

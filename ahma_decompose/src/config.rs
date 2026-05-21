@@ -1,7 +1,10 @@
 //! Configuration types for `tool_type: decompose` tools.
 
+use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use ahma_common::config::{interpolate_env_vars, warn_if_looks_like_literal_secret};
 
 use crate::reducer::ReduceMode;
 
@@ -12,8 +15,41 @@ pub struct LlmProviderConfig {
     pub base_url: String,
     /// Model identifier, e.g. `llama3.2`, `gemma:4b`.
     pub model: String,
-    /// Optional bearer token. Omit for local models that don't require authentication.
+    /// Optional bearer token. Supports `${ENV_VAR}` interpolation — **never
+    /// store literal API keys in tool definition files**.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+impl LlmProviderConfig {
+    /// Resolve env-var placeholders and return concrete connection values.
+    ///
+    /// - `${ENV_VAR}` in `api_key` is expanded from the process environment.
+    /// - Returns `Err` if a referenced variable is not set.
+    /// - Warns if `api_key` looks like a literal secret (e.g. starts with `sk-`).
+    pub fn resolve(&self) -> Result<ResolvedLlmProvider> {
+        // Warn on literal key even before interpolation attempt.
+        if let Some(key) = &self.api_key {
+            warn_if_looks_like_literal_secret(key);
+        }
+        let api_key = self
+            .api_key
+            .as_deref()
+            .map(interpolate_env_vars)
+            .transpose()?;
+        Ok(ResolvedLlmProvider {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            api_key,
+        })
+    }
+}
+
+/// A [`LlmProviderConfig`] with secrets resolved — ready to pass to an HTTP client.
+#[derive(Debug, Clone)]
+pub struct ResolvedLlmProvider {
+    pub base_url: String,
+    pub model: String,
     pub api_key: Option<String>,
 }
 

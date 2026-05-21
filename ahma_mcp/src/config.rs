@@ -38,6 +38,7 @@
 //! - **Dynamic Behavior**: The server's behavior, such as whether a command runs
 //!   synchronously or asynchronously, can be controlled directly from the configuration files.
 
+use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -151,8 +152,39 @@ pub struct LlmProviderConfig {
     pub base_url: String,
     /// Model identifier, e.g. `llama3.2`, `gpt-4o-mini`.
     pub model: String,
-    /// Optional bearer token. Omit for local models that don't require authentication.
+    /// Optional bearer token. Supports `${ENV_VAR}` interpolation — **never
+    /// store literal API keys in tool definition files**.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+impl LlmProviderConfig {
+    /// Resolve env-var placeholders in `api_key` and warn on literal secrets.
+    ///
+    /// Returns `Err` if a `${VAR}` reference is not set in the environment.
+    pub fn resolve(&self) -> Result<ResolvedLlmProvider> {
+        use ahma_common::config::{interpolate_env_vars, warn_if_looks_like_literal_secret};
+        if let Some(key) = &self.api_key {
+            warn_if_looks_like_literal_secret(key);
+        }
+        let api_key = self
+            .api_key
+            .as_deref()
+            .map(interpolate_env_vars)
+            .transpose()?;
+        Ok(ResolvedLlmProvider {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            api_key,
+        })
+    }
+}
+
+/// An [`LlmProviderConfig`] with secrets resolved — ready to hand to an HTTP client.
+#[derive(Debug, Clone)]
+pub struct ResolvedLlmProvider {
+    pub base_url: String,
+    pub model: String,
     pub api_key: Option<String>,
 }
 

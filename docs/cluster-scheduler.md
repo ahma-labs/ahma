@@ -66,9 +66,28 @@ The peer must be reachable at the `addr` configured in `peers.json`.
 
 ## Security: signed task manifests
 
-The coordinator signs each task manifest with a shared HMAC key before sending it to a peer. The peer verifies the signature before executing. This prevents an untrusted machine on the same network from injecting tasks.
+The coordinator signs each task manifest with HMAC-SHA256 before sending it to a peer.
+The peer verifies the signature in constant time before executing. This prevents an
+untrusted machine on the same network from injecting or replaying tasks.
 
-The current implementation uses a lightweight djb2-based HMAC stub. Full HMAC-SHA256 is planned before the cluster feature exits experimental status.
+**Threat model:**
+
+| Threat | Mitigation |
+|--------|------------|
+| Task injection | HMAC-SHA256 signature over `task_id\|prompt\|model\|llm_base_url\|nonce\|issued_at` |
+| Replay attack | `issued_at` timestamp checked; manifests older than 60 s are rejected |
+| Timing oracle | Signature comparison uses `subtle::ConstantTimeEq` |
+| Key brute-force | 256-bit random key; rotate with `ahma cluster rotate-key` |
+
+To set the shared key, write a 32+ byte random value to a file and reference it:
+
+```bash
+# Generate a strong key once per cluster (run on the coordinator)
+openssl rand -hex 32 > ~/.ahma/cluster/shared.key
+chmod 600 ~/.ahma/cluster/shared.key
+```
+
+Each peer must have the same key file at the same path.
 
 ## Peer discovery
 
@@ -81,8 +100,9 @@ The current implementation uses a lightweight djb2-based HMAC stub. Full HMAC-SH
 ## Scheduler behaviour
 
 - Peers without the requested model are excluded.
-- Among eligible peers, the one with the lowest `active_ops` is selected.
+- Among eligible peers, the one with the lowest `active_ops` is selected. If VRAM free < 1 GiB an additional penalty is applied.
 - If no peer is available, the orchestrator falls back to running the sub-task locally.
+- Peers announce their capabilities (loaded models, VRAM, concurrency) via heartbeat; the coordinator updates its registry on each heartbeat.
 
 ## Using via ahma_core
 
@@ -92,7 +112,9 @@ use ahma_core::{WorkerRegistry, ClusterScheduler, TaskManifest};
 let registry = WorkerRegistry::new(60);  // 60s TTL
 registry.load_static_peers()?;
 
-let scheduler = ClusterScheduler::new(registry, "my-shared-key");
+// Key is 32+ raw bytes; load from file, not hard-coded
+let key = std::fs::read("~/.ahma/cluster/shared.key")?;
+let scheduler = ClusterScheduler::new(registry, key);
 
 let manifest = TaskManifest {
     task_id: "sub_1".into(),
@@ -101,6 +123,9 @@ let manifest = TaskManifest {
     llm_base_url: "http://localhost:11434/v1".into(),
     max_tokens: 256,
     timeout_secs: 30,
+    // nonce and issued_at are filled in by manifest.sign(&key)
+    nonce: String::new(),
+    issued_at: 0,
     signature: String::new(),
 };
 

@@ -7,6 +7,7 @@ name = "ahma_bin"
 version = "0.7.0"
 dependencies = [
  "ahma_cluster",
+ "ahma_common",
  "ahma_decompose",
  "ahma_mcp",
  "ahma_renewal",
@@ -16,8 +17,11 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "reqwest 0.13.3",
+ "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -28,12 +32,17 @@ dependencies = [
  "ahma_decompose",
  "ahma_worker",
  "anyhow",
+ "chrono",
  "dirs",
+ "hmac",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -41,12 +50,15 @@ name = "ahma_common"
 version = "0.7.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -70,6 +82,7 @@ dependencies = [
 name = "ahma_decompose"
 version = "0.7.0"
 dependencies = [
+ "ahma_common",
  "ahma_llm_monitor",
  "ahma_vault",
  "anyhow",
@@ -114,6 +127,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -157,6 +171,7 @@ dependencies = [
 name = "ahma_llm_monitor"
 version = "0.7.0"
 dependencies = [
+ "ahma_common",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
@@ -264,6 +279,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -845,6 +861,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -1270,6 +1287,15 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"

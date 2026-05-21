@@ -27,7 +27,11 @@ pub use list_tools::{
 };
 
 pub use cli::{build_app_config, dispatch_subcommand, run};
-pub use cli::{Cli, Subcommands, TuiArgs, VaultArgs, VaultCommand, VaultCreateArgs};
+pub use cli::{
+    Cli, ClusterAddPeerArgs, ClusterArgs, ClusterCommand, ClusterPingArgs, LlmAddArgs, LlmArgs,
+    LlmCommand, LlmRemoveArgs, LlmTestArgs, Subcommands, TuiArgs, VaultArgs, VaultCommand,
+    VaultCreateArgs,
+};
 
 pub use resolution::{
     find_matching_tool, find_tool_config, normalize_tools_dir, resolve_cli_subcommand,

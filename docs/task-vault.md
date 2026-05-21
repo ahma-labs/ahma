@@ -87,9 +87,41 @@ let audit = vault.audit_writer();
 audit.vault_created(&vault.path().display().to_string(), "my-task").await?;
 ```
 
+## Egress allowlist
+
+Each vault has an `egress.allowlist` file that controls which outbound hosts the task may
+contact. If the file is absent (the default), the vault is **loopback-only** — only
+`localhost`, `127.*`, and `::1` are reachable. This is the secure-by-default posture:
+tools cannot phone home or exfiltrate data unless you explicitly permit it.
+
+### File format
+
+```
+# Lines starting with # are comments; blank lines are ignored.
+# Exact hostname match:
+api.example.com
+# Wildcard subdomain (matches foo.internal but NOT internal):
+*.internal
+# Allow all outbound (not recommended; emits a warning at load time):
+*
+```
+
+The allowlist is case-insensitive. `localhost`, `127.0.0.1`/`127.*`, and `::1` are always
+allowed regardless of the file contents — they cannot be blocked.
+
+### Example: granting access to a specific API
+
+```bash
+echo 'api.openai.com' >> ~/.ahma/tasks/<vault>/egress.allowlist
+echo '*.googleapis.com' >> ~/.ahma/tasks/<vault>/egress.allowlist
+```
+
+Every allow/deny decision is recorded in `audit.jsonl` as an `egress_decision` event.
+
 ## See also
 
 - [docs/security-sandbox.md](security-sandbox.md) — kernel sandbox and egress proxy details
 - [docs/egress-sandbox.md](egress-sandbox.md) — per-task network allowlist
 - [docs/renewal-contract.md](renewal-contract.md) — automatic halt for unattended sessions
 - [SPEC.md §5.8](../SPEC.md) — MTDF vault integration specification
+

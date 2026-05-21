@@ -31,6 +31,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -41,6 +42,7 @@ use base64::Engine as _;
 use futures::stream::{self, StreamExt};
 use serde_json::Value;
 use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc};
+use subtle::ConstantTimeEq as _;
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::{
     cors::{AllowHeaders, AllowMethods, CorsLayer},
@@ -126,6 +128,15 @@ pub struct BridgeConfig {
     /// `ListenerKind::Unix(path)` to serve MCP Streamable HTTP over a Unix
     /// domain socket instead of a TCP port.  `bind_addr` is ignored in that case.
     pub listener_kind: ListenerKind,
+
+    /// Bearer token required on every request (except `/health`).
+    ///
+    /// Set via `--require-token <path>` in the CLI.  The file should contain a
+    /// single line with the secret token.  If `None`, no token is checked —
+    /// **only acceptable on a loopback bind address**.
+    ///
+    /// The comparison is constant-time to prevent timing side-channels.
+    pub require_token: Option<String>,
 }
 
 impl Default for BridgeConfig {
@@ -141,6 +152,7 @@ impl Default for BridgeConfig {
             enable_quic: true,
             disable_http1_1: false,
             listener_kind: ListenerKind::Tcp(bind_addr),
+            require_token: None,
         }
     }
 }
@@ -149,6 +161,9 @@ impl Default for BridgeConfig {
 struct BridgeState {
     /// Session manager (session isolation mode only)
     session_manager: Arc<SessionManager>,
+    /// Optional bearer token.  When set, every request (except `/health`) must
+    /// supply `Authorization: Bearer <token>`.  Compared constant-time.
+    require_token: Option<String>,
 }
 
 /// Build a CORS layer appropriate for the bind address.
@@ -204,6 +219,58 @@ fn build_cors_layer(bind_addr: &SocketAddr) -> CorsLayer {
 /// MCP Session-Id header name (per MCP spec 2025-03-26)
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
+// ─── Bearer-token authentication middleware ───────────────────────────────────
+
+/// Axum middleware that enforces a bearer-token check when `BridgeState::require_token`
+/// is set.
+///
+/// The `/health` endpoint is exempted so load-balancers can probe it without a token.
+/// All other requests must supply `Authorization: Bearer <token>`.
+///
+/// The comparison uses constant-time equality from the `subtle` crate to prevent
+/// timing side-channels.
+async fn bearer_auth_middleware(
+    State(state): State<Arc<BridgeState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let Some(ref expected_token) = state.require_token else {
+        // No token configured — let the request through.
+        return next.run(request).await;
+    };
+
+    // /health is exempt: load-balancers must be able to probe it unauthenticated.
+    if request.uri().path() == "/health" {
+        return next.run(request).await;
+    }
+
+    // Extract `Authorization: Bearer <token>` header.
+    let provided = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::to_owned);
+
+    match provided {
+        Some(token) if token.as_bytes().ct_eq(expected_token.as_bytes()).into() => {
+            next.run(request).await
+        }
+        _ => {
+            debug!("Request rejected: missing or invalid bearer token");
+            (
+                StatusCode::UNAUTHORIZED,
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    "Bearer realm=\"ahma-http-bridge\"",
+                )],
+                "Unauthorized",
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Starts the HTTP bridge server and blocks until shutdown.
 ///
 /// This function initializes the session manager, sets up the Axum router for MCP
@@ -251,7 +318,10 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
         handshake_timeout_secs: config.handshake_timeout_secs,
     };
     let session_manager = Arc::new(SessionManager::new(session_config));
-    Arc::new(BridgeState { session_manager })
+    Arc::new(BridgeState {
+        session_manager,
+        require_token: config.require_token.clone(),
+    })
 }
 
 /// Build the axum router with optional QUIC `Alt-Svc` header injection.
@@ -269,6 +339,10 @@ fn build_mcp_router(
                 .delete(handle_session_delete),
         )
         .fallback(handle_not_found)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            bearer_auth_middleware,
+        ))
         .layer(cors)
         .with_state(state);
 
@@ -431,7 +505,10 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
         handshake_timeout_secs: config.handshake_timeout_secs,
     };
     let session_manager = Arc::new(SessionManager::new(session_config));
-    let state = Arc::new(BridgeState { session_manager });
+    let state = Arc::new(BridgeState {
+        session_manager,
+        require_token: config.require_token.clone(),
+    });
 
     // For Unix sockets, CORS origin matching is less meaningful but we still
     // build the layer for middleware compatibility.
@@ -915,6 +992,7 @@ mod tests {
             enable_quic: false,
             disable_http1_1: false,
             listener_kind: ListenerKind::Tcp("0.0.0.0:8080".parse().unwrap()),
+            require_token: None,
         };
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
         assert_eq!(config.server_command, "custom_server");
@@ -953,7 +1031,10 @@ mod tests {
     }
 
     fn create_state_with_session_manager(session_manager: Arc<SessionManager>) -> Arc<BridgeState> {
-        Arc::new(BridgeState { session_manager })
+        Arc::new(BridgeState {
+            session_manager,
+            require_token: None,
+        })
     }
 
     fn write_mock_mcp_server_script(temp_dir: &TempDir) -> std::path::PathBuf {

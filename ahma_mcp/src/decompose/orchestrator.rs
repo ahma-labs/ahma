@@ -45,13 +45,17 @@ pub struct DecomposeOrchestrator {
 
 impl DecomposeOrchestrator {
     /// Build an orchestrator from a [`DecomposeConfig`].
-    pub fn new(cfg: DecomposeConfig) -> Self {
+    ///
+    /// Resolves any `${ENV_VAR}` placeholders in the provider's API key.
+    /// Returns `Err` if a referenced environment variable is not set.
+    pub fn new(cfg: DecomposeConfig) -> Result<Self> {
+        let provider = cfg.llm_provider.resolve()?;
         let client = Arc::new(LlmClient::new(
-            &cfg.llm_provider.base_url,
-            &cfg.llm_provider.model,
-            cfg.llm_provider.api_key.clone(),
+            &provider.base_url,
+            &provider.model,
+            provider.api_key,
         ));
-        Self { cfg, client }
+        Ok(Self { cfg, client })
     }
 
     /// Run the full decompose pipeline and return the aggregated answer.
@@ -201,6 +205,6 @@ mod tests {
 
     #[test]
     fn orchestrator_constructs_without_panic() {
-        let _orch = DecomposeOrchestrator::new(test_cfg());
+        DecomposeOrchestrator::new(test_cfg()).expect("orchestrator construction should succeed");
     }
 }

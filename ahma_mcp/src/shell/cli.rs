@@ -530,6 +530,18 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             )
         }
         Subcommands::Bundle(bundle_args) => dispatch_bundle_command(bundle_args),
+        Subcommands::Llm(_) => {
+            anyhow::bail!(
+                "llm commands are provided by the ahma_bin crate (includes ahma_common). \
+                 If you are running a custom binary, implement llm dispatch using ahma_common::config::AhmaConfig."
+            )
+        }
+        Subcommands::Cluster(_) => {
+            anyhow::bail!(
+                "cluster commands are provided by the ahma_bin crate (includes ahma_cluster). \
+                 If you are running a custom binary, implement cluster dispatch using ahma_cluster::discovery::WorkerRegistry."
+            )
+        }
         #[cfg(feature = "simplify")]
         Subcommands::Simplify(args) => {
             tracing::info!("Running in simplify mode");
@@ -652,6 +664,10 @@ pub enum Subcommands {
     Tui(TuiArgs),
     /// Bundle management: audit and verify MTDF tool bundles.
     Bundle(BundleArgs),
+    /// LLM provider management: add, list, test, and remove named providers.
+    Llm(LlmArgs),
+    /// Cluster peer management: add, list, ping, and inspect worker nodes.
+    Cluster(ClusterArgs),
     /// Analyze source code complexity and generate a simplicity report.
     #[cfg(feature = "simplify")]
     Simplify(crate::simplify::SimplifyArgs),
@@ -1124,6 +1140,115 @@ pub struct BundleSignArgs {
     /// Path to the bundle directory to sign.
     #[arg(value_name = "PATH")]
     pub path: PathBuf,
+}
+
+// ── llm ───────────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma llm`.
+#[derive(Parser, Debug)]
+#[command(after_help = "EXAMPLES:
+  ahma llm list
+  ahma llm add --name ollama-local --base-url http://localhost:11434/v1 --model llama3.2
+  ahma llm add --name openai --base-url https://api.openai.com/v1 --model gpt-4o-mini --api-key '${OPENAI_API_KEY}'
+  ahma llm test ollama-local
+  ahma llm remove ollama-local")]
+pub struct LlmArgs {
+    #[command(subcommand)]
+    pub command: LlmCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LlmCommand {
+    /// List all named providers in ~/.ahma/config.toml.
+    List,
+    /// Add a named provider to ~/.ahma/config.toml.
+    Add(LlmAddArgs),
+    /// Test connectivity to a named provider (GET /v1/models).
+    Test(LlmTestArgs),
+    /// Remove a named provider from ~/.ahma/config.toml.
+    Remove(LlmRemoveArgs),
+}
+
+/// Arguments for `ahma llm add`.
+#[derive(Parser, Debug)]
+pub struct LlmAddArgs {
+    /// Unique name for this provider (e.g. "ollama-local").
+    #[arg(long)]
+    pub name: String,
+    /// Base URL of the OpenAI-compatible API (e.g. http://localhost:11434/v1).
+    #[arg(long)]
+    pub base_url: String,
+    /// Default model to use with this provider (e.g. "llama3.2").
+    #[arg(long)]
+    pub model: String,
+    /// Optional API key. Use \${ENV_VAR} notation to reference an environment variable.
+    #[arg(long)]
+    pub api_key: Option<String>,
+}
+
+/// Arguments for `ahma llm test`.
+#[derive(Parser, Debug)]
+pub struct LlmTestArgs {
+    /// Name of the provider to test (must exist in ~/.ahma/config.toml).
+    #[arg(value_name = "NAME")]
+    pub name: String,
+}
+
+/// Arguments for `ahma llm remove`.
+#[derive(Parser, Debug)]
+pub struct LlmRemoveArgs {
+    /// Name of the provider to remove.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+}
+
+// ── cluster ───────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma cluster`.
+#[derive(Parser, Debug)]
+#[command(after_help = "EXAMPLES:
+  ahma cluster list
+  ahma cluster add-peer --id workstation --addr http://workstation.local:3000 --models llama3.2,gemma4
+  ahma cluster ping workstation
+  ahma cluster status")]
+pub struct ClusterArgs {
+    #[command(subcommand)]
+    pub command: ClusterCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ClusterCommand {
+    /// List peers in ~/.ahma/cluster/peers.json.
+    List,
+    /// Add a worker peer to ~/.ahma/cluster/peers.json.
+    #[command(name = "add-peer")]
+    AddPeer(ClusterAddPeerArgs),
+    /// Ping a peer's /health endpoint.
+    Ping(ClusterPingArgs),
+    /// Show status of all configured peers (reachability + capabilities).
+    Status,
+}
+
+/// Arguments for `ahma cluster add-peer`.
+#[derive(Parser, Debug)]
+pub struct ClusterAddPeerArgs {
+    /// Unique peer ID (hostname or UUID).
+    #[arg(long)]
+    pub id: String,
+    /// HTTP address of the peer's ahma HTTP bridge (e.g. http://workstation.local:3000).
+    #[arg(long)]
+    pub addr: String,
+    /// Comma-separated list of model names available on this peer.
+    #[arg(long, value_delimiter = ',', default_value = "")]
+    pub models: Vec<String>,
+}
+
+/// Arguments for `ahma cluster ping`.
+#[derive(Parser, Debug)]
+pub struct ClusterPingArgs {
+    /// Peer ID to ping (must exist in ~/.ahma/cluster/peers.json).
+    #[arg(value_name = "ID")]
+    pub id: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

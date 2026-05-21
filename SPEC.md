@@ -1402,3 +1402,28 @@ If the symlink does not exist or does not resolve, the check fails.
 `skills/ahma/SKILL.md` targets **AI agents using Ahma**. `AGENTS.md` targets **AI contributors
 developing Ahma**. Do not copy developer-only content (testing rules, cross-platform checklist,
 commit format) into the skill, and do not copy agent usage recipes into AGENTS.md.
+
+---
+
+## 16. Future Work
+
+### v0.8 — Discovery, Observability, Economics
+
+| Area | Item | Notes |
+|------|------|-------|
+| Cluster | **mDNS peer discovery** (`mdns-sd` crate, `_ahma-worker._tcp.local`) | Zero-config LAN; replaces `peers.json` bootstrap for trusted networks |
+| Cluster | **Named provider refs in tool files** (`llm_provider_ref: "ollama-local"`) | Avoids duplicating connection details across tool definitions |
+| UX | **`ratatui` TUI** — real-time task dashboard | Replace stub `ahma tui` with a full terminal UI showing active ops, peer status, VRAM gauges |
+| Economics | **Cost metering** — track token counts + estimated cost per tool call | Aggregate by provider; expose via `ahma tool info --cost-summary` |
+| Security | **Signed bundle index** (`bundle-index.json` with HMAC-SHA256 over manifest) | Prevent silent tampering with downloaded bundles |
+| Security | **`--require-token` key rotation** — reload token from file on SIGHUP | Zero-downtime key rotation for long-running HTTP bridge instances |
+
+### v0.9 — Scheduling Refinement, Keyring
+
+| Area | Item | Notes |
+|------|------|-------|
+| Cluster | **Weighted scheduling** — factor GPU model, RAM, historical latency into `load_score_for` | Better affinity for large models |
+| Cluster | **`cluster remove` subcommand** — remove a peer from `peers.json` by ID | Complement `cluster add-peer` |
+| Security | **OS keyring integration** (`keyring` crate) — store API keys in system credential store instead of env vars | macOS Keychain, GNOME Secrets, Windows Credential Manager |
+| Config | **Encrypted secrets at rest** in `~/.ahma/config.toml` (age encryption) | Fallback when OS keyring is unavailable |
+

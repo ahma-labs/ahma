@@ -19,15 +19,7 @@
       "type": "string"
     },
     "decompose": {
-      "description": "Decompose orchestration configuration. Required when `tool_type` is `Decompose`.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/DecomposeConfig"
-        },
-        {
-          "type": "null"
-        }
-      ]
+      "description": "Decompose orchestration configuration (opaque — parsed by `ahma_decompose` crate).\nRequired when `tool_type` is `decompose`; stored as raw JSON for GPL-crate consumption."
     },
     "description": {
       "type": "string"
@@ -130,7 +122,7 @@
       "minimum": 0
     },
     "tool_type": {
-      "description": "Tool type classifier. Defaults to `Command` for normal CLI tools.\nSet to `Livelog` for long-running log-streaming tools that pipe output through an LLM.",
+      "description": "Tool type classifier. Defaults to `Command` for normal CLI tools.\nSet to `Livelog` for long-running log-streaming tools that pipe output through an LLM.\nTool types implemented in separate GPL-licensed crates (e.g. `decompose`, `worker`)\nare deserialized as `Extension` and their configurations stored in the matching\nopaque JSON fields below.",
       "anyOf": [
         {
           "$ref": "#/$defs/ToolType"
@@ -141,15 +133,7 @@
       ]
     },
     "worker": {
-      "description": "Worker synthesis configuration. Required when `tool_type` is `Worker`.",
-      "anyOf": [
-        {
-          "$ref": "#/$defs/WorkerConfig"
-        },
-        {
-          "type": "null"
-        }
-      ]
+      "description": "Worker synthesis configuration (opaque — parsed by `ahma_worker` crate).\nRequired when `tool_type` is `worker`; stored as raw JSON for GPL-crate consumption."
     }
   },
   "additionalProperties": false,
@@ -265,64 +249,6 @@
         "type"
       ]
     },
-    "DecomposeConfig": {
-      "description": "Configuration for a `tool_type: decompose` tool.\n\nA decompose tool splits a complex business question into smaller sub-questions,\ndispatches each to a local LLM (e.g. `gemma:4b` via Ollama), and aggregates\nthe results with a deterministic Rust reducer — no cloud egress required.",
-      "type": "object",
-      "properties": {
-        "answer_prompt": {
-          "description": "System prompt injected when asking the LLM to answer each sub-question.\nIf absent, a generic \"answer concisely\" prompt is used.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "llm_provider": {
-          "description": "LLM provider to use for both splitting and answering sub-questions.\nPrefer a small local model (`gemma:4b`, `llama3.2:3b`) for privacy.",
-          "$ref": "#/$defs/LlmProviderConfig"
-        },
-        "llm_timeout_seconds": {
-          "description": "Timeout in seconds for each individual LLM call.  Defaults to 30.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        },
-        "max_concurrent": {
-          "description": "Maximum number of sub-questions to run concurrently.\nKeep this low (2–4) for single-machine Ollama deployments.  Defaults to 3.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint",
-          "minimum": 0
-        },
-        "max_subtasks": {
-          "description": "Maximum number of sub-questions to generate from the parent question.\nDefaults to 5.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint",
-          "minimum": 0
-        },
-        "reduce_mode": {
-          "description": "How to combine sub-task results.\nValues: `summarize` (default), `extract_fields`, `classify`, `concat`, `first`.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ReduceMode"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "required": [
-        "llm_provider"
-      ]
-    },
     "ItemsSpec": {
       "description": "Schema details for array items.",
       "type": "object",
@@ -412,7 +338,7 @@
       "type": "object",
       "properties": {
         "api_key": {
-          "description": "Optional bearer token. Omit for local models that don't require authentication.",
+          "description": "Optional bearer token. Supports `${ENV_VAR}` interpolation — **never\nstore literal API keys in tool definition files**.",
           "type": [
             "string",
             "null"
@@ -430,36 +356,6 @@
       "required": [
         "base_url",
         "model"
-      ]
-    },
-    "ReduceMode": {
-      "description": "How to combine sub-task results into a single answer.",
-      "oneOf": [
-        {
-          "description": "Concatenate each result under a numbered heading.",
-          "type": "string",
-          "const": "summarize"
-        },
-        {
-          "description": "Collect unique key=value pairs extracted from each result.",
-          "type": "string",
-          "const": "extract_fields"
-        },
-        {
-          "description": "Majority-vote classification: pick the label that appears most often.",
-          "type": "string",
-          "const": "classify"
-        },
-        {
-          "description": "Append all non-empty results separated by double newlines.",
-          "type": "string",
-          "const": "concat"
-        },
-        {
-          "description": "Return only the first non-empty result (useful for \"find first match\").",
-          "type": "string",
-          "const": "first"
-        }
       ]
     },
     "SequenceStep": {
@@ -671,7 +567,7 @@
       "additionalProperties": false
     },
     "ToolType": {
-      "description": "Classifier that determines how the MCP service routes a tool invocation.",
+      "description": "Classifier that determines how the MCP service routes a tool invocation.\n\nThe permissive `ahma_mcp` library handles `Command` and `Livelog` natively.\nTool types implemented in the GPL-licensed sibling crates (`ahma_decompose`,\n`ahma_worker`, etc.) are serialised to their JSON names (e.g. `\"decompose\"`,\n`\"worker\"`) and round-trip correctly — they are just stored as `Extension`\nin this enum so the MIT library has no compile-time dependency on GPL code.\n`ahma_bin` routes those calls to the appropriate GPL crate at runtime.",
       "oneOf": [
         {
           "description": "Normal command-line tool (default).",
@@ -684,64 +580,9 @@
           "const": "livelog"
         },
         {
-          "description": "Decompose a complex question into sub-questions, dispatch to local LLMs,\nand aggregate the answers with a deterministic reducer.",
+          "description": "Any tool type implemented outside this crate (e.g. `decompose`, `worker`).\nThe raw `tool_type` string is preserved for routing by the GPL binary crates.",
           "type": "string",
-          "const": "decompose"
-        },
-        {
-          "description": "Synthesize and run ephemeral Rust or Python worker code in a sub-vault.",
-          "type": "string",
-          "const": "worker"
-        }
-      ]
-    },
-    "WorkerConfig": {
-      "description": "Configuration for a `tool_type: worker` tool.\n\nA worker tool accepts synthesized source code, compiles or runs it inside a\nsub-vault, captures the output to `outputs/`, and by default deletes the\nsource after execution.  Because the program is compiled deterministic code\n(not an LLM in the loop), it cannot be re-injected mid-run.",
-      "type": "object",
-      "properties": {
-        "extra_args": {
-          "description": "Additional compiler / interpreter arguments.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "string"
-          }
-        },
-        "keep_source": {
-          "description": "Keep the synthesized source file after execution (`--keep` flag semantic).\nDefaults to `false` — source is deleted after the run.",
-          "type": "boolean",
-          "default": false
-        },
-        "language": {
-          "description": "Programming language for the synthesized worker.",
-          "$ref": "#/$defs/WorkerLanguage",
-          "default": "rust"
-        },
-        "timeout_seconds": {
-          "description": "Execution timeout in seconds.  Defaults to 60.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0
-        }
-      }
-    },
-    "WorkerLanguage": {
-      "description": "Language for an ephemeral synthesized worker.",
-      "oneOf": [
-        {
-          "description": "Compile and run a Rust program (`rustc` must be on PATH).",
-          "type": "string",
-          "const": "rust"
-        },
-        {
-          "description": "Run a Python 3 script (`python3` must be on PATH).",
-          "type": "string",
-          "const": "python"
+          "const": "extension"
         }
       ]
     }
