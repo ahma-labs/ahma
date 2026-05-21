@@ -72,7 +72,7 @@ impl PeerInfo {
 
     /// Return `true` if `model` is currently loaded in memory on this peer.
     pub fn has_model_loaded(&self, model: &str) -> bool {
-        self.capabilities.as_ref().map_or(false, |c| {
+        self.capabilities.as_ref().is_some_and(|c| {
             c.models_loaded
                 .iter()
                 .any(|m| m == model || m.starts_with(&format!("{model}:")))

@@ -113,15 +113,15 @@ async fn run_release_update(
         && let Some(installed) = read_installed_version(&target).await
     {
         if installed == asset.version {
-                println!(
-                    "Ahma {installed} is already installed at {}",
-                    target.display()
-                );
-                if args.dry_run {
-                    println!("[dry-run] Would reinstall with --force");
-                } else {
-                    println!("Use --force to reinstall anyway.");
-                }
+            println!(
+                "Ahma {installed} is already installed at {}",
+                target.display()
+            );
+            if args.dry_run {
+                println!("[dry-run] Would reinstall with --force");
+            } else {
+                println!("Use --force to reinstall anyway.");
+            }
             return Ok(());
         }
         println!("Upgrading ahma from {installed} to {}...", asset.version);

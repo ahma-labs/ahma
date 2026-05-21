@@ -1011,7 +1011,7 @@ async fn run_monitoring_loop(
 
         if start.elapsed().as_secs().is_multiple_of(5) {
             let elapsed = start.elapsed().as_secs();
-            let rate = if elapsed > 0 { success / elapsed } else { 0 };
+            let rate = success.checked_div(elapsed).unwrap_or(0);
             println!(
                 "[{:3}s] Success: {} | Errors: {} | Rate: {}/s",
                 elapsed, success, errors, rate

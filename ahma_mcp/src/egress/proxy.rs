@@ -188,7 +188,7 @@ async fn handle_plain_http(
     let host = raw_str
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("host:"))
-        .and_then(|l| l.splitn(2, ':').nth(1))
+        .and_then(|l| l.split_once(':').map(|x| x.1))
         .map(|h| h.trim().split(':').next().unwrap_or("").to_string())
         .unwrap_or_default();
 

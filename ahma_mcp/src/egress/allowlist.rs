@@ -67,6 +67,7 @@ impl EgressAllowlist {
     }
 
     /// Parse allowlist from a string (used for tests and in-memory configs).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         let mut patterns = vec![];
         for line in s.lines() {
@@ -113,12 +114,12 @@ impl EgressAllowlist {
                     //   api.example.com  → YES (prefix "api", no dots)
                     //   deep.api.example.com → NO  (prefix "deep.api", contains a dot)
                     //   example.com → NO (no prefix at all)
-                    if let Some(rest) = lower.strip_suffix(suffix.as_str()) {
-                        if let Some(label) = rest.strip_suffix('.') {
-                            if !label.is_empty() && !label.contains('.') {
-                                return true;
-                            }
-                        }
+                    if let Some(rest) = lower.strip_suffix(suffix.as_str())
+                        && let Some(label) = rest.strip_suffix('.')
+                        && !label.is_empty()
+                        && !label.contains('.')
+                    {
+                        return true;
                     }
                 }
             }

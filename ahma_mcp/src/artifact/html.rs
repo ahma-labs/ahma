@@ -131,6 +131,7 @@ impl ArtifactBuilder {
 // Template renderer
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn render_template(
     title: &str,
     description: Option<&str>,

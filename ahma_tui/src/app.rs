@@ -74,11 +74,8 @@ impl TuiApp {
             TuiEvent::Key(TuiKey::Up) => {
                 self.selected = self.selected.saturating_sub(1);
             }
-            TuiEvent::Key(TuiKey::Down) => {
-                if !self.operations.is_empty() {
-                    self.selected =
-                        (self.selected + 1).min(self.operations.len().saturating_sub(1));
-                }
+            TuiEvent::Key(TuiKey::Down) if !self.operations.is_empty() => {
+                self.selected = (self.selected + 1).min(self.operations.len().saturating_sub(1));
             }
             TuiEvent::Key(TuiKey::Yes) => {
                 if let Some((op_id, _)) = self.pending_approval.take() {
