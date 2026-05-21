@@ -17,7 +17,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.6.7 | author: Paul Houghton -->
+<!-- version: 0.7.0 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
