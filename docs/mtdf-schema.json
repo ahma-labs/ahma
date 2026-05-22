@@ -567,8 +567,7 @@
       "additionalProperties": false
     },
     "ToolType": {
-"description": "Classifier that determines how the MCP service routes a tool invocation.\n\nThe permissive `ahma_mcp` library handles `Command` and `Livelog` natively.\nTool types implemented in the AGPL-licensed sibling crates (`ahma_decompose`,\n`ahma_worker`, etc.) are serialised to their JSON names (e.g. `\"decompose\"`,\n`\"worker\"`) and round-trip correctly \u2014 they are just stored as `Extension`\nin this enum so the MIT library has no compile-time dependency on AGPL code.\n`ahma_bin` routes those calls to the appropriate AGPL crate at runtime."
-      "oneOf": [
+      "description": "Classifier that determines how the MCP service routes a tool invocation.\n\nThe permissive `ahma_mcp` library handles `Command` and `Livelog` natively.\nTool types implemented in the AGPL-licensed sibling crates (`ahma_decompose`,\n`ahma_worker`, etc.) are serialised to their JSON names (e.g. `\"decompose\"`,\n`\"worker\"`) and round-trip correctly \u2014 they are just stored as `Extension`\nin this enum so the MIT library has no compile-time dependency on AGPL code.\n`ahma_bin` routes those calls to the appropriate AGPL crate at runtime.""oneOf": [
         {
           "description": "Normal command-line tool (default).",
           "type": "string",

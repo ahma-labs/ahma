@@ -63,7 +63,10 @@ mod tests {
     #[test]
     fn create_vault_sync_without_ahma_vault_errors() {
         let result = create_vault_sync("test-python-binding");
-        assert!(result.is_err(), "expected error without ahma_vault AGPL crate");
+        assert!(
+            result.is_err(),
+            "expected error without ahma_vault AGPL crate"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("AGPL"), "error should mention AGPL");
     }
