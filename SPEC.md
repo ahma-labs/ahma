@@ -153,7 +153,7 @@ These tools are always available regardless of JSON configuration:
 - **R1.5.3**: The `--disable-progressive-disclosure` CLI flag **must** restore legacy behavior where all enabled tools are listed immediately.
 - **R1.5.4**: The `instructions` field in the MCP `initialize` response **must** contain sandbox routing directives instructing the model to use `sandboxed_shell` for all command execution.
 - **R1.5.5**: The `activate_tools` description **must** dynamically list all loaded bundles with action-oriented hints (`ai_hint`) so the AI knows exactly when to activate each bundle.
-- **R1.5.6**: CLI-enabled bundles (e.g., `--tools rust,git`) are **loaded but hidden by default**. The `--auto-reveal` flag (or `AHMA_AUTO_REVEAL=1`) makes them immediately visible at startup, bypassing the progressive disclosure step. Without `--auto-reveal`, the LLM must call `activate_tools` to reveal them.
+- **R1.5.6**: CLI-enabled bundles (e.g., `--tools rust,git`) are **loaded but hidden by default**. The startup visibility profile is controlled by the `AHMA_REVEAL_PROFILE` environment variable (`minimal` | `balanced` | `full`). Setting `AHMA_REVEAL_PROFILE=balanced` (or the legacy `--auto-reveal` CLI flag / `AHMA_AUTO_REVEAL=1` env var) makes all loaded bundles immediately visible at startup, bypassing the progressive disclosure step. Without any of these, the LLM must call `activate_tools` to reveal them. Precedence: `AHMA_REVEAL_PROFILE` > `--auto-reveal` / `AHMA_AUTO_REVEAL=1` > default (`minimal`).
 
 ### R2: Async-First Architecture
 

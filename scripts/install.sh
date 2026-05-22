@@ -834,6 +834,11 @@ activate_tools(action="reveal", bundle="git")    # Unlock Git tools
 "args": ["serve", "stdio", "--tools", "rust,git,fileutils", "--auto-reveal"]
 ```
 
+Prefer setting `AHMA_REVEAL_PROFILE=balanced` in the `env` block instead of `--auto-reveal`:
+```json
+"env": { "AHMA_REVEAL_PROFILE": "balanced" }
+```
+
 ---
 
 ## Built-in Tools (Always Available)

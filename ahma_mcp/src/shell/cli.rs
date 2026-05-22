@@ -803,6 +803,15 @@ pub struct ServeArgs {
     /// The vault must exist (create with `ahma vault create <slug>` first).
     #[arg(long = "task-vault", value_name = "PATH", global = true)]
     pub task_vault: Option<PathBuf>,
+
+    /// Immediately reveal all loaded `--tools` bundles at startup without
+    /// requiring an `activate_tools` call. Equivalent to `AHMA_AUTO_REVEAL=1`
+    /// or `AHMA_REVEAL_PROFILE=balanced`.
+    ///
+    /// Deprecated: prefer the `AHMA_REVEAL_PROFILE=balanced` environment
+    /// variable; this flag is kept for backward compatibility.
+    #[arg(long = "auto-reveal", global = true)]
+    pub auto_reveal: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1382,6 +1391,13 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         None
     };
 
+    // auto-reveal legacy alias from CLI
+    let cli_auto_reveal: bool = if let Subcommands::Serve(s) = &cli.command {
+        s.auto_reveal
+    } else {
+        false
+    };
+
     // Tool list args
     let (list_server, mcp_config, list_http, list_format) = if let Subcommands::Tool(ToolArgs {
         command: ToolCommand::List(la),
@@ -1450,6 +1466,9 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         {
             "balanced" => StartupProfile::Balanced,
             "full" => StartupProfile::Full,
+            _ if cli_auto_reveal || AppConfig::env_flag("AHMA_AUTO_REVEAL") => {
+                StartupProfile::Balanced
+            }
             _ => StartupProfile::Minimal,
         },
         no_sandbox: cli_no_sandbox || AppConfig::env_flag("AHMA_DISABLE_SANDBOX"),
@@ -2379,5 +2398,71 @@ mod tests {
         unsafe { std::env::set_var("AHMA_TEST_CFG_FLAG", "yes") };
         assert!(AppConfig::env_flag("AHMA_TEST_CFG_FLAG"));
         unsafe { std::env::remove_var("AHMA_TEST_CFG_FLAG") };
+    }
+
+    // ─── --auto-reveal / AHMA_AUTO_REVEAL compatibility ──────────────────────
+
+    #[test]
+    fn test_cli_parse_auto_reveal_flag() {
+        // Regression: `--auto-reveal` must be accepted (not rejected) by clap.
+        let cli =
+            Cli::try_parse_from(["ahma", "serve", "stdio", "--auto-reveal"]).unwrap();
+        if let Subcommands::Serve(s) = cli.command {
+            assert!(s.auto_reveal, "auto_reveal should be true when --auto-reveal is passed");
+        } else {
+            panic!("expected serve stdio subcommand");
+        }
+    }
+
+    #[test]
+    fn test_build_app_config_auto_reveal_flag_maps_to_balanced() {
+        let cli = Cli::try_parse_from(["ahma", "serve", "stdio", "--auto-reveal"]).unwrap();
+        let cfg = build_app_config(&cli);
+        assert_eq!(
+            cfg.reveal_profile,
+            StartupProfile::Balanced,
+            "--auto-reveal should set reveal_profile to Balanced"
+        );
+    }
+
+    #[test]
+    fn test_build_app_config_ahma_auto_reveal_env_maps_to_balanced() {
+        let cli = Cli::try_parse_from(["ahma", "serve", "stdio"]).unwrap();
+        unsafe { std::env::set_var("AHMA_AUTO_REVEAL", "1") };
+        let cfg = build_app_config(&cli);
+        unsafe { std::env::remove_var("AHMA_AUTO_REVEAL") };
+        assert_eq!(
+            cfg.reveal_profile,
+            StartupProfile::Balanced,
+            "AHMA_AUTO_REVEAL=1 should set reveal_profile to Balanced"
+        );
+    }
+
+    #[test]
+    fn test_build_app_config_reveal_profile_env_takes_precedence_over_auto_reveal() {
+        // AHMA_REVEAL_PROFILE wins; --auto-reveal should not override it.
+        let cli = Cli::try_parse_from(["ahma", "serve", "stdio", "--auto-reveal"]).unwrap();
+        unsafe { std::env::set_var("AHMA_REVEAL_PROFILE", "full") };
+        let cfg = build_app_config(&cli);
+        unsafe { std::env::remove_var("AHMA_REVEAL_PROFILE") };
+        assert_eq!(
+            cfg.reveal_profile,
+            StartupProfile::Full,
+            "AHMA_REVEAL_PROFILE=full should override --auto-reveal"
+        );
+    }
+
+    #[test]
+    fn test_build_app_config_default_reveal_profile_is_minimal() {
+        let cli = Cli::try_parse_from(["ahma", "serve", "stdio"]).unwrap();
+        // Ensure no relevant env vars are set
+        unsafe { std::env::remove_var("AHMA_REVEAL_PROFILE") };
+        unsafe { std::env::remove_var("AHMA_AUTO_REVEAL") };
+        let cfg = build_app_config(&cli);
+        assert_eq!(
+            cfg.reveal_profile,
+            StartupProfile::Minimal,
+            "default reveal_profile should be Minimal"
+        );
     }
 }
