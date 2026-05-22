@@ -554,7 +554,10 @@ impl AhmaMcpService {
 }
 
 #[async_trait::async_trait]
-#[allow(clippy::manual_async_fn)] // Required by rmcp ServerHandler trait
+#[expect(
+    clippy::manual_async_fn,
+    reason = "async-trait desugars to manual Future returns; required by rmcp ServerHandler trait contract"
+)]
 impl ServerHandler for AhmaMcpService {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.progressive_disclosure {

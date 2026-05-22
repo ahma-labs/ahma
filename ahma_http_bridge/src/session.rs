@@ -512,113 +512,6 @@ async fn await_response(
 }
 
 impl SessionManager {
-    #[cfg(target_os = "windows")]
-    fn is_windows_drive_path(path: &str) -> bool {
-        let path = path.strip_prefix(r"\\?\").unwrap_or(path);
-        let path = path.strip_prefix(r"\\?\/").unwrap_or(path);
-        let bytes = path.as_bytes();
-        bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && (bytes[2] == b'/' || bytes[2] == b'\\')
-    }
-
-    fn parse_file_uri_to_path(uri: &str) -> Option<PathBuf> {
-        // RFC 8089-ish minimal parsing: accept file:///abs/path and file://localhost/abs/path.
-        // Percent-decoding is required for common IDE roots that contain spaces/unicode.
-        const PREFIX: &str = "file://";
-        if !uri.starts_with(PREFIX) {
-            return None;
-        }
-
-        // Remove scheme.
-        let mut rest = &uri[PREFIX.len()..];
-
-        // Strip any query/fragment.
-        if let Some(idx) = rest.find(['?', '#']) {
-            rest = &rest[..idx];
-        }
-
-        // Handle host form: file://localhost/...
-        if let Some(after_localhost) = rest.strip_prefix("localhost") {
-            rest = after_localhost;
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            // Accept drive-letter forms:
-            // - file:///C:/Users/name
-            // - file://localhost/C:/Users/name
-            // - file://C:/Users/name
-            // And UNC host form:
-            // - file://server/share/path
-            let decoded = Self::percent_decode_utf8(rest)?;
-
-            if let Some(without_leading_slash) = decoded.strip_prefix('/')
-                && Self::is_windows_drive_path(without_leading_slash)
-            {
-                return Some(PathBuf::from(without_leading_slash));
-            }
-
-            if Self::is_windows_drive_path(&decoded) {
-                return Some(PathBuf::from(decoded));
-            }
-
-            if !decoded.starts_with('/') && !decoded.starts_with("//") {
-                return Some(PathBuf::from(format!("//{}", decoded)));
-            }
-
-            return None;
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            // For unix-like paths, we only accept absolute paths.
-            if !rest.starts_with('/') {
-                return None;
-            }
-
-            let decoded = Self::percent_decode_utf8(rest)?;
-            Some(PathBuf::from(decoded))
-        }
-    }
-
-    fn percent_decode_utf8(input: &str) -> Option<String> {
-        // Decode %XX sequences into bytes, then UTF-8.
-        // If decoding fails, return None so the roots entry is treated as invalid.
-        let bytes = input.as_bytes();
-        let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'%' => {
-                    if i + 2 >= bytes.len() {
-                        return None;
-                    }
-                    let hi = bytes[i + 1];
-                    let lo = bytes[i + 2];
-                    let hex = |b: u8| -> Option<u8> {
-                        match b {
-                            b'0'..=b'9' => Some(b - b'0'),
-                            b'a'..=b'f' => Some(b - b'a' + 10),
-                            b'A'..=b'F' => Some(b - b'A' + 10),
-                            _ => None,
-                        }
-                    };
-                    let hi = hex(hi)?;
-                    let lo = hex(lo)?;
-                    out.push((hi << 4) | lo);
-                    i += 3;
-                }
-                b => {
-                    out.push(b);
-                    i += 1;
-                }
-            }
-        }
-        String::from_utf8(out).ok()
-    }
-
     /// Creates a new `SessionManager` with the given configuration.
     pub fn new(config: SessionManagerConfig) -> Self {
         Self {
@@ -844,10 +737,11 @@ impl SessionManager {
             return Ok(false);
         }
 
-        // Extract all roots as sandbox scopes
+        // Extract all roots as sandbox scopes.
+        // Delegate to the shared file_uri parser so security improvements apply everywhere.
         let parsed_scopes: Vec<PathBuf> = roots
             .iter()
-            .filter_map(|r| Self::parse_file_uri_to_path(&r.uri))
+            .filter_map(|r| ahma_common::file_uri::parse_file_uri_to_path(&r.uri))
             .collect();
 
         let scopes = if !parsed_scopes.is_empty() {
@@ -1075,11 +969,9 @@ impl SessionManager {
                             if let Ok(value) = serde_json::from_str::<Value>(&line) {
                                 // Check if it's a response to a pending request
                                 if let Some(id) = value.get("id") {
-                                    let id_str = if id.is_string() {
-                                        id.as_str().unwrap().to_string()
-                                    } else {
-                                        id.to_string()
-                                    };
+                                    let id_str = id
+                                        .as_str()
+                                        .map_or_else(|| id.to_string(), str::to_string);
 
                                     if let Some((_, sender)) = session.pending_requests.remove(&id_str) {
                                         let _ = sender.send(value);
@@ -1089,44 +981,46 @@ impl SessionManager {
 
                                 // If this is a notification that the subprocess has applied
                                 // the sandbox scopes, mark the session and notify waiters.
-                                if let Some(method_val) = value.get("method") {
-                                    if let Some(method_str) = method_val.as_str() {
-                                        if method_str == "notifications/sandbox/configured" {
-                                            if let Err(e) = session.sandbox_state_machine.transition_to_active() {
-                                                warn!(
-                                                    session_id = %session.id,
-                                                    error = %e,
-                                                    "Failed to transition sandbox state to Active (received notifications/sandbox/configured)"
-                                                );
-                                            } else {
-                                                info!(session_id = %session.id, "Observed notifications/sandbox/configured from subprocess - Sandbox is now ACTIVE");
-                                            }
-                                        } else if method_str == "notifications/sandbox/failed" {
-                                            let err_msg = value
-                                                .get("params")
-                                                .and_then(|p| p.get("error"))
-                                                .and_then(|e| e.as_str())
-                                                .unwrap_or("Unknown error");
-
-                                            if let Err(e) = session.sandbox_state_machine.transition_to_failed(err_msg.to_string()) {
-                                                warn!(
-                                                    session_id = %session.id,
-                                                    error = %e,
-                                                    "Failed to transition sandbox state to Failed (received notifications/sandbox/failed)"
-                                                );
-                                            } else {
-                                                warn!(
-                                                    session_id = %session.id,
-                                                    error_msg = %err_msg,
-                                                    "Subprocess reported sandbox configuration failed"
-                                                );
-                                            }
+                                match value.get("method").and_then(Value::as_str) {
+                                    Some("notifications/sandbox/configured") => {
+                                        if let Err(e) = session.sandbox_state_machine.transition_to_active() {
+                                            warn!(
+                                                session_id = %session.id,
+                                                error = %e,
+                                                "Failed to transition sandbox state to Active (received notifications/sandbox/configured)"
+                                            );
                                         } else {
-                                            debug!(session_id = %session.id, method = %method_str, "Subprocess sent a different notification");
+                                            info!(session_id = %session.id, "Observed notifications/sandbox/configured from subprocess - Sandbox is now ACTIVE");
                                         }
-                                    } else {
+                                    }
+                                    Some("notifications/sandbox/failed") => {
+                                        let err_msg = value
+                                            .get("params")
+                                            .and_then(|p| p.get("error"))
+                                            .and_then(|e| e.as_str())
+                                            .unwrap_or("Unknown error");
+
+                                        if let Err(e) = session.sandbox_state_machine.transition_to_failed(err_msg.to_string()) {
+                                            warn!(
+                                                session_id = %session.id,
+                                                error = %e,
+                                                "Failed to transition sandbox state to Failed (received notifications/sandbox/failed)"
+                                            );
+                                        } else {
+                                            warn!(
+                                                session_id = %session.id,
+                                                error_msg = %err_msg,
+                                                "Subprocess reported sandbox configuration failed"
+                                            );
+                                        }
+                                    }
+                                    Some(method_str) => {
+                                        debug!(session_id = %session.id, method = %method_str, "Subprocess sent a different notification");
+                                    }
+                                    None if value.get("method").is_some() => {
                                         warn!(session_id = %session.id, "Subprocess sent a method that is not a string");
                                     }
+                                    None => {}
                                 }
 
                                 // Not a response to a pending request - broadcast as SSE event

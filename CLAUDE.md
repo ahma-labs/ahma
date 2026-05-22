@@ -412,7 +412,8 @@ The `--tmp` flag (or `AHMA_TMP_ACCESS=1` environment variable) adds the system t
 
 > **Status**: Runtime (PowerShell shell pool, path model) is `in-progress`.
 > Job Object sandbox enforcement (`enforce_windows_sandbox`) is **done** and wired into startup.
-> AppContainer backend (`ahma/src/sandbox/windows.rs`) is `not-started` — fails closed until implemented.
+> AppContainer spawn isolation is **pending**; do not mark it done until Windows CI proves
+> write attempts outside the sandbox are OS-blocked.
 
 #### Key rules for Windows-targeted changes
 
@@ -432,11 +433,10 @@ The `--tmp` flag (or `AHMA_TMP_ACCESS=1` environment variable) adds the system t
 Before marking `Windows Sandbox backend` → `tests-pass` in SPEC.md, all of the following
 must be satisfied (see R6.3 in SPEC.md for the full acceptance criteria):
 
-- [x] `check_windows_sandbox_available()` returns `Ok(())` when AppContainer backend is ready — **done**: probes `CreateAppContainerProfile` with invalid name; `E_INVALIDARG` confirms Win8+ API is present
+- [x] `check_windows_sandbox_available()` returns `Ok(())` when the AppContainer API is available — **done**: probes `CreateAppContainerProfile` with invalid name; `E_INVALIDARG` confirms Win8+ API is present
 - [x] `enforce_windows_sandbox(roots)` — **done**: Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` applied at startup; non-fatal if already inside a job
-- [x] Win32 imports in `windows.rs` are active (not commented out) — `CloseHandle`, `FALSE`, `CreateJobObjectW`, `SetInformationJobObject`, `AssignProcessToJobObject`, `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, `GetCurrentProcess`
-- [x] AppContainer profile + DACL grant implemented in `create_windows_sandboxed_command` — **done**: `CreateAppContainerProfile`, `SetNamedSecurityInfoW` with `FILE_ALL_ACCESS` for container SID
-- [x] Write outside scope is OS-blocked at kernel level — **done**: `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` applied via `raw_attribute`; AppContainer SID attached at spawn (R6.3.3)
+- [ ] Implement AppContainer spawn isolation in `create_windows_sandboxed_command` — **pending**: attach an AppContainer SID at process spawn and grant only scoped filesystem access
+- [ ] Write outside scope is OS-blocked at kernel level — **pending**: requires AppContainer spawn isolation and Windows CI proof (R6.3.3)
 - [x] `tools/call` before sandbox lock returns HTTP 409 / JSON-RPC `-32001` — covered by `handshake_timeout_test`
 - [x] Filesystem root scopes (`C:\`, UNC) are rejected by `canonicalize_scopes` — **done**: `is_filesystem_root()` handles all Win/Unix root forms
 - [x] All sandbox gating integration tests pass on `windows-latest` CI runner — **done**: Windows bypass removed from `sandbox_env.rs`; `red_team_command_write_escape_blocked` enabled on Windows (R6.3.7)

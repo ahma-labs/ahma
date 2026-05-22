@@ -97,9 +97,32 @@ threads-required = 2
 # ---------------------------------------------------------------------------
 # Coverage profile (cargo llvm-cov) — instrumentation slows tests significantly
 # ---------------------------------------------------------------------------
+#
+# IMPORTANT: coverage mode MUST mirror the subprocess-throttling intent of the
+# CI profile.  llvm-cov instrumentation adds binary-loading and pipe-I/O
+# overhead that is 2-4x worse than a plain run.  Without these overrides,
+# bridge and ahma_mcp subprocess tests compete for the scheduler and produce
+# assertion timeouts (e.g. fast-error-response tests fail because the real
+# round-trip time exceeds the 2-second assertion budget).
 
 [profile.coverage]
+test-threads = "num-cpus"
 slow-timeout = { period = "1800s", terminate-after = 2 }
 failure-output = "immediate"
 success-output = "never"
 retries = 0
+
+# Bridge tests spawn server subprocesses. Under coverage, binary loading and
+# IPC are substantially slower. threads-required = 2 with test-threads = num-cpus
+# (= 2 on CI) means only 1 bridge test runs at a time — preventing scheduler
+# starvation and fast-error assertion breaches.
+[[profile.coverage.overrides]]
+filter = "package(ahma_http_bridge)"
+threads-required = 2
+slow-timeout = { period = "600s", terminate-after = 2 }
+
+# Many ahma_mcp integration test binaries spawn ahma subprocess.
+# Same throttle as CI — prevents concurrent subprocess starvation.
+[[profile.coverage.overrides]]
+filter = "binary_id(~ahma_mcp::)"
+threads-required = 2

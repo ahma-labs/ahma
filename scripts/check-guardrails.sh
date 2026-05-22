@@ -119,7 +119,35 @@ if [[ "$missing" -ne 0 ]]; then
 fi
 echo "OK Crate root preflight passed"
 
-echo "=== Guardrail: lint recurring test patterns ==="
+echo "=== Guardrail: no per-crate edition or rust-version overrides ==="
+# All crates must inherit edition and rust-version from the workspace.
+# Local overrides silently break MSRV guarantees across the workspace.
+EDITION_OVERRIDE_FAIL=0
+while IFS= read -r manifest; do
+  crate_dir="$(dirname "$manifest")"
+  # Skip workspace root (it is allowed to define edition/rust-version).
+  if ! grep -q "^\[package\]" "$manifest"; then
+    continue
+  fi
+  if grep -Eq '^edition\s*=' "$manifest"; then
+    echo "FAIL $manifest defines its own 'edition'; remove it and inherit from [workspace.package]."
+    EDITION_OVERRIDE_FAIL=1
+  fi
+  if grep -Eq '^rust-version\s*=' "$manifest"; then
+    echo "FAIL $manifest defines its own 'rust-version'; remove it and inherit from [workspace.package]."
+    EDITION_OVERRIDE_FAIL=1
+  fi
+done < <(find . -name Cargo.toml -not -path "./target/*")
+if [[ "$EDITION_OVERRIDE_FAIL" -ne 0 ]]; then
+  echo ""
+  echo "  Each member crate must use:"
+  echo "    edition.workspace = true"
+  echo "    rust-version.workspace = true"
+  exit 1
+fi
+echo "OK No per-crate edition/rust-version overrides"
+
+echo "=== Guardrail: lint recurring test patterns ===" 
 ./scripts/lint_test_paths.sh
 
 echo "=== Guardrail: workspace cargo check ==="

@@ -579,16 +579,17 @@ async fn load_single_config_path(
 }
 
 fn insert_built_in_config(configs: &mut HashMap<String, ToolConfig>, config: ToolConfig) {
-    if configs.contains_key(&config.name) {
-        tracing::info!(
-            "Bundled tool '{}' overridden by local .ahma/ definition",
-            config.name
-        );
-        return;
+    match configs.entry(config.name.clone()) {
+        std::collections::hash_map::Entry::Occupied(_) => {
+            tracing::info!(
+                "Bundled tool '{}' overridden by local .ahma/ definition",
+                config.name
+            );
+        }
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(config);
+        }
     }
-
-    let tool_name = config.name.clone();
-    configs.insert(tool_name, config);
 }
 
 fn log_builtin_config_parse_error(bundle_name: &str, error: &anyhow::Error) {

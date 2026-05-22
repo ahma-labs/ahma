@@ -2,7 +2,6 @@ use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::test_utils::http::{HttpMcpTestClient, spawn_http_bridge};
 use anyhow::Context;
 use serde_json::json;
-use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
@@ -70,9 +69,10 @@ async fn test_http_no_progress_token_does_not_emit_progress_notifications() -> a
     );
 
     // Assert: no notifications/progress arrive within a short window.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(2);
     while tokio::time::Instant::now() < deadline {
-        let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(200), events_rx.recv()).await
+        let Ok(Some(ev)) =
+            tokio::time::timeout(TestTimeouts::scale_millis(200), events_rx.recv()).await
         else {
             continue;
         };
@@ -137,10 +137,10 @@ async fn test_http_progress_token_is_echoed_in_progress_notifications() -> anyho
     );
 
     // Expect at least one notifications/progress with matching token.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(3);
     while tokio::time::Instant::now() < deadline {
         if let Ok(Some(ev)) =
-            tokio::time::timeout(Duration::from_millis(500), events_rx.recv()).await
+            tokio::time::timeout(TestTimeouts::scale_millis(500), events_rx.recv()).await
         {
             if ev.get("method").and_then(|m| m.as_str()) != Some("notifications/progress") {
                 continue;

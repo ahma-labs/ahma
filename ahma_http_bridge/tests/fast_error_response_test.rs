@@ -37,7 +37,13 @@ fn should_skip_in_nested_sandbox() -> bool {
 
 /// Maximum allowed response time for ANY error case.
 /// If any request takes longer than this, the server has a hang bug.
-const MAX_ERROR_RESPONSE_MS: u128 = 2000;
+///
+/// Scales with the platform multiplier from `TestTimeouts::multiplier()` so
+/// that coverage instrumentation (2×) and Windows CI (4×) do not produce
+/// false-positive "hang" failures while still catching real hangs.
+fn max_error_response_ms() -> u128 {
+    TestTimeouts::scale_millis(2000).as_millis()
+}
 
 // Thread-local storage for the current test's server URL
 std::thread_local! {
@@ -294,10 +300,10 @@ async fn test_missing_session_id_returns_fast_error() {
 
     // MUST return fast - if this fails, server has a hang bug
     assert!(
-        duration_ms < MAX_ERROR_RESPONSE_MS,
+        duration_ms < max_error_response_ms(),
         "Server took {}ms to respond to missing session ID (max: {}ms). HANG BUG!",
         duration_ms,
-        MAX_ERROR_RESPONSE_MS
+        max_error_response_ms()
     );
 
     // Should be an error (400 status, which becomes Err)
@@ -347,10 +353,10 @@ async fn test_invalid_tool_name_returns_fast_error() {
 
     // MUST return fast
     assert!(
-        duration_ms < MAX_ERROR_RESPONSE_MS,
+        duration_ms < max_error_response_ms(),
         "Server took {}ms to respond to invalid tool name (max: {}ms). HANG BUG!",
         duration_ms,
-        MAX_ERROR_RESPONSE_MS
+        max_error_response_ms()
     );
 
     // Should be a JSON-RPC error response
@@ -412,10 +418,10 @@ async fn test_invalid_subcommand_returns_fast_error() {
 
     // MUST return fast
     assert!(
-        duration_ms < MAX_ERROR_RESPONSE_MS,
+        duration_ms < max_error_response_ms(),
         "Server took {}ms to respond to invalid subcommand (max: {}ms). HANG BUG!",
         duration_ms,
-        MAX_ERROR_RESPONSE_MS
+        max_error_response_ms()
     );
 
     // Should be a JSON-RPC error response
@@ -468,10 +474,10 @@ async fn test_invalid_method_returns_fast_error() {
 
     // MUST return fast
     assert!(
-        duration_ms < MAX_ERROR_RESPONSE_MS,
+        duration_ms < max_error_response_ms(),
         "Server took {}ms to respond to invalid method (max: {}ms). HANG BUG!",
         duration_ms,
-        MAX_ERROR_RESPONSE_MS
+        max_error_response_ms()
     );
 
     // Should be a JSON-RPC error response
@@ -514,10 +520,10 @@ async fn test_malformed_json_returns_fast_error() {
 
     // MUST return fast
     assert!(
-        duration_ms < MAX_ERROR_RESPONSE_MS,
+        duration_ms < max_error_response_ms(),
         "Server took {}ms to respond to malformed JSON (max: {}ms). HANG BUG!",
         duration_ms,
-        MAX_ERROR_RESPONSE_MS
+        max_error_response_ms()
     );
 
     // Should return some response (error is fine)
@@ -564,9 +570,9 @@ async fn test_missing_required_args_returns_fast_error() {
 
     // MUST return fast
     assert!(
-        duration_ms < MAX_ERROR_RESPONSE_MS,
+        duration_ms < max_error_response_ms(),
         "Server took {}ms to respond to missing args (max: {}ms). HANG BUG!",
         duration_ms,
-        MAX_ERROR_RESPONSE_MS
+        max_error_response_ms()
     );
 }

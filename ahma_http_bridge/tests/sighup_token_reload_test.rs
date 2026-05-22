@@ -18,10 +18,11 @@
 
 mod common;
 
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use common::server::resolve_binary_path;
 use reqwest::Client;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tempfile::{NamedTempFile, tempdir};
 
 const INITIAL_TOKEN: &str = "initial-secret-token";
@@ -53,7 +54,7 @@ fn spawn_auth_server(token_file: &NamedTempFile) -> Result<(std::process::Child,
     let port = {
         use std::io::BufRead;
         let reader = std::io::BufReader::new(stderr);
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + TestTimeouts::get(TimeoutCategory::ProcessSpawn);
         let mut found_port = None;
         for line in reader.lines().map_while(Result::ok) {
             if line.contains("AHMA_BOUND_PORT=") {
@@ -73,7 +74,7 @@ fn spawn_auth_server(token_file: &NamedTempFile) -> Result<(std::process::Child,
     };
 
     // Wait for TCP to be reachable.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + TestTimeouts::get(TimeoutCategory::HealthCheck);
     loop {
         if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
             break;
@@ -82,7 +83,7 @@ fn spawn_auth_server(token_file: &NamedTempFile) -> Result<(std::process::Child,
             let _ = child.kill();
             return Err(format!("Server on port {port} never became reachable"));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(TestTimeouts::poll_interval());
     }
 
     Ok((child, port))
@@ -109,7 +110,7 @@ async fn initial_token_is_enforced() {
     };
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(TestTimeouts::scale_secs(5))
         .build()
         .unwrap();
     let health_url = format!("http://127.0.0.1:{port}/health");
@@ -169,7 +170,7 @@ async fn sighup_reloads_bearer_token() {
     };
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(TestTimeouts::scale_secs(5))
         .build()
         .unwrap();
     let mcp_url = format!("http://127.0.0.1:{port}/mcp");
@@ -200,7 +201,7 @@ async fn sighup_reloads_bearer_token() {
     assert!(status.success(), "`kill -s HUP {pid}` failed: {status}");
 
     // Give the server time to handle the signal and reload.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(TestTimeouts::scale_millis(500)).await;
 
     // New token must now be accepted.
     let resp = client

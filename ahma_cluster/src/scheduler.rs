@@ -139,11 +139,13 @@ impl NonceCache {
         let mut inner = self.inner.lock().expect("NonceCache lock poisoned");
         // Evict entries that have fallen outside the replay-protection window.
         inner.retain(|_, &mut ts| now.saturating_sub(ts) <= MANIFEST_MAX_AGE_SECS);
-        if inner.contains_key(nonce) {
-            return false;
+        match inner.entry(nonce.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(issued_at);
+                true
+            }
         }
-        inner.insert(nonce.to_owned(), issued_at);
-        true
     }
 }
 
