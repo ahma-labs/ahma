@@ -729,8 +729,9 @@ mod tests {
     #[test]
     fn test_extract_working_directory_fallback_default() {
         // The sandbox canonicalises "." to the real cwd, so the fallback is the
-        // absolute path — not the literal ".".
-        let workspace = Path::new(".").canonicalize().unwrap();
+        // absolute path — not the literal ".". Use dunce to avoid Windows \?\
+        // extended-length path prefixes in test expectations.
+        let workspace = dunce::canonicalize(Path::new(".")).unwrap();
         let adapter = create_test_config(&workspace).unwrap();
         let params = CallToolRequestParams::new("test".to_string());
         let wd = extract_working_directory(&adapter, &params);
