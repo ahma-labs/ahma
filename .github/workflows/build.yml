@@ -436,7 +436,7 @@ jobs:
 
       - name: Generate code simplicity report
         run: |
-          cargo run -p ahma_mcp -- simplify . --limit 20 --html
+          cargo run -p ahma_bin -- simplify . --limit 20 --html
           cp CODE_SIMPLICITY.md coverage/
           cp CODE_SIMPLICITY.html coverage/
 
@@ -477,6 +477,7 @@ jobs:
       run:
         shell: bash
     strategy:
+      fail-fast: false
       max-parallel: 2
       matrix:
         include:
@@ -605,6 +606,8 @@ jobs:
 
       - name: Install cross (for cross-compilation)
         if: matrix.use_cross
+        env:
+          RUSTC_WRAPPER: "" # sccache not usable during cargo-binstall/install bootstrap
         run: |
           if ! command -v cross &> /dev/null; then
             echo "cross not found, installing..."
