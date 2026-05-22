@@ -85,6 +85,24 @@ list.add("api.openai.com");
 list.save(vault.path().join("egress.allowlist"))?;
 ```
 
+## Using `EgressClient` in Rust code
+
+Internal ahma services that need to make outbound HTTP calls should use
+[`EgressClient`](../ahma_vault/src/egress_client.rs) instead of a raw
+`reqwest::Client`. It enforces the vault's egress policy before every request:
+
+```rust
+use ahma_vault::{EgressClient, EgressPolicy};
+
+let policy = EgressPolicy::from_vault_path(&vault_path);
+let client = EgressClient::new(policy);
+
+// Checked against the allowlist — returns EgressError::Denied if blocked.
+let body: serde_json::Value = client.get_json("https://api.openai.com/v1/models").await?;
+```
+
+This prevents code from accidentally bypassing policy by constructing a raw client.
+
 ## Limitations
 
 - The proxy covers `HTTP_PROXY` / `HTTPS_PROXY` convention. Tools that make raw TCP connections or use their own resolver may bypass it. Landlock/Seatbelt still prevents filesystem-level workarounds.

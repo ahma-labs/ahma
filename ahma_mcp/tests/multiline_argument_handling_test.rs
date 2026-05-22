@@ -12,6 +12,7 @@ use ahma_mcp::{
     sandbox::Sandbox,
     shell_pool::{ShellPoolConfig, ShellPoolManager},
 };
+use ahma_test_support::path_helpers::test_root;
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tempfile::tempdir;
@@ -104,12 +105,13 @@ async fn test_simple_git_commit_without_multiline() {
 #[tokio::test]
 async fn test_multiline_argument_with_echo() {
     init_test_logging();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
         Duration::from_secs(30),
     )));
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
 
-    let scopes = vec![ahma_mcp::test_utils::path_helpers::test_root()];
+    let scopes = vec![test_root()];
     let sandbox = Arc::new(
         Sandbox::new(
             scopes,
@@ -165,7 +167,7 @@ async fn test_multiline_argument_with_echo() {
         .execute_async_in_dir_with_options(
             "echo_test",
             "echo",
-            "/tmp",
+            temp_dir.path().to_str().unwrap(),
             AsyncExecOptions {
                 id: Some("test_echo_multiline".to_string()),
                 args: args.as_object().cloned(),
@@ -575,6 +577,7 @@ async fn test_multiline_git_commit_message() {
 #[tokio::test]
 async fn test_special_characters_in_arguments() {
     init_test_logging();
+    let temp_dir = tempdir().expect("Failed to create temp dir");
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
         Duration::from_secs(30),
     )));
@@ -624,7 +627,7 @@ async fn test_special_characters_in_arguments() {
         .execute_async_in_dir_with_options(
             "echo_test",
             "echo",
-            "/tmp",
+            temp_dir.path().to_str().unwrap(),
             AsyncExecOptions {
                 id: Some("test_special_chars".to_string()),
                 args: args.as_object().cloned(),

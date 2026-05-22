@@ -58,6 +58,28 @@ On Windows, Ahma uses Job Object enforcement (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOS
 
 When running inside Cursor, VS Code, or Docker, the outer environment may prevent Ahma from applying its own sandbox. Ahma detects this and exits with instructions.
 
+## HTTP Transport Authentication
+
+When running in `--mode http`, all `/mcp` endpoints are protected by **bearer token authentication**:
+
+```jsonc
+// mcp.json
+{
+  "mcpServers": {
+    "ahma": {
+      "url": "http://localhost:4000/mcp",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN" }
+    }
+  }
+}
+```
+
+- Start the server with `--bearer-token <token>` or set `AHMA_BEARER_TOKEN`.
+- The `Authorization: Bearer` scheme is **case-insensitive** (RFC 7235 §2.1).
+- The `/health` endpoint is explicitly **exempt** from authentication so orchestrators can probe liveness without credentials.
+- Bearer tokens are compared in **constant time** to prevent timing attacks.
+- **Hot-reload**: Send `SIGHUP` to swap the token without restarting; the new token is read from config and applied atomically.
+
 **Manual override** (when you know the outer environment is safe):
 
 ```bash

@@ -94,7 +94,7 @@ Each peer must have the same key file at the same path.
 | Method | Status |
 |--------|--------|
 | Static `~/.ahma/cluster/peers.json` | Working |
-| mDNS (`_ahma-worker._tcp.local`) | Stub — logs a warning; full implementation requires the `mdns-sd` crate |
+| mDNS (`_ahma-worker._tcp.local`) | Working — zero-config LAN discovery via the `mdns-sd` crate |
 | Tailscale | Configure static peers using Tailscale hostnames |
 
 ## Scheduler behaviour
@@ -133,6 +133,56 @@ if let Some(result) = scheduler.schedule(manifest).await {
     println!("Answer from {}: {}", result.worker_id, result.text);
 }
 ```
+
+## Security — HMAC signing & replay protection
+
+All cluster communication between nodes is authenticated with **HMAC-SHA256**.
+
+### Signed task manifests
+
+Every `TaskManifest` is signed before dispatch and verified on receipt. The fields `nonce`, `issued_at`, and `signature` are handled automatically by `TaskManifest::sign`:
+
+```rust
+manifest.sign(&key);      // fills nonce (UUID v4), issued_at (Unix seconds), signature
+manifest.verify(&key)?;   // returns Err if signature is wrong or manifest has expired
+```
+
+`verify` rejects manifests that are **older than 60 seconds** (configurable via `valid_window_secs`).
+
+### Replay protection (NonceCache)
+
+The receiving node passes the manifest through `verify_with_nonce_cache`, which calls `verify` *and* records the nonce in an in-memory `NonceCache`:
+
+```rust
+// Receiving side:
+if !manifest.verify_with_nonce_cache(&key, &scheduler.nonce_cache)? {
+    // nonce was already seen — replay attack blocked
+    bail!("Duplicate nonce rejected");
+}
+```
+
+`NonceCache` automatically evicts entries older than `issued_at + valid_window_secs` to bound memory usage.
+
+### Signed heartbeats
+
+Peer heartbeats are also signed. The capabilities payload is serialised to JSON and signed with the shared key:
+
+```rust
+// Sending side (worker):
+let payload = serde_json::to_string(&capabilities)?;
+let sig = hmac_sha256_hex(&key, &payload);
+
+// Receiving side (coordinator):
+registry.receive_signed_heartbeat(peer_id, capabilities, &sig, &key)?;
+```
+
+The receiving side uses `subtle::ConstantTimeEq` for the signature comparison to prevent timing side-channels.
+
+### Key management
+
+- Store the shared key in `~/.ahma/cluster/shared.key` (32+ random bytes, `chmod 600`).
+- The key fingerprint (first 8 hex chars of its SHA-256) is logged at startup for cross-node audit.
+- Configure the path via `cluster.key_file` in `~/.ahma/config.toml`.
 
 ## See also
 

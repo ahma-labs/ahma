@@ -19,6 +19,14 @@ async fn main() -> Result<()> {
         .unwrap_or(false);
 
     let cli = Cli::parse();
+
+    // --markdown-help: emit the full CLI reference as Markdown and exit.
+    // Regenerate docs/cli-reference.md with:  ahma --markdown-help > docs/cli-reference.md
+    if cli.markdown_help {
+        print!("{}", clap_markdown::help_markdown::<Cli>());
+        return Ok(());
+    }
+
     let cfg = build_app_config(&cli);
     let subcommand = cli.command;
 
@@ -379,6 +387,83 @@ async fn dispatch_cluster(args: ahma_mcp::shell::ClusterArgs) -> Result<()> {
                     );
                 }
             }
+            Ok(())
+        }
+
+        ClusterCommand::Discover => {
+            println!("Browsing for ahma worker peers via mDNS (_ahma-worker._tcp.local.)…");
+            println!("Press Ctrl-C to stop.\n");
+            let registry = ahma_cluster::WorkerRegistry::new(120);
+            registry.start_mdns_discovery().await;
+            // Poll and print for 30 s then exit, or run until Ctrl-C.
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                for peer in registry.all_live() {
+                    if seen.insert(peer.id.clone()) {
+                        let models = if peer.models.is_empty() {
+                            "no models listed".to_string()
+                        } else {
+                            peer.models.join(", ")
+                        };
+                        println!("  Found: {:<20} {}  [{}]", peer.id, peer.addr, models);
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            if seen.is_empty() {
+                println!("No ahma peers discovered on the local network.");
+            } else {
+                println!("\nDiscovery complete ({} peer(s) found).", seen.len());
+            }
+            Ok(())
+        }
+
+        ClusterCommand::Announce(ann_args) => {
+            let id = ann_args.id.unwrap_or_else(|| {
+                std::env::var("HOSTNAME")
+                    .or_else(|_| std::env::var("COMPUTERNAME"))
+                    .unwrap_or_else(|_| "ahma-worker".to_owned())
+            });
+            let models: Vec<String> = ann_args
+                .models
+                .into_iter()
+                .filter(|m| !m.is_empty())
+                .collect();
+            let registry = ahma_cluster::WorkerRegistry::new(120);
+            registry.announce_self(&id, ann_args.port, &models)?;
+            println!(
+                "Announcing '{}' on port {} via mDNS. Press Ctrl-C to stop.",
+                id, ann_args.port
+            );
+            // Keep running until killed.
+            tokio::signal::ctrl_c().await?;
+            Ok(())
+        }
+
+        ClusterCommand::Cert(cert_cmd) => dispatch_cert(cert_cmd),
+    }
+}
+
+fn dispatch_cert(cmd: ahma_mcp::shell::CertCommand) -> Result<()> {
+    use ahma_mcp::shell::CertCommand;
+    match cmd {
+        CertCommand::Init { out_dir } => {
+            let out_path = if out_dir.starts_with('~') {
+                let home =
+                    dirs::home_dir().context("Cannot determine home directory for cert init")?;
+                home.join(&out_dir[2..])
+            } else {
+                std::path::PathBuf::from(&out_dir)
+            };
+            ahma_cluster::tls::generate_self_signed_cluster_certs(&out_path)?;
+            println!("mTLS certificates written to {}", out_path.display());
+            println!("  ca.pem    — CA certificate (share with all peers)");
+            println!("  cert.pem  — leaf certificate for this peer");
+            println!("  key.pem   — private key for this peer (keep secret)");
             Ok(())
         }
     }

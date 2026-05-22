@@ -6,7 +6,6 @@ use tempfile::TempDir;
 #[test]
 fn test_guard_rail_detects_hardcoded_tool_conflicts() {
     init_test_logging();
-    println!("🧪 Testing guard rail system for hardcoded tool conflicts...");
 
     // Create a temporary directory with a conflicting tool configuration
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -68,36 +67,24 @@ fn test_guard_rail_detects_hardcoded_tool_conflicts() {
         Some(&tools_dir),
     );
 
-    match result {
-        Err(e) => {
-            let error_message = e.to_string();
-            assert!(
-                error_message.contains("await"),
-                "Error should mention the conflicting 'await' tool, got: {}",
-                error_message
-            );
-            assert!(
-                error_message.contains("system tool") || error_message.contains("conflict"),
-                "Error should mention system tool or conflict, got: {}",
-                error_message
-            );
-            println!(
-                "OK Guard rail correctly detected conflict: {}",
-                error_message
-            );
-        }
-        Ok(_) => {
-            panic!("Expected guard rail to detect conflict and return error, but got Ok(_)");
-        }
-    }
-
-    println!("OK Guard rail system test passed!");
+    let error_message = result
+        .expect_err("Expected guard rail to detect conflict and return error")
+        .to_string();
+    assert!(
+        error_message.contains("await"),
+        "Error should mention the conflicting 'await' tool, got: {}",
+        error_message
+    );
+    assert!(
+        error_message.contains("system tool") || error_message.contains("conflict"),
+        "Error should mention system tool or conflict, got: {}",
+        error_message
+    );
 }
 
 #[test]
 fn test_guard_rail_allows_valid_configurations() {
     init_test_logging();
-    println!("🧪 Testing guard rail allows valid configurations...");
 
     // Create a temporary directory with only valid tool configurations
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
@@ -134,31 +121,19 @@ fn test_guard_rail_allows_valid_configurations() {
         Some(&tools_dir),
     );
 
-    match result {
-        Ok(configs) => {
-            // ls tool optional; do not assert its presence
-            assert!(configs.contains_key("git"), "Should load git tool");
-            assert!(
-                !configs.contains_key("await"),
-                "Should not contain hardcoded await tool"
-            );
-            assert!(
-                !configs.contains_key("status"),
-                "Should not contain hardcoded status tool"
-            );
-            assert!(
-                !configs.contains_key("cancel"),
-                "Should not contain hardcoded cancel tool"
-            );
-            println!("OK Guard rail correctly allowed valid configurations");
-        }
-        Err(e) => {
-            panic!(
-                "Expected guard rail to allow valid configurations, but got error: {}",
-                e
-            );
-        }
-    }
-
-    println!("OK Guard rail validation test passed!");
+    let configs = result.expect("Expected guard rail to allow valid configurations");
+    // ls tool optional; do not assert its presence
+    assert!(configs.contains_key("git"), "Should load git tool");
+    assert!(
+        !configs.contains_key("await"),
+        "Should not contain hardcoded await tool"
+    );
+    assert!(
+        !configs.contains_key("status"),
+        "Should not contain hardcoded status tool"
+    );
+    assert!(
+        !configs.contains_key("cancel"),
+        "Should not contain hardcoded cancel tool"
+    );
 }

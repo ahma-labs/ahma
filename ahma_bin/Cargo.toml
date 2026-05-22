@@ -27,6 +27,7 @@ ahma_tui = { path = "../ahma_tui" }
 ahma_common = { path = "../ahma_common" }
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
+clap-markdown = "0.1"
 dirs.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls"] }
 serde_json.workspace = true

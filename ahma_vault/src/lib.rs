@@ -30,10 +30,34 @@
 //! println!("Sandbox scope: {}", vault.sandbox_scope().display());
 //! # Ok::<(), anyhow::Error>(())
 //! ```
+//!
+//! ## Egress policy
+//!
+//! Every vault owns an [`EgressPolicy`] that controls which outbound hostnames
+//! agent code may reach.  Use [`EgressClient`] instead of a raw `reqwest::Client`
+//! to have the policy automatically enforced before each request:
+//!
+//! ```no_run
+//! use ahma_vault::{EgressClient, EgressPolicy};
+//!
+//! let policy = EgressPolicy::deny_all();
+//! let client = EgressClient::new(policy);
+//!
+//! // Returns EgressError::Denied if the host is not in the allow-list.
+//! # async fn example(client: EgressClient) -> anyhow::Result<()> {
+//! let body: serde_json::Value =
+//!     client.get_json("https://api.openai.com/v1/models").await?;
+//! # Ok(())
+//! # }
+//! ```
 
 pub mod audit;
 pub mod egress;
+pub mod egress_client;
 pub mod trash;
+
+pub use egress::EgressPolicy;
+pub use egress_client::{EgressClient, EgressError};
 
 use std::path::{Path, PathBuf};
 

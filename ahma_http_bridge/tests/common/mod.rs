@@ -7,9 +7,6 @@
 
 use ahma_common::timeouts::TestTimeouts;
 
-#[macro_use]
-pub mod sse_test_helpers;
-
 pub mod client;
 pub mod protocol;
 pub mod sandbox_env;
@@ -120,6 +117,17 @@ pub async fn setup_test_mcp(
                 attempt, last_error
             );
         }
+    }
+    // In CI (or when AHMA_TEST_FAIL_ON_SETUP_ERROR is set) a persistent handshake
+    // failure is a real regression, not a local infrastructure hiccup; panic so the
+    // build fails visibly instead of silently skipping the test.
+    let in_ci = std::env::var("CI").is_ok()
+        || std::env::var("AHMA_TEST_FAIL_ON_SETUP_ERROR").is_ok();
+    if in_ci {
+        panic!(
+            "setup_test_mcp: handshake failed in CI — aborting: {}",
+            last_error
+        );
     }
     eprintln!(
         "WARNING  setup_test_mcp: skipping due to persistent handshake failure: {}",

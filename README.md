@@ -20,28 +20,14 @@ Ahma is an MCP server for running real project work through existing CLI tools w
 **Linux / macOS — first-time install**
 
 ```bash
-cargo install --git https://github.com/paulirotta/ahma ahma_mcp --bin ahma --root ~/.local --locked --force
+curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-**Install a specific branch (first time or after `ahma` is on PATH):**
-
-```bash
-# First time (no ahma yet)
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root ~/.local --locked --force
-
-# After ahma is installed
-ahma update feature/update
-```
-
-**Windows (PowerShell 5.1+)**
+**Windows (PowerShell 5.1+) — first-time install**
 
 ```powershell
-# Latest release
 irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
-
-# Branch (requires Rust)
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root $HOME\.local --locked --force
 ```
 
 **Update an existing install:**
@@ -50,6 +36,30 @@ cargo install --git https://github.com/paulirotta/ahma --branch feature/update a
 ahma update              # latest release
 ahma update main         # build from branch
 ```
+
+<details>
+<summary><strong>Advanced — install a specific branch (requires <a href="https://rustup.rs/">Rust</a>)</strong></summary>
+
+Use this if you need to test an unreleased branch before the next binary release.
+
+**Linux / macOS**
+
+```bash
+# First time (no ahma yet)
+cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root ~/.local --locked --force
+export PATH="$HOME/.local/bin:$PATH"
+
+# After ahma is installed
+ahma update feature/update
+```
+
+**Windows (PowerShell 5.1+)**
+
+```powershell
+cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root $HOME\.local --locked --force
+```
+
+</details>
 
 See [docs/installation.md](docs/installation.md) for platform details, source builds, and branch installs from local checkouts.
 

@@ -26,6 +26,7 @@ owo-colors = "4.3"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 subtle.workspace = true
+arc-swap = "1"
 thiserror.workspace = true
 tokio = { workspace = true, features = [
     "rt-multi-thread",
@@ -33,10 +34,12 @@ tokio = { workspace = true, features = [
     "io-util",
     "process",
     "sync",
+    "signal",
 ] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { workspace = true, features = ["io", "codec"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "set-header"] }
+tower_governor = "0.8"
 
 # QUIC / HTTP/3 support
 base64 = "0.22"

@@ -138,7 +138,11 @@ fn test_livelog_config_missing_source_command_fails() {
     }"#;
 
     let result = serde_json::from_str::<LivelogConfig>(json);
-    assert!(result.is_err(), "should fail without source_command");
+    let err = result.expect_err("should fail without source_command");
+    assert!(
+        err.to_string().contains("source_command"),
+        "error should mention source_command: {err}"
+    );
 }
 
 #[test]
@@ -152,7 +156,11 @@ fn test_livelog_config_missing_detection_prompt_fails() {
     }"#;
 
     let result = serde_json::from_str::<LivelogConfig>(json);
-    assert!(result.is_err(), "should fail without detection_prompt");
+    let err = result.expect_err("should fail without detection_prompt");
+    assert!(
+        err.to_string().contains("detection_prompt"),
+        "error should mention detection_prompt: {err}"
+    );
 }
 
 #[test]
@@ -164,7 +172,11 @@ fn test_livelog_config_missing_llm_provider_fails() {
     }"#;
 
     let result = serde_json::from_str::<LivelogConfig>(json);
-    assert!(result.is_err(), "should fail without llm_provider");
+    let err = result.expect_err("should fail without llm_provider");
+    assert!(
+        err.to_string().contains("llm_provider"),
+        "error should mention llm_provider: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +274,11 @@ fn test_llm_provider_missing_base_url_fails() {
     }"#;
 
     let result = serde_json::from_str::<LlmProviderConfig>(json);
-    assert!(result.is_err(), "should fail without base_url");
+    let err = result.expect_err("should fail without base_url");
+    assert!(
+        err.to_string().contains("base_url"),
+        "error should mention base_url: {err}"
+    );
 }
 
 #[test]
@@ -272,7 +288,11 @@ fn test_llm_provider_missing_model_fails() {
     }"#;
 
     let result = serde_json::from_str::<LlmProviderConfig>(json);
-    assert!(result.is_err(), "should fail without model");
+    let err = result.expect_err("should fail without model");
+    assert!(
+        err.to_string().contains("model"),
+        "error should mention model: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------

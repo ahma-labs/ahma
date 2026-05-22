@@ -5,6 +5,7 @@ use crate::adapter::Adapter;
 use crate::client::Client;
 use crate::mcp_service::AhmaMcpService;
 use crate::operation_monitor::{MonitorConfig, OperationMonitor};
+use crate::sandbox::{Sandbox, SandboxMode};
 use crate::shell_pool::{ShellPoolConfig, ShellPoolManager};
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use anyhow::{Context, Result};
@@ -385,7 +386,16 @@ pub async fn setup_test_environment() -> (AhmaMcpService, TempDir) {
     let monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_pool_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_pool_config));
-    let sandbox = Arc::new(crate::sandbox::Sandbox::new_test());
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![temp_dir.path().to_path_buf()],
+            SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter = Arc::new(Adapter::new(monitor.clone(), shell_pool, sandbox).unwrap());
 
     // Create empty configs and guidance for the new API
@@ -412,7 +422,16 @@ pub async fn setup_test_environment_with_io()
     let monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_pool_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_pool_config));
-    let sandbox = Arc::new(crate::sandbox::Sandbox::new_test());
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![temp_dir.path().to_path_buf()],
+            SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter = Arc::new(Adapter::new(monitor.clone(), shell_pool, sandbox).unwrap());
 
     // Create empty configs and guidance for the new API
@@ -429,7 +448,7 @@ pub async fn setup_test_environment_with_io()
 
 /// Create a test config for integration tests
 #[allow(dead_code)]
-pub fn create_test_config(_workspace_dir: &Path) -> Result<Arc<Adapter>> {
+pub fn create_test_config(workspace_dir: &Path) -> Result<Arc<Adapter>> {
     let config = super::config::default_config();
     // Create test monitor and shell pool configurations
     let monitor_config = MonitorConfig::with_timeout(config.default_timeout);
@@ -447,8 +466,14 @@ pub fn create_test_config(_workspace_dir: &Path) -> Result<Arc<Adapter>> {
     };
     let shell_pool_manager = Arc::new(ShellPoolManager::new(shell_pool_config));
 
-    // Create a test sandbox
-    let sandbox = Arc::new(crate::sandbox::Sandbox::new_test());
+    // Create a strict test sandbox scoped to the requested workspace.
+    let sandbox = Arc::new(Sandbox::new(
+        vec![workspace_dir.to_path_buf()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )?);
 
     Adapter::new(operation_monitor, shell_pool_manager, sandbox).map(Arc::new)
 }

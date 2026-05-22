@@ -19,6 +19,7 @@
 use ahma_mcp::skip_if_disabled_async_result;
 use ahma_mcp::test_utils::client::ClientBuilder;
 use ahma_mcp::utils::logging::init_test_logging;
+use ahma_test_support::path_helpers::test_temp_path;
 use anyhow::Result;
 use rmcp::model::CallToolRequestParams;
 use serde_json::json;
@@ -302,7 +303,9 @@ fn test_progress_update_variants() {
         id: "op_123".to_string(),
         command: "echo test".to_string(),
         description: "Echo test".to_string(),
-        working_directory: "/tmp".to_string(),
+        working_directory: test_temp_path("callback_test")
+            .to_string_lossy()
+            .into_owned(),
         success: true,
         full_output: "test\n".to_string(),
         duration_ms: 100,

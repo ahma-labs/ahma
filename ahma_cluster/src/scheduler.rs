@@ -5,8 +5,11 @@
 //! with an invalid signature or an `issued_at` older than [`MANIFEST_MAX_AGE_SECS`]
 //! (replay protection).
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use ahma_common::config::TransportMode;
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -15,6 +18,7 @@ use subtle::ConstantTimeEq;
 use tracing::{debug, info, warn};
 
 use super::discovery::{PeerInfo, WorkerRegistry};
+use super::transport::ClusterTransport;
 
 /// HMAC-SHA256 type alias.
 type HmacSha256 = Hmac<Sha256>;
@@ -80,6 +84,21 @@ impl TaskManifest {
         }
     }
 
+    /// Verify signature and freshness, then record the nonce in `cache`.
+    ///
+    /// Returns `Err` if the signature is invalid, the manifest is expired, or
+    /// the nonce has already been seen (replay attack).
+    pub fn verify_with_nonce_cache(&self, shared_key: &[u8], cache: &NonceCache) -> Result<()> {
+        self.verify(shared_key)?;
+        if !cache.check_and_record(&self.nonce, self.issued_at) {
+            bail!(
+                "Manifest replay rejected: nonce '{}' already seen",
+                self.nonce
+            );
+        }
+        Ok(())
+    }
+
     fn canonical_payload(&self) -> String {
         format!(
             "{}|{}|{}|{}|{}|{}",
@@ -97,11 +116,45 @@ pub struct TaskResult {
     pub worker_id: String,
 }
 
+/// Thread-safe in-memory cache of seen manifest nonces.
+///
+/// Protects against replay attacks by rejecting any nonce that was already
+/// accepted within the [`MANIFEST_MAX_AGE_SECS`] window.
+/// Stale entries are evicted on each insert to bound memory growth.
+#[derive(Clone, Default)]
+pub struct NonceCache {
+    inner: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl NonceCache {
+    /// Attempt to record `nonce` with the `issued_at` Unix timestamp.
+    ///
+    /// Returns `true` if the nonce is new and was recorded.
+    /// Returns `false` if the nonce was already seen (replay).
+    ///
+    /// Evicts entries whose `issued_at` is older than [`MANIFEST_MAX_AGE_SECS`]
+    /// before checking, so the map stays bounded to the active window.
+    pub fn check_and_record(&self, nonce: &str, issued_at: u64) -> bool {
+        let now = unix_now_secs();
+        let mut inner = self.inner.lock().expect("NonceCache lock poisoned");
+        // Evict entries that have fallen outside the replay-protection window.
+        inner.retain(|_, &mut ts| now.saturating_sub(ts) <= MANIFEST_MAX_AGE_SECS);
+        if inner.contains_key(nonce) {
+            return false;
+        }
+        inner.insert(nonce.to_owned(), issued_at);
+        true
+    }
+}
+
 /// Routes decompose sub-tasks to the best-available peer.
 pub struct ClusterScheduler {
     registry: WorkerRegistry,
     shared_key: Vec<u8>,
-    http: reqwest::Client,
+    transport: ClusterTransport,
+    /// Nonce cache used by the receiver-side `verify_with_nonce_cache`.
+    #[allow(dead_code)]
+    nonce_cache: NonceCache,
 }
 
 impl ClusterScheduler {
@@ -109,16 +162,45 @@ impl ClusterScheduler {
     ///
     /// `shared_key` should be loaded from a key file, not passed as a CLI argument
     /// (which would expose it in `ps` output).  See `--cluster-key-file`.
+    ///
+    /// Logs the first 16 hex characters of the SHA-256 fingerprint of the key at
+    /// `info` level so operators can verify that all cluster nodes share the same
+    /// key without exposing the key itself.
     pub fn new(registry: WorkerRegistry, shared_key: impl Into<Vec<u8>>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .unwrap_or_default();
+        let key_bytes: Vec<u8> = shared_key.into();
+
+        // Log a short fingerprint of the shared key so operators can cross-check
+        // that all nodes were configured with the same secret without leaking the
+        // key itself.
+        let fingerprint = sha256_hex_fingerprint(&key_bytes);
+        info!("Cluster key SHA-256 fingerprint: {}…", &fingerprint[..16]);
+
         Self {
             registry,
-            shared_key: shared_key.into(),
-            http,
+            shared_key: key_bytes,
+            transport: ClusterTransport::new(ClusterTransport::default_preference(), None),
+            nonce_cache: NonceCache::default(),
         }
+    }
+
+    /// Configure a custom transport preference and optional TLS CA certificate.
+    ///
+    /// Call this on a newly-created scheduler to override the default transport
+    /// preference (`[Quic, Http2, Http1]`):
+    ///
+    /// ```no_run
+    /// use ahma_cluster::{ClusterScheduler, ClusterTransport};
+    /// use ahma_common::config::TransportMode;
+    ///
+    /// # async fn example() {
+    /// let sched = ClusterScheduler::new(todo!(), b"key")
+    ///     .with_transport(vec![TransportMode::Http2, TransportMode::Http1], None);
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_transport(mut self, preference: Vec<TransportMode>, ca_pem: Option<&str>) -> Self {
+        self.transport = ClusterTransport::new(preference, ca_pem);
+        self
     }
 
     /// Pick the best peer for `model` and dispatch `manifest` to it.
@@ -162,17 +244,13 @@ impl ClusterScheduler {
         manifest: TaskManifest,
     ) -> Result<TaskResult> {
         let signed = manifest.sign(&self.shared_key);
-        let url = format!("{}/tasks", peer.addr.trim_end_matches('/'));
-
         info!("Dispatching task {} to peer {}", signed.task_id, peer.id);
 
         let resp = self
-            .http
-            .post(&url)
-            .json(&signed)
-            .send()
+            .transport
+            .post(&peer.addr, "/tasks", &signed)
             .await
-            .with_context(|| format!("Failed to dispatch to peer {}", peer.addr))?;
+            .with_context(|| format!("Failed to dispatch task to peer {}", peer.id))?;
 
         let result: TaskResult = resp
             .json()
@@ -186,11 +264,25 @@ impl ClusterScheduler {
 // ─── Crypto helpers ─────────────────────────────────────────────────────────
 
 /// Compute HMAC-SHA256 over `message` with `key`; return the lowercase hex digest.
-fn hmac_sha256_hex(key: &[u8], message: &str) -> String {
+pub(crate) fn hmac_sha256_hex(key: &[u8], message: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(message.as_bytes());
     let bytes = mac.finalize().into_bytes();
     bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// Return the lowercase hex SHA-256 digest of `key` for use as a key fingerprint.
+///
+/// Only used in log messages so operators can verify cluster nodes share the same
+/// key without exposing the key itself.
+fn sha256_hex_fingerprint(key: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(key);
+    hash.iter().fold(String::with_capacity(64), |mut s, b| {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
         s
@@ -294,5 +386,72 @@ mod tests {
         let reg = WorkerRegistry::new(60);
         let scheduler = ClusterScheduler::new(reg, b"test-key".to_vec());
         assert!(scheduler.registry.all_live().is_empty());
+    }
+
+    // ── Nonce-cache / replay-protection tests ────────────────────────────────
+
+    #[test]
+    fn nonce_cache_accepts_fresh_nonce() {
+        let cache = NonceCache::default();
+        assert!(
+            cache.check_and_record("unique-nonce-1", unix_now_secs()),
+            "fresh nonce must be accepted"
+        );
+    }
+
+    #[test]
+    fn nonce_cache_rejects_duplicate_nonce() {
+        let cache = NonceCache::default();
+        let ts = unix_now_secs();
+        assert!(cache.check_and_record("dup-nonce", ts));
+        assert!(
+            !cache.check_and_record("dup-nonce", ts),
+            "duplicate nonce must be rejected"
+        );
+    }
+
+    #[test]
+    fn verify_with_nonce_cache_allows_first_verify() {
+        let key = b"replay-test-key";
+        let signed = base_manifest().sign(key);
+        let cache = NonceCache::default();
+        signed
+            .verify_with_nonce_cache(key, &cache)
+            .expect("first verification must succeed");
+    }
+
+    #[test]
+    fn verify_with_nonce_cache_rejects_replay() {
+        let key = b"replay-test-key";
+        let signed = base_manifest().sign(key);
+        let cache = NonceCache::default();
+        signed
+            .verify_with_nonce_cache(key, &cache)
+            .expect("first verification must succeed");
+        let err = signed
+            .verify_with_nonce_cache(key, &cache)
+            .expect_err("replayed manifest must be rejected");
+        assert!(
+            err.to_string().contains("already seen"),
+            "error must mention replay: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_with_nonce_cache_rejects_wrong_key_before_recording_nonce() {
+        let signed = base_manifest().sign(b"correct-key");
+        let cache = NonceCache::default();
+        let err = signed
+            .verify_with_nonce_cache(b"wrong-key", &cache)
+            .expect_err("wrong key must fail");
+        assert!(
+            err.to_string().contains("signature"),
+            "error must mention signature failure: {err}"
+        );
+        // After a wrong-key rejection, the nonce must NOT be recorded —
+        // so a correct-key retry should succeed.
+        signed
+            .verify_with_nonce_cache(b"correct-key", &cache)
+            .expect("correct-key retry must succeed after failed wrong-key attempt");
     }
 }

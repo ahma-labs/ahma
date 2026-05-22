@@ -252,8 +252,10 @@ async fn test_id_generation_uniqueness() {
     // Test that operation IDs are unique across multiple calls
     // This tests the generate_id function without actually executing commands
 
-    let (adapter1, _temp_dir1) = create_simple_test_adapter().await;
-    let (adapter2, _temp_dir2) = create_simple_test_adapter().await;
+    let (adapter1, temp_dir1) = create_simple_test_adapter().await;
+    let (adapter2, temp_dir2) = create_simple_test_adapter().await;
+    let work_dir1 = temp_dir1.path().to_str().unwrap();
+    let work_dir2 = temp_dir2.path().to_str().unwrap();
 
     // Generate multiple operation IDs by starting operations (but not waiting for completion)
     let mut ids = Vec::new();
@@ -261,11 +263,11 @@ async fn test_id_generation_uniqueness() {
     // Generate 20 operation IDs quickly (10 from each adapter)
     for _ in 0..10 {
         let id1 = adapter1
-            .execute_async_in_dir("test1", "true", None, "/tmp", Some(1)) // Use 'true' command which exits immediately
+            .execute_async_in_dir("test1", "true", None, work_dir1, Some(1)) // Use 'true' command which exits immediately
             .await
             .unwrap();
         let id2 = adapter2
-            .execute_async_in_dir("test2", "true", None, "/tmp", Some(1)) // Use 'true' command which exits immediately
+            .execute_async_in_dir("test2", "true", None, work_dir2, Some(1)) // Use 'true' command which exits immediately
             .await
             .unwrap();
         ids.push(id1);
@@ -329,7 +331,8 @@ async fn test_async_execution_task_error_handling() {
 #[tokio::test]
 async fn test_shutdown_with_active_tasks() {
     init_test_logging();
-    let (adapter, _temp_dir) = create_simple_test_adapter().await;
+    let (adapter, temp_dir) = create_simple_test_adapter().await;
+    let work_dir = temp_dir.path().to_str().unwrap();
 
     // Start multiple async operations
     let mut ids = Vec::new();
@@ -343,7 +346,7 @@ async fn test_shutdown_with_active_tasks() {
                     args.insert("message".to_string(), json!(format!("test {}", i)));
                     args
                 }),
-                "/tmp",
+                work_dir,
                 Some(5),
             )
             .await

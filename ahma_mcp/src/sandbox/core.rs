@@ -160,10 +160,13 @@ impl Sandbox {
         })
     }
 
-    /// Create a sandbox in Test mode (bypasses restrictions).
+    /// Create a sandbox in Test mode scoped to the current workspace and temp dir.
+    ///
+    /// This is intentionally not rooted at `/`: tests should exercise normal
+    /// path validation unless they explicitly construct broader scopes.
     pub fn new_test() -> Self {
         Self {
-            scopes: std::sync::RwLock::new(vec![PathBuf::from("/")]),
+            scopes: std::sync::RwLock::new(default_test_scopes()),
             read_scopes: Vec::new(),
             mode: SandboxMode::Test,
             no_temp_files: false,
@@ -305,6 +308,21 @@ impl Sandbox {
 
 fn is_test_root_scope(scopes_guard: &[PathBuf]) -> bool {
     scopes_guard.is_empty() || scopes_guard.iter().any(|scope| scope == Path::new("/"))
+}
+
+fn default_test_scopes() -> Vec<PathBuf> {
+    let mut scopes = Vec::new();
+    push_existing_scope(&mut scopes, std::env::current_dir().ok());
+    push_existing_scope(&mut scopes, Some(std::env::temp_dir()));
+    scopes
+}
+
+fn push_existing_scope(scopes: &mut Vec<PathBuf>, path: Option<PathBuf>) {
+    let Some(path) = path else { return };
+    let scope = dunce::canonicalize(&path).unwrap_or(path);
+    if !scopes.contains(&scope) {
+        scopes.push(scope);
+    }
 }
 
 /// Strip the Windows extended-length path prefix (`\\?\`) if present.

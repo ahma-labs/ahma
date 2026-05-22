@@ -7,15 +7,21 @@
 //! 2. **Static bootstrap** (`~/.ahma/cluster/peers.json`): initial URL list for Tailscale
 //!    or pre-configured machines.  Updated at runtime by heartbeats.
 //! 3. **mDNS** (`_ahma-worker._tcp.local`): zero-config LAN discovery.
-//!    **Not yet implemented** — planned for v0.8.  See `TODO(v0.8)` in `SPEC.md`.
+//!    Peers browse for `_ahma-worker._tcp.local.` and upsert resolved entries into the
+//!    registry; `announce_self` registers the local process so remote peers find it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq as _;
 use tracing::{debug, info, warn};
+
+/// mDNS service type used by ahma worker peers.
+const MDNS_SERVICE_TYPE: &str = "_ahma-worker._tcp.local.";
 
 /// Capabilities advertised by a worker peer via [`WorkerRegistry::receive_heartbeat`].
 ///
@@ -174,6 +180,35 @@ impl WorkerRegistry {
         }
     }
 
+    /// Accept a **signed** heartbeat from peer `id`.
+    ///
+    /// The caller must supply the HMAC-SHA256 hex signature computed over the
+    /// canonical JSON serialisation of `caps` using the cluster shared key.
+    /// Rejects the heartbeat if:
+    /// - the signature doesn't match (wrong key or tampered payload), or
+    /// - the peer ID is not pre-registered in the registry.
+    ///
+    /// Returns `Ok(true)` when the peer was updated, `Ok(false)` when the peer
+    /// is unknown (caller may log/drop accordingly), or `Err` on bad signature.
+    pub fn receive_signed_heartbeat(
+        &self,
+        id: &str,
+        caps: PeerCapabilities,
+        signature: &str,
+        shared_key: &[u8],
+    ) -> Result<bool> {
+        let payload = serde_json::to_string(&caps).expect("PeerCapabilities serialises infallibly");
+        let expected = crate::scheduler::hmac_sha256_hex(shared_key, &payload);
+        let sig_match: bool = expected.as_bytes().ct_eq(signature.as_bytes()).into();
+        if !sig_match {
+            bail!(
+                "Heartbeat from peer {id}: HMAC-SHA256 signature mismatch — \
+                 check that both sides use the same cluster key"
+            );
+        }
+        Ok(self.receive_heartbeat(id, caps))
+    }
+
     /// Return all live, reachable peers that have `model` available.
     pub fn peers_for_model(&self, model: &str) -> Vec<PeerInfo> {
         let inner = self.inner.read().unwrap();
@@ -218,16 +253,180 @@ impl WorkerRegistry {
         Ok(count)
     }
 
-    /// Start mDNS discovery (stub — logs warning until mdns-sd is added).
+    /// Start mDNS discovery: browse for `_ahma-worker._tcp.local.` peers and
+    /// upsert them into the registry as they appear or disappear.
+    ///
+    /// This method spawns a background Tokio task and returns immediately.
+    /// Resolved peers are registered with an HTTP address derived from the
+    /// mDNS TXT record (`id`, `models` comma-separated) or defaults.
     pub async fn start_mdns_discovery(&self) {
-        warn!(
-            "mDNS peer discovery is not yet implemented (requires mdns-sd crate). \
-             Static peers in ~/.ahma/cluster/peers.json are still active."
+        let registry = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_mdns_browse(registry).await {
+                warn!("mDNS discovery stopped with error: {e}");
+            }
+        });
+        info!(
+            "mDNS peer discovery started (browsing {})",
+            MDNS_SERVICE_TYPE
         );
         debug!(
             "Cluster registry initialized with {} static peers",
             self.all_live().len()
         );
+    }
+
+    /// Announce this process as an `ahma worker` peer via mDNS.
+    ///
+    /// Other peers on the LAN will discover this node via `start_mdns_discovery`.
+    ///
+    /// # Parameters
+    /// * `peer_id` — unique name for this instance (e.g. `hostname-uuid`)
+    /// * `port`    — HTTP port the local ahma bridge is listening on
+    /// * `models`  — models available on this node (comma-separated in TXT record)
+    pub fn announce_self(&self, peer_id: &str, port: u16, models: &[String]) -> Result<()> {
+        let daemon =
+            ServiceDaemon::new().map_err(|e| anyhow::anyhow!("mDNS daemon start failed: {e}"))?;
+
+        let hostname = hostname_string();
+        let mut properties = HashMap::new();
+        properties.insert("id".to_owned(), peer_id.to_owned());
+        properties.insert("models".to_owned(), models.join(","));
+
+        let svc = ServiceInfo::new(
+            MDNS_SERVICE_TYPE,
+            peer_id,
+            &hostname,
+            (),
+            port,
+            Some(properties),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create mDNS ServiceInfo: {e}"))?;
+
+        daemon
+            .register(svc)
+            .map_err(|e| anyhow::anyhow!("mDNS register failed: {e}"))?;
+
+        info!(
+            "Announced self as mDNS peer '{}' on port {} with models: [{}]",
+            peer_id,
+            port,
+            models.join(", ")
+        );
+        // SAFETY: The ServiceDaemon MUST outlive this function — it keeps
+        // broadcasting our mDNS record until the process exits.  We
+        // intentionally leak it here; the OS reclaims the memory at exit.
+        // Callers must not call `announce_self` more than once per process.
+        std::mem::forget(daemon);
+        Ok(())
+    }
+}
+
+/// Browse for `_ahma-worker._tcp.local.` via mDNS and upsert/remove peers in `registry`.
+async fn run_mdns_browse(registry: WorkerRegistry) -> anyhow::Result<()> {
+    let daemon =
+        ServiceDaemon::new().map_err(|e| anyhow::anyhow!("mDNS daemon start failed: {e}"))?;
+    let browse = daemon
+        .browse(MDNS_SERVICE_TYPE)
+        .map_err(|e| anyhow::anyhow!("mDNS browse failed: {e}"))?;
+
+    loop {
+        let event = browse
+            .recv_async()
+            .await
+            .map_err(|e| anyhow::anyhow!("mDNS channel closed: {e}"))?;
+
+        match event {
+            ServiceEvent::ServiceResolved(info) => {
+                if let Some(peer) = mdns_info_to_peer(&info) {
+                    info!("mDNS: discovered peer '{}' at {}", peer.id, peer.addr);
+                    registry.upsert(peer);
+                }
+            }
+            ServiceEvent::ServiceRemoved(_, fullname) => {
+                // The instance name is the first label of the fullname.
+                let id = fullname.split('.').next().unwrap_or(&fullname).to_owned();
+                debug!("mDNS: peer '{}' departed", id);
+                registry.remove(&id);
+            }
+            ServiceEvent::SearchStarted(ty) => {
+                debug!("mDNS: browse search started for {ty}");
+            }
+            ServiceEvent::SearchStopped(ty) => {
+                debug!("mDNS: browse search stopped for {ty}");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Convert an mDNS `ServiceInfo` into a `PeerInfo`, returning `None` if the
+/// service has no usable address.
+fn mdns_info_to_peer(info: &ServiceInfo) -> Option<PeerInfo> {
+    // Prefer an IPv4 address; fall back to the first address or the hostname.
+    let addr_str = info
+        .get_addresses()
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| info.get_addresses().iter().next())
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| info.get_hostname().trim_end_matches('.').to_owned());
+
+    let port = info.get_port();
+    let http_addr = format!("http://{addr_str}:{port}");
+
+    // Peer ID from TXT `id` property; fall back to the instance name.
+    let instance_name = info
+        .get_fullname()
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_owned();
+    let id = info
+        .get_property_val_str("id")
+        .unwrap_or(&instance_name)
+        .to_owned();
+
+    if id.is_empty() {
+        return None;
+    }
+
+    // Models from TXT `models` property (comma-separated).
+    let models: Vec<String> = info
+        .get_property_val_str("models")
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(PeerInfo {
+        id,
+        addr: http_addr,
+        models,
+        active_ops: 0,
+        reachable: true,
+        capabilities: None,
+    })
+}
+
+/// Return a suitable mDNS hostname for this machine (e.g. `mymac.local.`).
+///
+/// Reads `HOSTNAME` (Unix) or `COMPUTERNAME` (Windows) environment variables;
+/// falls back to `"ahma-worker"` if neither is set.
+fn hostname_string() -> String {
+    let base = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "ahma-worker".to_owned());
+    if base.ends_with('.') {
+        base
+    } else if base.contains('.') {
+        format!("{base}.")
+    } else {
+        format!("{base}.local.")
     }
 }
 
@@ -331,5 +530,94 @@ mod tests {
         peer.apply_capabilities(caps);
         // Score should include the 50-point VRAM penalty even with model loaded.
         assert_eq!(peer.load_score_for("model"), 50);
+    }
+
+    // ── Signed heartbeat tests ────────────────────────────────────────────────
+
+    fn sign_caps(caps: &PeerCapabilities, key: &[u8]) -> String {
+        let payload = serde_json::to_string(caps).unwrap();
+        crate::scheduler::hmac_sha256_hex(key, &payload)
+    }
+
+    #[test]
+    fn signed_heartbeat_accepted_with_correct_key() {
+        let key = b"cluster-shared-key";
+        let reg = WorkerRegistry::new(60);
+        reg.upsert(make_peer("node-a", "gemma:4b"));
+
+        let caps = PeerCapabilities {
+            models_available: vec!["gemma:4b".into()],
+            models_loaded: vec![],
+            active_ops: 1,
+            max_concurrent: 4,
+            vram_free_mb: Some(8192),
+        };
+        let sig = sign_caps(&caps, key);
+
+        let result = reg.receive_signed_heartbeat("node-a", caps, &sig, key);
+        assert!(result.unwrap(), "valid signed heartbeat must be accepted");
+
+        let peers = reg.peers_for_model("gemma");
+        assert_eq!(peers[0].active_ops, 1, "peer active_ops must be updated");
+    }
+
+    #[test]
+    fn signed_heartbeat_rejected_with_wrong_key() {
+        let reg = WorkerRegistry::new(60);
+        reg.upsert(make_peer("node-a", "gemma:4b"));
+
+        let caps = PeerCapabilities::default();
+        let sig = sign_caps(&caps, b"correct-key");
+
+        let err = reg
+            .receive_signed_heartbeat("node-a", caps, &sig, b"wrong-key")
+            .expect_err("wrong key must fail");
+        assert!(
+            err.to_string().contains("signature mismatch"),
+            "error must mention signature mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn signed_heartbeat_rejected_for_unknown_peer() {
+        let key = b"key";
+        let reg = WorkerRegistry::new(60);
+        // No upsert — peer is unknown.
+        let caps = PeerCapabilities::default();
+        let sig = sign_caps(&caps, key);
+
+        let accepted = reg
+            .receive_signed_heartbeat("ghost-node", caps, &sig, key)
+            .unwrap();
+        assert!(
+            !accepted,
+            "unknown peer must not be accepted even with valid signature"
+        );
+    }
+
+    #[test]
+    fn signed_heartbeat_rejected_with_tampered_payload() {
+        let key = b"key";
+        let reg = WorkerRegistry::new(60);
+        reg.upsert(make_peer("node-a", "gemma:4b"));
+
+        let caps = PeerCapabilities {
+            active_ops: 2,
+            ..PeerCapabilities::default()
+        };
+        let sig = sign_caps(&caps, key);
+
+        // Tamper: different active_ops from what was signed.
+        let tampered = PeerCapabilities {
+            active_ops: 99,
+            ..PeerCapabilities::default()
+        };
+        let err = reg
+            .receive_signed_heartbeat("node-a", tampered, &sig, key)
+            .expect_err("tampered payload must fail");
+        assert!(
+            err.to_string().contains("signature mismatch"),
+            "error must mention signature mismatch: {err}"
+        );
     }
 }

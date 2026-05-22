@@ -65,3 +65,23 @@ pub use ahma_mcp::{Adapter, AhmaMcpService};
 
 // Re-export LLM client for direct use
 pub use ahma_llm_monitor::LlmClient;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn reexported_monitor_config_is_constructible() {
+        let config = MonitorConfig::with_timeout(Duration::from_secs(7));
+
+        assert_eq!(config.default_timeout, Duration::from_secs(7));
+        assert_eq!(config.shutdown_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reexported_sandbox_mode_is_available() {
+        assert_eq!(format!("{:?}", SandboxMode::Strict), "Strict");
+        assert_ne!(SandboxMode::Strict, SandboxMode::Test);
+    }
+}

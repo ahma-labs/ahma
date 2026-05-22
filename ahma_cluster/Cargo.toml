@@ -8,18 +8,32 @@ rust-version.workspace = true
 version.workspace = true
 description = "Network-facing local cluster scheduler for ahma: mDNS/Tailscale peer discovery and signed task dispatch over QUIC. (AGPL-3.0-or-later)"
 
+[features]
+default = []
+## Enable HTTP/3 (QUIC) for cluster peer dispatch.
+##
+## Adds the `http3` feature to `reqwest`, which pulls in `quinn` and `h3`.
+## When this feature is NOT compiled in, the `TransportMode::Quic` preference
+## is silently treated as `Http2` (h2c prior-knowledge).
+cluster-quic = ["reqwest/http3"]
+
 [lib]
 name = "ahma_cluster"
 path = "src/lib.rs"
 
 [dependencies]
+ahma_common = { path = "../ahma_common" }
 ahma_decompose = { path = "../ahma_decompose" }
 ahma_worker = { path = "../ahma_worker" }
 anyhow.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 hmac.workspace = true
-reqwest = { workspace = true, features = ["json", "rustls"] }
+mdns-sd = "0.12"
+rcgen = "0.13"
+reqwest = { workspace = true, features = ["json", "rustls", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
@@ -29,4 +43,5 @@ tracing.workspace = true
 uuid = { workspace = true }
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -27,9 +27,9 @@ pub use list_tools::{
 };
 
 pub use cli::{
-    Cli, ClusterAddPeerArgs, ClusterArgs, ClusterCommand, ClusterPingArgs, LlmAddArgs, LlmArgs,
-    LlmCommand, LlmRemoveArgs, LlmTestArgs, Subcommands, TuiArgs, VaultArgs, VaultCommand,
-    VaultCreateArgs,
+    CertCommand, Cli, ClusterAddPeerArgs, ClusterAnnounceArgs, ClusterArgs, ClusterCommand,
+    ClusterPingArgs, LlmAddArgs, LlmArgs, LlmCommand, LlmRemoveArgs, LlmTestArgs, Subcommands,
+    TuiArgs, VaultArgs, VaultCommand, VaultCreateArgs,
 };
 pub use cli::{build_app_config, dispatch_subcommand, run};
 

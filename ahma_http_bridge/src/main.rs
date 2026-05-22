@@ -62,6 +62,21 @@ struct Args {
     /// **Required** when `--bind-addr` is not a loopback address.
     #[arg(long, value_name = "PATH")]
     require_token: Option<PathBuf>,
+
+    /// Maximum request rate per client IP (requests/second).
+    ///
+    /// `0` disables rate limiting (default).  Once a client exceeds the limit,
+    /// subsequent requests receive HTTP 429 with a `Retry-After` header.
+    /// The `/health` endpoint is always exempt.
+    #[arg(long, default_value = "0")]
+    rate_limit_rps: u64,
+
+    /// Burst allowance for the per-IP token bucket (requests above the sustained
+    /// rate that are permitted before limiting kicks in).
+    ///
+    /// Defaults to `10`.  Only effective when `--rate-limit-rps > 0`.
+    #[arg(long, default_value = "10")]
+    rate_limit_burst: u32,
 }
 
 #[tokio::main]
@@ -120,6 +135,9 @@ async fn main() -> anyhow::Result<()> {
         disable_http1_1: args.disable_http1_1,
         listener_kind: ahma_http_bridge::ListenerKind::Tcp(args.bind_addr),
         require_token: load_token_file(args.require_token.as_deref())?,
+        require_token_path: args.require_token,
+        rate_limit_rps: args.rate_limit_rps,
+        rate_limit_burst: args.rate_limit_burst,
     };
 
     // Warn when listening on a non-loopback address without a token.

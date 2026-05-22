@@ -8,6 +8,7 @@ default-members = [
     "ahma_common",
     "ahma_llm_monitor",
     "ahma_core",
+    "ahma_test_support",
     # GPL-3.0-or-later crates (end-user product surface)
     "ahma_vault",
     "ahma_decompose",
@@ -28,6 +29,7 @@ members = [
     "ahma_common",
     "ahma_llm_monitor",
     "ahma_core",
+    "ahma_test_support",
     # GPL-3.0-or-later crates (end-user product surface)
     "ahma_vault",
     "ahma_decompose",

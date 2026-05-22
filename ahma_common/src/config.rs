@@ -3,6 +3,7 @@
 //! ## `~/.ahma/config.toml` format
 //!
 //! ```toml
+//! # ── LLM providers ──────────────────────────────────────────────────────────
 //! [[providers]]
 //! name        = "ollama-local"
 //! base_url    = "http://localhost:11434/v1"
@@ -14,6 +15,24 @@
 //! base_url      = "https://api.openai.com/v1"
 //! default_model = "gpt-4o-mini"
 //! api_key       = "${OPENAI_API_KEY}"
+//!
+//! # ── Cluster ─────────────────────────────────────────────────────────────────
+//! [cluster]
+//! # Path to the file containing the shared HMAC-SHA256 cluster key.
+//! # Must be readable only by the ahma user (mode 0600 on Unix).
+//! key_file = "/etc/ahma/cluster.key"
+//!
+//! # How long (in seconds) a peer heartbeat remains valid before the peer is
+//! # considered offline.  Default: 60.
+//! heartbeat_ttl_secs = 60
+//!
+//! [[cluster.peers]]
+//! name = "gpu-1"
+//! url  = "http://10.0.0.5:7000"
+//!
+//! [[cluster.peers]]
+//! name = "gpu-2"
+//! url  = "http://10.0.0.6:7000"
 //! ```
 //!
 //! MTDF tools can then reference a provider by name:
@@ -139,12 +158,116 @@ pub struct ResolvedProvider {
     pub api_key: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Cluster configuration
+// ---------------------------------------------------------------------------
+
+/// Transport protocol preference for ahma cluster peer-to-peer communication.
+///
+/// Ordered from highest to lowest preference.  `ahma_cluster::ClusterScheduler`
+/// tries each mode in turn and falls back to the next on connection failure.
+///
+/// In config TOML use lowercase strings: `"quic"`, `"http2"`, `"http1"`.
+///
+/// # Example (`~/.ahma/config.toml`)
+/// ```toml
+/// [cluster]
+/// transport_preference = ["quic", "http2", "http1"]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportMode {
+    /// HTTP/3 over QUIC (UDP).
+    ///
+    /// Requires the peer bridge to have QUIC enabled (`--enable-quic`, default
+    /// `true`) and a self-signed TLS certificate.  The dispatcher uses
+    /// `https://` URLs and skips certificate hostname verification when no CA
+    /// cert is provided.  Compile `ahma_cluster` with the `cluster-quic`
+    /// feature to enable this transport at runtime; without that feature the
+    /// mode is silently treated as `Http2`.
+    Quic,
+    /// HTTP/2 with prior-knowledge (h2c) over plain TCP.
+    ///
+    /// Uses the same `http://` URL as the bridge bind address.  No TLS required.
+    Http2,
+    /// HTTP/1.1 over plain TCP.  Most compatible fallback.
+    Http1,
+}
+
+fn default_transport_preference() -> Vec<TransportMode> {
+    vec![
+        TransportMode::Quic,
+        TransportMode::Http2,
+        TransportMode::Http1,
+    ]
+}
+
+/// A single peer entry in the `[[cluster.peers]]` array.
+///
+/// Mirrors the peer fields stored in `ahma_cluster::PeerInfo` but lives in
+/// `ahma_common` so the config layer doesn't need to depend on `ahma_cluster`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterPeerConfig {
+    /// Human-readable identifier for this peer (used in `ahma cluster list`).
+    pub name: String,
+    /// Base URL of the peer's ahma HTTP bridge (e.g. `http://10.0.0.5:7000`).
+    pub url: String,
+}
+
+/// The optional `[cluster]` table in `~/.ahma/config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    /// Path to the file containing the shared HMAC-SHA256 key used for mutual
+    /// authentication between cluster nodes.
+    ///
+    /// The key file must be readable by the ahma process.  On Unix, restrict
+    /// permissions to `0600` to prevent other users from reading it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<String>,
+
+    /// Seconds a peer's last heartbeat may be in the past before the peer is
+    /// considered offline.  Defaults to `60`.
+    #[serde(default = "default_heartbeat_ttl")]
+    pub heartbeat_ttl_secs: u64,
+
+    /// Static peer list.  Peers can also be discovered dynamically; this list
+    /// seeds the registry on startup.
+    #[serde(default)]
+    pub peers: Vec<ClusterPeerConfig>,
+
+    /// Preferred transport order for outbound peer dispatch.
+    ///
+    /// `ahma_cluster::ClusterScheduler` tries each mode in order and falls back
+    /// on any connection error.  Defaults to `["quic", "http2", "http1"]`.
+    #[serde(default = "default_transport_preference")]
+    pub transport_preference: Vec<TransportMode>,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            key_file: None,
+            heartbeat_ttl_secs: default_heartbeat_ttl(),
+            peers: Vec::new(),
+            transport_preference: default_transport_preference(),
+        }
+    }
+}
+
+fn default_heartbeat_ttl() -> u64 {
+    60
+}
+
 /// The top-level structure of `~/.ahma/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AhmaConfig {
     /// Named LLM provider definitions.
     #[serde(default)]
     pub providers: Vec<ProviderEntry>,
+
+    /// Optional cluster coordination settings.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 impl AhmaConfig {
@@ -362,5 +485,130 @@ api_key = "${AHMA_TEST_PROVIDER_KEY}"
         unsafe {
             std::env::remove_var("AHMA_TEST_PROVIDER_KEY");
         }
+    }
+
+    // ── Config roundtrip tests ────────────────────────────────────────────────
+
+    /// Add a provider programmatically, serialise to TOML, reload — verify the
+    /// entry survives the full write/read cycle.
+    #[test]
+    fn provider_add_roundtrip_via_load_from() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+
+        let mut cfg = AhmaConfig::default();
+        cfg.providers.push(ProviderEntry {
+            name: "roundtrip-test".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            default_model: "llama3.2".into(),
+            api_key: None,
+        });
+
+        let toml_text = toml::to_string_pretty(&cfg).unwrap();
+        std::fs::write(tmp.path(), toml_text).unwrap();
+
+        let reloaded = AhmaConfig::load_from(tmp.path());
+        assert_eq!(reloaded.providers.len(), 1);
+        assert_eq!(reloaded.providers[0].name, "roundtrip-test");
+        assert_eq!(reloaded.providers[0].base_url, "http://localhost:11434/v1");
+        assert_eq!(reloaded.providers[0].default_model, "llama3.2");
+        assert!(reloaded.providers[0].api_key.is_none());
+    }
+
+    /// Add two providers, remove one, re-save, reload — verify only one survives.
+    #[test]
+    fn provider_remove_roundtrip_via_load_from() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+
+        let mut cfg = AhmaConfig::default();
+        cfg.providers.push(ProviderEntry {
+            name: "keep-me".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            default_model: "gemma3n".into(),
+            api_key: None,
+        });
+        cfg.providers.push(ProviderEntry {
+            name: "remove-me".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            default_model: "gpt-4o-mini".into(),
+            api_key: Some("sk-placeholder".into()),
+        });
+
+        let toml_text = toml::to_string_pretty(&cfg).unwrap();
+        std::fs::write(tmp.path(), toml_text).unwrap();
+
+        // Simulate `ahma llm remove remove-me`.
+        let mut cfg2 = AhmaConfig::load_from(tmp.path());
+        cfg2.providers.retain(|p| p.name != "remove-me");
+        let toml_text2 = toml::to_string_pretty(&cfg2).unwrap();
+        std::fs::write(tmp.path(), toml_text2).unwrap();
+
+        let final_cfg = AhmaConfig::load_from(tmp.path());
+        assert_eq!(final_cfg.providers.len(), 1);
+        assert_eq!(final_cfg.providers[0].name, "keep-me");
+    }
+
+    /// Cluster config (key_file, heartbeat_ttl_secs, peers) survives a
+    /// serialise/deserialise cycle.
+    #[test]
+    fn cluster_config_roundtrip_via_load_from() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+
+        let cfg = AhmaConfig {
+            cluster: ClusterConfig {
+                key_file: Some("/etc/ahma/cluster.key".into()),
+                heartbeat_ttl_secs: 90,
+                peers: vec![
+                    ClusterPeerConfig {
+                        name: "node-a".into(),
+                        url: "http://10.0.0.1:4000".into(),
+                    },
+                    ClusterPeerConfig {
+                        name: "node-b".into(),
+                        url: "http://10.0.0.2:4000".into(),
+                    },
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let toml_text = toml::to_string_pretty(&cfg).unwrap();
+        std::fs::write(tmp.path(), toml_text).unwrap();
+
+        let reloaded = AhmaConfig::load_from(tmp.path());
+        assert_eq!(
+            reloaded.cluster.key_file.as_deref(),
+            Some("/etc/ahma/cluster.key")
+        );
+        assert_eq!(reloaded.cluster.heartbeat_ttl_secs, 90);
+        assert_eq!(reloaded.cluster.peers.len(), 2);
+        assert_eq!(reloaded.cluster.peers[0].name, "node-a");
+        assert_eq!(reloaded.cluster.peers[1].url, "http://10.0.0.2:4000");
+    }
+
+    /// Default cluster config has no key_file, no peers, and the default TTL.
+    #[test]
+    fn cluster_config_defaults_are_sane() {
+        let cfg = AhmaConfig::default();
+        assert!(cfg.cluster.key_file.is_none());
+        assert!(cfg.cluster.peers.is_empty());
+        assert_eq!(cfg.cluster.heartbeat_ttl_secs, 60);
+    }
+
+    /// A config with only [[providers]] (no [cluster] section) loads cleanly
+    /// with a default cluster config — no parse error.
+    #[test]
+    fn missing_cluster_section_uses_defaults() {
+        let toml_str = r#"
+[[providers]]
+name = "ollama-local"
+base_url = "http://localhost:11434/v1"
+default_model = "llama3.2"
+"#;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), toml_str).unwrap();
+        let cfg = AhmaConfig::load_from(tmp.path());
+        assert_eq!(cfg.providers.len(), 1);
+        assert!(cfg.cluster.peers.is_empty(), "cluster defaults to no peers");
     }
 }

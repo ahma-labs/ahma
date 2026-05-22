@@ -211,6 +211,28 @@ impl McpTestClient {
         roots_answered: &mut bool,
         configured_seen: &mut bool,
     ) -> Result<bool, String> {
+        let mcp_url = self.mcp_url();
+        Self::handle_roots_handshake_event(
+            &self.client,
+            &mcp_url,
+            value,
+            session_id,
+            roots,
+            roots_answered,
+            configured_seen,
+        )
+        .await
+    }
+
+    async fn handle_roots_handshake_event(
+        client: &Client,
+        mcp_url: &str,
+        value: &Value,
+        session_id: &str,
+        roots: &[PathBuf],
+        roots_answered: &mut bool,
+        configured_seen: &mut bool,
+    ) -> Result<bool, String> {
         let method = value.get("method").and_then(|m| m.as_str());
 
         if method == Some("notifications/sandbox/failed") {
@@ -234,8 +256,7 @@ impl McpTestClient {
                 .get("id")
                 .cloned()
                 .ok_or_else(|| "roots/list must include id".to_string())?;
-            self.send_roots_response(session_id, request_id, roots)
-                .await?;
+            Self::send_roots_response(client, mcp_url, session_id, request_id, roots).await?;
             *roots_answered = true;
             if *configured_seen {
                 return Ok(true);
@@ -243,6 +264,46 @@ impl McpTestClient {
         }
 
         Ok(false)
+    }
+
+    fn roots_json(roots: &[PathBuf]) -> Vec<Value> {
+        roots
+            .iter()
+            .map(|path| {
+                json!({
+                    "uri": encode_file_uri(path),
+                    "name": path.file_name().and_then(|n| n.to_str()).unwrap_or("root")
+                })
+            })
+            .collect()
+    }
+
+    async fn send_roots_response(
+        client: &Client,
+        mcp_url: &str,
+        session_id: &str,
+        request_id: Value,
+        roots: &[PathBuf],
+    ) -> Result<(), String> {
+        let roots_response = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "roots": Self::roots_json(roots)
+            }
+        });
+
+        let _ = client
+            .post(mcp_url)
+            .header("Content-Type", "application/json")
+            .header("Mcp-Session-Id", session_id)
+            .json(&roots_response)
+            .timeout(TestTimeouts::get(TimeoutCategory::HttpRequest))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send roots response: {}", e))?;
+
+        Ok(())
     }
 
     async fn process_roots_handshake_stream(
@@ -330,104 +391,21 @@ impl McpTestClient {
                 let Some(value) = Self::event_data_to_json(&raw_event) else {
                     continue;
                 };
-
-                let method = value.get("method").and_then(|m| m.as_str());
-
-                if method == Some("notifications/sandbox/failed") {
-                    let error = value
-                        .get("params")
-                        .and_then(|p| p.get("error"))
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("unknown");
-                    return Err(format!("Sandbox configuration failed: {}", error));
-                }
-
-                if method == Some("notifications/sandbox/configured") {
-                    configured_seen = true;
-                    if roots_answered {
-                        return Ok(());
-                    }
-                }
-
-                if method == Some("roots/list") {
-                    let request_id = value
-                        .get("id")
-                        .cloned()
-                        .ok_or_else(|| "roots/list must include id".to_string())?;
-
-                    let roots_json: Vec<Value> = roots
-                        .iter()
-                        .map(|path| {
-                            json!({
-                                "uri": encode_file_uri(path),
-                                "name": path.file_name().and_then(|n| n.to_str()).unwrap_or("root")
-                            })
-                        })
-                        .collect();
-
-                    let roots_response = json!({
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "result": {
-                            "roots": roots_json
-                        }
-                    });
-
-                    let _ = client
-                        .post(&mcp_url)
-                        .header("Content-Type", "application/json")
-                        .header("Mcp-Session-Id", &session_id)
-                        .json(&roots_response)
-                        .timeout(TestTimeouts::get(TimeoutCategory::HttpRequest))
-                        .send()
-                        .await
-                        .map_err(|e| format!("Failed to send roots response: {}", e))?;
-
-                    roots_answered = true;
-                    if configured_seen {
-                        return Ok(());
-                    }
+                if Self::handle_roots_handshake_event(
+                    &client,
+                    &mcp_url,
+                    &value,
+                    &session_id,
+                    &roots,
+                    &mut roots_answered,
+                    &mut configured_seen,
+                )
+                .await?
+                {
+                    return Ok(());
                 }
             }
         }
-    }
-
-    async fn send_roots_response(
-        &self,
-        session_id: &str,
-        request_id: Value,
-        roots: &[PathBuf],
-    ) -> Result<(), String> {
-        let roots_json: Vec<Value> = roots
-            .iter()
-            .map(|path| {
-                json!({
-                    "uri": encode_file_uri(path),
-                    "name": path.file_name().and_then(|n| n.to_str()).unwrap_or("root")
-                })
-            })
-            .collect();
-
-        let roots_response = json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "roots": roots_json
-            }
-        });
-
-        let _ = self
-            .client
-            .post(self.mcp_url())
-            .header("Content-Type", "application/json")
-            .header("Mcp-Session-Id", session_id)
-            .json(&roots_response)
-            .timeout(TestTimeouts::get(TimeoutCategory::HttpRequest))
-            .send()
-            .await
-            .map_err(|e| format!("Failed to send roots response: {}", e))?;
-
-        Ok(())
     }
 
     /// Complete the MCP handshake: initialize + initialized notification.

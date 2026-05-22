@@ -27,6 +27,7 @@
 
 use crate::error::{BridgeError, Result};
 use crate::session::{DEFAULT_HANDSHAKE_TIMEOUT_SECS, SessionManager, SessionManagerConfig};
+use arc_swap::ArcSwapOption;
 use axum::{
     Json, Router,
     extract::State,
@@ -44,6 +45,9 @@ use serde_json::Value;
 use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc};
 use subtle::ConstantTimeEq as _;
 use tokio_stream::wrappers::BroadcastStream;
+use tower_governor::{
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+};
 use tower_http::{
     cors::{AllowHeaders, AllowMethods, CorsLayer},
     set_header::SetResponseHeaderLayer,
@@ -137,6 +141,25 @@ pub struct BridgeConfig {
     ///
     /// The comparison is constant-time to prevent timing side-channels.
     pub require_token: Option<String>,
+
+    /// Path of the file from which `require_token` was loaded.
+    ///
+    /// When present, a SIGHUP signal causes the bridge to re-read this file and
+    /// atomically replace the in-flight token with zero downtime.
+    pub require_token_path: Option<PathBuf>,
+
+    /// Maximum sustained request rate per client IP, in requests/second.
+    ///
+    /// `0` disables rate limiting (default).  Clients that exceed the limit
+    /// receive HTTP 429 with a `Retry-After` header.  The `/health` endpoint
+    /// is always exempt from rate limiting.
+    pub rate_limit_rps: u64,
+
+    /// Burst size for the per-IP token bucket (requests above the sustained
+    /// rate that are allowed before throttling begins).
+    ///
+    /// Defaults to `10`. Only effective when `rate_limit_rps > 0`.
+    pub rate_limit_burst: u32,
 }
 
 impl Default for BridgeConfig {
@@ -153,17 +176,33 @@ impl Default for BridgeConfig {
             disable_http1_1: false,
             listener_kind: ListenerKind::Tcp(bind_addr),
             require_token: None,
+            require_token_path: None,
+            rate_limit_rps: 0,
+            rate_limit_burst: 10,
         }
     }
 }
 
-/// Shared state for the bridge
-struct BridgeState {
+/// Shared state threaded through every Axum handler via [`axum::Extension`].
+///
+/// Contains all mutable server state that needs to be accessible to individual
+/// request handlers:
+///
+/// - **Session management** — active MCP session lifecycle tracking.
+/// - **Bearer token** — optional auth token held behind [`ArcSwapOption`] so it
+///   can be swapped atomically on SIGHUP without restarting (zero downtime reload).
+///
+/// The entire struct is wrapped in `Arc` before being registered as an Axum
+/// extension, so handler clones are cheap reference-count increments.
+pub struct BridgeState {
     /// Session manager (session isolation mode only)
     session_manager: Arc<SessionManager>,
     /// Optional bearer token.  When set, every request (except `/health`) must
     /// supply `Authorization: Bearer <token>`.  Compared constant-time.
-    require_token: Option<String>,
+    ///
+    /// Uses `ArcSwapOption` so the token can be atomically replaced on SIGHUP
+    /// without restarting the bridge or locking out in-flight requests.
+    require_token: ArcSwapOption<String>,
 }
 
 /// Build a CORS layer appropriate for the bind address.
@@ -234,7 +273,8 @@ async fn bearer_auth_middleware(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    let Some(ref expected_token) = state.require_token else {
+    let guard = state.require_token.load();
+    let Some(ref expected_token) = *guard else {
         // No token configured — let the request through.
         return next.run(request).await;
     };
@@ -245,11 +285,21 @@ async fn bearer_auth_middleware(
     }
 
     // Extract `Authorization: Bearer <token>` header.
+    // RFC 7235 §2.1: the auth-scheme token is case-insensitive.
+    // Uppercase the whole header value for the prefix check, then slice the
+    // token from the *original* string (all "bearer " variants are 7 bytes).
     let provided = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
+        .and_then(|s| {
+            if s.to_uppercase().starts_with("BEARER ") {
+                const BEARER_PREFIX_LEN: usize = "BEARER ".len();
+                Some(&s[BEARER_PREFIX_LEN..])
+            } else {
+                None
+            }
+        })
         .map(str::to_owned);
 
     match provided {
@@ -320,18 +370,67 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
     let session_manager = Arc::new(SessionManager::new(session_config));
     Arc::new(BridgeState {
         session_manager,
-        require_token: config.require_token.clone(),
+        require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),
     })
 }
 
-/// Build the axum router with optional QUIC `Alt-Svc` header injection.
+/// On Unix, spawn a background task that watches for SIGHUP and reloads the
+/// bearer token from the given path.  The new token is swapped in atomically
+/// so no in-flight request is interrupted.
+///
+/// No-op on non-Unix platforms (Windows has no SIGHUP).
+#[cfg(unix)]
+fn maybe_install_sighup_handler(state: Arc<BridgeState>, path: Option<PathBuf>) {
+    let Some(p) = path else { return };
+    tokio::spawn(async move {
+        let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to install SIGHUP handler for token reload: {e}");
+                return;
+            }
+        };
+        info!("SIGHUP token reload enabled — watching {}", p.display());
+        loop {
+            sig.recv().await;
+            match std::fs::read_to_string(&p) {
+                Ok(raw) => {
+                    let token = raw.trim().to_owned();
+                    if token.is_empty() {
+                        warn!(
+                            "Token file {} is empty after SIGHUP — keeping current token",
+                            p.display()
+                        );
+                    } else {
+                        state.require_token.store(Some(Arc::new(token)));
+                        info!("Bearer token reloaded from {} after SIGHUP", p.display());
+                    }
+                }
+                Err(e) => warn!("Failed to reload token on SIGHUP from {}: {e}", p.display()),
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn maybe_install_sighup_handler(_state: Arc<BridgeState>, _path: Option<PathBuf>) {}
+
+/// Build the axum router with optional QUIC `Alt-Svc` header injection and
+/// optional per-IP rate limiting.
+///
+/// `/health` is placed outside the rate-limit and auth layers so that
+/// load-balancer probes are never blocked or throttled.
 fn build_mcp_router(
     state: Arc<BridgeState>,
     cors: CorsLayer,
     quic_info: Option<&QuicInfo>,
+    rate_limit_rps: u64,
+    rate_limit_burst: u32,
 ) -> Router {
-    let base = Router::new()
-        .route("/health", get(health_check))
+    // /health is intentionally outside auth + rate-limit layers.
+    let health_route = Router::new().route("/health", get(health_check));
+
+    let mcp_routes = Router::new()
         .route(
             "/mcp",
             post(handle_mcp_request)
@@ -343,8 +442,24 @@ fn build_mcp_router(
             state.clone(),
             bearer_auth_middleware,
         ))
-        .layer(cors)
         .with_state(state);
+
+    // Apply per-IP rate limiting to MCP routes only, when configured.
+    let mcp_routes = if rate_limit_rps > 0 {
+        let governor_conf = Arc::new(
+            GovernorConfigBuilder::default()
+                .per_second(rate_limit_rps)
+                .burst_size(rate_limit_burst)
+                .key_extractor(SmartIpKeyExtractor)
+                .finish()
+                .expect("Invalid rate-limit configuration"),
+        );
+        mcp_routes.layer(GovernorLayer::new(governor_conf))
+    } else {
+        mcp_routes
+    };
+
+    let base = health_route.merge(mcp_routes).layer(cors);
 
     if let Some(qi) = quic_info {
         let alt_svc = HeaderValue::from_str(&qi.alt_svc_header)
@@ -360,13 +475,24 @@ fn build_mcp_router(
 }
 
 /// Serve a single accepted TCP stream over HTTP/2-only or auto HTTP/1.1+HTTP/2.
-async fn serve_tcp_connection(stream: tokio::net::TcpStream, app: Router, disable_http1_1: bool) {
+///
+/// `peer_addr` is injected as `ConnectInfo<SocketAddr>` so that middleware such
+/// as `GovernorLayer` (per-IP rate limiting) can extract the client address.
+async fn serve_tcp_connection(
+    stream: tokio::net::TcpStream,
+    app: Router,
+    disable_http1_1: bool,
+    peer_addr: std::net::SocketAddr,
+) {
     let io = hyper_util::rt::TokioIo::new(stream);
     let hyper_svc =
-        hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+        hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
             let mut svc = app.clone();
             async move {
                 use tower::Service;
+                // Inject ConnectInfo so IP-based middleware (e.g. rate limiter) works.
+                req.extensions_mut()
+                    .insert(axum::extract::ConnectInfo(peer_addr));
                 let req = req.map(axum::body::Body::new);
                 svc.call(req).await
             }
@@ -404,6 +530,8 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
 
     info!("Session isolation: ENABLED (always-on)");
     let state = build_bridge_state(&config);
+    // Install SIGHUP handler for zero-downtime token rotation.
+    maybe_install_sighup_handler(state.clone(), config.require_token_path.clone());
 
     // MCP Streamable HTTP transport: single endpoint supporting POST, GET (SSE), DELETE.
     // See: https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http
@@ -430,7 +558,13 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
     };
 
     // Build the axum router; when QUIC is active Alt-Svc is injected automatically.
-    let app = build_mcp_router(state, cors, quic_info.as_ref());
+    let app = build_mcp_router(
+        state,
+        cors,
+        quic_info.as_ref(),
+        config.rate_limit_rps,
+        config.rate_limit_burst,
+    );
 
     // Print QUIC startup markers *before* AHMA_BOUND_PORT so parsers see them in order.
     if let Some(ref qi) = quic_info {
@@ -469,7 +603,7 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
         );
     }
     loop {
-        let (stream, _peer_addr) = listener
+        let (stream, peer_addr) = listener
             .accept()
             .await
             .map_err(|e| BridgeError::HttpServer(format!("Accept error: {}", e)))?;
@@ -477,6 +611,7 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
             stream,
             app.clone(),
             config.disable_http1_1,
+            peer_addr,
         ));
     }
 }
@@ -507,26 +642,24 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
     let session_manager = Arc::new(SessionManager::new(session_config));
     let state = Arc::new(BridgeState {
         session_manager,
-        require_token: config.require_token.clone(),
+        require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),
     });
+    // Install SIGHUP handler for zero-downtime token rotation.
+    maybe_install_sighup_handler(state.clone(), config.require_token_path.clone());
 
     // For Unix sockets, CORS origin matching is less meaningful but we still
     // build the layer for middleware compatibility.
     let dummy_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let cors = build_cors_layer(&dummy_addr);
 
-    let app = Router::new()
-        .route("/health", get(health_check))
-        .route(
-            "/mcp",
-            post(handle_mcp_request)
-                .get(handle_sse_stream)
-                .delete(handle_session_delete),
-        )
-        .fallback(handle_not_found)
-        .layer(cors)
-        .with_state(state)
-        .layer(TraceLayer::new_for_http());
+    // Reuse build_mcp_router so auth and rate-limiting are consistent across transports.
+    let app = build_mcp_router(
+        state,
+        cors,
+        None,
+        config.rate_limit_rps,
+        config.rate_limit_burst,
+    );
 
     // Remove a stale filesystem socket file from a previous run, if any.
     // Abstract sockets start with '\0' and have no filesystem entry.
@@ -993,6 +1126,9 @@ mod tests {
             disable_http1_1: false,
             listener_kind: ListenerKind::Tcp("0.0.0.0:8080".parse().unwrap()),
             require_token: None,
+            require_token_path: None,
+            rate_limit_rps: 0,
+            rate_limit_burst: 10,
         };
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
         assert_eq!(config.server_command, "custom_server");
@@ -1033,7 +1169,7 @@ mod tests {
     fn create_state_with_session_manager(session_manager: Arc<SessionManager>) -> Arc<BridgeState> {
         Arc::new(BridgeState {
             session_manager,
-            require_token: None,
+            require_token: ArcSwapOption::new(None),
         })
     }
 
@@ -1432,6 +1568,197 @@ for line in sys.stdin:
         assert!(
             response.headers().get("www-authenticate").is_none(),
             "Response must not include WWW-Authenticate header"
+        );
+    }
+
+    // ── Bearer auth middleware tests ────────────────────────────────────────
+
+    /// Build a minimal router with bearer auth middleware wired in, using a dummy
+    /// session manager that won't be exercised by these tests.
+    fn create_app_with_token(token: Option<&str>) -> Router {
+        let temp_dir = TempDir::new().expect("bearer-auth test: create temp dir");
+        let state = Arc::new(BridgeState {
+            session_manager: Arc::new(SessionManager::new(SessionManagerConfig {
+                server_command: "echo".to_string(),
+                server_args: vec![],
+                default_scope: Some(temp_dir.path().to_path_buf()),
+                enable_colored_output: false,
+                handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            })),
+            require_token: ArcSwapOption::new(token.map(|s| Arc::new(s.to_owned()))),
+        });
+        let loopback_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
+        Router::new()
+            .route("/health", get(health_check))
+            .route("/mcp", post(handle_mcp_request))
+            .fallback(handle_not_found)
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                bearer_auth_middleware,
+            ))
+            .layer(build_cors_layer(&loopback_addr))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_bearer_no_token_configured_allows_all() {
+        let app = create_app_with_token(None);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Session creation will fail because there's no real server, but the
+        // bearer middleware should not reject (no token required → passes through).
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "No token configured: should not return 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bearer_valid_token_accepted() {
+        // A valid token on the exempt /health route returns 200.
+        // (The middleware lets /health through regardless; this confirms the
+        //  token path doesn't accidentally break health checks.)
+        let app = create_app_with_token(Some("secret-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "Valid bearer token on /health must return 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bearer_missing_token_returns_401() {
+        let app = create_app_with_token(Some("secret-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Missing token must return 401"
+        );
+        assert!(
+            response.headers().contains_key("www-authenticate"),
+            "401 response must include WWW-Authenticate header"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bearer_wrong_token_returns_401() {
+        let app = create_app_with_token(Some("secret-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("authorization", "Bearer wrong-token")
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Wrong token must return 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bearer_health_exempt_without_token() {
+        let app = create_app_with_token(Some("secret-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    // Deliberately no Authorization header.
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // /health is exempted so load-balancers can probe it unauthenticated.
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "/health must be exempt from bearer auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bearer_scheme_case_insensitive_lowercase() {
+        let app = create_app_with_token(Some("secret-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("authorization", "bearer secret-token")
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Auth passed — middleware let the request through (not 401).
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Lowercase 'bearer' scheme must be accepted (RFC 7235 case-insensitive)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bearer_scheme_case_insensitive_uppercase() {
+        let app = create_app_with_token(Some("secret-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("authorization", "BEARER secret-token")
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Auth passed — middleware let the request through (not 401).
+        assert_ne!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Uppercase 'BEARER' scheme must be accepted (RFC 7235 case-insensitive)"
         );
     }
 }

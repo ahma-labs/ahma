@@ -46,7 +46,14 @@ pub async fn create_in_process_mcp_from_dir(tools_dir: &Path) -> Result<InProces
     let configs = load_tool_configs(&AppConfig::default(), Some(tools_dir))
         .await
         .unwrap_or_default();
-    create_in_process_mcp(configs).await
+    let sandbox = Sandbox::new(
+        vec![default_scope_for_tools_dir(tools_dir)?],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )?;
+    wire_in_process_mcp(configs, sandbox).await
 }
 
 /// Core constructor: wire `AhmaMcpService` to a client over a duplex channel.
@@ -54,7 +61,14 @@ pub async fn create_in_process_mcp_from_dir(tools_dir: &Path) -> Result<InProces
 /// Both the MCP initialize/initialized handshake and any subsequent requests
 /// go through the in-memory channel – no subprocess is spawned.
 pub async fn create_in_process_mcp(configs: HashMap<String, ToolConfig>) -> Result<InProcessMcp> {
-    wire_in_process_mcp(configs, Sandbox::new_test()).await
+    let sandbox = Sandbox::new(
+        vec![std::env::current_dir()?],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )?;
+    wire_in_process_mcp(configs, sandbox).await
 }
 
 /// Create an in-process MCP pair with a strict sandbox scoped to `scopes`.
@@ -115,4 +129,14 @@ async fn wire_in_process_mcp(
         client: client_result?,
         _server: server_result?,
     })
+}
+
+fn default_scope_for_tools_dir(tools_dir: &Path) -> Result<PathBuf> {
+    if let Some(parent) = tools_dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        return Ok(parent.to_path_buf());
+    }
+
+    Ok(std::env::current_dir()?)
 }
