@@ -3,7 +3,6 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
 /// HTTP-to-stdio bridge for MCP servers with session isolation support.
 ///
 /// Enables multiple IDE instances to share a single HTTP endpoint while maintaining
@@ -54,6 +53,30 @@ struct Args {
     /// Providing this flag enables tracing. Equivalent to OTEL_EXPORTER_OTLP_ENDPOINT.
     #[arg(long, global = true)]
     opentelemetry: Option<String>,
+
+    /// Path to a file containing the bearer token required on every request.
+    ///
+    /// The file should contain a single line with the secret token.
+    /// Using a file instead of `--token` avoids exposing the secret in `ps` output.
+    ///
+    /// **Required** when `--bind-addr` is not a loopback address.
+    #[arg(long, value_name = "PATH")]
+    require_token: Option<PathBuf>,
+
+    /// Maximum request rate per client IP (requests/second).
+    ///
+    /// `0` disables rate limiting (default).  Once a client exceeds the limit,
+    /// subsequent requests receive HTTP 429 with a `Retry-After` header.
+    /// The `/health` endpoint is always exempt.
+    #[arg(long, default_value = "0")]
+    rate_limit_rps: u64,
+
+    /// Burst allowance for the per-IP token bucket (requests above the sustained
+    /// rate that are permitted before limiting kicks in).
+    ///
+    /// Defaults to `10`.  Only effective when `--rate-limit-rps > 0`.
+    #[arg(long, default_value = "10")]
+    rate_limit_burst: u32,
 }
 
 #[tokio::main]
@@ -111,7 +134,20 @@ async fn main() -> anyhow::Result<()> {
         enable_quic: true,
         disable_http1_1: args.disable_http1_1,
         listener_kind: ahma_http_bridge::ListenerKind::Tcp(args.bind_addr),
+        require_token: load_token_file(args.require_token.as_deref())?,
+        require_token_path: args.require_token,
+        rate_limit_rps: args.rate_limit_rps,
+        rate_limit_burst: args.rate_limit_burst,
     };
+
+    // Warn when listening on a non-loopback address without a token.
+    if !config.bind_addr.ip().is_loopback() && config.require_token.is_none() {
+        tracing::warn!(
+            "SECURITY: ahma-http-bridge is bound to a non-loopback address ({}) \
+             without authentication. Pass --require-token <path> to require a bearer token.",
+            config.bind_addr
+        );
+    }
 
     tracing::info!("Starting Ahma HTTP Bridge on {}", config.bind_addr);
     tracing::info!("Proxying to command: {}", config.server_command);
@@ -128,6 +164,18 @@ fn detect_local_debug_binary(base_dir: &Path) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Load a bearer token from `path`, trimming whitespace and newlines.
+///
+/// Returns `Ok(None)` when `path` is `None`.
+fn load_token_file(path: Option<&Path>) -> anyhow::Result<Option<String>> {
+    let Some(p) = path else { return Ok(None) };
+    let raw = std::fs::read_to_string(p)
+        .map_err(|e| anyhow::anyhow!("Failed to read token file {}: {e}", p.display()))?;
+    let token = raw.trim().to_owned();
+    anyhow::ensure!(!token.is_empty(), "Token file {} is empty", p.display());
+    Ok(Some(token))
 }
 
 #[cfg(test)]

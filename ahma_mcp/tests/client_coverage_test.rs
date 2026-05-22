@@ -17,25 +17,25 @@ async fn test_client_methods_fail_before_initialization() {
 
     // status() should fail
     let result = client.status("test_op").await;
-    assert!(result.is_err());
+    let err = result.expect_err("status() should fail before client initialization");
     assert!(
-        result.unwrap_err().to_string().contains("not initialized"),
+        err.to_string().contains("not initialized"),
         "status() should indicate client not initialized"
     );
 
     // await_op() should fail
     let result = client.await_op("test_op").await;
-    assert!(result.is_err());
+    let err = result.expect_err("await_op() should fail before client initialization");
     assert!(
-        result.unwrap_err().to_string().contains("not initialized"),
+        err.to_string().contains("not initialized"),
         "await_op() should indicate client not initialized"
     );
 
     // shell_async_sleep() should fail
     let result = client.shell_async_sleep("1").await;
-    assert!(result.is_err());
+    let err = result.expect_err("shell_async_sleep() should fail before client initialization");
     assert!(
-        result.unwrap_err().to_string().contains("not initialized"),
+        err.to_string().contains("not initialized"),
         "shell_async_sleep() should indicate client not initialized"
     );
 }

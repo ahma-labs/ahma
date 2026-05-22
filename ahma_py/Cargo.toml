@@ -1,0 +1,24 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+name = "ahma_py"
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Python bindings for ahma_core (requires pyo3 feature)"
+
+[lib]
+name = "ahma_py"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ahma_core = { path = "../ahma_core" }
+anyhow.workspace = true
+tracing.workspace = true
+
+[features]
+# Enable Python bindings (requires pyo3 which is not in workspace deps yet)
+# Activate with: cargo build -p ahma_py --features python
+python = []

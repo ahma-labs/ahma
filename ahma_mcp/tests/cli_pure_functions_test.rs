@@ -31,6 +31,7 @@ fn create_test_tool_config(name: &str, command: &str) -> ToolConfig {
         monitor_stream: None,
         tool_type: None,
         livelog: None,
+        ..Default::default()
     }
 }
 
@@ -58,6 +59,7 @@ fn create_tool_config_with_subcommands(
         monitor_stream: None,
         tool_type: None,
         livelog: None,
+        ..Default::default()
     }
 }
 

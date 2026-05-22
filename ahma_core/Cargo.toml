@@ -1,0 +1,23 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+name = "ahma_core"
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Core library for embedding ahma's sandbox and MCP service in other Rust applications (MIT OR Apache-2.0). GPL-licensed feature crates (ahma_vault, ahma_decompose, ahma_worker, ahma_renewal, ahma_tui, ahma_cluster) are available separately."
+
+[lib]
+name = "ahma_core"
+path = "src/lib.rs"
+
+[dependencies]
+ahma_mcp = { path = "../ahma_mcp" }
+ahma_common = { path = "../ahma_common" }
+ahma_llm_monitor = { path = "../ahma_llm_monitor" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.52", features = ["full"] }
+tracing.workspace = true

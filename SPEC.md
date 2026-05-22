@@ -153,7 +153,7 @@ These tools are always available regardless of JSON configuration:
 - **R1.5.3**: The `--disable-progressive-disclosure` CLI flag **must** restore legacy behavior where all enabled tools are listed immediately.
 - **R1.5.4**: The `instructions` field in the MCP `initialize` response **must** contain sandbox routing directives instructing the model to use `sandboxed_shell` for all command execution.
 - **R1.5.5**: The `activate_tools` description **must** dynamically list all loaded bundles with action-oriented hints (`ai_hint`) so the AI knows exactly when to activate each bundle.
-- **R1.5.6**: CLI-enabled bundles (e.g., `--tools rust,git`) are **loaded but hidden by default**. The `--auto-reveal` flag (or `AHMA_AUTO_REVEAL=1`) makes them immediately visible at startup, bypassing the progressive disclosure step. Without `--auto-reveal`, the LLM must call `activate_tools` to reveal them.
+- **R1.5.6**: CLI-enabled bundles (e.g., `--tools rust,git`) are **loaded but hidden by default**. The startup visibility profile is controlled by the `AHMA_REVEAL_PROFILE` environment variable (`minimal` | `balanced` | `full`). Setting `AHMA_REVEAL_PROFILE=balanced` (or the legacy `--auto-reveal` CLI flag / `AHMA_AUTO_REVEAL=1` env var) makes all loaded bundles immediately visible at startup, bypassing the progressive disclosure step. Without any of these, the LLM must call `activate_tools` to reveal them. Precedence: `AHMA_REVEAL_PROFILE` > `--auto-reveal` / `AHMA_AUTO_REVEAL=1` > default (`minimal`).
 
 ### R2: Async-First Architecture
 
@@ -435,6 +435,91 @@ The `source_command` executes inside the same sandbox scope as all other tools (
 
 ---
 
+### 5.6 Decompose Tool Type
+
+Set `"tool_type": "decompose"` to split a complex business question into smaller sub-questions, dispatch each to a local LLM, and aggregate the results with a deterministic Rust reducer.  **No cloud egress required** — uses the same `LlmProviderConfig` as `livelog`.
+
+#### Fields
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `tool_type` | No | `"command"` | Set to `"decompose"` to activate |
+| `decompose` | Yes (when `tool_type=decompose`) | — | `DecomposeConfig` block |
+
+**`DecomposeConfig` fields:**
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `llm_provider` | Yes | — | `LlmProviderConfig` — prefer small local models (`gemma3:4b`, `llama3.2:3b`) |
+| `max_subtasks` | No | `5` | Maximum sub-questions to generate |
+| `max_concurrent` | No | `3` | Sub-questions to run concurrently (keep low for single-machine Ollama) |
+| `reduce_mode` | No | `"summarize"` | How to combine results: `summarize`, `extract_fields`, `classify`, `concat`, `first` |
+| `answer_prompt` | No | `"Answer concisely"` | System prompt for each sub-question LLM call |
+| `llm_timeout_seconds` | No | `30` | Timeout per LLM call |
+
+#### Pipeline
+
+1. `tools/call` returns an `operation_id` immediately.
+2. The orchestrator asks the LLM to split the question into up to `max_subtasks` sub-questions.
+3. Sub-questions are dispatched in batches of `max_concurrent` to the LLM.
+4. Results are aggregated by the deterministic `Reducer` (no additional LLM call).
+5. The aggregated answer is pushed as a `ProgressUpdate` notification.
+
+#### Example (`.ahma/decompose.json`)
+
+See the ready-to-use config in [`.ahma/decompose.json`](.ahma/decompose.json).
+
+---
+
+### 5.7 Worker Tool Type
+
+Set `"tool_type": "worker"` to compile and run synthesized Rust or Python code inside a sub-vault.  The synthesized program is deterministic code — it cannot be re-injected mid-run.
+
+#### Fields
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `tool_type` | No | `"command"` | Set to `"worker"` to activate |
+| `worker` | Yes (when `tool_type=worker`) | — | `WorkerConfig` block |
+
+**`WorkerConfig` fields:**
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `language` | No | `"rust"` | `"rust"` (requires `rustc`) or `"python"` (requires `python3`) |
+| `extra_args` | No | `[]` | Additional compiler / interpreter arguments |
+| `keep_source` | No | `false` | Retain the synthesized source file after execution |
+| `timeout_seconds` | No | `60` | Execution timeout |
+
+#### Security properties
+
+- Worker executes inside the vault's `workdir/` kernel sandbox scope.
+- Source hash (SHA-256-like digest) is recorded in `audit.jsonl`.
+- Source is deleted after execution unless `keep_source: true`.
+
+---
+
+### 5.8 Task Vault
+
+Each `ahma vault create <slug>` call produces a directory tree at
+`~/.ahma/tasks/<utc-date>-<slug>-<hex>/`:
+
+```
+inputs/       — copies of user-provided files (read intent)
+workdir/      — kernel sandbox scope root
+outputs/      — tool artifacts (HTML reports, CSV exports)
+trash/        — staged deletions (two-phase delete)
+audit.jsonl   — append-only event log
+egress.allowlist — per-task outbound domain allowlist
+```
+
+Use `--task-vault <path>` on `ahma serve http` or `ahma serve stdio` to set
+the sandbox scope to `<vault>/workdir/` and wire the audit log and trash.
+
+See [docs/security-sandbox.md](docs/security-sandbox.md) for full documentation.
+
+---
+
 ## 6. Usage Modes
 
 ### 6.1 STDIO Mode (Default)
@@ -527,6 +612,49 @@ ahma --list-tools --http http://localhost:3000
 ---
 
 ## 8. Development Workflow
+
+### 8.0 Documentation Requirements
+
+#### R-DOC: Feature Documentation Contract
+
+Every major feature in ahma **must** have a corresponding page in `docs/` and an entry in `README.md`. This applies to both stable and experimental features.
+
+**R-DOC.1 — Dedicated doc page**: Each major feature **must** have its own `docs/<feature>.md` file with:
+- A clear statement of whether the feature is stable or **Experimental** (version introduced).
+- A motivating "Why" paragraph explaining the security or usability rationale.
+- A practical quickstart with runnable commands or code.
+- A reference table of configuration options where applicable.
+- A "See also" section linking to related docs and the relevant SPEC.md section.
+
+**R-DOC.2 — README entry**: Each major feature **must** have a brief entry in `README.md` under the appropriate section (stable features) or the "vX.Y Experimental Features" section (new/unstable features). The entry **must** link to the dedicated doc page.
+
+**R-DOC.3 — SPEC.md accuracy**: When a feature's behaviour is changed, the corresponding SPEC.md section and its `docs/<feature>.md` page **must** be updated in the same commit or PR.
+
+**R-DOC.4 — Experimental graduation**: When an experimental feature is stabilised, its doc page **must** remove the "Experimental" notice, update SPEC.md status to `tests-pass`, and move its README entry from the "Experimental" section to the appropriate stable section.
+
+**R-DOC.5 — Removal**: When a feature is removed, its `docs/<feature>.md` **must** be deleted and all README and SPEC.md references **must** be removed in the same commit.
+
+**R-DOC.6 — No orphan docs**: Every file in `docs/` **must** be referenced from at least one of: `README.md`, `SPEC.md`, or another `docs/*.md` file. Orphan documentation is misleading and should not accumulate.
+
+| Feature area | Stable doc | SPEC.md section |
+|---|---|---|
+| Kernel sandbox | [docs/security-sandbox.md](docs/security-sandbox.md) | R5, R6 |
+| Connection modes | [docs/connection-modes.md](docs/connection-modes.md) | §6 |
+| Custom tools / MTDF | [docs/custom-tools.md](docs/custom-tools.md) | §5 |
+| Live log monitoring | [docs/live-log-monitoring.md](docs/live-log-monitoring.md) | §5.5 |
+| Environment variables | [docs/environment-variables.md](docs/environment-variables.md) | — |
+| Installation | [docs/installation.md](docs/installation.md) | — |
+| Session isolation | [docs/session-isolation.md](docs/session-isolation.md) | R10 |
+| Task vaults | [docs/task-vault.md](docs/task-vault.md) | §5.8 |
+| Decompose | [docs/decompose.md](docs/decompose.md) | §5.6 |
+| TUI | [docs/tui.md](docs/tui.md) | — |
+| Egress sandbox | [docs/egress-sandbox.md](docs/egress-sandbox.md) | — |
+| Artifacts | [docs/artifacts.md](docs/artifacts.md) | — |
+| Worker synthesis | [docs/worker-synthesis.md](docs/worker-synthesis.md) | §5.7 |
+| Bundle audit | [docs/bundle-audit.md](docs/bundle-audit.md) | — |
+| Cluster scheduler | [docs/cluster-scheduler.md](docs/cluster-scheduler.md) | — |
+| Renewal contract | [docs/renewal-contract.md](docs/renewal-contract.md) | — |
+| ahma_core library | [docs/ahma-core-library.md](docs/ahma-core-library.md) | — |
 
 ### 8.1 Core Principle: Use Ahma
 
@@ -1274,3 +1402,28 @@ If the symlink does not exist or does not resolve, the check fails.
 `skills/ahma/SKILL.md` targets **AI agents using Ahma**. `AGENTS.md` targets **AI contributors
 developing Ahma**. Do not copy developer-only content (testing rules, cross-platform checklist,
 commit format) into the skill, and do not copy agent usage recipes into AGENTS.md.
+
+---
+
+## 16. Future Work
+
+### v0.8 — Discovery, Observability, Economics
+
+| Area | Item | Notes |
+|------|------|-------|
+| Cluster | **mDNS peer discovery** (`mdns-sd` crate, `_ahma-worker._tcp.local`) | Zero-config LAN; replaces `peers.json` bootstrap for trusted networks |
+| Cluster | **Named provider refs in tool files** (`llm_provider_ref: "ollama-local"`) | Avoids duplicating connection details across tool definitions |
+| UX | **`ratatui` TUI** — real-time task dashboard | Replace stub `ahma tui` with a full terminal UI showing active ops, peer status, VRAM gauges |
+| Economics | **Cost metering** — track token counts + estimated cost per tool call | Aggregate by provider; expose via `ahma tool info --cost-summary` |
+| Security | **Signed bundle index** (`bundle-index.json` with HMAC-SHA256 over manifest) | Prevent silent tampering with downloaded bundles |
+| Security | **`--require-token` key rotation** — reload token from file on SIGHUP | Zero-downtime key rotation for long-running HTTP bridge instances |
+
+### v0.9 — Scheduling Refinement, Keyring
+
+| Area | Item | Notes |
+|------|------|-------|
+| Cluster | **Weighted scheduling** — factor GPU model, RAM, historical latency into `load_score_for` | Better affinity for large models |
+| Cluster | **`cluster remove` subcommand** — remove a peer from `peers.json` by ID | Complement `cluster add-peer` |
+| Security | **OS keyring integration** (`keyring` crate) — store API keys in system credential store instead of env vars | macOS Keychain, GNOME Secrets, Windows Credential Manager |
+| Config | **Encrypted secrets at rest** in `~/.ahma/config.toml` (age encryption) | Fallback when OS keyring is unavailable |
+

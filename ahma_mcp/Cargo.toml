@@ -11,10 +11,6 @@ version.workspace = true
 name = "ahma_mcp"
 path = "src/lib.rs"
 
-[[bin]]
-name = "ahma"
-path = "src/shell/bin.rs"
-
 
 [dependencies]
 ahma_common = { path = "../ahma_common" }
@@ -68,6 +64,7 @@ landlock.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
+ahma_test_support = { path = "../ahma_test_support" }
 futures.workspace = true
 tempfile.workspace = true
 wiremock = "0.6"

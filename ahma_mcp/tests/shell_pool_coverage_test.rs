@@ -9,6 +9,7 @@ use ahma_mcp::shell_pool::{
     ShellCommand, ShellError, ShellPool, ShellPoolConfig, ShellPoolManager,
 };
 use ahma_mcp::utils::logging::init_test_logging;
+use ahma_test_support::path_helpers::test_temp_path;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -241,10 +242,13 @@ fn test_shell_pool_config_custom_values() {
 #[test]
 fn test_shell_command_creation() {
     init_test_logging();
+    let working_dir = test_temp_path("shell_command_creation")
+        .to_string_lossy()
+        .into_owned();
     let command = ShellCommand {
         id: "test_cmd_1".to_string(),
         command: vec!["echo".to_string(), "hello".to_string()],
-        working_dir: "/tmp".to_string(),
+        working_dir: working_dir.clone(),
         timeout_ms: 5000,
     };
 
@@ -252,7 +256,7 @@ fn test_shell_command_creation() {
     assert_eq!(command.command.len(), 2);
     assert_eq!(command.command[0], "echo");
     assert_eq!(command.command[1], "hello");
-    assert_eq!(command.working_dir, "/tmp");
+    assert_eq!(command.working_dir, working_dir);
     assert_eq!(command.timeout_ms, 5000);
 }
 
@@ -290,7 +294,8 @@ async fn test_shell_pool_manager_disabled_returns_none() {
     };
 
     let manager = ShellPoolManager::new(config);
-    let shell = manager.get_shell("/tmp").await;
+    let working_dir = test_temp_path("disabled_shell_pool");
+    let shell = manager.get_shell(working_dir.to_str().unwrap()).await;
     assert!(shell.is_none(), "Disabled pool should return None");
 }
 

@@ -1,23 +1,24 @@
 ---
 name: ahma
-version: 0.6.7
+version: 0.7.0
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
   to understand how to run tools, activate bundles, use the sandbox, monitor logs, author custom
-  tools, or configure ahma. Also handles code complexity analysis via `/ahma simplify`
-  and installation updates via `/ahma update`.
+  tools, or configure ahma. Also handles code complexity analysis via `/ahma simplify` and
+  installation updates via `/ahma update`.
   Trigger phrases: "use ahma", "run with ahma", "ahma tool", "activate bundle",
   "sandboxed_shell", "ahma async", "ahma serve", "mcp.json ahma", "ahma sandbox",
   "ahma livelog", "ahma monitor", "custom tool .ahma", "ahma", "await tool",
   "cancel operation", "tool bundle", "progressive disclosure", "activate_tools",
   "simplify", "reduce complexity", "too complex", "hard to read", "refactor",
   "maintainability", "cognitive complexity", "cyclomatic complexity", "simplicity score",
-  "code quality metrics", "hotspot", "ahma simplify", "ahma help", "ahma ?", "ahma update".
+  "code quality metrics", "hotspot", "ahma simplify", "ahma help", "ahma ?",
+  "ahma update".
 user-invocable: true
 ---
 
-<!-- version: 0.6.7 | author: Paul Houghton -->
+<!-- version: 0.7.0 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -96,40 +97,12 @@ are auto-approved (no confirmation dialogs). Pairs well with Ahma's kernel sandb
 }
 ```
 
-### 5. Install and update
+### 5. Install script (multi-IDE setup)
 
-**If `ahma` is already installed**, use the CLI updater (or `/ahma update` in chat):
-
+Run the install script to configure Ahma across all supported IDEs at once:
 ```bash
-ahma update                    # latest published release
-ahma update 0.6.7              # specific release tag
-ahma update main               # build from Git branch
-ahma update feature/my-branch  # build from feature branch
+curl -fsSL https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
 ```
-
-**First-time install** (no `ahma` binary yet):
-
-```bash
-# Linux/macOS — latest release via Cargo (requires Rust)
-cargo install --git https://github.com/paulirotta/ahma ahma_mcp --bin ahma --root ~/.local --locked --force
-
-# Linux/macOS — specific branch
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root ~/.local --locked --force
-
-# Windows (PowerShell) — latest release
-irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
-
-# Windows — branch install
-irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex; install.ps1 feature/update
-```
-
-**Unpushed local checkout** (branch not on GitHub):
-
-```bash
-cargo install --path ahma_mcp --bin ahma --root ~/.local --locked --force
-```
-
-After updating, restart MCP clients or reload the IDE window. See [installation.md](https://github.com/paulirotta/ahma/blob/main/docs/installation.md).
 
 ### 6. Dev containers
 
@@ -421,9 +394,6 @@ Full reference: [environment-variables.md](https://github.com/paulirotta/ahma/bl
 ## CLI Reference
 
 ```bash
-# Install or upgrade ahma
-ahma update [ref] [--force] [--dry-run] [--install-dir ~/.local/bin]
-
 # Start MCP server (stdio — for IDE integration)
 ahma serve stdio [--tools rust,git] [--tmp] [--log-monitor]
 
@@ -514,8 +484,8 @@ The `/ahma` skill supports these user-invocable subcommands in chat:
 | Command | Alias | Purpose |
 |---------|-------|---------|
 | `/ahma help` | `/ahma ?` | List all available subcommands and their usage |
-| `/ahma update [ref]` | — | Install or upgrade ahma (release or Git branch) |
 | `/ahma simplify [lang] [n]` | — | Analyze code complexity and get fix instructions |
+| `/ahma update` | — | Update ahma to the latest version |
 
 ---
 
@@ -527,44 +497,108 @@ user-invocable subcommands and a one-line description of each:
 ```
 /ahma help         — Show this help list
 /ahma ?            — Alias for /ahma help
-/ahma update       — Install latest ahma release (or branch: /ahma update main)
 /ahma simplify     — Analyze code complexity and get AI fix instructions for the worst file
+/ahma update       — Update ahma to the latest version
 ```
 
 Also mention the key flags for configure, e.g., `--tools`, `--tmp`, `--log-monitor`.
 
 ---
 
-## `/ahma update` — Install or Upgrade
-
-When the user types `/ahma update [ref]`, run the real CLI command via **native shell**
-(writes outside the workspace — do not use `sandboxed_shell`).
+## `/ahma update [ref]` — Update the Installed Binary
 
 ### Syntax
 
 ```
-/ahma update                  # latest published release
-/ahma update 0.6.7            # specific release tag
-/ahma update main             # build from main branch
-/ahma update feature/update   # build from feature branch
+/ahma update                  # Install the latest published GitHub release
+/ahma update 0.7.1            # Install a specific release tag (semver, with or without 'v')
+/ahma update main             # Build and install from the main branch
+/ahma update feature/update   # Build and install from a named feature branch
 ```
 
-### Workflow
+### What the ref means
 
-1. Check if `ahma` is on PATH (`ahma --version`).
-2. If installed, run `ahma update [ref]` (add `--force` only if user asks to reinstall same version).
-3. If not installed, use the first-time bootstrap commands from **Install and update** above.
-4. Tell the user to restart MCP clients / reload IDE after a binary change.
+| ref | Behaviour |
+|-----|-----------|
+| *(omitted)* | Downloads the latest pre-built release asset for the current platform |
+| semver (e.g. `0.7.1`) | Downloads that specific release asset |
+| branch name (e.g. `main`) | Runs `cargo install --git ... ahma_bin --branch <ref>` from GitHub source |
 
-### Ref semantics
+### Primary workflow — use the built-in `ahma update` subcommand
 
-| Ref | Behavior |
-|-----|----------|
-| (none) | Download latest GitHub release binary |
-| `0.6.7` / `v0.6.7` | Download that release tag |
-| `main`, `feature/foo` | `cargo install --git ... --branch <ref>` (builds locally) |
+The `ahma update` subcommand handles platform detection, version comparison, `RUSTFLAGS`,
+PATH hints, and the restart reminder automatically.  Always prefer it.
 
-Branch refs must exist on GitHub. Unpushed local work: `cargo install --path ahma_mcp ...`.
+**Step 1 — run the update:**
+
+```
+sandboxed_shell("ahma update feature/update")
+```
+
+Or for the latest release:
+
+```
+sandboxed_shell("ahma update")
+```
+
+Branch installs compile from source and take several minutes.  Watch for the
+`Installed /path/to/ahma` line to confirm success.
+
+**Step 2 — verify the version:**
+
+```
+sandboxed_shell("ahma --version")
+```
+
+The output must show the expected version (e.g. `ahma 0.7.0`).
+
+**Step 3 — reload the IDE**
+
+MCP clients cache the binary path. After a successful update, ask the user to:
+- VS Code: run **Developer: Reload Window** (Cmd/Ctrl+Shift+P)
+- Cursor: reload the window or restart the app
+
+### Fallback — manual `cargo install` (only when `ahma update` is absent or broken)
+
+Use this only if `ahma` is not yet installed or `ahma update` itself is broken:
+
+**Linux / macOS:**
+
+```bash
+RUSTFLAGS='--cfg reqwest_unstable' \
+  cargo install --git https://github.com/paulirotta/ahma \
+    --branch feature/update ahma_bin --bin ahma --root ~/.local --locked --force
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+**Windows (PowerShell 5.1+):**
+
+```powershell
+$env:RUSTFLAGS='--cfg reqwest_unstable'
+cargo install --git https://github.com/paulirotta/ahma `
+  --branch feature/update ahma_bin --bin ahma --root $HOME\.local --locked --force
+```
+
+**Local checkout (iterating on ahma itself):**
+
+```bash
+RUSTFLAGS='--cfg reqwest_unstable' \
+  cargo install --path ahma_bin --bin ahma --root ~/.local --locked --force
+```
+
+### Anti-patterns
+
+- **Do NOT target the `ahma_mcp` package.** The `ahma` binary moved to `ahma_bin` in 0.7.0.
+  `--path ahma_mcp` / `ahma_mcp` as the positional package will fail with
+  `no bin target named ahma`.
+- **Do NOT omit `RUSTFLAGS='--cfg reqwest_unstable'` for source builds.** The workspace uses
+  `reqwest` with the `http3` feature, which refuses to compile without this flag.
+  The `ahma update` subcommand sets it automatically; the manual snippets above show
+  the exact form needed.
+- **Do NOT skip the version check.** Run `ahma --version` and confirm it reports the
+  expected value before declaring success.
+- **Do NOT forget to reload the IDE.** An updated binary is not picked up by a running
+  MCP session until the client restarts.
 
 ---
 
@@ -751,7 +785,7 @@ ahma simplify . --exclude '**/generated/**,**/vendor/**' --ai-fix 1
 2. **Do not add comments to improve scores** — structural change is needed.
 3. **Do not inline complex logic** — fewer functions with more complexity each makes scores worse.
 4. **Do not run `--ai-fix` without reading the structured prompt.**
-5. **Step 4 (verify) is required** — complexity improvements must be confirmed by metrics.
+5. **Do not skip Step 4 (verify)** — complexity improvements must be confirmed by metrics.
 
 ---
 

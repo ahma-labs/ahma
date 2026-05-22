@@ -1,0 +1,39 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "ahma_bin"
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "The ahma binary: wires the MIT ahma_mcp library with the GPL-licensed feature crates (vault, decompose, worker, cluster, renewal, tui)."
+
+# Note: because ahma_bin links ahma_cluster (AGPL-3.0-or-later), the compiled
+# ahma binary is effectively AGPL-3.0-or-later for redistribution and network-
+# service purposes. See README for details.
+
+[[bin]]
+name = "ahma"
+path = "src/main.rs"
+
+[dependencies]
+ahma_mcp = { path = "../ahma_mcp" }
+ahma_vault = { path = "../ahma_vault" }
+ahma_decompose = { path = "../ahma_decompose" }
+ahma_worker = { path = "../ahma_worker" }
+ahma_cluster = { path = "../ahma_cluster" }
+ahma_renewal = { path = "../ahma_renewal" }
+ahma_tui = { path = "../ahma_tui" }
+ahma_common = { path = "../ahma_common" }
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+clap-markdown = "0.1"
+dirs.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

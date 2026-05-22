@@ -11,8 +11,9 @@ pub struct Platform {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
+    #[cfg_attr(target_os = "windows", allow(dead_code))] // Zip on Windows.
     TarGz,
-    #[allow(dead_code)] // Used on Windows; TarGz on Unix dev builds.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // TarGz on Unix-like platforms.
     Zip,
 }
 
@@ -62,10 +63,10 @@ pub fn detect_platform() -> Result<Platform> {
         if std::env::consts::ARCH != "aarch64" {
             bail!("Unsupported macOS architecture: {}", std::env::consts::ARCH);
         }
-        return Ok(Platform {
+        Ok(Platform {
             id: "darwin-arm64".to_string(),
             archive_ext: ArchiveFormat::TarGz,
-        });
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -112,7 +113,11 @@ fn detect_linux_musl() -> bool {
         .output()
         .ok()
         .and_then(|o| {
-            let bytes = if !o.stderr.is_empty() { o.stderr } else { o.stdout };
+            let bytes = if !o.stderr.is_empty() {
+                o.stderr
+            } else {
+                o.stdout
+            };
             String::from_utf8(bytes).ok()
         })
         .map(|s| s.to_ascii_lowercase().contains("musl"))

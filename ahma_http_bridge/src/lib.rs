@@ -25,6 +25,21 @@
 //!    specification, including Server-Sent Events (SSE) for real-time notifications
 //!    and reconnection resilience.
 //!
+//! ## Security
+//!
+//! The bridge has two transport-layer security features that operate independently:
+//!
+//! - **Bearer authentication** — set [`BridgeConfig::require_token`] or
+//!   `--bearer-token` / `AHMA_BEARER_TOKEN` to require `Authorization: Bearer
+//!   <token>` on all requests.  The `/health` endpoint is always exempt so
+//!   load-balancers can probe without a credential.  The comparison is
+//!   constant-time (timing-safe).  The token can be hot-reloaded at runtime via
+//!   SIGHUP without restarting the bridge.
+//!
+//! - **Per-IP rate limiting** — pass `--rate-limit-per-minute` to cap requests
+//!   per client IP using a token-bucket governor.  This protects against both
+//!   accidental and malicious request floods.
+//!
 //! ## Practical Use
 //!
 //! This crate is ideal for deploying Ahma in multi-user environments (like a

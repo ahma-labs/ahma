@@ -1,0 +1,84 @@
+# ahma_core — Embedding Ahma in Rust Applications
+
+> **License**: `ahma_core` is dual-licensed under **MIT OR Apache-2.0**.
+
+`ahma_core` is a re-export crate that exposes Ahma's permissive secure execution
+primitives as an embeddable Rust library.
+
+## Adding to your project
+
+```toml
+[dependencies]
+ahma_core = { git = "https://github.com/paulirotta/ahma.git" }
+```
+
+## Available primitives (MIT OR Apache-2.0)
+
+| Type | Purpose |
+|------|---------|
+| `Sandbox` / `SandboxMode` | Kernel-level filesystem sandbox |
+| `OperationMonitor` | Async operation tracking and cancellation |
+| `MonitorConfig` / `OperationStatus` | Monitor configuration and status |
+| `AhmaMcpService` | Full MCP server service |
+| `Adapter` | CLI tool execution adapter |
+| `LlmClient` | OpenAI-compatible LLM client |
+
+## GPL-licensed sibling crates
+
+The following primitives are available in separate copyleft crates.  Add them
+to your `Cargo.toml` only if you accept the applicable license terms.
+
+| Crate | License | Key types |
+|-------|---------|-----------|
+| `ahma_vault` | GPL-3.0-or-later | `TaskVault`, `AuditWriter`, `TrashManager` |
+| `ahma_decompose` | GPL-3.0-or-later | `DecomposeOrchestrator`, `DecomposeConfig`, `Reducer`, `ReduceMode` |
+| `ahma_worker` | GPL-3.0-or-later | `WorkerRunner`, `WorkerConfig`, `WorkerLanguage` |
+| `ahma_renewal` | GPL-3.0-or-later | `RenewalWatcher`, `RenewalConfig`, `RenewalHaltEvent` |
+| `ahma_tui` | GPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
+| `ahma_cluster` | **AGPL-3.0-or-later** | `ClusterScheduler`, `WorkerRegistry`, `TaskManifest`, `PeerInfo` |
+
+Embedding `ahma_cluster` means any modified version offered to remote users
+over a network must publish its modified source code (AGPL-3.0 §13).
+
+## Minimal example: sandbox + monitor
+
+```rust
+use ahma_core::{Sandbox, SandboxMode, OperationMonitor, MonitorConfig};
+use std::time::Duration;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let sandbox = Arc::new(Sandbox::new(vec![], SandboxMode::Strict, false, false, false)?);
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(300),
+    )));
+    println!("Sandbox and monitor ready.");
+    Ok(())
+}
+```
+
+## Example: vault + audit (requires ahma_vault, GPL-3.0-or-later)
+
+Add `ahma_vault = { git = "..." }` to your `Cargo.toml` (GPL terms apply):
+
+```rust
+use ahma_vault::{TaskVault, audit::AuditWriter};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let vault = TaskVault::create("my-analysis")?;
+    println!("Vault: {}", vault.path().display());
+    let audit = vault.audit_writer();
+    audit.vault_created(&vault.path().display().to_string(), "my-analysis").await?;
+    println!("Sandbox scope: {}", vault.sandbox_scope().display());
+    Ok(())
+}
+```
+
+## See also
+
+- [docs/task-vault.md](task-vault.md)
+- [docs/decompose.md](decompose.md)
+- [docs/egress-sandbox.md](egress-sandbox.md)
+- [docs/renewal-contract.md](renewal-contract.md)

@@ -306,10 +306,9 @@ async fn test_sandboxed_shell_execution() -> Result<()> {
 }
 
 /// Test sandboxed_shell with working_directory parameter
-/// Uses a directory inside the workspace to comply with sandbox restrictions
+/// Uses a directory inside the sandbox scope (.ahma) to comply with sandbox restrictions
 #[tokio::test]
 async fn test_sandboxed_shell_with_working_dir() -> Result<()> {
-    use ahma_mcp::test_utils::fs::get_workspace_tools_dir;
     skip_if_disabled_async_result!("sandboxed_shell");
 
     init_test_logging();
@@ -317,17 +316,8 @@ async fn test_sandboxed_shell_with_working_dir() -> Result<()> {
     let mcp = build_test_client().await?;
     let client = &mcp.client;
 
-    // Use the workspace's target directory which is inside the sandbox
-    let tools_dir = get_workspace_tools_dir();
-    let workspace_dir = tools_dir.parent().expect("Should have workspace parent");
-    let target_dir = workspace_dir.join("target");
-
-    // Use target directory if it exists, otherwise use workspace root
-    let working_dir = if target_dir.exists() {
-        target_dir
-    } else {
-        workspace_dir.to_path_buf()
-    };
+    // The sandbox scope is the cwd (ahma_mcp/ crate directory). Use cwd directly.
+    let working_dir = std::env::current_dir().unwrap();
 
     let result = call_test_tool(
         client,

@@ -4,6 +4,8 @@ use reqwest::Client;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
+use ahma_common::config::warn_if_looks_like_literal_secret;
+
 use crate::error::LlmMonitorError;
 use crate::prompt::build_messages;
 
@@ -27,6 +29,9 @@ impl LlmClient {
         model: impl Into<String>,
         api_key: Option<String>,
     ) -> Self {
+        if let Some(key) = &api_key {
+            warn_if_looks_like_literal_secret(key);
+        }
         Self {
             http: Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),

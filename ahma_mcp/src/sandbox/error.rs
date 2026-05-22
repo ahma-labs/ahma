@@ -1,11 +1,16 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
+}
 
 /// Errors specific to sandbox operations
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
     #[error(
-        "Path '{path:?}' is outside the sandbox root{} (this usually means your MCP session is scoped to a different workspace root; reconnect from the intended workspace or use a multi-root workspace)",
-        format_scopes(.scopes)
+        "Path '{path}' is outside the sandbox root{} (this usually means your MCP session is scoped to a different workspace root; reconnect from the intended workspace or use a multi-root workspace)",
+        format_scopes(.scopes),
+        path = display_path(.path)
     )]
     PathOutsideSandbox { path: PathBuf, scopes: Vec<PathBuf> },
 
@@ -22,13 +27,19 @@ pub enum SandboxError {
     #[error("Unsupported operating system: {0}")]
     UnsupportedOs(String),
 
-    #[error("Failed to canonicalize path '{path:?}': {reason}")]
+    #[error(
+        "Failed to canonicalize path '{path}': {reason}",
+        path = display_path(.path)
+    )]
     CanonicalizationFailed { path: PathBuf, reason: String },
 
     #[error("Sandbox prerequisite check failed: {0}")]
     PrerequisiteFailed(String),
 
-    #[error("Path '{path:?}' is blocked by high-security mode (no-temp-files)")]
+    #[error(
+        "Path '{path}' is blocked by high-security mode (no-temp-files)",
+        path = display_path(.path)
+    )]
     HighSecurityViolation { path: PathBuf },
 
     #[error(
@@ -199,6 +210,37 @@ mod tests {
                 || msg.contains("high-security")
                 || msg.contains("blocked"),
             "Should mention high-security mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_path_messages_use_display_formatting() {
+        let path = PathBuf::from(r"C:\temp\secret.txt");
+
+        let outside_msg = SandboxError::PathOutsideSandbox {
+            path: path.clone(),
+            scopes: vec![PathBuf::from("/allowed")],
+        }
+        .to_string();
+        assert!(
+            outside_msg.contains(r"C:\temp\secret.txt"),
+            "Should preserve backslashes in outside-sandbox message: {outside_msg}"
+        );
+
+        let canonicalization_msg = SandboxError::CanonicalizationFailed {
+            path: path.clone(),
+            reason: "missing".to_string(),
+        }
+        .to_string();
+        assert!(
+            canonicalization_msg.contains(r"C:\temp\secret.txt"),
+            "Should preserve backslashes in canonicalization message: {canonicalization_msg}"
+        );
+
+        let high_security_msg = SandboxError::HighSecurityViolation { path }.to_string();
+        assert!(
+            high_security_msg.contains(r"C:\temp\secret.txt"),
+            "Should preserve backslashes in high-security message: {high_security_msg}"
         );
     }
 

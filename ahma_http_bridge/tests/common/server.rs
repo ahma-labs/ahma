@@ -115,7 +115,7 @@ fn candidate_in_target(base_target: &Path, subdir: &str, bin_name: &str) -> Path
     base_target.join(subdir).join(bin_name)
 }
 
-pub fn resolve_binary_path() -> PathBuf {
+pub fn resolve_binary_path() -> Result<PathBuf, String> {
     static BINARY_LOG_ONCE: std::sync::Once = std::sync::Once::new();
 
     let debug_bin = ahma_mcp::test_utils::cli::get_binary_path("ahma", "ahma");
@@ -133,27 +133,23 @@ pub fn resolve_binary_path() -> PathBuf {
         }
     }
 
-    let binary_path = candidates
-        .into_iter()
-        .find(|p| p.exists())
-        .unwrap_or_else(|| {
-            panic!(
-                "\n\
-                 FAIL ahma binary NOT FOUND in target directory.\n\n\
+    let binary_path = candidates.into_iter().find(|p| p.exists()).ok_or_else(|| {
+        format!(
+            "FAIL ahma binary NOT FOUND in target directory.\n\n\
                  The integration tests require the server binary to be built first.\n\
-                 Please run: cargo build --package ahma_mcp --bin ahma\n\n\
+                 Please run: cargo build --package ahma_bin --bin ahma\n\n\
                  Looked in: {:?}\n",
-                ahma_mcp::test_utils::cli::get_binary_path("ahma", "ahma")
-                    .parent()
-                    .and_then(|p| p.parent())
-            )
-        });
+            ahma_mcp::test_utils::cli::get_binary_path("ahma", "ahma")
+                .parent()
+                .and_then(|p| p.parent())
+        )
+    })?;
 
     BINARY_LOG_ONCE.call_once(|| {
         eprintln!("[TestServer] Using ahma binary: {}", binary_path.display());
     });
 
-    binary_path
+    Ok(binary_path)
 }
 
 struct ServerSpec {
@@ -437,7 +433,10 @@ pub async fn spawn_test_server() -> Result<TestServerInstance, String> {
 pub async fn spawn_test_server_with_timeout(
     handshake_timeout_secs: Option<u64>,
 ) -> Result<TestServerInstance, String> {
-    let binary = resolve_binary_path();
+    let binary = resolve_binary_path().map_err(|e| {
+        eprintln!("WARNING  {e}");
+        e
+    })?;
     let workspace = workspace_dir();
     let tools_dir = workspace.join(".ahma");
     let temp_dir = TempDir::new().map_err(|e| format!("Failed to create temp dir: {}", e))?;
@@ -488,7 +487,10 @@ pub async fn spawn_server_guard_with_config(
     sandbox_scope: &Path,
     handshake_timeout_secs: Option<u64>,
 ) -> Result<ServerGuard, String> {
-    let binary = resolve_binary_path();
+    let binary = resolve_binary_path().map_err(|e| {
+        eprintln!("WARNING  {e}");
+        e
+    })?;
     let workspace = workspace_dir();
     let spec = build_server_spec(tools_dir, sandbox_scope, handshake_timeout_secs);
 

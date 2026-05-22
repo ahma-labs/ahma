@@ -554,6 +554,7 @@ mod tests {
             monitor_stream: None,
             tool_type: None,
             livelog: None,
+            ..Default::default()
         };
         assert!(is_top_level_sequence(&config));
     }
@@ -579,6 +580,7 @@ mod tests {
             monitor_stream: None,
             tool_type: None,
             livelog: None,
+            ..Default::default()
         };
         assert!(!is_top_level_sequence(&config));
     }
@@ -604,6 +606,7 @@ mod tests {
             monitor_stream: None,
             tool_type: None,
             livelog: None,
+            ..Default::default()
         };
         assert!(!is_top_level_sequence(&config));
     }
@@ -639,6 +642,7 @@ mod tests {
             monitor_stream: None,
             tool_type: None,
             livelog: None,
+            ..Default::default()
         };
         let sub = sequence_subcommand_config(&config);
         assert_eq!(sub.name, "quality");

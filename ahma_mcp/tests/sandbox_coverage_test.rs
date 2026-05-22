@@ -1,8 +1,7 @@
 #[cfg(target_os = "macos")]
 use ahma_mcp::sandbox::test_sandbox_exec_available;
 use ahma_mcp::sandbox::{Sandbox, SandboxMode, check_sandbox_prerequisites};
-#[cfg(unix)]
-use std::path::PathBuf;
+use ahma_test_support::path_helpers::test_out_of_scope_path;
 use tempfile::TempDir;
 
 #[test]
@@ -61,37 +60,35 @@ fn test_validate_path_no_temp_files_violation() {
     let _sandbox =
         Sandbox::new(vec![root.clone()], SandboxMode::Strict, true, false, false).unwrap();
 
-    // Even if /tmp is in scope (unlikely but if added), it should be blocked by HighSecurityViolation logic
+    // Even if the system temp dir is in scope (unlikely but if added), it should be blocked by HighSecurityViolation logic
     // But logic says: if scopes.iter().any... THEN check high security.
     // So to trigger HighSecurityViolation, the path MUST be in scope AND be a temp path.
 
-    // If we add /tmp as a scope
-    #[cfg(unix)]
-    {
-        let tmp_root = PathBuf::from("/tmp");
-        if tmp_root.exists() {
-            let sandbox_lax = Sandbox::new(
-                vec![tmp_root.clone()],
-                SandboxMode::Strict,
-                true,
-                false,
-                false,
-            )
-            .unwrap();
+    // If we add the platform temp dir as a scope
+    let tmp_root = std::env::temp_dir();
+    if tmp_root.exists() {
+        let sandbox_lax = Sandbox::new(
+            vec![tmp_root.clone()],
+            SandboxMode::Strict,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
 
-            let file_in_tmp = tmp_root.join("test_security.txt");
-            // It is in scope /tmp, but blocked by no_temp_files policy
-            let res = sandbox_lax.validate_path(&file_in_tmp);
+        let file_in_tmp = tmp_root.join("test_security.txt");
+        let _ = std::fs::write(&file_in_tmp, "security test");
+        // It is in scope for the platform temp dir, but blocked by no_temp_files policy
+        let res = sandbox_lax.validate_path(&file_in_tmp);
 
-            // Depending on whether `test_security.txt` exists, validate_path might behave differently regarding canonicalization,
-            // but it should eventually hit the check.
-            // Actually, validate_path tries to canonicalize first.
+        // Depending on whether `test_security.txt` exists, validate_path might behave differently regarding canonicalization,
+        // but it should eventually hit the check.
+        // Actually, validate_path tries to canonicalize first.
 
-            // If res is Err, we want to check it is HighSecurityViolation ideally, but Anyhow hides it.
-            // Just asserting error is enough coverage for now.
-            // Note: on Mac /tmp is symlink to /private/tmp.
-            assert!(res.is_err());
-        }
+        // If res is Err, we want to check it is HighSecurityViolation ideally, but Anyhow hides it.
+        // Just asserting error is enough coverage for now.
+        assert!(res.is_err());
+        let _ = std::fs::remove_file(&file_in_tmp);
     }
 }
 
@@ -127,10 +124,17 @@ fn test_validate_path_symlink_traversal() {
 
 #[test]
 fn test_sandbox_test_mode_bypass() {
-    // In Test mode with no scopes, everything should be allowed
-    let sandbox = Sandbox::new_test(); // has "/" scope or similar permissive
+    // Test sandboxes include practical local scopes but must not be globally rooted.
+    let sandbox = Sandbox::new_test();
 
     let path = std::env::current_dir().unwrap();
     let res = sandbox.validate_path(&path);
     assert!(res.is_ok());
+
+    let outside = test_out_of_scope_path();
+    let res = sandbox.validate_path(&outside);
+    assert!(
+        res.is_err(),
+        "new_test should not bypass validation for out-of-scope paths"
+    );
 }

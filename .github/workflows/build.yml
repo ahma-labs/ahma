@@ -32,9 +32,9 @@ concurrency:
 
 on:
   push:
-    branches: [ main, production ]
+    branches: [main, production]
   pull_request:
-    branches: [ main, production ]
+    branches: [main, production]
 
 env:
   RUSTUP_MAX_RETRIES: 10
@@ -60,7 +60,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        os: [ ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest ]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -146,6 +146,9 @@ jobs:
 
       - name: Install cargo-nextest
         run: cargo binstall cargo-nextest --no-confirm --force --locked
+
+      - name: Build ahma binary (required by integration tests)
+        run: cargo build --locked --no-default-features -p ahma_bin
 
       - name: Cargo Nextest (excluding Android/Kotlin tests)
         timeout-minutes: 20
@@ -559,7 +562,8 @@ jobs:
             ~/.cargo/git
             ~/.cargo/.package-cache
             ~/.cargo/bin
-          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target
+          key:
+            cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target
             }}-day${{ steps.day-number.outputs.day }}
           restore-keys: |
             cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
@@ -707,7 +711,7 @@ jobs:
   # --------------------------------------------------------------------------
   job-publish-winget:
     name: Publish Winget Manifest
-    needs: [ job-publish-release ]
+    needs: [job-publish-release]
     # Enable by defining repository variable WINGET_PUBLISH_ENABLED=true.
     if: ${{ vars.WINGET_PUBLISH_ENABLED == 'true' }}
     runs-on: windows-latest

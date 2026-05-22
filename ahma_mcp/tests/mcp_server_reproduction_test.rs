@@ -14,8 +14,6 @@ mod tests {
     /// 4. Verify that MCP notifications prevent duplicates through proper tracking
     #[tokio::test]
     async fn test_persistent_completion_history_behavior() {
-        println!("🔄 Testing persistent completion history behavior...");
-
         let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(30));
         let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
 
@@ -41,8 +39,6 @@ mod tests {
         );
         operation_monitor.add_operation(op2).await;
 
-        println!("OK Added 2 operations to monitor");
-
         // Complete both operations via update_status (this moves them to completion_history)
         operation_monitor
             .update_status(
@@ -60,16 +56,12 @@ mod tests {
             )
             .await;
 
-        println!("OK Completed both operations (moved to completion_history)");
-
         // Wait for operations to be available
         operation_monitor.wait_for_operation(op1_id).await;
         operation_monitor.wait_for_operation(op2_id).await;
 
         // Test that completed operations remain consistently accessible
-        for iteration in 1..=3 {
-            println!("\n--- Completion History Access {} ---", iteration);
-
+        for _ in 1..=3 {
             let completed_ops = operation_monitor.get_completed_operations().await;
 
             // NEW BEHAVIOR: Operations remain in persistent history
@@ -90,23 +82,9 @@ mod tests {
                 "op_test_2 should be in completion history"
             );
 
-            println!(
-                "OK Iteration {}: Found expected 2 operations in completion history",
-                iteration
-            );
-
-            for op in &completed_ops {
-                println!("  - Operation {}: {:?}", op.id, op.state);
-            }
-
             // The loop itself, combined with the assertions, is enough to test
             // the persistence of the completion history. The sleep was here to
             // simulate notification timing, but it's not necessary for correctness.
         }
-
-        println!("\nOK Persistent completion history test PASSED");
-        println!("  - Operations moved to completion_history on completion");
-        println!("  - Operations remain accessible for await operations");
-        println!("  - Duplicate notifications prevented by MCP callback system");
     }
 }

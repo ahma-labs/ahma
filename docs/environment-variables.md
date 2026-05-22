@@ -25,6 +25,8 @@ On Windows, use semicolons (`;`) as separators.
 | `AHMA_HOT_RELOAD` | — | off | Watch the tools directory for JSON changes and reload tool definitions at runtime. **Security warning**: enabling this allows future writes to the tools directory to add or replace tools mid-session. Enable only while authoring tool definitions. |
 | `AHMA_SKIP_PROBES` | — | off | Skip tool availability probes at startup. Probes detect whether required executables (e.g. `cargo`, `git`) are installed and hide tools whose prerequisites are missing. Skip to reduce startup latency when you know all tools are available. |
 | `AHMA_PROGRESSIVE_DISCLOSURE_OFF` | — | off | Disable progressive disclosure (expose all tools to the client immediately). By default, less-frequently-used tools are hidden until the client requests them, preserving the AI's context window. |
+| `AHMA_REVEAL_PROFILE` | `--auto-reveal` (legacy) | `minimal` | Startup visibility profile. `minimal` — only built-in tools are listed (default); `balanced` — all `--tools` bundles are immediately visible at startup; `full` — all tools including built-ins are visible. Prefer this over the legacy `--auto-reveal` flag. |
+| `AHMA_AUTO_REVEAL` | `--auto-reveal` | off | **Legacy alias.** Setting `AHMA_AUTO_REVEAL=1` is equivalent to `AHMA_REVEAL_PROFILE=balanced`. Superseded by `AHMA_REVEAL_PROFILE`; retained for backward compatibility. |
 
 ```bash
 # Use a shared tools directory

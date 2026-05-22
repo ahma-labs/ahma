@@ -33,6 +33,9 @@ allow = [
     "MPL-2.0",                        # option-ext, rust-code-analysis (weak copyleft, file-level)
     "Unicode-3.0",                    # icu_* / unicode crates
     "CDLA-Permissive-2.0",            # webpki-root-certs, webpki-roots
+    # First-party crates (ahma_bin, ahma_cluster, ahma_vault, etc.)
+    "GPL-3.0-or-later",
+    "AGPL-3.0-or-later",
 ]
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ use ahma_mcp::config::{
     AvailabilityCheck, CommandOption, ItemsSpec, SequenceStep, SubcommandConfig, ToolConfig,
     ToolHints, load_mcp_config, load_tool_configs_sync,
 };
+use ahma_test_support::path_helpers::test_temp_path;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -150,6 +151,7 @@ fn test_tool_config_serialization_roundtrip() {
         monitor_stream: None,
         tool_type: None,
         livelog: None,
+        ..Default::default()
     };
 
     let serialized = serde_json::to_string(&config).unwrap();
@@ -378,10 +380,13 @@ fn test_availability_check_default() {
 
 #[test]
 fn test_availability_check_full() {
+    let working_directory = test_temp_path("availability_check")
+        .to_string_lossy()
+        .into_owned();
     let json = json!({
         "command": "node",
         "args": ["--version"],
-        "working_directory": "/tmp",
+        "working_directory": working_directory,
         "success_exit_codes": [0, 1],
         "skip_subcommand_args": true
     });
@@ -389,7 +394,7 @@ fn test_availability_check_full() {
     let check: AvailabilityCheck = serde_json::from_value(json).unwrap();
     assert_eq!(check.command, Some("node".to_string()));
     assert_eq!(check.args, vec!["--version"]);
-    assert_eq!(check.working_directory, Some("/tmp".to_string()));
+    assert_eq!(check.working_directory, Some(working_directory));
     assert_eq!(check.success_exit_codes, Some(vec![0, 1]));
     assert!(check.skip_subcommand_args);
 }

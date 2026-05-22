@@ -155,6 +155,12 @@ pub struct AppConfig {
     pub run_tool: Option<String>,
     /// Arguments forwarded to the tool after `--`.
     pub run_tool_args: Vec<String>,
+
+    // ── task vault ───────────────────────────────────────────────────────────
+    /// Task vault root to use as sandbox scope (--task-vault <path>).
+    /// When set, the sandbox scope is set to <vault>/workdir/ and an audit
+    /// log is initialized at <vault>/audit.jsonl.
+    pub task_vault: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -190,6 +196,7 @@ impl Default for AppConfig {
             list_format: list_tools::OutputFormat::Text,
             run_tool: None,
             run_tool_args: vec![],
+            task_vault: None,
         }
     }
 }
@@ -463,7 +470,7 @@ fn check_powershell_available() {
     }
 }
 
-async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
+pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
     match cmd {
         Subcommands::Serve(serve_args) => match serve_args.transport {
             ServeTransport::Stdio => {
@@ -511,6 +518,31 @@ async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
                 run_tool_info_mode(info_args).await
             }
         },
+        Subcommands::Vault(_) => {
+            anyhow::bail!(
+                "vault commands are provided by the ahma_bin crate (includes ahma_vault). \
+                 If you are running a custom binary, implement vault dispatch using ahma_vault::TaskVault."
+            )
+        }
+        Subcommands::Tui(_) => {
+            anyhow::bail!(
+                "tui is provided by the ahma_bin crate (includes ahma_tui). \
+                 If you are running a custom binary, implement TUI dispatch using ahma_tui::run_tui."
+            )
+        }
+        Subcommands::Bundle(bundle_args) => dispatch_bundle_command(bundle_args),
+        Subcommands::Llm(_) => {
+            anyhow::bail!(
+                "llm commands are provided by the ahma_bin crate (includes ahma_common). \
+                 If you are running a custom binary, implement llm dispatch using ahma_common::config::AhmaConfig."
+            )
+        }
+        Subcommands::Cluster(_) => {
+            anyhow::bail!(
+                "cluster commands are provided by the ahma_bin crate (includes ahma_cluster). \
+                 If you are running a custom binary, implement cluster dispatch using ahma_cluster::discovery::WorkerRegistry."
+            )
+        }
         #[cfg(feature = "simplify")]
         Subcommands::Simplify(args) => {
             tracing::info!("Running in simplify mode");
@@ -519,6 +551,67 @@ async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
         Subcommands::Update(args) => {
             tracing::info!("Running in update mode");
             crate::update::run(args).await
+        }
+    }
+}
+
+fn dispatch_bundle_command(args: BundleArgs) -> Result<()> {
+    match args.command {
+        BundleCommand::Audit(audit_args) => {
+            println!("Auditing bundle: {}", audit_args.path.display());
+            let result = crate::bundle::signing::audit_bundle(&audit_args.path)
+                .context("Bundle audit failed")?;
+
+            println!(
+                "Files checked: {} | Findings: {}",
+                result.files_checked,
+                result.findings.len()
+            );
+
+            for finding in &result.findings {
+                let sev = match finding.severity {
+                    crate::bundle::BundleAuditSeverity::Info => "INFO    ",
+                    crate::bundle::BundleAuditSeverity::Warning => "WARNING ",
+                    crate::bundle::BundleAuditSeverity::Critical => "CRITICAL",
+                };
+                println!("[{sev}] {}: {}", finding.file, finding.description);
+                println!("         Recommendation: {}", finding.recommendation);
+            }
+
+            if result.passed {
+                println!("PASS Bundle audit passed.");
+                Ok(())
+            } else if audit_args.strict && !result.findings.is_empty() {
+                anyhow::bail!("Bundle audit found issues (--strict mode).")
+            } else if !result.passed {
+                anyhow::bail!("Bundle audit found critical issues.")
+            } else {
+                Ok(())
+            }
+        }
+        BundleCommand::Verify(verify_args) => {
+            println!("Verifying bundle: {}", verify_args.path.display());
+            let verifier = crate::bundle::BundleVerifier::new(
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".ahma")
+                    .join("keys")
+                    .join("trusted"),
+            );
+            match verifier.verify(&verify_args.path)? {
+                true => {
+                    println!("PASS Bundle verification passed.");
+                    Ok(())
+                }
+                false => anyhow::bail!("FAIL Bundle verification failed."),
+            }
+        }
+        BundleCommand::Sign(sign_args) => {
+            println!("Signing bundle: {}", sign_args.path.display());
+            let digests = crate::bundle::BundleSigner::sign(&sign_args.path)
+                .context("Bundle signing failed")?;
+            println!("Manifest written with {} file hashes.", digests.len());
+            Ok(())
         }
     }
 }
@@ -559,6 +652,14 @@ fn check_stdio_not_interactive() -> Result<()> {
     about = "Ahma MCP: secure, config-driven adapter for CLI tools"
 )]
 pub struct Cli {
+    /// Emit the full CLI reference as Markdown and exit.
+    ///
+    /// Pipe into a file to regenerate `docs/cli-reference.md`:
+    ///
+    ///   ahma --markdown-help > docs/cli-reference.md
+    #[arg(long, global = true, hide = true)]
+    pub markdown_help: bool,
+
     #[command(subcommand)]
     pub command: Subcommands,
 }
@@ -569,6 +670,16 @@ pub enum Subcommands {
     Serve(ServeArgs),
     /// Tool management and execution utilities.
     Tool(ToolArgs),
+    /// Task vault management: create and inspect per-question working directories.
+    Vault(VaultArgs),
+    /// Start the TUI control plane (terminal dashboard for active tasks).
+    Tui(TuiArgs),
+    /// Bundle management: audit and verify MTDF tool bundles.
+    Bundle(BundleArgs),
+    /// LLM provider management: add, list, test, and remove named providers.
+    Llm(LlmArgs),
+    /// Cluster peer management: add, list, ping, and inspect worker nodes.
+    Cluster(ClusterArgs),
     /// Analyze source code complexity and generate a simplicity report.
     #[cfg(feature = "simplify")]
     Simplify(crate::simplify::SimplifyArgs),
@@ -684,6 +795,23 @@ pub struct ServeArgs {
     /// Providing this flag enables tracing. Equivalent to OTEL_EXPORTER_OTLP_ENDPOINT.
     #[arg(long = "opentelemetry", value_name = "URL", global = true)]
     pub opentelemetry: Option<String>,
+
+    /// Run this server session inside an existing task vault.
+    ///
+    /// Sets the sandbox scope to <vault>/workdir/, initializes an audit log at
+    /// <vault>/audit.jsonl, and wires two-phase delete through <vault>/trash/.
+    /// The vault must exist (create with `ahma vault create <slug>` first).
+    #[arg(long = "task-vault", value_name = "PATH", global = true)]
+    pub task_vault: Option<PathBuf>,
+
+    /// Immediately reveal all loaded `--tools` bundles at startup without
+    /// requiring an `activate_tools` call. Equivalent to `AHMA_AUTO_REVEAL=1`
+    /// or `AHMA_REVEAL_PROFILE=balanced`.
+    ///
+    /// Deprecated: prefer the `AHMA_REVEAL_PROFILE=balanced` environment
+    /// variable; this flag is kept for backward compatibility.
+    #[arg(long = "auto-reveal", global = true)]
+    pub auto_reveal: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -941,11 +1069,264 @@ pub struct InfoArgs {
     pub filter: Option<String>,
 }
 
+// ── vault ─────────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma vault`.
+#[derive(Parser, Debug)]
+pub struct VaultArgs {
+    #[command(subcommand)]
+    pub command: VaultCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VaultCommand {
+    /// Create a new task vault for a user question.
+    ///
+    /// Creates ~/.ahma/tasks/<date>-<slug>-<id>/ with inputs/, workdir/,
+    /// outputs/, trash/, and audit.jsonl.  Prints the vault root path to stdout.
+    #[command(after_help = "EXAMPLES:
+  ahma vault create summarise-q4-report
+  ahma vault create \"analyse customer data\"")]
+    Create(VaultCreateArgs),
+    /// List all existing task vaults.
+    List,
+}
+
+/// Arguments for `ahma vault create`.
+#[derive(Parser, Debug)]
+pub struct VaultCreateArgs {
+    /// A short human-readable slug describing the task (becomes part of the directory name).
+    #[arg(value_name = "SLUG")]
+    pub slug: String,
+}
+
+// ── tui ───────────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma tui`.
+#[derive(Parser, Debug)]
+#[command(after_help = "EXAMPLES:
+  # Connect to the default ahma HTTP bridge
+  ahma tui
+
+  # Connect to a custom address
+  ahma tui --connect http://localhost:8080")]
+pub struct TuiArgs {
+    /// URL of the ahma HTTP bridge to monitor.
+    #[arg(long = "connect", default_value = "http://localhost:3000")]
+    pub connect: String,
+}
+
+// ── bundle ────────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma bundle`.
+#[derive(Parser, Debug)]
+pub struct BundleArgs {
+    #[command(subcommand)]
+    pub command: BundleCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BundleCommand {
+    /// Audit a bundle directory for security issues.
+    ///
+    /// Scans all JSON files for embedded secrets, missing path validation,
+    /// prompt-injection payloads, and other supply-chain risks.
+    Audit(BundleAuditArgs),
+    /// Verify a bundle directory against its content manifest.
+    Verify(BundleVerifyArgs),
+    /// Create a content manifest for a bundle directory.
+    Sign(BundleSignArgs),
+}
+
+/// Arguments for `ahma bundle audit <path>`.
+#[derive(Parser, Debug)]
+pub struct BundleAuditArgs {
+    /// Path to the bundle directory to audit.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+    /// Exit with a non-zero code if any warnings are found (not just criticals).
+    #[arg(long)]
+    pub strict: bool,
+}
+
+/// Arguments for `ahma bundle verify <path>`.
+#[derive(Parser, Debug)]
+pub struct BundleVerifyArgs {
+    /// Path to the bundle directory to verify.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+}
+
+/// Arguments for `ahma bundle sign <path>`.
+#[derive(Parser, Debug)]
+pub struct BundleSignArgs {
+    /// Path to the bundle directory to sign.
+    #[arg(value_name = "PATH")]
+    pub path: PathBuf,
+}
+
+// ── llm ───────────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma llm`.
+#[derive(Parser, Debug)]
+#[command(after_help = "EXAMPLES:
+  ahma llm list
+  ahma llm add --name ollama-local --base-url http://localhost:11434/v1 --model llama3.2
+  ahma llm add --name openai --base-url https://api.openai.com/v1 --model gpt-4o-mini --api-key '${OPENAI_API_KEY}'
+  ahma llm test ollama-local
+  ahma llm remove ollama-local")]
+pub struct LlmArgs {
+    #[command(subcommand)]
+    pub command: LlmCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LlmCommand {
+    /// List all named providers in ~/.ahma/config.toml.
+    List,
+    /// Add a named provider to ~/.ahma/config.toml.
+    Add(LlmAddArgs),
+    /// Test connectivity to a named provider (GET /v1/models).
+    Test(LlmTestArgs),
+    /// Remove a named provider from ~/.ahma/config.toml.
+    Remove(LlmRemoveArgs),
+}
+
+/// Arguments for `ahma llm add`.
+#[derive(Parser, Debug)]
+pub struct LlmAddArgs {
+    /// Unique name for this provider (e.g. "ollama-local").
+    #[arg(long)]
+    pub name: String,
+    /// Base URL of the OpenAI-compatible API (e.g. http://localhost:11434/v1).
+    #[arg(long)]
+    pub base_url: String,
+    /// Default model to use with this provider (e.g. "llama3.2").
+    #[arg(long)]
+    pub model: String,
+    /// Optional API key. Use \${ENV_VAR} notation to reference an environment variable.
+    #[arg(long)]
+    pub api_key: Option<String>,
+}
+
+/// Arguments for `ahma llm test`.
+#[derive(Parser, Debug)]
+pub struct LlmTestArgs {
+    /// Name of the provider to test (must exist in ~/.ahma/config.toml).
+    #[arg(value_name = "NAME")]
+    pub name: String,
+}
+
+/// Arguments for `ahma llm remove`.
+#[derive(Parser, Debug)]
+pub struct LlmRemoveArgs {
+    /// Name of the provider to remove.
+    #[arg(value_name = "NAME")]
+    pub name: String,
+}
+
+// ── cluster ───────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma cluster`.
+#[derive(Parser, Debug)]
+#[command(after_help = "EXAMPLES:
+  ahma cluster list
+  ahma cluster add-peer --id workstation --addr http://workstation.local:3000 --models llama3.2,gemma4
+  ahma cluster ping workstation
+  ahma cluster status
+  ahma cluster discover
+  ahma cluster announce --port 3000 --models llama3.2,gemma4
+  ahma cluster cert init --out-dir ~/.ahma/cluster/certs")]
+pub struct ClusterArgs {
+    /// Directory containing mTLS certificates for peer authentication.
+    ///
+    /// When set, all outbound peer connections use mTLS.  The directory must
+    /// contain `ca.pem`, `cert.pem`, and `key.pem` generated by
+    /// `ahma cluster cert init`.
+    #[arg(long, value_name = "DIR")]
+    pub tls_dir: Option<std::path::PathBuf>,
+
+    #[command(subcommand)]
+    pub command: ClusterCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ClusterCommand {
+    /// List peers in ~/.ahma/cluster/peers.json.
+    List,
+    /// Add a worker peer to ~/.ahma/cluster/peers.json.
+    #[command(name = "add-peer")]
+    AddPeer(ClusterAddPeerArgs),
+    /// Ping a peer's /health endpoint.
+    Ping(ClusterPingArgs),
+    /// Show status of all configured peers (reachability + capabilities).
+    Status,
+    /// Browse the local network for ahma worker peers via mDNS and print what
+    /// is found within the discovery window.
+    Discover,
+    /// Announce this machine as an ahma worker peer via mDNS so remote peers
+    /// can discover it automatically.
+    Announce(ClusterAnnounceArgs),
+    /// Manage mTLS certificates for cluster peer authentication.
+    #[command(subcommand)]
+    Cert(CertCommand),
+}
+
+/// Arguments for `ahma cluster announce`.
+#[derive(Parser, Debug)]
+pub struct ClusterAnnounceArgs {
+    /// Unique peer ID broadcast in the mDNS TXT record (defaults to hostname).
+    #[arg(long)]
+    pub id: Option<String>,
+    /// HTTP port the local ahma bridge is listening on.
+    #[arg(long, default_value = "3000")]
+    pub port: u16,
+    /// Models available on this peer (comma-separated).
+    #[arg(long, value_delimiter = ',', default_value = "")]
+    pub models: Vec<String>,
+}
+
+/// Sub-commands for `ahma cluster cert`.
+#[derive(Subcommand, Debug)]
+pub enum CertCommand {
+    /// Generate a self-signed CA plus a leaf certificate and key for this peer.
+    ///
+    /// Writes `ca.pem`, `cert.pem`, and `key.pem` to `--out-dir`.
+    /// Share `ca.pem` with all other peers so they can verify each other.
+    Init {
+        /// Directory where the generated PEM files are written.
+        #[arg(long, default_value = "~/.ahma/cluster/certs")]
+        out_dir: String,
+    },
+}
+
+/// Arguments for `ahma cluster add-peer`.
+#[derive(Parser, Debug)]
+pub struct ClusterAddPeerArgs {
+    /// Unique peer ID (hostname or UUID).
+    #[arg(long)]
+    pub id: String,
+    /// HTTP address of the peer's ahma HTTP bridge (e.g. http://workstation.local:3000).
+    #[arg(long)]
+    pub addr: String,
+    /// Comma-separated list of model names available on this peer.
+    #[arg(long, value_delimiter = ',', default_value = "")]
+    pub models: Vec<String>,
+}
+
+/// Arguments for `ahma cluster ping`.
+#[derive(Parser, Debug)]
+pub struct ClusterPingArgs {
+    /// Peer ID to ping (must exist in ~/.ahma/cluster/peers.json).
+    #[arg(value_name = "ID")]
+    pub id: String,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AppConfig construction from CLI + env vars
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn build_app_config(cli: &Cli) -> AppConfig {
+pub fn build_app_config(cli: &Cli) -> AppConfig {
     // Gather serve-level fields if present
     #[allow(clippy::type_complexity)]
     let (
@@ -1001,6 +1382,20 @@ fn build_app_config(cli: &Cli) -> AppConfig {
             false,
             None::<String>,
         ),
+    };
+
+    // task-vault from CLI
+    let cli_task_vault: Option<PathBuf> = if let Subcommands::Serve(s) = &cli.command {
+        s.task_vault.clone()
+    } else {
+        None
+    };
+
+    // auto-reveal legacy alias from CLI
+    let cli_auto_reveal: bool = if let Subcommands::Serve(s) = &cli.command {
+        s.auto_reveal
+    } else {
+        false
     };
 
     // Tool list args
@@ -1071,6 +1466,9 @@ fn build_app_config(cli: &Cli) -> AppConfig {
         {
             "balanced" => StartupProfile::Balanced,
             "full" => StartupProfile::Full,
+            _ if cli_auto_reveal || AppConfig::env_flag("AHMA_AUTO_REVEAL") => {
+                StartupProfile::Balanced
+            }
             _ => StartupProfile::Minimal,
         },
         no_sandbox: cli_no_sandbox || AppConfig::env_flag("AHMA_DISABLE_SANDBOX"),
@@ -1115,6 +1513,8 @@ fn build_app_config(cli: &Cli) -> AppConfig {
         list_format,
         run_tool,
         run_tool_args,
+        task_vault: cli_task_vault
+            .or_else(|| std::env::var("AHMA_TASK_VAULT").ok().map(PathBuf::from)),
     }
 }
 
@@ -1497,6 +1897,7 @@ mod tests {
             run_tool: None,
             run_tool_args: vec![],
             observability: ahma_common::observability::ObservabilityConfig::default(),
+            task_vault: None,
         }
     }
 
@@ -1997,5 +2398,71 @@ mod tests {
         unsafe { std::env::set_var("AHMA_TEST_CFG_FLAG", "yes") };
         assert!(AppConfig::env_flag("AHMA_TEST_CFG_FLAG"));
         unsafe { std::env::remove_var("AHMA_TEST_CFG_FLAG") };
+    }
+
+    // ─── --auto-reveal / AHMA_AUTO_REVEAL compatibility ──────────────────────
+
+    #[test]
+    fn test_cli_parse_auto_reveal_flag() {
+        // Regression: `--auto-reveal` must be accepted (not rejected) by clap.
+        let cli =
+            Cli::try_parse_from(["ahma", "serve", "stdio", "--auto-reveal"]).unwrap();
+        if let Subcommands::Serve(s) = cli.command {
+            assert!(s.auto_reveal, "auto_reveal should be true when --auto-reveal is passed");
+        } else {
+            panic!("expected serve stdio subcommand");
+        }
+    }
+
+    #[test]
+    fn test_build_app_config_auto_reveal_flag_maps_to_balanced() {
+        let cli = Cli::try_parse_from(["ahma", "serve", "stdio", "--auto-reveal"]).unwrap();
+        let cfg = build_app_config(&cli);
+        assert_eq!(
+            cfg.reveal_profile,
+            StartupProfile::Balanced,
+            "--auto-reveal should set reveal_profile to Balanced"
+        );
+    }
+
+    #[test]
+    fn test_build_app_config_ahma_auto_reveal_env_maps_to_balanced() {
+        let cli = Cli::try_parse_from(["ahma", "serve", "stdio"]).unwrap();
+        unsafe { std::env::set_var("AHMA_AUTO_REVEAL", "1") };
+        let cfg = build_app_config(&cli);
+        unsafe { std::env::remove_var("AHMA_AUTO_REVEAL") };
+        assert_eq!(
+            cfg.reveal_profile,
+            StartupProfile::Balanced,
+            "AHMA_AUTO_REVEAL=1 should set reveal_profile to Balanced"
+        );
+    }
+
+    #[test]
+    fn test_build_app_config_reveal_profile_env_takes_precedence_over_auto_reveal() {
+        // AHMA_REVEAL_PROFILE wins; --auto-reveal should not override it.
+        let cli = Cli::try_parse_from(["ahma", "serve", "stdio", "--auto-reveal"]).unwrap();
+        unsafe { std::env::set_var("AHMA_REVEAL_PROFILE", "full") };
+        let cfg = build_app_config(&cli);
+        unsafe { std::env::remove_var("AHMA_REVEAL_PROFILE") };
+        assert_eq!(
+            cfg.reveal_profile,
+            StartupProfile::Full,
+            "AHMA_REVEAL_PROFILE=full should override --auto-reveal"
+        );
+    }
+
+    #[test]
+    fn test_build_app_config_default_reveal_profile_is_minimal() {
+        let cli = Cli::try_parse_from(["ahma", "serve", "stdio"]).unwrap();
+        // Ensure no relevant env vars are set
+        unsafe { std::env::remove_var("AHMA_REVEAL_PROFILE") };
+        unsafe { std::env::remove_var("AHMA_AUTO_REVEAL") };
+        let cfg = build_app_config(&cli);
+        assert_eq!(
+            cfg.reveal_profile,
+            StartupProfile::Minimal,
+            "default reveal_profile should be Minimal"
+        );
     }
 }

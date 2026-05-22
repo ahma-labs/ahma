@@ -510,6 +510,7 @@ mod tests {
             monitor_stream: None,
             tool_type: None,
             livelog: None,
+            ..Default::default()
         }
     }
 
@@ -727,10 +728,14 @@ mod tests {
 
     #[test]
     fn test_extract_working_directory_fallback_default() {
-        let adapter = create_test_config(Path::new(".")).unwrap();
+        // The sandbox canonicalises "." to the real cwd, so the fallback is the
+        // absolute path — not the literal ".". Use dunce to avoid Windows \?\
+        // extended-length path prefixes in test expectations.
+        let workspace = dunce::canonicalize(Path::new(".")).unwrap();
+        let adapter = create_test_config(&workspace).unwrap();
         let params = CallToolRequestParams::new("test".to_string());
         let wd = extract_working_directory(&adapter, &params);
-        assert_eq!(wd, ".");
+        assert_eq!(wd, workspace.to_string_lossy().as_ref());
     }
 
     // ============= find_step_subcommand tests =============

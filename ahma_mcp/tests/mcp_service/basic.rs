@@ -156,6 +156,7 @@ mod mcp_service_tests {
             }]),
             sequence: None,
             step_delay_ms: None,
+            ..Default::default()
         };
 
         assert_eq!(config.name, "test_tool");

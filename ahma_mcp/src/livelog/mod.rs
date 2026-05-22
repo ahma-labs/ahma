@@ -46,11 +46,17 @@ pub async fn run_livelog_pipeline(
     cancellation_token: CancellationToken,
     callback: Option<&(dyn CallbackSender + Send + Sync)>,
 ) {
-    let llm = LlmClient::new(
-        &config.llm_provider.base_url,
-        &config.llm_provider.model,
-        config.llm_provider.api_key.clone(),
-    );
+    let provider = match config.llm_provider.resolve() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                "livelog[{}]: failed to resolve LLM provider config: {}",
+                op_id, e
+            );
+            return;
+        }
+    };
+    let llm = LlmClient::new(&provider.base_url, &provider.model, provider.api_key);
 
     let cmd_result =
         sandbox.create_command(&config.source_command, &config.source_args, working_dir);

@@ -28,7 +28,7 @@ use source::install_from_git_ref;
         With a semver ref (e.g. 0.6.7 or v0.6.7): install that release tag.\n\
         With a branch ref (e.g. main or feature/update): build from GitHub source via cargo install.\n\n\
         For an unpushed local checkout, use:\n\
-          cargo install --path ahma_mcp --bin ahma --root ~/.local --locked --force",
+          RUSTFLAGS='--cfg reqwest_unstable' cargo install --path ahma_bin --bin ahma --root ~/.local --locked --force",
     after_help = "EXAMPLES:
   # Install latest published release
   ahma update
@@ -85,10 +85,14 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
             )?;
             run_release_update(&args, &platform, &install_dir, &mode).await
         }
-        UpdateMode::GitRef { branch } => {
-            install_from_git_ref(&branch, &install_dir, args.dry_run).await
-        }
+        UpdateMode::GitRef { branch } => run_git_update(&branch, &install_dir, args.dry_run).await,
     }
+}
+
+async fn run_git_update(branch: &str, install_dir: &std::path::Path, dry_run: bool) -> Result<()> {
+    let installed = install_from_git_ref(branch, install_dir, dry_run).await?;
+    print_post_install_details(&installed, install_dir, dry_run).await;
+    Ok(())
 }
 
 async fn run_release_update(
@@ -113,15 +117,15 @@ async fn run_release_update(
         && let Some(installed) = read_installed_version(&target).await
     {
         if installed == asset.version {
-                println!(
-                    "Ahma {installed} is already installed at {}",
-                    target.display()
-                );
-                if args.dry_run {
-                    println!("[dry-run] Would reinstall with --force");
-                } else {
-                    println!("Use --force to reinstall anyway.");
-                }
+            println!(
+                "Ahma {installed} is already installed at {}",
+                target.display()
+            );
+            if args.dry_run {
+                println!("[dry-run] Would reinstall with --force");
+            } else {
+                println!("Use --force to reinstall anyway.");
+            }
             return Ok(());
         }
         println!("Upgrading ahma from {installed} to {}...", asset.version);
@@ -131,18 +135,34 @@ async fn run_release_update(
     let installed =
         install_release_asset(&client, &asset, platform, install_dir, args.dry_run).await?;
 
-    if !args.dry_run {
-        if let Some(version) = read_installed_version(&installed).await {
-            println!(
-                "Success! ahma {version} installed to {}",
-                installed.display()
-            );
-        }
-        print_path_hint(install_dir);
-        print_restart_hint();
-    }
+    print_post_install_details(&installed, install_dir, args.dry_run).await;
 
     Ok(())
+}
+
+async fn print_post_install_details(
+    installed: &std::path::Path,
+    install_dir: &std::path::Path,
+    dry_run: bool,
+) {
+    if dry_run {
+        return;
+    }
+
+    let version = read_installed_version(installed).await;
+    println!("{}", format_install_success(installed, version.as_deref()));
+    print_path_hint(install_dir);
+    print_restart_hint();
+}
+
+fn format_install_success(installed: &std::path::Path, version: Option<&str>) -> String {
+    match version {
+        Some(version) => format!(
+            "Success! ahma {version} installed to {}",
+            installed.display()
+        ),
+        None => format!("Success! Installed {}", installed.display()),
+    }
 }
 
 async fn warn_if_running_binary_differs(install_dir: &std::path::Path) {
@@ -204,5 +224,17 @@ mod tests {
         assert!(args.reference.is_none());
         assert!(!args.force);
         assert!(!args.dry_run);
+    }
+
+    #[test]
+    fn test_format_install_success_with_version() {
+        let message = format_install_success(std::path::Path::new("/tmp/ahma"), Some("0.7.0"));
+        assert_eq!(message, "Success! ahma 0.7.0 installed to /tmp/ahma");
+    }
+
+    #[test]
+    fn test_format_install_success_without_version() {
+        let message = format_install_success(std::path::Path::new("/tmp/ahma"), None);
+        assert_eq!(message, "Success! Installed /tmp/ahma");
     }
 }

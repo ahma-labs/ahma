@@ -6,14 +6,14 @@
 //! Per MCP specification (R8.4.7): HTTP DELETE with `Mcp-Session-Id` terminates
 //! session and subprocess.
 
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use reqwest::Client;
 use serde_json::{Value, json};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 use tempfile::TempDir;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 /// RAII guard for a raw `Child` server process.
 /// Kills the child on drop to prevent leaky tests when assertions panic.
@@ -109,8 +109,9 @@ async fn start_http_bridge(
         .expect("Failed to build HTTP/2 client");
     let health_url = format!("http://127.0.0.1:{}/health", port);
 
-    for _ in 0..30 {
-        sleep(Duration::from_millis(200)).await;
+    let health_deadline = Instant::now() + TestTimeouts::get(TimeoutCategory::HealthCheck);
+    while Instant::now() < health_deadline {
+        sleep(TestTimeouts::poll_interval()).await;
         if let Ok(resp) = client.get(&health_url).send().await
             && resp.status().is_success()
         {
@@ -137,7 +138,7 @@ async fn send_mcp_request(
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
-        .timeout(Duration::from_secs(60));
+        .timeout(TestTimeouts::get(TimeoutCategory::HttpRequest));
 
     if let Some(id) = session_id {
         req = req.header("Mcp-Session-Id", id);
@@ -224,7 +225,7 @@ async fn test_delete_session_terminates_subprocess() {
     let delete_response = client
         .delete(&delete_url)
         .header("Mcp-Session-Id", &session_id)
-        .timeout(Duration::from_secs(30))
+        .timeout(TestTimeouts::get(TimeoutCategory::HttpRequest))
         .send()
         .await
         .expect("DELETE request should succeed");
@@ -239,7 +240,7 @@ async fn test_delete_session_terminates_subprocess() {
     );
 
     // Step 4: Verify subsequent requests with same session ID return 404
-    sleep(Duration::from_millis(100)).await;
+    sleep(TestTimeouts::short_delay()).await;
 
     let post_response = client
         .post(format!("{}/mcp", base_url))
@@ -252,7 +253,7 @@ async fn test_delete_session_terminates_subprocess() {
             "method": "tools/list",
             "params": {}
         }))
-        .timeout(Duration::from_secs(30))
+        .timeout(TestTimeouts::get(TimeoutCategory::HttpRequest))
         .send()
         .await
         .expect("POST request should complete");
@@ -298,7 +299,7 @@ async fn test_delete_without_session_id_returns_400() {
     let delete_url = format!("{}/mcp", base_url);
     let delete_response = client
         .delete(&delete_url)
-        .timeout(Duration::from_secs(30))
+        .timeout(TestTimeouts::get(TimeoutCategory::HttpRequest))
         .send()
         .await
         .expect("DELETE request should complete");
@@ -343,7 +344,7 @@ async fn test_delete_nonexistent_session_returns_404() {
     let delete_response = client
         .delete(&delete_url)
         .header("Mcp-Session-Id", "non-existent-session-id-12345")
-        .timeout(Duration::from_secs(30))
+        .timeout(TestTimeouts::get(TimeoutCategory::HttpRequest))
         .send()
         .await
         .expect("DELETE request should complete");

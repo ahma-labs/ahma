@@ -2,15 +2,17 @@
 /// This addresses the need for clear, structured callback messages that enable AI decision-making
 use ahma_mcp::callback_system::ProgressUpdate;
 use ahma_mcp::utils::logging::init_test_logging;
+use ahma_test_support::path_helpers::test_temp_path;
 
 #[tokio::test]
 async fn test_callback_messages_are_ai_actionable() {
     init_test_logging();
-    println!("🤖 Testing callback message clarity for AI decision-making...");
 
     // Test different types of progress updates that an AI might receive
     let id = "test_op_123".to_string();
-    let working_dir = "/tmp/test".to_string();
+    let working_dir = test_temp_path("callback_clarity_test")
+        .to_string_lossy()
+        .into_owned();
 
     // Test 1: Started message should clearly indicate what's beginning
     let started = ProgressUpdate::Started {
@@ -19,8 +21,18 @@ async fn test_callback_messages_are_ai_actionable() {
         description: "Running tests with nextest".to_string(),
     };
 
-    println!("📨 Started message: {:?}", started);
-    assert!(matches!(started, ProgressUpdate::Started { .. }));
+    match started {
+        ProgressUpdate::Started {
+            id: started_id,
+            command,
+            description,
+        } => {
+            assert_eq!(started_id, id);
+            assert_eq!(command, "cargo nextest run");
+            assert!(description.contains("nextest"));
+        }
+        other => panic!("Expected Started update, got {other:?}"),
+    }
 
     // Test 2: Final result message should provide comprehensive outcome
     let final_result = ProgressUpdate::FinalResult {
@@ -32,8 +44,6 @@ async fn test_callback_messages_are_ai_actionable() {
         full_output: "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s\n\nfailures:\n\n---- my_test stdout ----\nthread 'my_test' panicked at 'assertion failed: `(left == right)`'".to_string(),
         duration_ms: 1230,
     };
-
-    println!("📨 Final result message: {:?}", final_result);
 
     // Verify the final result contains all necessary info for AI decision-making
     if let ProgressUpdate::FinalResult {
@@ -65,8 +75,6 @@ async fn test_callback_messages_are_ai_actionable() {
             duration_ms > 0,
             "Duration should be available for performance assessment"
         );
-
-        println!("OK Final result message contains all necessary AI decision-making info");
     } else {
         panic!("FAIL Expected FinalResult variant");
     }
@@ -78,8 +86,6 @@ async fn test_callback_messages_are_ai_actionable() {
         duration_ms: 1500,
     };
 
-    println!("📨 Failed message: {:?}", failed);
-
     if let ProgressUpdate::Failed { error, .. } = failed {
         // AI should understand this is a failure and why
         assert!(
@@ -90,17 +96,14 @@ async fn test_callback_messages_are_ai_actionable() {
             error.contains("101"),
             "Specific exit code should be available"
         );
-
-        println!("OK Failed message provides actionable error information");
+    } else {
+        panic!("Expected Failed variant");
     }
-
-    println!("🎯 All callback messages provide sufficient clarity for AI decision-making");
 }
 
 #[tokio::test]
 async fn test_callback_message_formatting_for_nextest() {
     init_test_logging();
-    println!("🧪 Testing specific nextest callback message formatting...");
 
     // Simulate a realistic nextest failure that an AI should understand
     let nextest_output = r#"
@@ -132,35 +135,34 @@ test result: FAILED. 15 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out;
     };
 
     // Verify AI can extract key information
-    if let ProgressUpdate::FinalResult { full_output, .. } = final_result {
-        // Parse test results
-        assert!(
-            full_output.contains("15 passed; 3 failed"),
-            "AI should be able to parse test counts"
-        );
+    let full_output = match final_result {
+        ProgressUpdate::FinalResult { full_output, .. } => full_output,
+        other => panic!("Expected FinalResult update, got {other:?}"),
+    };
 
-        // Identify specific test failures
-        assert!(
-            full_output.contains("integration_test"),
-            "AI should identify specific failing tests"
-        );
-        assert!(
-            full_output.contains("index out of bounds"),
-            "AI should see specific error types"
-        );
-        assert!(
-            full_output.contains("validation error"),
-            "AI should understand different error categories"
-        );
+    // Parse test results
+    assert!(
+        full_output.contains("15 passed; 3 failed"),
+        "AI should be able to parse test counts"
+    );
 
-        // Performance information
-        assert!(
-            full_output.contains("finished in 2.34s"),
-            "AI should have timing information"
-        );
+    // Identify specific test failures
+    assert!(
+        full_output.contains("integration_test"),
+        "AI should identify specific failing tests"
+    );
+    assert!(
+        full_output.contains("index out of bounds"),
+        "AI should see specific error types"
+    );
+    assert!(
+        full_output.contains("validation error"),
+        "AI should understand different error categories"
+    );
 
-        println!("OK Nextest output provides comprehensive failure analysis for AI");
-    }
-
-    println!("🎯 Nextest callback messages enable AI to diagnose and respond to test failures");
+    // Performance information
+    assert!(
+        full_output.contains("finished in 2.34s"),
+        "AI should have timing information"
+    );
 }

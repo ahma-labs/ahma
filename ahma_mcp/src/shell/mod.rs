@@ -26,7 +26,12 @@ pub use list_tools::{
     list_tools_stdio_with_env, parse_mcp_config, print_json_output, print_text_output,
 };
 
-pub use cli::run;
+pub use cli::{
+    CertCommand, Cli, ClusterAddPeerArgs, ClusterAnnounceArgs, ClusterArgs, ClusterCommand,
+    ClusterPingArgs, LlmAddArgs, LlmArgs, LlmCommand, LlmRemoveArgs, LlmTestArgs, Subcommands,
+    TuiArgs, VaultArgs, VaultCommand, VaultCreateArgs,
+};
+pub use cli::{build_app_config, dispatch_subcommand, run};
 
 pub use resolution::{
     find_matching_tool, find_tool_config, normalize_tools_dir, resolve_cli_subcommand,

@@ -20,28 +20,14 @@ Ahma is an MCP server for running real project work through existing CLI tools w
 **Linux / macOS — first-time install**
 
 ```bash
-cargo install --git https://github.com/paulirotta/ahma ahma_mcp --bin ahma --root ~/.local --locked --force
+curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-**Install a specific branch (first time or after `ahma` is on PATH):**
-
-```bash
-# First time (no ahma yet)
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root ~/.local --locked --force
-
-# After ahma is installed
-ahma update feature/update
-```
-
-**Windows (PowerShell 5.1+)**
+**Windows (PowerShell 5.1+) — first-time install**
 
 ```powershell
-# Latest release
 irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
-
-# Branch (requires Rust)
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root $HOME\.local --locked --force
 ```
 
 **Update an existing install:**
@@ -50,6 +36,34 @@ cargo install --git https://github.com/paulirotta/ahma --branch feature/update a
 ahma update              # latest release
 ahma update main         # build from branch
 ```
+
+<details>
+<summary><strong>Advanced — install a specific branch (requires <a href="https://rustup.rs/">Rust</a>)</strong></summary>
+
+Use this if you need to test an unreleased branch before the next binary release.
+
+The workspace uses `reqwest` with the `http3` feature, so source builds require `RUSTFLAGS='--cfg reqwest_unstable'`. The `ahma update <branch>` command sets this automatically; the snippets below are only needed if you are installing for the first time without an existing `ahma` binary.
+
+**Linux / macOS**
+
+```bash
+# First time (no ahma yet)
+RUSTFLAGS='--cfg reqwest_unstable' \
+  cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_bin --bin ahma --root ~/.local --locked --force
+export PATH="$HOME/.local/bin:$PATH"
+
+# After ahma is installed — the subcommand handles RUSTFLAGS automatically
+ahma update feature/update
+```
+
+**Windows (PowerShell 5.1+)**
+
+```powershell
+$env:RUSTFLAGS='--cfg reqwest_unstable'
+cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_bin --bin ahma --root $HOME\.local --locked --force
+```
+
+</details>
 
 See [docs/installation.md](docs/installation.md) for platform details, source builds, and branch installs from local checkouts.
 
@@ -142,6 +156,104 @@ See [docs/live-log-monitoring.md](docs/live-log-monitoring.md) for setup, the An
 - **Agent skills**: Optional agent-specific setup is documented in [docs/agent-skills.md](docs/agent-skills.md).
 - **Code complexity analysis**: `ahma simplify` analyzes source files and returns structured AI fix instructions. See [SIMPLIFY.md](SIMPLIFY.md).
 
+---
+
+## v0.7 Experimental Features
+
+The following capabilities were introduced in v0.7. They are functional and tested but their APIs and configuration formats may change before stabilisation. Each is opt-in — existing workflows are unaffected.
+
+### Security rationale
+
+Every v0.7 feature was designed around the principle that **the kernel sandbox is the trust boundary, not a classifier or a user-discipline rule**. The design was informed by documented weaknesses in cloud agent tools:
+
+- Prompt injection can bypass any filter with non-zero probability. Ahma's response is to make the *consequences* of a successful injection bounded by the kernel sandbox scope, not to prevent injection entirely.
+- Folder-level permission grants that survive a whole session give too much access for too long. Task vaults enforce the per-task folder discipline that responsible users already practice — but make it the only option.
+- Network egress from agent subprocesses is not controlled by filesystem sandboxing alone. The egress sandbox adds a deny-by-default HTTP proxy layer.
+- Long unattended sessions are the highest-risk usage pattern. The renewal contract halts them automatically.
+
+### Task Vaults — isolated per-question working directories
+
+```bash
+VAULT=$(ahma vault create my-question)
+ahma serve stdio --task-vault "$VAULT"
+ahma vault list
+```
+
+Each vault gets its own kernel sandbox scope (`workdir/`), input copies, output directory, two-phase delete staging (`trash/`), and append-only audit log. There is no "grant my whole Documents folder" option — the vault is the only scope.
+
+See [docs/task-vault.md](docs/task-vault.md).
+
+### Decompose — split complex questions across local LLMs
+
+```bash
+# .ahma/decompose.json ships pre-configured for gemma4 via Ollama
+ollama pull gemma4
+# Then ask your agent: use the decompose tool to answer "..."
+```
+
+The `decompose` MTDF tool type breaks a question into sub-questions, runs them concurrently against a local model, and aggregates results with a deterministic Rust reducer. No cloud egress required.
+
+See [docs/decompose.md](docs/decompose.md).
+
+### TUI — terminal dashboard and approval gates
+
+```bash
+ahma tui
+ahma tui --connect http://localhost:8080
+```
+
+A terminal dashboard for monitoring active operations and handling approval gates (renewal checkpoints, elevation requests, deletion confirmations).
+
+See [docs/tui.md](docs/tui.md).
+
+### Egress Sandbox — per-task outbound network control
+
+Every vault has an `egress.allowlist` file. An HTTP proxy enforces it for all subprocess traffic. Default: deny all outbound connections. Local Ollama (localhost) is always excluded from the proxy.
+
+See [docs/egress-sandbox.md](docs/egress-sandbox.md).
+
+### Interactive HTML Artifacts
+
+Tools can emit `outputs/result.html` — a self-contained artifact with embedded data, rendered tables, and a local-LLM chat widget. The user opens it in a browser and keeps iterating without re-engaging the agent.
+
+See [docs/artifacts.md](docs/artifacts.md).
+
+### Worker Code Synthesis — ephemeral Rust/Python programs
+
+The `worker` MTDF tool type compiles and runs synthesized code inside the vault sandbox. Because the program runs without an LLM in the execution loop, it cannot be re-injected mid-run. Source is deleted after execution unless `keep_source: true`.
+
+See [docs/worker-synthesis.md](docs/worker-synthesis.md).
+
+### Bundle Audit — supply-chain security for MTDF bundles
+
+```bash
+ahma bundle audit /path/to/bundle
+ahma bundle sign   /path/to/bundle
+ahma bundle verify /path/to/bundle
+```
+
+Scans for embedded secrets, missing path validation, and prompt-injection payloads in tool JSON files before they are loaded.
+
+See [docs/bundle-audit.md](docs/bundle-audit.md).
+
+### Local Cluster Scheduler
+
+Routes decompose sub-tasks to `ahma worker` peers on your LAN or Tailscale mesh. Each peer runs its own local model. Static peer configuration is functional; mDNS peer discovery is planned.
+
+See [docs/cluster-scheduler.md](docs/cluster-scheduler.md).
+
+### Renewal Contract — automatic halt for unattended sessions
+
+Any operation running unattended beyond `T_renew` seconds (default 5 minutes) is automatically halted, a checkpoint is written to the vault, and the TUI prompts for re-approval. This closes the "long unattended run" risk class.
+
+See [docs/renewal-contract.md](docs/renewal-contract.md).
+
+### ahma_core — embedding Ahma in Rust applications
+
+The `ahma_core` crate exposes vaults, orchestration, egress, workers, and the renewal contract as a library for embedding in other Rust applications.
+
+See [docs/ahma-core-library.md](docs/ahma-core-library.md).
+
 ## MCP Server Connection Modes
 
 `ahma` supports **STDIO** (default — IDE spawns a subprocess per workspace), **HTTP Bridge** (proxy for web clients and debugging), and **HTTP Streaming** (MCP Streamable HTTP with event replay and full-duplex).
@@ -178,4 +290,10 @@ Workspace-level rules in `AGENTS.md` reach Claude as operator-trusted content (h
 
 ## License
 
-Licensed under either [Apache License 2.0](APACHE_LICENSE.txt) or [MIT License](MIT_LICENSE.txt).
+Ahma uses a mixed-license model in a single workspace:
+
+- The library crates (`ahma_mcp`, `ahma_core`, `ahma_common`, `ahma_http_bridge`, `ahma_http_mcp_client`, `ahma_llm_monitor`, `ahma_py`, `generate_tool_schema`) are dual-licensed under **MIT OR Apache-2.0**.
+- The end-user product surface — `ahma_bin` (which produces the `ahma` binary), `ahma_vault`, `ahma_decompose`, `ahma_worker`, `ahma_renewal`, `ahma_tui` — is licensed under **GPL-3.0-or-later** to discourage commercial expropriation.
+- The network-facing peer scheduler `ahma_cluster` is licensed under **AGPL-3.0-or-later** to also cover hosted-service deployments (AGPL §13 requires source disclosure to remote users of modified versions).
+
+Because the shipped `ahma` binary statically links `ahma_cluster`, the combined executable is effectively AGPL-3.0-or-later for redistribution and network-service purposes. Each crate's `Cargo.toml` is the authoritative license declaration. Refer to it before redistributing.

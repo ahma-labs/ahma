@@ -6,6 +6,7 @@
 //! `Sandbox::validate_path` which internally calls `format_scopes`.
 
 use ahma_mcp::sandbox::{Sandbox, SandboxError, SandboxMode};
+use ahma_test_support::path_helpers::test_temp_path;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
@@ -124,12 +125,13 @@ fn test_prerequisite_failed_display() {
 /// HighSecurityViolation display should reference the blocked path.
 #[test]
 fn test_high_security_violation_display() {
+    let blocked_path = test_temp_path("blocked.txt");
     let err = SandboxError::HighSecurityViolation {
-        path: PathBuf::from("/tmp/blocked.txt"),
+        path: blocked_path.clone(),
     };
     let msg = err.to_string();
     assert!(
-        msg.contains("blocked.txt") || msg.contains("/tmp"),
+        msg.contains("blocked.txt") || msg.contains(&blocked_path.to_string_lossy().to_string()),
         "HighSecurityViolation should reference the blocked path: {msg}"
     );
     assert!(
@@ -231,8 +233,9 @@ fn test_validate_path_triggers_format_scopes_multiple_scopes() {
 /// platform-dependent.)
 #[test]
 fn test_high_security_violation_error_display() {
+    let secret_path = test_temp_path("secret.txt");
     let err = SandboxError::HighSecurityViolation {
-        path: PathBuf::from("/tmp/secret.txt"),
+        path: secret_path.clone(),
     };
     let msg = err.to_string();
     assert!(
@@ -240,7 +243,7 @@ fn test_high_security_violation_error_display() {
         "HighSecurityViolation should have a message"
     );
     assert!(
-        msg.contains("/tmp/secret.txt"),
+        msg.contains(&secret_path.to_string_lossy().to_string()),
         "Should reference the blocked path: {msg}"
     );
 }

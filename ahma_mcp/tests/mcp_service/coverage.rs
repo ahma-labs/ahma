@@ -125,6 +125,7 @@ fn test_tool_config_creation() {
         monitor_stream: None,
         tool_type: None,
         livelog: None,
+        ..Default::default()
     };
 
     assert_eq!(tool_config.name, "cargo");
@@ -294,6 +295,7 @@ async fn test_service_with_configs() {
         monitor_stream: None,
         tool_type: None,
         livelog: None,
+        ..Default::default()
     };
     configs.insert("test_tool".to_string(), tool_config);
 
@@ -404,6 +406,7 @@ fn test_tool_config_with_nested_subcommands() {
         monitor_stream: None,
         tool_type: None,
         livelog: None,
+        ..Default::default()
     };
 
     assert_eq!(tool_config.name, "cargo");
@@ -465,6 +468,7 @@ async fn test_service_with_tool_configs() {
         monitor_stream: None,
         tool_type: None,
         livelog: None,
+        ..Default::default()
     };
     configs.insert("cargo".to_string(), tool_config);
 

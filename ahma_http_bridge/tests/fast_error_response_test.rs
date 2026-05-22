@@ -15,11 +15,12 @@
 
 mod common;
 
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use common::spawn_test_server;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(target_os = "macos")]
 fn should_skip_in_nested_sandbox() -> bool {
@@ -90,7 +91,7 @@ async fn timed_request(
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
         .json(request)
-        .timeout(Duration::from_secs(5))
+        .timeout(TestTimeouts::get(TimeoutCategory::Quick))
         .send()
         .await;
 
@@ -120,7 +121,7 @@ async fn try_single_initialize(client: &Client, url: &str, init_request: &Value)
         .post(url)
         .header("Content-Type", "application/json")
         .json(init_request)
-        .timeout(Duration::from_secs(5))
+        .timeout(TestTimeouts::get(TimeoutCategory::Quick))
         .send()
         .await
         .ok()?;
@@ -146,7 +147,7 @@ async fn try_single_initialize(client: &Client, url: &str, init_request: &Value)
         .header("Content-Type", "application/json")
         .header("Mcp-Session-Id", &session_id)
         .json(&initialized_notification)
-        .timeout(Duration::from_secs(5))
+        .timeout(TestTimeouts::get(TimeoutCategory::Quick))
         .send()
         .await;
 
@@ -174,7 +175,7 @@ async fn initialize_session(client: &Client) -> Option<String> {
     // Retry a few times - the shared server may still be starting
     for attempt in 0..5 {
         if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(TestTimeouts::scale_millis(500)).await;
         }
         if let Some(sid) = try_single_initialize(client, &url, &init_request).await {
             return Some(sid);
@@ -207,7 +208,7 @@ async fn timed_request_with_session(
         .header("Accept", "application/json")
         .header("Mcp-Session-Id", session_id)
         .json(request)
-        .timeout(Duration::from_secs(5))
+        .timeout(TestTimeouts::get(TimeoutCategory::Quick))
         .send()
         .await;
 
@@ -246,7 +247,7 @@ macro_rules! setup_fast_error_test {
         let $client = common::make_h2_client();
 
         // Wait a moment for the server to stabilize if it just started
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(TestTimeouts::short_delay()).await;
     };
     ($client:ident, $session:ident) => {
         setup_fast_error_test!($client);
@@ -503,7 +504,7 @@ async fn test_malformed_json_returns_fast_error() {
         .post(&url)
         .header("Content-Type", "application/json")
         .body("{invalid json")
-        .timeout(Duration::from_secs(5))
+        .timeout(TestTimeouts::get(TimeoutCategory::Quick))
         .send()
         .await;
 

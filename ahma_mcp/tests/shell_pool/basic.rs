@@ -1,6 +1,7 @@
 use ahma_mcp::shell_pool::{
     ShellCommand, ShellError, ShellPoolConfig, ShellPoolManager, ShellResponse,
 };
+use ahma_test_support::path_helpers::test_temp_path;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -73,10 +74,13 @@ async fn test_shell_pool_manager_with_disabled_config() {
 
 #[tokio::test]
 async fn test_shell_command_creation() {
+    let working_dir = test_temp_path("shell_command_creation_basic")
+        .to_string_lossy()
+        .into_owned();
     let command = ShellCommand {
         id: "test_cmd_123".to_string(),
         command: vec!["echo".to_string(), "hello".to_string()],
-        working_dir: "/tmp".to_string(),
+        working_dir: working_dir.clone(),
         timeout_ms: 5000,
     };
 
@@ -84,7 +88,7 @@ async fn test_shell_command_creation() {
     assert_eq!(command.command.len(), 2);
     assert_eq!(command.command[0], "echo");
     assert_eq!(command.command[1], "hello");
-    assert_eq!(command.working_dir, "/tmp");
+    assert_eq!(command.working_dir, working_dir);
     assert_eq!(command.timeout_ms, 5000);
 }
 
@@ -327,18 +331,13 @@ async fn test_shell_command_with_complex_args() {
             "cargo".to_string(),
             "test".to_string(),
             "--".to_string(),
-//            "--test-threads".to_string(),
-//            "4".to_string(),
             "--nocapture".to_string(),
         ],
         working_dir: "/workspace/project".to_string(),
         timeout_ms: 30000,
     };
 
-    assert_eq!(command.command.len(), 6);
- //   assert!(command.command.contains(&"--test-threads".to_string()));
- //   assert!(command.command.contains(&"4".to_string()));
-    assert!(command.command.contains(&"--nocapture".to_string()));
+    assert_eq!(command.command, ["cargo", "test", "--", "--nocapture"]);
 }
 
 #[tokio::test]

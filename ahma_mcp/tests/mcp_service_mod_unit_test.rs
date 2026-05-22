@@ -377,6 +377,7 @@ async fn test_update_tools_replaces_configs() {
                 monitor_stream: None,
                 tool_type: None,
                 livelog: None,
+                ..Default::default()
             },
         );
     }
@@ -406,6 +407,7 @@ async fn test_update_tools_replaces_configs() {
             monitor_stream: None,
             tool_type: None,
             livelog: None,
+            ..Default::default()
         },
     );
     new_configs.insert(
@@ -429,6 +431,7 @@ async fn test_update_tools_replaces_configs() {
             monitor_stream: None,
             tool_type: None,
             livelog: None,
+            ..Default::default()
         },
     );
 

@@ -7,9 +7,10 @@
                 "serve",
                 "stdio",
                 "--tools",
-                "rust,git",
+                "rust,git,fileutils",
                 "--tmp",
-                "--log-monitor"
+                "--log-monitor",
+                "--auto-reveal"
             ]
         },
         "ahma-http": {

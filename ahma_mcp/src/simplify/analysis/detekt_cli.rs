@@ -103,13 +103,13 @@ impl ExternalAnalyzer for DetektCliAnalyzer {
 /// Homebrew installs it as `detekt`; some other distributions use `detekt-cli`.
 fn detekt_cli_binary() -> Option<PathBuf> {
     for candidate in &["detekt", "detekt-cli"] {
-        if let Ok(output) = Command::new("which").arg(candidate).output() {
-            if output.status.success() {
-                let path_str = String::from_utf8_lossy(&output.stdout);
-                let path = PathBuf::from(path_str.trim());
-                if path.is_file() {
-                    return Some(path);
-                }
+        if let Ok(output) = Command::new("which").arg(candidate).output()
+            && output.status.success()
+        {
+            let path_str = String::from_utf8_lossy(&output.stdout);
+            let path = PathBuf::from(path_str.trim());
+            if path.is_file() {
+                return Some(path);
             }
         }
     }

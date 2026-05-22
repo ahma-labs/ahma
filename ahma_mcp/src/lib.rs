@@ -152,6 +152,31 @@ pub mod utils;
 /// Tool configuration validation.
 pub mod validation;
 
+// ── New modules (roadmap milestones) ─────────────────────────────────────────
+//
+// The following milestone modules have been extracted into dedicated
+// GPL-3.0-or-later (or AGPL-3.0-or-later) crates to allow this library to
+// remain MIT OR Apache-2.0:
+//
+//   ahma_vault    — task vault, audit log, two-phase trash  (GPL-3.0-or-later)
+//   ahma_decompose — local-LLM decompose orchestration       (GPL-3.0-or-later)
+//   ahma_worker   — ephemeral worker code synthesis          (GPL-3.0-or-later)
+//   ahma_renewal  — renewal contract for long-running tasks  (GPL-3.0-or-later)
+//   ahma_tui      — ratatui TUI control plane                (GPL-3.0-or-later)
+//   ahma_cluster  — local cluster scheduler (mDNS/QUIC)      (AGPL-3.0-or-later)
+//
+// These crates live in the same workspace and depend on this library;
+// they must NOT be depended on from this crate.
+
+/// Egress sandbox: per-task HTTP proxy with domain allowlist.
+pub mod egress;
+
+/// HTML+WASM artifact channel: interactive output with embedded LLM chat.
+pub mod artifact;
+
+/// Bundle signing and supply-chain auditor.
+pub mod bundle;
+
 // Test utilities
 /// Test helpers for integration and unit tests.
 pub mod test_utils;

@@ -18,6 +18,9 @@
     "command": {
       "type": "string"
     },
+    "decompose": {
+      "description": "Decompose orchestration configuration (opaque — parsed by `ahma_decompose` crate).\nRequired when `tool_type` is `decompose`; stored as raw JSON for GPL-crate consumption."
+    },
     "description": {
       "type": "string"
     },
@@ -119,7 +122,7 @@
       "minimum": 0
     },
     "tool_type": {
-      "description": "Tool type classifier. Defaults to `Command` for normal CLI tools.\nSet to `Livelog` for long-running log-streaming tools that pipe output through an LLM.",
+      "description": "Tool type classifier. Defaults to `Command` for normal CLI tools.\nSet to `Livelog` for long-running log-streaming tools that pipe output through an LLM.\nTool types implemented in separate GPL-licensed crates (e.g. `decompose`, `worker`)\nare deserialized as `Extension` and their configurations stored in the matching\nopaque JSON fields below.",
       "anyOf": [
         {
           "$ref": "#/$defs/ToolType"
@@ -128,6 +131,9 @@
           "type": "null"
         }
       ]
+    },
+    "worker": {
+      "description": "Worker synthesis configuration (opaque — parsed by `ahma_worker` crate).\nRequired when `tool_type` is `worker`; stored as raw JSON for GPL-crate consumption."
     }
   },
   "additionalProperties": false,
@@ -332,7 +338,7 @@
       "type": "object",
       "properties": {
         "api_key": {
-          "description": "Optional bearer token. Omit for local models that don't require authentication.",
+          "description": "Optional bearer token. Supports `${ENV_VAR}` interpolation — **never\nstore literal API keys in tool definition files**.",
           "type": [
             "string",
             "null"
@@ -561,7 +567,7 @@
       "additionalProperties": false
     },
     "ToolType": {
-      "description": "Classifier that determines how the MCP service routes a tool invocation.",
+      "description": "Classifier that determines how the MCP service routes a tool invocation.\n\nThe permissive `ahma_mcp` library handles `Command` and `Livelog` natively.\nTool types implemented in the GPL-licensed sibling crates (`ahma_decompose`,\n`ahma_worker`, etc.) are serialised to their JSON names (e.g. `\"decompose\"`,\n`\"worker\"`) and round-trip correctly — they are just stored as `Extension`\nin this enum so the MIT library has no compile-time dependency on GPL code.\n`ahma_bin` routes those calls to the appropriate GPL crate at runtime.",
       "oneOf": [
         {
           "description": "Normal command-line tool (default).",
@@ -572,6 +578,11 @@
           "description": "Long-running log source piped through an LLM for issue detection.",
           "type": "string",
           "const": "livelog"
+        },
+        {
+          "description": "Any tool type implemented outside this crate (e.g. `decompose`, `worker`).\nThe raw `tool_type` string is preserved for routing by the GPL binary crates.",
+          "type": "string",
+          "const": "extension"
         }
       ]
     }

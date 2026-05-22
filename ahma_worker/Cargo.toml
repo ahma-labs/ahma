@@ -1,0 +1,27 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "ahma_worker"
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Ephemeral worker code synthesis for ahma: compile and run Rust/Python programs inside a vault sandbox."
+
+[lib]
+name = "ahma_worker"
+path = "src/lib.rs"
+
+[dependencies]
+ahma_vault = { path = "../ahma_vault" }
+anyhow.workspace = true
+schemars.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["process", "fs", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

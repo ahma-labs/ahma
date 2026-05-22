@@ -359,7 +359,7 @@ async fn test_meta_params_not_passed_as_args() {
     // These should be filtered out and not passed to the command
     args.insert(
         "working_directory".to_string(),
-        Value::String("/tmp".to_string()),
+        Value::String(temp.path().to_string_lossy().into_owned()),
     );
     args.insert(
         "execution_mode".to_string(),

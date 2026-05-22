@@ -85,6 +85,10 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         enable_quic: false,
         disable_http1_1: false,
         listener_kind: ListenerKind::Unix(socket_path),
+        require_token: None,
+        require_token_path: None,
+        rate_limit_rps: 0,
+        rate_limit_burst: 10,
     };
 
     start_bridge(bridge_config).await?;

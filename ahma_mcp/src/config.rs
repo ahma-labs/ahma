@@ -38,6 +38,7 @@
 //! - **Dynamic Behavior**: The server's behavior, such as whether a command runs
 //!   synchronously or asynchronously, can be controlled directly from the configuration files.
 
+use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -103,14 +104,32 @@ pub struct ToolConfig {
     pub monitor_stream: Option<String>,
     /// Tool type classifier. Defaults to `Command` for normal CLI tools.
     /// Set to `Livelog` for long-running log-streaming tools that pipe output through an LLM.
+    /// Tool types implemented in separate GPL-licensed crates (e.g. `decompose`, `worker`)
+    /// are deserialized as `Extension` and their configurations stored in the matching
+    /// opaque JSON fields below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_type: Option<ToolType>,
     /// Live log monitoring configuration. Required when `tool_type` is `Livelog`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub livelog: Option<LivelogConfig>,
+    /// Decompose orchestration configuration (opaque — parsed by `ahma_decompose` crate).
+    /// Required when `tool_type` is `decompose`; stored as raw JSON for GPL-crate consumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decompose: Option<serde_json::Value>,
+    /// Worker synthesis configuration (opaque — parsed by `ahma_worker` crate).
+    /// Required when `tool_type` is `worker`; stored as raw JSON for GPL-crate consumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<serde_json::Value>,
 }
 
 /// Classifier that determines how the MCP service routes a tool invocation.
+///
+/// The permissive `ahma_mcp` library handles `Command` and `Livelog` natively.
+/// Tool types implemented in the GPL-licensed sibling crates (`ahma_decompose`,
+/// `ahma_worker`, etc.) are serialised to their JSON names (e.g. `"decompose"`,
+/// `"worker"`) and round-trip correctly — they are just stored as `Extension`
+/// in this enum so the MIT library has no compile-time dependency on GPL code.
+/// `ahma_bin` routes those calls to the appropriate GPL crate at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolType {
@@ -119,6 +138,10 @@ pub enum ToolType {
     Command,
     /// Long-running log source piped through an LLM for issue detection.
     Livelog,
+    /// Any tool type implemented outside this crate (e.g. `decompose`, `worker`).
+    /// The raw `tool_type` string is preserved for routing by the GPL binary crates.
+    #[serde(other)]
+    Extension,
 }
 
 /// Connection details for an OpenAI-compatible LLM provider.
@@ -129,8 +152,39 @@ pub struct LlmProviderConfig {
     pub base_url: String,
     /// Model identifier, e.g. `llama3.2`, `gpt-4o-mini`.
     pub model: String,
-    /// Optional bearer token. Omit for local models that don't require authentication.
+    /// Optional bearer token. Supports `${ENV_VAR}` interpolation — **never
+    /// store literal API keys in tool definition files**.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+impl LlmProviderConfig {
+    /// Resolve env-var placeholders in `api_key` and warn on literal secrets.
+    ///
+    /// Returns `Err` if a `${VAR}` reference is not set in the environment.
+    pub fn resolve(&self) -> Result<ResolvedLlmProvider> {
+        use ahma_common::config::{interpolate_env_vars, warn_if_looks_like_literal_secret};
+        if let Some(key) = &self.api_key {
+            warn_if_looks_like_literal_secret(key);
+        }
+        let api_key = self
+            .api_key
+            .as_deref()
+            .map(interpolate_env_vars)
+            .transpose()?;
+        Ok(ResolvedLlmProvider {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            api_key,
+        })
+    }
+}
+
+/// An [`LlmProviderConfig`] with secrets resolved — ready to hand to an HTTP client.
+#[derive(Debug, Clone)]
+pub struct ResolvedLlmProvider {
+    pub base_url: String,
+    pub model: String,
     pub api_key: Option<String>,
 }
 

@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod main_tests {
     use ahma_mcp::utils::logging::init_test_logging;
+    use ahma_test_support::path_helpers::test_temp_path;
     use std::path::PathBuf;
 
     #[test]
@@ -122,14 +123,17 @@ mod main_tests {
     #[test]
     fn test_cli_argument_parsing() {
         init_test_logging();
+        let working_directory = test_temp_path("cli_argument_parsing")
+            .to_string_lossy()
+            .into_owned();
         let test_cases = vec![
             (
                 vec![
                     "--working-directory".to_string(),
-                    "/tmp".to_string(),
+                    working_directory.clone(),
                     "--verbose".to_string(),
                 ],
-                Some("/tmp".to_string()),
+                Some(working_directory),
                 vec![("verbose".to_string(), serde_json::Value::Bool(true))],
             ),
             (
@@ -207,14 +211,18 @@ mod main_tests {
     fn test_environment_variable_parsing() {
         init_test_logging();
         // Test parsing of AHMA_MCP_ARGS environment variable
-        let test_json =
-            r#"{"working_directory": "/tmp", "verbose": true, "args": ["file1", "file2"]}"#;
-
-        let json_val: serde_json::Value = serde_json::from_str(test_json).unwrap();
+        let working_directory = test_temp_path("env_arg_parsing")
+            .to_string_lossy()
+            .into_owned();
+        let json_val = serde_json::json!({
+            "working_directory": working_directory,
+            "verbose": true,
+            "args": ["file1", "file2"]
+        });
         if let Some(map) = json_val.as_object() {
             assert_eq!(
                 map.get("working_directory").unwrap().as_str().unwrap(),
-                "/tmp"
+                working_directory
             );
             assert!(map.get("verbose").unwrap().as_bool().unwrap());
             assert_eq!(map.get("args").unwrap().as_array().unwrap().len(), 2);
@@ -311,6 +319,7 @@ mod main_tests {
                 monitor_stream: None,
                 tool_type: None,
                 livelog: None,
+                ..Default::default()
             },
         );
 
@@ -406,7 +415,7 @@ mod main_tests {
     fn test_working_directory_resolution() {
         init_test_logging();
         // Test working directory resolution logic
-        let explicit_wd = Some("/tmp/project".to_string());
+        let explicit_wd = Some(test_temp_path("project").to_string_lossy().into_owned());
         let from_args = Some("/home/user/project".to_string());
         let current_dir = std::env::current_dir()
             .ok()
@@ -415,7 +424,10 @@ mod main_tests {
 
         // Test explicit working directory
         let final_wd = explicit_wd.or_else(|| from_args.clone());
-        assert_eq!(final_wd, Some("/tmp/project".to_string()));
+        assert_eq!(
+            final_wd,
+            Some(test_temp_path("project").to_string_lossy().into_owned())
+        );
 
         // Test fallback to args
         let final_wd = none.clone().or_else(|| from_args.clone());

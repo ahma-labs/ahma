@@ -21,14 +21,13 @@ fn extract_shell_working_directory(output: &str) -> Result<PathBuf> {
     let path_line = output
         .lines()
         .map(str::trim)
-        .filter(|line| {
+        .rfind(|line| {
             !line.is_empty()
                 // PowerShell table header
                 && !line.eq_ignore_ascii_case("path")
                 // PowerShell dashed separator (e.g. "----")
                 && !line.chars().all(|c| c == '-')
         })
-        .next_back()
         .ok_or_else(|| anyhow!("no path line found in shell output: {:?}", output))?;
     Ok(PathBuf::from(path_line))
 }

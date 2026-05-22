@@ -2,8 +2,8 @@ use ahma_http_bridge::session::{
     HandshakeState, SessionManager, SessionManagerConfig, SessionTerminationReason,
 };
 
+use ahma_common::timeouts::TestTimeouts;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::time::sleep;
 
 #[tokio::test]
@@ -76,7 +76,7 @@ async fn test_handshake_state_machine_race_condition_stress() {
         let session_clone2 = session.clone();
 
         let t1 = tokio::spawn(async move {
-            sleep(Duration::from_millis(1)).await; // Tiny unexpected delay
+            sleep(TestTimeouts::scale_millis(1)).await; // Tiny unexpected delay
             session_clone1.mark_sse_connected().await
         });
 

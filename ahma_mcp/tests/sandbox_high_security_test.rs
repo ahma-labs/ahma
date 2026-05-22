@@ -1,5 +1,5 @@
 use ahma_mcp::sandbox::{Sandbox, SandboxMode};
-use ahma_mcp::test_utils::path_helpers::{test_out_of_scope_path, test_temp_path};
+use ahma_test_support::path_helpers::{test_out_of_scope_path, test_temp_path};
 
 #[test]
 fn test_high_security_mode_enforcement() {
