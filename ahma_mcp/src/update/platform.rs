@@ -11,8 +11,9 @@ pub struct Platform {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
+    #[cfg_attr(target_os = "windows", allow(dead_code))] // Zip on Windows.
     TarGz,
-    #[allow(dead_code)] // Used on Windows; TarGz on Unix dev builds.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))] // TarGz on Unix-like platforms.
     Zip,
 }
 
