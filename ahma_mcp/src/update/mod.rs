@@ -157,7 +157,10 @@ async fn print_post_install_details(
 
 fn format_install_success(installed: &std::path::Path, version: Option<&str>) -> String {
     match version {
-        Some(version) => format!("Success! ahma {version} installed to {}", installed.display()),
+        Some(version) => format!(
+            "Success! ahma {version} installed to {}",
+            installed.display()
+        ),
         None => format!("Success! Installed {}", installed.display()),
     }
 }

@@ -141,8 +141,14 @@ mod tests {
         assert_eq!(cmd[0], "cargo");
         assert!(cmd.contains(&"--branch".to_string()));
         assert!(cmd.contains(&"feature/update".to_string()));
-        assert!(cmd.contains(&"ahma_bin".to_string()), "package should be ahma_bin, not ahma_mcp");
-        assert!(!cmd.contains(&"ahma_mcp".to_string()), "ahma_mcp no longer has the ahma bin target");
+        assert!(
+            cmd.contains(&"ahma_bin".to_string()),
+            "package should be ahma_bin, not ahma_mcp"
+        );
+        assert!(
+            !cmd.contains(&"ahma_mcp".to_string()),
+            "ahma_mcp no longer has the ahma bin target"
+        );
         assert!(cmd.contains(&"--root".to_string()));
         assert!(cmd.contains(&"/home/u/.local".to_string()));
     }
@@ -153,7 +159,10 @@ mod tests {
         // SAFETY: test-only; single-threaded by nextest process isolation.
         unsafe { std::env::remove_var("RUSTFLAGS") };
         let flags = required_rustflags();
-        assert!(flags.contains("--cfg reqwest_unstable"), "expected reqwest_unstable in '{flags}'");
+        assert!(
+            flags.contains("--cfg reqwest_unstable"),
+            "expected reqwest_unstable in '{flags}'"
+        );
     }
 
     #[test]
@@ -161,8 +170,14 @@ mod tests {
         // SAFETY: test-only; single-threaded by nextest process isolation.
         unsafe { std::env::set_var("RUSTFLAGS", "-C opt-level=2") };
         let flags = required_rustflags();
-        assert!(flags.contains("-C opt-level=2"), "existing flag should be preserved");
-        assert!(flags.contains("--cfg reqwest_unstable"), "reqwest flag should be appended");
+        assert!(
+            flags.contains("-C opt-level=2"),
+            "existing flag should be preserved"
+        );
+        assert!(
+            flags.contains("--cfg reqwest_unstable"),
+            "reqwest flag should be appended"
+        );
         unsafe { std::env::remove_var("RUSTFLAGS") };
     }
 
