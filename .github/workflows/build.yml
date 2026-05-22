@@ -426,6 +426,9 @@ jobs:
           cargo binstall cargo-nextest --no-confirm --force --locked
           cargo binstall cargo-llvm-cov --no-confirm --force
 
+      - name: Build ahma binary (required by integration tests)
+        run: cargo build --locked --no-default-features -p ahma_bin
+
       - name: Generate coverage report
         timeout-minutes: 40
         run: |
@@ -613,14 +616,14 @@ jobs:
       - name: Build release binaries (native)
         if: "!matrix.use_cross"
         run: |
-          cargo build --release --locked --target ${{ matrix.target }} -p ahma_mcp
+          cargo build --release --locked --target ${{ matrix.target }} -p ahma_bin
 
       - name: Build release binaries (cross-compiled)
         if: matrix.use_cross
         run: |
           # Disable sccache for cross builds (incompatible with cross's Docker containers)
           unset RUSTC_WRAPPER
-          cross build --release --locked --target ${{ matrix.target }} -p ahma_mcp
+          cross build --release --locked --target ${{ matrix.target }} -p ahma_bin
 
       - name: Package release binaries
         id: package
