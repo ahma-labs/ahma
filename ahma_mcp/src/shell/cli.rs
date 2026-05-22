@@ -438,8 +438,8 @@ fn log_sandbox_mode(no_sandbox: bool) {
 
     #[cfg(target_os = "windows")]
     tracing::info!(
-        "SECURE Sandbox mode: APPCONTAINER (per-command path security) + \
-         JOB OBJECT (kill-on-close process tracking)"
+        "SECURE Sandbox mode: JOB OBJECT (kill-on-close process tracking); \
+         AppContainer spawn isolation pending"
     );
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -2405,10 +2405,12 @@ mod tests {
     #[test]
     fn test_cli_parse_auto_reveal_flag() {
         // Regression: `--auto-reveal` must be accepted (not rejected) by clap.
-        let cli =
-            Cli::try_parse_from(["ahma", "serve", "stdio", "--auto-reveal"]).unwrap();
+        let cli = Cli::try_parse_from(["ahma", "serve", "stdio", "--auto-reveal"]).unwrap();
         if let Subcommands::Serve(s) = cli.command {
-            assert!(s.auto_reveal, "auto_reveal should be true when --auto-reveal is passed");
+            assert!(
+                s.auto_reveal,
+                "auto_reveal should be true when --auto-reveal is passed"
+            );
         } else {
             panic!("expected serve stdio subcommand");
         }

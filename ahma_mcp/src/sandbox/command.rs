@@ -70,8 +70,9 @@ impl Sandbox {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            // Windows: launch inside an AppContainer using
-            // PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES (R6.3.3).
+            // Windows: route through the Windows sandbox backend. Today that
+            // provides Job Object process-tree containment; per-command
+            // AppContainer spawn isolation is still pending (R6.3.3).
             #[cfg(target_os = "windows")]
             {
                 let scope = self

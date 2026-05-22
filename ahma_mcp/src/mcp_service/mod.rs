@@ -554,7 +554,10 @@ impl AhmaMcpService {
 }
 
 #[async_trait::async_trait]
-#[allow(clippy::manual_async_fn)] // Required by rmcp ServerHandler trait
+#[expect(
+    clippy::manual_async_fn,
+    reason = "async-trait desugars to manual Future returns; required by rmcp ServerHandler trait contract"
+)]
 impl ServerHandler for AhmaMcpService {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.progressive_disclosure {
@@ -1434,6 +1437,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn parse_file_uri_to_path_accepts_localhost_and_decodes() {
         let p = AhmaMcpService::parse_file_uri_to_path(
             "file://localhost/Users/test/My%20Project/file.txt?x=1#frag",
@@ -1443,6 +1447,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn parse_file_uri_to_path_rejects_non_file_scheme_and_relative() {
         assert!(AhmaMcpService::parse_file_uri_to_path("http://example.com/a").is_none());
         assert!(AhmaMcpService::parse_file_uri_to_path("file://not-abs").is_none());
@@ -1450,12 +1455,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn parse_file_uri_to_path_accepts_absolute_without_localhost() {
         let p = AhmaMcpService::parse_file_uri_to_path("file:///home/user/file.txt").expect("path");
         assert_eq!(p.to_string_lossy(), "/home/user/file.txt");
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn parse_file_uri_to_path_strips_query_only() {
         let p =
             AhmaMcpService::parse_file_uri_to_path("file:///path/to/file?query=1").expect("path");
@@ -1463,10 +1470,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn parse_file_uri_to_path_strips_fragment_only() {
         let p =
             AhmaMcpService::parse_file_uri_to_path("file:///path/to/file#section").expect("path");
         assert_eq!(p.to_string_lossy(), "/path/to/file");
+    }
+
+    // ── parse_file_uri_to_path (Windows equivalents) ────────────────────────
+    // Windows uses drive-letter URIs (file:///C:/...) instead of Unix absolute paths.
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn parse_file_uri_to_path_accepts_absolute_without_localhost() {
+        let p =
+            AhmaMcpService::parse_file_uri_to_path("file:///C:/home/user/file.txt").expect("path");
+        assert_eq!(p.to_string_lossy(), "C:/home/user/file.txt");
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn parse_file_uri_to_path_accepts_localhost_and_decodes() {
+        let p = AhmaMcpService::parse_file_uri_to_path(
+            "file://localhost/C:/Users/test/My%20Project/file.txt?x=1#frag",
+        )
+        .expect("path");
+        assert_eq!(p.to_string_lossy(), "C:/Users/test/My Project/file.txt");
     }
 
     #[test]

@@ -1,8 +1,6 @@
 //! # ahma binary entry point
 //!
-//! This crate is licensed under **GPL-3.0-or-later**.  It statically links
-//! `ahma_cluster` (AGPL-3.0-or-later), so the compiled binary is effectively
-//! AGPL-3.0-or-later for redistribution and network-service purposes.
+//! This crate is licensed under **AGPL-3.0-or-later**.
 
 use anyhow::{Context, Result};
 use clap::Parser as _;

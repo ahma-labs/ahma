@@ -6,11 +6,10 @@
 
 mod common;
 
-use ahma_common::timeouts::TestTimeouts;
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use common::{McpTestClient, spawn_test_server};
 use futures::StreamExt;
 use serde_json::{Value, json};
-use std::time::Duration;
 
 fn find_sse_event_id(buffer: &str) -> Option<u64> {
     buffer.lines().find_map(|line| {
@@ -40,7 +39,7 @@ async fn test_post_json_content_negotiation() {
                 "clientInfo": {"name": "json-test", "version": "1.0"}
             }
         }))
-        .timeout(Duration::from_secs(60))
+        .timeout(TestTimeouts::get(TimeoutCategory::SseStream))
         .send()
         .await
         .expect("request should succeed");
@@ -82,7 +81,7 @@ async fn test_post_sse_content_negotiation() {
         }))
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
-        .timeout(Duration::from_secs(60))
+        .timeout(TestTimeouts::get(TimeoutCategory::SseStream))
         .send()
         .await
         .expect("request should succeed");
@@ -139,7 +138,7 @@ async fn test_post_sse_response_includes_event_id() {
         }))
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
-        .timeout(Duration::from_secs(60))
+        .timeout(TestTimeouts::get(TimeoutCategory::SseStream))
         .send()
         .await
         .expect("request should succeed");
@@ -147,10 +146,10 @@ async fn test_post_sse_response_includes_event_id() {
     // Read SSE stream and check for id: field
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(30);
 
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(2000), stream.next()).await {
+        match tokio::time::timeout(TestTimeouts::scale_millis(2000), stream.next()).await {
             Ok(Some(Ok(bytes))) => {
                 buffer.push_str(&String::from_utf8_lossy(&bytes));
                 if buffer.contains("id:") && buffer.contains("data:") {
@@ -209,10 +208,10 @@ async fn test_get_sse_events_include_event_id() {
     // Read SSE events and verify they have id fields
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(30);
 
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(2000), stream.next()).await {
+        match tokio::time::timeout(TestTimeouts::scale_millis(2000), stream.next()).await {
             Ok(Some(Ok(bytes))) => {
                 buffer.push_str(&String::from_utf8_lossy(&bytes));
                 if let Some(id) = find_sse_event_id(&buffer) {
@@ -384,7 +383,7 @@ async fn test_post_sse_streams_response() {
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
         .header("Mcp-Session-Id", &session_id)
-        .timeout(Duration::from_secs(60))
+        .timeout(TestTimeouts::get(TimeoutCategory::SseStream))
         .send()
         .await
         .expect("request should succeed");
@@ -412,10 +411,10 @@ async fn test_post_sse_streams_response() {
     // Parse SSE stream to find the response
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(30);
 
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(2000), stream.next()).await {
+        match tokio::time::timeout(TestTimeouts::scale_millis(2000), stream.next()).await {
             Ok(Some(Ok(bytes))) => {
                 buffer.push_str(&String::from_utf8_lossy(&bytes));
             }

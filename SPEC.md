@@ -13,7 +13,7 @@
 | macOS Sandbox (Seatbelt) | tests-pass | Kernel-level FS sandboxing via `sandbox-exec` |
 | Nested Sandbox Detection | tests-pass | Detects Cursor/VS Code/Docker outer sandboxes |
 | Windows Runtime (PowerShell) | in-progress | Built-in PowerShell (5.1+) shell pool; cross-platform path security + file URI; parity tests green |
-| Windows Sandbox backend | in-progress | Job Object enforcement done; AppContainer profile + DACL grant implemented (Windows CI validation required for `tests-pass`) |
+| Windows Sandbox backend | in-progress | Job Object enforcement done; AppContainer spawn isolation pending Windows CI proof |
 | Windows Pre-built Releases | in-progress | `x86_64-pc-windows-msvc`; `.zip` CI artifacts; `install.ps1`; winget manifests + `job-publish-winget` CI job |
 | STDIO Mode | tests-pass | Direct MCP server over stdio for IDE integration |
 | HTTP Bridge Mode | tests-pass | HTTP/SSE proxy for web clients |
@@ -220,9 +220,10 @@ The sandbox scope defines the root directory boundary. AI has **full read/write 
 > Until it does, strict mode **must** fail closed (`SandboxError::PrerequisiteFailed`) so the
 > server never runs unsandboxed without explicit `--disable-sandbox` opt-out.
 >
-> **Current status**: Job Object enforcement and AppContainer profile + DACL grant are
-> **implemented** in `sandbox/windows.rs`.  Final validation (R6.3.1, R6.3.3, R6.3.7)
-> requires a `windows-latest` CI run.
+> **Current status**: Job Object enforcement is implemented in `sandbox/windows.rs`.
+> AppContainer availability probing is present, but per-command AppContainer spawn
+> isolation and scoped access grants are not active yet. Final validation (R6.3.1,
+> R6.3.3, R6.3.7) requires a `windows-latest` CI run.
 
 ##### Architecture decision
 
@@ -239,7 +240,7 @@ The planned implementation uses two mechanisms in order of preference:
 ##### Acceptance criteria (required before GA)
 
 - **R6.3.1**: `check_windows_sandbox_available()` returns `Ok(())` when the AppContainer
-  backend is confirmed ready on Windows 8+. _Status: implemented (probes `CreateAppContainerProfile`
+  API is available on Windows 8+. _Status: implemented (probes `CreateAppContainerProfile`
   with an invalid name; returns `Ok(())` on Win8+, `PrerequisiteFailed` on older OS)._
 - **R6.3.2**: `enforce_windows_sandbox(roots)` applies Job Object containment at server
   startup, ensuring child processes are killed on server exit. Signature mirrors

@@ -122,7 +122,7 @@
       "minimum": 0
     },
     "tool_type": {
-      "description": "Tool type classifier. Defaults to `Command` for normal CLI tools.\nSet to `Livelog` for long-running log-streaming tools that pipe output through an LLM.\nTool types implemented in separate GPL-licensed crates (e.g. `decompose`, `worker`)\nare deserialized as `Extension` and their configurations stored in the matching\nopaque JSON fields below.",
+      "description": "Tool type classifier. Defaults to `Command` for normal CLI tools.\nSet to `Livelog` for long-running log-streaming tools that pipe output through an LLM.\nTool types implemented in separate AGPL-licensed crates (e.g. `decompose`, `worker`)\nare deserialized as `Extension` and their configurations stored in the matching\nopaque JSON fields below.",
       "anyOf": [
         {
           "$ref": "#/$defs/ToolType"
@@ -567,7 +567,7 @@
       "additionalProperties": false
     },
     "ToolType": {
-      "description": "Classifier that determines how the MCP service routes a tool invocation.\n\nThe permissive `ahma_mcp` library handles `Command` and `Livelog` natively.\nTool types implemented in the GPL-licensed sibling crates (`ahma_decompose`,\n`ahma_worker`, etc.) are serialised to their JSON names (e.g. `\"decompose\"`,\n`\"worker\"`) and round-trip correctly — they are just stored as `Extension`\nin this enum so the MIT library has no compile-time dependency on GPL code.\n`ahma_bin` routes those calls to the appropriate GPL crate at runtime.",
+"description": "Classifier that determines how the MCP service routes a tool invocation.\n\nThe permissive `ahma_mcp` library handles `Command` and `Livelog` natively.\nTool types implemented in the AGPL-licensed sibling crates (`ahma_decompose`,\n`ahma_worker`, etc.) are serialised to their JSON names (e.g. `\"decompose\"`,\n`\"worker\"`) and round-trip correctly \u2014 they are just stored as `Extension`\nin this enum so the MIT library has no compile-time dependency on AGPL code.\n`ahma_bin` routes those calls to the appropriate AGPL crate at runtime."
       "oneOf": [
         {
           "description": "Normal command-line tool (default).",
@@ -580,7 +580,7 @@
           "const": "livelog"
         },
         {
-          "description": "Any tool type implemented outside this crate (e.g. `decompose`, `worker`).\nThe raw `tool_type` string is preserved for routing by the GPL binary crates.",
+          "description": "Any tool type implemented outside this crate (e.g. `decompose`, `worker`).\nThe raw `tool_type` string is preserved for routing by the AGPL binary crates.",
           "type": "string",
           "const": "extension"
         }

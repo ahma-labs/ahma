@@ -10,10 +10,11 @@
 
 mod common;
 
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use common::server::{ServerGuard, resolve_binary_path};
 use reqwest::Client;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tempfile::tempdir;
 
 /// Spawn a bridge server with rate limiting enabled.
@@ -44,7 +45,7 @@ fn spawn_rate_limited_server() -> Result<ServerGuard, String> {
     let port = {
         use std::io::BufRead;
         let reader = std::io::BufReader::new(stderr);
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + TestTimeouts::get(TimeoutCategory::ProcessSpawn);
         let mut found_port = None;
         for line in reader.lines().map_while(Result::ok) {
             if line.contains("AHMA_BOUND_PORT=") {
@@ -65,7 +66,7 @@ fn spawn_rate_limited_server() -> Result<ServerGuard, String> {
 
     // Wait for server to be ready.
     let base_url = format!("http://127.0.0.1:{port}");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + TestTimeouts::get(TimeoutCategory::HealthCheck);
     loop {
         if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
             break;
@@ -74,7 +75,7 @@ fn spawn_rate_limited_server() -> Result<ServerGuard, String> {
             let _ = child.kill();
             return Err(format!("Server on port {port} never became reachable"));
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(TestTimeouts::poll_interval());
     }
     let _ = base_url; // consumed above
 
@@ -100,7 +101,7 @@ async fn health_endpoint_is_never_rate_limited() {
     for i in 0..5 {
         let resp = client
             .get(&health_url)
-            .timeout(Duration::from_secs(5))
+            .timeout(TestTimeouts::scale_secs(5))
             .send()
             .await
             .unwrap_or_else(|e| panic!("Request {i} to /health failed: {e}"));
@@ -129,7 +130,7 @@ async fn mcp_endpoint_returns_429_after_burst_exhausted() {
 
     let client = reqwest::Client::builder()
         .http2_prior_knowledge()
-        .timeout(Duration::from_secs(5))
+        .timeout(TestTimeouts::scale_secs(5))
         .build()
         .expect("Failed to build HTTP/2 client");
     let mcp_url = format!("{}/mcp", guard.base_url());

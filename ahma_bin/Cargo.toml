@@ -1,16 +1,16 @@
 [package]
 authors.workspace = true
 edition.workspace = true
-license = "GPL-3.0-or-later"
+license = "AGPL-3.0-or-later"
 name = "ahma_bin"
 readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
-description = "The ahma binary: wires the MIT ahma_mcp library with the GPL-licensed feature crates (vault, decompose, worker, cluster, renewal, tui)."
+description = "The ahma binary: wires the MIT ahma_mcp library with the AGPL-licensed feature crates (vault, decompose, worker, cluster, renewal, tui)."
 
-# Note: because ahma_bin links ahma_cluster (AGPL-3.0-or-later), the compiled
-# ahma binary is effectively AGPL-3.0-or-later for redistribution and network-
-# service purposes. See README for details.
+# All first-party copyleft crates (ahma_vault, ahma_decompose, ahma_worker,
+# ahma_renewal, ahma_tui, ahma_cluster) are AGPL-3.0-or-later. The compiled
+# ahma binary is therefore AGPL-3.0-or-later. See README for details.
 
 [[bin]]
 name = "ahma"

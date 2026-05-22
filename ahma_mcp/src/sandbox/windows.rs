@@ -1,4 +1,4 @@
-//! # Windows Sandbox Backend — Job Object + AppContainer
+//! # Windows Sandbox Backend — Job Object + AppContainer prerequisites
 //!
 //! This module provides Windows-specific sandbox enforcement.
 //!
@@ -8,26 +8,12 @@
 //! server process at startup.  This ensures all child processes are terminated
 //! when the server exits, preventing orphaned tool processes.
 //!
-//! ## Implemented: AppContainer per-command sandbox (`create_windows_sandboxed_command`)
+//! ## AppContainer status
 //!
-//! Each child process is launched inside an anonymous AppContainer, isolating its
-//! file-system write access to the workspace scope.
-//!
-//! Required Win32 call sequence per command launch:
-//!
-//! ```text
-//! 1. CreateAppContainerProfile(name, ...) → appContainerSid (PSID)
-//! 2. Build SECURITY_CAPABILITIES { appContainerSid, caps=[], capCount=0 }
-//! 3. InitializeProcThreadAttributeList(attrList, count=1)
-//! 4. UpdateProcThreadAttribute(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &secCap)
-//! 5. STARTUPINFOEXW { .StartupInfo = ..., .lpAttributeList = attrList }
-//! 6. Grant scope DACL: SetNamedSecurityInfoW (FILE_ALL_ACCESS for container SID)
-//! 7. CreateProcessW(..., CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, ...)
-//! 8. ResumeThread(process)
-//! 9. WaitForSingleObject + GetExitCodeProcess
-//! 10. Cleanup: CloseHandle × 2, FreeSid, DeleteProcThreadAttributeList,
-//!     DeleteAppContainerProfile (on shutdown / new session)
-//! ```
+//! The module probes AppContainer availability so Windows strict mode can fail
+//! closed on unsupported systems. Per-command AppContainer spawn isolation is
+//! not active yet; child processes currently rely on Job Object process-tree
+//! containment plus the existing command/path validation layers.
 
 use super::error::SandboxError;
 use std::path::{Path, PathBuf};
@@ -181,7 +167,7 @@ pub fn enforce_windows_sandbox(_roots: &[PathBuf]) -> Result<(), SandboxError> {
 /// CreateAppContainerProfile implementation.
 ///
 /// We call it with a deliberately invalid name (empty string) — the expected
-/// result is `E_INVALIDARG` (0x80070057).  Any other Win32 error also
+/// result is `E_INVALIDARG` (0x80070057). Any other Windows error also
 /// confirms the API is present.  `ERROR_PROC_NOT_FOUND` would mean the DLL
 /// entry point is missing (very old OS).
 #[cfg(target_os = "windows")]
@@ -226,7 +212,7 @@ fn probe_appcontainer_api() -> Result<(), SandboxError> {
     }
 }
 
-/// Heuristic: `HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND)` == 0x8007007F
+/// Heuristic: the HRESULT for `ERROR_PROC_NOT_FOUND` is 0x8007007F, which
 /// indicates the entry point is absent, i.e., the OS is older than Windows 8.
 #[cfg(target_os = "windows")]
 fn sid_looks_like_proc_not_found(hr: i32) -> bool {
@@ -250,7 +236,7 @@ fn appcontainer_name_for_scope(scope: &Path) -> Vec<u16> {
     name.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// A NUL-terminated UTF-16 wide string (retained for future Win32 FFI use).
+/// A NUL-terminated UTF-16 wide string (retained for future Windows FFI use).
 #[cfg(target_os = "windows")]
 #[allow(dead_code)]
 fn to_wide(s: &str) -> Vec<u16> {
@@ -259,17 +245,9 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 /// Launch `program` with `args` inside an AppContainer restricted to `scope`.
 ///
-/// AppContainer spawn isolation via `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
-/// requires direct `CreateProcessW` Win32 calls because
-/// `std::os::windows::process::CommandExt::raw_attribute` is an unstable
-/// nightly-only API (tracking issue rust-lang/rust#114854, not yet stabilised).
-/// Until that API is stable (or a direct Win32 implementation is added — see the
-/// call sequence in the module-level doc comment), processes run under Job Object
-/// enforcement only, which provides kill-on-close protection for the child tree.
-///
-/// The full direct-Win32 implementation plan is documented at the top of this
-/// module (`InitializeProcThreadAttributeList` → `UpdateProcThreadAttribute` →
-/// `STARTUPINFOEXW` → `CreateProcessW`).
+/// AppContainer spawn isolation is pending a direct Windows process-creation
+/// implementation. Until then, processes run under Job Object enforcement only,
+/// which provides kill-on-close protection for the child tree.
 #[cfg(target_os = "windows")]
 fn create_appcontainer_command(
     program: &str,
@@ -285,9 +263,8 @@ fn create_appcontainer_command(
     static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     WARNED.get_or_init(|| {
         tracing::warn!(
-            "AppContainer spawn isolation is not active on stable Rust \
-             (std::process::Command::raw_attribute requires nightly, \
-             rust-lang/rust#114854). Processes run under Job Object enforcement only."
+            "AppContainer spawn isolation is not active yet. \
+             Processes run under Job Object enforcement only."
         );
     });
 

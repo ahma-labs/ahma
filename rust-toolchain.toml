@@ -1,0 +1,6 @@
+# Pin the Rust toolchain for exact local and CI reproducibility.
+# Must match rust-version in Cargo.toml [workspace.package].
+# Components are the minimum set needed for development and CI.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

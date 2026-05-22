@@ -116,14 +116,12 @@ impl BoundedLineCollector {
             ));
         }
 
-        output.push_str(
-            &self
-                .lines
-                .iter()
-                .map(std::string::String::as_str)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        for (i, line) in self.lines.iter().enumerate() {
+            if i > 0 {
+                output.push('\n');
+            }
+            output.push_str(line);
+        }
 
         output
     }
@@ -453,7 +451,7 @@ impl Adapter {
         let safe_wd = self
             .sandbox
             .validate_path(std::path::Path::new(working_dir))?;
-        let safe_wd_str = safe_wd.to_string_lossy().to_string();
+        let safe_wd_str = safe_wd.to_string_lossy().into_owned();
 
         // Validate command arguments
         let (program_with_subcommand, args_vec) = self
@@ -982,7 +980,7 @@ async fn execute_with_streaming(
         Ok(status) => status.code().unwrap_or(-1),
         Err(_) => -1,
     };
-    let success = exit_status.as_ref().map(|s| s.success()).unwrap_or(false);
+    let success = exit_status.as_ref().is_ok_and(|s| s.success());
 
     let stdout_str = collected_stdout.rendered_output();
     let stderr_str = collected_stderr.rendered_output();

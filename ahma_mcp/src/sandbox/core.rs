@@ -252,7 +252,7 @@ impl Sandbox {
     fn resolve_test_path(&self, path: &Path) -> Result<PathBuf> {
         // Use dunce::canonicalize to avoid the \\?\ extended-length prefix that
         // std::fs::canonicalize adds on Windows; that prefix is accepted by most
-        // Win32 APIs but rejected by CreateProcess as a working directory
+        // Windows APIs but rejected by CreateProcess as a working directory
         // (OS error 267 "The directory name is invalid").
         dunce::canonicalize(path).or_else(|_| Ok(path.to_path_buf()))
     }

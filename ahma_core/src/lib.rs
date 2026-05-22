@@ -20,7 +20,7 @@
 //! | [`AhmaMcpService`] | `ahma_mcp` | Full MCP server service |
 //! | [`LlmClient`] | `ahma_llm_monitor` | OpenAI-compatible LLM client |
 //!
-//! ## GPL-licensed sibling crates
+//! ## AGPL-licensed sibling crates
 //!
 //! The following primitives were extracted into separate copyleft crates to
 //! allow this library to remain MIT OR Apache-2.0.  Embedders who need them
@@ -29,14 +29,14 @@
 //!
 //! | Crate | License | Primitives |
 //! |-------|---------|-----------|
-//! | `ahma_vault` | GPL-3.0-or-later | `TaskVault`, `AuditWriter`, `TrashManager` |
-//! | `ahma_decompose` | GPL-3.0-or-later | `DecomposeOrchestrator`, `ReduceMode`, `Reducer` |
-//! | `ahma_worker` | GPL-3.0-or-later | `WorkerRunner`, `WorkerConfig`, `WorkerLanguage` |
-//! | `ahma_renewal` | GPL-3.0-or-later | `RenewalWatcher`, `RenewalConfig` |
-//! | `ahma_tui` | GPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
+//! | `ahma_vault` | AGPL-3.0-or-later | `TaskVault`, `AuditWriter`, `TrashManager` |
+//! | `ahma_decompose` | AGPL-3.0-or-later | `DecomposeOrchestrator`, `ReduceMode`, `Reducer` |
+//! | `ahma_worker` | AGPL-3.0-or-later | `WorkerRunner`, `WorkerConfig`, `WorkerLanguage` |
+//! | `ahma_renewal` | AGPL-3.0-or-later | `RenewalWatcher`, `RenewalConfig` |
+//! | `ahma_tui` | AGPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
 //! | `ahma_cluster` | **AGPL-3.0-or-later** | `ClusterScheduler`, `WorkerRegistry`, `TaskManifest` |
 //!
-//! Linking `ahma_cluster` (AGPL) into a binary means any modified version
+//! Linking any of these AGPL crates into a binary means any modified version
 //! offered to remote users over a network must provide source access per
 //! AGPL-3.0 §13.
 //!
