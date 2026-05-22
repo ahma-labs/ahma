@@ -160,14 +160,14 @@ mod tests {
     /// The leaf certificate PEM must be parseable as a single DER certificate.
     #[test]
     fn test_leaf_cert_parseable_as_der() {
-        use std::io::BufReader;
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
         let dir = tempdir().unwrap();
         generate_self_signed_cluster_certs(dir.path()).unwrap();
         let cfg = load_from_dir(dir.path()).unwrap();
-        let mut reader = BufReader::new(cfg.cert_pem.as_bytes());
-        let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("leaf cert PEM should be valid DER");
+        let certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(cfg.cert_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .expect("leaf cert PEM should be valid DER");
         assert_eq!(
             certs.len(),
             1,
@@ -190,12 +190,11 @@ mod tests {
     /// `key.pem` must contain a parseable private key.
     #[test]
     fn test_private_key_parseable() {
-        use std::io::BufReader;
+        use rustls::pki_types::{PrivateKeyDer, pem::PemObject};
         let dir = tempdir().unwrap();
         generate_self_signed_cluster_certs(dir.path()).unwrap();
         let cfg = load_from_dir(dir.path()).unwrap();
-        let mut reader = BufReader::new(cfg.key_pem.as_bytes());
-        let key = rustls_pemfile::private_key(&mut reader).unwrap();
-        assert!(key.is_some(), "key.pem must contain a private key");
+        PrivateKeyDer::from_pem_slice(cfg.key_pem.as_bytes())
+            .expect("key.pem must contain a parseable private key");
     }
 }

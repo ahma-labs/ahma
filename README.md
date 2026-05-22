@@ -42,21 +42,25 @@ ahma update main         # build from branch
 
 Use this if you need to test an unreleased branch before the next binary release.
 
+The workspace uses `reqwest` with the `http3` feature, so source builds require `RUSTFLAGS='--cfg reqwest_unstable'`. The `ahma update <branch>` command sets this automatically; the snippets below are only needed if you are installing for the first time without an existing `ahma` binary.
+
 **Linux / macOS**
 
 ```bash
 # First time (no ahma yet)
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root ~/.local --locked --force
+RUSTFLAGS='--cfg reqwest_unstable' \
+  cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_bin --bin ahma --root ~/.local --locked --force
 export PATH="$HOME/.local/bin:$PATH"
 
-# After ahma is installed
+# After ahma is installed — the subcommand handles RUSTFLAGS automatically
 ahma update feature/update
 ```
 
 **Windows (PowerShell 5.1+)**
 
 ```powershell
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root $HOME\.local --locked --force
+$env:RUSTFLAGS='--cfg reqwest_unstable'
+cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_bin --bin ahma --root $HOME\.local --locked --force
 ```
 
 </details>

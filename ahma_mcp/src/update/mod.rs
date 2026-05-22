@@ -28,7 +28,7 @@ use source::install_from_git_ref;
         With a semver ref (e.g. 0.6.7 or v0.6.7): install that release tag.\n\
         With a branch ref (e.g. main or feature/update): build from GitHub source via cargo install.\n\n\
         For an unpushed local checkout, use:\n\
-          cargo install --path ahma_mcp --bin ahma --root ~/.local --locked --force",
+          RUSTFLAGS='--cfg reqwest_unstable' cargo install --path ahma_bin --bin ahma --root ~/.local --locked --force",
     after_help = "EXAMPLES:
   # Install latest published release
   ahma update
