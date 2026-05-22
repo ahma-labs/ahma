@@ -48,7 +48,11 @@ pub fn required_rustflags() -> String {
 }
 
 /// Install from a Git branch using Cargo.
-pub async fn install_from_git_ref(branch: &str, install_dir: &Path, dry_run: bool) -> Result<()> {
+pub async fn install_from_git_ref(
+    branch: &str,
+    install_dir: &Path,
+    dry_run: bool,
+) -> Result<PathBuf> {
     let args = build_cargo_install_command(branch, install_dir);
     let display = args.join(" ");
 
@@ -56,7 +60,11 @@ pub async fn install_from_git_ref(branch: &str, install_dir: &Path, dry_run: boo
 
     if dry_run {
         println!("[dry-run] Would run: RUSTFLAGS='{rustflags}' {display}");
-        return Ok(());
+        return Ok(install_dir.join(if cfg!(target_os = "windows") {
+            "ahma.exe"
+        } else {
+            "ahma"
+        }));
     }
 
     if which_cargo().is_none() {
@@ -96,7 +104,7 @@ pub async fn install_from_git_ref(branch: &str, install_dir: &Path, dry_run: boo
     }
 
     println!("Installed {}", binary.display());
-    Ok(())
+    Ok(binary)
 }
 
 fn which_cargo() -> Option<PathBuf> {
