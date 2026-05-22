@@ -20,6 +20,7 @@ permissions:
 # want to delete caches, perhaps different types at different times:
 #   gh cache delete --all
 #   gh cache delete cargo-
+#   gh cache delete sccache-
 #   gh cache delete gradle-
 #
 # Avoid pull requests- they cause needless double builds. Instead rebase from 'main'
@@ -49,7 +50,6 @@ env:
   IS_DEV_BUILD: "true" # Set "true" to speed up builds for CI testing
   RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
-  SCCACHE_CACHE_SIZE: 1G # Limit sccache size to prevent GitHub Actions cache eviction
 jobs:
   job-cargo-nextest:
     name: Cargo Nextest (${{ matrix.os }})
@@ -132,8 +132,19 @@ jobs:
 
       - name: Configure sccache cache keys
         run: |
-          echo "SCCACHE_GHA_CACHE_TO=sccache-${{ runner.os }}-${{ runner.arch }}-test-day${{ steps.day-number.outputs.day }}" >> "$GITHUB_ENV"
-          echo "SCCACHE_GHA_CACHE_FROM=sccache-${{ runner.os }}-${{ runner.arch }}-test-day${{ steps.day-number.outputs.day }},sccache-${{ runner.os }}-${{ runner.arch }}-test-day,sccache-${{ runner.os }}-${{ runner.arch }}-android-day" >> "$GITHUB_ENV"
+          CACHE_TO="sccache-${{ runner.os }}-${{ runner.arch }}-test-day${{ steps.day-number.outputs.day }}"
+          # Base fallback chain: today's exact key, then any-day prefix for this job
+          CACHE_FROM="${CACHE_TO},sccache-${{ runner.os }}-${{ runner.arch }}-test-day"
+          # Add cross-job fallback only where the source job actually runs on this runner
+          if [[ "${{ runner.os }}" == "macOS" && "${{ runner.arch }}" == "ARM64" ]]; then
+            # android-nextest runs on macos-latest (ARM64) — its sccache is reusable here
+            CACHE_FROM="${CACHE_FROM},sccache-macOS-ARM64-android-day"
+          elif [[ "${{ runner.os }}" == "Linux" && "${{ runner.arch }}" == "X64" ]]; then
+            # coverage runs on ubuntu-latest (Linux X64) — its sccache is reusable here
+            CACHE_FROM="${CACHE_FROM},sccache-Linux-X64-coverage-day"
+          fi
+          echo "SCCACHE_GHA_CACHE_TO=${CACHE_TO}" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_CACHE_FROM=${CACHE_FROM}" >> "$GITHUB_ENV"
 
       - name: sccache-action
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -151,7 +162,7 @@ jobs:
         run: cargo build --locked --no-default-features -p ahma_bin
 
       - name: Cargo Nextest (excluding Android/Kotlin tests)
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: |
           echo "--- cargo --version" && cargo --version
           echo "--- cargo nextest --version" && cargo nextest --version
@@ -572,8 +583,12 @@ jobs:
       - name: Configure sccache cache keys
         if: "!matrix.use_cross"
         run: |
-          echo "SCCACHE_GHA_CACHE_TO=sccache-${{ matrix.platform }}-release-day${{ steps.day-number.outputs.day }}" >> "$GITHUB_ENV"
-          echo "SCCACHE_GHA_CACHE_FROM=sccache-${{ matrix.platform }}-release-day${{ steps.day-number.outputs.day }},sccache-${{ matrix.platform }}-release-day" >> "$GITHUB_ENV"
+          CACHE_TO="sccache-${{ matrix.platform }}-release-day${{ steps.day-number.outputs.day }}"
+          # Fall back to prior release days first, then reuse nextest-compiled artifacts
+          # from the same runner OS/arch (saves recompiling unchanged deps)
+          CACHE_FROM="${CACHE_TO},sccache-${{ matrix.platform }}-release-day,sccache-${{ runner.os }}-${{ runner.arch }}-test-day"
+          echo "SCCACHE_GHA_CACHE_TO=${CACHE_TO}" >> "$GITHUB_ENV"
+          echo "SCCACHE_GHA_CACHE_FROM=${CACHE_FROM}" >> "$GITHUB_ENV"
 
       - name: sccache-action
         if: "!matrix.use_cross"
