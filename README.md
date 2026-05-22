@@ -293,7 +293,6 @@ Workspace-level rules in `AGENTS.md` reach Claude as operator-trusted content (h
 Ahma uses a mixed-license model in a single workspace:
 
 - The library crates (`ahma_mcp`, `ahma_core`, `ahma_common`, `ahma_http_bridge`, `ahma_http_mcp_client`, `ahma_llm_monitor`, `ahma_py`, `generate_tool_schema`) are dual-licensed under **MIT OR Apache-2.0**.
-- The end-user product surface — `ahma_bin` (which produces the `ahma` binary), `ahma_vault`, `ahma_decompose`, `ahma_worker`, `ahma_renewal`, `ahma_tui` — is licensed under **GPL-3.0-or-later** to discourage commercial expropriation.
-- The network-facing peer scheduler `ahma_cluster` is licensed under **AGPL-3.0-or-later** to also cover hosted-service deployments (AGPL §13 requires source disclosure to remote users of modified versions).
+- The end-user product surface — `ahma_bin` (which produces the `ahma` binary), `ahma_vault`, `ahma_decompose`, `ahma_worker`, `ahma_renewal`, `ahma_tui`, and the network-facing peer scheduler `ahma_cluster` — is licensed under **AGPL-3.0-or-later** to discourage commercial expropriation and to ensure that modified versions offered over a network must publish their source.
 
-Because the shipped `ahma` binary statically links `ahma_cluster`, the combined executable is effectively AGPL-3.0-or-later for redistribution and network-service purposes. Each crate's `Cargo.toml` is the authoritative license declaration. Refer to it before redistributing.
+The shipped `ahma` binary is AGPL-3.0-or-later. Each crate's `Cargo.toml` is the authoritative license declaration. Refer to it before redistributing.

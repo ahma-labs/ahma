@@ -104,7 +104,7 @@ pub struct ToolConfig {
     pub monitor_stream: Option<String>,
     /// Tool type classifier. Defaults to `Command` for normal CLI tools.
     /// Set to `Livelog` for long-running log-streaming tools that pipe output through an LLM.
-    /// Tool types implemented in separate GPL-licensed crates (e.g. `decompose`, `worker`)
+    /// Tool types implemented in separate AGPL-licensed crates (e.g. `decompose`, `worker`)
     /// are deserialized as `Extension` and their configurations stored in the matching
     /// opaque JSON fields below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,11 +125,11 @@ pub struct ToolConfig {
 /// Classifier that determines how the MCP service routes a tool invocation.
 ///
 /// The permissive `ahma_mcp` library handles `Command` and `Livelog` natively.
-/// Tool types implemented in the GPL-licensed sibling crates (`ahma_decompose`,
+/// Tool types implemented in the AGPL-licensed sibling crates (`ahma_decompose`,
 /// `ahma_worker`, etc.) are serialised to their JSON names (e.g. `"decompose"`,
 /// `"worker"`) and round-trip correctly — they are just stored as `Extension`
-/// in this enum so the MIT library has no compile-time dependency on GPL code.
-/// `ahma_bin` routes those calls to the appropriate GPL crate at runtime.
+/// in this enum so the MIT library has no compile-time dependency on AGPL code.
+/// `ahma_bin` routes those calls to the appropriate AGPL crate at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolType {
@@ -139,7 +139,7 @@ pub enum ToolType {
     /// Long-running log source piped through an LLM for issue detection.
     Livelog,
     /// Any tool type implemented outside this crate (e.g. `decompose`, `worker`).
-    /// The raw `tool_type` string is preserved for routing by the GPL binary crates.
+    /// The raw `tool_type` string is preserved for routing by the AGPL binary crates.
     #[serde(other)]
     Extension,
 }

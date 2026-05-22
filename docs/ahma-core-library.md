@@ -23,21 +23,21 @@ ahma_core = { git = "https://github.com/paulirotta/ahma.git" }
 | `Adapter` | CLI tool execution adapter |
 | `LlmClient` | OpenAI-compatible LLM client |
 
-## GPL-licensed sibling crates
+## AGPL-licensed sibling crates
 
 The following primitives are available in separate copyleft crates.  Add them
 to your `Cargo.toml` only if you accept the applicable license terms.
 
 | Crate | License | Key types |
-|-------|---------|-----------|
-| `ahma_vault` | GPL-3.0-or-later | `TaskVault`, `AuditWriter`, `TrashManager` |
-| `ahma_decompose` | GPL-3.0-or-later | `DecomposeOrchestrator`, `DecomposeConfig`, `Reducer`, `ReduceMode` |
-| `ahma_worker` | GPL-3.0-or-later | `WorkerRunner`, `WorkerConfig`, `WorkerLanguage` |
-| `ahma_renewal` | GPL-3.0-or-later | `RenewalWatcher`, `RenewalConfig`, `RenewalHaltEvent` |
-| `ahma_tui` | GPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
+|-------|---------|----------|
+| `ahma_vault` | AGPL-3.0-or-later | `TaskVault`, `AuditWriter`, `TrashManager` |
+| `ahma_decompose` | AGPL-3.0-or-later | `DecomposeOrchestrator`, `DecomposeConfig`, `Reducer`, `ReduceMode` |
+| `ahma_worker` | AGPL-3.0-or-later | `WorkerRunner`, `WorkerConfig`, `WorkerLanguage` |
+| `ahma_renewal` | AGPL-3.0-or-later | `RenewalWatcher`, `RenewalConfig`, `RenewalHaltEvent` |
+| `ahma_tui` | AGPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
 | `ahma_cluster` | **AGPL-3.0-or-later** | `ClusterScheduler`, `WorkerRegistry`, `TaskManifest`, `PeerInfo` |
 
-Embedding `ahma_cluster` means any modified version offered to remote users
+Embedding any of these AGPL crates means any modified version offered to remote users
 over a network must publish its modified source code (AGPL-3.0 §13).
 
 ## Minimal example: sandbox + monitor
@@ -58,9 +58,9 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-## Example: vault + audit (requires ahma_vault, GPL-3.0-or-later)
+## Example: vault + audit (requires ahma_vault, AGPL-3.0-or-later)
 
-Add `ahma_vault = { git = "..." }` to your `Cargo.toml` (GPL terms apply):
+Add `ahma_vault = { git = "..." }` to your `Cargo.toml` (AGPL terms apply):
 
 ```rust
 use ahma_vault::{TaskVault, audit::AuditWriter};

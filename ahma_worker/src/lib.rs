@@ -6,7 +6,7 @@
 //!
 //! ## License
 //!
-//! This crate is licensed under **GPL-3.0-or-later**.
+//! This crate is licensed under **AGPL-3.0-or-later**.
 
 pub mod config;
 pub mod runner;

@@ -7,8 +7,8 @@ PublisherUrl: https://github.com/paulirotta
 PublisherSupportUrl: https://github.com/paulirotta/ahma/issues
 PackageName: Ahma
 PackageUrl: https://github.com/paulirotta/ahma
-License: MIT OR Apache-2.0
-LicenseUrl: https://github.com/paulirotta/ahma/blob/main/MIT_LICENSE.txt
+License: AGPL-3.0-or-later
+LicenseUrl: https://github.com/paulirotta/ahma/blob/main/AGPL_LICENSE.txt
 ShortDescription: >-
   Universal MCP server — turn any CLI tool into an AI agent tool
   with one JSON file, with kernel-enforced sandboxing.
