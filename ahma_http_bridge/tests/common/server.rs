@@ -487,12 +487,25 @@ pub async fn spawn_server_guard_with_config(
     sandbox_scope: &Path,
     handshake_timeout_secs: Option<u64>,
 ) -> Result<ServerGuard, String> {
+    spawn_server_guard_with_config_extra_env(tools_dir, sandbox_scope, handshake_timeout_secs, &[])
+        .await
+}
+
+/// Like [`spawn_server_guard_with_config`] but also injects additional env vars
+/// into the server process (useful for test diagnostics like `AHMA_PCT_MARKER`).
+pub async fn spawn_server_guard_with_config_extra_env(
+    tools_dir: &Path,
+    sandbox_scope: &Path,
+    handshake_timeout_secs: Option<u64>,
+    extra_env: &[(String, String)],
+) -> Result<ServerGuard, String> {
     let binary = resolve_binary_path().map_err(|e| {
         eprintln!("WARNING  {e}");
         e
     })?;
     let workspace = workspace_dir();
-    let spec = build_server_spec(tools_dir, sandbox_scope, handshake_timeout_secs);
+    let mut spec = build_server_spec(tools_dir, sandbox_scope, handshake_timeout_secs);
+    spec.env.extend_from_slice(extra_env);
 
     eprintln!(
         "[TestServer] Starting custom server with scope {}",

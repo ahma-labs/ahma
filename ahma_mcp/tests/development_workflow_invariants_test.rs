@@ -399,8 +399,8 @@ mod skill_version_invariants {
 
         // install.ps1: Install-OneSkill -Name 'ahma' -Version 'X.Y.Z'
         let install_ps1_path = get_workspace_path("scripts/install.ps1");
-        let install_ps1 = std::fs::read_to_string(&install_ps1_path)
-            .expect("Failed to read scripts/install.ps1");
+        let install_ps1 =
+            std::fs::read_to_string(&install_ps1_path).expect("Failed to read scripts/install.ps1");
         let install_ps1_ver = install_ps1
             .lines()
             .find(|l| l.contains("Install-OneSkill") && l.contains("-Version '"))

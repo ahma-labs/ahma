@@ -94,6 +94,16 @@ pub struct AhmaMcpService {
     pub progressive_disclosure: bool,
     /// Set of bundle names whose tools have been disclosed to the client.
     pub disclosed_bundles: Arc<RwLock<HashSet<String>>>,
+    /// Optional snapshot of the AppConfig used to construct this service.
+    /// Stored so that runtime events (e.g. `roots/list` arrival) can rediscover
+    /// a per-client `.ahma/` directory and reload tool configs against it
+    /// without having to thread the AppConfig through every callsite.
+    /// `None` for tests that don't need per-client tool discovery.
+    pub app_config: Arc<RwLock<Option<Arc<crate::shell::cli::AppConfig>>>>,
+    /// Path of the tools directory whose configs are currently loaded.
+    /// Used by `configure_sandbox_from_roots` to detect when the per-client
+    /// `.ahma/` differs from the currently-loaded one and reload is needed.
+    pub current_tools_dir: Arc<RwLock<Option<std::path::PathBuf>>>,
 }
 
 impl AhmaMcpService {
@@ -136,7 +146,18 @@ impl AhmaMcpService {
             monitor_rate_limit_seconds: crate::log_monitor::DEFAULT_RATE_LIMIT_SECONDS,
             progressive_disclosure,
             disclosed_bundles: Arc::new(RwLock::new(HashSet::new())),
+            app_config: Arc::new(RwLock::new(None)),
+            current_tools_dir: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Store the AppConfig that constructed this service so runtime events
+    /// (such as `roots/list` arrival) can rediscover per-client `.ahma/` dirs.
+    pub fn set_app_config(&self, config: Arc<crate::shell::cli::AppConfig>) {
+        if let Some(dir) = config.tools_dir.clone() {
+            *self.current_tools_dir.write().unwrap() = Some(dir);
+        }
+        *self.app_config.write().unwrap() = Some(config);
     }
 
     /// Pre-discloses the given bundle names so their tools appear in the first

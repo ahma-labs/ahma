@@ -202,6 +202,7 @@ impl<'a> ServiceBuilder<'a> {
         .await?;
 
         service.monitor_rate_limit_seconds = self.monitor_rate_limit;
+        service.set_app_config(std::sync::Arc::new(config.clone()));
 
         // Apply the reveal profile:
         //   Minimal  — no pre-disclosure; LLM must call `activate_tools reveal` explicitly.

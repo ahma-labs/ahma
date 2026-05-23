@@ -21,8 +21,8 @@ pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use sandbox_env::{SANDBOX_BYPASS_ENV_VARS, SandboxTestEnv};
 #[allow(unused_imports)]
 pub use server::{
-    ServerGuard, TestServerInstance, spawn_server_guard_with_config, spawn_test_server,
-    spawn_test_server_with_timeout,
+    ServerGuard, TestServerInstance, spawn_server_guard_with_config,
+    spawn_server_guard_with_config_extra_env, spawn_test_server, spawn_test_server_with_timeout,
 };
 #[allow(unused_imports)]
 pub use uri::{

@@ -298,6 +298,10 @@ impl AhmaMcpService {
             roots.len()
         );
 
+        // Remember the first client root so we can look for `<root>/.ahma`
+        // AFTER the scopes vec is moved into `apply_and_enforce_scopes`.
+        let client_root: Option<PathBuf> = new_scopes.first().cloned();
+
         if !new_scopes.is_empty() {
             tracing::debug!(
                 "Attempting to update sandbox scopes with {} paths",
@@ -316,6 +320,75 @@ impl AhmaMcpService {
         } else {
             tracing::warn!("No scopes available from roots or pre-configuration");
             return;
+        }
+
+        // Per-client tool discovery: if the first scope (preferring the client
+        // root if it was just supplied, else the pre-configured first scope)
+        // contains a `.ahma/` directory, load tool configs from it so each
+        // VS Code window gets the tool set defined by its own workspace. This
+        // complements the bridge-CWD `.ahma/` that may have been loaded at
+        // startup.
+        let discovery_root = client_root.or_else(|| {
+            self.adapter
+                .sandbox()
+                .scopes()
+                .first()
+                .map(|p| p.to_path_buf())
+        });
+        if let Some(root) = discovery_root {
+            let candidate = root.join(".ahma");
+            let is_dir = tokio::fs::metadata(&candidate)
+                .await
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if is_dir {
+                let already_loaded = self
+                    .current_tools_dir
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .map(|p| p == &candidate)
+                    .unwrap_or(false);
+
+                if already_loaded {
+                    tracing::debug!(
+                        "Per-client tools dir already loaded: {}",
+                        candidate.display()
+                    );
+                } else {
+                    let app_config_opt = self.app_config.read().unwrap().clone();
+                    if let Some(app_config) = app_config_opt {
+                        tracing::info!(
+                            "Discovered per-client tools directory: {}",
+                            candidate.display()
+                        );
+                        match load_tool_configs(&app_config, Some(&candidate)).await {
+                            Ok(new_configs) => {
+                                let count = new_configs.len();
+                                self.update_tools(new_configs).await;
+                                *self.current_tools_dir.write().unwrap() = Some(candidate.clone());
+                                tracing::info!(
+                                    "Loaded {} tool configs from per-client {}",
+                                    count,
+                                    candidate.display()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to load per-client tool configs from {}: {}",
+                                    candidate.display(),
+                                    e
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            "Per-client tools dir {} found but AppConfig unavailable; skipping reload",
+                            candidate.display()
+                        );
+                    }
+                }
+            }
         }
 
         // Notify bridge that sandbox has been configured so it can safely
