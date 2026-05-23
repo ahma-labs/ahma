@@ -181,8 +181,8 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     // Verify only built-in tools are present
     assert_eq!(
         tools.len(),
-        4,
-        "Should have exactly 4 built-in tools when no .ahma exists. Got: {:?}",
+        7,
+        "Should have exactly 7 built-in tools when no .ahma exists. Got: {:?}",
         tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 
@@ -201,6 +201,18 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     assert!(
         tools.iter().any(|t| t.name == "activate_tools"),
         "Built-in 'activate_tools' tool should be present"
+    );
+    assert!(
+        tools.iter().any(|t| t.name == "logs_list"),
+        "Built-in 'logs_list' tool should be present"
+    );
+    assert!(
+        tools.iter().any(|t| t.name == "logs_read"),
+        "Built-in 'logs_read' tool should be present"
+    );
+    assert!(
+        tools.iter().any(|t| t.name == "logs_search"),
+        "Built-in 'logs_search' tool should be present"
     );
 
     Ok(())

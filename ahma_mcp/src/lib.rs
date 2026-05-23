@@ -108,6 +108,8 @@ pub mod client_type;
 pub mod config;
 /// Constants used for guidance and tool hints.
 pub mod constants;
+/// External terminal hook management for supported AI tools.
+pub mod hooks;
 /// Live log monitoring pipeline (LLM-powered issue detection).
 pub mod livelog;
 /// Live log monitoring for streaming processes.

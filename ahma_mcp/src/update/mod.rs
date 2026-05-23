@@ -8,7 +8,10 @@ mod source;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use std::path::PathBuf;
+use std::{
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+};
 
 pub use install::{cargo_install_root, default_install_dir};
 pub use ref_mode::{UpdateMode, classify_ref};
@@ -43,6 +46,9 @@ use source::install_from_git_ref;
   # Custom install location
   ahma update --install-dir ~/.local/bin
 
+    # Also install user-scoped terminal hooks
+    ahma update --install-hooks
+
   # Preview actions without writing
   ahma update --dry-run"
 )]
@@ -59,9 +65,18 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub force: bool,
 
+    /// Install user-scoped terminal hooks after updating.
+    #[arg(long)]
+    pub install_hooks: bool,
+
     /// Print planned actions without downloading or installing
     #[arg(long)]
     pub dry_run: bool,
+}
+
+struct UpdateOutcome {
+    binary_path: PathBuf,
+    binary_changed: bool,
 }
 
 /// Entry point for `ahma update`.
@@ -77,7 +92,7 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
 
     warn_if_running_binary_differs(&install_dir).await;
 
-    match mode {
+    let outcome = match mode {
         UpdateMode::LatestRelease | UpdateMode::TaggedRelease { .. } => {
             let platform = platform.context(
                 "Prebuilt releases are unavailable on this platform. \
@@ -86,21 +101,28 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
             run_release_update(&args, &platform, &install_dir, &mode).await
         }
         UpdateMode::GitRef { branch } => run_git_update(&branch, &install_dir, args.dry_run).await,
+    }?;
+
+    if outcome.binary_changed {
+        print_post_install_details(&outcome.binary_path, &install_dir, args.dry_run).await;
     }
+    maybe_install_terminal_hooks(&args, &outcome.binary_path).await
 }
 
-async fn run_git_update(branch: &str, install_dir: &std::path::Path, dry_run: bool) -> Result<()> {
+async fn run_git_update(branch: &str, install_dir: &Path, dry_run: bool) -> Result<UpdateOutcome> {
     let installed = install_from_git_ref(branch, install_dir, dry_run).await?;
-    print_post_install_details(&installed, install_dir, dry_run).await;
-    Ok(())
+    Ok(UpdateOutcome {
+        binary_path: installed,
+        binary_changed: !dry_run,
+    })
 }
 
 async fn run_release_update(
     args: &UpdateArgs,
     platform: &platform::Platform,
-    install_dir: &std::path::Path,
+    install_dir: &Path,
     mode: &UpdateMode,
-) -> Result<()> {
+) -> Result<UpdateOutcome> {
     let client = reqwest::Client::builder()
         .user_agent("ahma-updater")
         .build()
@@ -126,7 +148,10 @@ async fn run_release_update(
             } else {
                 println!("Use --force to reinstall anyway.");
             }
-            return Ok(());
+            return Ok(UpdateOutcome {
+                binary_path: target,
+                binary_changed: false,
+            });
         }
         println!("Upgrading ahma from {installed} to {}...", asset.version);
     }
@@ -135,16 +160,13 @@ async fn run_release_update(
     let installed =
         install_release_asset(&client, &asset, platform, install_dir, args.dry_run).await?;
 
-    print_post_install_details(&installed, install_dir, args.dry_run).await;
-
-    Ok(())
+    Ok(UpdateOutcome {
+        binary_path: installed,
+        binary_changed: !args.dry_run,
+    })
 }
 
-async fn print_post_install_details(
-    installed: &std::path::Path,
-    install_dir: &std::path::Path,
-    dry_run: bool,
-) {
+async fn print_post_install_details(installed: &Path, install_dir: &Path, dry_run: bool) {
     if dry_run {
         return;
     }
@@ -186,6 +208,94 @@ async fn warn_if_running_binary_differs(install_dir: &std::path::Path) {
     }
 }
 
+async fn maybe_install_terminal_hooks(args: &UpdateArgs, binary_path: &Path) -> Result<()> {
+    if args.dry_run {
+        if args.install_hooks {
+            println!(
+                "[dry-run] Would run {} hooks install --scope user",
+                binary_path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    if args.install_hooks {
+        install_user_hooks(binary_path).await?;
+        return Ok(());
+    }
+
+    if !can_prompt_for_terminal_hooks()
+        || crate::hooks::any_managed_hooks_installed(crate::hooks::HookScope::User)?
+    {
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "Optional: install user-scoped terminal hooks so Cursor, Claude Code, and Codex route shell tool calls through ahma."
+    );
+
+    if !prompt_yes_no("Install user-scoped terminal hooks now? [y/N]: ").await? {
+        println!("Tip: run `ahma hooks install` later if you want ahma to wrap shell tool calls.");
+        return Ok(());
+    }
+
+    if let Err(error) = install_user_hooks(binary_path).await {
+        eprintln!("Warning: updated ahma but failed to install terminal hooks: {error}");
+        eprintln!("Run `ahma hooks install` later to retry.");
+    }
+
+    Ok(())
+}
+
+fn can_prompt_for_terminal_hooks() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+async fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    let prompt = prompt.to_string();
+    tokio::task::spawn_blocking(move || {
+        print!("{prompt}");
+        io::stdout().flush().context("Failed to flush prompt")?;
+
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("Failed to read prompt response")?;
+
+        Ok(matches!(input.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
+    })
+    .await
+    .context("Hook prompt task failed")?
+}
+
+async fn install_user_hooks(binary_path: &Path) -> Result<()> {
+    println!();
+    println!("Installing user-scoped terminal hooks...");
+
+    let status = tokio::process::Command::new(binary_path)
+        .args(["hooks", "install", "--scope", "user"])
+        .status()
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to run {} hooks install --scope user",
+                binary_path.display()
+            )
+        })?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "{} hooks install --scope user exited with status {}",
+            binary_path.display(),
+            status
+        );
+    }
+
+    println!("Restart Cursor, Claude Code, or Codex to pick up the updated hook configuration.");
+    Ok(())
+}
+
 fn print_path_hint(install_dir: &std::path::Path) {
     println!();
     println!("Ensure {} is on your PATH.", install_dir.display());
@@ -223,7 +333,26 @@ mod tests {
         let UpdateCmd::Update(args) = cli.cmd;
         assert!(args.reference.is_none());
         assert!(!args.force);
+        assert!(!args.install_hooks);
         assert!(!args.dry_run);
+    }
+
+    #[test]
+    fn test_update_args_parse_install_hooks() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            cmd: UpdateCmd,
+        }
+        #[derive(clap::Subcommand)]
+        enum UpdateCmd {
+            Update(UpdateArgs),
+        }
+
+        let cli = Cli::try_parse_from(["ahma", "update", "--install-hooks"]).unwrap();
+        let UpdateCmd::Update(args) = cli.cmd;
+        assert!(args.install_hooks);
     }
 
     #[test]

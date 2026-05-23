@@ -105,7 +105,7 @@ ahma --mode http --tmp --livelog --simplify
 The HTTP server requires **HTTP/2 or HTTP/3**. HTTP/1.1 connections are explicitly rejected.
 
 - **HTTP/2** (h2c — cleartext, no TLS required): the default transport for all HTTP clients.
-- **HTTP/3** (QUIC): clients that support HTTP/3 and Alt-Svc negotiation may upgrade automatically. Server-side QUIC is not yet implemented; clients fall back to HTTP/2.
+- **HTTP/3** (QUIC): clients that advertise Alt-Svc support (including `ahma tui`) will automatically upgrade to QUIC when local TLS material is present at `~/.ahma/tls/`. Run `ahma tls init` to provision the certificate. See [TLS management](#tls-management-for-quic) below.
 
 Default endpoint: `http://localhost:3000/mcp`
 
@@ -237,3 +237,26 @@ ahma serve unix --socket-path @ahma
 Ahma HTTP clients built on `reqwest` prefer HTTP/3 (QUIC) when the remote server advertises support via `Alt-Svc`, with transparent fallback to HTTP/2 and HTTP/1.1.
 
 For this local HTTP bridge endpoint, clients should expect HTTP/2 or HTTP/1.1.
+
+## TLS management for QUIC
+
+`ahma tui` upgrades to HTTP/3 (QUIC) when:
+1. The server returns an `Alt-Svc: h3=…` header, **and**
+2. Local TLS material exists at `~/.ahma/tls/` (or `$AHMA_TLS_DIR`).
+
+Manage the local TLS certificate with the `ahma tls` subcommands:
+
+```bash
+# First-time provisioning (idempotent — safe to re-run)
+ahma tls init
+
+# Force certificate rotation (e.g. every 30 days or after key compromise)
+ahma tls rotate
+
+# Show certificate path, age, and whether rotation is recommended
+ahma tls status
+```
+
+The private key (`~/.ahma/tls/key.der`) is stored with mode `0600` (Unix). The certificate is self-signed and used only for local loopback QUIC sessions — it is not exposed to the network.
+
+Set `AHMA_DISABLE_QUIC=1` to prevent the HTTP/3 upgrade globally.

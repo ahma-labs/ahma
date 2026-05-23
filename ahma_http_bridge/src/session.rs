@@ -339,6 +339,28 @@ impl Session {
         self.broadcast_tx.send((id, message))
     }
 
+    /// Serialize and send a JSON message to the subprocess.
+    async fn send_to_subprocess(&self, message: &Value, error_context: &str) -> Result<()> {
+        let json_str = serde_json::to_string(message)?;
+        self.send_serialized_to_subprocess(json_str, error_context)
+            .await
+    }
+
+    /// Send an already-serialized JSON string to the subprocess.
+    async fn send_serialized_to_subprocess(
+        &self,
+        json_str: String,
+        error_context: &str,
+    ) -> Result<()> {
+        self.sender
+            .lock()
+            .await
+            .send(json_str)
+            .await
+            .map_err(|e| BridgeError::Communication(format!("{error_context}: {e}")))?;
+        Ok(())
+    }
+
     /// Helper to transitions state and return necessary action
     fn transition_sse_connected(&self) -> HandshakeAction {
         let mut state = self.handshake_state.lock().unwrap();
@@ -422,10 +444,8 @@ impl Session {
             "jsonrpc": "2.0",
             "method": "notifications/roots/list_changed"
         });
-        let json_str = serde_json::to_string(&notification)?;
-        self.sender.lock().await.send(json_str).await.map_err(|e| {
-            BridgeError::Communication(format!("Failed to send roots/list_changed: {}", e))
-        })?;
+        self.send_to_subprocess(&notification, "Failed to send roots/list_changed")
+            .await?;
         let sse_receivers = self.broadcast_tx.receiver_count();
         info!(session_id = %self.id, sse_receivers = sse_receivers, "Sent roots/list_changed to subprocess; waiting for roots/list response via broadcast");
         Ok(())
@@ -486,6 +506,33 @@ fn extract_request_id(request: &Value) -> Option<String> {
     })
 }
 
+/// Register a pending request and return the receiver used to await its response.
+fn register_pending_request(
+    pending: &DashMap<String, oneshot::Sender<Value>>,
+    id: Option<&String>,
+) -> Option<oneshot::Receiver<Value>> {
+    id.map(|id| {
+        let (tx, rx) = oneshot::channel();
+        pending.insert(id.clone(), tx);
+        rx
+    })
+}
+
+/// Remove a pending request registration if one exists.
+fn clear_pending_request(pending: &DashMap<String, oneshot::Sender<Value>>, id: Option<&str>) {
+    if let Some(id) = id {
+        pending.remove(id);
+    }
+}
+
+/// Remove and return the sender for a pending request, if present.
+fn take_pending_request(
+    pending: &DashMap<String, oneshot::Sender<Value>>,
+    id: &str,
+) -> Option<oneshot::Sender<Value>> {
+    pending.remove(id).map(|(_, sender)| sender)
+}
+
 /// Wait for a JSON-RPC response via a oneshot channel, or return immediately for notifications.
 async fn await_response(
     response_rx: Option<oneshot::Receiver<Value>>,
@@ -503,9 +550,7 @@ async fn await_response(
             "Response channel closed".to_string(),
         )),
         Err(_) => {
-            if let Some(id) = id_opt {
-                pending.remove(id);
-            }
+            clear_pending_request(pending, id_opt.as_deref());
             Err(BridgeError::Communication("Request timed out".to_string()))
         }
     }
@@ -632,6 +677,51 @@ impl SessionManager {
         self.sessions.get(session_id).map(|s| s.clone())
     }
 
+    /// Resolve the sandbox scopes that should be locked for this session.
+    fn resolve_sandbox_scopes(&self, session_id: &str, roots: &[McpRoot]) -> Result<Vec<PathBuf>> {
+        // Extract all roots as sandbox scopes.
+        // Delegate to the shared file_uri parser so security improvements apply everywhere.
+        let parsed_scopes: Vec<PathBuf> = roots
+            .iter()
+            .filter_map(|root| ahma_common::file_uri::parse_file_uri_to_path(&root.uri))
+            .collect();
+
+        if !parsed_scopes.is_empty() {
+            return Ok(parsed_scopes);
+        }
+
+        if roots.is_empty() {
+            return match &self.config.default_scope {
+                Some(scope) => {
+                    info!(
+                        session_id = %session_id,
+                        fallback_scope = %scope.display(),
+                        "Client provided no roots; using explicit fallback sandbox scope"
+                    );
+                    Ok(vec![scope.clone()])
+                }
+                None => {
+                    warn!(
+                        session_id = %session_id,
+                        "Rejecting sandbox lock: client provided no roots and no explicit fallback scope is configured"
+                    );
+                    Err(BridgeError::Communication(
+                        "Client did not provide roots/list entries. Configure explicit sandbox scope on server startup (e.g. --sandbox-scope /path/to/project) or use a client that supports roots/list.".to_string()
+                    ))
+                }
+            };
+        }
+
+        warn!(
+            session_id = %session_id,
+            provided_roots = roots.len(),
+            "Rejecting sandbox lock: roots/list contained no valid file:// URIs"
+        );
+        Err(BridgeError::Communication(
+            "No valid file:// sandbox roots were provided in roots/list response.".to_string(),
+        ))
+    }
+
     /// Send a message to a session's subprocess
     pub async fn send_message(&self, session_id: &str, message: &Value) -> Result<()> {
         let session = self.sessions.get(session_id).ok_or_else(|| {
@@ -644,18 +734,9 @@ impl SessionManager {
             ));
         }
 
-        let json_str = serde_json::to_string(message)?;
         session
-            .sender
-            .lock()
+            .send_to_subprocess(message, "Failed to send to subprocess")
             .await
-            .send(json_str)
-            .await
-            .map_err(|e| {
-                BridgeError::Communication(format!("Failed to send to subprocess: {}", e))
-            })?;
-
-        Ok(())
     }
 
     /// Send a request and wait for response
@@ -677,34 +758,17 @@ impl SessionManager {
 
         let id_opt = extract_request_id(request);
 
-        let (response_tx, response_rx) = if id_opt.is_some() {
-            let (tx, rx) = oneshot::channel();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
-        // Register pending request
-        if let Some(id) = &id_opt {
-            session
-                .pending_requests
-                .insert(id.clone(), response_tx.unwrap());
-        }
+        let response_rx = register_pending_request(&session.pending_requests, id_opt.as_ref());
 
         // Send the request
         let json_str = serde_json::to_string(request)?;
-        session
-            .sender
-            .lock()
+        if let Err(err) = session
+            .send_serialized_to_subprocess(json_str, "Failed to send to subprocess")
             .await
-            .send(json_str)
-            .await
-            .map_err(|e| {
-                if let Some(id) = &id_opt {
-                    session.pending_requests.remove(id);
-                }
-                BridgeError::Communication(format!("Failed to send to subprocess: {}", e))
-            })?;
+        {
+            clear_pending_request(&session.pending_requests, id_opt.as_deref());
+            return Err(err);
+        }
 
         await_response(response_rx, timeout, &id_opt, &session.pending_requests).await
     }
@@ -737,45 +801,7 @@ impl SessionManager {
             return Ok(false);
         }
 
-        // Extract all roots as sandbox scopes.
-        // Delegate to the shared file_uri parser so security improvements apply everywhere.
-        let parsed_scopes: Vec<PathBuf> = roots
-            .iter()
-            .filter_map(|r| ahma_common::file_uri::parse_file_uri_to_path(&r.uri))
-            .collect();
-
-        let scopes = if !parsed_scopes.is_empty() {
-            parsed_scopes
-        } else if roots.is_empty() {
-            match &self.config.default_scope {
-                Some(scope) => {
-                    info!(
-                        session_id = %session_id,
-                        fallback_scope = %scope.display(),
-                        "Client provided no roots; using explicit fallback sandbox scope"
-                    );
-                    vec![scope.clone()]
-                }
-                None => {
-                    warn!(
-                        session_id = %session_id,
-                        "Rejecting sandbox lock: client provided no roots and no explicit fallback scope is configured"
-                    );
-                    return Err(BridgeError::Communication(
-                        "Client did not provide roots/list entries. Configure explicit sandbox scope on server startup (e.g. --sandbox-scope /path/to/project) or use a client that supports roots/list.".to_string()
-                    ));
-                }
-            }
-        } else {
-            warn!(
-                session_id = %session_id,
-                provided_roots = roots.len(),
-                "Rejecting sandbox lock: roots/list contained no valid file:// URIs"
-            );
-            return Err(BridgeError::Communication(
-                "No valid file:// sandbox roots were provided in roots/list response.".to_string(),
-            ));
-        };
+        let scopes = self.resolve_sandbox_scopes(session_id, roots)?;
 
         info!(
             session_id = %session_id,
@@ -973,7 +999,7 @@ impl SessionManager {
                                         .as_str()
                                         .map_or_else(|| id.to_string(), str::to_string);
 
-                                    if let Some((_, sender)) = session.pending_requests.remove(&id_str) {
+                                    if let Some(sender) = take_pending_request(&session.pending_requests, &id_str) {
                                         let _ = sender.send(value);
                                         continue;
                                     }
@@ -1105,7 +1131,7 @@ impl SessionManager {
                 .map(|entry| entry.key().clone())
                 .collect();
             for id in pending {
-                if let Some((_, sender)) = session.pending_requests.remove(&id) {
+                if let Some(sender) = take_pending_request(&session.pending_requests, &id) {
                     let error_response = serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": id,

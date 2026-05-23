@@ -62,6 +62,22 @@ fn error_response(code: i32, message: &str) -> Response {
     error_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, code, message)
 }
 
+fn missing_session_id_response() -> Response {
+    error_response_with_status(
+        StatusCode::BAD_REQUEST,
+        -32600,
+        "Missing Mcp-Session-Id header. Send initialize request first.",
+    )
+}
+
+fn session_not_found_response() -> Response {
+    error_response_with_status(
+        StatusCode::FORBIDDEN,
+        -32600,
+        "Session not found or terminated",
+    )
+}
+
 /// Handles requests in session isolation mode.
 #[tracing::instrument(skip_all, fields(method, session_id))]
 pub async fn handle_session_isolated_request(
@@ -91,11 +107,7 @@ pub async fn handle_session_isolated_request(
         "Request without session ID for non-initialize method: {:?}",
         method
     );
-    error_response_with_status(
-        StatusCode::BAD_REQUEST,
-        -32600,
-        "Missing Mcp-Session-Id header. Send initialize request first.",
-    )
+    missing_session_id_response()
 }
 
 fn validate_initialize_payload(payload: &Value) -> Option<Response> {
@@ -164,11 +176,7 @@ async fn handle_initialize(session_manager: &SessionManager, payload: &Value) ->
 fn check_session_exists(session_manager: &SessionManager, session_id: &str) -> Option<Response> {
     if !session_manager.session_exists(session_id) {
         warn!(session_id = %session_id, "Request for non-existent or terminated session");
-        Some(error_response_with_status(
-            StatusCode::FORBIDDEN,
-            -32600,
-            "Session not found or terminated",
-        ))
+        Some(session_not_found_response())
     } else {
         None
     }
@@ -470,30 +478,49 @@ fn should_lock_sandbox(
             .is_some_and(|s| s.is_sse_connected())
 }
 
+fn collect_valid_mcp_roots(session_id: &str, roots: &[Value]) -> Vec<McpRoot> {
+    let mcp_roots: Vec<McpRoot> = roots
+        .iter()
+        .filter_map(|root| {
+            let parsed = serde_json::from_value::<McpRoot>(root.clone());
+            match &parsed {
+                Ok(parsed_root) => {
+                    info!(session_id = %session_id, "Successfully parsed root: {:?}", parsed_root)
+                }
+                Err(e) => warn!(session_id = %session_id, "Failed to parse root {:?}: {}", root, e),
+            }
+            parsed.ok()
+        })
+        .collect();
+
+    info!(
+        session_id = %session_id,
+        "Extracted {} valid McpRoot instances from {} raw roots",
+        mcp_roots.len(),
+        roots.len()
+    );
+
+    mcp_roots
+}
+
+fn parse_roots_list_result(session_id: &str, result: &Value) -> Option<Vec<McpRoot>> {
+    let Some(roots) = result.get("roots").and_then(|r| r.as_array()) else {
+        warn!(session_id = %session_id, "roots/list response missing 'roots' array or it is invalid: {:?}", result);
+        return None;
+    };
+
+    Some(collect_valid_mcp_roots(session_id, roots))
+}
+
 /// Attempt to lock sandbox from a `roots/list` style result payload.
 async fn try_lock_sandbox_from_roots(
     session_manager: &SessionManager,
     session_id: &str,
     result: &Value,
 ) {
-    let Some(roots) = result.get("roots").and_then(|r| r.as_array()) else {
-        warn!(session_id = %session_id, "roots/list response missing 'roots' array or it is invalid: {:?}", result);
+    let Some(mcp_roots) = parse_roots_list_result(session_id, result) else {
         return;
     };
-
-    let mcp_roots: Vec<McpRoot> = roots
-        .iter()
-        .filter_map(|r| {
-            let parsed = serde_json::from_value::<McpRoot>(r.clone());
-            match &parsed {
-                Ok(pr) => info!(session_id = %session_id, "Successfully parsed root: {:?}", pr),
-                Err(e) => warn!(session_id = %session_id, "Failed to parse root {:?}: {}", r, e),
-            }
-            parsed.ok()
-        })
-        .collect();
-
-    info!(session_id = %session_id, "Extracted {} valid McpRoot instances from {} raw roots", mcp_roots.len(), roots.len());
 
     if !should_lock_sandbox(&mcp_roots, session_manager, session_id) {
         debug!(
@@ -607,21 +634,31 @@ fn calculate_tool_timeout(payload: &Value) -> Duration {
 
 // ─── POST SSE streaming ──────────────────────────────────────────────
 
-/// Build an SSE response from a single JSON value, assigning an event ID from the session.
-fn sse_single_event_response(session: &crate::session::Session, value: Value) -> Response {
-    let json_str = serde_json::to_string(&value).unwrap_or_default();
-    let id = session.assign_event_id(&json_str);
-    let event_stream = stream::once(async move {
-        Ok::<_, Infallible>(Event::default().id(id.to_string()).data(json_str))
-    });
+fn serialize_sse_data(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+fn sse_event(id: u64, data: String) -> Event {
+    Event::default().id(id.to_string()).data(data)
+}
+
+fn sse_single_event_response_with_id(id: u64, data: String) -> Response {
+    let event_stream = stream::once(async move { Ok::<_, Infallible>(sse_event(id, data)) });
     Sse::new(event_stream)
         .keep_alive(KeepAlive::default())
         .into_response()
 }
 
-/// Build an SSE error response (errors are always returned as JSON, regardless of Accept).
-fn sse_error_json_response(status: StatusCode, code: i32, message: &str) -> Response {
-    error_response_with_status(status, code, message)
+fn session_sse_event(session: &crate::session::Session, value: &Value) -> (u64, String) {
+    let json_str = serialize_sse_data(value);
+    let id = session.assign_event_id(&json_str);
+    (id, json_str)
+}
+
+/// Build an SSE response from a single JSON value, assigning an event ID from the session.
+fn sse_single_event_response(session: &crate::session::Session, value: Value) -> Response {
+    let (id, json_str) = session_sse_event(session, &value);
+    sse_single_event_response_with_id(id, json_str)
 }
 
 /// Handles POST requests that accept `text/event-stream` (SSE) responses.
@@ -655,11 +692,7 @@ pub async fn handle_session_isolated_request_sse(
     }
 
     let Some(session_id) = session_id else {
-        return sse_error_json_response(
-            StatusCode::BAD_REQUEST,
-            -32600,
-            "Missing Mcp-Session-Id header. Send initialize request first.",
-        );
+        return missing_session_id_response();
     };
 
     // Validate session exists
@@ -749,26 +782,14 @@ async fn handle_initialize_sse(session_manager: &SessionManager, payload: &Value
         .await
     {
         Ok(response) => {
-            let session = session_manager.get_session(&new_session_id);
-            let json_str = serde_json::to_string(&response).unwrap_or_default();
-            let (id, event_stream) = if let Some(ref s) = session {
-                let id = s.assign_event_id(&json_str);
-                (id, json_str)
+            let sse_response = if let Some(session) = session_manager.get_session(&new_session_id) {
+                let (id, json_str) = session_sse_event(&session, &response);
+                sse_single_event_response_with_id(id, json_str)
             } else {
-                (1, json_str)
+                sse_single_event_response_with_id(1, serialize_sse_data(&response))
             };
 
-            let sse_stream = stream::once(async move {
-                Ok::<_, Infallible>(Event::default().id(id.to_string()).data(event_stream))
-            });
-            let mut resp = Sse::new(sse_stream)
-                .keep_alive(KeepAlive::default())
-                .into_response();
-            let header_value = HeaderValue::from_str(&new_session_id)
-                .unwrap_or_else(|_| HeaderValue::from_static("invalid"));
-            resp.headers_mut()
-                .insert(MCP_SESSION_ID_HEADER, header_value);
-            resp
+            with_session_header(sse_response, &new_session_id)
         }
         Err(e) => handle_initialize_error(session_manager, &new_session_id, e).await,
     }
@@ -815,13 +836,7 @@ async fn forward_request_sse(
 ) -> Response {
     let session = match session_manager.get_session(session_id) {
         Some(s) => s,
-        None => {
-            return error_response_with_status(
-                StatusCode::FORBIDDEN,
-                -32600,
-                "Session not found or terminated",
-            );
-        }
+        None => return session_not_found_response(),
     };
 
     // Subscribe to broadcast BEFORE sending the request so we don't miss events
@@ -845,8 +860,7 @@ async fn forward_request_sse(
                 .await;
 
             // Build SSE stream: broadcast events that arrived during processing + the response
-            let response_json = serde_json::to_string(&response).unwrap_or_default();
-            let response_id = session.assign_event_id(&response_json);
+            let (response_id, response_json) = session_sse_event(&session, &response);
 
             // Collect any broadcast events that arrived while waiting for the response
             let session_clone = session.clone();
@@ -859,9 +873,7 @@ async fn forward_request_sse(
                         match result {
                             Ok((id, msg)) => {
                                 debug!(session_id = %sid, event_id = id, "POST SSE notification: {}", msg);
-                                Some(Ok::<_, Infallible>(
-                                    Event::default().id(id.to_string()).data(msg),
-                                ))
+                                Some(Ok::<_, Infallible>(sse_event(id, msg)))
                             }
                             Err(
                                 tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(
@@ -879,13 +891,10 @@ async fn forward_request_sse(
                 });
 
             // The response event is emitted last, then the stream closes
-            let response_event = stream::once(async move {
-                Ok::<_, Infallible>(
-                    Event::default()
-                        .id(response_id.to_string())
-                        .data(response_json),
-                )
-            });
+            let response_event =
+                stream::once(
+                    async move { Ok::<_, Infallible>(sse_event(response_id, response_json)) },
+                );
 
             // Take only notifications that arrived before the response, then emit response
             // Since we already awaited the response, any events in the broadcast channel

@@ -21,6 +21,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 use serial_test::serial;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::time::sleep;
@@ -366,68 +367,64 @@ async fn process_sse_roots_handshake(
     }
 }
 
-fn percent_encode_path_for_file_uri(path: &std::path::Path) -> String {
-    // Produce an RFC 8089-compatible file URI *path component* from a
-    // filesystem path.  This string is meant to be appended directly after
-    // the authority (e.g. `file://localhost` or `file://`).
-    //
-    // On Windows:
-    //   1. Canonicalize to resolve 8.3 short names (e.g. RUNNER~1 → runneradmin).
-    //   2. Strip any `\\?\` extended-length prefix.
-    //   3. Convert backslashes to forward slashes.
-    //   4. Prepend "/" so the drive letter (e.g. "C:") is in the *path*
-    //      component, not the authority field of the URL.
-    //      Without this step `file://localhostC%3A...` would put
-    //      `localhostC%3A...` in the host field, breaking `url::Url::parse`.
-    let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut s = canonical.to_string_lossy().into_owned();
+fn canonical_test_path(path: &Path) -> std::path::PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
 
-    // Strip \\?\ prefix (Windows extended-length paths).
-    if s.starts_with(r"\\?\") {
-        s = s[4..].to_string();
-    }
-    // Normalise path separators.
-    s = s.replace('\\', "/");
+fn encode_test_file_uri(path: &Path) -> String {
+    common::encode_file_uri(&canonical_test_path(path))
+}
 
-    let mut out = String::with_capacity(s.len() + 1);
+fn encode_test_file_uri_with_localhost(path: &Path) -> String {
+    let uri = encode_test_file_uri(path);
+    let suffix = uri
+        .strip_prefix("file://")
+        .expect("shared file URI helper must include scheme");
+    format!("file://localhost{}", suffix)
+}
 
-    // If this is a Windows drive-letter path (e.g. "C:/…"), the path
-    // component must begin with "/" so the drive letter is not confused with
-    // the URL authority.  This applies whether the caller will prepend
-    // "file://" or "file://localhost".
-    #[cfg(target_os = "windows")]
-    {
-        let is_drive =
-            s.len() >= 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1] == b':';
-        if is_drive {
-            out.push('/');
+fn initialize_request() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "roots": { "listChanged": true }
+            },
+            "clientInfo": {"name": "test-client", "version": "1.0.0"}
         }
-    }
+    })
+}
 
-    for b in s.as_bytes() {
-        let b = *b;
-        // Keep unreserved chars and forward slashes.
-        // Keep ':' so Windows drive letters (C:/) are not encoded.
-        let keep = matches!(
-            b,
-            b'a'..=b'z'
-                | b'A'..=b'Z'
-                | b'0'..=b'9'
-                | b'-'
-                | b'.'
-                | b'_'
-                | b'~'
-                | b'/'
-                | b':'
-        );
-        if keep {
-            out.push(b as char);
-        } else {
-            out.push('%');
-            out.push_str(&format!("{:02X}", b));
+async fn initialize_session(client: &Client, base_url: &str) -> String {
+    let (_, session_id) = send_mcp_request(client, base_url, &initialize_request(), None)
+        .await
+        .expect("Initialize should succeed");
+    session_id.expect("Session isolation must return mcp-session-id header")
+}
+
+fn initialized_notification() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    })
+}
+
+fn pwd_tool_call(request_id: u64, working_directory: &Path) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "tools/call",
+        "params": {
+            "name": "pwd",
+            "arguments": {
+                "subcommand": "default",
+                "working_directory": working_directory.to_string_lossy()
+            }
         }
-    }
-    out
+    })
 }
 
 /// REGRESSION TEST (DO NOT WEAKEN): Cross-repo working_directory must succeed.
@@ -456,7 +453,7 @@ async fn test_roots_uri_parsing_percent_encoded_path() {
     let tools_dir = server_scope_dir.path().join("tools");
     std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
 
-    common::uri::create_pwd_tool_config(&tools_dir);
+    common::create_pwd_tool_config(&tools_dir);
 
     // Make a workspace root with space + unicode in the path.
     let client_root = client_scope_dir.path().join("my proj OK");
@@ -468,25 +465,9 @@ async fn test_roots_uri_parsing_percent_encoded_path() {
     let base_url = server.base_url();
     let client = common::make_h2_client();
 
-    let init_request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "roots": { "listChanged": true }
-            },
-            "clientInfo": {"name": "test-client", "version": "1.0.0"}
-        }
-    });
-    let (_, session_id) = send_mcp_request(&client, &base_url, &init_request, None)
-        .await
-        .expect("Initialize should succeed");
-    let session_id = session_id.expect("Session isolation must return mcp-session-id header");
+    let session_id = initialize_session(&client, &base_url).await;
 
-    let encoded_path = percent_encode_path_for_file_uri(&client_root);
-    let uri = format!("file://{}", encoded_path);
+    let uri = encode_test_file_uri(&client_root);
 
     // Open SSE stream BEFORE sending notifications/initialized so the server's
     // roots/list request is not lost if it fires immediately on initialized.
@@ -514,25 +495,11 @@ async fn test_roots_uri_parsing_percent_encoded_path() {
         .await;
     });
 
-    let initialized = json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized"
-    });
+    let initialized = initialized_notification();
     let _ = send_mcp_request(&client, &base_url, &initialized, Some(&session_id)).await;
     sse_task.await.expect("roots/list SSE task panicked");
 
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
-                "subcommand": "default",
-                "working_directory": client_root.to_string_lossy()
-            }
-        }
-    });
+    let tool_call = pwd_tool_call(2, &client_root);
 
     let resp = send_tool_call_with_retry(&client, &base_url, &session_id, &tool_call).await;
 
@@ -565,21 +532,7 @@ async fn test_roots_uri_parsing_file_localhost() {
     let tools_dir = server_scope_dir.path().join("tools");
     std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print current working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{
-            "name": "default",
-            "description": "Print working directory"
-        }]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
+    common::create_pwd_tool_config(&tools_dir);
 
     let client_root = client_scope_dir.path().join("my proj OK");
     tokio::fs::create_dir_all(&client_root)
@@ -590,25 +543,9 @@ async fn test_roots_uri_parsing_file_localhost() {
     let base_url = server.base_url();
     let client = common::make_h2_client();
 
-    let init_request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "roots": { "listChanged": true }
-            },
-            "clientInfo": {"name": "test-client", "version": "1.0.0"}
-        }
-    });
-    let (_, session_id) = send_mcp_request(&client, &base_url, &init_request, None)
-        .await
-        .expect("Initialize should succeed");
-    let session_id = session_id.expect("Session isolation must return mcp-session-id header");
+    let session_id = initialize_session(&client, &base_url).await;
 
-    let encoded_path = percent_encode_path_for_file_uri(&client_root);
-    let uri = format!("file://localhost{}", encoded_path);
+    let uri = encode_test_file_uri_with_localhost(&client_root);
 
     let sse_resp = open_roots_sse_stream(&client, &base_url, &session_id).await;
     let sse_client = client.clone();
@@ -626,25 +563,11 @@ async fn test_roots_uri_parsing_file_localhost() {
         .await;
     });
 
-    let initialized = json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized"
-    });
+    let initialized = initialized_notification();
     let _ = send_mcp_request(&client, &base_url, &initialized, Some(&session_id)).await;
     sse_task.await.expect("roots/list SSE task panicked");
 
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
-                "subcommand": "default",
-                "working_directory": client_root.to_string_lossy()
-            }
-        }
-    });
+    let tool_call = pwd_tool_call(2, &client_root);
 
     let resp = send_tool_call_with_retry(&client, &base_url, &session_id, &tool_call).await;
 
@@ -663,7 +586,7 @@ async fn test_tool_call_without_initialize_returns_proper_error() {
     let tools_dir = temp_dir.path().join("tools");
     std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
 
-    common::uri::create_pwd_tool_config(&tools_dir);
+    common::create_pwd_tool_config(&tools_dir);
 
     let sandbox_scope = temp_dir.path().to_path_buf();
     let server = start_http_bridge(&tools_dir, &sandbox_scope).await;
@@ -672,18 +595,7 @@ async fn test_tool_call_without_initialize_returns_proper_error() {
 
     // SKIP initialize - send tools/call directly
     // This reproduces the user's bug where the subprocess gets a tools/call first
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
-                "subcommand": "default",
-                "working_directory": sandbox_scope.to_string_lossy()
-            }
-        }
-    });
+    let tool_call = pwd_tool_call(1, &sandbox_scope);
 
     let result = send_mcp_request(&client, &base_url, &tool_call, None).await;
 

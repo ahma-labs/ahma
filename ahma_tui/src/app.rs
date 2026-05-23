@@ -3,6 +3,8 @@
 use std::time::Duration;
 use tracing::debug;
 
+use crate::connection::{ResolvedConnection, probe_candidate};
+
 /// Events that drive the TUI state machine.
 #[derive(Debug, Clone)]
 pub enum TuiEvent {
@@ -45,6 +47,7 @@ pub struct OperationSummary {
 /// Application state for the TUI.
 pub struct TuiApp {
     pub server_url: String,
+    pub server_transport: String,
     pub server_healthy: bool,
     pub operations: Vec<OperationSummary>,
     pub selected: usize,
@@ -57,6 +60,20 @@ impl TuiApp {
     pub fn new(server_url: impl Into<String>) -> Self {
         Self {
             server_url: server_url.into(),
+            server_transport: "HTTP".to_string(),
+            server_healthy: false,
+            operations: vec![],
+            selected: 0,
+            log_lines: vec![],
+            pending_approval: None,
+            should_quit: false,
+        }
+    }
+
+    pub fn new_with_transport(server_url: impl Into<String>, transport: impl Into<String>) -> Self {
+        Self {
+            server_url: server_url.into(),
+            server_transport: transport.into(),
             server_healthy: false,
             operations: vec![],
             selected: 0,
@@ -117,32 +134,35 @@ impl TuiApp {
 }
 
 /// Start the TUI event loop.
-pub async fn run(server_url: &str) -> anyhow::Result<()> {
-    run_cli_fallback(server_url).await
+pub async fn run(connection: &ResolvedConnection) -> anyhow::Result<()> {
+    run_cli_fallback(connection).await
 }
 
-async fn run_cli_fallback(server_url: &str) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
-    let health_url = format!("{}/health", server_url.trim_end_matches('/'));
-
+async fn run_cli_fallback(connection: &ResolvedConnection) -> anyhow::Result<()> {
     println!("Ahma TUI (text mode — compile with --features tui for full TUI)");
-    println!("Connecting to: {server_url}");
+    println!(
+        "Connected to: {} [{}]",
+        connection.display_url,
+        connection.transport_label()
+    );
     println!("Press Ctrl-C to quit.\n");
 
     loop {
-        let healthy = client
-            .get(&health_url)
-            .timeout(Duration::from_secs(2))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
+        let healthy = probe_candidate(connection).await;
 
         let status = if healthy { "HEALTHY" } else { "UNREACHABLE" };
         let now = chrono::Utc::now().format("%H:%M:%S");
-        println!("[{now}] Server {server_url} — {status}");
+        println!(
+            "[{now}] {} ({}) — {status}",
+            connection.display_url,
+            connection.transport_label()
+        );
 
-        debug!("TUI heartbeat: server={server_url} healthy={healthy}");
+        debug!(
+            "TUI heartbeat: server={} transport={} healthy={healthy}",
+            connection.display_url,
+            connection.transport_label()
+        );
 
         tokio::time::sleep(Duration::from_secs(2)).await;
     }

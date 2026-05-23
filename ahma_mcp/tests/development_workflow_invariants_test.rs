@@ -380,7 +380,42 @@ mod skill_version_invariants {
             "skills/ahma/SKILL.md HTML comment version ({html_ver}) must match Cargo.toml ({cargo_ver})"
         );
 
-        println!("OK Skill versions consistent: v{cargo_ver}");
+        // install.sh: AHMA_VERSION="X.Y.Z"
+        let install_sh_path = get_workspace_path("scripts/install.sh");
+        let install_sh =
+            std::fs::read_to_string(&install_sh_path).expect("Failed to read scripts/install.sh");
+        let install_sh_ver = install_sh
+            .lines()
+            .find(|l| l.starts_with("AHMA_VERSION=\""))
+            .expect("No AHMA_VERSION line in scripts/install.sh")
+            .split('"')
+            .nth(1)
+            .expect("Unexpected AHMA_VERSION format in scripts/install.sh")
+            .to_string();
+        assert_eq!(
+            install_sh_ver, cargo_ver,
+            "scripts/install.sh AHMA_VERSION ({install_sh_ver}) must match Cargo.toml ({cargo_ver})"
+        );
+
+        // install.ps1: Install-OneSkill -Name 'ahma' -Version 'X.Y.Z'
+        let install_ps1_path = get_workspace_path("scripts/install.ps1");
+        let install_ps1 = std::fs::read_to_string(&install_ps1_path)
+            .expect("Failed to read scripts/install.ps1");
+        let install_ps1_ver = install_ps1
+            .lines()
+            .find(|l| l.contains("Install-OneSkill") && l.contains("-Version '"))
+            .expect("No Install-OneSkill -Version line in scripts/install.ps1")
+            .split("-Version '")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("Unexpected -Version format in scripts/install.ps1")
+            .to_string();
+        assert_eq!(
+            install_ps1_ver, cargo_ver,
+            "scripts/install.ps1 Install-OneSkill -Version ({install_ps1_ver}) must match Cargo.toml ({cargo_ver})"
+        );
+
+        println!("OK All version strings consistent: v{cargo_ver}");
     }
 
     /// INVARIANT 9: Skill author consistency

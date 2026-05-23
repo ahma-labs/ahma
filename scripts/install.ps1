@@ -446,7 +446,7 @@ function Get-AhmaMainSkillContent {
     return @'
 ---
 name: ahma
-version: 0.6.5
+version: __AHMA_VERSION__
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -462,7 +462,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.6.5 | author: Paul Houghton -->
+<!-- version: __AHMA_VERSION__ | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -972,13 +972,13 @@ function Invoke-AhmaSkillSetup {
         }
 
         New-Item -ItemType Directory -Force -Path $skillDir | Out-Null
-        & $ContentFn | Set-Content -Encoding UTF8 -Path $skillPath
+        (& $ContentFn) -replace '__AHMA_VERSION__', $Version | Set-Content -Encoding UTF8 -Path $skillPath
         Write-Host "  OK $skillPath"
     }
 
     Write-Host ""
     Write-Host "  Installing skills..."
-    Install-OneSkill -Name 'ahma' -Version '0.6.1' -ContentFn { Get-AhmaMainSkillContent }
+    Install-OneSkill -Name 'ahma' -Version '0.7.1' -ContentFn { Get-AhmaMainSkillContent }
 
     Write-Host ""
     Write-Host "  Skills are automatically available in:"

@@ -18,6 +18,7 @@
 
 pub mod config;
 pub mod file_uri;
+pub mod local_tls;
 pub mod observability;
 pub mod sandbox_state;
 pub mod state_machine;

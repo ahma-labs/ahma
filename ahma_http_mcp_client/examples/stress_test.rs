@@ -57,6 +57,7 @@ const ROOTS_LIST_TIMEOUT_SECS: u64 = 10;
 const SANDBOX_CONFIG_TIMEOUT_SECS: u64 = 45;
 const TOOL_CALL_RETRY_WINDOW_SECS: u64 = 10;
 const TOOL_CALL_RETRY_BACKOFF_MS: u64 = 100;
+const SANDBOX_INITIALIZING_MESSAGE: &str = "Sandbox initializing from client roots";
 
 // ---------------------------------------------------------------------------
 // CLI arguments
@@ -140,8 +141,7 @@ impl AsyncProgressState {
     async fn track_completion(&self, token: &str, message: &str) {
         let removed = self.pending_tokens.lock().await.remove(token);
         if removed {
-            let is_failure = message.starts_with("Failed:") || message.contains("OPERATION FAILED");
-            if is_failure {
+            if is_progress_failure(message) {
                 self.completed_error.fetch_add(1, Ordering::Relaxed);
             } else {
                 self.completed_success.fetch_add(1, Ordering::Relaxed);
@@ -374,11 +374,7 @@ impl StressClient {
         let session_id = self.session_id()?.to_string();
 
         let progress_token = self.prepare_progress_token(&session_id, id).await;
-        let execution_mode = if self.is_sync {
-            "Synchronous"
-        } else {
-            "AsyncResultPush"
-        };
+        let execution_mode = tool_execution_mode(self.is_sync);
 
         let body = self
             .retry_tool_call(
@@ -486,34 +482,7 @@ impl StressClient {
             .await
             .map_err(|e| anyhow!("Failed to send request: {}", e))?;
 
-        if response.status() == reqwest::StatusCode::CONFLICT {
-            let body_text = response.text().await.unwrap_or_default();
-            if body_text.contains("Sandbox initializing from client roots") {
-                return Ok(ToolCallResult::Retry);
-            }
-            return Ok(ToolCallResult::Failure(format!(
-                "Request failed (409): {}",
-                body_text
-            )));
-        }
-
-        if !response.status().is_success() {
-            return Ok(ToolCallResult::Failure(format!(
-                "Request failed: {}",
-                response.status()
-            )));
-        }
-
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse response body: {}", e))?;
-
-        if is_retryable_sandbox_error(&body) {
-            return Ok(ToolCallResult::Retry);
-        }
-
-        Ok(ToolCallResult::Success(body))
+        parse_tool_call_response(response).await
     }
 
     async fn clear_pending_token(&self, token: Option<&str>) {
@@ -532,6 +501,57 @@ enum ToolCallResult {
     Failure(String),
 }
 
+fn is_progress_failure(message: &str) -> bool {
+    message.starts_with("Failed:") || message.contains("OPERATION FAILED")
+}
+
+fn tool_execution_mode(is_sync: bool) -> &'static str {
+    if is_sync {
+        "Synchronous"
+    } else {
+        "AsyncResultPush"
+    }
+}
+
+fn classify_conflict_response(body_text: &str) -> ToolCallResult {
+    if body_text.contains(SANDBOX_INITIALIZING_MESSAGE) {
+        ToolCallResult::Retry
+    } else {
+        ToolCallResult::Failure(format!("Request failed (409): {}", body_text))
+    }
+}
+
+fn classify_tool_call_body(body: Value) -> ToolCallResult {
+    if is_retryable_sandbox_error(&body) {
+        ToolCallResult::Retry
+    } else {
+        ToolCallResult::Success(body)
+    }
+}
+
+async fn parse_tool_call_response(response: reqwest::Response) -> Result<ToolCallResult> {
+    let status = response.status();
+
+    if status == reqwest::StatusCode::CONFLICT {
+        let body_text = response.text().await.unwrap_or_default();
+        return Ok(classify_conflict_response(&body_text));
+    }
+
+    if !status.is_success() {
+        return Ok(ToolCallResult::Failure(format!(
+            "Request failed: {}",
+            status
+        )));
+    }
+
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|e| anyhow!("Failed to parse response body: {}", e))?;
+
+    Ok(classify_tool_call_body(body))
+}
+
 fn is_retryable_sandbox_error(body: &Value) -> bool {
     let Some(error) = body.get("error") else {
         return false;
@@ -540,8 +560,24 @@ fn is_retryable_sandbox_error(body: &Value) -> bool {
     let msg_match = error
         .get("message")
         .and_then(|m| m.as_str())
-        .is_some_and(|m| m.contains("Sandbox initializing from client roots"));
+        .is_some_and(|m| m.contains(SANDBOX_INITIALIZING_MESSAGE));
     code_match || msg_match
+}
+
+fn progress_completion(msg: &Value) -> Option<(&str, &str)> {
+    let params = msg.get("params")?;
+    let progress = params
+        .get("progress")
+        .and_then(|p| p.as_f64())
+        .unwrap_or(0.0);
+    if progress < 100.0 {
+        return None;
+    }
+
+    let token = params.get("progressToken").and_then(|t| t.as_str())?;
+    let message = params.get("message").and_then(|m| m.as_str()).unwrap_or("");
+
+    Some((token, message))
 }
 
 // ---------------------------------------------------------------------------
@@ -705,21 +741,7 @@ impl<'a> SseLoopContext<'a> {
         let Some(state) = &self.progress_state else {
             return;
         };
-        let params = msg.get("params");
-        let token = params
-            .and_then(|p| p.get("progressToken"))
-            .and_then(|t| t.as_str());
-        let progress = params
-            .and_then(|p| p.get("progress"))
-            .and_then(|p| p.as_f64());
-        let message = params
-            .and_then(|p| p.get("message"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
-
-        if progress.unwrap_or(0.0) >= 100.0
-            && let Some(token) = token
-        {
+        if let Some((token, message)) = progress_completion(msg) {
             state.track_completion(token, message).await;
         }
     }
@@ -972,6 +994,11 @@ fn spawn_client(
     });
 }
 
+async fn abort_clients_and_kill_server(join_set: &mut JoinSet<Result<()>>, server: ServerManager) {
+    join_set.abort_all();
+    let _ = server.kill().await;
+}
+
 // ---------------------------------------------------------------------------
 // Main loop monitoring & reporting
 // ---------------------------------------------------------------------------
@@ -1127,14 +1154,12 @@ async fn main() -> Result<()> {
     match run_monitoring_loop(&server, &counters, &stop_flag, duration).await {
         TestOutcome::ServerError => {
             print_server_error(&server).await;
-            join_set.abort_all();
-            let _ = server.kill().await;
+            abort_clients_and_kill_server(&mut join_set, server).await;
             std::process::exit(1);
         }
         TestOutcome::ExcessiveClientErrors => {
             print_excessive_errors(&counters);
-            join_set.abort_all();
-            let _ = server.kill().await;
+            abort_clients_and_kill_server(&mut join_set, server).await;
             std::process::exit(1);
         }
         TestOutcome::DurationElapsed => {}

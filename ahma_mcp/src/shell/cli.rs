@@ -13,6 +13,7 @@
 //! ahma tool validate [TARGET]
 //! ahma tool list [--server NAME] [--http URL] [--format json|text] [--mcp-config PATH]
 //! ahma tool info [--tools rust,git] [--format json|text] [TOOL]
+//! ahma hooks install [--platform cursor,claude,codex] [--scope user|project]
 //! ahma update [REF] [--force] [--dry-run] [--install-dir PATH]
 //! ```
 //!
@@ -530,12 +531,22 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
                  If you are running a custom binary, implement TUI dispatch using ahma_tui::run_tui."
             )
         }
+        Subcommands::Tls(_) => {
+            anyhow::bail!(
+                "tls commands are provided by the ahma_bin crate (includes ahma_common::local_tls). \
+                 If you are running a custom binary, implement TLS dispatch using ahma_common::local_tls."
+            )
+        }
         Subcommands::Bundle(bundle_args) => dispatch_bundle_command(bundle_args),
         Subcommands::Llm(_) => {
             anyhow::bail!(
                 "llm commands are provided by the ahma_bin crate (includes ahma_common). \
                  If you are running a custom binary, implement llm dispatch using ahma_common::config::AhmaConfig."
             )
+        }
+        Subcommands::Hooks(args) => {
+            tracing::info!("Running in hooks mode");
+            crate::hooks::run(args, cfg).await
         }
         Subcommands::Cluster(_) => {
             anyhow::bail!(
@@ -555,64 +566,70 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
     }
 }
 
-fn dispatch_bundle_command(args: BundleArgs) -> Result<()> {
-    match args.command {
-        BundleCommand::Audit(audit_args) => {
-            println!("Auditing bundle: {}", audit_args.path.display());
-            let result = crate::bundle::signing::audit_bundle(&audit_args.path)
-                .context("Bundle audit failed")?;
+fn audit_bundle_command(audit_args: BundleAuditArgs) -> Result<()> {
+    println!("Auditing bundle: {}", audit_args.path.display());
+    let result =
+        crate::bundle::signing::audit_bundle(&audit_args.path).context("Bundle audit failed")?;
 
-            println!(
-                "Files checked: {} | Findings: {}",
-                result.files_checked,
-                result.findings.len()
-            );
+    println!(
+        "Files checked: {} | Findings: {}",
+        result.files_checked,
+        result.findings.len()
+    );
 
-            for finding in &result.findings {
-                let sev = match finding.severity {
-                    crate::bundle::BundleAuditSeverity::Info => "INFO    ",
-                    crate::bundle::BundleAuditSeverity::Warning => "WARNING ",
-                    crate::bundle::BundleAuditSeverity::Critical => "CRITICAL",
-                };
-                println!("[{sev}] {}: {}", finding.file, finding.description);
-                println!("         Recommendation: {}", finding.recommendation);
-            }
+    for finding in &result.findings {
+        let sev = match finding.severity {
+            crate::bundle::BundleAuditSeverity::Info => "INFO    ",
+            crate::bundle::BundleAuditSeverity::Warning => "WARNING ",
+            crate::bundle::BundleAuditSeverity::Critical => "CRITICAL",
+        };
+        println!("[{sev}] {}: {}", finding.file, finding.description);
+        println!("         Recommendation: {}", finding.recommendation);
+    }
 
-            if result.passed {
-                println!("PASS Bundle audit passed.");
-                Ok(())
-            } else if audit_args.strict && !result.findings.is_empty() {
-                anyhow::bail!("Bundle audit found issues (--strict mode).")
-            } else if !result.passed {
-                anyhow::bail!("Bundle audit found critical issues.")
-            } else {
-                Ok(())
-            }
-        }
-        BundleCommand::Verify(verify_args) => {
-            println!("Verifying bundle: {}", verify_args.path.display());
-            let verifier = crate::bundle::BundleVerifier::new(
-                dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".ahma")
-                    .join("keys")
-                    .join("trusted"),
-            );
-            match verifier.verify(&verify_args.path)? {
-                true => {
-                    println!("PASS Bundle verification passed.");
-                    Ok(())
-                }
-                false => anyhow::bail!("FAIL Bundle verification failed."),
-            }
-        }
-        BundleCommand::Sign(sign_args) => {
-            println!("Signing bundle: {}", sign_args.path.display());
-            let digests = crate::bundle::BundleSigner::sign(&sign_args.path)
-                .context("Bundle signing failed")?;
-            println!("Manifest written with {} file hashes.", digests.len());
+    if result.passed {
+        println!("PASS Bundle audit passed.");
+        Ok(())
+    } else if audit_args.strict && !result.findings.is_empty() {
+        anyhow::bail!("Bundle audit found issues (--strict mode).")
+    } else if !result.passed {
+        anyhow::bail!("Bundle audit found critical issues.")
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_bundle_command(verify_args: BundleVerifyArgs) -> Result<()> {
+    println!("Verifying bundle: {}", verify_args.path.display());
+    let verifier = crate::bundle::BundleVerifier::new(
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".ahma")
+            .join("keys")
+            .join("trusted"),
+    );
+    match verifier.verify(&verify_args.path)? {
+        true => {
+            println!("PASS Bundle verification passed.");
             Ok(())
         }
+        false => anyhow::bail!("FAIL Bundle verification failed."),
+    }
+}
+
+fn sign_bundle_command(sign_args: BundleSignArgs) -> Result<()> {
+    println!("Signing bundle: {}", sign_args.path.display());
+    let digests =
+        crate::bundle::BundleSigner::sign(&sign_args.path).context("Bundle signing failed")?;
+    println!("Manifest written with {} file hashes.", digests.len());
+    Ok(())
+}
+
+fn dispatch_bundle_command(args: BundleArgs) -> Result<()> {
+    match args.command {
+        BundleCommand::Audit(audit_args) => audit_bundle_command(audit_args),
+        BundleCommand::Verify(verify_args) => verify_bundle_command(verify_args),
+        BundleCommand::Sign(sign_args) => sign_bundle_command(sign_args),
     }
 }
 
@@ -674,10 +691,14 @@ pub enum Subcommands {
     Vault(VaultArgs),
     /// Start the TUI control plane (terminal dashboard for active tasks).
     Tui(TuiArgs),
+    /// Local TLS certificate management: init, rotate, and check status.
+    Tls(TlsArgs),
     /// Bundle management: audit and verify MTDF tool bundles.
     Bundle(BundleArgs),
     /// LLM provider management: add, list, test, and remove named providers.
     Llm(LlmArgs),
+    /// Manage terminal hooks for external AI tools.
+    Hooks(crate::hooks::HooksArgs),
     /// Cluster peer management: add, list, ping, and inspect worker nodes.
     Cluster(ClusterArgs),
     /// Analyze source code complexity and generate a simplicity report.
@@ -1105,15 +1126,66 @@ pub struct VaultCreateArgs {
 /// Arguments for `ahma tui`.
 #[derive(Parser, Debug)]
 #[command(after_help = "EXAMPLES:
-  # Connect to the default ahma HTTP bridge
+  # Auto-detect the best available local transport (Unix socket, then HTTP)
   ahma tui
 
-  # Connect to a custom address
-  ahma tui --connect http://localhost:8080")]
+  # Connect to a specific HTTP bridge
+  ahma tui --connect http://localhost:8080
+
+  # Connect via a Unix domain socket
+  ahma tui --connect unix:///tmp/ahma.sock")]
 pub struct TuiArgs {
-    /// URL of the ahma HTTP bridge to monitor.
-    #[arg(long = "connect", default_value = "http://localhost:3000")]
-    pub connect: String,
+    /// URL of the ahma server to monitor.
+    ///
+    /// When omitted, `ahma tui` probes local transports in order:
+    /// Unix socket (default `/tmp/ahma.sock`, or `AHMA_UNIX_SOCKET`) on Unix,
+    /// then `http://localhost:3000`.
+    ///
+    /// Supported URL formats:
+    ///   http://host:port        — plain HTTP / HTTP2 / HTTP3
+    ///   https://host:port       — HTTPS
+    ///   unix:///path/to.sock    — Unix domain socket (Unix only)
+    #[arg(long = "connect")]
+    pub connect: Option<String>,
+}
+
+// ── tls ───────────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma tls`.
+#[derive(Parser, Debug)]
+#[command(after_help = "EXAMPLES:
+  # Generate the initial TLS certificate for local QUIC (first-time setup)
+  ahma tls init
+
+  # Regenerate and replace the existing TLS certificate
+  ahma tls rotate
+
+  # Show the certificate status (path, age, rotation needed)
+  ahma tls status")]
+pub struct TlsArgs {
+    #[command(subcommand)]
+    pub command: TlsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TlsCommand {
+    /// Generate the local TLS certificate (first-time setup).
+    ///
+    /// Creates a self-signed certificate under `~/.ahma/tls/` (or `AHMA_TLS_DIR`).
+    /// The private key is written with mode 0600 on Unix.  Safe to re-run —
+    /// does nothing if the certificate already exists.
+    Init,
+    /// Rotate the local TLS certificate (replace with a freshly generated one).
+    ///
+    /// Deletes the existing certificate and generates a new self-signed certificate
+    /// under `~/.ahma/tls/`.  Use this when the certificate is approaching expiry
+    /// or has been compromised.
+    Rotate,
+    /// Print the local TLS certificate status.
+    ///
+    /// Shows the certificate path, creation time, age, and whether rotation is
+    /// recommended (certificate older than 30 days).
+    Status,
 }
 
 // ── bundle ────────────────────────────────────────────────────────────────────
@@ -1543,7 +1615,7 @@ pub async fn run() -> Result<()> {
     dispatch_subcommand(subcommand, cfg).await
 }
 
-fn initialize_sandbox(cfg: &AppConfig) -> Result<Option<Arc<sandbox::Sandbox>>> {
+pub(crate) fn initialize_sandbox(cfg: &AppConfig) -> Result<Option<Arc<sandbox::Sandbox>>> {
     let policy = resolve_sandbox_policy(cfg);
 
     check_sandbox_availability(policy.no_sandbox)?;
@@ -1633,53 +1705,60 @@ fn print_command_arg_positional(arg: &crate::config::CommandOption) {
     println!();
 }
 
-fn print_subcommands(subs: &[crate::config::SubcommandConfig]) {
-    println!("  Subcommands:");
-    for sub in subs {
-        let status = if sub.enabled { "" } else { " (disabled)" };
-        println!("    - {}{}: {}", sub.name, status, sub.description);
-        if let Some(ref opts) = sub.options {
-            for opt in opts {
-                print_command_arg_flag(opt);
-            }
-        }
-        if let Some(ref pos) = sub.positional_args {
-            for arg in pos {
-                print_command_arg_positional(arg);
-            }
+fn print_optional_command_args(
+    args: Option<&[crate::config::CommandOption]>,
+    printer: fn(&crate::config::CommandOption),
+) {
+    if let Some(args) = args {
+        for arg in args {
+            printer(arg);
         }
     }
 }
 
+fn print_subcommand(sub: &crate::config::SubcommandConfig) {
+    let status = if sub.enabled { "" } else { " (disabled)" };
+    println!("    - {}{}: {}", sub.name, status, sub.description);
+    print_optional_command_args(sub.options.as_deref(), print_command_arg_flag);
+    print_optional_command_args(sub.positional_args.as_deref(), print_command_arg_positional);
+}
+
+fn print_subcommands(subs: &[crate::config::SubcommandConfig]) {
+    println!("  Subcommands:");
+    for sub in subs {
+        print_subcommand(sub);
+    }
+}
+
+fn print_hint_line(label: &str, value: &str) {
+    println!("    {}: {}", label, value);
+}
+
 fn print_hints(h: &crate::config::ToolHints) {
-    let has_hints = h.build.is_some()
-        || h.test.is_some()
-        || h.dependencies.is_some()
-        || h.clean.is_some()
-        || h.run.is_some()
-        || h.custom.as_ref().is_some_and(|c| !c.is_empty());
-    if !has_hints {
+    let standard_hints = [
+        ("build", h.build.as_deref()),
+        ("test", h.test.as_deref()),
+        ("dependencies", h.dependencies.as_deref()),
+        ("clean", h.clean.as_deref()),
+        ("run", h.run.as_deref()),
+    ];
+    let custom_hints = h.custom.as_ref().filter(|custom| !custom.is_empty());
+
+    if !standard_hints.iter().any(|(_, value)| value.is_some()) && custom_hints.is_none() {
         return;
     }
+
     println!("  Hints:");
-    if let Some(ref v) = h.build {
-        println!("    build: {}", v);
+
+    for (label, value) in standard_hints {
+        if let Some(value) = value {
+            print_hint_line(label, value);
+        }
     }
-    if let Some(ref v) = h.test {
-        println!("    test: {}", v);
-    }
-    if let Some(ref v) = h.dependencies {
-        println!("    dependencies: {}", v);
-    }
-    if let Some(ref v) = h.clean {
-        println!("    clean: {}", v);
-    }
-    if let Some(ref v) = h.run {
-        println!("    run: {}", v);
-    }
-    if let Some(ref custom) = h.custom {
+
+    if let Some(custom) = custom_hints {
         for (k, v) in custom {
-            println!("    {}: {}", k, v);
+            print_hint_line(k, v);
         }
     }
 }
@@ -1695,35 +1774,43 @@ fn print_availability_check(ac: &crate::config::AvailabilityCheck) {
     println!();
 }
 
-fn print_tool_info_text(tools: &[(&String, &crate::config::ToolConfig)]) {
+fn print_tool_info_header(total_tools: usize) {
     println!("Local Tool Configurations");
     println!("=========================");
     println!();
-    println!("Total tools: {}", tools.len());
+    println!("Total tools: {}", total_tools);
     println!();
+}
+
+fn print_tool_info_entry(name: &str, config: &crate::config::ToolConfig) {
+    println!("Tool: {}", name);
+    println!("  Description: {}", config.description);
+    println!("  Command:     {}", config.command);
+    println!("  Enabled:     {}", config.enabled);
+    if let Some(timeout) = config.timeout_seconds {
+        println!("  Timeout:     {}s", timeout);
+    }
+    if let Some(sync) = config.synchronous {
+        println!("  Synchronous: {}", sync);
+    }
+    if let Some(ref subs) = config.subcommand {
+        print_subcommands(subs);
+    }
+    print_hints(&config.hints);
+    if let Some(ref ac) = config.availability_check {
+        print_availability_check(ac);
+    }
+    if let Some(ref inst) = config.install_instructions {
+        println!("  Install: {}", inst);
+    }
+    println!();
+}
+
+fn print_tool_info_text(tools: &[(&String, &crate::config::ToolConfig)]) {
+    print_tool_info_header(tools.len());
 
     for (name, config) in tools {
-        println!("Tool: {}", name);
-        println!("  Description: {}", config.description);
-        println!("  Command:     {}", config.command);
-        println!("  Enabled:     {}", config.enabled);
-        if let Some(timeout) = config.timeout_seconds {
-            println!("  Timeout:     {}s", timeout);
-        }
-        if let Some(sync) = config.synchronous {
-            println!("  Synchronous: {}", sync);
-        }
-        if let Some(ref subs) = config.subcommand {
-            print_subcommands(subs);
-        }
-        print_hints(&config.hints);
-        if let Some(ref ac) = config.availability_check {
-            print_availability_check(ac);
-        }
-        if let Some(ref inst) = config.install_instructions {
-            println!("  Install: {}", inst);
-        }
-        println!();
+        print_tool_info_entry(name, config);
     }
 }
 
@@ -2322,6 +2409,24 @@ mod tests {
         } else {
             panic!("expected tool validate with target");
         }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_subcommand_tls_bails_for_custom_binary() {
+        let err = dispatch_subcommand(
+            Subcommands::Tls(TlsArgs {
+                command: TlsCommand::Status,
+            }),
+            make_cfg(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("tls commands are provided by the ahma_bin crate"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

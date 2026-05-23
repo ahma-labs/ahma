@@ -9,9 +9,11 @@ ahma update                    # latest published release
 ahma update 0.6.7              # specific release tag
 ahma update main               # build from Git branch
 ahma update feature/my-branch  # build from feature branch
+ahma update --install-hooks    # also install user-scoped terminal hooks
 ```
 
 Use `--force` to reinstall when the version already matches. Use `--dry-run` to preview actions.
+When run interactively, `ahma update` now offers user-scoped terminal hook installation if none are currently managed.
 
 Custom install location: `--install-dir ~/.local/bin` or `AHMA_INSTALL_DIR`.
 
@@ -90,7 +92,13 @@ Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 
 ## After installation
 
+- The install script now offers optional user-scoped terminal hook setup for Cursor, Claude Code, and Codex.
 - Configure your MCP client — see [connection-modes.md](connection-modes.md).
+- Optional terminal hooks for Cursor, Claude Code, and Codex:
+	- `ahma hooks install` installs user-scoped managed hooks using the current binary path.
+	- `ahma hooks install --scope project` writes portable project hooks that call `ahma` from `PATH`.
+	- `ahma hooks status` shows both user and project hook status.
+	- `ahma hooks uninstall` removes managed hooks again if you no longer want shell-tool wrapping.
 - Optional agent skill — see [agent-skills.md](agent-skills.md).
 - Restart MCP clients or reload your IDE after updating the binary.
 

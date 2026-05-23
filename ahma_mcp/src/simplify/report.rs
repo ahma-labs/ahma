@@ -14,13 +14,55 @@ pub struct LanguageSummary {
     pub package_scores: Vec<(String, f64)>,
 }
 
+fn average<I>(values: I) -> f64
+where
+    I: IntoIterator<Item = f64>,
+{
+    let (sum, count) = values
+        .into_iter()
+        .fold((0.0, 0usize), |(sum, count), value| {
+            (sum + value, count + 1)
+        });
+
+    if count == 0 { 0.0 } else { sum / count as f64 }
+}
+
+fn sorted_languages<T>(language_map: &HashMap<Language, T>) -> Vec<&Language> {
+    let mut languages: Vec<_> = language_map.keys().collect();
+    languages.sort_by(|a, b| a.display_name().cmp(b.display_name()));
+    languages
+}
+
+fn language_group_label(lang: &Language, is_workspace: bool) -> &'static str {
+    match lang {
+        Language::Rust => {
+            if is_workspace {
+                "Crate"
+            } else {
+                "Module"
+            }
+        }
+        Language::Python | Language::JavaScript | Language::TypeScript => "Module",
+        Language::Kotlin | Language::Java => "Package",
+        _ => "Directory",
+    }
+}
+
+fn relative_path_string(path: &Path, base_dir: &Path) -> String {
+    get_relative_path(path, base_dir)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn path_components(path: &Path) -> Vec<String> {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect()
+}
+
 impl RepoSummary {
     pub fn from_files(files: &[FileSimplicity], base_dir: &Path) -> Self {
-        let avg_score = if files.is_empty() {
-            0.0
-        } else {
-            files.iter().map(|f| f.score).sum::<f64>() / files.len() as f64
-        };
+        let avg_score = average(files.iter().map(|f| f.score));
 
         let mut lang_map: HashMap<Language, Vec<&FileSimplicity>> = HashMap::new();
         for f in files {
@@ -30,11 +72,7 @@ impl RepoSummary {
         let mut language_summaries = HashMap::new();
 
         for (lang, lang_files) in lang_map {
-            let lang_avg = if lang_files.is_empty() {
-                0.0
-            } else {
-                lang_files.iter().map(|f| f.score).sum::<f64>() / lang_files.len() as f64
-            };
+            let lang_avg = average(lang_files.iter().map(|f| f.score));
 
             let mut package_map: HashMap<String, Vec<f64>> = HashMap::new();
             for f in &lang_files {
@@ -44,10 +82,7 @@ impl RepoSummary {
 
             let mut package_scores: Vec<(String, f64)> = package_map
                 .into_iter()
-                .map(|(p, scores)| {
-                    let avg = scores.iter().sum::<f64>() / scores.len() as f64;
-                    (p, avg)
-                })
+                .map(|(p, scores)| (p, average(scores)))
                 .collect();
             package_scores.sort_by(|a, b| {
                 b.1.partial_cmp(&a.1)
@@ -158,9 +193,7 @@ fn write_executive_summary(report: &mut String, avg_score: f64) {
 }
 
 fn write_package_simplicity(report: &mut String, summary: &RepoSummary, is_workspace: bool) {
-    // Sort languages by name for consistent output
-    let mut languages: Vec<_> = summary.language_summaries.keys().collect();
-    languages.sort_by(|a, b| a.display_name().cmp(b.display_name()));
+    let languages = sorted_languages(&summary.language_summaries);
 
     for lang in languages {
         if let Some(lang_summary) = summary.language_summaries.get(lang) {
@@ -170,18 +203,7 @@ fn write_package_simplicity(report: &mut String, summary: &RepoSummary, is_works
                 lang_summary.score
             ));
 
-            let group_label = match lang {
-                Language::Rust => {
-                    if is_workspace {
-                        "Crate"
-                    } else {
-                        "Module"
-                    }
-                }
-                Language::Python | Language::JavaScript | Language::TypeScript => "Module",
-                Language::Kotlin | Language::Java => "Package",
-                _ => "Directory",
-            };
+            let group_label = language_group_label(lang, is_workspace);
 
             if lang_summary.package_scores.len() > 1 {
                 report.push_str(&format!("### By {}\n\n", group_label));
@@ -224,21 +246,14 @@ fn disambiguate_display_names(files: &[&FileSimplicity], base_dir: &Path) -> Vec
                 return basename.clone();
             }
 
-            let components: Vec<String> = rel_path
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().to_string())
-                .collect();
+            let components = path_components(rel_path);
             let n = components.len();
 
             let siblings: Vec<Vec<String>> = entries
                 .iter()
                 .enumerate()
                 .filter(|(j, (_, b))| *j != i && b == basename)
-                .map(|(_, (rp, _))| {
-                    rp.components()
-                        .map(|c| c.as_os_str().to_string_lossy().to_string())
-                        .collect()
-                })
+                .map(|(_, (rp, _))| path_components(rp))
                 .collect();
 
             for depth in 2..=n {
@@ -261,14 +276,83 @@ fn disambiguate_display_names(files: &[&FileSimplicity], base_dir: &Path) -> Vec
         .collect()
 }
 
+fn write_issue_metrics(report: &mut String, file: &FileSimplicity) {
+    report.push_str(&format!(
+        "    - Metrics: Cog: {:.0}, PeakCog: {:.0}, Cyc: {:.0}, SLOC: {:.0}, MI: {:.1}\n",
+        file.cognitive, file.peak_cognitive, file.cyclomatic, file.sloc, file.mi
+    ));
+}
+
+fn write_hotspot_details(report: &mut String, file: &FileSimplicity) {
+    if !file.hotspots.is_empty() {
+        report.push_str("    - **Hotspots**:\n");
+        for hotspot in &file.hotspots {
+            report.push_str(&format!(
+                "      - `{}()` lines {}-{}: Cog={}, Cyc={}, SLOC={}\n",
+                hotspot.name,
+                hotspot.start_line,
+                hotspot.end_line,
+                hotspot.cognitive as u32,
+                hotspot.cyclomatic as u32,
+                hotspot.sloc as u32
+            ));
+        }
+    }
+}
+
+fn write_detekt_findings(report: &mut String, file: &FileSimplicity) {
+    let other_issues: Vec<_> = file
+        .external_issues
+        .iter()
+        .filter(|issue| {
+            let rule = issue.rule.to_lowercase();
+            !rule.contains("cognitive") && !rule.contains("cyclomatic")
+        })
+        .take(5)
+        .collect();
+
+    if !other_issues.is_empty() {
+        report.push_str("    - **Detekt Findings**:\n");
+        for issue in other_issues {
+            let fn_ctx = issue
+                .function_name
+                .as_deref()
+                .map(|name| format!(" in `{name}()`"))
+                .unwrap_or_default();
+            report.push_str(&format!(
+                "      - [{}{}] {} (line {})\n",
+                issue.rule, fn_ctx, issue.message, issue.start_line
+            ));
+        }
+    }
+}
+
+fn write_emergency_entry(
+    report: &mut String,
+    rank: usize,
+    file: &FileSimplicity,
+    display_name: &str,
+    base_dir: &Path,
+) {
+    let culprit = identify_culprit(file);
+    let rel_str = relative_path_string(Path::new(&file.path), base_dir);
+
+    report.push_str(&format!(
+        "{}. **{}**: Simplicity: {:.0}% ({})**\n\t{}\n",
+        rank, display_name, file.score, culprit, rel_str
+    ));
+    write_issue_metrics(report, file);
+    write_hotspot_details(report, file);
+    write_detekt_findings(report, file);
+}
+
 fn write_emergencies(report: &mut String, files: &[FileSimplicity], limit: usize, base_dir: &Path) {
     let mut lang_map: HashMap<Language, Vec<&FileSimplicity>> = HashMap::new();
     for f in files {
         lang_map.entry(f.language).or_default().push(f);
     }
 
-    let mut languages: Vec<_> = lang_map.keys().collect();
-    languages.sort_by(|a, b| a.display_name().cmp(b.display_name()));
+    let languages = sorted_languages(&lang_map);
 
     for lang in languages {
         let lang_files = lang_map.get(lang).unwrap();
@@ -283,61 +367,7 @@ fn write_emergencies(report: &mut String, files: &[FileSimplicity], limit: usize
         ));
 
         for (i, f) in displayed.iter().enumerate() {
-            let culprit = identify_culprit(f);
-            let path = Path::new(&f.path);
-            let rel_path = get_relative_path(path, base_dir);
-            let rel_str = rel_path.to_string_lossy();
-
-            report.push_str(&format!(
-                "{}. **{}**: Simplicity: {:.0}% ({})**\n\t{}\n",
-                i + 1,
-                display_names[i],
-                f.score,
-                culprit,
-                rel_str
-            ));
-            report.push_str(&format!(
-                "    - Metrics: Cog: {:.0}, PeakCog: {:.0}, Cyc: {:.0}, SLOC: {:.0}, MI: {:.1}\n",
-                f.cognitive, f.peak_cognitive, f.cyclomatic, f.sloc, f.mi
-            ));
-            if !f.hotspots.is_empty() {
-                report.push_str("    - **Hotspots**:\n");
-                for h in &f.hotspots {
-                    report.push_str(&format!(
-                        "      - `{}()` lines {}-{}: Cog={}, Cyc={}, SLOC={}\n",
-                        h.name,
-                        h.start_line,
-                        h.end_line,
-                        h.cognitive as u32,
-                        h.cyclomatic as u32,
-                        h.sloc as u32
-                    ));
-                }
-            }
-            // Show additional Detekt findings (style/other rules not in hotspots).
-            let other_issues: Vec<_> = f
-                .external_issues
-                .iter()
-                .filter(|i| {
-                    let r = i.rule.to_lowercase();
-                    !r.contains("cognitive") && !r.contains("cyclomatic")
-                })
-                .take(5)
-                .collect();
-            if !other_issues.is_empty() {
-                report.push_str("    - **Detekt Findings**:\n");
-                for issue in other_issues {
-                    let fn_ctx = issue
-                        .function_name
-                        .as_deref()
-                        .map(|n| format!(" in `{n}()`"))
-                        .unwrap_or_default();
-                    report.push_str(&format!(
-                        "      - [{}{}] {} (line {})\n",
-                        issue.rule, fn_ctx, issue.message, issue.start_line
-                    ));
-                }
-            }
+            write_emergency_entry(report, i + 1, f, &display_names[i], base_dir);
         }
         report.push('\n');
     }
@@ -392,8 +422,7 @@ pub fn generate_ai_fix_prompt(
     let index = issue_number - 1;
     let file = files.get(index)?;
 
-    let rel_path = get_relative_path(Path::new(&file.path), base_dir);
-    let rel_str = rel_path.to_string_lossy();
+    let rel_str = relative_path_string(Path::new(&file.path), base_dir);
     let culprit = identify_culprit(file);
     let is_test_file = file.path.contains("/tests/")
         || file.path.contains("_test.rs")
