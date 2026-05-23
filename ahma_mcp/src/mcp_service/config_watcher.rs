@@ -341,7 +341,6 @@ impl AhmaMcpService {
                 .await
                 .map(|m| m.is_dir())
                 .unwrap_or(false);
-
             if is_dir {
                 let already_loaded = self
                     .current_tools_dir
