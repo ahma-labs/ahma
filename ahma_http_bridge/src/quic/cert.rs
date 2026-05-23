@@ -1,6 +1,11 @@
 //! TLS certificate generation for the HTTP/3 (QUIC) server.
 //!
-//! Generates a self-signed certificate valid for `127.0.0.1` and `localhost`.
+//! Prefers loading the persistent certificate from `~/.ahma/tls/` (managed by
+//! [`ahma_common::local_tls`]).  Falls back to generating a fresh ephemeral
+//! self-signed certificate when the persistent store is unavailable (e.g. on
+//! first run before `ahma tls init` has been called, or when the directory is
+//! not writable).
+//!
 //! The certificate DER bytes are exported so test clients can add them to their
 //! trust stores via `reqwest::ClientBuilder::add_root_certificate()`.
 
@@ -13,6 +18,38 @@ pub struct SelfSignedCert {
     pub cert_der: Vec<u8>,
     /// DER-encoded private key bytes (for rustls).
     pub key_der: Vec<u8>,
+}
+
+/// Load the persistent TLS certificate from `~/.ahma/tls/`, generating new
+/// material if the directory is empty.
+///
+/// Falls back to an ephemeral self-signed certificate on any I/O or generation
+/// error so that the QUIC endpoint always starts.
+pub fn load_or_generate() -> SelfSignedCert {
+    let config = ahma_common::local_tls::LocalTlsConfig::from_env();
+    match ahma_common::local_tls::provision_if_needed(&config) {
+        Ok(certs) => {
+            tracing::info!(
+                "QUIC: using persistent TLS certificate from {}",
+                config.dir.display()
+            );
+            SelfSignedCert {
+                cert_der: certs.cert_der,
+                key_der: certs.key_der,
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "QUIC: could not load/generate persistent TLS cert ({}); \
+                 using ephemeral certificate. Run `ahma tls init` to persist it.",
+                e
+            );
+            generate_self_signed_cert().unwrap_or_else(|e2| {
+                // This should never happen — rcgen generation is infallible in practice.
+                panic!("QUIC: failed to generate ephemeral self-signed cert: {e2}");
+            })
+        }
+    }
 }
 
 /// Generate a self-signed TLS certificate valid for `127.0.0.1` and `localhost`.

@@ -69,6 +69,45 @@ Connecting to: http://localhost:3000
 
 Press Ctrl-C to exit.
 
+## Transport auto-detection
+
+`ahma tui` automatically picks the best available transport in order:
+
+1. **Unix socket** (`/tmp/ahma.sock` or `$AHMA_UNIX_SOCKET`) — lowest latency, local only.
+2. **HTTP/3 (QUIC)** — when the server advertises `Alt-Svc: h3=…` _and_ local TLS material exists at `~/.ahma/tls/`. See [TLS provisioning](#tls-provisioning-for-quic) below.
+3. **HTTP/1.1 / HTTP/2** — plain TCP, always available as a fallback.
+
+The transport in use is shown in the TUI header (e.g. `transport: HTTP/3 (QUIC)` or `transport: Unix socket`).
+
+Use `--connect` to bypass detection and force a specific endpoint:
+
+```bash
+# Force a specific HTTP address (skips Unix socket probe)
+ahma tui --connect http://localhost:8080
+
+# Force the Unix socket path
+ahma tui --connect unix:///run/ahma/mcp.sock
+```
+
+Set `AHMA_DISABLE_QUIC=1` to prevent the HTTP/3 upgrade even when the server advertises it.
+
+## TLS provisioning for QUIC
+
+HTTP/3 transport requires TLS. `ahma` manages a persistent self-signed certificate at `~/.ahma/tls/` (override with `$AHMA_TLS_DIR`):
+
+```bash
+# Generate certificate on first use (safe to re-run — idempotent)
+ahma tls init
+
+# Replace the certificate (e.g. after 30 days or key compromise)
+ahma tls rotate
+
+# Check certificate age and rotation status
+ahma tls status
+```
+
+The `ahma tls init` step is offered automatically during `install.sh`. The private key is stored with 0600 permissions.
+
 ## See also
 
 - [docs/renewal-contract.md](renewal-contract.md) — task renewal and approval gates

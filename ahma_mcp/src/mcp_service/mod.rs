@@ -157,6 +157,63 @@ impl AhmaMcpService {
         );
     }
 
+    fn leaf_subcommands(
+        tool_config: &ToolConfig,
+    ) -> Vec<(String, &crate::config::SubcommandConfig)> {
+        let mut leaf_subcommands = Vec::new();
+        if let Some(subcommands) = &tool_config.subcommand {
+            schema::collect_leaf_subcommands(subcommands, "", &mut leaf_subcommands);
+        }
+        leaf_subcommands
+    }
+
+    fn creates_single_tool(
+        leaf_subcommands: &[(String, &crate::config::SubcommandConfig)],
+    ) -> bool {
+        match leaf_subcommands {
+            [] => true,
+            [(name, _)] => name == "default",
+            _ => false,
+        }
+    }
+
+    fn build_single_tool_from_config(&self, tool_config: &ToolConfig) -> Tool {
+        let base_name = &tool_config.name;
+        let description = self.tool_description(tool_config, base_name);
+        let input_schema =
+            schema::generate_schema_for_tool_config(tool_config, self.guidance.as_ref());
+        Tool::new(base_name.clone(), description, input_schema).with_title(base_name.clone())
+    }
+
+    fn flattened_subcommand_description(
+        tool_config: &ToolConfig,
+        subcommand_config: &crate::config::SubcommandConfig,
+    ) -> String {
+        if subcommand_config.description.is_empty() {
+            tool_config.description.clone()
+        } else {
+            subcommand_config.description.clone()
+        }
+    }
+
+    fn build_flattened_tool_from_config(
+        &self,
+        tool_config: &ToolConfig,
+        sub_path: &str,
+        subcommand_config: &crate::config::SubcommandConfig,
+    ) -> Tool {
+        let base_name = &tool_config.name;
+        let flat_name = format!("{}_{}", base_name, sub_path);
+        let sub_description =
+            Self::flattened_subcommand_description(tool_config, subcommand_config);
+        let description = self.tool_description_text(tool_config, &flat_name, &sub_description);
+        let input_schema = Arc::new(schema::generate_single_command_schema_pub(
+            tool_config,
+            &(sub_path.to_string(), subcommand_config),
+        ));
+        Tool::new(flat_name.clone(), description, input_schema).with_title(flat_name)
+    }
+
     /// Creates MCP Tools from a ToolConfig.
     ///
     /// If the tool has subcommands, returns one flattened Tool per leaf subcommand
@@ -164,47 +221,17 @@ impl AhmaMcpService {
     /// subcommands (or only a single `"default"` one), returns a single Tool
     /// with the original config name.
     fn create_tools_from_config(&self, tool_config: &ToolConfig) -> Vec<Tool> {
-        let base_name = &tool_config.name;
+        let leaf_subcommands = Self::leaf_subcommands(tool_config);
 
-        let mut leaf_subcommands = Vec::new();
-        if let Some(subcommands) = &tool_config.subcommand {
-            schema::collect_leaf_subcommands(subcommands, "", &mut leaf_subcommands);
-        }
-
-        // Single tool without subcommands, or a single "default" subcommand
-        let is_single_default = match leaf_subcommands.as_slice() {
-            [] => true,
-            [(name, _)] if name == "default" => true,
-            _ => false,
-        };
-
-        if is_single_default {
-            let description = self.tool_description(tool_config, base_name);
-            let input_schema =
-                schema::generate_schema_for_tool_config(tool_config, self.guidance.as_ref());
-            return vec![
-                Tool::new(base_name.clone(), description, input_schema)
-                    .with_title(base_name.clone()),
-            ];
+        if Self::creates_single_tool(&leaf_subcommands) {
+            return vec![self.build_single_tool_from_config(tool_config)];
         }
 
         // Multiple subcommands → flatten into one Tool per leaf
         leaf_subcommands
-            .iter()
-            .map(|(sub_path, sub_config)| {
-                let flat_name = format!("{}_{}", base_name, sub_path);
-                let sub_description = if sub_config.description.is_empty() {
-                    tool_config.description.clone()
-                } else {
-                    sub_config.description.clone()
-                };
-                let description =
-                    self.tool_description_text(tool_config, &flat_name, &sub_description);
-                let input_schema = Arc::new(schema::generate_single_command_schema_pub(
-                    tool_config,
-                    &(sub_path.clone(), *sub_config),
-                ));
-                Tool::new(flat_name.clone(), description, input_schema).with_title(flat_name)
+            .into_iter()
+            .map(|(sub_path, subcommand_config)| {
+                self.build_flattened_tool_from_config(tool_config, &sub_path, subcommand_config)
             })
             .collect()
     }
@@ -256,23 +283,23 @@ impl AhmaMcpService {
         None
     }
 
+    fn current_peer(&self) -> Option<Peer<RoleServer>> {
+        self.peer.read().unwrap().clone()
+    }
+
     /// Sends a `notifications/tools/list_changed` notification to the connected client.
     ///
     /// Called after bundle disclosure state changes (e.g., via `activate_tools reveal`).
     pub async fn notify_tools_changed(&self) {
-        let peer_opt = {
-            let peer_lock = self.peer.read().unwrap();
-            peer_lock.clone()
+        let Some(peer) = self.current_peer() else {
+            tracing::debug!("No peer connected, skipping tools/list_changed notification");
+            return;
         };
 
-        if let Some(peer) = peer_opt {
-            if let Err(e) = peer.notify_tool_list_changed().await {
-                tracing::error!("Failed to send tools/list_changed notification: {}", e);
-            } else {
-                tracing::info!("Sent tools/list_changed notification after bundle reveal");
-            }
+        if let Err(e) = peer.notify_tool_list_changed().await {
+            tracing::error!("Failed to send tools/list_changed notification: {}", e);
         } else {
-            tracing::debug!("No peer connected, skipping tools/list_changed notification");
+            tracing::info!("Sent tools/list_changed notification after bundle reveal");
         }
     }
 
@@ -299,6 +326,9 @@ impl AhmaMcpService {
         "sandboxed_shell",
         "cancel",
         "activate_tools",
+        "logs_list",
+        "logs_read",
+        "logs_search",
     ];
 
     /// Returns a snapshot of the disclosed-bundle set when progressive
@@ -384,21 +414,86 @@ impl AhmaMcpService {
         parts.join("\n")
     }
 
+    fn sync_override_from_config(
+        subcommand_config: &crate::config::SubcommandConfig,
+        tool_config: &ToolConfig,
+    ) -> Option<bool> {
+        subcommand_config.synchronous.or(tool_config.synchronous)
+    }
+
+    fn execution_mode_from_preferences(
+        sync_override: Option<bool>,
+        force_synchronous: bool,
+        explicit_mode_str: Option<&str>,
+    ) -> crate::adapter::ExecutionMode {
+        match sync_override {
+            Some(true) => crate::adapter::ExecutionMode::Synchronous,
+            Some(false) => crate::adapter::ExecutionMode::AsyncResultPush,
+            None if force_synchronous || explicit_mode_str == Some("Synchronous") => {
+                crate::adapter::ExecutionMode::Synchronous
+            }
+            None => crate::adapter::ExecutionMode::AsyncResultPush,
+        }
+    }
+
     fn determine_execution_mode(
         &self,
         subcommand_config: &crate::config::SubcommandConfig,
         tool_config: &ToolConfig,
         explicit_mode_str: Option<&str>,
     ) -> crate::adapter::ExecutionMode {
-        let sync_override = subcommand_config.synchronous.or(tool_config.synchronous);
-        if sync_override == Some(true) {
-            crate::adapter::ExecutionMode::Synchronous
-        } else if sync_override == Some(false) {
-            crate::adapter::ExecutionMode::AsyncResultPush
-        } else if self.force_synchronous || explicit_mode_str == Some("Synchronous") {
-            crate::adapter::ExecutionMode::Synchronous
-        } else {
-            crate::adapter::ExecutionMode::AsyncResultPush
+        let sync_override = Self::sync_override_from_config(subcommand_config, tool_config);
+        Self::execution_mode_from_preferences(
+            sync_override,
+            self.force_synchronous,
+            explicit_mode_str,
+        )
+    }
+
+    fn sync_tool_progress_description(base_command: &str, working_directory: &str) -> String {
+        format!("Execute {} in {}", base_command, working_directory)
+    }
+
+    fn sync_started_progress_update(
+        id: &str,
+        base_command: &str,
+        working_directory: &str,
+    ) -> crate::callback_system::ProgressUpdate {
+        crate::callback_system::ProgressUpdate::Started {
+            id: id.to_string(),
+            command: base_command.to_string(),
+            description: Self::sync_tool_progress_description(base_command, working_directory),
+        }
+    }
+
+    fn sync_final_progress_update<E: std::fmt::Display>(
+        id: &str,
+        base_command: &str,
+        working_directory: &str,
+        result: &Result<String, E>,
+    ) -> crate::callback_system::ProgressUpdate {
+        let description = Self::sync_tool_progress_description(base_command, working_directory);
+        let working_directory = working_directory.to_string();
+
+        match result {
+            Ok(output) => crate::callback_system::ProgressUpdate::FinalResult {
+                id: id.to_string(),
+                command: base_command.to_string(),
+                description,
+                working_directory,
+                success: true,
+                duration_ms: 0,
+                full_output: output.clone(),
+            },
+            Err(e) => crate::callback_system::ProgressUpdate::FinalResult {
+                id: id.to_string(),
+                command: base_command.to_string(),
+                description,
+                working_directory,
+                success: false,
+                duration_ms: 0,
+                full_output: format!("Error: {}", e),
+            },
         }
     }
 
@@ -419,11 +514,11 @@ impl AhmaMcpService {
             let callback =
                 McpCallbackSender::new(peer.clone(), id.clone(), Some(token), client_type);
             let _ = callback
-                .send_progress(crate::callback_system::ProgressUpdate::Started {
-                    id: id.clone(),
-                    command: base_command.to_string(),
-                    description: format!("Execute {} in {}", base_command, working_directory),
-                })
+                .send_progress(Self::sync_started_progress_update(
+                    &id,
+                    base_command,
+                    working_directory,
+                ))
                 .await;
         }
 
@@ -440,26 +535,8 @@ impl AhmaMcpService {
 
         if let Some(token) = progress_token {
             let callback = McpCallbackSender::new(peer, id.clone(), Some(token), client_type);
-            let final_update = match &result {
-                Ok(output) => crate::callback_system::ProgressUpdate::FinalResult {
-                    id: id.clone(),
-                    command: base_command.to_string(),
-                    description: format!("Execute {} in {}", base_command, working_directory),
-                    working_directory: working_directory.to_string(),
-                    success: true,
-                    duration_ms: 0,
-                    full_output: output.clone(),
-                },
-                Err(e) => crate::callback_system::ProgressUpdate::FinalResult {
-                    id: id.clone(),
-                    command: base_command.to_string(),
-                    description: format!("Execute {} in {}", base_command, working_directory),
-                    working_directory: working_directory.to_string(),
-                    success: false,
-                    duration_ms: 0,
-                    full_output: format!("Error: {}", e),
-                },
-            };
+            let final_update =
+                Self::sync_final_progress_update(&id, base_command, working_directory, &result);
             let _ = callback.send_progress(final_update).await;
         }
 
@@ -761,37 +838,48 @@ impl ServerHandler for AhmaMcpService {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
-            let mut tools = Vec::new();
-
-            // Hard-wired await command - always available
-            tools.push(
+            let mut tools = vec![
+                // Hard-wired await command - always available
                 Tool::new(
                     "await",
                     "Block until a started operation completes and return its final result. Operations notify automatically when they finish, so prefer doing other useful work first; reach for `await` only when the next step truly depends on the result.",
                     self.generate_input_schema_for_wait(),
                 )
                 .with_title("await"),
-            );
-
-            // Hard-wired status command - always available
-            tools.push(
+                // Hard-wired status command - always available
                 Tool::new(
                     "status",
                     "Return a snapshot of active and completed operations without blocking. Completion is pushed via notifications, so this is for ad-hoc inspection rather than polling.",
                     self.generate_input_schema_for_status(),
                 )
                 .with_title("status"),
-            );
-
-            // Hard-wired sandboxed_shell command - always available
-            tools.push(
+                // Hard-wired sandboxed_shell command - always available
                 Tool::new(
                     "sandboxed_shell",
                     "Run a shell command inside a kernel-level filesystem sandbox (Landlock on Linux, Seatbelt on macOS, Job Objects on Windows). Returns an operation_id immediately; use `status`, `await`, or `cancel` to manage long-running work. Supports pipes, redirects, environment variables, and full shell syntax. Set `monitor_level` to stream error/warning alerts from stdout or stderr.",
                     self.generate_input_schema_for_sandboxed_shell(),
                 )
                 .with_title("sandboxed_shell"),
-            );
+                // Hard-wired log inspection tools — always available
+                Tool::new(
+                    "logs_list",
+                    "List all log files in the project log directory (`./log/`). Returns file names, sizes, modification times, and symlink targets. Use this to discover which log files are available before calling logs_read or logs_search.",
+                    handlers::log_tools::logs_list_schema(),
+                )
+                .with_title("logs_list"),
+                Tool::new(
+                    "logs_read",
+                    "Read lines from a project log file with optional pagination. Sensitive values (tokens, passwords, API keys) are redacted by default. Use `raw: true` only when debugging credential issues.",
+                    handlers::log_tools::logs_read_schema(),
+                )
+                .with_title("logs_read"),
+                Tool::new(
+                    "logs_search",
+                    "Search a project log file for lines matching a pattern (case-insensitive substring match by default). Returns matching lines with line numbers. Sensitive values are redacted by default.",
+                    handlers::log_tools::logs_search_schema(),
+                )
+                .with_title("logs_search"),
+            ];
 
             // When progressive disclosure is enabled, expose the activate_tools meta-tool
             // with a dynamically generated description listing all loaded bundles
@@ -845,6 +933,18 @@ impl ServerHandler for AhmaMcpService {
                 }
                 "activate_tools" => {
                     self.handle_discover_tools(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "logs_list" => {
+                    self.handle_logs_list(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "logs_read" => {
+                    self.handle_logs_read(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "logs_search" => {
+                    self.handle_logs_search(params.arguments.unwrap_or_default())
                         .await
                 }
                 _ => self.dispatch_configured_tool(params, context).await,

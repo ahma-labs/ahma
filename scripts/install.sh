@@ -14,8 +14,8 @@
 set -euo pipefail
 
 # Skill version — keep in sync with [workspace.package] version in Cargo.toml.
-# CI guardrails verify this matches. Bump alongside Cargo.toml on every release.
-AHMA_VERSION="0.6.5"
+# CI guardrails verify this matches. Bump via: cargo xtask bump-version X.Y.Z
+AHMA_VERSION="0.7.1"
 
 # Detect OS and Architecture
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -202,6 +202,7 @@ fi
 
 "$INSTALL_DIR/ahma" --version
 echo "Success! Installed ahma to ${INSTALL_DIR}"
+AHMA_BIN="$INSTALL_DIR/ahma"
 
 # Remove legacy ahma-simplify binary if present
 for legacy_bin in "$INSTALL_DIR/ahma-simplify" "$HOME/.local/bin/ahma-simplify" "/usr/local/bin/ahma-simplify"; do
@@ -657,6 +658,89 @@ PYEOF
         fi
     else
         echo "No MCP configurations were changed."
+    fi
+    echo ""
+}
+
+setup_terminal_hooks() {
+    set +e  # Wizard exit codes must not abort the script
+
+    if [ ! -e /dev/tty ]; then
+        echo ""
+        echo "Tip: Run '$AHMA_BIN hooks install' later to make ahma the default shell wrapper"
+        echo "     in Cursor, Claude Code, and Codex."
+        return 0
+    fi
+
+    if [ ! -x "$AHMA_BIN" ]; then
+        return 0
+    fi
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Terminal Hook Setup"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "  Managed terminal hooks rewrite shell/Bash tool calls so ahma becomes"
+    echo "  the default wrapper in supported AI tools."
+    echo ""
+    printf "Install user-scoped terminal hooks for Cursor, Claude Code, and Codex? [y/N]: "
+    local CHOICE
+    IFS= read -r CHOICE < /dev/tty
+    case "$CHOICE" in
+        [Yy]*) ;;
+        *)
+            echo "  Skipped. Run 'ahma hooks install' later if you change your mind."
+            return 0
+            ;;
+    esac
+
+    echo ""
+    echo "Select tools to configure (comma-separated numbers, or Enter for all):"
+    echo "  1) Cursor        (${HOME}/.cursor/hooks.json)"
+    echo "  2) Claude Code   (${HOME}/.claude/settings.json)"
+    echo "  3) Codex         (${HOME}/.codex/hooks.json)"
+    echo ""
+    printf "  Selection [default: 1,2,3 — all]: "
+    local PLATFORMS
+    IFS= read -r PLATFORMS < /dev/tty
+    case "$PLATFORMS" in
+        ""|all|ALL|All) PLATFORMS="1,2,3" ;;
+    esac
+
+    local -a PLATFORM_ARGS=()
+    local HOOK_TOOLS=""
+
+    if _ahma_list_has "$PLATFORMS" 1; then
+        PLATFORM_ARGS+=(--platform cursor)
+        HOOK_TOOLS="${HOOK_TOOLS}|Cursor"
+    fi
+    if _ahma_list_has "$PLATFORMS" 2; then
+        PLATFORM_ARGS+=(--platform claude)
+        HOOK_TOOLS="${HOOK_TOOLS}|Claude Code"
+    fi
+    if _ahma_list_has "$PLATFORMS" 3; then
+        PLATFORM_ARGS+=(--platform codex)
+        HOOK_TOOLS="${HOOK_TOOLS}|Codex"
+    fi
+
+    if [ "${#PLATFORM_ARGS[@]}" -eq 0 ]; then
+        echo "  No tools selected. Skipped."
+        return 0
+    fi
+
+    echo ""
+    echo "  Installing user-scoped terminal hooks..."
+    if "$AHMA_BIN" hooks install --scope user "${PLATFORM_ARGS[@]}"; then
+        echo ""
+        echo "✓ Terminal hooks installed. Restart these tools to pick up the changes:"
+        echo "$HOOK_TOOLS" | tr '|' '\n' | while IFS= read -r TOOL; do
+            [ -n "$TOOL" ] && echo "    - ${TOOL}"
+        done
+    else
+        echo ""
+        echo "Warning: terminal hook installation failed."
+        echo "You can retry later with: $AHMA_BIN hooks install"
     fi
     echo ""
 }
@@ -1315,6 +1399,19 @@ setup_skill() {
 
 # Run the MCP setup wizard
 setup_mcp
+
+# Offer to install managed terminal hooks for supported AI tools
+setup_terminal_hooks
+
+# Offer to initialize local TLS certificates for QUIC/HTTP3 transport
+if [ -e /dev/tty ] && [ -x "$AHMA_BIN" ]; then
+    printf "\nInitialize local TLS certificates for QUIC/HTTP3 transport? [y/N]: "
+    IFS= read -r TLS_CONFIRM < /dev/tty
+    case "$TLS_CONFIRM" in
+        [Yy]*) "$AHMA_BIN" tls init ;;
+        *) echo "  Skipped. Run 'ahma tls init' later to enable QUIC." ;;
+    esac
+fi
 
 # Run the skill setup wizard
 setup_skill

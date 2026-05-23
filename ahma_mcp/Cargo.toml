@@ -19,6 +19,7 @@ ahma_http_mcp_client = { path = "../ahma_http_mcp_client" }
 ahma_llm_monitor = { path = "../ahma_llm_monitor" }
 anyhow.workspace = true
 async-trait.workspace = true
+base64 = "0.22"
 chrono.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
@@ -45,7 +46,7 @@ serde_json.workspace = true
 sha2 = "0.10"
 tar = "0.4"
 tempfile.workspace = true
-zip = "2.2"
+zip = "2.4"
 thiserror.workspace = true
 tokio-util.workspace = true
 tokio = "1.52"

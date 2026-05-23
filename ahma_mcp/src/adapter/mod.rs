@@ -502,7 +502,7 @@ impl Adapter {
                     .send_progress(crate::callback_system::ProgressUpdate::Started {
                         id: op_id.clone(),
                         command: command.clone(),
-                        description: format!("Execute {} in {}", command, wd_clone),
+                        description: execution_description(&command, &wd_clone),
                     })
                     .await;
             }
@@ -541,21 +541,18 @@ impl Adapter {
                             Some(Value::String(error_message.clone())),
                         )
                         .await;
-                    if let Some(callback) = &callback {
-                        let failure_update = crate::callback_system::ProgressUpdate::FinalResult {
-                            id: op_id.clone(),
-                            command: program_with_subcommand.clone(),
-                            description: format!(
-                                "Execute {} in {}",
-                                program_with_subcommand, wd_clone
-                            ),
-                            working_directory: wd_clone.clone(),
-                            success: false,
-                            duration_ms: 0,
-                            full_output: format!("Error: {}", error_message),
-                        };
-                        let _ = callback.send_progress(failure_update).await;
-                    }
+                    send_progress_best_effort(
+                        &callback,
+                        final_result_progress_update(
+                            &op_id,
+                            &program_with_subcommand,
+                            &wd_clone,
+                            false,
+                            0,
+                            format!("Error: {}", error_message),
+                        ),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -678,6 +675,66 @@ fn combine_stdout_stderr(stdout: String, stderr: String) -> String {
     }
 }
 
+fn execution_description(program: &str, working_dir: &str) -> String {
+    format!("Execute {} in {}", program, working_dir)
+}
+
+fn final_result_progress_update(
+    op_id: &str,
+    program: &str,
+    working_dir: &str,
+    success: bool,
+    duration_ms: u64,
+    full_output: String,
+) -> crate::callback_system::ProgressUpdate {
+    crate::callback_system::ProgressUpdate::FinalResult {
+        id: op_id.to_string(),
+        command: program.to_string(),
+        description: execution_description(program, working_dir),
+        working_directory: working_dir.to_string(),
+        success,
+        duration_ms,
+        full_output,
+    }
+}
+
+fn cancelled_progress_update(
+    op_id: &str,
+    message: String,
+    duration_ms: u64,
+) -> crate::callback_system::ProgressUpdate {
+    crate::callback_system::ProgressUpdate::Cancelled {
+        id: op_id.to_string(),
+        message,
+        duration_ms,
+    }
+}
+
+async fn send_progress_best_effort(
+    callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
+    update: crate::callback_system::ProgressUpdate,
+) {
+    if let Some(callback) = callback.as_ref() {
+        let _ = callback.send_progress(update).await;
+    }
+}
+
+async fn send_final_result_progress(
+    callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
+    update: crate::callback_system::ProgressUpdate,
+    op_id: &str,
+) {
+    let Some(callback) = callback.as_ref() else {
+        return;
+    };
+
+    if let Err(e) = callback.send_progress(update).await {
+        tracing::error!("Failed to send completion notification: {:?}", e);
+    } else {
+        tracing::info!("Sent completion notification for operation: {}", op_id);
+    }
+}
+
 /// Execute a command in batch mode (existing behavior): collect all output at once.
 #[allow(clippy::too_many_arguments)]
 async fn execute_batch(
@@ -722,25 +779,22 @@ async fn execute_batch(
                 .update_status(op_id, status, Some(final_output.clone()))
                 .await;
 
-            if let Some(callback) = callback {
-                let completion_update = crate::callback_system::ProgressUpdate::FinalResult {
-                    id: op_id.to_string(),
-                    command: program.to_string(),
-                    description: format!("Execute {} in {}", program, working_dir),
-                    working_directory: working_dir.to_string(),
+            send_final_result_progress(
+                callback,
+                final_result_progress_update(
+                    op_id,
+                    program,
+                    working_dir,
                     success,
                     duration_ms,
-                    full_output: format!(
+                    format!(
                         "Exit code: {}\nStdout:\n{}\nStderr:\n{}",
                         final_output["exit_code"], final_output["stdout"], final_output["stderr"]
                     ),
-                };
-                if let Err(e) = callback.send_progress(completion_update).await {
-                    tracing::error!("Failed to send completion notification: {:?}", e);
-                } else {
-                    tracing::info!("Sent completion notification for operation: {}", op_id);
-                }
-            }
+                ),
+                op_id,
+            )
+            .await;
         }
         Ok(Err(e)) => {
             let error_message = e.to_string();
@@ -752,18 +806,18 @@ async fn execute_batch(
                 )
                 .await;
 
-            if let Some(callback) = callback {
-                let failure_update = crate::callback_system::ProgressUpdate::FinalResult {
-                    id: op_id.to_string(),
-                    command: program.to_string(),
-                    description: format!("Execute {} in {}", program, working_dir),
-                    working_directory: working_dir.to_string(),
-                    success: false,
+            send_progress_best_effort(
+                callback,
+                final_result_progress_update(
+                    op_id,
+                    program,
+                    working_dir,
+                    false,
                     duration_ms,
-                    full_output: format!("Error: {}", error_message),
-                };
-                let _ = callback.send_progress(failure_update).await;
-            }
+                    format!("Error: {}", error_message),
+                ),
+            )
+            .await;
         }
         Err(_) => {
             let timeout_reason = format!(
@@ -778,15 +832,11 @@ async fn execute_batch(
                 )
                 .await;
 
-            if let Some(callback) = callback {
-                let _ = callback
-                    .send_progress(crate::callback_system::ProgressUpdate::Cancelled {
-                        id: op_id.to_string(),
-                        message: timeout_reason,
-                        duration_ms,
-                    })
-                    .await;
-            }
+            send_progress_best_effort(
+                callback,
+                cancelled_progress_update(op_id, timeout_reason, duration_ms),
+            )
+            .await;
         }
     }
 }
@@ -828,19 +878,18 @@ async fn execute_with_streaming(
                     Some(Value::String(error_message.clone())),
                 )
                 .await;
-            if let Some(callback) = callback {
-                let _ = callback
-                    .send_progress(crate::callback_system::ProgressUpdate::FinalResult {
-                        id: op_id.to_string(),
-                        command: program.to_string(),
-                        description: format!("Execute {} in {}", program, working_dir),
-                        working_directory: working_dir.to_string(),
-                        success: false,
-                        duration_ms: 0,
-                        full_output: format!("Error: {}", error_message),
-                    })
-                    .await;
-            }
+            send_progress_best_effort(
+                callback,
+                final_result_progress_update(
+                    op_id,
+                    program,
+                    working_dir,
+                    false,
+                    0,
+                    format!("Error: {}", error_message),
+                ),
+            )
+            .await;
             return;
         }
     };
@@ -888,15 +937,11 @@ async fn execute_with_streaming(
                         Some(Value::String(timeout_reason.clone())),
                     )
                     .await;
-                if let Some(callback) = callback {
-                    let _ = callback
-                        .send_progress(crate::callback_system::ProgressUpdate::Cancelled {
-                            id: op_id.to_string(),
-                            message: timeout_reason,
-                            duration_ms,
-                        })
-                        .await;
-                }
+                send_progress_best_effort(
+                    callback,
+                    cancelled_progress_update(op_id, timeout_reason, duration_ms),
+                )
+                .await;
                 return;
             }
 
@@ -1004,25 +1049,22 @@ async fn execute_with_streaming(
         .update_status(op_id, status, Some(final_output.clone()))
         .await;
 
-    if let Some(callback) = callback {
-        let completion_update = crate::callback_system::ProgressUpdate::FinalResult {
-            id: op_id.to_string(),
-            command: program.to_string(),
-            description: format!("Execute {} in {}", program, working_dir),
-            working_directory: working_dir.to_string(),
+    send_final_result_progress(
+        callback,
+        final_result_progress_update(
+            op_id,
+            program,
+            working_dir,
             success,
             duration_ms,
-            full_output: format!(
+            format!(
                 "Exit code: {}\nStdout:\n{}\nStderr:\n{}",
                 exit_code, stdout_str, stderr_str
             ),
-        };
-        if let Err(e) = callback.send_progress(completion_update).await {
-            tracing::error!("Failed to send completion notification: {:?}", e);
-        } else {
-            tracing::info!("Sent completion notification for operation: {}", op_id);
-        }
-    }
+        ),
+        op_id,
+    )
+    .await;
 }
 
 /// Handle cancellation of an operation — shared logic for both execution paths.
@@ -1039,7 +1081,7 @@ async fn handle_cancellation(
             Some(Value::String("Operation was cancelled".to_string())),
         )
         .await;
-    if let Some(callback) = callback {
+    if callback.is_some() {
         let reason_owned = match monitor.get_operation(op_id).await {
             Some(op) => {
                 let val = op.result.clone();
@@ -1049,13 +1091,11 @@ async fn handle_cancellation(
             }
             None => "Operation was cancelled".to_string(),
         };
-        let _ = callback
-            .send_progress(crate::callback_system::ProgressUpdate::Cancelled {
-                id: op_id.to_string(),
-                message: reason_owned,
-                duration_ms,
-            })
-            .await;
+        send_progress_best_effort(
+            callback,
+            cancelled_progress_update(op_id, reason_owned, duration_ms),
+        )
+        .await;
     }
 }
 

@@ -13,6 +13,7 @@ coverage = ["dep:serde_json"]
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
+rcgen = "0.13"
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::Parser as _;
 
 use ahma_mcp::shell::cli::{
-    Cli, ClusterCommand, LlmCommand, Subcommands, VaultCommand, build_app_config,
+    Cli, ClusterCommand, LlmCommand, Subcommands, TlsCommand, VaultCommand, build_app_config,
     dispatch_subcommand,
 };
 use ahma_mcp::utils::logging::init_logging_with_observability;
@@ -41,7 +41,11 @@ async fn main() -> Result<()> {
         }
         Subcommands::Tui(tui_args) => {
             tracing::info!("Starting TUI control plane");
-            ahma_tui::run_tui(&tui_args.connect).await
+            ahma_tui::run_tui(tui_args.connect.as_deref()).await
+        }
+        Subcommands::Tls(tls_args) => {
+            tracing::info!("TLS subcommand");
+            dispatch_tls(tls_args)
         }
         Subcommands::Llm(llm_args) => {
             tracing::info!("Dispatching llm subcommand");
@@ -53,6 +57,72 @@ async fn main() -> Result<()> {
         }
         other => dispatch_subcommand(other, cfg).await,
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TLS subcommand handlers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn dispatch_tls(args: ahma_mcp::shell::TlsArgs) -> Result<()> {
+    use ahma_common::local_tls::{
+        LocalTlsConfig, check_rotation_needed, generate_and_save, rotate,
+    };
+
+    let config = LocalTlsConfig::from_env();
+    match args.command {
+        TlsCommand::Init => {
+            if config.exists() {
+                println!(
+                    "Local TLS certificate already exists at {}",
+                    config.cert_path().display()
+                );
+                println!("Use `ahma tls rotate` to replace it with a new certificate.");
+                return Ok(());
+            }
+            generate_and_save(&config).context("Failed to generate local TLS certificate")?;
+            println!("Local TLS certificate generated:");
+            println!("  Certificate : {}", config.cert_path().display());
+            println!("  Private key : {}", config.key_path().display());
+            #[cfg(unix)]
+            println!("  Key permissions : 0600");
+        }
+        TlsCommand::Rotate => {
+            rotate(&config).context("Failed to rotate local TLS certificate")?;
+            println!("Local TLS certificate rotated:");
+            println!("  Certificate : {}", config.cert_path().display());
+            println!("  Private key : {}", config.key_path().display());
+        }
+        TlsCommand::Status => {
+            if !config.exists() {
+                println!("No local TLS certificate found.");
+                println!("  Expected location : {}", config.cert_path().display());
+                println!("  Run `ahma tls init` to generate one.");
+                return Ok(());
+            }
+            let meta = std::fs::metadata(config.cert_path())
+                .context("Failed to read certificate metadata")?;
+            let created = meta
+                .created()
+                .or_else(|_| meta.modified())
+                .context("Failed to read certificate creation time")?;
+            let age = std::time::SystemTime::now()
+                .duration_since(created)
+                .unwrap_or(std::time::Duration::ZERO);
+            let age_days = age.as_secs() / 86_400;
+            let rotation_needed = check_rotation_needed(&config);
+            println!("Local TLS certificate status:");
+            println!("  Certificate : {}", config.cert_path().display());
+            println!("  Private key : {}", config.key_path().display());
+            println!("  Age         : {} day(s)", age_days);
+            if rotation_needed {
+                println!("  Rotation    : RECOMMENDED (certificate is 30+ days old)");
+                println!("  Run `ahma tls rotate` to regenerate it.");
+            } else {
+                println!("  Rotation    : not needed");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn dispatch_vault(args: ahma_mcp::shell::VaultArgs) -> Result<()> {

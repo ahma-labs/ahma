@@ -415,6 +415,11 @@ ahma tool list [--http http://localhost:3000] [--format json]
 
 # Show locally configured tools with descriptions
 ahma tool info [--tools rust,git]
+
+# Local TLS certificate management (required for QUIC/HTTP3 transport)
+ahma tls init      # Generate cert at ~/.ahma/tls/ (idempotent)
+ahma tls rotate    # Replace the certificate with a new one
+ahma tls status    # Show cert path, age, and rotation recommendation
 ```
 
 ---

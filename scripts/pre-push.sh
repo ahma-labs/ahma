@@ -42,7 +42,7 @@ if [ "$SKILL_HTML_VER" != "$CARGO_VER" ]; then
 fi
 if [ "$VER_FAIL" -ne 0 ]; then
   echo ""
-  echo "  Run: ./scripts/bump-version.sh ${CARGO_VER}"
+  echo "  Run: cargo xtask bump-version ${CARGO_VER}"
   echo "  to sync skill version strings to the Cargo.toml value."
   exit 1
 fi

@@ -398,9 +398,13 @@ Notes:
 4. **Run tests**: `cargo nextest run` must pass with ≥80% coverage
 
 Optional local guardrail before pushing:
-- Install pre-push hook: `cp scripts/pre-push.sh .git/hooks/pre-push && chmod +x .git/hooks/pre-push`
-- The hook enforces a clean working tree (including no untracked files) and runs `cargo check --workspace --locked`.
+- Install hooks: `cp scripts/check-guardrails.sh .git/hooks/pre-push && chmod +x .git/hooks/pre-push`
+- The hook enforces a clean working tree, version consistency across all files, and runs `cargo check --workspace --locked`.
 - This catches "works locally but fails on CI checkout" cases caused by untracked required source files.
+
+To bump the version across all files at once:
+- Run: `cargo xtask bump-version X.Y.Z`
+- This updates `Cargo.toml`, `skills/ahma/SKILL.md`, `scripts/install.sh`, and `scripts/install.ps1` in one step.
 
 Optional but recommended for faster runs:
 - `cargo nextest run` (and for ignored: `cargo nextest run --run-ignored all`)

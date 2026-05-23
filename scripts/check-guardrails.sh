@@ -77,6 +77,8 @@ echo "=== Guardrail: skill version consistency with Cargo.toml ==="
 CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
 AHMA_SKILL_VER=$(grep '^version:' skills/ahma/SKILL.md | head -1 | awk '{print $2}')
 SKILL_HTML_VER=$(grep '<!-- version:' skills/ahma/SKILL.md | head -1 | sed -E 's/.*version: ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+INSTALL_SH_VER=$(grep -m1 'AHMA_VERSION="' scripts/install.sh | awk -F'"' '{print $2}')
+INSTALL_PS1_VER=$(grep -m1 "Version '" scripts/install.ps1 | awk -F"'" '{print $2}')
 
 SKILL_VER_FAIL=0
 if [ "$AHMA_SKILL_VER" != "$CARGO_VER" ]; then
@@ -87,13 +89,21 @@ if [ "$SKILL_HTML_VER" != "$CARGO_VER" ]; then
   echo "FAIL skills/ahma/SKILL.md HTML comment version: ${SKILL_HTML_VER} != Cargo.toml version ${CARGO_VER}"
   SKILL_VER_FAIL=1
 fi
+if [ "$INSTALL_SH_VER" != "$CARGO_VER" ]; then
+  echo "FAIL scripts/install.sh AHMA_VERSION: ${INSTALL_SH_VER} != Cargo.toml version ${CARGO_VER}"
+  SKILL_VER_FAIL=1
+fi
+if [ "$INSTALL_PS1_VER" != "$CARGO_VER" ]; then
+  echo "FAIL scripts/install.ps1 Version call: ${INSTALL_PS1_VER} != Cargo.toml version ${CARGO_VER}"
+  SKILL_VER_FAIL=1
+fi
 if [ "$SKILL_VER_FAIL" -ne 0 ]; then
   echo ""
-  echo "  Bump version: in skills/ahma/SKILL.md (YAML and HTML comment)"
-  echo "  to match [workspace.package] version = \"${CARGO_VER}\" in Cargo.toml."
+  echo "  Run: cargo xtask bump-version ${CARGO_VER}"
+  echo "  to sync all version strings to the Cargo.toml value."
   exit 1
 fi
-echo "OK Skill versions consistent (v${CARGO_VER})"
+echo "OK Version strings consistent (v${CARGO_VER})"
 
 echo "=== Guardrail: crate root preflight (src/lib.rs or src/main.rs) ==="
 missing=0

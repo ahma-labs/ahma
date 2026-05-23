@@ -43,6 +43,11 @@ fn roots_handshake_timeout() -> Duration {
     TestTimeouts::get(TimeoutCategory::SseStream)
 }
 
+fn parse_bound_port_line(line: &str) -> Option<u16> {
+    let (_, port_str) = line.split_once("AHMA_BOUND_PORT=")?;
+    port_str.trim().parse().ok()
+}
+
 // =============================================================================
 // Test Infrastructure
 // =============================================================================
@@ -92,12 +97,9 @@ fn wait_for_bound_port(
 
     while start.elapsed() < timeout {
         if let Ok(line) = rx.recv_timeout(poll_interval)
-            && let Some(idx) = line.find("AHMA_BOUND_PORT=")
+            && let Some(port) = parse_bound_port_line(&line)
         {
-            let port_str = &line[idx + "AHMA_BOUND_PORT=".len()..];
-            if let Ok(p) = port_str.trim().parse::<u16>() {
-                return p;
-            }
+            return port;
         }
         if let Ok(Some(status)) = child.try_wait() {
             panic!("Child process exited unexpectedly with status: {}", status);
@@ -156,6 +158,77 @@ async fn start_deferred_sandbox_server(tools_dir: &std::path::Path) -> ServerGua
     let _ = child.kill();
     let _ = child.wait();
     panic!("HTTP bridge failed to start within timeout");
+}
+
+fn server_base_url(server: &ServerGuard) -> String {
+    format!("http://127.0.0.1:{}", server.port())
+}
+
+fn write_pwd_tool_config(tools_dir: &Path) {
+    std::fs::create_dir_all(tools_dir).expect("Failed to create tools dir");
+
+    let tool_config = json!({
+        "name": "pwd",
+        "description": "Print working directory",
+        "command": "pwd",
+        "enabled": true,
+        "subcommand": [{"name": "default", "description": "pwd"}]
+    });
+    std::fs::write(
+        tools_dir.join("pwd.json"),
+        serde_json::to_string_pretty(&tool_config).unwrap(),
+    )
+    .expect("Failed to write tool config");
+}
+
+async fn start_initialized_session(tools_dir: &Path) -> (ServerGuard, String, Client, String) {
+    let server = start_deferred_sandbox_server(tools_dir).await;
+    let base_url = server_base_url(&server);
+    let client = common::make_h2_client();
+    let session_id = initialize_session(&client, &base_url)
+        .await
+        .expect("Initialize failed");
+    (server, base_url, client, session_id)
+}
+
+fn pwd_tool_call(id: u64, working_directory: Option<&Path>) -> Value {
+    match working_directory {
+        Some(working_directory) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "pwd",
+                "arguments": {
+                    "subcommand": "default",
+                    "working_directory": working_directory.to_string_lossy()
+                }
+            }
+        }),
+        None => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "pwd",
+                "arguments": {"subcommand": "default"}
+            }
+        }),
+    }
+}
+
+fn spawn_complete_roots_handshake(
+    client: &Client,
+    base_url: &str,
+    session_id: &str,
+    root_uris: Vec<String>,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    let client = client.clone();
+    let base_url = base_url.to_string();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        complete_roots_handshake_with_uris(&client, &base_url, &session_id, &root_uris).await
+    })
 }
 
 /// Send a JSON-RPC request to the MCP endpoint
@@ -245,18 +318,7 @@ async fn wait_for_tool_ready(
     let mut last_error: Option<String> = None;
 
     while tokio::time::Instant::now() < deadline {
-        let tool_call = json!({
-            "jsonrpc": "2.0",
-            "id": 9001,
-            "method": "tools/call",
-            "params": {
-                "name": "pwd",
-                "arguments": {
-                    "subcommand": "default",
-                    "working_directory": working_directory.to_string_lossy()
-                }
-            }
-        });
+        let tool_call = pwd_tool_call(9001, Some(working_directory));
 
         match send_mcp_request(client, base_url, &tool_call, Some(session_id)).await {
             Ok((response, _)) if response.get("error").is_none() => return Ok(()),
@@ -334,6 +396,31 @@ async fn handle_sse_event(
     )
 }
 
+async fn open_roots_sse_stream(
+    client: &Client,
+    base_url: &str,
+    session_id: &str,
+) -> Result<reqwest::Response, String> {
+    let url = format!("{}/mcp", base_url);
+    // No reqwest .timeout() here: SSE is an infinite stream, so a reqwest timeout fires on the
+    // body read phase and aborts the connection before roots/list arrives. The internal deadline
+    // inside process_roots_list_response handles the per-test time budget.
+    let resp = client
+        .get(&url)
+        .header("Accept", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Mcp-Session-Id", session_id)
+        .send()
+        .await
+        .map_err(|e| format!("SSE connection failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("SSE stream failed: HTTP {}", resp.status()));
+    }
+
+    Ok(resp)
+}
+
 async fn process_roots_list_response(
     resp: reqwest::Response,
     client: &Client,
@@ -384,23 +471,7 @@ async fn answer_roots_list_with_uris(
     session_id: &str,
     root_uris: &[String],
 ) -> Result<(), String> {
-    let url = format!("{}/mcp", base_url);
-    // No reqwest .timeout() here: SSE is an infinite stream, so a reqwest timeout fires on the
-    // body read phase and aborts the connection before roots/list arrives. The internal deadline
-    // inside process_roots_list_response handles the per-test time budget.
-    let resp = client
-        .get(&url)
-        .header("Accept", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header("Mcp-Session-Id", session_id)
-        .send()
-        .await
-        .map_err(|e| format!("SSE connection failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("SSE stream failed: HTTP {}", resp.status()));
-    }
-
+    let resp = open_roots_sse_stream(client, base_url, session_id).await?;
     process_roots_list_response(resp, client, base_url, session_id, root_uris).await
 }
 
@@ -411,23 +482,7 @@ async fn complete_roots_handshake_with_uris(
     session_id: &str,
     root_uris: &[String],
 ) -> Result<(), String> {
-    let url = format!("{}/mcp", base_url);
-    // No reqwest .timeout() here: SSE is an infinite stream, so a reqwest timeout fires on the
-    // body read phase and aborts the connection before roots/list arrives. The internal deadline
-    // inside process_roots_list_response handles the per-test time budget.
-    let resp = client
-        .get(&url)
-        .header("Accept", "text/event-stream")
-        .header("Cache-Control", "no-cache")
-        .header("Mcp-Session-Id", session_id)
-        .send()
-        .await
-        .map_err(|e| format!("SSE connection failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("SSE stream failed: HTTP {}", resp.status()));
-    }
-
+    let resp = open_roots_sse_stream(client, base_url, session_id).await?;
     sleep(TestTimeouts::short_delay()).await;
     send_initialized_notification(client, base_url, session_id).await?;
     process_roots_list_response(resp, client, base_url, session_id, root_uris).await
@@ -446,50 +501,18 @@ async fn complete_roots_handshake_with_uris(
 async fn test_empty_roots_rejection() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let tools_dir = temp_dir.path().join("tools");
-    std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
+    write_pwd_tool_config(&tools_dir);
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
+    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
 
-    let server = start_deferred_sandbox_server(&tools_dir).await;
-    let base_url = format!("http://127.0.0.1:{}", server.port());
-    let client = common::make_h2_client();
-
-    let session_id = initialize_session(&client, &base_url)
-        .await
-        .expect("Initialize failed");
-
-    let sse_client = client.clone();
-    let sse_base_url = base_url.clone();
-    let sse_session_id = session_id.clone();
-    let sse_task = tokio::spawn(async move {
-        complete_roots_handshake_with_uris(&sse_client, &sse_base_url, &sse_session_id, &[]).await
-    });
+    let sse_task = spawn_complete_roots_handshake(&client, &base_url, &session_id, vec![]);
 
     // Give time for roots/list exchange
     sleep(TestTimeouts::short_delay()).await;
     let _ = sse_task.await;
 
     // Try to call a tool - should fail because sandbox wasn't initialized
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {"subcommand": "default"}
-        }
-    });
+    let tool_call = pwd_tool_call(2, None);
 
     let result = send_mcp_request(&client, &base_url, &tool_call, Some(&session_id)).await;
 
@@ -589,28 +612,9 @@ async fn test_malformed_uri_parsing() {
 async fn test_session_with_only_malformed_uris() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let tools_dir = temp_dir.path().join("tools");
-    std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
+    write_pwd_tool_config(&tools_dir);
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
-
-    let server = start_deferred_sandbox_server(&tools_dir).await;
-    let base_url = format!("http://127.0.0.1:{}", server.port());
-    let client = common::make_h2_client();
-
-    let session_id = initialize_session(&client, &base_url)
-        .await
-        .expect("Initialize failed");
+    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
 
     // Answer roots/list with only malformed URIs
     let malformed_uris = vec![
@@ -619,32 +623,13 @@ async fn test_session_with_only_malformed_uris() {
         "".to_string(),
     ];
 
-    let sse_client = client.clone();
-    let sse_base_url = base_url.clone();
-    let sse_session_id = session_id.clone();
-    let sse_task = tokio::spawn(async move {
-        complete_roots_handshake_with_uris(
-            &sse_client,
-            &sse_base_url,
-            &sse_session_id,
-            &malformed_uris,
-        )
-        .await
-    });
+    let sse_task = spawn_complete_roots_handshake(&client, &base_url, &session_id, malformed_uris);
 
     sleep(TestTimeouts::short_delay()).await;
     let _ = sse_task.await;
 
     // Tool call should fail - no valid roots
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {"subcommand": "default"}
-        }
-    });
+    let tool_call = pwd_tool_call(2, None);
 
     let result = send_mcp_request(&client, &base_url, &tool_call, Some(&session_id)).await;
 
@@ -674,42 +659,17 @@ async fn test_multi_root_workspace_scoping() {
     let root2 = TempDir::new().expect("Failed to create temp dir 2");
     let tools_temp = TempDir::new().expect("Failed to create tools temp dir");
     let tools_dir = tools_temp.path().join("tools");
-    std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
+    write_pwd_tool_config(&tools_dir);
 
     // Create test file in root2 to prove it's accessible
     std::fs::write(root2.path().join("test.txt"), "hello").expect("Failed to create test file");
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
-
-    let server = start_deferred_sandbox_server(&tools_dir).await;
-    let base_url = format!("http://127.0.0.1:{}", server.port());
-    let client = common::make_h2_client();
-
-    let session_id = initialize_session(&client, &base_url)
-        .await
-        .expect("Initialize failed");
+    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
 
     // Answer roots/list with both roots
     let root_uris = vec![encode_file_uri(root1.path()), encode_file_uri(root2.path())];
 
-    let sse_client = client.clone();
-    let sse_base_url = base_url.clone();
-    let sse_session_id = session_id.clone();
-    let sse_task = tokio::spawn(async move {
-        complete_roots_handshake_with_uris(&sse_client, &sse_base_url, &sse_session_id, &root_uris)
-            .await
-    });
+    let sse_task = spawn_complete_roots_handshake(&client, &base_url, &session_id, root_uris);
 
     // Wait for roots exchange
     let sse_result = sse_task.await.expect("SSE task panicked");
@@ -724,18 +684,7 @@ async fn test_multi_root_workspace_scoping() {
         .expect("Sandbox should become ready for tool calls");
 
     // Tool call in root1 should work
-    let tool_call_1 = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
-                "subcommand": "default",
-                "working_directory": root1.path().to_string_lossy()
-            }
-        }
-    });
+    let tool_call_1 = pwd_tool_call(2, Some(root1.path()));
 
     let (response1, _) = send_mcp_request(&client, &base_url, &tool_call_1, Some(&session_id))
         .await
@@ -748,18 +697,7 @@ async fn test_multi_root_workspace_scoping() {
     );
 
     // Tool call in root2 should also work
-    let tool_call_2 = json!({
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
-                "subcommand": "default",
-                "working_directory": root2.path().to_string_lossy()
-            }
-        }
-    });
+    let tool_call_2 = pwd_tool_call(3, Some(root2.path()));
 
     let (response2, _) = send_mcp_request(&client, &base_url, &tool_call_2, Some(&session_id))
         .await
@@ -785,28 +723,9 @@ async fn test_url_encoded_path_in_roots() {
     std::fs::create_dir_all(&special_path).expect("Failed to create special dir");
 
     let tools_dir = base_temp.path().join("tools");
-    std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
+    write_pwd_tool_config(&tools_dir);
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
-
-    let server = start_deferred_sandbox_server(&tools_dir).await;
-    let base_url = format!("http://127.0.0.1:{}", server.port());
-    let client = common::make_h2_client();
-
-    let session_id = initialize_session(&client, &base_url)
-        .await
-        .expect("Initialize failed");
+    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
 
     // Create properly encoded URI with space
     let root_uri = encode_file_uri(&special_path);
@@ -816,13 +735,7 @@ async fn test_url_encoded_path_in_roots() {
         root_uri
     );
 
-    let sse_client = client.clone();
-    let sse_base_url = base_url.clone();
-    let sse_session_id = session_id.clone();
-    let sse_task = tokio::spawn(async move {
-        complete_roots_handshake_with_uris(&sse_client, &sse_base_url, &sse_session_id, &[root_uri])
-            .await
-    });
+    let sse_task = spawn_complete_roots_handshake(&client, &base_url, &session_id, vec![root_uri]);
 
     let sse_result = sse_task.await.expect("SSE task panicked");
     assert!(
@@ -836,18 +749,7 @@ async fn test_url_encoded_path_in_roots() {
         .expect("Sandbox should become ready for URL-encoded root");
 
     // Tool call in the special path should work
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
-                "subcommand": "default",
-                "working_directory": special_path.to_string_lossy()
-            }
-        }
-    });
+    let tool_call = pwd_tool_call(2, Some(&special_path));
 
     let (response, _) = send_mcp_request(&client, &base_url, &tool_call, Some(&session_id))
         .await
@@ -949,23 +851,10 @@ async fn test_handshake_ordering_sse_first() {
     std::fs::create_dir_all(&project_dir).expect("Failed to create project dir");
 
     let tools_dir = temp_dir.path().join("tools");
-    std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
+    write_pwd_tool_config(&tools_dir);
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
-
-    let server = start_deferred_sandbox_server(&tools_dir).await;
-    let base_url = format!("http://127.0.0.1:{}", server.port());
+    let _server = start_deferred_sandbox_server(&tools_dir).await;
+    let base_url = server_base_url(&_server);
     let client = common::make_h2_client();
 
     // VSCode Copilot style: Initialize, then SSE connects and answers roots/list
@@ -1015,18 +904,7 @@ async fn test_handshake_ordering_sse_first() {
         .expect("Sandbox should become ready for VSCode-style ordering");
 
     // Step 4: Verify tool call works
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
-                "subcommand": "default",
-                "working_directory": project_dir.to_string_lossy()
-            }
-        }
-    });
+    let tool_call = pwd_tool_call(2, Some(&project_dir));
 
     let (response, _) = send_mcp_request(&client, &base_url, &tool_call, Some(&session_id))
         .await
@@ -1049,28 +927,9 @@ async fn test_mixed_valid_invalid_uris() {
     let valid_root = TempDir::new().expect("Failed to create temp dir");
     let tools_temp = TempDir::new().expect("Failed to create tools temp dir");
     let tools_dir = tools_temp.path().join("tools");
-    std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
+    write_pwd_tool_config(&tools_dir);
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
-
-    let server = start_deferred_sandbox_server(&tools_dir).await;
-    let base_url = format!("http://127.0.0.1:{}", server.port());
-    let client = common::make_h2_client();
-
-    let session_id = initialize_session(&client, &base_url)
-        .await
-        .expect("Initialize failed");
+    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
 
     // Mix of valid and invalid URIs
     let root_uris = vec![
@@ -1080,13 +939,7 @@ async fn test_mixed_valid_invalid_uris() {
         "".to_string(),
     ];
 
-    let sse_client = client.clone();
-    let sse_base_url = base_url.clone();
-    let sse_session_id = session_id.clone();
-    let sse_task = tokio::spawn(async move {
-        complete_roots_handshake_with_uris(&sse_client, &sse_base_url, &sse_session_id, &root_uris)
-            .await
-    });
+    let sse_task = spawn_complete_roots_handshake(&client, &base_url, &session_id, root_uris);
 
     let sse_result = sse_task.await.expect("SSE task panicked");
     assert!(
@@ -1100,18 +953,7 @@ async fn test_mixed_valid_invalid_uris() {
         .expect("Sandbox should become ready with mixed valid/invalid URIs");
 
     // Tool call should work because we had one valid root
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
-                "subcommand": "default",
-                "working_directory": valid_root.path().to_string_lossy()
-            }
-        }
-    });
+    let tool_call = pwd_tool_call(2, Some(valid_root.path()));
 
     let (response, _) = send_mcp_request(&client, &base_url, &tool_call, Some(&session_id))
         .await
@@ -1142,44 +984,14 @@ async fn test_post_lock_roots_change_rejected() {
     let _new_root = TempDir::new().expect("Failed to create new root"); // Unused but demonstrates attacker's intent
     let tools_temp = TempDir::new().expect("Failed to create tools temp dir");
     let tools_dir = tools_temp.path().join("tools");
-    std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
+    write_pwd_tool_config(&tools_dir);
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
-
-    let server = start_deferred_sandbox_server(&tools_dir).await;
-    let base_url = format!("http://127.0.0.1:{}", server.port());
-    let client = common::make_h2_client();
-
-    // Complete handshake with initial root
-    let session_id = initialize_session(&client, &base_url)
-        .await
-        .expect("Initialize failed");
+    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
 
     // Answer roots/list with initial root (locks sandbox)
     let initial_uri = encode_file_uri(initial_root.path());
-    let sse_client = client.clone();
-    let sse_base_url = base_url.clone();
-    let sse_session_id = session_id.clone();
-    let sse_task = tokio::spawn(async move {
-        complete_roots_handshake_with_uris(
-            &sse_client,
-            &sse_base_url,
-            &sse_session_id,
-            &[initial_uri],
-        )
-        .await
-    });
+    let sse_task =
+        spawn_complete_roots_handshake(&client, &base_url, &session_id, vec![initial_uri]);
 
     let sse_result = sse_task.await.expect("SSE task panicked");
     assert!(sse_result.is_ok(), "Initial roots exchange failed");
@@ -1194,18 +1006,7 @@ async fn test_post_lock_roots_change_rejected() {
         .expect("Sandbox should become ready before roots/list_changed test");
 
     // Verify initial root works
-    let tool_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
-                "subcommand": "default",
-                "working_directory": initial_root.path().to_string_lossy()
-            }
-        }
-    });
+    let tool_call = pwd_tool_call(2, Some(initial_root.path()));
 
     let (response, _) = send_mcp_request(&client, &base_url, &tool_call, Some(&session_id))
         .await
@@ -1241,18 +1042,7 @@ async fn test_post_lock_roots_change_rejected() {
             // Try another tool call - should fail
             sleep(TestTimeouts::poll_interval()).await;
 
-            let tool_call_2 = json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "pwd",
-                    "arguments": {
-                        "subcommand": "default",
-                        "working_directory": initial_root.path().to_string_lossy()
-                    }
-                }
-            });
+            let tool_call_2 = pwd_tool_call(3, Some(initial_root.path()));
 
             let result2 =
                 send_mcp_request(&client, &base_url, &tool_call_2, Some(&session_id)).await;
@@ -1284,43 +1074,14 @@ async fn test_working_directory_outside_sandbox_rejected() {
     let forbidden_root = TempDir::new().expect("Failed to create forbidden root");
     let tools_temp = TempDir::new().expect("Failed to create tools temp dir");
     let tools_dir = tools_temp.path().join("tools");
-    std::fs::create_dir_all(&tools_dir).expect("Failed to create tools dir");
+    write_pwd_tool_config(&tools_dir);
 
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
-
-    let server = start_deferred_sandbox_server(&tools_dir).await;
-    let base_url = format!("http://127.0.0.1:{}", server.port());
-    let client = common::make_h2_client();
-
-    let session_id = initialize_session(&client, &base_url)
-        .await
-        .expect("Initialize failed");
+    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
 
     // Lock sandbox to ONLY allowed_root
     let allowed_uri = encode_file_uri(allowed_root.path());
-    let sse_client = client.clone();
-    let sse_base_url = base_url.clone();
-    let sse_session_id = session_id.clone();
-    let sse_task = tokio::spawn(async move {
-        complete_roots_handshake_with_uris(
-            &sse_client,
-            &sse_base_url,
-            &sse_session_id,
-            &[allowed_uri],
-        )
-        .await
-    });
+    let sse_task =
+        spawn_complete_roots_handshake(&client, &base_url, &session_id, vec![allowed_uri]);
 
     let sse_result = sse_task.await.expect("SSE task panicked");
     assert!(sse_result.is_ok(), "Roots exchange failed");
@@ -1330,18 +1091,7 @@ async fn test_working_directory_outside_sandbox_rejected() {
         .expect("Sandbox should become ready for allowed root");
 
     // Tool call in allowed root should work
-    let allowed_call = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
-                "subcommand": "default",
-                "working_directory": allowed_root.path().to_string_lossy()
-            }
-        }
-    });
+    let allowed_call = pwd_tool_call(2, Some(allowed_root.path()));
 
     let (allowed_response, _) =
         send_mcp_request(&client, &base_url, &allowed_call, Some(&session_id))
@@ -1354,18 +1104,7 @@ async fn test_working_directory_outside_sandbox_rejected() {
     );
 
     // Tool call in FORBIDDEN root should fail
-    let forbidden_call = json!({
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "tools/call",
-        "params": {
-            "name": "pwd",
-            "arguments": {
-                "subcommand": "default",
-                "working_directory": forbidden_root.path().to_string_lossy()
-            }
-        }
-    });
+    let forbidden_call = pwd_tool_call(3, Some(forbidden_root.path()));
 
     let (forbidden_response, _) =
         send_mcp_request(&client, &base_url, &forbidden_call, Some(&session_id))

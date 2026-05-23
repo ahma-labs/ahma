@@ -39,6 +39,8 @@ members = [
     "ahma_bin",
     # AGPL-3.0-or-later (network-facing cluster scheduler)
     "ahma_cluster",
+    # dev-only workspace automation (not published, not in default-members)
+    "xtask",
 ]
 
 resolver = "3"

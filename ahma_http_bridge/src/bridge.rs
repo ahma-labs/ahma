@@ -257,6 +257,33 @@ fn build_cors_layer(bind_addr: &SocketAddr) -> CorsLayer {
 
 /// MCP Session-Id header name (per MCP spec 2025-03-26)
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+const MCP_PATH: &str = "/mcp";
+const HEALTH_PATH: &str = "/health";
+const ACCEPT_HEADER: &str = "accept";
+const LAST_EVENT_ID_HEADER: &str = "last-event-id";
+const SSE_ACCEPT_MIME: &str = "text/event-stream";
+const BEARER_PREFIX: &str = "Bearer ";
+const BEARER_WWW_AUTHENTICATE: &str = "Bearer realm=\"ahma-http-bridge\"";
+
+fn session_id_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(MCP_SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+}
+
+fn extract_bearer_token(value: &str) -> Option<&str> {
+    value
+        .get(..BEARER_PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(BEARER_PREFIX))
+        .and_then(|_| value.get(BEARER_PREFIX.len()..))
+}
+
+fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(extract_bearer_token)
+}
 
 // ─── Bearer-token authentication middleware ───────────────────────────────────
 
@@ -280,29 +307,13 @@ async fn bearer_auth_middleware(
     };
 
     // /health is exempt: load-balancers must be able to probe it unauthenticated.
-    if request.uri().path() == "/health" {
+    if request.uri().path() == HEALTH_PATH {
         return next.run(request).await;
     }
 
     // Extract `Authorization: Bearer <token>` header.
     // RFC 7235 §2.1: the auth-scheme token is case-insensitive.
-    // Uppercase the whole header value for the prefix check, then slice the
-    // token from the *original* string (all "bearer " variants are 7 bytes).
-    let provided = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| {
-            if s.to_uppercase().starts_with("BEARER ") {
-                const BEARER_PREFIX_LEN: usize = "BEARER ".len();
-                Some(&s[BEARER_PREFIX_LEN..])
-            } else {
-                None
-            }
-        })
-        .map(str::to_owned);
-
-    match provided {
+    match bearer_token_from_headers(request.headers()) {
         Some(token) if token.as_bytes().ct_eq(expected_token.as_bytes()).into() => {
             next.run(request).await
         }
@@ -312,7 +323,7 @@ async fn bearer_auth_middleware(
                 StatusCode::UNAUTHORIZED,
                 [(
                     axum::http::header::WWW_AUTHENTICATE,
-                    "Bearer realm=\"ahma-http-bridge\"",
+                    BEARER_WWW_AUTHENTICATE,
                 )],
                 "Unauthorized",
             )
@@ -432,7 +443,7 @@ fn build_mcp_router(
 
     let mcp_routes = Router::new()
         .route(
-            "/mcp",
+            MCP_PATH,
             post(handle_mcp_request)
                 .get(handle_sse_stream)
                 .delete(handle_session_delete),
@@ -547,8 +558,8 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
         .map_err(|e| BridgeError::HttpServer(format!("Failed to get local addr: {}", e)))?;
 
     info!("HTTP bridge listening on http://{}", local_addr);
-    info!("MCP endpoint (POST): http://{}/mcp", local_addr);
-    info!("MCP endpoint (GET/SSE): http://{}/mcp", local_addr);
+    info!("MCP endpoint (POST): http://{}{}", local_addr, MCP_PATH);
+    info!("MCP endpoint (GET/SSE): http://{}{}", local_addr, MCP_PATH);
 
     // Optionally start QUIC / HTTP/3 endpoint.
     let quic_info = if config.enable_quic {
@@ -632,18 +643,7 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
     info!("Starting HTTP bridge on Unix socket: {}", raw_socket_path);
     info!("Session isolation: ENABLED (always-on)");
 
-    let session_config = SessionManagerConfig {
-        server_command: config.server_command.clone(),
-        server_args: config.server_args.clone(),
-        default_scope: config.default_sandbox_scope.clone(),
-        enable_colored_output: config.enable_colored_output,
-        handshake_timeout_secs: config.handshake_timeout_secs,
-    };
-    let session_manager = Arc::new(SessionManager::new(session_config));
-    let state = Arc::new(BridgeState {
-        session_manager,
-        require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),
-    });
+    let state = build_bridge_state(&config);
     // Install SIGHUP handler for zero-downtime token rotation.
     maybe_install_sighup_handler(state.clone(), config.require_token_path.clone());
 
@@ -671,7 +671,10 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
         .map_err(|e| BridgeError::HttpServer(format!("Failed to bind Unix socket: {}", e)))?;
 
     info!("HTTP bridge listening on Unix socket: {}", raw_socket_path);
-    info!("MCP endpoint (POST): http+unix://{}/mcp", raw_socket_path);
+    info!(
+        "MCP endpoint (POST): http+unix://{}{}",
+        raw_socket_path, MCP_PATH
+    );
 
     // Print machine-readable bound socket path for test infrastructure.
     eprintln!("AHMA_UNIX_SOCKET_PATH={}", raw_socket_path);
@@ -737,13 +740,7 @@ fn bind_quic_endpoint(
 ///
 /// Returns `None` non-fatally if QUIC is unavailable or the binding fails.
 async fn try_start_quic_endpoint(tcp_addr: SocketAddr) -> Option<QuicInfo> {
-    let cert = match crate::quic::cert::generate_self_signed_cert() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("QUIC: failed to generate self-signed cert: {e}");
-            return None;
-        }
-    };
+    let cert = crate::quic::cert::load_or_generate();
 
     let tls_config = match crate::quic::cert::build_quic_tls_config(&cert) {
         Ok(c) => c,
@@ -819,10 +816,7 @@ async fn handle_session_delete(
     headers: HeaderMap,
 ) -> Response {
     // Get session ID from header
-    let session_id = match headers
-        .get(MCP_SESSION_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-    {
+    let session_id = match session_id_from_headers(&headers) {
         Some(id) => id.to_string(),
         None => {
             warn!("DELETE request without session ID header");
@@ -893,10 +887,7 @@ async fn handle_session_delete(
 async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: HeaderMap) -> Response {
     // Get session ID from header - required for SSE
     // Return 404 (not 400) to hide SSE from clients without a session
-    let session_id = match headers
-        .get(MCP_SESSION_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-    {
+    let session_id = match session_id_from_headers(&headers) {
         Some(id) => id.to_string(),
         None => {
             debug!("SSE request without session ID header - returning 404");
@@ -928,7 +919,7 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
 
     // Parse Last-Event-Id header for replay support
     let last_event_id: Option<u64> = headers
-        .get("last-event-id")
+        .get(LAST_EVENT_ID_HEADER)
         .or_else(|| headers.get("Last-Event-Id"))
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok());
@@ -1009,9 +1000,9 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
 /// Check whether the client prefers SSE over JSON for POST responses.
 fn accepts_sse(headers: &HeaderMap) -> bool {
     headers
-        .get_all("accept")
+        .get_all(ACCEPT_HEADER)
         .iter()
-        .any(|v| v.to_str().unwrap_or_default().contains("text/event-stream"))
+        .any(|v| v.to_str().unwrap_or_default().contains(SSE_ACCEPT_MIME))
 }
 
 /// Handle MCP JSON-RPC requests with content negotiation
@@ -1063,6 +1054,9 @@ mod tests {
         )
     }
 
+    const FILE_URI_PREFIX: &str = "file://";
+    const WINDOWS_EXTENDED_PATH_PREFIX: &str = r"\\?\";
+
     /// Encode a filesystem path as a file:// URI.
     ///
     /// Windows: `C:\foo\bar` → `file:///C:/foo/bar`
@@ -1071,15 +1065,15 @@ mod tests {
         let mut path_str = path.to_string_lossy().into_owned();
 
         // Strip Windows extended-length prefix (\\?\) if present.
-        if path_str.starts_with(r"\\?\") {
-            path_str = path_str[4..].to_string();
+        if path_str.starts_with(WINDOWS_EXTENDED_PATH_PREFIX) {
+            path_str = path_str[WINDOWS_EXTENDED_PATH_PREFIX.len()..].to_string();
         }
 
         // Normalise path separators to forward slashes.
         path_str = path_str.replace('\\', "/");
 
         let mut out = String::with_capacity(path_str.len() + 10);
-        out.push_str("file://");
+        out.push_str(FILE_URI_PREFIX);
 
         // On Windows a drive-letter path looks like "C:/Users/…".
         // RFC 8089 §2 requires the path to start with "/" so that it occupies
@@ -1159,8 +1153,8 @@ mod tests {
     fn create_app(state: Arc<BridgeState>) -> Router {
         let loopback_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         Router::new()
-            .route("/health", get(health_check))
-            .route("/mcp", post(handle_mcp_request))
+            .route(HEALTH_PATH, get(health_check))
+            .route(MCP_PATH, post(handle_mcp_request))
             .fallback(handle_not_found)
             .layer(build_cors_layer(&loopback_addr))
             .with_state(state)
@@ -1589,8 +1583,8 @@ for line in sys.stdin:
         });
         let loopback_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         Router::new()
-            .route("/health", get(health_check))
-            .route("/mcp", post(handle_mcp_request))
+            .route(HEALTH_PATH, get(health_check))
+            .route(MCP_PATH, post(handle_mcp_request))
             .fallback(handle_not_found)
             .layer(middleware::from_fn_with_state(
                 state.clone(),

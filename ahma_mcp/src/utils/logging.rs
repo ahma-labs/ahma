@@ -159,26 +159,63 @@ fn try_create_file_appender() -> Option<tracing_appender::rolling::RollingFileAp
         return None;
     }
 
-    // Delete old standard `.log` files in `log/` to wipe previous logs.
+    // Delete old rolling log files in `log/` matching the `ahma_mcp.log.*` pattern.
     // Do not delete directories or symlinks.
     cleanup_old_logs(&log_dir);
 
     // Use catch_unwind to handle panics from tracing_appender
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let appender = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         tracing_appender::rolling::daily(&log_dir, "ahma_mcp.log")
     }))
-    .ok()
+    .ok()?;
+
+    // Create a stable `ahma_mcp.log` symlink pointing to today's dated rolling file.
+    // This lets `tail -F ./log/ahma_mcp.log` work even though the actual file is dated.
+    try_update_current_log_symlink(&log_dir);
+
+    Some(appender)
+}
+
+/// Attempt to create/update `<log_dir>/ahma_mcp.log` as a symlink to today's dated
+/// rolling file (e.g. `ahma_mcp.log.2026-05-24`).
+///
+/// This is a best-effort operation — failure is logged at debug level and ignored.
+fn try_update_current_log_symlink(log_dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let today = chrono::Local::now().format("%Y-%m-%d");
+        let dated_name = format!("ahma_mcp.log.{today}");
+        let symlink_path = log_dir.join("ahma_mcp.log");
+
+        // Remove any existing file/symlink at the stable path.
+        let _ = std::fs::remove_file(&symlink_path);
+
+        // Create a relative symlink so the log dir is portable.
+        if let Err(e) = symlink(&dated_name, &symlink_path) {
+            eprintln!("ahma: could not create log symlink {symlink_path:?} → {dated_name}: {e}");
+        }
+    }
 }
 
 fn cleanup_old_logs(log_dir: &Path) {
     if let Ok(entries) = std::fs::read_dir(log_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Ok(meta) = std::fs::symlink_metadata(&path)
-                && meta.is_file()
-                && path.extension().is_some_and(|e| e == "log")
-            {
-                let _ = std::fs::remove_file(path);
+            // Skip directories, symlinks, and files not belonging to our rolling log set.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // Match both plain `ahma_mcp.log` and dated rolling files `ahma_mcp.log.YYYY-MM-DD`.
+            if name == "ahma_mcp.log" || name.starts_with("ahma_mcp.log.") {
+                let _ = std::fs::remove_file(&path);
             }
         }
     }

@@ -40,6 +40,23 @@
 
 ---
 
+## TODO: Python bindings (former `ahma_py` crate)
+
+The `ahma_py` crate has been removed from the workspace and the source files deleted. Before removal it served as the project's Python bindings (PyO3) to expose `ahma_core` to Python consumers and provided build notes for producing a wheel. Key points captured from the crate's source before deletion:
+
+- Purpose: Python bindings for `ahma_core` via PyO3; intended to publish an `ahma-py` wheel for Jupyter/FastAPI/Streamlit use-cases.
+- AGPL separation: planned separate `ahma_py_agpl` distribution for bindings that expose AGPL-licensed crates (e.g., `ahma_vault`, `ahma_decompose`, `ahma_worker`).
+- Build hints (from removed crate): use `maturin` to build/develop the wheel; example commands were included in the crate docs.
+- Implementation notes: some APIs were stubs that returned errors when AGPL dependencies were not present (explicitly instructing the integrator to add the AGPL crate if they accept those terms).
+
+Deferred action items (documented TODO):
+
+1. Re-evaluate packaging and licensing approach for Python bindings (single wheel vs. split permissive/AGPL wheels).
+2. If re-introducing bindings: add `pyo3` and `maturin` build guidance to workspace docs, update `workspace.dependencies` or document build-time requirements, and gate AGPL features behind a separate crate/package.
+3. Preserve a record of the removed crate in the git history and reference the commit that deleted `ahma_py` for future restoration.
+
+The deleted crate files were under `ahma_py/` prior to removal. Check the git history if you need the original sources.
+
 ## 1. Project Overview
 
 **Ahma** (Finnish for "wolverine") is a universal, high-performance **Model Context Protocol (MCP) server** designed to dynamically adapt any command-line tool for use by AI agents. Its purpose is to provide a consistent, powerful, and non-blocking bridge between AI and the vast ecosystem of command-line utilities.
