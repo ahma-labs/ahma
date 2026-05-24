@@ -16,8 +16,8 @@ use std::sync::atomic::Ordering;
 use tracing;
 
 impl AhmaMcpService {
-    /// Generates the specific input schema for the `sandboxed_shell` tool.
-    pub fn generate_input_schema_for_sandboxed_shell(&self) -> Arc<Map<String, Value>> {
+    /// Generates the specific input schema for the `run_terminal_command` tool.
+    pub fn generate_input_schema_for_run_terminal_command(&self) -> Arc<Map<String, Value>> {
         let mut properties = Map::new();
         properties.insert(
             "command".to_string(),
@@ -47,8 +47,8 @@ impl AhmaMcpService {
         schema::object_input_schema(properties, &["command"])
     }
 
-    /// Handles the 'sandboxed_shell' built-in tool call.
-    pub async fn handle_sandboxed_shell(
+    /// Handles the 'run_terminal_command' built-in tool call.
+    pub async fn handle_run_terminal_command(
         &self,
         params: CallToolRequestParams,
         context: RequestContext<RoleServer>,
@@ -153,7 +153,7 @@ impl AhmaMcpService {
         execution_mode: &crate::adapter::ExecutionMode,
     ) -> crate::config::SubcommandConfig {
         crate::config::SubcommandConfig {
-            name: "sandboxed_shell".to_string(),
+            name: "run_terminal_command".to_string(),
             description: "Execute shell commands".to_string(),
             subcommand: None,
             options: Some(vec![crate::config::CommandOption {
@@ -287,7 +287,7 @@ impl AhmaMcpService {
         let job_id = self
             .adapter
             .execute_async_in_dir_with_options(
-                "sandboxed_shell",
+                "run_terminal_command",
                 platform_shell_program(),
                 working_directory,
                 crate::adapter::AsyncExecOptions {
@@ -310,7 +310,7 @@ impl AhmaMcpService {
                     return Ok(result);
                 }
 
-                let hint = crate::tool_hints::preview(&id, "sandboxed_shell");
+                let hint = crate::tool_hints::preview(&id, "run_terminal_command");
                 let message = format!("AHMA ID: {}{}", id, hint);
                 Ok(common::text_result(message))
             }

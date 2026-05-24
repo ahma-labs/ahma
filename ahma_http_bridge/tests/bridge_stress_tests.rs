@@ -88,35 +88,35 @@ async fn run_concurrent_tool_calls(transport: TransportMode) {
         ("file-tools_ls", json!({"path": "."})),
         ("file-tools_ls", json!({"path": "ahma_mcp"})),
         ("file-tools_cat", json!({"files": ["Cargo.toml"]})),
-        ("sandboxed_shell", json!({"command": "echo test1"})),
-        ("sandboxed_shell", json!({"command": "echo test2"})),
-        ("sandboxed_shell", json!({"command": "echo test3"})),
-        ("sandboxed_shell", json!({"command": "pwd"})),
-        ("sandboxed_shell", json!({"command": "ls -la"})),
-        ("sandboxed_shell", json!({"command": "echo 'hello world'"})),
-        ("sandboxed_shell", json!({"command": "date"})),
-        ("sandboxed_shell", json!({"command": "whoami"})),
-        ("sandboxed_shell", json!({"command": "uname -a"})),
+        ("run_terminal_command", json!({"command": "echo test1"})),
+        ("run_terminal_command", json!({"command": "echo test2"})),
+        ("run_terminal_command", json!({"command": "echo test3"})),
+        ("run_terminal_command", json!({"command": "pwd"})),
+        ("run_terminal_command", json!({"command": "ls -la"})),
+        ("run_terminal_command", json!({"command": "echo 'hello world'"})),
+        ("run_terminal_command", json!({"command": "date"})),
+        ("run_terminal_command", json!({"command": "whoami"})),
+        ("run_terminal_command", json!({"command": "uname -a"})),
         (
-            "sandboxed_shell",
+            "run_terminal_command",
             json!({"command": "cat Cargo.toml | head -5"}),
         ),
     ];
     #[cfg(windows)]
     let mut requests: Vec<(&str, serde_json::Value)> = vec![
-        ("sandboxed_shell", json!({"command": "echo test1"})),
-        ("sandboxed_shell", json!({"command": "echo test2"})),
-        ("sandboxed_shell", json!({"command": "echo test3"})),
-        ("sandboxed_shell", json!({"command": "echo test4"})),
-        ("sandboxed_shell", json!({"command": "echo test5"})),
-        ("sandboxed_shell", json!({"command": "pwd"})),
-        ("sandboxed_shell", json!({"command": "whoami"})),
-        ("sandboxed_shell", json!({"command": "Get-Date"})),
+        ("run_terminal_command", json!({"command": "echo test1"})),
+        ("run_terminal_command", json!({"command": "echo test2"})),
+        ("run_terminal_command", json!({"command": "echo test3"})),
+        ("run_terminal_command", json!({"command": "echo test4"})),
+        ("run_terminal_command", json!({"command": "echo test5"})),
+        ("run_terminal_command", json!({"command": "pwd"})),
+        ("run_terminal_command", json!({"command": "whoami"})),
+        ("run_terminal_command", json!({"command": "Get-Date"})),
         (
-            "sandboxed_shell",
+            "run_terminal_command",
             json!({"command": "Get-ChildItem Cargo.toml"}),
         ),
-        ("sandboxed_shell", json!({"command": "echo done"})),
+        ("run_terminal_command", json!({"command": "echo done"})),
     ];
 
     if is_low_core_or_ci() {
@@ -204,7 +204,7 @@ async fn run_high_volume_concurrent_requests(num_requests: usize, transport: Tra
             async move {
                 bounded_call_tool(
                     mcp,
-                    "sandboxed_shell",
+                    "run_terminal_command",
                     json!({"command": format!("echo 'Request {}'", i)}),
                 )
                 .await
@@ -255,7 +255,7 @@ async fn test_concurrent_tool_calls_sse() {
 
 /// High-volume echo stress using `Accept: application/json`.
 ///
-/// On Windows the count is reduced because each `sandboxed_shell` spawns a
+/// On Windows the count is reduced because each `run_terminal_command` spawns a
 /// PowerShell process through AppContainer.
 #[tokio::test]
 async fn test_high_volume_concurrent_requests_json() {

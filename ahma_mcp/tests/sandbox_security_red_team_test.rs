@@ -140,7 +140,7 @@ async fn red_team_basic_path_traversal_blocked() {
     .unwrap();
 
     // Attempt to escape via simple ../
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": "cat /etc/passwd",
             "working_directory": "../"
@@ -167,7 +167,7 @@ async fn red_team_deep_path_traversal_blocked() {
     .unwrap();
 
     // Attempt to escape via deeply nested traversal
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": "ls",
             "working_directory": "a/b/c/d/e/../../../../../../../../../../"
@@ -194,7 +194,7 @@ async fn red_team_absolute_path_escape_blocked() {
     .unwrap();
 
     // Attempt to use absolute path outside sandbox
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": "ls",
             "working_directory": "/etc"
@@ -245,7 +245,7 @@ async fn red_team_symlink_escape_blocked() {
         Err(e) => panic!("Failed to create symlink: {}", e),
     }
 
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": "cat passwd",
             "working_directory": "etc_link"
@@ -300,7 +300,7 @@ async fn red_team_symlink_to_home_blocked() {
         Err(e) => panic!("Failed to create symlink: {}", e),
     }
 
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": "ls .ssh",
             "working_directory": "home_link"
@@ -332,7 +332,7 @@ async fn red_team_shell_metacharacters_in_path() {
 
     // Attempt to inject shell commands via path
     // The path "; cat /etc/passwd #" doesn't exist as a directory
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": "echo test",
             "working_directory": "; cat /etc/passwd #"
@@ -393,7 +393,7 @@ async fn red_team_global_read_access_blocked() {
     let outside_file = outside_dir.path().join("secret.txt");
     std::fs::write(&outside_file, "secret content").unwrap();
 
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": format!("cat {}", outside_file.display()),
             "execution_mode": "Synchronous"
@@ -464,7 +464,7 @@ async fn red_team_livelog_symlink_read_allowed() {
 
     // 1. We MUST be able to read the explicit target file via its absolute path.
     //    The livelog feature adds this path to read_scopes so it is always readable.
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": format!("cat {}", outside_target.display()),
             "execution_mode": "Synchronous"
@@ -489,7 +489,7 @@ async fn red_team_livelog_symlink_read_allowed() {
     assert!(read_succeeded, "Read command did not complete successfully");
 
     // 2. We MUST NOT be able to read neighboring files in the external directory.
-    let params2 = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params2 = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": format!("cat {}", outside_forbidden.display()),
             "execution_mode": "Synchronous"
@@ -506,7 +506,7 @@ async fn red_team_livelog_symlink_read_allowed() {
     // 3. We MUST NOT be able to WRITE to the explicit target file.
     //    The core livelog invariant is Linux-focused: livelog must remain read-only and
     //    must not expand write scope to external files.
-    let params3 = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params3 = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": format!("echo hax > {}", outside_target.display()),
             "execution_mode": "Synchronous"
@@ -550,7 +550,7 @@ async fn red_team_command_write_escape_blocked() {
         .unwrap();
 
     // Attempt to write to a file outside the sandbox using absolute path
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": format!("echo 'hacked' > {}", outside_file.display()),
             "execution_mode": "Synchronous"
@@ -592,7 +592,7 @@ async fn red_team_command_read_escape_blocked_linux() {
         .unwrap();
 
     // Attempt to read /etc/shadow (or similar restricted file)
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": "cat /etc/shadow", // Typically root only, but Landlock should block open() regardless
             "execution_mode": "Synchronous"
@@ -642,7 +642,7 @@ async fn red_team_command_read_escape_blocked_linux_custom() {
         .unwrap();
 
     // Attempt to read the outside file
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": format!("cat {}", outside_file.display()),
             "execution_mode": "Synchronous"

@@ -117,8 +117,8 @@ fn test_nested_sandbox_detection_exits_with_error() {
             binary.to_str().unwrap(),
             "tool",
             "run",
-            // run subcommand: execute sandboxed_shell with echo (command as single arg)
-            "sandboxed_shell",
+            // run subcommand: execute run_terminal_command with echo (command as single arg)
+            "run_terminal_command",
             "--",
             "echo test",
         ])
@@ -181,8 +181,8 @@ fn test_no_sandbox_flag_allows_nested_execution() {
             binary.to_str().unwrap(),
             "tool",
             "run",
-            // run subcommand: execute sandboxed_shell with echo (command as single arg)
-            "sandboxed_shell",
+            // run subcommand: execute run_terminal_command with echo (command as single arg)
+            "run_terminal_command",
             "--",
             "echo nested_sandbox_test_success",
         ])
@@ -232,8 +232,8 @@ fn test_no_sandbox_env_var_allows_nested_execution() {
             binary.to_str().unwrap(),
             "tool",
             "run",
-            // run subcommand: execute sandboxed_shell with echo (command as single arg)
-            "sandboxed_shell",
+            // run subcommand: execute run_terminal_command with echo (command as single arg)
+            "run_terminal_command",
             "--",
             "echo env_var_test_success",
         ])

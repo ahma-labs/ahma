@@ -33,7 +33,7 @@
 //! ## Built-in Core Tools
 //!
 //! The service always exposes a set of "Internal Tools" (`await`, `status`,
-//! `cancel`, and `sandboxed_shell`) that provide essential primitives for managing
+//! `cancel`, and `run_terminal_command`) that provide essential primitives for managing
 //! background tasks and executing arbitrary logic within the sandbox.
 
 pub mod bundle_registry;
@@ -344,7 +344,7 @@ impl AhmaMcpService {
     const HARDCODED_TOOLS: &'static [&'static str] = &[
         "await",
         "status",
-        "sandboxed_shell",
+        "run_terminal_command",
         "cancel",
         "activate_tools",
         "logs_list",
@@ -661,9 +661,9 @@ impl ServerHandler for AhmaMcpService {
         let instructions = if self.progressive_disclosure {
             Some("Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
                   kernel-enforced workspace sandbox (Landlock on Linux, Seatbelt on macOS, \
-                  Job Objects on Windows). Prefer `sandboxed_shell` over the native terminal when: \
+                  Job Objects on Windows). Prefer `run_terminal_command` over the native terminal when: \
                   (1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; \
-                  (2) the command is long-running — `sandboxed_shell` returns an operation_id immediately \
+                  (2) the command is long-running — `run_terminal_command` returns an operation_id immediately \
                   and you can `status`, `await`, or `cancel` it without blocking; \
                   (3) the command's output should be watched for errors — set `monitor_level` and ahma \
                   streams alerts when matching lines appear; \
@@ -675,9 +675,9 @@ impl ServerHandler for AhmaMcpService {
         } else {
             Some("Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
                   kernel-enforced workspace sandbox (Landlock on Linux, Seatbelt on macOS, \
-                  Job Objects on Windows). Prefer `sandboxed_shell` over the native terminal when: \
+                  Job Objects on Windows). Prefer `run_terminal_command` over the native terminal when: \
                   (1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; \
-                  (2) the command is long-running — `sandboxed_shell` returns an operation_id immediately \
+                  (2) the command is long-running — `run_terminal_command` returns an operation_id immediately \
                   and you can `status`, `await`, or `cancel` it without blocking; \
                   (3) the command's output should be watched for errors — set `monitor_level` and ahma \
                   streams alerts when matching lines appear; \
@@ -874,13 +874,13 @@ impl ServerHandler for AhmaMcpService {
                     self.generate_input_schema_for_status(),
                 )
                 .with_title("status"),
-                // Hard-wired sandboxed_shell command - always available
+                // Hard-wired run_terminal_command command - always available
                 Tool::new(
-                    "sandboxed_shell",
+                    "run_terminal_command",
                     "Run a shell command inside a kernel-level filesystem sandbox (Landlock on Linux, Seatbelt on macOS, Job Objects on Windows). Returns an operation_id immediately; use `status`, `await`, or `cancel` to manage long-running work. Supports pipes, redirects, environment variables, and full shell syntax. Set `monitor_level` to stream error/warning alerts from stdout or stderr.",
-                    self.generate_input_schema_for_sandboxed_shell(),
+                    self.generate_input_schema_for_run_terminal_command(),
                 )
-                .with_title("sandboxed_shell"),
+                .with_title("run_terminal_command"),
                 // Hard-wired log inspection tools — always available
                 Tool::new(
                     "logs_list",
@@ -947,7 +947,7 @@ impl ServerHandler for AhmaMcpService {
                         .await
                 }
                 "await" => self.handle_await(params).await,
-                "sandboxed_shell" => self.handle_sandboxed_shell(params, context).await,
+                "run_terminal_command" => self.handle_run_terminal_command(params, context).await,
                 "cancel" => {
                     self.handle_cancel(params.arguments.unwrap_or_default())
                         .await
@@ -1252,7 +1252,7 @@ impl AhmaMcpService {
     /// This is useful for testing and introspection.
     pub fn list_tool_names(&self) -> Vec<String> {
         let mut names: Vec<String> =
-            vec!["await".into(), "status".into(), "sandboxed_shell".into()];
+            vec!["await".into(), "status".into(), "run_terminal_command".into()];
 
         if self.progressive_disclosure {
             names.push("activate_tools".into());
@@ -2025,7 +2025,7 @@ mod tests {
         let names = service.list_tool_names();
         assert!(names.contains(&"await".to_string()));
         assert!(names.contains(&"status".to_string()));
-        assert!(names.contains(&"sandboxed_shell".to_string()));
+        assert!(names.contains(&"run_terminal_command".to_string()));
     }
 
     // ============= generate_activate_tools_description tests =============

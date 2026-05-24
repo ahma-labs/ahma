@@ -214,7 +214,7 @@ impl<'a> ServiceBuilder<'a> {
                 service.pre_disclose(&cli_bundles);
             }
             StartupProfile::Minimal | StartupProfile::Full => {
-                // Minimal: keep all bundles hidden; LLM uses activate_tools or sandboxed_shell.
+                // Minimal: keep all bundles hidden; LLM uses activate_tools or run_terminal_command.
                 // Full: PD disabled, everything visible already.
             }
         }

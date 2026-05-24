@@ -45,7 +45,7 @@ async fn test_handle_await_with_pending_ops() -> Result<()> {
     );
     args.insert("execution_mode".to_string(), json!("Asynchronous"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
     let result = client.call_tool(call_param).await?;
     let content = result
@@ -111,13 +111,13 @@ async fn test_handle_await_with_tool_filter() -> Result<()> {
     );
     args.insert("execution_mode".to_string(), json!("Asynchronous"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
     let _ = client.call_tool(call_param).await?;
 
-    // Call await for tools="sandboxed_shell"
+    // Call await for tools="run_terminal_command"
     let mut await_args = Map::new();
-    await_args.insert("tools".to_string(), json!("sandboxed_shell"));
+    await_args.insert("tools".to_string(), json!("run_terminal_command"));
 
     let await_param = CallToolRequestParams::new("await").with_arguments(await_args);
 
@@ -155,7 +155,7 @@ async fn test_await_tool_no_pending_ops_after_timeout() -> Result<()> {
     // Synchronous mode so it completes immediately
     args.insert("execution_mode".to_string(), json!("Synchronous"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
     match tokio::time::timeout(op_timeout, client.call_tool(call_param)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
@@ -176,7 +176,7 @@ async fn test_await_tool_no_pending_ops_after_timeout() -> Result<()> {
 
     // Call await to query recently completed operations
     let mut await_args = Map::new();
-    await_args.insert("tools".to_string(), json!("sandboxed_shell"));
+    await_args.insert("tools".to_string(), json!("run_terminal_command"));
 
     let await_param = CallToolRequestParams::new("await").with_arguments(await_args);
 

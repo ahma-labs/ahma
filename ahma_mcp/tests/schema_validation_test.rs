@@ -101,10 +101,10 @@ fn validate_json_schema_map(obj: &Map<String, Value>, tool_name: &str) -> Result
     Ok(())
 }
 
-/// Test that the sandboxed_shell built-in tool has a valid JSON Schema.
+/// Test that the run_terminal_command built-in tool has a valid JSON Schema.
 ///
-/// `sandboxed_shell` is the only built-in whose schema is generated from the
-/// same config-file code path as user tools (via `synthetic_sandboxed_shell_config`
+/// `run_terminal_command` is the only built-in whose schema is generated from the
+/// same config-file code path as user tools (via `synthetic_run_terminal_command_config`
 /// + `generate_schema_for_tool_config`). The `await` and `status` tools are
 /// hardcoded directly in the MCP service and tested separately.
 ///
@@ -116,16 +116,16 @@ async fn test_builtin_tools_have_valid_json_schema() {
         .await
         .expect("Failed to load built-in tool configs");
 
-    // Only sandboxed_shell goes through the config-file schema generation path.
+    // Only run_terminal_command goes through the config-file schema generation path.
     let tool_config = tools
-        .get("sandboxed_shell")
-        .expect("sandboxed_shell should be present in default config");
+        .get("run_terminal_command")
+        .expect("run_terminal_command should be present in default config");
 
     let schema = generate_schema_for_tool_config(tool_config, &None);
-    let result = validate_json_schema_map(&schema, "sandboxed_shell");
+    let result = validate_json_schema_map(&schema, "run_terminal_command");
     assert!(
         result.is_ok(),
-        "Built-in tool 'sandboxed_shell' has invalid JSON Schema: {}",
+        "Built-in tool 'run_terminal_command' has invalid JSON Schema: {}",
         result.unwrap_err()
     );
 }
@@ -158,21 +158,21 @@ async fn test_all_tools_have_valid_json_schema() {
     );
 }
 
-/// Test specifically that sandboxed_shell schema is valid.
+/// Test specifically that run_terminal_command schema is valid.
 ///
 /// This test catches the specific bug where `required: true` was placed inside
 /// property definitions. Loads the synthetic config via `load_tool_configs` —
 /// no subprocess needed.
 #[tokio::test]
-async fn test_sandboxed_shell_schema_no_required_in_properties() {
+async fn test_run_terminal_command_schema_no_required_in_properties() {
     let config = AppConfig::default();
     let tools = load_tool_configs(&config, None)
         .await
         .expect("Failed to load built-in tool configs");
 
     let tool_config = tools
-        .get("sandboxed_shell")
-        .expect("sandboxed_shell tool config should exist");
+        .get("run_terminal_command")
+        .expect("run_terminal_command tool config should exist");
 
     let schema = generate_schema_for_tool_config(tool_config, &None);
 
@@ -182,7 +182,7 @@ async fn test_sandboxed_shell_schema_no_required_in_properties() {
         .expect("Schema should have 'required' field");
     assert!(
         required.is_array(),
-        "sandboxed_shell: 'required' must be an array at schema level, got {:?}",
+        "run_terminal_command: 'required' must be an array at schema level, got {:?}",
         required
     );
 
@@ -194,7 +194,7 @@ async fn test_sandboxed_shell_schema_no_required_in_properties() {
             if let Some(prop_obj) = prop_schema.as_object() {
                 assert!(
                     !prop_obj.contains_key("required"),
-                    "sandboxed_shell: Property '{}' should NOT have 'required' inside it. \
+                    "run_terminal_command: Property '{}' should NOT have 'required' inside it. \
                      Use the top-level 'required' array instead.",
                     prop_name
                 );

@@ -93,7 +93,7 @@ async fn test_filesystem_overrides_bundled_tool() {
 async fn test_reserved_names_rejected() {
     let temp_dir = tempdir().unwrap();
 
-    for reserved in &["await", "status", "sandboxed_shell", "cancel"] {
+    for reserved in &["await", "status", "run_terminal_command", "cancel"] {
         let config = format!(
             r#"{{
   "name": "{}",
@@ -144,10 +144,10 @@ async fn test_bundled_tools_load_without_tools_dir() {
         configs.keys().collect::<Vec<_>>()
     );
 
-    // sandboxed_shell synthetic config should also be present
+    // run_terminal_command synthetic config should also be present
     assert!(
-        configs.contains_key("sandboxed_shell"),
-        "sandboxed_shell synthetic config should always be present"
+        configs.contains_key("run_terminal_command"),
+        "run_terminal_command synthetic config should always be present"
     );
 }
 
@@ -180,7 +180,7 @@ async fn test_each_bundled_flag_works_without_tools_dir() {
 }
 
 /// Verify that `load_tool_configs` never produces duplicate keys.
-/// The synthetic `sandboxed_shell` config and RESERVED_TOOL_NAMES must be consistent.
+/// The synthetic `run_terminal_command` config and RESERVED_TOOL_NAMES must be consistent.
 #[tokio::test]
 async fn test_no_duplicate_tool_names_in_config_output() {
     let temp_dir = tempdir().unwrap();
@@ -217,10 +217,10 @@ async fn test_no_duplicate_tool_names_in_config_output() {
         );
     }
 
-    // Verify sandboxed_shell synthetic config exists exactly once and is in RESERVED set
+    // Verify run_terminal_command synthetic config exists exactly once and is in RESERVED set
     assert!(
-        configs.contains_key("sandboxed_shell"),
-        "Synthetic sandboxed_shell config should always be present"
+        configs.contains_key("run_terminal_command"),
+        "Synthetic run_terminal_command config should always be present"
     );
 
     // Count occurrences of each name to confirm no logical duplicates

@@ -48,14 +48,14 @@ pub fn normalize_tools_dir(tools_dir: Option<PathBuf>) -> Option<PathBuf> {
         } else {
             tracing::warn!(
                 "No .ahma directory found in current working directory ({}). \
-                 Falling back to built-in internal tools only (await, status, sandboxed_shell).",
+                 Falling back to built-in internal tools only (await, status, run_terminal_command).",
                 cwd.display()
             );
         }
     } else {
         tracing::warn!(
             "Could not determine current working directory. \
-             Falling back to built-in internal tools only (await, status, sandboxed_shell)."
+             Falling back to built-in internal tools only (await, status, run_terminal_command)."
         );
     }
 

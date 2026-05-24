@@ -25,7 +25,7 @@ impl SandboxTestEnv {
     }
 
     /// When the *current* test process is running inside a nested sandbox
-    /// (e.g., `mcp_ahma_sandboxed_shell`, Cursor, VS Code, Docker), the child
+    /// (e.g., `mcp_ahma_run_terminal_command`, Cursor, VS Code, Docker), the child
     /// `ahma_mcp` binary would detect the nesting and exit before serving any
     /// requests.  This helper adds `AHMA_DISABLE_SANDBOX=1` to the command so the
     /// binary can start; application-level path security (path_security.rs) is

@@ -37,7 +37,7 @@ use std::{io::IsTerminal, path::PathBuf, sync::Arc};
 
 /// Controls the initial tool-visibility profile for the MCP session.
 ///
-/// In all profiles, built-in tools (`sandboxed_shell`, `await`, `status`,
+/// In all profiles, built-in tools (`run_terminal_command`, `await`, `status`,
 /// `activate_tools`) are always visible.  The profile determines whether
 /// CLI-flagged bundles are auto-revealed at startup or kept hidden until an
 /// explicit `activate_tools reveal` call.

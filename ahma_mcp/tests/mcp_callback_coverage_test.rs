@@ -32,12 +32,12 @@ use serde_json::json;
 /// This exercises Started, Progress, Output, and Completed/FinalResult paths
 #[tokio::test]
 async fn test_async_operation_triggers_callbacks() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
 
     // Start an async operation that produces output
-    let shell_params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let shell_params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         json!({ "command": "echo 'callback test output'" })
             .as_object()
             .unwrap()
@@ -69,12 +69,12 @@ async fn test_async_operation_triggers_callbacks() -> Result<()> {
 /// Test that failed operations trigger the Failed callback path
 #[tokio::test]
 async fn test_failed_operation_callback() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
 
     // Start an operation that will fail
-    let shell_params = CallToolRequestParams::new("sandboxed_shell")
+    let shell_params = CallToolRequestParams::new("run_terminal_command")
         .with_arguments(json!({ "command": "exit 1" }).as_object().unwrap().clone());
 
     let result = client.call_tool(shell_params).await?;
@@ -101,12 +101,12 @@ async fn test_failed_operation_callback() -> Result<()> {
 /// Test cancel operation which triggers the Cancelled callback path
 #[tokio::test]
 async fn test_cancelled_operation_callback() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
 
     // Start a long-running async operation
-    let shell_params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let shell_params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         json!({ "command": "sleep 60" })
             .as_object()
             .unwrap()
@@ -154,7 +154,7 @@ async fn test_cancelled_operation_callback() -> Result<()> {
 /// Test stderr output handling (covers Output variant with is_stderr=true)
 #[tokio::test]
 async fn test_stderr_output_callback() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
 
@@ -165,7 +165,7 @@ async fn test_stderr_output_callback() -> Result<()> {
     #[cfg(not(any(unix, windows)))]
     let stderr_cmd = "echo 'stderr test' >&2";
 
-    let shell_params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let shell_params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         json!({ "command": stderr_cmd })
             .as_object()
             .unwrap()
@@ -195,18 +195,18 @@ async fn test_stderr_output_callback() -> Result<()> {
 /// Test multiple concurrent operations exercising callback system
 #[tokio::test]
 async fn test_concurrent_operations_callbacks() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
 
     // Start multiple operations
-    let params1 = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params1 = CallToolRequestParams::new("run_terminal_command").with_arguments(
         json!({ "command": "echo 'op1'" })
             .as_object()
             .unwrap()
             .clone(),
     );
-    let params2 = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params2 = CallToolRequestParams::new("run_terminal_command").with_arguments(
         json!({ "command": "echo 'op2'" })
             .as_object()
             .unwrap()

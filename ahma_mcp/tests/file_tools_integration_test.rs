@@ -37,7 +37,7 @@ mod file_tools_tests {
 
     #[test]
     fn test_file_tools_pwd() {
-        skip_if_disabled!("sandboxed_shell");
+        skip_if_disabled!("run_terminal_command");
 
         let binary = build_binary("ahma_mcp", "ahma");
         let workspace = workspace_dir();
@@ -47,16 +47,16 @@ mod file_tools_tests {
         let output = test_command(&binary)
             .current_dir(temp_dir.path())
             .env("AHMA_TOOLS_DIR", &tools_dir)
-            .args(["tool", "run", "sandboxed_shell", "pwd"])
+            .args(["tool", "run", "run_terminal_command", "pwd"])
             .output()
-            .expect("Failed to execute pwd via sandboxed_shell");
+            .expect("Failed to execute pwd via run_terminal_command");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert!(
             output.status.success(),
-            "pwd via sandboxed_shell should succeed. stdout: {}, stderr: {}",
+            "pwd via run_terminal_command should succeed. stdout: {}, stderr: {}",
             stdout,
             stderr
         );
@@ -73,7 +73,7 @@ mod file_tools_tests {
 
     #[test]
     fn test_file_tools_touch_and_ls() {
-        skip_if_disabled!("sandboxed_shell");
+        skip_if_disabled!("run_terminal_command");
 
         let binary = build_binary("ahma_mcp", "ahma");
         let workspace = workspace_dir();
@@ -88,15 +88,15 @@ mod file_tools_tests {
             .args([
                 "tool",
                 "run",
-                "sandboxed_shell",
+                "run_terminal_command",
                 &format!("touch {}", test_file),
             ])
             .output()
-            .expect("Failed to execute touch via sandboxed_shell");
+            .expect("Failed to execute touch via run_terminal_command");
 
         assert!(
             output_touch.status.success(),
-            "touch via sandboxed_shell should succeed. stderr: {}",
+            "touch via run_terminal_command should succeed. stderr: {}",
             String::from_utf8_lossy(&output_touch.stderr)
         );
 
@@ -113,16 +113,16 @@ mod file_tools_tests {
             .args([
                 "tool",
                 "run",
-                "sandboxed_shell",
+                "run_terminal_command",
                 &format!("ls {}", test_file),
             ])
             .output()
-            .expect("Failed to execute ls via sandboxed_shell");
+            .expect("Failed to execute ls via run_terminal_command");
 
         let stdout_ls = String::from_utf8_lossy(&output_ls.stdout);
         assert!(
             output_ls.status.success(),
-            "ls via sandboxed_shell should succeed. stderr: {}",
+            "ls via run_terminal_command should succeed. stderr: {}",
             String::from_utf8_lossy(&output_ls.stderr)
         );
 
@@ -135,7 +135,7 @@ mod file_tools_tests {
 
     #[test]
     fn test_file_tools_cp_and_mv() {
-        skip_if_disabled!("sandboxed_shell");
+        skip_if_disabled!("run_terminal_command");
 
         let binary = build_binary("ahma_mcp", "ahma");
         let workspace = workspace_dir();
@@ -157,15 +157,15 @@ mod file_tools_tests {
             .args([
                 "tool",
                 "run",
-                "sandboxed_shell",
+                "run_terminal_command",
                 &format!("cp {} {}", source_file, dest_file),
             ])
             .output()
-            .expect("Failed to execute cp via sandboxed_shell");
+            .expect("Failed to execute cp via run_terminal_command");
 
         assert!(
             output_cp.status.success(),
-            "cp via sandboxed_shell should succeed. stderr: {}",
+            "cp via run_terminal_command should succeed. stderr: {}",
             String::from_utf8_lossy(&output_cp.stderr)
         );
 
@@ -181,15 +181,15 @@ mod file_tools_tests {
             .args([
                 "tool",
                 "run",
-                "sandboxed_shell",
+                "run_terminal_command",
                 &format!("mv {} {}", dest_file, moved_file),
             ])
             .output()
-            .expect("Failed to execute mv via sandboxed_shell");
+            .expect("Failed to execute mv via run_terminal_command");
 
         assert!(
             output_mv.status.success(),
-            "mv via sandboxed_shell should succeed. stderr: {}",
+            "mv via run_terminal_command should succeed. stderr: {}",
             String::from_utf8_lossy(&output_mv.stderr)
         );
 
@@ -205,7 +205,7 @@ mod file_tools_tests {
 
     #[test]
     fn test_file_tools_rm() {
-        skip_if_disabled!("sandboxed_shell");
+        skip_if_disabled!("run_terminal_command");
 
         let binary = build_binary("ahma_mcp", "ahma");
         let workspace = workspace_dir();
@@ -223,15 +223,15 @@ mod file_tools_tests {
             .args([
                 "tool",
                 "run",
-                "sandboxed_shell",
+                "run_terminal_command",
                 &format!("rm {}", test_file),
             ])
             .output()
-            .expect("Failed to execute rm via sandboxed_shell");
+            .expect("Failed to execute rm via run_terminal_command");
 
         assert!(
             output_rm.status.success(),
-            "rm via sandboxed_shell should succeed. stderr: {}",
+            "rm via run_terminal_command should succeed. stderr: {}",
             String::from_utf8_lossy(&output_rm.stderr)
         );
 
@@ -243,7 +243,7 @@ mod file_tools_tests {
 
     #[test]
     fn test_file_tools_cat_and_grep() {
-        skip_if_disabled!("sandboxed_shell");
+        skip_if_disabled!("run_terminal_command");
 
         let binary = build_binary("ahma_mcp", "ahma");
         let workspace = workspace_dir();
@@ -262,16 +262,16 @@ mod file_tools_tests {
             .args([
                 "tool",
                 "run",
-                "sandboxed_shell",
+                "run_terminal_command",
                 &format!("cat {}", test_file),
             ])
             .output()
-            .expect("Failed to execute cat via sandboxed_shell");
+            .expect("Failed to execute cat via run_terminal_command");
 
         let stdout_cat = String::from_utf8_lossy(&output_cat.stdout);
         assert!(
             output_cat.status.success(),
-            "cat via sandboxed_shell should succeed. stderr: {}",
+            "cat via run_terminal_command should succeed. stderr: {}",
             String::from_utf8_lossy(&output_cat.stderr)
         );
         assert!(
@@ -286,16 +286,16 @@ mod file_tools_tests {
             .args([
                 "tool",
                 "run",
-                "sandboxed_shell",
+                "run_terminal_command",
                 &format!("grep Target {}", test_file),
             ])
             .output()
-            .expect("Failed to execute grep via sandboxed_shell");
+            .expect("Failed to execute grep via run_terminal_command");
 
         let stdout_grep = String::from_utf8_lossy(&output_grep.stdout);
         assert!(
             output_grep.status.success(),
-            "grep via sandboxed_shell should succeed. stderr: {}",
+            "grep via run_terminal_command should succeed. stderr: {}",
             String::from_utf8_lossy(&output_grep.stderr)
         );
         assert!(
@@ -309,12 +309,12 @@ mod file_tools_tests {
     }
 }
 
-mod sandboxed_shell_tests {
+mod run_terminal_command_tests {
     use super::*;
 
     #[test]
-    fn test_sandboxed_shell_echo() {
-        skip_if_disabled!("sandboxed_shell");
+    fn test_run_terminal_command_echo() {
+        skip_if_disabled!("run_terminal_command");
         let binary = build_binary("ahma_mcp", "ahma");
         let workspace = workspace_dir();
         let tools_dir = workspace.join(".ahma");
@@ -323,14 +323,14 @@ mod sandboxed_shell_tests {
         let output = test_command(&binary)
             .current_dir(temp_dir.path())
             .env("AHMA_TOOLS_DIR", &tools_dir)
-            .args(["tool", "run", "sandboxed_shell", "echo 'Hello from shell'"])
+            .args(["tool", "run", "run_terminal_command", "echo 'Hello from shell'"])
             .output()
-            .expect("Failed to execute sandboxed_shell");
+            .expect("Failed to execute run_terminal_command");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),
-            "sandboxed_shell should succeed. stderr: {}",
+            "run_terminal_command should succeed. stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
@@ -340,8 +340,8 @@ mod sandboxed_shell_tests {
     }
 
     #[test]
-    fn test_sandboxed_shell_write_file() {
-        skip_if_disabled!("sandboxed_shell");
+    fn test_run_terminal_command_write_file() {
+        skip_if_disabled!("run_terminal_command");
         let binary = build_binary("ahma_mcp", "ahma");
         let workspace = workspace_dir();
         let tools_dir = workspace.join(".ahma");
@@ -360,13 +360,13 @@ mod sandboxed_shell_tests {
         let output = test_command(&binary)
             .current_dir(temp_dir.path())
             .env("AHMA_TOOLS_DIR", &tools_dir)
-            .args(["tool", "run", "sandboxed_shell", &script])
+            .args(["tool", "run", "run_terminal_command", &script])
             .output()
-            .expect("Failed to execute sandboxed_shell");
+            .expect("Failed to execute run_terminal_command");
 
         assert!(
             output.status.success(),
-            "sandboxed_shell should succeed. stderr: {}",
+            "run_terminal_command should succeed. stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
 

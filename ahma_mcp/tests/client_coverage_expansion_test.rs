@@ -66,7 +66,7 @@ async fn test_client_start_process_with_tools_dir() -> Result<()> {
     // Should have default tools available
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert!(
-        tool_names.contains(&"sandboxed_shell")
+        tool_names.contains(&"run_terminal_command")
             || tool_names.contains(&"await")
             || tool_names.contains(&"status"),
         "Expected standard tools, got: {:?}",
@@ -224,14 +224,14 @@ async fn test_client_await_nonexistent_operation() -> Result<()> {
 /// Test full async operation lifecycle: start, status, await
 #[tokio::test]
 async fn test_async_operation_lifecycle() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let mcp = build_test_client().await?;
     let client = &mcp.client;
 
     // Start an async operation (short sleep)
     let start_result =
-        call_test_tool(client, "sandboxed_shell", json!({ "command": "sleep 0.5" })).await?;
+        call_test_tool(client, "run_terminal_command", json!({ "command": "sleep 0.5" })).await?;
 
     assert!(!start_result.content.is_empty());
 
@@ -256,17 +256,17 @@ async fn test_async_operation_lifecycle() -> Result<()> {
 /// Test multiple async operations can be tracked
 #[tokio::test]
 async fn test_multiple_async_operations() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let mcp = build_test_client().await?;
     let client = &mcp.client;
 
     // Start two async operations
     let result1 =
-        call_test_tool(client, "sandboxed_shell", json!({ "command": "sleep 0.3" })).await?;
+        call_test_tool(client, "run_terminal_command", json!({ "command": "sleep 0.3" })).await?;
 
     let result2 =
-        call_test_tool(client, "sandboxed_shell", json!({ "command": "sleep 0.3" })).await?;
+        call_test_tool(client, "run_terminal_command", json!({ "command": "sleep 0.3" })).await?;
 
     // Check overall status
     let status = call_test_tool(client, "status", json!({})).await?;
@@ -286,10 +286,10 @@ async fn test_multiple_async_operations() -> Result<()> {
 // Shell Execution Tests
 // ============================================================================
 
-/// Test sandboxed_shell tool execution (covers shell-related paths in client)
+/// Test run_terminal_command tool execution (covers shell-related paths in client)
 #[tokio::test]
-async fn test_sandboxed_shell_execution() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+async fn test_run_terminal_command_execution() -> Result<()> {
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let mcp = build_test_client().await?;
     let client = &mcp.client;
@@ -297,7 +297,7 @@ async fn test_sandboxed_shell_execution() -> Result<()> {
     // Run a simple command
     let result = call_test_tool(
         client,
-        "sandboxed_shell",
+        "run_terminal_command",
         json!({ "command": "echo 'hello from test'" }),
     )
     .await?;
@@ -305,11 +305,11 @@ async fn test_sandboxed_shell_execution() -> Result<()> {
     Ok(())
 }
 
-/// Test sandboxed_shell with working_directory parameter
+/// Test run_terminal_command with working_directory parameter
 /// Uses a directory inside the sandbox scope (.ahma) to comply with sandbox restrictions
 #[tokio::test]
-async fn test_sandboxed_shell_with_working_dir() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+async fn test_run_terminal_command_with_working_dir() -> Result<()> {
+    skip_if_disabled_async_result!("run_terminal_command");
 
     init_test_logging();
 
@@ -321,7 +321,7 @@ async fn test_sandboxed_shell_with_working_dir() -> Result<()> {
 
     let result = call_test_tool(
         client,
-        "sandboxed_shell",
+        "run_terminal_command",
         json!({
             "command": "pwd",
             "working_directory": working_dir.to_str().unwrap()
@@ -364,7 +364,7 @@ async fn test_list_tools_format() -> Result<()> {
     // Should contain standard tools
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert!(
-        tool_names.contains(&"sandboxed_shell")
+        tool_names.contains(&"run_terminal_command")
             || tool_names.contains(&"await")
             || tool_names.contains(&"status"),
         "Expected standard tools, got: {:?}",

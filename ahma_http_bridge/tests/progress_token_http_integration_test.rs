@@ -8,7 +8,7 @@ use tokio::time::sleep;
 fn short_sleep_command() -> &'static str {
     #[cfg(windows)]
     {
-        // `sandboxed_shell` executes through powershell on Windows.
+        // `run_terminal_command` executes through powershell on Windows.
         "Start-Sleep -Milliseconds 200"
     }
 
@@ -23,7 +23,7 @@ async fn test_http_no_progress_token_does_not_emit_progress_notifications() -> a
     let server = spawn_http_bridge().await?;
     let mut client = HttpMcpTestClient::new(server.base_url());
 
-    // sandboxed_shell is a core built-in tool - no JSON config needed
+    // run_terminal_command is a core built-in tool - no JSON config needed
 
     let client_root_dir = TempDir::new().context("Failed to create temp dir (client_root)")?;
     let mut events_rx = client
@@ -40,7 +40,7 @@ async fn test_http_no_progress_token_does_not_emit_progress_notifications() -> a
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "sandboxed_shell",
+            "name": "run_terminal_command",
             "arguments": {
                 "command": short_sleep_command(),
                 "working_directory": client_root_dir.path().to_string_lossy()
@@ -90,7 +90,7 @@ async fn test_http_progress_token_is_echoed_in_progress_notifications() -> anyho
     let server = spawn_http_bridge().await?;
     let mut client = HttpMcpTestClient::new(server.base_url());
 
-    // sandboxed_shell is a core built-in tool - no JSON config needed
+    // run_terminal_command is a core built-in tool - no JSON config needed
 
     let client_root_dir = TempDir::new().context("Failed to create temp dir (client_root)")?;
     let mut events_rx = client
@@ -108,7 +108,7 @@ async fn test_http_progress_token_is_echoed_in_progress_notifications() -> anyho
         "method": "tools/call",
         "params": {
             "_meta": { "progressToken": token },
-            "name": "sandboxed_shell",
+            "name": "run_terminal_command",
             "arguments": {
                 "command": short_sleep_command(),
                 "working_directory": client_root_dir.path().to_string_lossy()

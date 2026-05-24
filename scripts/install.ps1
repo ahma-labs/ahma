@@ -438,7 +438,7 @@ function Invoke-AhmaMcpSetup {
 
 # Skill Setup Wizard
 # Installs Ahma agent skills to ~/.agents/skills/
-#   ahma — comprehensive usage guide (sandboxed_shell, bundles, sandbox, simplify, etc.)
+#   ahma — comprehensive usage guide (run_terminal_command, bundles, sandbox, simplify, etc.)
 # Compatible with VS Code (GitHub Copilot), Cursor, and Claude Code — all index .agents/skills/
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -453,7 +453,7 @@ description: >
   to understand how to run tools, activate bundles, use the sandbox, monitor logs, author custom
   tools, or configure ahma. Also handles code complexity analysis via /ahma simplify.
   Trigger phrases: "use ahma", "run with ahma", "ahma tool", "activate bundle",
-  "sandboxed_shell", "ahma async", "ahma serve", "mcp.json ahma", "ahma sandbox",
+  "run_terminal_command", "ahma async", "ahma serve", "mcp.json ahma", "ahma sandbox",
   "ahma livelog", "ahma monitor", "custom tool .ahma", "ahma", "await tool",
   "cancel operation", "tool bundle", "progressive disclosure", "activate_tools",
   "simplify", "reduce complexity", "too complex", "hard to read", "refactor",
@@ -577,7 +577,7 @@ If a user asks you to use Ahma but it isn't configured, help them by:
 ## Tool Bundles & Progressive Disclosure
 
 By default, Ahma hides bundled tools to save AI context ("progressive disclosure"). You first
-see only: `sandboxed_shell`, `status`, `await`, `cancel`, and `activate_tools`.
+see only: `run_terminal_command`, `status`, `await`, `cancel`, and `activate_tools`.
 
 ### Discovering and Activating Bundles
 
@@ -618,10 +618,10 @@ Prefer setting `AHMA_REVEAL_PROFILE=balanced` in the `env` block instead of `--a
 
 ## Built-in Tools (Always Available)
 
-### `sandboxed_shell` -- Run any shell command
+### `run_terminal_command` -- Run any shell command
 
 ```
-sandboxed_shell(
+run_terminal_command(
   command="cargo build --release",
   working_directory="/path/to/project",
   timeout_seconds=300
@@ -853,7 +853,7 @@ ahma serve unix [--socket-path /tmp/ahma.sock]
 
 # Run a single tool from the CLI
 ahma tool run cargo_build -- --release
-ahma tool run sandboxed_shell -- "echo hello"
+ahma tool run run_terminal_command -- "echo hello"
 
 # Validate .ahma/ tool configs
 ahma tool validate [.ahma/]
@@ -882,8 +882,8 @@ cargo_nextest_run(subcommand="nextest run")
 ### Run arbitrary shell commands
 
 ```
-sandboxed_shell(command="npm ci && npm run build", working_directory="/project")
-sandboxed_shell(command="docker compose up -d", timeout_seconds=60)
+run_terminal_command(command="npm ci && npm run build", working_directory="/project")
+run_terminal_command(command="docker compose up -d", timeout_seconds=60)
 ```
 
 ### Check what bundles are available
@@ -940,7 +940,7 @@ function Invoke-AhmaSkillSetup {
     Write-Host ""
     Write-Host "  One agent skill is available for AI tools (VS Code, Cursor, Claude Code):"
     Write-Host ""
-    Write-Host "    ahma -- comprehensive usage guide including sandboxed_shell, bundles, sandbox,"
+    Write-Host "    ahma -- comprehensive usage guide including run_terminal_command, bundles, sandbox,"
     Write-Host "             code complexity analysis (/ahma simplify), and more."
     Write-Host ""
     Write-Host "  Skills install to ~/.agents/skills/ -- the universal cross-platform skill path."
@@ -978,7 +978,7 @@ function Invoke-AhmaSkillSetup {
 
     Write-Host ""
     Write-Host "  Installing skills..."
-    Install-OneSkill -Name 'ahma' -Version '0.7.1' -ContentFn { Get-AhmaMainSkillContent }
+    Install-OneSkill -Name 'ahma' -Version '0.7.2' -ContentFn { Get-AhmaMainSkillContent }
 
     Write-Host ""
     Write-Host "  Skills are automatically available in:"

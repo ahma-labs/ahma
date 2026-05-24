@@ -65,7 +65,7 @@ async fn test_automatic_async_fast_shell_returns_inline() -> Result<()> {
         .await?;
 
     // Don't set execution_mode — let it default to AsyncResultPush
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         json!({
             "command": "echo 'automatic_async_test_marker'"
         })
@@ -129,7 +129,7 @@ async fn test_automatic_async_slow_command_returns_async_id() -> Result<()> {
         "sleep 30 && echo done"
     };
 
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         json!({
             "command": command_str
         })
@@ -179,7 +179,7 @@ async fn test_automatic_async_slow_command_returns_async_id() -> Result<()> {
 // Test: Fast configured async tool returns inline result
 // ============================================================================
 
-/// A fast async tool (configured via JSON, not sandboxed_shell) should also
+/// A fast async tool (configured via JSON, not run_terminal_command) should also
 /// benefit from automatic async and return inline results.
 #[tokio::test]
 async fn test_automatic_async_configured_tool_returns_inline() -> Result<()> {
@@ -240,7 +240,7 @@ async fn test_automatic_async_does_not_affect_sync_mode() -> Result<()> {
 
     let start = std::time::Instant::now();
 
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         json!({
             "command": "echo sync_marker",
             "execution_mode": "Synchronous"
@@ -301,7 +301,7 @@ async fn test_automatic_async_multiple_fast_commands() -> Result<()> {
 
     for i in 1..=3 {
         let marker = format!("fast_cmd_{}", i);
-        let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+        let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
             json!({
                 "command": format!("echo '{}'", marker)
             })

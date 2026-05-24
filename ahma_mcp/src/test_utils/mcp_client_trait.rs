@@ -17,7 +17,7 @@
 //! # #[tokio::main]
 //! # async fn main() -> anyhow::Result<()> {
 //! let mcp = create_in_process_mcp_empty().await?;
-//! let result = mcp.call_tool("sandboxed_shell", json!({"subcommand": "default", "args": ["echo hi"]})).await;
+//! let result = mcp.call_tool("run_terminal_command", json!({"subcommand": "default", "args": ["echo hi"]})).await;
 //! assert!(result.success, "{:?}", result.error);
 //! # Ok(())
 //! # }

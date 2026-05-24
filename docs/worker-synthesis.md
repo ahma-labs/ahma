@@ -6,7 +6,7 @@ The `worker` tool type compiles and runs synthesized Rust or Python programs ins
 
 ## Why worker synthesis?
 
-An AI agent running shell commands with `sandboxed_shell` is safe at the filesystem level, but the command string itself is constructed by an LLM. A successful prompt-injection could alter the command at the last moment.
+An AI agent running shell commands with `run_terminal_command` is safe at the filesystem level, but the command string itself is constructed by an LLM. A successful prompt-injection could alter the command at the last moment.
 
 A worker sidesteps this: the agent generates the source code once, the code is reviewed (optionally) and then compiled or interpreted as a fixed program. Execution does not involve the LLM; the sandbox enforces filesystem boundaries; the source hash is recorded in `audit.jsonl`.
 

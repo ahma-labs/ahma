@@ -7,7 +7,7 @@
 //! Requirements tested:
 //! - R1.2.1: Auto-detection of .ahma in CWD when --tools-dir not provided
 //! - R1.2.2: Explicit --tools-dir takes precedence over auto-detection
-//! - Built-in tools (await, status, sandboxed_shell) always available
+//! - Built-in tools (await, status, run_terminal_command) always available
 
 use ahma_mcp::test_utils::client::ClientBuilder;
 use std::time::Duration;
@@ -78,8 +78,8 @@ async fn test_auto_detect_ahma_in_cwd() -> anyhow::Result<()> {
         "Built-in 'status' tool should be present"
     );
     assert!(
-        tools.iter().any(|t| t.name == "sandboxed_shell"),
-        "Built-in 'sandboxed_shell' tool should be present"
+        tools.iter().any(|t| t.name == "run_terminal_command"),
+        "Built-in 'run_terminal_command' tool should be present"
     );
 
     // Verify auto-detected tool is present
@@ -141,8 +141,8 @@ async fn test_explicit_tools_dir_takes_precedence() -> anyhow::Result<()> {
         "Built-in 'status' tool should be present"
     );
     assert!(
-        tools.iter().any(|t| t.name == "sandboxed_shell"),
-        "Built-in 'sandboxed_shell' tool should be present"
+        tools.iter().any(|t| t.name == "run_terminal_command"),
+        "Built-in 'run_terminal_command' tool should be present"
     );
 
     // Verify tool_b is present (from explicit dir)
@@ -195,8 +195,8 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
         "Built-in 'status' tool should be present"
     );
     assert!(
-        tools.iter().any(|t| t.name == "sandboxed_shell"),
-        "Built-in 'sandboxed_shell' tool should be present"
+        tools.iter().any(|t| t.name == "run_terminal_command"),
+        "Built-in 'run_terminal_command' tool should be present"
     );
     assert!(
         tools.iter().any(|t| t.name == "activate_tools"),
@@ -218,9 +218,9 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test that sandboxed_shell is available as a core built-in even without any .ahma/ directory
+/// Test that run_terminal_command is available as a core built-in even without any .ahma/ directory
 #[tokio::test]
-async fn test_sandboxed_shell_builtin_without_json_file() -> anyhow::Result<()> {
+async fn test_run_terminal_command_builtin_without_json_file() -> anyhow::Result<()> {
     // Create a temp directory with NO .ahma
     let temp_dir = TempDir::new()?;
     let cwd = temp_dir.path();
@@ -233,23 +233,23 @@ async fn test_sandboxed_shell_builtin_without_json_file() -> anyhow::Result<()> 
     let tools_result = service.list_tools(None).await?;
     let tools = tools_result.tools;
 
-    // Verify sandboxed_shell is present even without JSON file
-    let sandboxed_shell = tools
+    // Verify run_terminal_command is present even without JSON file
+    let run_terminal_command = tools
         .iter()
-        .find(|t| t.name == "sandboxed_shell")
-        .expect("sandboxed_shell should be present as built-in tool");
+        .find(|t| t.name == "run_terminal_command")
+        .expect("run_terminal_command should be present as built-in tool");
 
     // Verify it has the expected description
     assert!(
-        sandboxed_shell
+        run_terminal_command
             .description
             .as_ref()
-            .map(|d| d.contains("sandboxed_shell")
+            .map(|d| d.contains("run_terminal_command")
                 || d.contains("sandbox")
                 || d.contains("operation_id"))
             .unwrap_or(false),
-        "sandboxed_shell should have proper description. Got: {:?}",
-        sandboxed_shell.description
+        "run_terminal_command should have proper description. Got: {:?}",
+        run_terminal_command.description
     );
 
     Ok(())

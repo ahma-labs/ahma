@@ -102,8 +102,8 @@ async fn test_progressive_disclosure_initial_tools() {
         "status should be listed"
     );
     assert!(
-        tool_names.contains(&"sandboxed_shell".to_string()),
-        "sandboxed_shell should be listed"
+        tool_names.contains(&"run_terminal_command".to_string()),
+        "run_terminal_command should be listed"
     );
     assert!(
         tool_names.contains(&"activate_tools".to_string()),
@@ -120,7 +120,7 @@ async fn test_progressive_disclosure_initial_tools() {
         "git should be hidden before reveal"
     );
 
-    // Exactly 4 tools: await, status, sandboxed_shell, activate_tools
+    // Exactly 4 tools: await, status, run_terminal_command, activate_tools
     assert_eq!(
         tool_names.len(),
         4,
@@ -139,7 +139,7 @@ async fn test_progressive_disclosure_legacy_shows_all() {
     // Built-in tools present
     assert!(tool_names.contains(&"await".to_string()));
     assert!(tool_names.contains(&"status".to_string()));
-    assert!(tool_names.contains(&"sandboxed_shell".to_string()));
+    assert!(tool_names.contains(&"run_terminal_command".to_string()));
 
     // activate_tools should NOT be present when PD is off
     assert!(
@@ -337,8 +337,8 @@ async fn test_instructions_populated_with_pd() {
     );
     let instructions = info.instructions.unwrap();
     assert!(
-        instructions.contains("sandboxed_shell"),
-        "instructions should mention sandboxed_shell"
+        instructions.contains("run_terminal_command"),
+        "instructions should mention run_terminal_command"
     );
     assert!(
         instructions.contains("activate_tools"),
@@ -358,8 +358,8 @@ async fn test_instructions_populated_without_pd() {
     );
     let instructions = info.instructions.unwrap();
     assert!(
-        instructions.contains("sandboxed_shell"),
-        "instructions should mention sandboxed_shell"
+        instructions.contains("run_terminal_command"),
+        "instructions should mention run_terminal_command"
     );
     assert!(
         !instructions.contains("activate_tools"),
@@ -453,7 +453,7 @@ async fn test_cli_flagged_bundles_auto_revealed() {
     // Built-in tools should still be present
     assert!(tool_names.contains(&"await".to_string()));
     assert!(tool_names.contains(&"status".to_string()));
-    assert!(tool_names.contains(&"sandboxed_shell".to_string()));
+    assert!(tool_names.contains(&"run_terminal_command".to_string()));
 
     // activate_tools should still be present (there may be other non-flagged bundles)
     assert!(tool_names.contains(&"activate_tools".to_string()));
@@ -598,10 +598,10 @@ async fn test_balanced_profile_reveals_cli_bundles() {
         tool_names
     );
 
-    // sandboxed_shell must still be present (built-in, not bundle-gated)
+    // run_terminal_command must still be present (built-in, not bundle-gated)
     assert!(
-        tool_names.contains(&"sandboxed_shell".to_string()),
-        "sandboxed_shell must always be visible, got: {:?}",
+        tool_names.contains(&"run_terminal_command".to_string()),
+        "run_terminal_command must always be visible, got: {:?}",
         tool_names
     );
 }
@@ -662,7 +662,7 @@ async fn test_minimal_profile_hides_cli_bundles() {
     );
 
     // Built-in tools must be visible
-    assert!(tool_names.contains(&"sandboxed_shell".to_string()));
+    assert!(tool_names.contains(&"run_terminal_command".to_string()));
     assert!(tool_names.contains(&"activate_tools".to_string()));
     assert!(tool_names.contains(&"await".to_string()));
     assert!(tool_names.contains(&"status".to_string()));

@@ -112,14 +112,14 @@ async fn test_error_handling_malformed_call_tool_params() -> Result<()> {
     init_test_logging();
     let mcp = create_in_process_mcp_empty().await?;
 
-    // sandboxed_shell requires the 'command' parameter
-    let missing_params = CallToolRequestParams::new("sandboxed_shell")
+    // run_terminal_command requires the 'command' parameter
+    let missing_params = CallToolRequestParams::new("run_terminal_command")
         .with_arguments(json!({}).as_object().cloned().unwrap_or_default());
 
     let result = mcp.client.call_tool(missing_params).await;
     assert!(
         result.is_err(),
-        "sandboxed_shell should require command parameter"
+        "run_terminal_command should require command parameter"
     );
 
     // Type mismatch for await id parameter — should not panic
@@ -210,12 +210,12 @@ async fn test_status_tool_filter_combinations() -> Result<()> {
 /// Test async operations with real tool execution
 #[tokio::test]
 async fn test_async_operation_with_real_execution() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
 
     // Start a real async operation (shell command)
-    let async_params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let async_params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         json!({ "command": "echo 'test async execution'" })
             .as_object()
             .cloned()

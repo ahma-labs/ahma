@@ -156,7 +156,7 @@ async fn setup_failure_test_configs() -> Result<TempDir> {
     )
     .await?;
 
-    // sandboxed_shell is a core built-in tool - no JSON config needed
+    // run_terminal_command is a core built-in tool - no JSON config needed
 
     // NOTE: marker_sequence is dynamically generated in the test that uses it,
     // because it needs paths inside the temp directory (sandbox-scoped).
@@ -316,7 +316,7 @@ async fn test_sequence_failure_with_filesystem_markers() -> Result<()> {
     "step_delay_ms": 50,
     "sequence": [
         {{
-            "tool": "sandboxed_shell",
+            "tool": "run_terminal_command",
             "subcommand": "default",
             "description": "Step 1: create first marker",
             "args": {{"command": "touch {}"}}
@@ -327,7 +327,7 @@ async fn test_sequence_failure_with_filesystem_markers() -> Result<()> {
             "description": "Step 2: fail"
         }},
         {{
-            "tool": "sandboxed_shell",
+            "tool": "run_terminal_command",
             "subcommand": "default",
             "description": "Step 3: should NOT create this marker",
             "args": {{"command": "touch {}"}}
