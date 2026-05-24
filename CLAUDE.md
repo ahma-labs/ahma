@@ -11,10 +11,10 @@ This file provides AI-specific development guidance for the `ahma` project. For 
 
 ## When to use ahma vs the native terminal
 
-For commands run during this project, prefer ahma's `sandboxed_shell` (via `CallMcpTool` on Cursor) when any of these apply:
+For commands run during this project, prefer ahma's `run_terminal_command` (via `CallMcpTool` on Cursor) when any of these apply:
 
 - the command writes to disk — the kernel-enforced sandbox keeps writes inside the workspace
-- the command runs for more than a few seconds — `sandboxed_shell` is async, returns an operation_id, and lets the agent continue other work while it runs
+- the command runs for more than a few seconds — `run_terminal_command` is async, returns an operation_id, and lets the agent continue other work while it runs
 - the output should be watched for errors mid-run — set `monitor_level` to get pushed alerts
 - multiple independent commands should run concurrently — each gets its own operation_id
 
@@ -98,8 +98,8 @@ cargo llvm-cov --html
 
 ### Quality Assurance
 ```bash
-# Preferred: run multi-step pipelines via sandboxed_shell
-ahma sandboxed_shell --working-directory . -- \
+# Preferred: run multi-step pipelines via run_terminal_command
+ahma run_terminal_command --working-directory . -- \
   "cargo fmt --all && cargo clippy --all-targets && cargo nextest run"
 
 # Individual quality checks (direct)

@@ -33,9 +33,9 @@ fn extract_shell_working_directory(output: &str) -> Result<PathBuf> {
 }
 
 #[tokio::test]
-async fn test_generate_input_schema_for_sandboxed_shell() -> Result<()> {
+async fn test_generate_input_schema_for_run_terminal_command() -> Result<()> {
     let (service, _tmp) = ahma_mcp::test_utils::client::setup_test_environment().await;
-    let schema = service.generate_input_schema_for_sandboxed_shell();
+    let schema = service.generate_input_schema_for_run_terminal_command();
 
     assert_eq!(schema.get("type").unwrap(), "object");
     let props = schema.get("properties").unwrap().as_object().unwrap();
@@ -53,7 +53,7 @@ async fn test_generate_input_schema_for_sandboxed_shell() -> Result<()> {
 async fn test_build_shell_subcommand_config_sync() -> Result<()> {
     let mode = ahma_mcp::adapter::ExecutionMode::Synchronous;
     let config = ahma_mcp::AhmaMcpService::build_shell_subcommand_config(Some(10), &mode);
-    assert_eq!(config.name, "sandboxed_shell");
+    assert_eq!(config.name, "run_terminal_command");
     assert_eq!(config.timeout_seconds, Some(10));
     assert_eq!(config.synchronous, Some(true));
     assert!(config.positional_args.is_some());
@@ -65,7 +65,7 @@ async fn test_build_shell_subcommand_config_sync() -> Result<()> {
 async fn test_build_shell_subcommand_config_async_mode() -> Result<()> {
     let mode = ahma_mcp::adapter::ExecutionMode::AsyncResultPush;
     let config = ahma_mcp::AhmaMcpService::build_shell_subcommand_config(Some(30), &mode);
-    assert_eq!(config.name, "sandboxed_shell");
+    assert_eq!(config.name, "run_terminal_command");
     assert_eq!(config.timeout_seconds, Some(30));
     assert_eq!(config.synchronous, Some(false));
     assert!(config.positional_args.is_some());
@@ -128,11 +128,11 @@ mod extract_shell_working_directory_tests {
 }
 
 #[tokio::test]
-async fn test_handle_sandboxed_shell_missing_command() -> Result<()> {
+async fn test_handle_run_terminal_command_missing_command() -> Result<()> {
     init_test_logging();
     let client = ClientBuilder::new().build().await?;
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(Map::new());
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(Map::new());
 
     let result = client.call_tool(call_param).await;
     assert!(result.is_err());
@@ -141,7 +141,7 @@ async fn test_handle_sandboxed_shell_missing_command() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_handle_sandboxed_shell_sync() -> Result<()> {
+async fn test_handle_run_terminal_command_sync() -> Result<()> {
     init_test_logging();
     let client = ClientBuilder::new().build().await?;
 
@@ -149,7 +149,7 @@ async fn test_handle_sandboxed_shell_sync() -> Result<()> {
     args.insert("command".to_string(), json!("echo 'hello sync'"));
     args.insert("execution_mode".to_string(), json!("Synchronous"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
     let result = client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
@@ -167,14 +167,14 @@ async fn test_handle_sandboxed_shell_sync() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_handle_sandboxed_shell_async() -> Result<()> {
+async fn test_handle_run_terminal_command_async() -> Result<()> {
     init_test_logging();
     let client = ClientBuilder::new().build().await?;
 
     let mut args = Map::new();
     args.insert("command".to_string(), json!("echo 'hello async'"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
     let result = client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
@@ -183,7 +183,7 @@ async fn test_handle_sandboxed_shell_async() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_handle_sandboxed_shell_working_directory() -> Result<()> {
+async fn test_handle_run_terminal_command_working_directory() -> Result<()> {
     init_test_logging();
 
     // Create tempdir first so it's in scope for both the client (sandbox scope) and
@@ -204,7 +204,7 @@ async fn test_handle_sandboxed_shell_working_directory() -> Result<()> {
     args.insert("working_directory".to_string(), json!(temp_dir_str));
     args.insert("execution_mode".to_string(), json!("Synchronous"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
     let result = client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
@@ -228,7 +228,7 @@ async fn test_handle_sandboxed_shell_working_directory() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_handle_sandboxed_shell_with_monitor_level_and_stream() -> Result<()> {
+async fn test_handle_run_terminal_command_with_monitor_level_and_stream() -> Result<()> {
     init_test_logging();
     let client = ClientBuilder::new().build().await?;
 
@@ -238,7 +238,7 @@ async fn test_handle_sandboxed_shell_with_monitor_level_and_stream() -> Result<(
     args.insert("monitor_stream".to_string(), json!("stdout"));
     args.insert("execution_mode".to_string(), json!("Synchronous"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
     let result = client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
@@ -251,7 +251,7 @@ async fn test_handle_sandboxed_shell_with_monitor_level_and_stream() -> Result<(
 }
 
 #[tokio::test]
-async fn test_handle_sandboxed_shell_with_invalid_monitor_level_fallback() -> Result<()> {
+async fn test_handle_run_terminal_command_with_invalid_monitor_level_fallback() -> Result<()> {
     init_test_logging();
     let client = ClientBuilder::new().build().await?;
 
@@ -260,7 +260,7 @@ async fn test_handle_sandboxed_shell_with_invalid_monitor_level_fallback() -> Re
     args.insert("monitor_level".to_string(), json!("invalid_level"));
     args.insert("execution_mode".to_string(), json!("Synchronous"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
     let result = client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
@@ -268,7 +268,7 @@ async fn test_handle_sandboxed_shell_with_invalid_monitor_level_fallback() -> Re
 }
 
 #[tokio::test]
-async fn test_handle_sandboxed_shell_with_timeout_seconds() -> Result<()> {
+async fn test_handle_run_terminal_command_with_timeout_seconds() -> Result<()> {
     init_test_logging();
     let client = ClientBuilder::new().build().await?;
 
@@ -277,7 +277,7 @@ async fn test_handle_sandboxed_shell_with_timeout_seconds() -> Result<()> {
     args.insert("timeout_seconds".to_string(), json!(60));
     args.insert("execution_mode".to_string(), json!("Synchronous"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
     let result = client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
@@ -285,7 +285,7 @@ async fn test_handle_sandboxed_shell_with_timeout_seconds() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_handle_sandboxed_shell_sync_failing_command() -> Result<()> {
+async fn test_handle_run_terminal_command_sync_failing_command() -> Result<()> {
     init_test_logging();
     let client = ClientBuilder::new().build().await?;
 
@@ -300,7 +300,7 @@ async fn test_handle_sandboxed_shell_sync_failing_command() -> Result<()> {
     );
     args.insert("execution_mode".to_string(), json!("Synchronous"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
     let result = client.call_tool(call_param).await;
     assert!(result.is_err());
@@ -308,7 +308,7 @@ async fn test_handle_sandboxed_shell_sync_failing_command() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_handle_sandboxed_shell_execution_mode_async_result_push() -> Result<()> {
+async fn test_handle_run_terminal_command_execution_mode_async_result_push() -> Result<()> {
     init_test_logging();
     let client = ClientBuilder::new().build().await?;
 
@@ -316,7 +316,7 @@ async fn test_handle_sandboxed_shell_execution_mode_async_result_push() -> Resul
     args.insert("command".to_string(), json!("echo 'async_push'"));
     args.insert("execution_mode".to_string(), json!("AsyncResultPush"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
     let result = client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());
@@ -333,7 +333,7 @@ async fn test_handle_sandboxed_shell_execution_mode_async_result_push() -> Resul
 }
 
 #[tokio::test]
-async fn test_handle_sandboxed_shell_execution_mode_unknown_defaults_to_async() -> Result<()> {
+async fn test_handle_run_terminal_command_execution_mode_unknown_defaults_to_async() -> Result<()> {
     init_test_logging();
     let client = ClientBuilder::new().build().await?;
 
@@ -341,7 +341,7 @@ async fn test_handle_sandboxed_shell_execution_mode_unknown_defaults_to_async() 
     args.insert("command".to_string(), json!("echo 'unknown_mode'"));
     args.insert("execution_mode".to_string(), json!("UnknownMode"));
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(args);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(args);
 
     let result = client.call_tool(call_param).await?;
     assert!(!result.content.is_empty());

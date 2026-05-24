@@ -16,7 +16,7 @@
 - Status: Edited (minimal hotspot refactor)
 - Rationale: Not a many-small-tests file; this is shared test server infrastructure where hotspot control flow was genuinely simplifiable without API/behavior changes.
 - Validation: `simplify verify` reported significant improvement (36% -> 68%).
-- Focused Check: Launched `cargo check -p ahma_http_bridge` via `sandboxed_shell` (AHMA op id: `op_8`).
+- Focused Check: Launched `cargo check -p ahma_http_bridge` via `run_terminal_command` (AHMA op id: `op_8`).
 - Next Step: Continue to next issue when requested.
 
 - Date: 2026-04-16

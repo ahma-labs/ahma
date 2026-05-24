@@ -71,7 +71,7 @@ async fn http_roots_handshake_then_tool_call_defaults_to_root() {
     // Intentionally omit working_directory: after the roots handshake the MCP service
     // should default tool execution to the first sandbox scope supplied by roots/list.
     let result = mcp
-        .call_tool("sandboxed_shell", json!({ "command": "pwd" }))
+        .call_tool("run_terminal_command", json!({ "command": "pwd" }))
         .await;
     assert!(
         result.success,

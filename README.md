@@ -93,7 +93,7 @@ _Ahma coordinating concurrent repo work._
 
 Ahma complements IDE and CLI MCP clients by making normal command-line work safer and less blocking. It is most useful where the client either exposes a broad terminal directly or has no terminal model at all.
 
-| Capability | Native IDE/CLI terminal | Ahma `sandboxed_shell` |
+| Capability | Native IDE/CLI terminal | Ahma `run_terminal_command` |
 |---|---|---|
 | **Write protection** | None — full filesystem access | Kernel-enforced to workspace only (Seatbelt on macOS, Landlock on Linux) |
 | **Async execution** | Synchronous — AI blocks until done | Async-first — AI continues working while commands run in background |
@@ -274,10 +274,10 @@ Claude models treat strongly imperative language in tool descriptions ("MANDATOR
 ```markdown
 ## When to use ahma vs the native terminal
 
-For commands run during this project, prefer ahma's `sandboxed_shell` (via `CallMcpTool` on Cursor) when any of these apply:
+For commands run during this project, prefer ahma's `run_terminal_command` (via `CallMcpTool` on Cursor) when any of these apply:
 
 - the command writes to disk — the kernel-enforced sandbox keeps writes inside the workspace
-- the command runs for more than a few seconds — `sandboxed_shell` is async, returns an operation_id, and lets the agent continue other work while it runs
+- the command runs for more than a few seconds — `run_terminal_command` is async, returns an operation_id, and lets the agent continue other work while it runs
 - the output should be watched for errors mid-run — set `monitor_level` to get pushed alerts
 - multiple independent commands should run concurrently — each gets its own operation_id
 

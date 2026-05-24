@@ -29,7 +29,7 @@ fn test_no_sandbox_warns_and_runs_on_legacy_kernel() {
         .env("AHMA_DISABLE_SANDBOX", "1")
         .args([
             "--log-to-stderr",
-            "sandboxed_shell",
+            "run_terminal_command",
             "--",
             "echo legacy-kernel-fallback",
         ])

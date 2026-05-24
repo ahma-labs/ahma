@@ -51,7 +51,7 @@ pub async fn run_cli_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> 
     let configs = built.configs;
     let service = built.service;
 
-    if configs.is_empty() && tool_name != "sandboxed_shell" {
+    if configs.is_empty() && tool_name != "run_terminal_command" {
         tracing::error!("No external tool configurations found");
         anyhow::bail!("No tool '{}' found", tool_name);
     }

@@ -456,7 +456,7 @@ impl StressClient {
         progress_token: Option<&str>,
     ) -> Result<ToolCallResult> {
         let mut params = json!({
-            "name": "sandboxed_shell",
+            "name": "run_terminal_command",
             "arguments": {
                 "command": cmd_str,
                 "working_directory": ".",

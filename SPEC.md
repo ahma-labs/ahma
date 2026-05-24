@@ -23,7 +23,7 @@
 | Built-in `status` Tool | tests-pass | Non-blocking progress check for async operations |
 | Built-in `await` Tool | tests-pass | Blocking wait for operation completion |
 | Built-in `cancel` Tool | tests-pass | Cancel running operations |
-| Built-in `sandboxed_shell` | tests-pass | Execute arbitrary shell commands within sandbox |
+| Built-in `run_terminal_command` | tests-pass | Execute arbitrary shell commands within sandbox |
 | Batteries-Included Tools | tests-pass | Built-in MTDF setups activated via CLI flags (e.g. `--rust`, `--python`) |
 | MTDF Schema Validation | tests-pass | JSON schema validation at startup |
 | Sequence Tools | tests-pass | Chain multiple commands into workflows |
@@ -100,7 +100,7 @@ These tools are always available regardless of JSON configuration:
 | `status` | Non-blocking progress check for async operations |
 | `await` | Blocking wait for operation completion (use sparingly) |
 | `cancel` | Cancel running operations |
-| `sandboxed_shell` | Execute arbitrary shell commands within sandbox scope (promoted from file-based to internal) |
+| `run_terminal_command` | Execute arbitrary shell commands within sandbox scope (promoted from file-based to internal) |
 
 **Note**: These internal tools are hardcoded into the `AhmaMcpService` and are guaranteed to be available even when no `.ahma` directory exists or when all external tool configurations fail to load.
 
@@ -160,15 +160,15 @@ These tools are always available regardless of JSON configuration:
 
 - **R1.1**: The system **must** adapt any CLI tool for use as MCP tools based on declarative JSON configuration files.
 - **R1.2**: All tool definitions **must** be stored in `.json` files within a `tools/` directory (default: `.ahma/`).
-- **R1.2.1**: **Auto-Detection**: When `--tools-dir` is not explicitly provided, the system **must** check for a `.ahma` directory in the current working directory. If found, it **must** be used as the tools directory. If not found, the system **must** log a warning and operate with only the built-in internal tools (`await`, `status`, `sandboxed_shell`).
+- **R1.2.1**: **Auto-Detection**: When `--tools-dir` is not explicitly provided, the system **must** check for a `.ahma` directory in the current working directory. If found, it **must** be used as the tools directory. If not found, the system **must** log a warning and operate with only the built-in internal tools (`await`, `status`, `run_terminal_command`).
 - **R1.2.2**: When `--tools-dir` is explicitly provided via CLI argument, that path **must** take precedence over auto-detection.
 - **R1.3**: The system **must not** be recompiled to add, remove, or modify a tool.
 - **R1.4**: **Hot-Reloading**: The system **must** watch the `tools/` directory and send `notifications/tools/list_changed` when files change.
-- **R1.5**: **Progressive Disclosure** (default enabled): When progressive disclosure is active, `tools/list` **must** return only built-in tools (`await`, `status`, `sandboxed_shell`, `cancel`) and the `activate_tools` meta-tool. Bundled tools are hidden until their bundle is explicitly revealed.
+- **R1.5**: **Progressive Disclosure** (default enabled): When progressive disclosure is active, `tools/list` **must** return only built-in tools (`await`, `status`, `run_terminal_command`, `cancel`) and the `activate_tools` meta-tool. Bundled tools are hidden until their bundle is explicitly revealed.
 - **R1.5.1**: The `activate_tools` meta-tool **must** support two actions: `list` (enumerate available bundles with name, description, tool count, and revealed status) and `reveal` (activate a named bundle).
 - **R1.5.2**: After a bundle is revealed via `activate_tools reveal`, the server **must** send `notifications/tools/list_changed` and include the bundle's tools in subsequent `tools/list` responses.
 - **R1.5.3**: The `--disable-progressive-disclosure` CLI flag **must** restore legacy behavior where all enabled tools are listed immediately.
-- **R1.5.4**: The `instructions` field in the MCP `initialize` response **must** contain sandbox routing directives instructing the model to use `sandboxed_shell` for all command execution.
+- **R1.5.4**: The `instructions` field in the MCP `initialize` response **must** contain sandbox routing directives instructing the model to use `run_terminal_command` for all command execution.
 - **R1.5.5**: The `activate_tools` description **must** dynamically list all loaded bundles with action-oriented hints (`ai_hint`) so the AI knows exactly when to activate each bundle.
 - **R1.5.6**: CLI-enabled bundles (e.g., `--tools rust,git`) are **loaded but hidden by default**. The startup visibility profile is controlled by the `AHMA_REVEAL_PROFILE` environment variable (`minimal` | `balanced` | `full`). Setting `AHMA_REVEAL_PROFILE=balanced` (or the legacy `--auto-reveal` CLI flag / `AHMA_AUTO_REVEAL=1` env var) makes all loaded bundles immediately visible at startup, bypassing the progressive disclosure step. Without any of these, the LLM must call `activate_tools` to reveal them. Precedence: `AHMA_REVEAL_PROFILE` > `--auto-reveal` / `AHMA_AUTO_REVEAL=1` > default (`minimal`).
 
@@ -553,7 +553,7 @@ Alternatively, standard tool configurations are bundled directly inside the bina
 ahma --mode stdio --rust --python --git --github --fileutils --simplify --kotlin
 ```
 
-Note: Core tools (`sandboxed_shell`, `await`, `status`, `cancel`) are always available without any flags.
+Note: Core tools (`run_terminal_command`, `await`, `status`, `cancel`) are always available without any flags.
 
 **Tool loading priority**: When an `.ahma/` directory exists (auto-detected or via explicit `--tools-dir`), **all** tool definitions in it are always loaded regardless of bundle flags. Bundle flags (`--rust`, `--simplify`, etc.) additionally activate built-in tool definitions compiled into the binary, serving as **fallbacks** for tools not defined locally. Local `.ahma/` definitions override bundled defaults with the same name. If *no* `.ahma/` directory exists and no `--tools-dir` is given, only bundle-flag tools plus core built-ins are available.
 
@@ -681,7 +681,7 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Instead of... | Use Ahma tool... |
 |---------------|---------------------|
 | `run_in_terminal("cargo build")` | `cargo` with `{"subcommand": "build"}` |
-| `run_in_terminal("any command")` | `sandboxed_shell` with `{"command": "any command"}` |
+| `run_in_terminal("any command")` | `run_terminal_command` with `{"command": "any command"}` |
 
 **Why**: We dogfood our own product. Using Ahma catches bugs immediately, runs faster (no GUI prompts), and enforces sandbox security.
 
@@ -1152,7 +1152,7 @@ details behind shared helpers so core execution algorithms remain easy to read.
 - **R19.4**: Tool-call readiness checks **must** use
   `sandbox::Sandbox::is_ready_for_tool_calls()` instead of duplicating
   `scopes().is_empty() && !is_test_mode()` checks.
-- **R19.5**: Built-in tool input schemas (`await`, `status`, `sandboxed_shell`, `activate_tools`)
+- **R19.5**: Built-in tool input schemas (`await`, `status`, `run_terminal_command`, `activate_tools`)
   **must** be generated with `mcp_service::schema` helper builders
   (`string_property`, `path_property`, enum helpers, `object_input_schema`).
 
@@ -1384,7 +1384,7 @@ snippets rather than prose paragraphs. Link to `docs/` for deep dives.
 |---------|---------|
 | Quick Start | mcp.json setup for VS Code, Cursor, Claude Code |
 | Tool Bundles | Table of all bundles, how to activate, when to use |
-| Built-in Tools | `sandboxed_shell`, `status`, `await`, `cancel` with examples |
+| Built-in Tools | `run_terminal_command`, `status`, `await`, `cancel` with examples |
 | Async Workflow | Operation ID pattern, status/await/cancel usage |
 | Sandbox | Scope rules, `--tmp`, env vars, nested sandbox note |
 | Key Env Vars | Quick-reference table with link to full reference |
@@ -1399,7 +1399,7 @@ updated in the same PR or commit:
 - CLI flags or subcommands (`ahma_mcp/src/shell/cli.rs`)
 - Environment variables (`ahma_mcp/src/config/`)
 - Tool bundle names or contents (`ahma_mcp/src/mcp_service/bundle_registry.rs`)
-- Built-in tool signatures (`sandboxed_shell`, `status`, `await`, `cancel`)
+- Built-in tool signatures (`run_terminal_command`, `status`, `await`, `cancel`)
 - Connection modes or HTTP endpoints (`ahma_http_bridge/`)
 - Sandbox scope semantics (`ahma_core/src/sandbox/`)
 - Live-log monitoring configuration

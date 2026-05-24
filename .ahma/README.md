@@ -7,7 +7,7 @@ This directory contains tool configuration files for the Ahma server (ahma). The
 AHMA has a three-tier tool model:
 
 ### 1. Core Built-in Tools (always available, no configuration needed)
-- **sandboxed_shell** — Execute shell commands in the security sandbox
+- **run_terminal_command** — Execute shell commands in the security sandbox
 - **await** — Wait for async operations to complete
 - **status** — Query operation status without blocking
 - **cancel** — Cancel running operations

@@ -18,7 +18,7 @@ async fn test_path_validation_nested_parent_segments() {
         .await
         .unwrap();
     // Deep relative escape attempt
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": "echo test",
             "working_directory": "a/b/c/../../../../"
@@ -47,7 +47,7 @@ async fn test_path_validation_unicode_directory() {
         .strip_prefix(temp_dir.path())
         .unwrap_or(&unicode_dir);
     let rel_str = rel.to_string_lossy();
-    let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": "echo unicode",
             "working_directory": rel_str
@@ -80,7 +80,7 @@ async fn test_path_validation_symlink_escape() {
         let rel = link_path
             .strip_prefix(temp_dir.path())
             .unwrap_or(&link_path);
-        let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+        let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
             serde_json::from_value(json!({
                 "command": "echo test",
                 "working_directory": rel.to_string_lossy()
@@ -112,7 +112,7 @@ async fn test_path_validation_symlink_internal() {
         let rel = link_path
             .strip_prefix(temp_dir.path())
             .unwrap_or(&link_path);
-        let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+        let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
             serde_json::from_value(json!({
                 "command": "echo ok",
                 "working_directory": rel.to_string_lossy()
@@ -133,7 +133,7 @@ async fn test_path_validation_reserved_names() {
         .await
         .unwrap();
     for wd in [".", "./", "././."] {
-        let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+        let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
             serde_json::from_value(json!({
                 "command": "echo here",
                 "working_directory": wd

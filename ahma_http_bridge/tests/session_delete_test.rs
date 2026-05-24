@@ -75,7 +75,7 @@ async fn start_http_bridge(
         .expect("Failed to get workspace dir")
         .to_path_buf();
 
-    // Detect nested sandbox (ahma_mcp_sandboxed_shell / VS Code / Docker) and disable
+    // Detect nested sandbox (ahma_mcp_run_terminal_command / VS Code / Docker) and disable
     // OS-level sandboxing so the binary can start; app-level path checks still apply.
     #[cfg(target_os = "macos")]
     let no_sandbox = ahma_mcp::sandbox::test_sandbox_exec_available().is_err();

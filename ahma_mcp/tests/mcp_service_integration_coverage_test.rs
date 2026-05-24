@@ -86,14 +86,14 @@ async fn test_status_tool_no_filters() -> Result<()> {
 /// Test status tool with tool filter parameter
 #[tokio::test]
 async fn test_status_tool_with_tool_filter() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
 
     // First start an async operation to have something to query
     let _ = client
         .call_tool(make_params(
-            "sandboxed_shell",
+            "run_terminal_command",
             Some(json!({"command": "echo test"})),
         ))
         .await?;
@@ -101,14 +101,14 @@ async fn test_status_tool_with_tool_filter() -> Result<()> {
     let result = client
         .call_tool(make_params(
             "status",
-            Some(json!({"tools": "sandboxed_shell"})),
+            Some(json!({"tools": "run_terminal_command"})),
         ))
         .await?;
 
     assert!(!result.content.is_empty());
     assert_text_contains_any(
         &result,
-        &["sandboxed_shell", "Operations status"],
+        &["run_terminal_command", "Operations status"],
         "Status should reference filter",
     );
 
@@ -216,14 +216,14 @@ async fn test_await_tool_with_tool_filter() -> Result<()> {
 /// Test await for an async operation that actually completes
 #[tokio::test]
 async fn test_await_for_completed_async_operation() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
 
     // Start a fast async shell command
     let start_result = client
         .call_tool(make_params(
-            "sandboxed_shell",
+            "run_terminal_command",
             Some(json!({"command": "echo 'quick test'"})),
         ))
         .await?;
@@ -234,7 +234,7 @@ async fn test_await_for_completed_async_operation() -> Result<()> {
     // Build await args - use id if found, otherwise filter by tool
     let await_args = match id {
         Some(id) => json!({"id": id}),
-        None => json!({"tools": "sandboxed_shell"}),
+        None => json!({"tools": "run_terminal_command"}),
     };
 
     let result = client
@@ -466,14 +466,14 @@ async fn test_list_tools_status_schema() -> Result<()> {
 /// Test full async operation lifecycle: start -> status -> await
 #[tokio::test]
 async fn test_async_operation_full_lifecycle() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
 
     // Start an async shell command
     let start_result = client
         .call_tool(make_params(
-            "sandboxed_shell",
+            "run_terminal_command",
             Some(json!({"command": "sleep 0.1 && echo lifecycle_test"})),
         ))
         .await?;
@@ -489,7 +489,7 @@ async fn test_async_operation_full_lifecycle() -> Result<()> {
     let await_result = client
         .call_tool(make_params(
             "await",
-            Some(json!({"tools": "sandboxed_shell"})),
+            Some(json!({"tools": "run_terminal_command"})),
         ))
         .await?;
     assert!(!await_result.content.is_empty());
@@ -554,7 +554,7 @@ async fn test_status_with_multiple_tool_filters() -> Result<()> {
         .client
         .call_tool(make_params(
             "status",
-            Some(json!({"tools": "cargo,git,sandboxed_shell"})),
+            Some(json!({"tools": "cargo,git,run_terminal_command"})),
         ))
         .await?;
 
@@ -565,7 +565,7 @@ async fn test_status_with_multiple_tool_filters() -> Result<()> {
             "Operations status",
             "cargo",
             "git",
-            "sandboxed_shell",
+            "run_terminal_command",
             "total",
         ],
         "Status should handle multiple filters",

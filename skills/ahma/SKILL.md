@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.7.1
+version: 0.7.2
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -8,7 +8,7 @@ description: >
   tools, or configure ahma. Also handles code complexity analysis via `/ahma simplify` and
   installation updates via `/ahma update`.
   Trigger phrases: "use ahma", "run with ahma", "ahma tool", "activate bundle",
-  "sandboxed_shell", "ahma async", "ahma serve", "mcp.json ahma", "ahma sandbox",
+  "run_terminal_command", "ahma async", "ahma serve", "mcp.json ahma", "ahma sandbox",
   "ahma livelog", "ahma monitor", "custom tool .ahma", "ahma", "await tool",
   "cancel operation", "tool bundle", "progressive disclosure", "activate_tools",
   "simplify", "reduce complexity", "too complex", "hard to read", "refactor",
@@ -18,7 +18,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.7.1 | author: Paul Houghton -->
+<!-- version: 0.7.2 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -131,7 +131,7 @@ If a user asks you to use Ahma but it isn't configured, help them by:
 
 ## Tool Bundles & Progressive Disclosure
 
-By default, Ahma shows only built-in tools (`sandboxed_shell`, `status`, `await`) plus
+By default, Ahma shows only built-in tools (`run_terminal_command`, `status`, `await`) plus
 `activate_tools` (when bundles are loaded but not yet specified via `--tools`).
 Bundles specified with `--tools` are **always revealed immediately** — no extra flag needed.
 Bundles NOT in `--tools` remain hidden and can be unlocked on demand via `activate_tools`.
@@ -170,10 +170,10 @@ activate_tools(action="reveal", bundle="git")    # Unlock Git tools
 
 ## Built-in Tools (Always Available)
 
-### `sandboxed_shell` — Run any shell command
+### `run_terminal_command` — Run any shell command
 
 ```
-sandboxed_shell(
+run_terminal_command(
   command="cargo build --release",
   working_directory="/path/to/project",
   timeout_seconds=300
@@ -405,7 +405,7 @@ ahma serve unix [--socket-path /tmp/ahma.sock]
 
 # Run a single tool from the CLI
 ahma tool run cargo_build -- --release
-ahma tool run sandboxed_shell -- "echo hello"
+ahma tool run run_terminal_command -- "echo hello"
 
 # Validate .ahma/ tool configs
 ahma tool validate [.ahma/]
@@ -439,8 +439,8 @@ cargo_nextest_run(subcommand="nextest run")
 ### Run arbitrary shell commands
 
 ```
-sandboxed_shell(command="npm ci && npm run build", working_directory="/project")
-sandboxed_shell(command="docker compose up -d", timeout_seconds=60)
+run_terminal_command(command="npm ci && npm run build", working_directory="/project")
+run_terminal_command(command="docker compose up -d", timeout_seconds=60)
 ```
 
 ### Check what bundles are available
@@ -537,13 +537,13 @@ PATH hints, and the restart reminder automatically.  Always prefer it.
 **Step 1 — run the update:**
 
 ```
-sandboxed_shell("ahma update feature/update")
+run_terminal_command("ahma update feature/update")
 ```
 
 Or for the latest release:
 
 ```
-sandboxed_shell("ahma update")
+run_terminal_command("ahma update")
 ```
 
 Branch installs compile from source and take several minutes.  Watch for the
@@ -552,7 +552,7 @@ Branch installs compile from source and take several minutes.  Watch for the
 **Step 2 — verify the version:**
 
 ```
-sandboxed_shell("ahma --version")
+run_terminal_command("ahma --version")
 ```
 
 The output must show the expected version (e.g. `ahma 0.7.0`).

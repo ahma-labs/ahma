@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{collections::HashMap, path::Path};
 
-const RESERVED_TOOL_NAMES: &[&str] = &["await", "status", "sandboxed_shell", "cancel"];
+const RESERVED_TOOL_NAMES: &[&str] = &["await", "status", "run_terminal_command", "cancel"];
 const TOOL_CONFIG_READ_MAX_ATTEMPTS: usize = 8;
 const TOOL_CONFIG_READ_BACKOFF_MS: u64 = 40;
 
@@ -600,9 +600,9 @@ fn log_builtin_config_parse_error(bundle_name: &str, error: &anyhow::Error) {
     );
 }
 
-fn synthetic_sandboxed_shell_config() -> ToolConfig {
+fn synthetic_run_terminal_command_config() -> ToolConfig {
     ToolConfig {
-        name: "sandboxed_shell".to_string(),
+        name: "run_terminal_command".to_string(),
         description: "Execute shell commands within a secure sandbox".to_string(),
         command: if cfg!(target_os = "windows") {
             "powershell -Command".to_string()
@@ -652,7 +652,7 @@ pub async fn load_mcp_config(config_path: &Path) -> anyhow::Result<McpConfig> {
 /// # Arguments
 /// * `config` - Current application configuration to determine which tool bundles are active
 /// * `tools_dir` - Optional path to the directory containing tool configuration files.
-///   When `None`, only bundled tools and the synthetic `sandboxed_shell` config are loaded.
+///   When `None`, only bundled tools and the synthetic `run_terminal_command` config are loaded.
 ///
 /// # Returns
 /// * `Result<HashMap<String, ToolConfig>>` - Map of tool name to configuration or error
@@ -688,13 +688,13 @@ pub async fn load_tool_configs(
         }
     }
 
-    // Inject synthetic config for `sandboxed_shell` so sequences can reference it.
-    // This is the single source of truth for sandboxed_shell's ToolConfig shape.
-    // The MCP service handler still intercepts `sandboxed_shell` calls directly,
+    // Inject synthetic config for `run_terminal_command` so sequences can reference it.
+    // This is the single source of truth for run_terminal_command's ToolConfig shape.
+    // The MCP service handler still intercepts `run_terminal_command` calls directly,
     // but sequences need a ToolConfig to resolve the command and subcommand.
     configs.insert(
-        "sandboxed_shell".to_string(),
-        synthetic_sandboxed_shell_config(),
+        "run_terminal_command".to_string(),
+        synthetic_run_terminal_command_config(),
     );
 
     Ok(configs)

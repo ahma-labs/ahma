@@ -14,7 +14,7 @@ async fn test_path_validation_security() -> Result<()> {
         json!("/../../../../etc/passwd"),
     );
 
-    let call_param = CallToolRequestParams::new("sandboxed_shell").with_arguments(params);
+    let call_param = CallToolRequestParams::new("run_terminal_command").with_arguments(params);
     let result = mcp.client.call_tool(call_param).await;
 
     if let Ok(tool_result) = result {

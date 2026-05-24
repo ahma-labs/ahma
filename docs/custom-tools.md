@@ -7,7 +7,7 @@ If your main goal is to use ahma with existing tools such as cargo, git, Python,
 ## When custom tools help
 
 - you want to expose a project-specific script through MCP
-- you want tighter argument-level control than direct `sandboxed_shell` access
+- you want tighter argument-level control than direct `run_terminal_command` access
 - you want local `.ahma/*.json` overrides for a particular repository
 
 ## Where to start

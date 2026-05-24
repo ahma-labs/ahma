@@ -155,7 +155,7 @@ async fn setup_mcp_service_test_tools() -> Result<TempDir> {
 "#;
     fs::write(tools_dir.join("disabled_tool.json"), disabled_tool).await?;
 
-    // sandboxed_shell is a core built-in tool - no JSON config needed
+    // run_terminal_command is a core built-in tool - no JSON config needed
 
     Ok(temp_dir)
 }
@@ -192,8 +192,8 @@ async fn test_mcp_list_tools_returns_enabled_tools() -> Result<()> {
         tool_names
     );
     assert!(
-        tool_names.iter().any(|n| n.contains("sandboxed_shell")),
-        "Should list sandboxed_shell tool. Got: {:?}",
+        tool_names.iter().any(|n| n.contains("run_terminal_command")),
+        "Should list run_terminal_command tool. Got: {:?}",
         tool_names
     );
 
@@ -527,7 +527,7 @@ async fn test_mcp_shell_command_execution() -> Result<()> {
             .build()
             .await?;
 
-        let params = CallToolRequestParams::new(Cow::Borrowed("sandboxed_shell")).with_arguments(
+        let params = CallToolRequestParams::new(Cow::Borrowed("run_terminal_command")).with_arguments(
             json!({
                 "command": "echo 'MCP test output'",
                 "execution_mode": "Synchronous"
@@ -598,7 +598,7 @@ async fn test_mcp_shell_command_failure() -> Result<()> {
             .build()
             .await?;
 
-        let params = CallToolRequestParams::new(Cow::Borrowed("sandboxed_shell"))
+        let params = CallToolRequestParams::new(Cow::Borrowed("run_terminal_command"))
             .with_arguments(json!({"command": "exit 1"}).as_object().unwrap().clone());
 
         let result = match tokio::time::timeout(call_timeout, client.call_tool(params)).await {
@@ -686,7 +686,7 @@ async fn test_mcp_working_directory_parameter() -> Result<()> {
         .build()
         .await?;
 
-    let params = CallToolRequestParams::new(Cow::Borrowed("sandboxed_shell")).with_arguments(
+    let params = CallToolRequestParams::new(Cow::Borrowed("run_terminal_command")).with_arguments(
         json!({
             "command": "ls",
             "working_directory": sub_dir.to_str().unwrap(),

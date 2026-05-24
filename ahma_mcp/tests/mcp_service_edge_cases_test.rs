@@ -147,7 +147,7 @@ async fn test_cancel_with_reason() -> Result<()> {
     // First start a long running operation (must exceed AUTOMATIC_ASYNC_TIMEOUT_SECS)
     let start_result = call_test_tool(
         client,
-        "sandboxed_shell",
+        "run_terminal_command",
         json!({
             "command": "sleep 30",
             "execution_mode": "AsyncResultPush"
@@ -194,7 +194,7 @@ async fn test_shell_missing_command() -> Result<()> {
     let fixture = setup_client_fixture().await?;
     let client = &fixture.client;
 
-    let result = call_test_tool(client, "sandboxed_shell", json!({})).await;
+    let result = call_test_tool(client, "run_terminal_command", json!({})).await;
     assert_required_param_error(result, "required");
 
     fixture.client.cancel().await?;
@@ -211,7 +211,7 @@ async fn test_shell_explicit_execution_modes() -> Result<()> {
     // 1. Explicit Synchronous
     let sync_result = call_test_tool(
         client,
-        "sandboxed_shell",
+        "run_terminal_command",
         json!({
             "command": "echo sync",
             "execution_mode": "Synchronous"
@@ -225,7 +225,7 @@ async fn test_shell_explicit_execution_modes() -> Result<()> {
     // 2. Explicit AsyncResultPush
     let async_result = call_test_tool(
         client,
-        "sandboxed_shell",
+        "run_terminal_command",
         json!({
             "command": "echo async",
             "execution_mode": "AsyncResultPush"
@@ -243,7 +243,7 @@ async fn test_shell_explicit_execution_modes() -> Result<()> {
     // 3. Invalid mode (should fallback to Async)
     let invalid_result = call_test_tool(
         client,
-        "sandboxed_shell",
+        "run_terminal_command",
         json!({
             "command": "echo fallback",
             "execution_mode": "InvalidMode"
@@ -272,7 +272,7 @@ async fn test_shell_timeout() -> Result<()> {
     // Run a command that sleeps for 2s with 1s timeout
     let result = call_test_tool(
         client,
-        "sandboxed_shell",
+        "run_terminal_command",
         json!({
             "command": "sleep 2",
             "timeout_seconds": 1,

@@ -255,11 +255,11 @@ async fn test_proper_vscode_handshake_allows_tool_calls() {
         }
     }
 
-    // Use sandboxed_shell with pwd - this tool is always available (built-in)
+    // Use run_terminal_command with pwd - this tool is always available (built-in)
     // This tests that tool calls work after proper handshake
     let result = client
         .call_tool(
-            "sandboxed_shell",
+            "run_terminal_command",
             json!({
                 "command": "echo ok",
                 "working_directory": root_path.to_string_lossy()

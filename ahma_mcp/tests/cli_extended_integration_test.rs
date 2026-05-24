@@ -468,18 +468,18 @@ mod cli_execution_tests {
         let workspace = workspace_dir();
         let tools_dir = workspace.join(".ahma");
 
-        // Try to run sandboxed_shell with an echo command
+        // Try to run run_terminal_command with an echo command
         let output = test_command(&binary)
             .current_dir(&workspace)
             .args([
                 "--tools-dir",
                 tools_dir.to_str().unwrap(),
-                "sandboxed_shell",
+                "run_terminal_command",
                 "--",
                 r#"{"command": "echo test_output"}"#,
             ])
             .output()
-            .expect("Failed to execute sandboxed_shell");
+            .expect("Failed to execute run_terminal_command");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

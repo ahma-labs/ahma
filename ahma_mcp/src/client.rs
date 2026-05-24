@@ -117,7 +117,7 @@ impl Client {
     pub async fn shell_async_sleep(&mut self, duration: &str) -> Result<ToolCallResult> {
         let service = self.get_service()?;
 
-        let params = CallToolRequestParams::new("sandboxed_shell").with_arguments(
+        let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
             json!({
                 "subcommand": "default",
                 "args": [format!("sleep {}", duration)]

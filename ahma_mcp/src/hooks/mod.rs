@@ -403,7 +403,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         .with_context(|| format!("Failed to change directory to {}", payload.cwd))?;
 
     let cfg = AppConfig {
-        run_tool: Some("sandboxed_shell".to_string()),
+        run_tool: Some("run_terminal_command".to_string()),
         run_tool_args: vec![payload.command],
         ..cfg
     };
@@ -552,7 +552,7 @@ fn decode_wrapped_shell_payload(encoded: &str) -> Result<WrappedShellPayload> {
 }
 
 fn is_wrapped_shell_command(command: &str) -> bool {
-    command.contains(WRAPPED_BY_MARKER) || command.contains("sandboxed_shell")
+    command.contains(WRAPPED_BY_MARKER) || command.contains("run_terminal_command")
 }
 
 fn install_platform_hook(

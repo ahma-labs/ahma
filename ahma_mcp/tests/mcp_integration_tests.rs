@@ -52,7 +52,7 @@ async fn test_call_tool_basic() -> Result<()> {
 
 #[tokio::test]
 async fn test_async_notification_delivery() -> Result<()> {
-    skip_if_disabled_async_result!("sandboxed_shell");
+    skip_if_disabled_async_result!("run_terminal_command");
     init_test_logging();
     // Use --async flag to enable async execution
     let client = ClientBuilder::new().tools_dir(".ahma").build().await?;
@@ -64,7 +64,7 @@ async fn test_async_notification_delivery() -> Result<()> {
     let async_tool_params = json!({
         "command": "sleep 1"
     });
-    let call_params = CallToolRequestParams::new("sandboxed_shell")
+    let call_params = CallToolRequestParams::new("run_terminal_command")
         .with_arguments(async_tool_params.as_object().cloned().unwrap_or_default());
 
     let result = client.call_tool(call_params).await?;

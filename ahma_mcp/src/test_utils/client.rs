@@ -316,7 +316,7 @@ impl McpClientFixture {
 }
 
 /// Returns `true` when the current process is running inside a sandbox environment
-/// (e.g., Cursor, VS Code, Docker, or ahma's own `sandboxed_shell`) that would
+/// (e.g., Cursor, VS Code, Docker, or ahma's own `run_terminal_command`) that would
 /// prevent the child MCP server from applying its own OS-level sandbox.
 ///
 /// On macOS this probes `sandbox-exec` directly; on other platforms we check for
@@ -358,7 +358,7 @@ fn ahma_mcp_internal_sandbox_probe() -> bool {
 
 pub async fn setup_mcp_service_with_client() -> Result<(TempDir, Client)> {
     // Create a temporary directory for tool configs
-    // sandboxed_shell is a core built-in tool, no JSON config needed
+    // run_terminal_command is a core built-in tool, no JSON config needed
     let temp_dir = tempfile::tempdir()?;
     let tools_dir = temp_dir.path();
 

@@ -120,7 +120,7 @@ pub async fn spawn_http_bridge() -> anyhow::Result<HttpBridgeTestInstance> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    // Detect nested sandbox (mcp_ahma_sandboxed_shell / VS Code / Docker) and use
+    // Detect nested sandbox (mcp_ahma_run_terminal_command / VS Code / Docker) and use
     // AHMA_DISABLE_SANDBOX so the child can start; app-level path security still applies.
     #[cfg(target_os = "macos")]
     if crate::sandbox::test_sandbox_exec_available().is_err() {
