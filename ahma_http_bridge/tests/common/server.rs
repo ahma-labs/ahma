@@ -54,8 +54,7 @@ impl Drop for TestServerInstance {
             "[TestServer] Shutting down test server on port {}",
             self.port
         );
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        stop_child(&mut self.child);
     }
 }
 
@@ -91,8 +90,7 @@ impl ServerGuard {
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_child(&mut child);
         }
     }
 }
@@ -271,7 +269,19 @@ fn parse_startup_marker(line: &str) -> Option<StartupMarker> {
 
 fn stop_child(child: &mut Child) {
     let _ = child.kill();
-    let _ = child.wait();
+    // Bounded reap: after a forceful kill the process should exit almost
+    // immediately, but we cap the wait so a zombie never blocks a tokio
+    // worker thread indefinitely (Drop is invoked from the async test context).
+    let deadline = Instant::now() + TestTimeouts::get(TimeoutCategory::Cleanup);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => break, // deadline exceeded or error — give up and move on
+        }
+    }
 }
 
 fn read_startup_line(
