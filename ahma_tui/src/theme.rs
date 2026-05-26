@@ -21,7 +21,9 @@ impl Theme {
     // ── Status colours ────────────────────────────────────────────────────────
 
     pub fn running(&self) -> Style {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     }
     pub fn success(&self) -> Style {
         Style::default().fg(Color::Green)
@@ -36,7 +38,9 @@ impl Theme {
         Style::default().fg(Color::DarkGray)
     }
     pub fn cancelled(&self) -> Style {
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
     }
 
     // ── UI chrome ─────────────────────────────────────────────────────────────
@@ -45,7 +49,9 @@ impl Theme {
         Style::default().bg(Color::DarkGray).fg(Color::White)
     }
     pub fn title(&self) -> Style {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     }
     pub fn selected_item(&self) -> Style {
         Style::default()
@@ -91,9 +97,7 @@ impl Theme {
         match level {
             LogLevel::Info => Style::default().fg(Color::White),
             LogLevel::Warn => Style::default().fg(Color::Yellow),
-            LogLevel::Error => Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            LogLevel::Error => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             LogLevel::Debug => Style::default().fg(Color::DarkGray),
         }
     }

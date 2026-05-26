@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::connection::{ResolvedConnection, ResolvedTransport};
-use crate::state::{AiActivityEntry, LogEntry, LogLevel, Operation, OpStatus};
+use crate::state::{AiActivityEntry, LogEntry, LogLevel, OpStatus, Operation};
 
 // ─── Events emitted by this task ─────────────────────────────────────────────
 
@@ -363,8 +363,7 @@ fn extract_http_base_url(connection: &ResolvedConnection) -> String {
         #[cfg(unix)]
         ResolvedTransport::UnixSocket(_) => {
             // Unix socket transport: the HTTP bridge is typically at localhost:3000
-            std::env::var("AHMA_HTTP_URL")
-                .unwrap_or_else(|_| "http://localhost:3000".to_string())
+            std::env::var("AHMA_HTTP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string())
         }
     }
 }

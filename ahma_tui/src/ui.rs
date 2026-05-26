@@ -25,8 +25,8 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph,
-        Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
 
@@ -41,16 +41,15 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
     let approval_h: u16 = if state.approval.is_some() { 3 } else { 0 };
 
-    let [header_a, activity_a, middle_a, log_a, approval_a, footer_a] =
-        Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Min(4),
-            Constraint::Length(approval_h),
-            Constraint::Length(1),
-        ])
-        .areas(full);
+    let [header_a, activity_a, middle_a, log_a, approval_a, footer_a] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Min(4),
+        Constraint::Length(approval_h),
+        Constraint::Length(1),
+    ])
+    .areas(full);
 
     let [ops_a, detail_a] =
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
@@ -82,12 +81,20 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
 fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let health_span = if state.server_healthy {
         Span::styled(
-            if state.unicode { " ● HEALTHY" } else { " * HEALTHY" },
+            if state.unicode {
+                " ● HEALTHY"
+            } else {
+                " * HEALTHY"
+            },
             theme.healthy(),
         )
     } else {
         Span::styled(
-            if state.unicode { " ○ OFFLINE" } else { " - OFFLINE" },
+            if state.unicode {
+                " ○ OFFLINE"
+            } else {
+                " - OFFLINE"
+            },
             theme.unhealthy(),
         )
     };
@@ -149,10 +156,7 @@ fn draw_ai_activity(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         } else {
             "  Connecting to server…"
         };
-        frame.render_widget(
-            Paragraph::new(Span::styled(hint, theme.dim())),
-            inner,
-        );
+        frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
         return;
     }
 
@@ -181,10 +185,7 @@ fn draw_ai_activity(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
 
             let line = Line::from(vec![
                 Span::styled(format!(" {ts} "), theme.dim()),
-                Span::styled(
-                    format!("{glyph} "),
-                    theme.activity_status_style(&e.status),
-                ),
+                Span::styled(format!("{glyph} "), theme.activity_status_style(&e.status)),
                 Span::styled(format!("{:<12}", e.method), theme.dim()),
                 Span::styled(format!("{:<18}", e.tool), theme.normal()),
                 Span::styled(elapsed, theme.dim()),
@@ -200,8 +201,7 @@ fn draw_ai_activity(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         ListState::default()
     };
 
-    let list =
-        List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, inner, &mut list_state);
 
     if state.ai_activity.len() > visible_h {
@@ -259,10 +259,7 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
                 ""
             };
             let id_short = &op.id[..op.id.len().min(6)];
-            let name_short = truncate(
-                &op.tool_name,
-                (inner.width as usize).saturating_sub(22),
-            );
+            let name_short = truncate(&op.tool_name, (inner.width as usize).saturating_sub(22));
             let elapsed = op.elapsed_display();
 
             let row_style = if i == state.ops_selected {
@@ -273,15 +270,9 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
 
             let line = Line::from(vec![
                 Span::styled(prefix, theme.dim()),
-                Span::styled(
-                    format!("{glyph} "),
-                    theme.op_status_style(&op.status),
-                ),
+                Span::styled(format!("{glyph} "), theme.op_status_style(&op.status)),
                 Span::styled(format!("{id_short} "), theme.dim()),
-                Span::styled(
-                    format!("{pinned}{name_short}"),
-                    row_style,
-                ),
+                Span::styled(format!("{pinned}{name_short}"), row_style),
                 Span::styled(format!("  {elapsed}"), theme.dim()),
             ]);
             ListItem::new(line)
@@ -380,12 +371,17 @@ fn draw_detail(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
                 } else {
                     "-".repeat((inner.width as usize).saturating_sub(4))
                 };
-                lines.push(Line::from(Span::styled(
-                    format!("  {sep}"),
-                    theme.dim(),
-                )));
+                lines.push(Line::from(Span::styled(format!("  {sep}"), theme.dim())));
                 let tail_h = (inner.height as usize).saturating_sub(lines.len());
-                for s in op.stdout_tail.iter().rev().take(tail_h).collect::<Vec<_>>().into_iter().rev() {
+                for s in op
+                    .stdout_tail
+                    .iter()
+                    .rev()
+                    .take(tail_h)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
                     lines.push(Line::from(Span::styled(
                         format!(
                             "  {}",
@@ -439,10 +435,7 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         } else {
             "  No entries match filter"
         };
-        frame.render_widget(
-            Paragraph::new(Span::styled(hint, theme.dim())),
-            inner,
-        );
+        frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
         return;
     }
 
@@ -495,10 +488,7 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
         .map(|s| format!("  ({s}s left)"))
         .unwrap_or_default();
 
-    let desc = truncate(
-        &gate.description,
-        (area.width as usize).saturating_sub(50),
-    );
+    let desc = truncate(&gate.description, (area.width as usize).saturating_sub(50));
     let warn = if state.unicode { "⚠ " } else { "! " };
 
     let line1 = Line::from(vec![
@@ -518,8 +508,7 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
         ),
     ]);
 
-    let para = Paragraph::new(Text::from(vec![line1, line2]))
-        .style(theme.approval_banner());
+    let para = Paragraph::new(Text::from(vec![line1, line2])).style(theme.approval_banner());
     frame.render_widget(para, area);
 }
 
@@ -623,10 +612,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
                 Line::from(Span::styled(format!(" {key}"), theme.title()))
             } else {
                 Line::from(vec![
-                    Span::styled(
-                        format!("  {:<24}", key),
-                        theme.footer_key(),
-                    ),
+                    Span::styled(format!("  {:<24}", key), theme.footer_key()),
                     Span::styled(desc.to_string(), theme.normal()),
                 ])
             }
@@ -762,4 +748,3 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// No-op stub so the crate compiles without the `tui` feature.
 #[cfg(not(feature = "tui"))]
 pub fn draw(_state: &AppState, _theme: &Theme) {}
-

@@ -219,11 +219,7 @@ impl ApprovalGate {
     pub fn remaining_secs(&self) -> Option<u64> {
         self.deadline.map(|d| {
             let now = Instant::now();
-            if d > now {
-                (d - now).as_secs()
-            } else {
-                0
-            }
+            if d > now { (d - now).as_secs() } else { 0 }
         })
     }
 }
