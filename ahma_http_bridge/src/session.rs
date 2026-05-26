@@ -495,15 +495,11 @@ pub struct SessionManager {
 /// Extract the request ID from a JSON-RPC request value.
 /// Returns `None` for absent or null IDs (notifications).
 fn extract_request_id(request: &Value) -> Option<String> {
-    request.get("id").and_then(|id| {
-        if id.is_null() {
-            None
-        } else if id.is_string() {
-            Some(id.as_str().unwrap().to_string())
-        } else {
-            Some(id.to_string())
-        }
-    })
+    match request.get("id")? {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        id => Some(id.to_string()),
+    }
 }
 
 /// Register a pending request and return the receiver used to await its response.
@@ -554,6 +550,112 @@ async fn await_response(
             Err(BridgeError::Communication("Request timed out".to_string()))
         }
     }
+}
+
+/// Handle sandbox lifecycle notifications received from the subprocess.
+///
+/// Drives the `SandboxStateMachine` forward based on `notifications/sandbox/*` methods.
+fn handle_sandbox_notification(session: &Arc<Session>, value: &Value) {
+    match value.get("method").and_then(Value::as_str) {
+        Some("notifications/sandbox/configured") => {
+            if let Err(e) = session.sandbox_state_machine.transition_to_active() {
+                warn!(
+                    session_id = %session.id,
+                    error = %e,
+                    "Failed to transition sandbox state to Active (received notifications/sandbox/configured)"
+                );
+            } else {
+                info!(session_id = %session.id, "Observed notifications/sandbox/configured from subprocess - Sandbox is now ACTIVE");
+            }
+        }
+        Some("notifications/sandbox/failed") => {
+            let err_msg = value
+                .get("params")
+                .and_then(|p| p.get("error"))
+                .and_then(|e| e.as_str())
+                .unwrap_or("Unknown error");
+            if let Err(e) = session
+                .sandbox_state_machine
+                .transition_to_failed(err_msg.to_string())
+            {
+                warn!(
+                    session_id = %session.id,
+                    error = %e,
+                    "Failed to transition sandbox state to Failed (received notifications/sandbox/failed)"
+                );
+            } else {
+                warn!(
+                    session_id = %session.id,
+                    error_msg = %err_msg,
+                    "Subprocess reported sandbox configuration failed"
+                );
+            }
+        }
+        Some(method_str) => {
+            debug!(session_id = %session.id, method = %method_str, "Subprocess sent a different notification");
+        }
+        None if value.get("method").is_some() => {
+            warn!(session_id = %session.id, "Subprocess sent a method that is not a string");
+        }
+        None => {}
+    }
+}
+
+/// Process a single line received from subprocess stdout.
+///
+/// Routes JSON-RPC responses to waiting callers; broadcasts all other messages
+/// (notifications) to SSE subscribers and drives sandbox state transitions.
+fn dispatch_subprocess_line(session: &Arc<Session>, line: &str, colored_output: bool) {
+    debug!(session_id = %session.id, "Received from subprocess: {}", line);
+
+    if colored_output {
+        let timestamp = format!("[{}]", Local::now().format("%H:%M:%S%.3f"));
+        let display = serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or_else(|| line.to_string());
+        eprintln!(
+            "{} {} {}\n{}",
+            timestamp,
+            format!("[{}]", &session.id[..8]).green(),
+            "← STDOUT:".green(),
+            display.green()
+        );
+    }
+
+    let value = match serde_json::from_str::<Value>(line) {
+        Ok(v) => v,
+        Err(_) => {
+            warn!(session_id = %session.id, "Failed to parse JSON from subprocess: {}", line);
+            return;
+        }
+    };
+
+    // Route to waiting caller if this is a response to a pending request
+    if let Some(id) = value.get("id") {
+        let id_str = id.as_str().map_or_else(|| id.to_string(), str::to_string);
+        if let Some(sender) = take_pending_request(&session.pending_requests, &id_str) {
+            let _ = sender.send(value);
+            return;
+        }
+    }
+
+    // Drive sandbox state machine for lifecycle notifications
+    handle_sandbox_notification(session, &value);
+
+    // Broadcast to SSE subscribers
+    let receiver_count = session.broadcast_tx.receiver_count();
+    if receiver_count == 0 {
+        warn!(
+            session_id = %session.id,
+            method = %value.get("method").and_then(|m| m.as_str()).unwrap_or("<none>"),
+            "Broadcasting to 0 SSE subscribers - event will be dropped (SSE stream not yet open)"
+        );
+    } else {
+        debug!(session_id = %session.id, receiver_count = receiver_count, "Broadcasting to SSE subscribers");
+    }
+    let id = session.assign_event_id(line);
+    let _ = session.broadcast_tx.send((id, line.to_string()));
 }
 
 impl SessionManager {
@@ -952,12 +1054,11 @@ impl SessionManager {
                     // Echo STDIN in cyan if colored output is enabled
                     if colored_output {
                         let timestamp = format!("[{}]", Local::now().format("%H:%M:%S%.3f"));
-                        if let Ok(parsed) = serde_json::from_str::<Value>(&msg) {
-                            let pretty = serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| msg.clone());
-                            eprintln!("{} {} {}\n{}", timestamp, format!("[{}]", &session.id[..8]).cyan(), "→ STDIN:".cyan(), pretty.cyan());
-                        } else {
-                            eprintln!("{} {} {}\n{}", timestamp, format!("[{}]", &session.id[..8]).cyan(), "→ STDIN:".cyan(), msg.cyan());
-                        }
+                        let display = serde_json::from_str::<Value>(&msg)
+                            .ok()
+                            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                            .unwrap_or_else(|| msg.clone());
+                        eprintln!("{} {} {}\n{}", timestamp, format!("[{}]", &session.id[..8]).cyan(), "→ STDIN:".cyan(), display.cyan());
                     }
 
                     if let Err(e) = stdin.write_all(msg.as_bytes()).await {
@@ -979,88 +1080,7 @@ impl SessionManager {
                     match stdout_result {
                         Some(Ok(Some(line))) => {
                             if line.is_empty() { continue; }
-                            debug!(session_id = %session.id, "Received from subprocess: {}", line);
-
-                            // Echo STDOUT in green if colored output is enabled
-                            if colored_output {
-                                let timestamp = format!("[{}]", Local::now().format("%H:%M:%S%.3f"));
-                                if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
-                                    let pretty = serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| line.clone());
-                                    eprintln!("{} {} {}\n{}", timestamp, format!("[{}]", &session.id[..8]).green(), "← STDOUT:".green(), pretty.green());
-                                } else {
-                                    eprintln!("{} {} {}\n{}", timestamp, format!("[{}]", &session.id[..8]).green(), "← STDOUT:".green(), line.green());
-                                }
-                            }
-
-                            if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                                // Check if it's a response to a pending request
-                                if let Some(id) = value.get("id") {
-                                    let id_str = id
-                                        .as_str()
-                                        .map_or_else(|| id.to_string(), str::to_string);
-
-                                    if let Some(sender) = take_pending_request(&session.pending_requests, &id_str) {
-                                        let _ = sender.send(value);
-                                        continue;
-                                    }
-                                }
-
-                                // If this is a notification that the subprocess has applied
-                                // the sandbox scopes, mark the session and notify waiters.
-                                match value.get("method").and_then(Value::as_str) {
-                                    Some("notifications/sandbox/configured") => {
-                                        if let Err(e) = session.sandbox_state_machine.transition_to_active() {
-                                            warn!(
-                                                session_id = %session.id,
-                                                error = %e,
-                                                "Failed to transition sandbox state to Active (received notifications/sandbox/configured)"
-                                            );
-                                        } else {
-                                            info!(session_id = %session.id, "Observed notifications/sandbox/configured from subprocess - Sandbox is now ACTIVE");
-                                        }
-                                    }
-                                    Some("notifications/sandbox/failed") => {
-                                        let err_msg = value
-                                            .get("params")
-                                            .and_then(|p| p.get("error"))
-                                            .and_then(|e| e.as_str())
-                                            .unwrap_or("Unknown error");
-
-                                        if let Err(e) = session.sandbox_state_machine.transition_to_failed(err_msg.to_string()) {
-                                            warn!(
-                                                session_id = %session.id,
-                                                error = %e,
-                                                "Failed to transition sandbox state to Failed (received notifications/sandbox/failed)"
-                                            );
-                                        } else {
-                                            warn!(
-                                                session_id = %session.id,
-                                                error_msg = %err_msg,
-                                                "Subprocess reported sandbox configuration failed"
-                                            );
-                                        }
-                                    }
-                                    Some(method_str) => {
-                                        debug!(session_id = %session.id, method = %method_str, "Subprocess sent a different notification");
-                                    }
-                                    None if value.get("method").is_some() => {
-                                        warn!(session_id = %session.id, "Subprocess sent a method that is not a string");
-                                    }
-                                    None => {}
-                                }
-
-                                // Not a response to a pending request - broadcast as SSE event
-                                let receiver_count = session.broadcast_tx.receiver_count();
-                                if receiver_count == 0 {
-                                    warn!(session_id = %session.id, method = %value.get("method").and_then(|m| m.as_str()).unwrap_or("<none>"), "Broadcasting to 0 SSE subscribers - event will be dropped (SSE stream not yet open)");
-                                } else {
-                                    debug!(session_id = %session.id, receiver_count = receiver_count, "Broadcasting to SSE subscribers");
-                                }
-                                let id = session.assign_event_id(&line);
-                                let _ = session.broadcast_tx.send((id, line));
-                            } else {
-                                warn!(session_id = %session.id, "Failed to parse JSON from subprocess: {}", line);
-                            }
+                            dispatch_subprocess_line(&session, &line, colored_output);
                         }
                         Some(Ok(None)) | None => {
                             warn!(session_id = %session.id, "Subprocess stdout closed - assuming crash or exit");
@@ -1084,12 +1104,11 @@ impl SessionManager {
                     match result {
                         Ok(Some(line)) if !line.is_empty() => {
                             let timestamp = format!("[{}]", Local::now().format("%H:%M:%S%.3f"));
-                            if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
-                                let pretty = serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| line.clone());
-                                eprintln!("{} {} {}\n{}", timestamp, format!("[{}]", &session.id[..8]).red(), "STDERR:".yellow(), pretty.dimmed());
-                            } else {
-                                eprintln!("{} {} {}\n{}", timestamp, format!("[{}]", &session.id[..8]).red(), "STDERR:".yellow(), line.dimmed());
-                            }
+                            let display = serde_json::from_str::<Value>(&line)
+                                .ok()
+                                .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                                .unwrap_or_else(|| line.clone());
+                            eprintln!("{} {} {}\n{}", timestamp, format!("[{}]", &session.id[..8]).red(), "STDERR:".yellow(), display.dimmed());
                         }
                         Ok(Some(_)) => {} // Empty line
                         Ok(None) => {} // stderr closed

@@ -175,15 +175,13 @@ impl AhmaMcpService {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
                         tracing::info!("Detected change in tools directory, reloading configs...");
-                        match load_tool_configs(&config, Some(&tools_dir)).await {
-                            Ok(new_configs) => {
-                                service.update_tools(new_configs).await;
-                                tracing::info!("Successfully reloaded tool configurations");
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to reload tool configurations: {}", e);
-                            }
-                        }
+                        service
+                            .reload_tool_configs_from_dir(
+                                &config,
+                                &tools_dir,
+                                "Successfully reloaded tool configurations",
+                            )
+                            .await;
                         last_snapshot = snapshot_json_files(&tools_dir).await;
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
@@ -198,15 +196,13 @@ impl AhmaMcpService {
                         let current = snapshot_json_files(&tools_dir).await;
                         if current != last_snapshot {
                             tracing::info!("Polling fallback detected tools directory change, reloading...");
-                            match load_tool_configs(&config, Some(&tools_dir)).await {
-                                Ok(new_configs) => {
-                                    service.update_tools(new_configs).await;
-                                    tracing::info!("Successfully reloaded tool configurations (polling fallback)");
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to reload tool configurations: {}", e);
-                                }
-                            }
+                            service
+                                .reload_tool_configs_from_dir(
+                                    &config,
+                                    &tools_dir,
+                                    "Successfully reloaded tool configurations (polling fallback)",
+                                )
+                                .await;
                             last_snapshot = current;
                         }
                     }
@@ -252,6 +248,91 @@ impl AhmaMcpService {
         }
 
         true
+    }
+
+    /// Reload tool configs from disk, update in-memory state, and notify clients.
+    async fn reload_tool_configs_from_dir(
+        &self,
+        config: &crate::shell::cli::AppConfig,
+        tools_dir: &Path,
+        success_msg: &str,
+    ) {
+        match load_tool_configs(config, Some(tools_dir)).await {
+            Ok(new_configs) => {
+                self.update_tools(new_configs).await;
+                tracing::info!("{}", success_msg);
+            }
+            Err(e) => {
+                tracing::error!("Failed to reload tool configurations: {}", e);
+            }
+        }
+    }
+
+    /// Load tool configs from a per-client `.ahma/` directory if present and not already loaded.
+    async fn maybe_load_per_client_tools(&self, discovery_root: Option<PathBuf>) {
+        let root = match discovery_root {
+            Some(r) => r,
+            None => return,
+        };
+
+        let candidate = root.join(".ahma");
+        let is_dir = tokio::fs::metadata(&candidate)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if !is_dir {
+            return;
+        }
+
+        let already_loaded = self
+            .current_tools_dir
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|p| p == &candidate)
+            .unwrap_or(false);
+        if already_loaded {
+            tracing::debug!(
+                "Per-client tools dir already loaded: {}",
+                candidate.display()
+            );
+            return;
+        }
+
+        let app_config = match self.app_config.read().unwrap().clone() {
+            Some(c) => c,
+            None => {
+                tracing::debug!(
+                    "Per-client tools dir {} found but AppConfig unavailable; skipping reload",
+                    candidate.display()
+                );
+                return;
+            }
+        };
+
+        tracing::info!(
+            "Discovered per-client tools directory: {}",
+            candidate.display()
+        );
+        match load_tool_configs(&app_config, Some(&candidate)).await {
+            Ok(new_configs) => {
+                let count = new_configs.len();
+                self.update_tools(new_configs).await;
+                *self.current_tools_dir.write().unwrap() = Some(candidate.clone());
+                tracing::info!(
+                    "Loaded {} tool configs from per-client {}",
+                    count,
+                    candidate.display()
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load per-client tool configs from {}: {}",
+                    candidate.display(),
+                    e
+                );
+            }
+        }
     }
 
     pub async fn configure_sandbox_from_roots(&self, peer: &Peer<RoleServer>) {
@@ -322,12 +403,7 @@ impl AhmaMcpService {
             return;
         }
 
-        // Per-client tool discovery: if the first scope (preferring the client
-        // root if it was just supplied, else the pre-configured first scope)
-        // contains a `.ahma/` directory, load tool configs from it so each
-        // VS Code window gets the tool set defined by its own workspace. This
-        // complements the bridge-CWD `.ahma/` that may have been loaded at
-        // startup.
+        // Per-client tool discovery: load tools from `<root>/.ahma/` if present.
         let discovery_root = client_root.or_else(|| {
             self.adapter
                 .sandbox()
@@ -335,61 +411,7 @@ impl AhmaMcpService {
                 .first()
                 .map(|p| p.to_path_buf())
         });
-        if let Some(root) = discovery_root {
-            let candidate = root.join(".ahma");
-            let is_dir = tokio::fs::metadata(&candidate)
-                .await
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
-            if is_dir {
-                let already_loaded = self
-                    .current_tools_dir
-                    .read()
-                    .unwrap()
-                    .as_ref()
-                    .map(|p| p == &candidate)
-                    .unwrap_or(false);
-
-                if already_loaded {
-                    tracing::debug!(
-                        "Per-client tools dir already loaded: {}",
-                        candidate.display()
-                    );
-                } else {
-                    let app_config_opt = self.app_config.read().unwrap().clone();
-                    if let Some(app_config) = app_config_opt {
-                        tracing::info!(
-                            "Discovered per-client tools directory: {}",
-                            candidate.display()
-                        );
-                        match load_tool_configs(&app_config, Some(&candidate)).await {
-                            Ok(new_configs) => {
-                                let count = new_configs.len();
-                                self.update_tools(new_configs).await;
-                                *self.current_tools_dir.write().unwrap() = Some(candidate.clone());
-                                tracing::info!(
-                                    "Loaded {} tool configs from per-client {}",
-                                    count,
-                                    candidate.display()
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "Failed to load per-client tool configs from {}: {}",
-                                    candidate.display(),
-                                    e
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            "Per-client tools dir {} found but AppConfig unavailable; skipping reload",
-                            candidate.display()
-                        );
-                    }
-                }
-            }
-        }
+        self.maybe_load_per_client_tools(discovery_root).await;
 
         // Notify bridge that sandbox has been configured so it can safely
         // forward tools/call requests. NOTE: raw JSON on stdout — the HTTP bridge

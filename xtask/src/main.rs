@@ -78,7 +78,29 @@ fn bump_version(new_ver: &str) {
         .to_string();
 
     if cur_ver == new_ver {
-        println!("Already at version {new_ver} — nothing to do.");
+        // Cargo.toml is already at the target version, but the scripts and skill file may
+        // still be behind (e.g. the workspace version was bumped manually without running
+        // this task).  Scan each file for any semver-looking version string and replace it.
+        println!("Cargo.toml is already at {new_ver}; checking other files for stale versions…");
+        let other_files: &[(&str, &str)] = &[
+            ("skills/ahma/SKILL.md", "skills/ahma/SKILL.md"),
+            ("scripts/install.sh", "scripts/install.sh"),
+            ("scripts/install.ps1", "scripts/install.ps1"),
+        ];
+        let mut any_updated = false;
+        for (rel_path, label) in other_files {
+            let path = root.join(rel_path);
+            if let Some(stale) = find_stale_version(&path, new_ver) {
+                println!("  Updating {label}: {stale} → {new_ver}");
+                replace_all_version_occurrences(&path, &stale, new_ver, label);
+                any_updated = true;
+            } else {
+                println!("  {label}: already at {new_ver} ✓");
+            }
+        }
+        if !any_updated {
+            println!("All files already at {new_ver} — nothing to do.");
+        }
         return;
     }
 
@@ -183,6 +205,35 @@ fn replace_substring(path: &Path, old: &str, new: &str, label: &str) {
         return;
     }
     let new_content = content.replacen(old, new, 1);
+    fs::write(path, new_content).unwrap_or_else(|e| {
+        eprintln!("ERROR: Failed to write {}: {e}", path.display());
+        process::exit(1);
+    });
+    println!("  OK {label}");
+}
+
+/// Scan `path` for a semver string that is not equal to `target`.
+/// Returns the first stale version found, or `None` if the file is already current.
+fn find_stale_version(path: &Path, target: &str) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    // Match bare semver patterns, e.g. 0.7.2 or 1.12.3, that differ from `target`.
+    let re = regex::Regex::new(r"\b(\d+\.\d+\.\d+)\b").expect("static regex");
+    for cap in re.captures_iter(&content) {
+        let ver = cap[1].to_string();
+        if ver != target {
+            return Some(ver);
+        }
+    }
+    None
+}
+
+/// Replace ALL occurrences of `old` with `new` in `path`.
+fn replace_all_version_occurrences(path: &Path, old: &str, new: &str, label: &str) {
+    let content = fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("ERROR: Failed to read {}: {e}", path.display());
+        process::exit(1);
+    });
+    let new_content = content.replace(old, new);
     fs::write(path, new_content).unwrap_or_else(|e| {
         eprintln!("ERROR: Failed to write {}: {e}", path.display());
         process::exit(1);

@@ -1,7 +1,8 @@
-use ahma_common::timeouts::TestTimeouts;
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::test_utils;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::path::Path;
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
@@ -18,6 +19,84 @@ impl Drop for ChildGuard {
     }
 }
 
+fn spawn_mcp_server(binary: &Path, temp_dir: &Path, tools_dir: &Path) -> Child {
+    // AHMA_DISABLE_SANDBOX=1: this test verifies lifecycle notification emission,
+    // not sandbox enforcement. Disabling avoids Landlock/seatbelt interactions and
+    // makes the test identical across all CI platforms.
+    // AHMA_SKIP_PROBES=1: no tools need availability probing; skip the startup delay.
+    Command::new(binary)
+        .args(["serve", "stdio"])
+        .current_dir(temp_dir)
+        .env("AHMA_SANDBOX_SCOPE", temp_dir)
+        .env("AHMA_TOOLS_DIR", tools_dir)
+        .env("AHMA_DISABLE_SANDBOX", "1")
+        .env("AHMA_SKIP_PROBES", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn ahma_mcp")
+}
+
+fn read_stdout_for_notifications(
+    stdout: ChildStdout,
+    init_ok_tx: mpsc::Sender<()>,
+    tools_ok_tx: mpsc::Sender<()>,
+) -> (String, bool) {
+    let reader = BufReader::new(stdout);
+    let mut output_log = String::new();
+    let mut seen_terminated = false;
+    let mut init_acked = false;
+    let mut tools_acked = false;
+
+    for line in reader.lines() {
+        let line = line.expect("Failed to read line");
+        output_log.push_str(&line);
+        output_log.push('\n');
+
+        if !init_acked && line.contains("\"id\":1") && line.contains("\"result\"") {
+            let _ = init_ok_tx.send(());
+            init_acked = true;
+        }
+        if !tools_acked && line.contains("\"id\":2") && line.contains("\"result\"") {
+            let _ = tools_ok_tx.send(());
+            tools_acked = true;
+        }
+        if line.contains("notifications/sandbox/terminated") {
+            seen_terminated = true;
+        }
+    }
+    (output_log, seen_terminated)
+}
+
+fn perform_mcp_handshake(
+    stdin: &mut dyn Write,
+    init_ok_rx: &mpsc::Receiver<()>,
+    tools_ok_rx: &mpsc::Receiver<()>,
+) -> (bool, bool) {
+    let timeout = TestTimeouts::get(TimeoutCategory::Handshake);
+
+    let init_req = r#"{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "1.0"} }}"#;
+    stdin.write_all(init_req.as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+
+    let init_ok = init_ok_rx.recv_timeout(timeout).is_ok();
+    if !init_ok {
+        return (false, false);
+    }
+
+    let initialized_notif = r#"{"jsonrpc": "2.0", "method": "notifications/initialized"}"#;
+    stdin.write_all(initialized_notif.as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+
+    let tools_req = r#"{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}"#;
+    stdin.write_all(tools_req.as_bytes()).unwrap();
+    stdin.write_all(b"\n").unwrap();
+
+    let tools_ok = tools_ok_rx.recv_timeout(timeout).is_ok();
+    (true, tools_ok)
+}
+
 #[test]
 fn test_sandbox_lifecycle_notifications() {
     let binary = test_utils::cli::build_binary_cached("ahma_mcp", "ahma");
@@ -25,24 +104,7 @@ fn test_sandbox_lifecycle_notifications() {
     let tools_dir = temp_dir.path().join("tools");
     std::fs::create_dir(&tools_dir).unwrap();
 
-    // AHMA_DISABLE_SANDBOX=1: this test verifies lifecycle notification emission,
-    // not sandbox enforcement. Disabling avoids Landlock/seatbelt interactions and
-    // makes the test identical across all CI platforms.
-    // AHMA_SKIP_PROBES=1: no tools need availability probing; skip the startup delay.
-    let child = Command::new(&binary)
-        .args(["serve", "stdio"])
-        .current_dir(temp_dir.path())
-        .env("AHMA_SANDBOX_SCOPE", temp_dir.path())
-        .env("AHMA_TOOLS_DIR", &tools_dir)
-        .env("AHMA_DISABLE_SANDBOX", "1")
-        .env("AHMA_SKIP_PROBES", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn ahma_mcp");
-
-    // Wrap in RAII guard so the child is always killed if the test panics.
+    let child = spawn_mcp_server(&binary, temp_dir.path(), &tools_dir);
     let mut guard = ChildGuard(Some(child));
     let child_ref = guard.0.as_mut().unwrap();
 
@@ -60,98 +122,31 @@ fn test_sandbox_lifecycle_notifications() {
         err_log
     });
 
-    // Channel: reader thread signals main thread once the initialize response arrives.
     let (init_ok_tx, init_ok_rx) = mpsc::channel::<()>();
     let (tools_ok_tx, tools_ok_rx) = mpsc::channel::<()>();
+    let handle =
+        thread::spawn(move || read_stdout_for_notifications(stdout, init_ok_tx, tools_ok_tx));
 
-    let handle = thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        let mut output_log = String::new();
-        let mut seen_terminated = false;
-        let mut init_acked = false;
-        let mut tools_acked = false;
+    let (init_ok, tools_ok) = perform_mcp_handshake(&mut stdin, &init_ok_rx, &tools_ok_rx);
 
-        for line in reader.lines() {
-            let line = line.expect("Failed to read line");
-            output_log.push_str(&line);
-            output_log.push('\n');
-
-            // Detect the initialize response: a JSON object with id=1 and a result field.
-            if !init_acked && line.contains("\"id\":1") && line.contains("\"result\"") {
-                let _ = init_ok_tx.send(());
-                init_acked = true;
-            }
-
-            // Detect tools/list response: a JSON object with id=2 and a result field.
-            if !tools_acked && line.contains("\"id\":2") && line.contains("\"result\"") {
-                let _ = tools_ok_tx.send(());
-                tools_acked = true;
-            }
-
-            if line.contains("notifications/sandbox/terminated") {
-                seen_terminated = true;
-            }
-        }
-        (output_log, seen_terminated)
-    });
-
-    // Send initialize request.
-    let init_req = r#"{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "test", "version": "1.0"} }}"#;
-    stdin.write_all(init_req.as_bytes()).unwrap();
-    stdin.write_all(b"\n").unwrap();
-
-    // Wait for the server's initialize response before proceeding — deterministic
-    // under any CI load instead of a blind fixed-duration sleep.
-    let init_result = init_ok_rx.recv_timeout(TestTimeouts::get(
-        ahma_common::timeouts::TimeoutCategory::Handshake,
-    ));
-    if init_result.is_err() {
+    if !init_ok || !tools_ok {
         if let Some(child) = guard.0.as_mut() {
             let _ = child.kill();
         }
         let stderr_log = stderr_handle.join().unwrap_or_default();
         let (stdout_log, _) = handle.join().unwrap_or_default();
+        let which = if !init_ok { "initialize" } else { "tools/list" };
         panic!(
-            "Timed out waiting for initialize response from server.\n\nSTDOUT LOG:\n{}\n\nSTDERR LOG:\n{}",
-            stdout_log, stderr_log
+            "Timed out waiting for {} response from server.\n\nSTDOUT LOG:\n{}\n\nSTDERR LOG:\n{}",
+            which, stdout_log, stderr_log
         );
     }
 
-    // Send initialized notification to complete the MCP handshake.
-    let initialized_notif = r#"{"jsonrpc": "2.0", "method": "notifications/initialized"}"#;
-    stdin.write_all(initialized_notif.as_bytes()).unwrap();
-    stdin.write_all(b"\n").unwrap();
-
-    // Send a tools/list request to guarantee the server has processed notifications/initialized.
-    // This acts as a synchronization barrier instead of a blind sleep.
-    let tools_req = r#"{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}"#;
-    stdin.write_all(tools_req.as_bytes()).unwrap();
-    stdin.write_all(b"\n").unwrap();
-
-    // Wait for the tools/list response.
-    let tools_result = tools_ok_rx.recv_timeout(TestTimeouts::get(
-        ahma_common::timeouts::TimeoutCategory::Handshake,
-    ));
-    if tools_result.is_err() {
-        if let Some(child) = guard.0.as_mut() {
-            let _ = child.kill();
-        }
-        let stderr_log = stderr_handle.join().unwrap_or_default();
-        let (stdout_log, _) = handle.join().unwrap_or_default();
-        panic!(
-            "Timed out waiting for tools/list response from server.\n\nSTDOUT LOG:\n{}\n\nSTDERR LOG:\n{}",
-            stdout_log, stderr_log
-        );
-    }
-
-    // Close stdin to signal end of session (clean shutdown).
     drop(stdin);
 
-    // Extract child from guard (guard.drop becomes a no-op) and wait for exit.
     let mut child = guard.0.take().unwrap();
     let _ = child.wait().expect("Failed to wait on child");
 
-    // Join reader thread and collect output.
     let (log, seen) = handle.join().expect("Thread panicked");
     let err_log = stderr_handle.join().unwrap_or_default();
 

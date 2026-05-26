@@ -313,26 +313,26 @@ fn get_conflict_message(requires_client_roots: bool) -> &'static str {
 fn check_sandbox_lock(session_manager: &SessionManager, session_id: &str) -> Option<Response> {
     let session = session_manager.get_session(session_id)?;
 
-    let current_state = session.current_sandbox_state();
-    if current_state.is_active() {
-        return None;
-    }
-
-    if let ahma_common::sandbox_state::SandboxState::Failed { error } = current_state {
-        return Some(with_session_header(
-            error_response_with_status(
-                StatusCode::FORBIDDEN,
-                -32000,
-                &format!("Sandbox configuration failed: {}", error),
-            ),
-            session_id,
-        ));
-    }
-    if let ahma_common::sandbox_state::SandboxState::Terminated = current_state {
-        return Some(with_session_header(
-            error_response_with_status(StatusCode::FORBIDDEN, -32000, "Session terminated"),
-            session_id,
-        ));
+    match session.current_sandbox_state() {
+        ahma_common::sandbox_state::SandboxState::Active { .. } => return None,
+        ahma_common::sandbox_state::SandboxState::Failed { error } => {
+            return Some(with_session_header(
+                error_response_with_status(
+                    StatusCode::FORBIDDEN,
+                    -32000,
+                    &format!("Sandbox configuration failed: {}", error),
+                ),
+                session_id,
+            ));
+        }
+        ahma_common::sandbox_state::SandboxState::Terminated => {
+            return Some(with_session_header(
+                error_response_with_status(StatusCode::FORBIDDEN, -32000, "Session terminated"),
+                session_id,
+            ));
+        }
+        ahma_common::sandbox_state::SandboxState::AwaitingRoots
+        | ahma_common::sandbox_state::SandboxState::Configuring { .. } => {}
     }
 
     let (sse_connected, mcp_initialized) =

@@ -133,14 +133,15 @@ async fn test_operation_monitor_get_completed_operations() {
     let config = MonitorConfig::with_timeout(Duration::from_secs(300));
     let monitor = Arc::new(OperationMonitor::new(config));
 
-    // Create and add an operation
+    // Create and add an operation in a non-terminal state so update_status
+    // can transition it to Completed and move it into completion_history.
     let mut operation = Operation::new(
         "op_test_001".to_string(),
         "test_tool".to_string(),
         "echo test".to_string(),
         None,
     );
-    operation.state = OperationStatus::Completed;
+    operation.state = OperationStatus::InProgress;
 
     monitor.add_operation(operation).await;
 

@@ -217,6 +217,23 @@ fn write_package_simplicity(report: &mut String, summary: &RepoSummary, is_works
     }
 }
 
+/// Returns the shortest path suffix (joined by `/`) from `components` that is
+/// not shared by any entry in `siblings`, or `None` if no such suffix exists.
+fn find_minimal_unique_suffix(components: &[String], siblings: &[Vec<String>]) -> Option<String> {
+    let n = components.len();
+    for depth in 2..=n {
+        let candidate = components[n - depth..].join("/");
+        let is_unique = siblings.iter().all(|other_comps| {
+            let on = other_comps.len();
+            depth > on || other_comps[on - depth..].join("/") != candidate
+        });
+        if is_unique {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Compute display names for a list of files, disambiguating entries that share
 /// a basename by adding the minimal parent directory context needed for uniqueness.
 fn disambiguate_display_names(files: &[&FileSimplicity], base_dir: &Path) -> Vec<String> {
@@ -247,8 +264,6 @@ fn disambiguate_display_names(files: &[&FileSimplicity], base_dir: &Path) -> Vec
             }
 
             let components = path_components(rel_path);
-            let n = components.len();
-
             let siblings: Vec<Vec<String>> = entries
                 .iter()
                 .enumerate()
@@ -256,22 +271,8 @@ fn disambiguate_display_names(files: &[&FileSimplicity], base_dir: &Path) -> Vec
                 .map(|(_, (rp, _))| path_components(rp))
                 .collect();
 
-            for depth in 2..=n {
-                let candidate = components[n - depth..].join("/");
-                let is_unique = siblings.iter().all(|other_comps| {
-                    let on = other_comps.len();
-                    if depth > on {
-                        true
-                    } else {
-                        other_comps[on - depth..].join("/") != candidate
-                    }
-                });
-                if is_unique {
-                    return candidate;
-                }
-            }
-
-            rel_path.to_string_lossy().to_string()
+            find_minimal_unique_suffix(&components, &siblings)
+                .unwrap_or_else(|| rel_path.to_string_lossy().to_string())
         })
         .collect()
 }
@@ -404,6 +405,41 @@ fn identify_culprit(f: &FileSimplicity) -> &'static str {
     }
 }
 
+/// Builds the hotspot/findings section of the AI fix prompt for `file`.
+/// Shows per-function hotspots when available, or falls back to raw Detekt findings.
+fn build_hotspot_section(file: &FileSimplicity) -> String {
+    if !file.hotspots.is_empty() {
+        let mut s = String::from("\nHOTSPOT FUNCTIONS (worst first — focus here):\n");
+        for h in &file.hotspots {
+            if h.cognitive > 0.0 || h.cyclomatic > 0.0 {
+                s.push_str(&format!(
+                    "  - `{}()` line {}: Cog={:.0}, Cyc={:.0}\n",
+                    h.name, h.start_line, h.cognitive, h.cyclomatic
+                ));
+            }
+        }
+        s
+    } else if !file.external_issues.is_empty() {
+        // Fallback for external-only analysis (e.g. Kotlin via Detekt) where
+        // hotspots were not populated — show raw tool findings instead.
+        let mut s = String::from("\nDETEKT FINDINGS (for context — fix the listed functions):\n");
+        for issue in file.external_issues.iter().take(10) {
+            let fn_ctx = issue
+                .function_name
+                .as_deref()
+                .map(|n| format!(" in `{n}()`"))
+                .unwrap_or_default();
+            s.push_str(&format!(
+                "  - [{}{}] line {}: {}\n",
+                issue.rule, fn_ctx, issue.start_line, issue.message
+            ));
+        }
+        s
+    } else {
+        String::new()
+    }
+}
+
 /// Generates a structured AI prompt instructing the parent AI to evaluate and
 /// optionally simplify a specific issue from the complexity report.
 ///
@@ -436,37 +472,7 @@ pub fn generate_ai_fix_prompt(
         ""
     };
 
-    // Build a hotspot section showing the worst functions so the AI knows where to focus.
-    let hotspot_section = if !file.hotspots.is_empty() {
-        let mut s = String::from("\nHOTSPOT FUNCTIONS (worst first — focus here):\n");
-        for h in &file.hotspots {
-            if h.cognitive > 0.0 || h.cyclomatic > 0.0 {
-                s.push_str(&format!(
-                    "  - `{}()` line {}: Cog={:.0}, Cyc={:.0}\n",
-                    h.name, h.start_line, h.cognitive, h.cyclomatic
-                ));
-            }
-        }
-        s
-    } else if !file.external_issues.is_empty() {
-        // Fallback for external-only analysis (e.g. Kotlin via Detekt) where
-        // hotspots were not populated — show raw tool findings instead.
-        let mut s = String::from("\nDETEKT FINDINGS (for context — fix the listed functions):\n");
-        for issue in file.external_issues.iter().take(10) {
-            let fn_ctx = issue
-                .function_name
-                .as_deref()
-                .map(|n| format!(" in `{n}()`"))
-                .unwrap_or_default();
-            s.push_str(&format!(
-                "  - [{}{}] line {}: {}\n",
-                issue.rule, fn_ctx, issue.start_line, issue.message
-            ));
-        }
-        s
-    } else {
-        String::new()
-    };
+    let hotspot_section = build_hotspot_section(file);
 
     Some(format!(
         "\
