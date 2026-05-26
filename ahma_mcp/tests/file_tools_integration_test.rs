@@ -323,7 +323,12 @@ mod run_terminal_command_tests {
         let output = test_command(&binary)
             .current_dir(temp_dir.path())
             .env("AHMA_TOOLS_DIR", &tools_dir)
-            .args(["tool", "run", "run_terminal_command", "echo 'Hello from shell'"])
+            .args([
+                "tool",
+                "run",
+                "run_terminal_command",
+                "echo 'Hello from shell'",
+            ])
             .output()
             .expect("Failed to execute run_terminal_command");
 

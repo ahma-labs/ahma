@@ -93,7 +93,10 @@ async fn run_concurrent_tool_calls(transport: TransportMode) {
         ("run_terminal_command", json!({"command": "echo test3"})),
         ("run_terminal_command", json!({"command": "pwd"})),
         ("run_terminal_command", json!({"command": "ls -la"})),
-        ("run_terminal_command", json!({"command": "echo 'hello world'"})),
+        (
+            "run_terminal_command",
+            json!({"command": "echo 'hello world'"}),
+        ),
         ("run_terminal_command", json!({"command": "date"})),
         ("run_terminal_command", json!({"command": "whoami"})),
         ("run_terminal_command", json!({"command": "uname -a"})),

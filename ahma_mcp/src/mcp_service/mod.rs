@@ -824,9 +824,28 @@ impl ServerHandler for AhmaMcpService {
                 let background_ops: Vec<_> = active_ops
                     .iter()
                     .filter(|op| {
-                        // Only cancel operations that represent actual background processes
-                        // NOT synchronous tools like 'await', 'status', 'cancel'
-                        !matches!(op.tool_name.as_str(), "await" | "status" | "cancel")
+                        // Only cancel operations that represent actual background processes.
+                        // Exclude synchronous / meta tools that never create OperationMonitor
+                        // entries — cancelling them would incorrectly kill the most-recent
+                        // background process instead.
+                        let is_sync_meta = matches!(
+                            op.tool_name.as_str(),
+                            "await"
+                                | "status"
+                                | "cancel"
+                                | "activate_tools"
+                                | "logs_list"
+                                | "logs_read"
+                                | "logs_search"
+                        );
+                        if is_sync_meta {
+                            tracing::debug!(
+                                "on_cancelled: skipping sync/meta tool '{}' (op {})",
+                                op.tool_name,
+                                op.id
+                            );
+                        }
+                        !is_sync_meta
                     })
                     .collect();
 
@@ -1251,8 +1270,11 @@ impl AhmaMcpService {
     ///
     /// This is useful for testing and introspection.
     pub fn list_tool_names(&self) -> Vec<String> {
-        let mut names: Vec<String> =
-            vec!["await".into(), "status".into(), "run_terminal_command".into()];
+        let mut names: Vec<String> = vec![
+            "await".into(),
+            "status".into(),
+            "run_terminal_command".into(),
+        ];
 
         if self.progressive_disclosure {
             names.push("activate_tools".into());

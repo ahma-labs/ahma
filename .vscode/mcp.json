@@ -2,7 +2,15 @@
     "servers": {
         "ahma-unix": {
             "type": "http",
-            "url": "unix:///tmp/ahma.sock#/mcp"
+            "url": "unix:///tmp/ahma.sock#/mcp",
+            "sandboxEnabled": true,
+            "sandbox": {
+                "filesystem": {
+                    "allowWrite": [
+                        "${workspaceFolder}"
+                    ]
+                }
+            }
         }
     }
 }

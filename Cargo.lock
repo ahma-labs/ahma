@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_bin"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_cluster",
  "ahma_common",
@@ -35,7 +35,7 @@ dependencies = [
  "clap",
  "clap-markdown",
  "dirs",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde_json",
  "tempfile",
  "tokio",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_cluster"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_common",
  "ahma_decompose",
@@ -56,7 +56,7 @@ dependencies = [
  "hmac",
  "mdns-sd",
  "rcgen",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rustls",
  "serde",
  "serde_json",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_common"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "dirs",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_core"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_common",
  "ahma_llm_monitor",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_decompose"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_common",
  "ahma_llm_monitor",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_http_bridge"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_common",
  "ahma_mcp",
@@ -146,7 +146,7 @@ dependencies = [
  "owo-colors",
  "quinn",
  "rcgen",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_http_mcp_client"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_common",
  "anyhow",
@@ -179,7 +179,7 @@ dependencies = [
  "clap",
  "futures",
  "oauth2",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rmcp",
  "serde",
  "serde_json",
@@ -195,10 +195,10 @@ dependencies = [
 
 [[package]]
 name = "ahma_llm_monitor"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_common",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_mcp"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_common",
  "ahma_http_bridge",
@@ -237,7 +237,7 @@ dependencies = [
  "quick-xml",
  "rand 0.10.1",
  "regex",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "rmcp",
  "rust-code-analysis",
  "schemars",
@@ -263,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_renewal"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_vault",
  "anyhow",
@@ -277,17 +277,17 @@ dependencies = [
 
 [[package]]
 name = "ahma_test_support"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "ahma_tui"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_common",
  "ahma_renewal",
  "anyhow",
  "chrono",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "tempfile",
  "tokio",
  "tracing",
@@ -295,13 +295,13 @@ dependencies = [
 
 [[package]]
 name = "ahma_vault"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "anyhow",
  "chrono",
  "dirs",
  "rand 0.10.1",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "tempfile",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_worker"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_vault",
  "anyhow",
@@ -1061,7 +1061,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1138,7 +1138,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "generate_tool_schema"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "ahma_mcp",
  "schemars",
@@ -1667,7 +1667,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2239,7 +2239,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2450,7 +2450,7 @@ dependencies = [
  "bytes",
  "http",
  "opentelemetry",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
 ]
 
 [[package]]
@@ -2465,7 +2465,7 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "prost",
- "reqwest 0.13.3",
+ "reqwest 0.13.4",
  "thiserror 2.0.18",
 ]
 
@@ -2768,7 +2768,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2808,9 +2808,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3041,9 +3041,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.3"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
@@ -3196,7 +3196,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3255,7 +3255,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3276,7 +3276,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3736,7 +3736,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4588,7 +4588,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5145,7 +5145,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.7.2"
+version = "0.7.3"
 
 [[package]]
 name = "xz2"
