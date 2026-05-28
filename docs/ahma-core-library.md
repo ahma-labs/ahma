@@ -25,8 +25,9 @@ ahma_core = { git = "https://github.com/paulirotta/ahma.git" }
 
 ## AGPL-licensed sibling crates
 
-The following primitives are available in separate copyleft crates.  Add them
-to your `Cargo.toml` only if you accept the applicable license terms.
+The following primitives are available in separate AGPL-licensed crates. Add
+them to your `Cargo.toml` only if you accept the applicable license terms for
+those crates.
 
 | Crate | License | Key types |
 |-------|---------|----------|
@@ -39,6 +40,8 @@ to your `Cargo.toml` only if you accept the applicable license terms.
 
 Embedding any of these AGPL crates means any modified version offered to remote users
 over a network must publish its modified source code (AGPL-3.0 §13).
+
+Each crate's `Cargo.toml` is the authoritative license declaration.
 
 ## Minimal example: sandbox + monitor
 

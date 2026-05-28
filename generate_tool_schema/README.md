@@ -28,5 +28,11 @@ Generates JSON schema files that can be used for:
 
 ## License
 
-MIT OR Apache-2.0
+`generate_tool_schema` is licensed under **MIT OR Apache-2.0**.
+
+It stays permissive because it is a standalone schema-generation utility rather
+than part of the shipped end-user product surface.
+
+The authoritative license declaration for this crate is in
+`generate_tool_schema/Cargo.toml`.
 

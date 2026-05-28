@@ -249,6 +249,18 @@ This script:
 - **Testing**: Easy to test with curl or Postman
 - **Debugging**: Can inspect requests/responses with HTTP tools
 
+## License
+
+`ahma_http_bridge` is licensed under **MIT OR Apache-2.0**.
+
+This crate stays permissive because it is a transport and integration layer:
+applications can expose MCP over HTTP without changing the license choice for
+the bridge itself. If you combine it with AGPL-licensed sibling crates elsewhere
+in the workspace, those crates keep their own terms.
+
+The authoritative license declaration for this crate is in
+`ahma_http_bridge/Cargo.toml`.
+
 ### For Developers
 
 - **Clean Separation**: Bridge is a separate crate

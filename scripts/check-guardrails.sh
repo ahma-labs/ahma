@@ -160,6 +160,9 @@ echo "OK No per-crate edition/rust-version overrides"
 echo "=== Guardrail: lint recurring test patterns ===" 
 ./scripts/lint_test_paths.sh
 
+echo "=== Guardrail: workspace license boundaries ==="
+bash ./scripts/check-license-boundaries.sh
+
 echo "=== Guardrail: workspace cargo check ==="
 cargo check --workspace --locked
 

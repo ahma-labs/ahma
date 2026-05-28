@@ -22,10 +22,9 @@
 //!
 //! ## AGPL-licensed sibling crates
 //!
-//! The following primitives were extracted into separate copyleft crates to
-//! allow this library to remain MIT OR Apache-2.0.  Embedders who need them
-//! must add those crates directly to their `Cargo.toml` and accept the
-//! applicable copyleft terms:
+//! The following primitives are available in separate AGPL-licensed crates.
+//! Embedders who need them must add those crates directly to their
+//! `Cargo.toml` and accept the applicable license terms for those crates:
 //!
 //! | Crate | License | Primitives |
 //! |-------|---------|-----------|
@@ -39,6 +38,8 @@
 //! Linking any of these AGPL crates into a binary means any modified version
 //! offered to remote users over a network must provide source access per
 //! AGPL-3.0 §13.
+//!
+//! Each crate's `Cargo.toml` is the authoritative license declaration.
 //!
 //! ## Quickstart
 //!

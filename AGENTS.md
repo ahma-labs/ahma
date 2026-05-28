@@ -585,6 +585,17 @@ ahma --debug --log-to-stderr cargo_test --working-directory .
 - **Coverage Reports**: https://paulirotta.github.io/ahma/html/
 - **MCP Protocol**: https://github.com/mcp-rs/rmcp
 
+## Repo-local Skills
+
+Skills under `.agents/skills/` are repo-local and not distributed with ahma releases.
+
+| Skill | Trigger | Purpose |
+|-------|---------|---------|
+| [.agents/skills/ahmadev/SKILL.md](.agents/skills/ahmadev/SKILL.md) | `/ahmadev` | Safe dep updates, dev workflows |
+
+Use `/ahmadev help` in chat for the full command list.  
+For general ahma tooling (sandbox, livelog, run_terminal_command, etc.) use `/ahma help`.
+
 ---
 
 **Last Updated**: 2026-03-04
