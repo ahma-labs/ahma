@@ -11,7 +11,7 @@ _Use your existing command line workflows through MCP with a repo-scoped sandbox
 
 |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |                                     |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------: |
-| [![CI](https://github.com/paulirotta/ahma/actions/workflows/build.yml/badge.svg)](https://github.com/paulirotta/ahma/actions/workflows/build.yml) [![Coverage Report](https://img.shields.io/badge/Coverage-Report-blue)](https://paulirotta.github.io/ahma/html/) [![Rust Docs](https://img.shields.io/badge/Rust-Docs-blue)](https://paulirotta.github.io/ahma/doc/) [![Code Simplicity](https://img.shields.io/badge/Code-Simplicity-green)](https://paulirotta.github.io/ahma/CODE_SIMPLICITY.html) [![Prebuilt Binaries](https://img.shields.io/badge/Prebuilt-Binaries-blueviolet)](https://github.com/paulirotta/ahma/actions/workflows/build.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![License: Apache: 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2020) [![Rust](https://img.shields.io/badge/Rust-1.93%2B-B7410E.svg)](https://www.rust-lang.org/) | ![Ahma Logo](./assets/ahma.png) |
+| [![CI](https://github.com/paulirotta/ahma/actions/workflows/build.yml/badge.svg)](https://github.com/paulirotta/ahma/actions/workflows/build.yml) [![Coverage Report](https://img.shields.io/badge/Coverage-Report-blue)](https://paulirotta.github.io/ahma/html/) [![Rust Docs](https://img.shields.io/badge/Rust-Docs-blue)](https://paulirotta.github.io/ahma/doc/) [![Code Simplicity](https://img.shields.io/badge/Code-Simplicity-green)](https://paulirotta.github.io/ahma/CODE_SIMPLICITY.html) [![Prebuilt Binaries](https://img.shields.io/badge/Prebuilt-Binaries-blueviolet)](https://github.com/paulirotta/ahma/actions/workflows/build.yml?query=branch%3Amain+event%3Apush+is%3Asuccess) [![License: Per Crate](https://img.shields.io/badge/License-Per--Crate-6f42c1)](#license) [![Rust](https://img.shields.io/badge/Rust-1.93%2B-B7410E.svg)](https://www.rust-lang.org/) | ![Ahma Logo](./assets/ahma.png) |
 
 Ahma is an MCP server for running real project work through existing CLI tools with tighter filesystem boundaries and less blocking. It is aimed at the common case: builds, tests, formatters, git operations, log inspection, and other deterministic command-line tasks that agents already try to run.
 
@@ -290,9 +290,55 @@ Workspace-level rules in `AGENTS.md` reach Claude as operator-trusted content (h
 
 ## License
 
-Ahma uses a mixed-license model in a single workspace:
+Ahma is licensed **per crate**, not under a single repository-wide license.
+The root `Cargo.toml` groups crates in one workspace, but each member crate's
+`Cargo.toml` is the authoritative declaration for that crate.
 
--- The library crates (`ahma_mcp`, `ahma_core`, `ahma_common`, `ahma_http_bridge`, `ahma_http_mcp_client`, `ahma_llm_monitor`, `generate_tool_schema`) are dual-licensed under **MIT OR Apache-2.0**.
-- The end-user product surface — `ahma_bin` (which produces the `ahma` binary), `ahma_vault`, `ahma_decompose`, `ahma_worker`, `ahma_renewal`, `ahma_tui`, and the network-facing peer scheduler `ahma_cluster` — is licensed under **AGPL-3.0-or-later** to discourage commercial expropriation and to ensure that modified versions offered over a network must publish their source.
+| Crate | License | Role |
+|---|---|---|
+| `ahma_mcp` | MIT OR Apache-2.0 | MCP server, sandbox, command execution |
+| `ahma_core` | MIT OR Apache-2.0 | Embedding crate for Ahma runtime primitives |
+| `ahma_common` | MIT OR Apache-2.0 | Shared types and utilities |
+| `ahma_http_bridge` | MIT OR Apache-2.0 | Streamable HTTP / stdio bridge |
+| `ahma_http_mcp_client` | MIT OR Apache-2.0 | HTTP MCP client transport |
+| `ahma_llm_monitor` | MIT OR Apache-2.0 | Log-monitoring and LLM client support |
+| `ahma_test_support` | MIT OR Apache-2.0 | Test helpers for workspace crates |
+| `generate_tool_schema` | MIT OR Apache-2.0 | Schema generation utility |
+| `ahma_vault` | AGPL-3.0-or-later | Task vaults and audit trail |
+| `ahma_decompose` | AGPL-3.0-or-later | Multi-step decomposition runtime |
+| `ahma_worker` | AGPL-3.0-or-later | Ephemeral code synthesis workers |
+| `ahma_renewal` | AGPL-3.0-or-later | Renewal / unattended-session controls |
+| `ahma_tui` | AGPL-3.0-or-later | Terminal dashboard and approval flow |
+| `ahma_cluster` | AGPL-3.0-or-later | Networked worker scheduling |
+| `ahma_bin` | AGPL-3.0-or-later | Shipped `ahma` binary |
 
-The shipped `ahma` binary is AGPL-3.0-or-later. Each crate's `Cargo.toml` is the authoritative license declaration. Refer to it before redistributing.
+`MIT OR Apache-2.0` is used for the embeddable libraries, transports, and
+tooling crates so other Rust applications can adopt Ahma's protocol and secure
+execution primitives directly. The Apache side of the dual license adds an
+explicit patent grant, and the MIT side preserves the standard Rust dual-license
+option used by many libraries.
+
+`AGPL-3.0-or-later` is used for the end-user and network-exposed product crates
+that define the shipped product surface and security-relevant runtime behavior.
+That includes the shipped `ahma` binary and the crates that define vaults,
+worker execution, renewal gates, cluster scheduling, and the user-facing TUI.
+
+### Common uses
+
+| If you want to... | Typical answer |
+|---|---|
+| Embed `ahma_mcp`, `ahma_core`, or `ahma_http_mcp_client` in your own application | Allowed under **MIT OR Apache-2.0** for those crates |
+| Distribute a modified `ahma` binary | Allowed under **AGPL-3.0-or-later** for the combined binary |
+| Offer a modified `ahma` service or modified `ahma_cluster` to remote users | Allowed, subject to the AGPL terms for those crates, including source-availability obligations |
+| Use Ahma internally for local or private workflows | Allowed subject to the applicable crate terms and your own compliance requirements |
+
+### Security note
+
+The license split supports a single published origin for the security-focused
+product crates, but the license does not by itself make a modified fork safe.
+Trust in Ahma comes from the published source, the default sandbox and approval
+controls, and the provenance of the specific build you run.
+
+The repository root includes `MIT_LICENSE.txt`, `APACHE_LICENSE.txt`, and
+`AGPL_LICENSE.txt` because different workspace crates use different licenses.
+When in doubt, check the target crate's `Cargo.toml` first.

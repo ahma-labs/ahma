@@ -30,4 +30,3 @@ pub async fn run_tui(connect: Option<&str>) -> Result<()> {
     let connection = connection::resolve_connection(connect).await?;
     app::run(&connection).await
 }
-

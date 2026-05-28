@@ -46,6 +46,9 @@ allow = [
 multiple-versions = "warn"
 # Wildcard version requirements are usually fine in dev-dependencies.
 wildcards = "allow"
+# First-party per-crate license boundaries are enforced separately by
+# `scripts/check-license-boundaries.sh`, because cargo-deny bans apply
+# globally rather than by dependent crate.
 
 # ---------------------------------------------------------------------------
 # Sources – only allow crates.io plus the owner's rust-code-analysis fork

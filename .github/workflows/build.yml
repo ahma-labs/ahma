@@ -223,6 +223,9 @@ jobs:
           # Point at our deny.toml at the workspace root
           manifest-path: Cargo.toml
 
+      - name: Check workspace license boundaries
+        run: bash ./scripts/check-license-boundaries.sh
+
   #######################################
 
   job-android-nextest:

@@ -72,7 +72,14 @@ The example opens your browser to complete the OAuth consent flow, listens for t
 
 ## License
 
-MIT OR Apache-2.0
+`ahma_http_mcp_client` is licensed under **MIT OR Apache-2.0**.
+
+This client transport remains permissive so other applications can speak MCP
+over HTTP without inheriting the license terms of Ahma's higher-level product
+crates.
+
+The authoritative license declaration for this crate is in
+`ahma_http_mcp_client/Cargo.toml`.
 
 ## Examples
 

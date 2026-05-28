@@ -31,9 +31,7 @@ async fn run_ratatui(connection: &ResolvedConnection) -> Result<()> {
     use crossterm::{
         event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream},
         execute,
-        terminal::{
-            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-        },
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     };
     use futures::StreamExt;
     use ratatui::{Terminal, backend::CrosstermBackend};
@@ -266,8 +264,7 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         Action::PaletteComplete => {
             let n = state.palette.completions.len();
             if n > 0 {
-                state.palette.selected_completion =
-                    (state.palette.selected_completion + 1) % n;
+                state.palette.selected_completion = (state.palette.selected_completion + 1) % n;
                 let idx = state.palette.selected_completion;
                 if let Some(name) = state.palette.completions.get(idx).cloned() {
                     state.palette.input = name;
@@ -277,8 +274,7 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         Action::PaletteDown => {
             let n = state.palette.completions.len();
             if n > 0 {
-                state.palette.selected_completion =
-                    (state.palette.selected_completion + 1) % n;
+                state.palette.selected_completion = (state.palette.selected_completion + 1) % n;
             }
         }
         Action::PaletteUp => {
@@ -371,7 +367,3 @@ fn detect_unicode() -> bool {
             .to_lowercase()
             .contains("dumb")
 }
-
-
-
-
