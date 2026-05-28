@@ -109,6 +109,20 @@ fn wait_for_bound_port(
     panic!("Timed out waiting for server to bind port");
 }
 
+async fn poll_until_healthy(client: &Client, health_url: &str) -> bool {
+    let timeout = TestTimeouts::get(TimeoutCategory::HealthCheck);
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        sleep(TestTimeouts::poll_interval()).await;
+        if let Ok(resp) = client.get(health_url).send().await
+            && resp.status().is_success()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Start an HTTP bridge server with deferred sandbox (for roots/list testing)
 async fn start_deferred_sandbox_server(tools_dir: &std::path::Path) -> ServerGuard {
     let binary = get_ahma_mcp_binary();
@@ -140,19 +154,10 @@ async fn start_deferred_sandbox_server(tools_dir: &std::path::Path) -> ServerGua
 
     let port = wait_for_bound_port(&rx, &mut child);
 
-    // Wait for server to be ready (health check)
     let client = common::make_h2_client();
     let health_url = format!("http://127.0.0.1:{}/health", port);
-    let health_timeout = TestTimeouts::get(TimeoutCategory::HealthCheck);
-    let health_start = std::time::Instant::now();
-
-    while health_start.elapsed() < health_timeout {
-        sleep(TestTimeouts::poll_interval()).await;
-        if let Ok(resp) = client.get(&health_url).send().await
-            && resp.status().is_success()
-        {
-            return ServerGuard::new(child, port);
-        }
+    if poll_until_healthy(&client, &health_url).await {
+        return ServerGuard::new(child, port);
     }
 
     let _ = child.kill();
@@ -421,6 +426,31 @@ async fn open_roots_sse_stream(
     Ok(resp)
 }
 
+/// Drain complete SSE events from `buffer`, dispatching each via `handle_sse_event`.
+/// Returns `Some(result)` when the exchange completes, or `None` to keep reading.
+async fn drain_sse_buffer(
+    buffer: &mut String,
+    client: &Client,
+    base_url: &str,
+    session_id: &str,
+    root_uris: &[String],
+) -> Option<Result<(), String>> {
+    while let Some(idx) = buffer.find("\n\n") {
+        let raw_event = buffer[..idx].to_string();
+        *buffer = buffer[idx + 2..].to_string();
+
+        let Some(value) = parse_sse_event_data(&raw_event) else {
+            continue;
+        };
+
+        if let Some(result) = handle_sse_event(value, client, base_url, session_id, root_uris).await
+        {
+            return Some(result);
+        }
+    }
+    None
+}
+
 async fn process_roots_list_response(
     resp: reqwest::Response,
     client: &Client,
@@ -442,24 +472,16 @@ async fn process_roots_list_response(
             .ok()
             .flatten();
 
-        if let Some(next) = chunk {
-            let bytes = next.map_err(|e| format!("SSE read error: {}", e))?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
+        let Some(next) = chunk else {
+            continue;
+        };
+        let bytes = next.map_err(|e| format!("SSE read error: {}", e))?;
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-            while let Some(idx) = buffer.find("\n\n") {
-                let raw_event = buffer[..idx].to_string();
-                buffer = buffer[idx + 2..].to_string();
-
-                let Some(value) = parse_sse_event_data(&raw_event) else {
-                    continue;
-                };
-
-                if let Some(result) =
-                    handle_sse_event(value, client, base_url, session_id, root_uris).await
-                {
-                    return result;
-                }
-            }
+        if let Some(result) =
+            drain_sse_buffer(&mut buffer, client, base_url, session_id, root_uris).await
+        {
+            return result;
         }
     }
 }
@@ -970,6 +992,31 @@ async fn test_mixed_valid_invalid_uris() {
 // Test: Post-Lock Roots Rejection (R8.4.6)
 // =============================================================================
 
+/// Verify that a session is no longer usable after a post-lock roots change attempt.
+/// Polls with a tool call and asserts it fails, catching a silent-accept security violation.
+async fn verify_session_terminated_after_roots_change(
+    client: &Client,
+    base_url: &str,
+    session_id: &str,
+    dir: &Path,
+) {
+    sleep(TestTimeouts::poll_interval()).await;
+    let tool_call = pwd_tool_call(3, Some(dir));
+    match send_mcp_request(client, base_url, &tool_call, Some(session_id)).await {
+        Err(e) => {
+            eprintln!("Session terminated after roots change (expected): {}", e);
+        }
+        Ok((response, _)) => {
+            assert!(
+                response.get("error").is_some(),
+                "SECURITY VIOLATION: Tool call succeeded after roots/list_changed. \
+                 Session should have been terminated. Response: {:?}",
+                response
+            );
+        }
+    }
+}
+
 /// SECURITY TEST: Attempts to change roots after sandbox lock must be rejected.
 ///
 /// Per requirement R8.4.6: "notifications/roots/list_changed after sandbox lock
@@ -1039,30 +1086,13 @@ async fn test_post_lock_roots_change_rejected() {
         }
         Ok(_) => {
             // Notification was accepted - verify session is now invalid
-            // Try another tool call - should fail
-            sleep(TestTimeouts::poll_interval()).await;
-
-            let tool_call_2 = pwd_tool_call(3, Some(initial_root.path()));
-
-            let result2 =
-                send_mcp_request(&client, &base_url, &tool_call_2, Some(&session_id)).await;
-            match result2 {
-                Err(e) => {
-                    eprintln!("Session terminated after roots change (expected): {}", e);
-                }
-                Ok((response2, _)) => {
-                    // If we got a response, it should be an error
-                    let has_error = response2.get("error").is_some();
-                    if !has_error {
-                        // This is a FAILURE - roots change was silently accepted
-                        panic!(
-                            "SECURITY VIOLATION: Tool call succeeded after roots/list_changed. \
-                             Session should have been terminated. Response: {:?}",
-                            response2
-                        );
-                    }
-                }
-            }
+            verify_session_terminated_after_roots_change(
+                &client,
+                &base_url,
+                &session_id,
+                initial_root.path(),
+            )
+            .await;
         }
     }
 }

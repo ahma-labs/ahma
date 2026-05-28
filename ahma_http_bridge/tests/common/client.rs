@@ -325,13 +325,17 @@ impl McpTestClient {
                 );
             }
 
-            let Some(chunk) = tokio::time::timeout(TestTimeouts::poll_interval(), stream.next())
-                .await
-                .ok()
-                .flatten()
-            else {
-                continue;
-            };
+            let chunk =
+                match tokio::time::timeout(TestTimeouts::poll_interval(), stream.next()).await {
+                    Err(_elapsed) => continue, // poll window elapsed, no data yet — try again
+                    Ok(None) => {
+                        return Err(
+                            "SSE handshake stream closed by server before handshake completed"
+                                .to_string(),
+                        );
+                    }
+                    Ok(Some(chunk)) => chunk,
+                };
 
             let bytes = chunk.map_err(|e| format!("SSE read error: {}", e))?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -376,13 +380,17 @@ impl McpTestClient {
                 );
             }
 
-            let Some(chunk) = tokio::time::timeout(TestTimeouts::poll_interval(), stream.next())
-                .await
-                .ok()
-                .flatten()
-            else {
-                continue;
-            };
+            let chunk =
+                match tokio::time::timeout(TestTimeouts::poll_interval(), stream.next()).await {
+                    Err(_elapsed) => continue, // poll window elapsed, no data yet — try again
+                    Ok(None) => {
+                        return Err(
+                            "SSE handshake stream closed by server before handshake completed"
+                                .to_string(),
+                        );
+                    }
+                    Ok(Some(chunk)) => chunk,
+                };
 
             let bytes = chunk.map_err(|e| format!("SSE read error: {}", e))?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
@@ -584,13 +592,16 @@ impl McpTestClient {
                 return Err("Timeout waiting for SSE response event".to_string());
             }
 
-            let Some(chunk) = tokio::time::timeout(TestTimeouts::poll_interval(), stream.next())
-                .await
-                .ok()
-                .flatten()
-            else {
-                continue;
-            };
+            let chunk =
+                match tokio::time::timeout(TestTimeouts::poll_interval(), stream.next()).await {
+                    Err(_elapsed) => continue, // poll window elapsed, no data yet — try again
+                    Ok(None) => {
+                        return Err(
+                            "SSE stream closed by server before response was received".to_string()
+                        );
+                    }
+                    Ok(Some(chunk)) => chunk,
+                };
 
             let bytes = chunk.map_err(|e| format!("SSE stream read error: {}", e))?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));

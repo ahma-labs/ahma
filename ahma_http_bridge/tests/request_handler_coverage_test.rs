@@ -356,7 +356,8 @@ async fn test_tools_list_sse() {
 
 /// Run tools/call with timeout_seconds in arguments to cover calculate_tool_timeout.
 async fn run_tools_call_timeout(mode: TransportMode) {
-    let Some((_server, mcp)) = setup_test_mcp_for_tools(mode, &["run_terminal_command"]).await else {
+    let Some((_server, mcp)) = setup_test_mcp_for_tools(mode, &["run_terminal_command"]).await
+    else {
         return;
     };
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

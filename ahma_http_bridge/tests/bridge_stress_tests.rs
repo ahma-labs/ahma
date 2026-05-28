@@ -93,7 +93,10 @@ async fn run_concurrent_tool_calls(transport: TransportMode) {
         ("run_terminal_command", json!({"command": "echo test3"})),
         ("run_terminal_command", json!({"command": "pwd"})),
         ("run_terminal_command", json!({"command": "ls -la"})),
-        ("run_terminal_command", json!({"command": "echo 'hello world'"})),
+        (
+            "run_terminal_command",
+            json!({"command": "echo 'hello world'"}),
+        ),
         ("run_terminal_command", json!({"command": "date"})),
         ("run_terminal_command", json!({"command": "whoami"})),
         ("run_terminal_command", json!({"command": "uname -a"})),
@@ -259,8 +262,13 @@ async fn test_concurrent_tool_calls_sse() {
 /// PowerShell process through AppContainer.
 #[tokio::test]
 async fn test_high_volume_concurrent_requests_json() {
-    let num_requests: usize = if cfg!(target_os = "windows") {
-        15
+    // Windows CI (2-CPU GitHub runner): each request spawns a PowerShell
+    // process; 15 concurrent spawns saturates the scheduler and stalls tokio
+    // timers.  Reduce the fan-out to keep wall-time within the nextest budget.
+    let num_requests: usize = if cfg!(target_os = "windows") && is_low_core_or_ci() {
+        8
+    } else if cfg!(target_os = "windows") {
+        12
     } else if is_low_core_or_ci() {
         20
     } else {
@@ -272,8 +280,13 @@ async fn test_high_volume_concurrent_requests_json() {
 /// High-volume echo stress using `Accept: text/event-stream`.
 #[tokio::test]
 async fn test_high_volume_concurrent_requests_sse() {
-    let num_requests: usize = if cfg!(target_os = "windows") {
-        15
+    // Windows CI (2-CPU GitHub runner): each request spawns a PowerShell
+    // process; 15 concurrent spawns saturates the scheduler and stalls tokio
+    // timers.  Reduce the fan-out to keep wall-time within the nextest budget.
+    let num_requests: usize = if cfg!(target_os = "windows") && is_low_core_or_ci() {
+        8
+    } else if cfg!(target_os = "windows") {
+        12
     } else if is_low_core_or_ci() {
         20
     } else {

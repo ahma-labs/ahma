@@ -337,6 +337,20 @@ impl OperationMonitor {
         let mut operation_to_move = None;
 
         if let Some(op) = ops.get_mut(id) {
+            // Guard: never overwrite an already-terminal state.  Terminal ops are removed
+            // from the active map immediately, so if one is still present here a concurrent
+            // transition must be in flight.  The first terminal writer wins; subsequent
+            // attempts become a no-op with a debug trace rather than silently corrupting state.
+            if op.state.is_terminal() {
+                tracing::debug!(
+                    "update_status: ignoring {:?} for op {} — already terminal ({:?})",
+                    status,
+                    id,
+                    op.state
+                );
+                return;
+            }
+
             tracing::debug!(
                 "Updating operation {} from {:?} to {:?}",
                 id,
@@ -706,5 +720,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Verifies that `update_status` does NOT overwrite a terminal state that was
+    /// set by a racing concurrent transition.  The guard added in the fix should
+    /// keep the first terminal state and discard the later update.
+    #[tokio::test]
+    async fn test_update_status_ignores_overwrite_of_terminal_state() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let op_id = "terminal-guard-test".to_string();
+
+        monitor
+            .add_operation(Operation::new(
+                op_id.clone(),
+                "test_tool".to_string(),
+                "terminal guard test".to_string(),
+                None,
+            ))
+            .await;
+
+        // Simulate: cancellation fires first, moves the op to terminal state.
+        let cancelled = monitor
+            .cancel_operation_with_reason(&op_id, Some("test cancel".to_string()))
+            .await;
+        assert!(cancelled, "cancel_operation_with_reason should succeed");
+
+        // Op should now be in history as Cancelled.
+        let in_history = monitor.check_completion_history_pub(&op_id).await;
+        assert!(
+            in_history.is_some(),
+            "cancelled op must appear in completion history"
+        );
+        assert_eq!(
+            in_history.unwrap().state,
+            OperationStatus::Cancelled,
+            "state in history should be Cancelled"
+        );
+
+        // Now simulate the background task calling update_status(Completed) after the cancel.
+        // With the guard this should be a no-op (op was already removed from active ops).
+        monitor
+            .update_status(
+                &op_id,
+                OperationStatus::Completed,
+                Some(serde_json::json!({"result": "late completion"})),
+            )
+            .await;
+
+        // History entry must remain Cancelled — the Completed update was discarded.
+        let after = monitor.check_completion_history_pub(&op_id).await.unwrap();
+        assert_eq!(
+            after.state,
+            OperationStatus::Cancelled,
+            "terminal state must not be overwritten by a late Completed update"
+        );
+    }
+
+    /// Verifies that `update_status` blocks a state downgrade (non-terminal
+    /// replacing an already-terminal state) when the op is still in the active map.
+    ///
+    /// In normal operation terminal ops are removed immediately, so this path is
+    /// defensive.  The guard must still prevent the downgrade.
+    #[tokio::test]
+    async fn test_update_status_blocks_downgrade_while_in_active_map() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let op_id = "downgrade-guard-test".to_string();
+
+        // Insert an operation and manually set it to a terminal state without removing it
+        // from the active map.  This mimics the edge-case the guard is designed for.
+        {
+            let op = Operation::new(
+                op_id.clone(),
+                "test_tool".to_string(),
+                "downgrade guard test".to_string(),
+                None,
+            );
+            let mut ops = monitor.operations.write().await;
+            let mut op_mut = op;
+            op_mut.state = OperationStatus::Completed; // force terminal while in active map
+            ops.insert(op_id.clone(), op_mut);
+        }
+
+        // update_status(InProgress) must be rejected because the op is already terminal.
+        monitor
+            .update_status(&op_id, OperationStatus::InProgress, None)
+            .await;
+
+        let ops = monitor.operations.read().await;
+        let op = ops.get(&op_id).unwrap();
+        assert_eq!(
+            op.state,
+            OperationStatus::Completed,
+            "state must stay Completed; downgrade to InProgress must be blocked"
+        );
     }
 }

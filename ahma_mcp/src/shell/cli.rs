@@ -589,14 +589,12 @@ fn audit_bundle_command(audit_args: BundleAuditArgs) -> Result<()> {
 
     if result.passed {
         println!("PASS Bundle audit passed.");
-        Ok(())
-    } else if audit_args.strict && !result.findings.is_empty() {
-        anyhow::bail!("Bundle audit found issues (--strict mode).")
-    } else if !result.passed {
-        anyhow::bail!("Bundle audit found critical issues.")
-    } else {
-        Ok(())
+        return Ok(());
     }
+    if audit_args.strict && !result.findings.is_empty() {
+        anyhow::bail!("Bundle audit found issues (--strict mode).")
+    }
+    anyhow::bail!("Bundle audit found critical issues.")
 }
 
 fn verify_bundle_command(verify_args: BundleVerifyArgs) -> Result<()> {
@@ -1398,6 +1396,26 @@ pub struct ClusterPingArgs {
 // AppConfig construction from CLI + env vars
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(unix)]
+fn unix_socket_path_from_cli(cli: &Cli) -> String {
+    match &cli.command {
+        Subcommands::Serve(s) => match &s.transport {
+            ServeTransport::Unix(u) => u
+                .socket_path
+                .clone()
+                .or_else(|| std::env::var("AHMA_UNIX_SOCKET").ok())
+                .unwrap_or_else(|| "/tmp/ahma.sock".to_string()),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+#[cfg(not(unix))]
+fn unix_socket_path_from_cli(_cli: &Cli) -> String {
+    String::new()
+}
+
 pub fn build_app_config(cli: &Cli) -> AppConfig {
     // Gather serve-level fields if present
     #[allow(clippy::type_complexity)]
@@ -1557,26 +1575,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         no_quic,
         disable_http1_1,
         handshake_timeout_secs: AppConfig::env_u64("AHMA_HANDSHAKE_TIMEOUT", 45),
-        unix_socket_path: {
-            #[cfg(unix)]
-            {
-                match &cli.command {
-                    Subcommands::Serve(s) => match &s.transport {
-                        ServeTransport::Unix(u) => u
-                            .socket_path
-                            .clone()
-                            .or_else(|| std::env::var("AHMA_UNIX_SOCKET").ok())
-                            .unwrap_or_else(|| "/tmp/ahma.sock".to_string()),
-                        _ => String::new(),
-                    },
-                    _ => String::new(),
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                String::new()
-            }
-        },
+        unix_socket_path: unix_socket_path_from_cli(cli),
         observability: ahma_common::observability::ObservabilityConfig::from_env("ahma_mcp")
             .with_endpoint(cli_opentelemetry.as_deref()),
         list_server,

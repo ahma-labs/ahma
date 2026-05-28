@@ -192,7 +192,9 @@ async fn test_mcp_list_tools_returns_enabled_tools() -> Result<()> {
         tool_names
     );
     assert!(
-        tool_names.iter().any(|n| n.contains("run_terminal_command")),
+        tool_names
+            .iter()
+            .any(|n| n.contains("run_terminal_command")),
         "Should list run_terminal_command tool. Got: {:?}",
         tool_names
     );
@@ -527,15 +529,16 @@ async fn test_mcp_shell_command_execution() -> Result<()> {
             .build()
             .await?;
 
-        let params = CallToolRequestParams::new(Cow::Borrowed("run_terminal_command")).with_arguments(
-            json!({
-                "command": "echo 'MCP test output'",
-                "execution_mode": "Synchronous"
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
-        );
+        let params = CallToolRequestParams::new(Cow::Borrowed("run_terminal_command"))
+            .with_arguments(
+                json!({
+                    "command": "echo 'MCP test output'",
+                    "execution_mode": "Synchronous"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            );
 
         let call_result = tokio::time::timeout(call_timeout, client.call_tool(params)).await;
         match call_result {

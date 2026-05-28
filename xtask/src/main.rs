@@ -3,7 +3,8 @@
 //! Run via: `cargo xtask <subcommand>`
 //!
 //! Subcommands:
-//!   bump-version X.Y.Z   Update the workspace version across all version-bearing files.
+//!   bump-version X.Y.Z      Update the workspace version across all version-bearing files.
+//!   bump-android-version    Increment the Android Play versionCode and sync versionName from Cargo.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,15 +20,27 @@ fn main() {
             });
             bump_version(&new_ver);
         }
+        Some("bump-android-version") => {
+            // Optional positional arg: path to the Android project root directory.
+            // Defaults to test-data/AndoidTestBasicViews.
+            let android_dir = args.next();
+            bump_android_version(android_dir.as_deref());
+        }
         Some(cmd) => {
             eprintln!("Unknown xtask command: {cmd}");
             eprintln!("Available commands:");
-            eprintln!("  bump-version X.Y.Z    Update version across all files");
+            eprintln!("  bump-version X.Y.Z         Update Cargo + skill version across all files");
+            eprintln!(
+                "  bump-android-version [dir] Increment Android Play versionCode and sync versionName"
+            );
             process::exit(1);
         }
         None => {
             eprintln!("Usage: cargo xtask <command>");
-            eprintln!("  bump-version X.Y.Z    Update version across all files");
+            eprintln!("  bump-version X.Y.Z         Update Cargo + skill version across all files");
+            eprintln!(
+                "  bump-android-version [dir] Increment Android Play versionCode and sync versionName"
+            );
             process::exit(1);
         }
     }
@@ -78,7 +91,29 @@ fn bump_version(new_ver: &str) {
         .to_string();
 
     if cur_ver == new_ver {
-        println!("Already at version {new_ver} — nothing to do.");
+        // Cargo.toml is already at the target version, but the scripts and skill file may
+        // still be behind (e.g. the workspace version was bumped manually without running
+        // this task).  Scan each file for any semver-looking version string and replace it.
+        println!("Cargo.toml is already at {new_ver}; checking other files for stale versions…");
+        let other_files: &[(&str, &str)] = &[
+            ("skills/ahma/SKILL.md", "skills/ahma/SKILL.md"),
+            ("scripts/install.sh", "scripts/install.sh"),
+            ("scripts/install.ps1", "scripts/install.ps1"),
+        ];
+        let mut any_updated = false;
+        for (rel_path, label) in other_files {
+            let path = root.join(rel_path);
+            if let Some(stale) = find_stale_version(&path, new_ver) {
+                println!("  Updating {label}: {stale} → {new_ver}");
+                replace_all_version_occurrences(&path, &stale, new_ver, label);
+                any_updated = true;
+            } else {
+                println!("  {label}: already at {new_ver} ✓");
+            }
+        }
+        if !any_updated {
+            println!("All files already at {new_ver} — nothing to do.");
+        }
         return;
     }
 
@@ -183,6 +218,138 @@ fn replace_substring(path: &Path, old: &str, new: &str, label: &str) {
         return;
     }
     let new_content = content.replacen(old, new, 1);
+    fs::write(path, new_content).unwrap_or_else(|e| {
+        eprintln!("ERROR: Failed to write {}: {e}", path.display());
+        process::exit(1);
+    });
+    println!("  OK {label}");
+}
+
+/// Scan `path` for a semver string that is not equal to `target`.
+/// Returns the first stale version found, or `None` if the file is already current.
+fn find_stale_version(path: &Path, target: &str) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    // Match bare semver patterns, e.g. 0.7.2 or 1.12.3, that differ from `target`.
+    let re = regex::Regex::new(r"\b(\d+\.\d+\.\d+)\b").expect("static regex");
+    for cap in re.captures_iter(&content) {
+        let ver = cap[1].to_string();
+        if ver != target {
+            return Some(ver);
+        }
+    }
+    None
+}
+
+/// Increment the Android Play Store versionCode and sync versionName from the Cargo workspace
+/// version.  Reads `android-version.properties` from the given Android project root directory
+/// (defaults to `test-data/AndoidTestBasicViews`).
+///
+/// # Layout expected in android-version.properties
+/// ```text
+/// VERSION_CODE=<positive integer>
+/// VERSION_NAME=<semver string>
+/// ```
+fn bump_android_version(android_dir: Option<&str>) {
+    let root = workspace_root();
+
+    let android_root = match android_dir {
+        Some(d) => PathBuf::from(d),
+        None => root.join("test-data").join("AndoidTestBasicViews"),
+    };
+    let props_path = android_root.join("android-version.properties");
+
+    // --- Read current properties ---
+    let content = fs::read_to_string(&props_path).unwrap_or_else(|e| {
+        eprintln!("ERROR: Failed to read {}: {e}", props_path.display());
+        eprintln!("Expected file at: {}", props_path.display());
+        process::exit(1);
+    });
+
+    // Parse VERSION_CODE
+    let current_code: u64 = content
+        .lines()
+        .find(|l| l.starts_with("VERSION_CODE="))
+        .unwrap_or_else(|| {
+            eprintln!("ERROR: VERSION_CODE not found in {}", props_path.display());
+            process::exit(1);
+        })
+        .trim_start_matches("VERSION_CODE=")
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: VERSION_CODE is not a valid integer: {e}");
+            process::exit(1);
+        });
+
+    // Play Console hard limit is 2_100_000_000
+    const PLAY_MAX: u64 = 2_100_000_000;
+    let new_code = current_code + 1;
+    if new_code > PLAY_MAX {
+        eprintln!("ERROR: new versionCode {new_code} exceeds Google Play maximum ({PLAY_MAX})");
+        process::exit(1);
+    }
+
+    // Read Cargo version for versionName
+    let cargo_toml_path = root.join("Cargo.toml");
+    let cargo_content = fs::read_to_string(&cargo_toml_path).expect("Failed to read Cargo.toml");
+    let cargo_ver = cargo_content
+        .lines()
+        .find(|l| l.starts_with("version = \""))
+        .expect("No version = \"...\" line found in Cargo.toml")
+        .split('"')
+        .nth(1)
+        .expect("Unexpected Cargo.toml version format")
+        .to_string();
+
+    // Rebuild properties, updating VERSION_CODE and VERSION_NAME lines in-place
+    // (preserves comments and ordering).
+    let new_content: String = content
+        .lines()
+        .map(|line| {
+            if line.starts_with("VERSION_CODE=") {
+                format!("VERSION_CODE={new_code}")
+            } else if line.starts_with("VERSION_NAME=") {
+                format!("VERSION_NAME={cargo_ver}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Preserve trailing newline
+    let new_content = if content.ends_with('\n') {
+        new_content + "\n"
+    } else {
+        new_content
+    };
+
+    fs::write(&props_path, new_content).unwrap_or_else(|e| {
+        eprintln!("ERROR: Failed to write {}: {e}", props_path.display());
+        process::exit(1);
+    });
+
+    println!("Android version bumped:");
+    println!("  VERSION_CODE : {current_code} → {new_code}");
+    println!("  VERSION_NAME : {cargo_ver}");
+    println!();
+    println!("Next steps:");
+    println!("  1. Build your release bundle:  ./gradlew bundleRelease");
+    println!("  2. Upload app-release.aab to Play Console → Internal testing.");
+    println!();
+    println!("Suggested commit:");
+    println!(
+        "  git add {} && git commit -m \"chore(android): bump Play versionCode to {new_code}\"",
+        props_path.display()
+    );
+}
+
+/// Replace ALL occurrences of `old` with `new` in `path`.
+fn replace_all_version_occurrences(path: &Path, old: &str, new: &str, label: &str) {
+    let content = fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("ERROR: Failed to read {}: {e}", path.display());
+        process::exit(1);
+    });
+    let new_content = content.replace(old, new);
     fs::write(path, new_content).unwrap_or_else(|e| {
         eprintln!("ERROR: Failed to write {}: {e}", path.display());
         process::exit(1);

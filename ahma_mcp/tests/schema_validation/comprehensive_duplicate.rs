@@ -59,7 +59,10 @@ async fn test_tools_list_no_duplicate_names() -> anyhow::Result<()> {
     }
 
     // Verify exactly one run_terminal_command
-    let shell_count = tools.iter().filter(|t| t.name == "run_terminal_command").count();
+    let shell_count = tools
+        .iter()
+        .filter(|t| t.name == "run_terminal_command")
+        .count();
     assert_eq!(
         shell_count,
         1,

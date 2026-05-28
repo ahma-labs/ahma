@@ -129,29 +129,22 @@ fn project_has_detekt(project_dir: &Path) -> bool {
         "build-logic/src/main/kotlin/detekt.gradle.kts",
     ];
 
-    for name in &root_candidates {
-        if file_contains_detekt(&project_dir.join(name)) {
-            return true;
-        }
+    if root_candidates
+        .iter()
+        .any(|name| file_contains_detekt(&project_dir.join(name)))
+    {
+        return true;
     }
 
     // Scan immediate subdirectories (modules) for build.gradle.kts / build.gradle
     let Ok(entries) = std::fs::read_dir(project_dir) else {
         return false;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        for build_file in &["build.gradle.kts", "build.gradle"] {
-            if file_contains_detekt(&path.join(build_file)) {
-                return true;
-            }
-        }
-    }
-
-    false
+    entries.flatten().filter(|e| e.path().is_dir()).any(|e| {
+        ["build.gradle.kts", "build.gradle"]
+            .iter()
+            .any(|f| file_contains_detekt(&e.path().join(f)))
+    })
 }
 
 /// Return `true` if `output` indicates that `task` was not found in the Gradle project.
@@ -467,6 +460,21 @@ fn extract_function_name(message: &str) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+/// Parse the leading decimal number from `s`. Returns `None` if `s` does not
+/// start with a digit. When `allow_decimal` is false only integer digits are
+/// consumed (used for integer-only patterns like `85/40`).
+fn parse_leading_number(s: &str, allow_decimal: bool) -> Option<f64> {
+    let num: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || (allow_decimal && *c == '.'))
+        .collect();
+    if num.is_empty() {
+        None
+    } else {
+        num.parse().ok()
+    }
+}
+
 /// Extract a numeric complexity value from a Detekt message.
 ///
 /// Handles patterns such as:
@@ -475,25 +483,14 @@ fn extract_function_name(message: &str) -> Option<String> {
 fn extract_complexity_value(message: &str) -> Option<f64> {
     // Pattern: " of <N>" (used by CyclomaticComplexMethod, CognitiveComplexMethod)
     if let Some(pos) = message.find(" of ") {
-        let rest = &message[pos + " of ".len()..];
-        let num: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        if let Ok(v) = num.parse::<f64>() {
+        if let Some(v) = parse_leading_number(&message[pos + " of ".len()..], true) {
             return Some(v);
         }
     }
 
     // Pattern: "(<N>/<threshold>)" used by LongMethod and similar rules.
     if let Some(start) = message.rfind('(') {
-        let rest = &message[start + 1..];
-        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if !num.is_empty()
-            && let Ok(v) = num.parse::<f64>()
-        {
-            return Some(v);
-        }
+        return parse_leading_number(&message[start + 1..], false);
     }
 
     None

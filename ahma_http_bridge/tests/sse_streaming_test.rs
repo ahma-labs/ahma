@@ -18,6 +18,85 @@ fn find_sse_event_id(buffer: &str) -> Option<u64> {
     })
 }
 
+/// Read a raw SSE bytes-stream into a `String` until `deadline` or stream close.
+///
+/// Stops early as soon as `stop_when(buffer)` returns `true` — checked after every
+/// successful chunk and on each per-chunk timeout.
+async fn collect_sse_stream(
+    stream: &mut (impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin),
+    deadline: tokio::time::Instant,
+    stop_when: impl Fn(&str) -> bool,
+) -> String {
+    let mut buffer = String::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(TestTimeouts::scale_millis(2000), stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                if stop_when(&buffer) {
+                    break;
+                }
+            }
+            Ok(Some(Err(e))) => panic!("Stream error: {}", e),
+            Ok(None) => break,
+            Err(_) => {
+                if stop_when(&buffer) {
+                    break;
+                }
+            }
+        }
+    }
+    buffer
+}
+
+/// Read SSE stream until an event `id:` field is found or `deadline` passes.
+///
+/// Returns `(buffer, Some(id))` when an event ID is found, `(buffer, None)` otherwise.
+async fn collect_sse_until_event_id(
+    stream: &mut (impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin),
+    deadline: tokio::time::Instant,
+) -> (String, Option<u64>) {
+    let buffer = collect_sse_stream(stream, deadline, |b| find_sse_event_id(b).is_some()).await;
+    let id = find_sse_event_id(&buffer);
+    (buffer, id)
+}
+
+/// Spawn a server and complete `initialize_with_roots`, retrying once on transient failure.
+///
+/// Returns `None` (with a logged warning) when both attempts fail — the caller should skip.
+async fn try_setup_for_sse_stream_test(
+    workspace: &std::path::PathBuf,
+    init_timeout: std::time::Duration,
+) -> Option<(common::TestServerInstance, McpTestClient)> {
+    let mut last_error = String::new();
+    for attempt in 1..=2 {
+        let server = spawn_test_server().await.expect("server should start");
+        let mut client = McpTestClient::for_server(&server);
+        match tokio::time::timeout(
+            init_timeout,
+            client.initialize_with_roots("sse-stream-test", std::slice::from_ref(workspace)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Some((server, client)),
+            Ok(Err(e)) => last_error = e.to_string(),
+            Err(_) => {
+                last_error = format!("initialize_with_roots timed out after {:?}", init_timeout)
+            }
+        }
+        if attempt == 1 {
+            eprintln!(
+                "WARNING  test_post_sse_streams_response handshake attempt {} failed: {}. Retrying once...",
+                attempt, last_error
+            );
+        }
+    }
+    eprintln!(
+        "WARNING  Skipping test_post_sse_streams_response due to handshake instability: {}",
+        last_error
+    );
+    None
+}
+
 /// Verify that POST with `Accept: application/json` returns JSON (backwards compat).
 /// Uses the `initialize` request which doesn't require prior session setup.
 #[tokio::test]
@@ -143,33 +222,16 @@ async fn test_post_sse_response_includes_event_id() {
         .await
         .expect("request should succeed");
 
-    // Read SSE stream and check for id: field
     let mut stream = resp.bytes_stream();
-    let mut buffer = String::new();
     let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(30);
-
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(TestTimeouts::scale_millis(2000), stream.next()).await {
-            Ok(Some(Ok(bytes))) => {
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                if buffer.contains("id:") && buffer.contains("data:") {
-                    let Some(id) = find_sse_event_id(&buffer) else {
-                        continue;
-                    };
-                    assert!(id > 0, "Event ID should be positive");
-                    return;
-                }
-            }
-            Ok(Some(Err(e))) => panic!("Stream error: {}", e),
-            Ok(None) => break,
-            Err(_) => continue,
-        }
-    }
-
-    panic!(
-        "Did not find SSE event with id: field in response. Buffer: {}",
-        buffer
-    );
+    let (buffer, id) = collect_sse_until_event_id(&mut stream, deadline).await;
+    let id = id.unwrap_or_else(|| {
+        panic!(
+            "Did not find SSE event with id: field in response. Buffer: {}",
+            buffer
+        )
+    });
+    assert!(id > 0, "Event ID should be positive");
 }
 
 /// Verify that GET SSE events include event IDs.
@@ -205,24 +267,13 @@ async fn test_get_sse_events_include_event_id() {
     // Send notifications/initialized to trigger roots/list over SSE
     let _ = client.send_initialized().await;
 
-    // Read SSE events and verify they have id fields
     let mut stream = resp.bytes_stream();
-    let mut buffer = String::new();
     let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(30);
+    let (buffer, id) = collect_sse_until_event_id(&mut stream, deadline).await;
 
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(TestTimeouts::scale_millis(2000), stream.next()).await {
-            Ok(Some(Ok(bytes))) => {
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-                if let Some(id) = find_sse_event_id(&buffer) {
-                    assert!(id > 0, "Event ID should be positive");
-                    return;
-                }
-            }
-            Ok(Some(Err(e))) => panic!("Stream error: {}", e),
-            Ok(None) => break,
-            Err(_) => continue,
-        }
+    if let Some(id) = id {
+        assert!(id > 0, "Event ID should be positive");
+        return;
     }
 
     // It's possible no broadcast events arrived if the subprocess didn't send anything.
@@ -321,49 +372,8 @@ async fn test_post_sse_streams_response() {
         .to_path_buf();
     let init_timeout = TestTimeouts::scale_secs(15);
 
-    // Retry once to handle transient handshake contention under high parallel load.
-    let mut setup = None;
-    let mut last_error = String::new();
-    for attempt in 1..=2 {
-        let server = match spawn_test_server().await {
-            Ok(server) => server,
-            Err(e) => {
-                panic!("server should start: {}", e);
-            }
-        };
-        let mut client = McpTestClient::for_server(&server);
-
-        match tokio::time::timeout(
-            init_timeout,
-            client.initialize_with_roots("sse-stream-test", std::slice::from_ref(&workspace)),
-        )
-        .await
-        {
-            Ok(Ok(_)) => {
-                setup = Some((server, client));
-                break;
-            }
-            Ok(Err(e)) => {
-                last_error = e.to_string();
-            }
-            Err(_) => {
-                last_error = format!("initialize_with_roots timed out after {:?}", init_timeout);
-            }
-        }
-
-        if attempt == 1 {
-            eprintln!(
-                "WARNING  test_post_sse_streams_response handshake attempt {} failed: {}. Retrying once...",
-                attempt, last_error
-            );
-        }
-    }
-
-    let Some((server, client)) = setup else {
-        eprintln!(
-            "WARNING  Skipping test_post_sse_streams_response due handshake instability: {}",
-            last_error
-        );
+    let Some((server, client)) = try_setup_for_sse_stream_test(&workspace, init_timeout).await
+    else {
         return;
     };
 
@@ -401,34 +411,16 @@ async fn test_post_sse_streams_response() {
             String::from_utf8_lossy(&b)
         );
     }
-
     assert!(
         content_type.contains("text/event-stream"),
         "Should be SSE, got: {}",
         content_type
     );
 
-    // Parse SSE stream to find the response
+    // Parse SSE stream to find the tools/list response
     let mut stream = resp.bytes_stream();
-    let mut buffer = String::new();
     let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(30);
-
-    while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(TestTimeouts::scale_millis(2000), stream.next()).await {
-            Ok(Some(Ok(bytes))) => {
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-            }
-            Ok(Some(Err(e))) => panic!("Stream error: {}", e),
-            Ok(None) => break,
-            Err(_) => {
-                // Check if we already have the response
-                if buffer.contains("\"tools\"") {
-                    break;
-                }
-                continue;
-            }
-        }
-    }
+    let buffer = collect_sse_stream(&mut stream, deadline, |b| b.contains("\"tools\"")).await;
 
     // Extract data: lines and parse JSON
     let data_lines: Vec<&str> = buffer

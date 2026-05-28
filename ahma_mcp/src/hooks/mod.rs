@@ -348,6 +348,18 @@ fn run_uninstall(args: HooksUninstallArgs) -> Result<()> {
     Ok(())
 }
 
+fn hook_status_string(path: &Path, platform: HookPlatform) -> Result<String> {
+    if !path.exists() {
+        return Ok("missing".to_string());
+    }
+    let document = load_hook_document(path)?;
+    if platform_hook_installed(&document, platform) {
+        Ok("installed".to_string())
+    } else {
+        Ok("not installed".to_string())
+    }
+}
+
 fn run_status(args: HooksStatusArgs) -> Result<()> {
     let env = HookEnvironment::detect()?;
     let scopes = match args.scope {
@@ -361,17 +373,7 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
     for scope in scopes {
         for platform in selected_platforms(&args.platforms) {
             let path = env.config_path(platform, scope);
-            let status = if !path.exists() {
-                "missing".to_string()
-            } else {
-                let document = load_hook_document(&path)?;
-                if platform_hook_installed(&document, platform) {
-                    "installed".to_string()
-                } else {
-                    "not installed".to_string()
-                }
-            };
-
+            let status = hook_status_string(&path, platform)?;
             println!(
                 "{:<14} {:<8} {:<14} {}",
                 platform.label(),
@@ -707,6 +709,37 @@ fn grouped_hook_installed(document: &Value, platform: HookPlatform) -> bool {
         .unwrap_or(false)
 }
 
+fn codex_group_entry(scope: HookScope, env: &HookEnvironment) -> Value {
+    let args = exec_args(HookPlatform::Codex, scope);
+    let binary_ref = BinaryReference::for_scope(env, scope);
+    let command = binary_ref.build_command(&args);
+    let mut handler = Map::new();
+    handler.insert("type".to_string(), Value::String("command".to_string()));
+    handler.insert("command".to_string(), Value::String(command));
+    if matches!(scope, HookScope::Project) || cfg!(target_os = "windows") {
+        let windows_command = match binary_ref {
+            BinaryReference::PathLookup => std::iter::once(PATH_LOOKUP_BINARY.to_string())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" "),
+            BinaryReference::Absolute(ref path) => build_windows_absolute_command(path, &args),
+        };
+        handler.insert("commandWindows".to_string(), Value::String(windows_command));
+    }
+    handler.insert(
+        "timeout".to_string(),
+        Value::Number(HOOK_TIMEOUT_SECS.into()),
+    );
+    handler.insert(
+        "statusMessage".to_string(),
+        Value::String("Routing Bash through ahma".to_string()),
+    );
+    json!({
+        "matcher": "^Bash$",
+        "hooks": [Value::Object(handler)],
+    })
+}
+
 fn managed_group_entry(platform: HookPlatform, scope: HookScope, env: &HookEnvironment) -> Value {
     match platform {
         HookPlatform::Claude => {
@@ -723,39 +756,7 @@ fn managed_group_entry(platform: HookPlatform, scope: HookScope, env: &HookEnvir
                 ]
             })
         }
-        HookPlatform::Codex => {
-            let args = exec_args(platform, scope);
-            let binary_ref = BinaryReference::for_scope(env, scope);
-            let command = binary_ref.build_command(&args);
-            let mut handler = Map::new();
-            handler.insert("type".to_string(), Value::String("command".to_string()));
-            handler.insert("command".to_string(), Value::String(command));
-            if matches!(scope, HookScope::Project) || cfg!(target_os = "windows") {
-                let windows_command = match binary_ref {
-                    BinaryReference::PathLookup => std::iter::once(PATH_LOOKUP_BINARY.to_string())
-                        .chain(args.iter().cloned())
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    BinaryReference::Absolute(ref path) => {
-                        build_windows_absolute_command(path, &args)
-                    }
-                };
-                handler.insert("commandWindows".to_string(), Value::String(windows_command));
-            }
-            handler.insert(
-                "timeout".to_string(),
-                Value::Number(HOOK_TIMEOUT_SECS.into()),
-            );
-            handler.insert(
-                "statusMessage".to_string(),
-                Value::String("Routing Bash through ahma".to_string()),
-            );
-
-            json!({
-                "matcher": "^Bash$",
-                "hooks": [Value::Object(handler)],
-            })
-        }
+        HookPlatform::Codex => codex_group_entry(scope, env),
         HookPlatform::Cursor => unreachable!("Cursor does not use grouped hooks"),
     }
 }

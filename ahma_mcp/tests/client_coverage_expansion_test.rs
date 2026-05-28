@@ -230,8 +230,12 @@ async fn test_async_operation_lifecycle() -> Result<()> {
     let client = &mcp.client;
 
     // Start an async operation (short sleep)
-    let start_result =
-        call_test_tool(client, "run_terminal_command", json!({ "command": "sleep 0.5" })).await?;
+    let start_result = call_test_tool(
+        client,
+        "run_terminal_command",
+        json!({ "command": "sleep 0.5" }),
+    )
+    .await?;
 
     assert!(!start_result.content.is_empty());
 
@@ -262,11 +266,19 @@ async fn test_multiple_async_operations() -> Result<()> {
     let client = &mcp.client;
 
     // Start two async operations
-    let result1 =
-        call_test_tool(client, "run_terminal_command", json!({ "command": "sleep 0.3" })).await?;
+    let result1 = call_test_tool(
+        client,
+        "run_terminal_command",
+        json!({ "command": "sleep 0.3" }),
+    )
+    .await?;
 
-    let result2 =
-        call_test_tool(client, "run_terminal_command", json!({ "command": "sleep 0.3" })).await?;
+    let result2 = call_test_tool(
+        client,
+        "run_terminal_command",
+        json!({ "command": "sleep 0.3" }),
+    )
+    .await?;
 
     // Check overall status
     let status = call_test_tool(client, "status", json!({})).await?;

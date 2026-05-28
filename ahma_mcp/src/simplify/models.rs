@@ -296,9 +296,7 @@ pub fn resolve_extensions(inputs: &[String]) -> Vec<String> {
             // Not a known language name — treat as a raw extension.
             result.push(input.clone());
         } else {
-            for ext in exts {
-                result.push(ext.to_string());
-            }
+            result.extend(exts.iter().map(|e| e.to_string()));
         }
     }
     result
@@ -530,26 +528,12 @@ impl FileSimplicity {
         }
 
         if changed {
-            // Recalculate score with updated complexity values using the same
-            // formula as calculate() (normalized density mode, function-weighted MI).
-            let mi_score = self.mi.clamp(0.0, 100.0);
-            let cog_score = Self::cognitive_density_score(self.cognitive, self.sloc, true);
-            let peak_score = (100.0 - self.peak_cognitive).max(0.0);
-            let length_score = Self::length_score(self.sloc);
-            let new_score =
-                0.4 * mi_score + 0.3 * cog_score + 0.2 * peak_score + 0.1 * length_score;
-            self.score = new_score.clamp(0.0, 100.0);
+            self.recalculate_score();
         }
 
         // Record which analyzer contributed regardless of whether values changed.
         if !external.analyzer.is_empty() {
-            let sources: Vec<&str> = external.analyzer.split(", ").collect();
-            for src in sources {
-                let s = src.to_string();
-                if !self.analysis_sources.contains(&s) {
-                    self.analysis_sources.push(s);
-                }
-            }
+            self.merge_analyzer_sources(&external.analyzer);
         }
 
         // Preserve external issue details for AI prompts and reports.
@@ -596,6 +580,26 @@ impl FileSimplicity {
             density_score.min(abs_score)
         } else {
             (100.0 - cognitive).max(0.0)
+        }
+    }
+
+    /// Recalculates `self.score` from current field values using the normalized formula.
+    fn recalculate_score(&mut self) {
+        let mi_score = self.mi.clamp(0.0, 100.0);
+        let cog_score = Self::cognitive_density_score(self.cognitive, self.sloc, true);
+        let peak_score = (100.0 - self.peak_cognitive).max(0.0);
+        let length_score = Self::length_score(self.sloc);
+        self.score = (0.4 * mi_score + 0.3 * cog_score + 0.2 * peak_score + 0.1 * length_score)
+            .clamp(0.0, 100.0);
+    }
+
+    /// Merges comma-separated analyzer names into `self.analysis_sources`, deduplicating.
+    fn merge_analyzer_sources(&mut self, analyzer: &str) {
+        for src in analyzer.split(", ") {
+            let s = src.to_string();
+            if !self.analysis_sources.contains(&s) {
+                self.analysis_sources.push(s);
+            }
         }
     }
 

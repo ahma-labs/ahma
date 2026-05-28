@@ -658,32 +658,26 @@ impl AhmaMcpService {
 )]
 impl ServerHandler for AhmaMcpService {
     fn get_info(&self) -> ServerInfo {
+        let base_instructions = "Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
+                  kernel-enforced workspace sandbox (Landlock on Linux, Seatbelt on macOS, \
+                  Job Objects on Windows). Prefer `run_terminal_command` over the native terminal when: \
+                  (1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; \
+                  (2) the command is long-running — `run_terminal_command` returns an operation_id immediately \
+                  and you can `status`, `await`, or `cancel` it without blocking; \
+                  (3) the command's output should be watched for errors — set `monitor_level` and ahma \
+                  streams alerts when matching lines appear; \
+                  (4) multiple commands should run concurrently — each call gets its own operation_id. \
+                  For read-only file inspection (read, grep, glob, replace) keep using the IDE's native \
+                  file tools — that is what they are for.";
+
         let instructions = if self.progressive_disclosure {
-            Some("Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
-                  kernel-enforced workspace sandbox (Landlock on Linux, Seatbelt on macOS, \
-                  Job Objects on Windows). Prefer `run_terminal_command` over the native terminal when: \
-                  (1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; \
-                  (2) the command is long-running — `run_terminal_command` returns an operation_id immediately \
-                  and you can `status`, `await`, or `cancel` it without blocking; \
-                  (3) the command's output should be watched for errors — set `monitor_level` and ahma \
-                  streams alerts when matching lines appear; \
-                  (4) multiple commands should run concurrently — each call gets its own operation_id. \
-                  For read-only file inspection (read, grep, glob, replace) keep using the IDE's native \
-                  file tools — that is what they are for. \
+            format!(
+                "{base_instructions} \
                   Bundles for cargo, git, python, kotlin, github, fileutils, and simplify are revealed \
-                  on demand via `activate_tools` (action `list` then `reveal`).".to_string())
+                  on demand via `activate_tools` (action `list` then `reveal`)."
+            )
         } else {
-            Some("Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
-                  kernel-enforced workspace sandbox (Landlock on Linux, Seatbelt on macOS, \
-                  Job Objects on Windows). Prefer `run_terminal_command` over the native terminal when: \
-                  (1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; \
-                  (2) the command is long-running — `run_terminal_command` returns an operation_id immediately \
-                  and you can `status`, `await`, or `cancel` it without blocking; \
-                  (3) the command's output should be watched for errors — set `monitor_level` and ahma \
-                  streams alerts when matching lines appear; \
-                  (4) multiple commands should run concurrently — each call gets its own operation_id. \
-                  For read-only file inspection (read, grep, glob, replace) keep using the IDE's native \
-                  file tools — that is what they are for.".to_string())
+            base_instructions.to_string()
         };
 
         let capabilities = ServerCapabilities::builder()
@@ -695,15 +689,10 @@ impl ServerHandler for AhmaMcpService {
         let server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
             .with_title(env!("CARGO_PKG_NAME"));
 
-        let info = ServerInfo::new(capabilities)
+        ServerInfo::new(capabilities)
             .with_protocol_version(ProtocolVersion::LATEST)
-            .with_server_info(server_info);
-
-        if let Some(instructions) = instructions {
-            info.with_instructions(instructions)
-        } else {
-            info
-        }
+            .with_server_info(server_info)
+            .with_instructions(instructions)
     }
 
     fn on_initialized(
@@ -816,40 +805,60 @@ impl ServerHandler for AhmaMcpService {
             // that get incorrectly processed as process cancellations.
 
             let active_ops = self.operation_monitor.get_all_active_operations().await;
-            let active_count = active_ops.len();
 
-            if active_count > 0 {
-                // Filter for operations that are actually background processes
-                // vs. synchronous MCP tools like 'await' that don't have processes
-                let background_ops: Vec<_> = active_ops
-                    .iter()
-                    .filter(|op| {
-                        // Only cancel operations that represent actual background processes
-                        // NOT synchronous tools like 'await', 'status', 'cancel'
-                        !matches!(op.tool_name.as_str(), "await" | "status" | "cancel")
-                    })
-                    .collect();
-
-                if !background_ops.is_empty() {
-                    tracing::info!(
-                        "Found {} background operations during MCP cancellation. Cancelling most recent background operation...",
-                        background_ops.len()
-                    );
-
-                    self.cancel_most_recent_background_op(&background_ops, &request_id, reason)
-                        .await;
-                } else {
-                    tracing::info!(
-                        "Found {} operations during MCP cancellation, but none are background processes. No cancellation needed.",
-                        active_count
-                    );
-                }
-            } else {
+            if active_ops.is_empty() {
                 tracing::info!(
                     "No active operations found during MCP protocol cancellation (request_id: {})",
                     request_id
                 );
+                return;
             }
+
+            // Filter for operations that are actually background processes
+            // vs. synchronous MCP tools like 'await' that don't have processes
+            let background_ops: Vec<_> = active_ops
+                .iter()
+                .filter(|op| {
+                    // Only cancel operations that represent actual background processes.
+                    // Exclude synchronous / meta tools that never create OperationMonitor
+                    // entries — cancelling them would incorrectly kill the most-recent
+                    // background process instead.
+                    let is_sync_meta = matches!(
+                        op.tool_name.as_str(),
+                        "await"
+                            | "status"
+                            | "cancel"
+                            | "activate_tools"
+                            | "logs_list"
+                            | "logs_read"
+                            | "logs_search"
+                    );
+                    if is_sync_meta {
+                        tracing::debug!(
+                            "on_cancelled: skipping sync/meta tool '{}' (op {})",
+                            op.tool_name,
+                            op.id
+                        );
+                    }
+                    !is_sync_meta
+                })
+                .collect();
+
+            if background_ops.is_empty() {
+                tracing::info!(
+                    "Found {} operations during MCP cancellation, but none are background processes. No cancellation needed.",
+                    active_ops.len()
+                );
+                return;
+            }
+
+            tracing::info!(
+                "Found {} background operations during MCP cancellation. Cancelling most recent background operation...",
+                background_ops.len()
+            );
+
+            self.cancel_most_recent_background_op(&background_ops, &request_id, reason)
+                .await;
         }
     }
 
@@ -1251,8 +1260,11 @@ impl AhmaMcpService {
     ///
     /// This is useful for testing and introspection.
     pub fn list_tool_names(&self) -> Vec<String> {
-        let mut names: Vec<String> =
-            vec!["await".into(), "status".into(), "run_terminal_command".into()];
+        let mut names: Vec<String> = vec![
+            "await".into(),
+            "status".into(),
+            "run_terminal_command".into(),
+        ];
 
         if self.progressive_disclosure {
             names.push("activate_tools".into());

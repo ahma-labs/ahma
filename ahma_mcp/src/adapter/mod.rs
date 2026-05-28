@@ -108,22 +108,16 @@ impl BoundedLineCollector {
     }
 
     fn rendered_output(&self) -> String {
-        let mut output = String::new();
+        let body: Vec<&str> = self.lines.iter().map(String::as_str).collect();
+        let body = body.join("\n");
         if self.dropped_lines > 0 {
-            output.push_str(&format!(
-                "[output truncated: dropped {} earlier lines ({} bytes)]\n",
-                self.dropped_lines, self.dropped_bytes
-            ));
+            format!(
+                "[output truncated: dropped {} earlier lines ({} bytes)]\n{}",
+                self.dropped_lines, self.dropped_bytes, body
+            )
+        } else {
+            body
         }
-
-        for (i, line) in self.lines.iter().enumerate() {
-            if i > 0 {
-                output.push('\n');
-            }
-            output.push_str(line);
-        }
-
-        output
     }
 }
 
@@ -947,33 +941,12 @@ async fn execute_with_streaming(
 
             // Read stderr line
             result = stderr_reader.next_line() => {
-                match result {
-                    Ok(Some(line)) => {
-                        process_streaming_line(&line, true, &mut collected_stderr, &mut log_monitor, callback, op_id).await;
-                    }
-                    Ok(None) => {
-                        // stderr stream closed — wait for process to exit
-                        // stdout may still be open, continue the loop to drain it
-                    }
-                    Err(e) => {
-                        tracing::warn!("Error reading stderr for {}: {}", op_id, e);
-                    }
-                }
+                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, callback, op_id).await;
             }
 
             // Read stdout line
             result = stdout_reader.next_line() => {
-                match result {
-                    Ok(Some(line)) => {
-                        process_streaming_line(&line, false, &mut collected_stdout, &mut log_monitor, callback, op_id).await;
-                    }
-                    Ok(None) => {
-                        // stdout stream closed
-                    }
-                    Err(e) => {
-                        tracing::warn!("Error reading stdout for {}: {}", op_id, e);
-                    }
-                }
+                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, callback, op_id).await;
             }
         }
 
@@ -1096,6 +1069,30 @@ async fn handle_cancellation(
             cancelled_progress_update(op_id, reason_owned, duration_ms),
         )
         .await;
+    }
+}
+
+/// Handle one result from a `next_line()` call inside the streaming select loop.
+///
+/// Dispatches to `process_streaming_line` on success, ignores closed-stream
+/// signals (`Ok(None)`), and logs a warning on read errors.
+async fn handle_stream_line(
+    result: Result<Option<String>, std::io::Error>,
+    is_stderr: bool,
+    collector: &mut BoundedLineCollector,
+    log_monitor: &mut crate::log_monitor::LogMonitor,
+    callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
+    op_id: &str,
+) {
+    match result {
+        Ok(Some(line)) => {
+            process_streaming_line(&line, is_stderr, collector, log_monitor, callback, op_id).await;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let stream = if is_stderr { "stderr" } else { "stdout" };
+            tracing::warn!("Error reading {} for {}: {}", stream, op_id, e);
+        }
     }
 }
 
