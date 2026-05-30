@@ -530,7 +530,7 @@ setup_mcp() {
     echo "  1) VS Code       (${VSCODE_MCP_PATH})"
     echo "  2) Claude Code   (${HOME}/.claude.json)"
     echo "  3) Cursor        (${HOME}/.cursor/mcp.json)"
-    echo "  4) Antigravity   (${HOME}/.antigravity/mcp.json)"
+    echo "  4) Antigravity   (${HOME}/.gemini/config/mcp_config.json)"
     echo "  5) Codex CLI     (${HOME}/.codex/config.toml)"
     echo ""
     printf "  Selection [default: 1,2,3,4,5 — all]: "
@@ -632,7 +632,7 @@ PYEOF
         _ahma_configure_platform "Cursor"      "${HOME}/.cursor/mcp.json"     "mcpServers" "standard"
     fi
     if _ahma_list_has "$PLATFORMS" 4; then
-        _ahma_configure_platform "Antigravity" "${HOME}/.antigravity/mcp.json" "mcpServers" "antigravity"
+        _ahma_configure_platform "Antigravity" "${HOME}/.gemini/config/mcp_config.json" "mcpServers" "antigravity"
     fi
     if _ahma_list_has "$PLATFORMS" 5; then
         _ahma_configure_codex
