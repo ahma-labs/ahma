@@ -478,11 +478,11 @@ fn detect_project_root() -> Result<PathBuf> {
     Ok(cwd)
 }
 
-fn extract_tool_args(input: &Value) -> Result<(Map<String, Value>, String)> {
-    let raw_args = input
-        .get("tool_input")
-        .or_else(|| input.get("toolArgs"))
-        .ok_or_else(|| anyhow!("Hook input is missing tool_input or toolArgs"))?;
+fn extract_tool_args(input: &Value) -> Result<Option<(Map<String, Value>, String)>> {
+    let Some(raw_args) = input.get("tool_input").or_else(|| input.get("toolArgs")) else {
+        // Not a shell tool invocation — allow through without modification
+        return Ok(None);
+    };
 
     let args_val = if let Some(s) = raw_args.as_str() {
         serde_json::from_str(s).context("Failed to parse toolArgs JSON string")?
@@ -494,13 +494,12 @@ fn extract_tool_args(input: &Value) -> Result<(Map<String, Value>, String)> {
         .as_object()
         .ok_or_else(|| anyhow!("Tool arguments must be a JSON object"))?;
 
-    let command = args_obj
-        .get("command")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Tool arguments are missing 'command' field"))?
-        .to_string();
+    let Some(command) = args_obj.get("command").and_then(Value::as_str) else {
+        // Tool does not invoke a shell command (e.g. editFiles, createFile) — allow through
+        return Ok(None);
+    };
 
-    Ok((args_obj.clone(), command))
+    Ok(Some((args_obj.clone(), command.to_string())))
 }
 
 fn build_exec_response(
@@ -509,14 +508,21 @@ fn build_exec_response(
     scope: HookScope,
     env: &HookEnvironment,
 ) -> Result<Value> {
-    let (tool_input, original_command) = extract_tool_args(input)?;
-
-    let updated_input = if is_wrapped_shell_command(&original_command) {
-        None
-    } else {
-        let cwd = extract_command_cwd(input, &tool_input)?;
-        let wrapped_command = build_wrapped_shell_command(scope, env, &cwd, &original_command)?;
-        Some(updated_tool_input(&tool_input, wrapped_command))
+    let updated_input = match extract_tool_args(input)? {
+        None => {
+            // Non-shell tool (e.g. editFiles, createFile) — allow through unchanged
+            None
+        }
+        Some((tool_input, original_command)) => {
+            if is_wrapped_shell_command(&original_command) {
+                None
+            } else {
+                let cwd = extract_command_cwd(input, &tool_input)?;
+                let wrapped_command =
+                    build_wrapped_shell_command(scope, env, &cwd, &original_command)?;
+                Some(updated_tool_input(&tool_input, wrapped_command))
+            }
+        }
     };
 
     Ok(match platform {
@@ -1300,6 +1306,48 @@ mod tests {
         assert!(command.starts_with("ahma hooks run-shell"));
         assert!(command.contains(WRAPPED_BY_MARKER));
         assert_eq!(updated["description"].as_str(), Some("Run tests"));
+    }
+
+    #[test]
+    fn test_exec_response_allows_non_shell_tools_without_warning() {
+        // Non-shell tools (editFiles, createFile, etc.) have no `command` field.
+        // The hook must exit 0 and return an allow response so VS Code does not
+        // show "warning from pre tool use hook".
+        let env = test_env();
+
+        for (tool_name, tool_input) in [
+            ("editFiles", json!({"files": [{"path": "src/main.rs"}]})),
+            ("createFile", json!({"path": "src/new.rs", "content": ""})),
+            ("readFile", json!({"path": "src/main.rs"})),
+        ] {
+            let input = json!({
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "cwd": "/tmp/project",
+            });
+            let output =
+                build_exec_response(&input, HookPlatform::Copilot, HookScope::User, &env).unwrap();
+            // Must return allow with no input modification
+            assert_eq!(
+                output["hookSpecificOutput"]["permissionDecision"].as_str(),
+                Some("allow"),
+                "{tool_name} should be allowed"
+            );
+            assert!(
+                output["hookSpecificOutput"]["updatedInput"].is_null(),
+                "{tool_name} should not have updatedInput"
+            );
+        }
+
+        // Also check: completely missing tool_input field
+        let input_no_args = json!({"tool_name": "unknown", "cwd": "/tmp"});
+        let output =
+            build_exec_response(&input_no_args, HookPlatform::Copilot, HookScope::User, &env)
+                .unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("allow")
+        );
     }
 
     #[test]

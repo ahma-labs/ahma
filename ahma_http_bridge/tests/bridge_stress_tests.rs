@@ -78,7 +78,10 @@ async fn run_concurrent_tool_calls(transport: TransportMode) {
     {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            eprintln!("WARNING  Skipping test - failed to initialize MCP client: {}", e);
+            eprintln!(
+                "WARNING  Skipping test - failed to initialize MCP client: {}",
+                e
+            );
             return;
         }
         Err(_) => {
@@ -211,7 +214,10 @@ async fn run_high_volume_concurrent_requests(num_requests: usize, transport: Tra
     {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
-            eprintln!("WARNING  Skipping test - failed to initialize MCP client: {}", e);
+            eprintln!(
+                "WARNING  Skipping test - failed to initialize MCP client: {}",
+                e
+            );
             return;
         }
         Err(_) => {

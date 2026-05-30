@@ -231,6 +231,7 @@ impl AppConfig {
             .map(|paths| {
                 std::env::split_paths(&paths)
                     .filter(|path| !path.as_os_str().is_empty())
+                    .map(expand_tilde)
                     .collect()
             })
             .unwrap_or_default()
@@ -242,10 +243,27 @@ impl AppConfig {
             .map(|paths| {
                 std::env::split_paths(&paths)
                     .filter(|path| !path.as_os_str().is_empty())
+                    .map(expand_tilde)
                     .collect()
             })
             .unwrap_or_default()
     }
+}
+
+fn expand_tilde(path: PathBuf) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if path_str == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    } else if (path_str.starts_with("~/") || path_str.starts_with("~\\"))
+        && let Some(home) = dirs::home_dir()
+    {
+        let mut expanded = home;
+        expanded.push(&path_str[2..]);
+        return expanded;
+    }
+    path
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2063,6 +2081,28 @@ mod tests {
         unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
 
         assert_eq!(scopes, vec![temp.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn test_env_sandbox_scopes_tilde() {
+        unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", "~") };
+        let scopes = AppConfig::env_sandbox_scopes();
+        unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
+
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(scopes, vec![home]);
+        }
+    }
+
+    #[test]
+    fn test_env_sandbox_scopes_tilde_slash() {
+        unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", "~/test_sandbox") };
+        let scopes = AppConfig::env_sandbox_scopes();
+        unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
+
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(scopes, vec![home.join("test_sandbox")]);
+        }
     }
 
     #[test]

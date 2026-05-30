@@ -97,8 +97,6 @@
 // Public modules
 /// Core adapter for tool execution.
 pub mod adapter;
-/// Background reporter that registers this instance with the hub daemon.
-pub mod daemon_reporter;
 /// Progress callback system for async operations.
 pub mod callback_system;
 mod check_service_ext;
@@ -110,6 +108,8 @@ pub mod client_type;
 pub mod config;
 /// Constants used for guidance and tool hints.
 pub mod constants;
+/// Background reporter that registers this instance with the hub daemon.
+pub mod daemon_reporter;
 /// External terminal hook management for supported AI tools.
 pub mod hooks;
 /// Live log monitoring pipeline (LLM-powered issue detection).

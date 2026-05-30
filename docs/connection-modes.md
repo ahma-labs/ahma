@@ -79,14 +79,24 @@ Alternatively, in a terminal run `ahma --mode http` for visibility of all action
 }
 ```
 
-**Antigravity** (uses bash wrapper to pass explicit scope — Antigravity doesn't send `roots/list`):
+**Antigravity** (sets `AHMA_SANDBOX_SCOPE` explicitly — Antigravity doesn't send `roots/list`):
 
 ```json
 {
   "mcpServers": {
     "Ahma": {
-      "command": "bash",
-      "args": ["-c", "ahma --simplify --rust --sandbox-scope $HOME/github"]
+      "command": "ahma",
+      "args": [
+        "serve",
+        "stdio",
+        "--tools",
+        "rust,simplify",
+        "--tmp",
+        "--log-monitor"
+      ],
+      "env": {
+        "AHMA_SANDBOX_SCOPE": "~"
+      }
     }
   }
 }

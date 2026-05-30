@@ -10,13 +10,11 @@
 //! * **Low overhead**: polls [`OperationMonitor`] every 2 seconds and diffs
 //!   the snapshot — no changes means no wire traffic.
 
-use crate::operation_monitor::{OperationMonitor, OperationStatus};
-use ahma_common::daemon_hub::{ClientMsg, DaemonEvent, connect_to_daemon, ensure_daemon_running, send_msg};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::Duration,
+use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
+use ahma_common::daemon_hub::{
+    ClientMsg, DaemonEvent, connect_to_daemon, ensure_daemon_running, send_msg,
 };
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tracing::{debug, warn};
 
 // ─── Snapshot entry ───────────────────────────────────────────────────────────
@@ -26,6 +24,9 @@ struct SnapEntry {
     tool_name: String,
     description: String,
     status: OperationStatus,
+    scope: String,
+    result_summary: Option<String>,
+    duration_ms: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -112,8 +113,58 @@ async fn run_reporter_loop(
             continue;
         }
 
+        // ── Replay completed operations ───────────────────────────────────────
+        let completed_ops = monitor.get_completed_operations().await;
+        for op in &completed_ops {
+            let started_ev = ClientMsg::Event {
+                payload: DaemonEvent::OpStarted {
+                    id: op.id.clone(),
+                    tool_name: op.tool_name.clone(),
+                    description: op.description.clone(),
+                    scope: scope.clone(),
+                },
+            };
+            if send_msg(&mut writer, &started_ev).await.is_err() {
+                break;
+            }
+            let duration_ms = op
+                .end_time
+                .and_then(|end| end.duration_since(op.start_time).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let finished_ev = ClientMsg::Event {
+                payload: DaemonEvent::OpFinished {
+                    id: op.id.clone(),
+                    status: status_label(op.state),
+                    result_summary: result_summary_from(op),
+                    duration_ms,
+                },
+            };
+            if send_msg(&mut writer, &finished_ev).await.is_err() {
+                break;
+            }
+        }
+
         // ── Event loop: poll monitor every 2 s ───────────────────────────────
         let mut snapshot: HashMap<String, SnapEntry> = HashMap::new();
+        for op in &completed_ops {
+            let duration_ms = op
+                .end_time
+                .and_then(|end| end.duration_since(op.start_time).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            snapshot.insert(
+                op.id.clone(),
+                SnapEntry {
+                    tool_name: op.tool_name.clone(),
+                    description: op.description.clone(),
+                    status: op.state,
+                    scope: scope.clone(),
+                    result_summary: result_summary_from(op),
+                    duration_ms,
+                },
+            );
+        }
 
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -124,12 +175,20 @@ async fn run_reporter_loop(
             // Build new snapshot from both active and recently-completed ops.
             let mut new_snap: HashMap<String, SnapEntry> = HashMap::new();
             for op in active.iter().chain(completed.iter()) {
+                let duration_ms = op
+                    .end_time
+                    .and_then(|end| end.duration_since(op.start_time).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
                 new_snap.insert(
                     op.id.clone(),
                     SnapEntry {
                         tool_name: op.tool_name.clone(),
                         description: op.description.clone(),
                         status: op.state,
+                        scope: scope.clone(),
+                        result_summary: result_summary_from(op),
+                        duration_ms,
                     },
                 );
             }
@@ -145,6 +204,8 @@ async fn run_reporter_loop(
                             payload: DaemonEvent::OpFinished {
                                 id: id.clone(),
                                 status: status_label(entry.status),
+                                result_summary: entry.result_summary.clone(),
+                                duration_ms: entry.duration_ms,
                             },
                         });
                     }
@@ -155,8 +216,19 @@ async fn run_reporter_loop(
                             id: id.clone(),
                             tool_name: entry.tool_name.clone(),
                             description: entry.description.clone(),
+                            scope: entry.scope.clone(),
                         },
                     });
+                    if entry.status.is_terminal() {
+                        events.push(ClientMsg::Event {
+                            payload: DaemonEvent::OpFinished {
+                                id: id.clone(),
+                                status: status_label(entry.status),
+                                result_summary: entry.result_summary.clone(),
+                                duration_ms: entry.duration_ms,
+                            },
+                        });
+                    }
                 }
             }
 
@@ -197,6 +269,29 @@ fn status_label(s: OperationStatus) -> String {
         _ => "Unknown",
     }
     .to_string()
+}
+
+fn result_summary_from(op: &Operation) -> Option<String> {
+    let result = op.result.as_ref()?;
+    let summary = if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+        msg.to_string()
+    } else if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+        err.to_string()
+    } else if let Some(err_obj) = result
+        .get("error")
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.as_str())
+    {
+        err_obj.to_string()
+    } else {
+        serde_json::to_string(result).unwrap_or_default()
+    };
+
+    if summary.len() > 200 {
+        Some(format!("{}...", &summary[..197]))
+    } else {
+        Some(summary)
+    }
 }
 
 /// Remove terminal entries that have been in the snapshot for a long time

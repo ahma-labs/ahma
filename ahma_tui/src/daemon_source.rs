@@ -14,16 +14,16 @@
 //!
 //! On disconnect the task waits 5 s then reconnects.
 
-use std::{
-    collections::HashMap,
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
 use ahma_common::daemon_hub::{
     ClientMsg, DaemonEvent, DaemonMsg, InstanceInfo, connect_to_daemon, ensure_daemon_running,
     recv_msg, send_msg,
 };
-use tokio::{io::BufReader, sync::mpsc};
+use tokio::{
+    io::BufReader,
+    sync::{broadcast, mpsc},
+};
 use tracing::{debug, warn};
 
 use crate::state::{OpStatus, Operation};
@@ -42,6 +42,45 @@ pub use crate::mcp_source::SourceEvent;
 pub fn spawn_daemon_source(tx: mpsc::Sender<SourceEvent>) {
     tokio::spawn(async move {
         daemon_source_task(tx).await;
+    });
+}
+
+/// Spawn the embedded hub source using a direct in-process broadcast channel.
+///
+/// Unlike [`spawn_daemon_source`], this does not connect via a socket — it
+/// receives [`DaemonMsg`] events pushed directly by the hub running inside
+/// the same TUI process, eliminating the socket round-trip.
+///
+/// Used when the TUI itself starts the hub via
+/// [`ahma_common::daemon_hub::try_start_hub_server`].
+pub fn spawn_embedded_hub_source(
+    mut rx: broadcast::Receiver<DaemonMsg>,
+    tx: mpsc::Sender<SourceEvent>,
+) {
+    tokio::spawn(async move {
+        let mut state = DaemonState::new();
+        loop {
+            match rx.recv().await {
+                Ok(msg) => {
+                    let changed = apply_msg(&mut state, msg);
+                    if changed {
+                        let ops = state.all_ops();
+                        if tx
+                            .send(SourceEvent::OperationsUpdated { ops })
+                            .await
+                            .is_err()
+                        {
+                            return; // TUI channel closed
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("embedded_hub_source: lagged {n} messages");
+                    // Non-fatal — continue from the oldest available message.
+                }
+                Err(broadcast::error::RecvError::Closed) => return, // Hub shut down
+            }
+        }
     });
 }
 
@@ -83,6 +122,7 @@ impl DaemonState {
         op_id: String,
         tool_name: String,
         _description: String,
+        scope: Option<String>,
     ) {
         let label = self
             .instances
@@ -93,6 +133,7 @@ impl DaemonState {
         let mut op = Operation::new(&op_id, &tool_name, OpStatus::Running);
         op.instance_id = Some(instance_id.to_string());
         op.instance_label = Some(label);
+        op.scope = scope;
 
         self.ops
             .entry(instance_id.to_string())
@@ -100,11 +141,21 @@ impl DaemonState {
             .insert(op_id, op);
     }
 
-    fn on_op_finished(&mut self, instance_id: &str, op_id: &str, status_str: &str) {
-        if let Some(instance_ops) = self.ops.get_mut(instance_id) {
-            if let Some(op) = instance_ops.get_mut(op_id) {
-                op.status = parse_op_status(status_str);
-            }
+    fn on_op_finished(
+        &mut self,
+        instance_id: &str,
+        op_id: &str,
+        status_str: &str,
+        result_summary: Option<String>,
+        duration_ms: u64,
+    ) {
+        if let Some(instance_ops) = self.ops.get_mut(instance_id)
+            && let Some(op) = instance_ops.get_mut(op_id)
+        {
+            op.status = parse_op_status(status_str);
+            op.result_summary = result_summary;
+            op.duration_ms = Some(duration_ms);
+            op.completed_at = Some(std::time::Instant::now());
         }
     }
 
@@ -129,7 +180,13 @@ impl DaemonState {
 
     fn prune_terminal(&mut self) {
         for instance_ops in self.ops.values_mut() {
-            instance_ops.retain(|_, op| matches!(op.status, OpStatus::Running | OpStatus::Pending));
+            instance_ops.retain(|_, op| {
+                matches!(op.status, OpStatus::Running | OpStatus::Pending)
+                    || op
+                        .completed_at
+                        .map(|t| t.elapsed() < Duration::from_secs(300))
+                        .unwrap_or(true)
+            });
         }
     }
 }
@@ -145,7 +202,10 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
     loop {
         // Ensure daemon is running (may spawn it).
         if let Err(e) = ensure_daemon_running().await {
-            debug!("daemon_source: daemon unavailable ({e}); retry in {:?}", backoff);
+            debug!(
+                "daemon_source: daemon unavailable ({e}); retry in {:?}",
+                backoff
+            );
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
             continue;
@@ -154,7 +214,10 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
         let stream = match connect_to_daemon().await {
             Ok(s) => s,
             Err(e) => {
-                debug!("daemon_source: connect failed ({e}); retry in {:?}", backoff);
+                debug!(
+                    "daemon_source: connect failed ({e}); retry in {:?}",
+                    backoff
+                );
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
                 continue;
@@ -187,7 +250,11 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
                             prune_counter = 0;
                         }
                         let ops = state.all_ops();
-                        if tx.send(SourceEvent::OperationsUpdated { ops }).await.is_err() {
+                        if tx
+                            .send(SourceEvent::OperationsUpdated { ops })
+                            .await
+                            .is_err()
+                        {
                             // Channel closed — TUI exited.
                             return;
                         }
@@ -232,16 +299,23 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> bool {
                 id,
                 tool_name,
                 description,
+                scope,
             } => {
-                state.on_op_started(&instance_id, id, tool_name, description);
+                state.on_op_started(&instance_id, id, tool_name, description, Some(scope));
                 true
             }
-            DaemonEvent::OpFinished { id, status } => {
-                state.on_op_finished(&instance_id, &id, &status);
+            DaemonEvent::OpFinished {
+                id,
+                status,
+                result_summary,
+                duration_ms,
+            } => {
+                state.on_op_finished(&instance_id, &id, &status, result_summary, duration_ms);
                 true
             }
             DaemonEvent::LogLine { .. } => false, // not yet surfaced in TUI
         },
+        DaemonMsg::Ping { .. } => false, // hub-to-instance ping; no state change for subscribers
     }
 }
 
@@ -263,8 +337,8 @@ fn parse_op_status(s: &str) -> OpStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ahma_common::daemon_hub::{DaemonEvent, DaemonMsg, InstanceInfo};
     use crate::state::OpStatus;
+    use ahma_common::daemon_hub::{DaemonEvent, DaemonMsg, InstanceInfo};
 
     fn inst(id: &str, label: &str) -> InstanceInfo {
         InstanceInfo {
@@ -302,7 +376,13 @@ mod tests {
     fn op_started_sets_running_with_instance_metadata() {
         let mut s = DaemonState::new();
         s.add_instance(inst("i1", "Cursor"));
-        s.on_op_started("i1", "op-1".to_string(), "cargo_build".to_string(), "Build".to_string());
+        s.on_op_started(
+            "i1",
+            "op-1".to_string(),
+            "cargo_build".to_string(),
+            "Build".to_string(),
+            Some("/test/scope".to_string()),
+        );
 
         let ops = s.all_ops();
         assert_eq!(ops.len(), 1);
@@ -310,17 +390,27 @@ mod tests {
         assert_eq!(ops[0].instance_label, Some("Cursor".to_string()));
         assert_eq!(ops[0].instance_id, Some("i1".to_string()));
         assert_eq!(ops[0].tool_name, "cargo_build");
+        assert_eq!(ops[0].scope, Some("/test/scope".to_string()));
     }
 
     #[test]
     fn op_finished_updates_status() {
         let mut s = DaemonState::new();
         s.add_instance(inst("i1", "Test"));
-        s.on_op_started("i1", "op-1".to_string(), "tool".to_string(), "".to_string());
-        s.on_op_finished("i1", "op-1", "Completed");
+        s.on_op_started(
+            "i1",
+            "op-1".to_string(),
+            "tool".to_string(),
+            "".to_string(),
+            None,
+        );
+        s.on_op_finished("i1", "op-1", "Completed", Some("ok".to_string()), 100);
 
         let ops = s.all_ops();
         assert_eq!(ops[0].status, OpStatus::Succeeded);
+        assert_eq!(ops[0].result_summary, Some("ok".to_string()));
+        assert_eq!(ops[0].duration_ms, Some(100));
+        assert!(ops[0].completed_at.is_some());
     }
 
     #[test]
@@ -328,20 +418,37 @@ mod tests {
         let mut s = DaemonState::new();
         s.add_instance(inst("i1", "Test"));
         // Should not panic.
-        s.on_op_finished("i1", "nonexistent-op", "Completed");
+        s.on_op_finished("i1", "nonexistent-op", "Completed", None, 0);
     }
 
     #[test]
     fn all_ops_running_sorted_before_terminal() {
         let mut s = DaemonState::new();
         s.add_instance(inst("i1", "Test"));
-        s.on_op_started("i1", "op-a".to_string(), "tool".to_string(), "".to_string());
-        s.on_op_started("i1", "op-b".to_string(), "tool".to_string(), "".to_string());
-        s.on_op_finished("i1", "op-a", "Completed");
+        s.on_op_started(
+            "i1",
+            "op-a".to_string(),
+            "tool".to_string(),
+            "".to_string(),
+            None,
+        );
+        s.on_op_started(
+            "i1",
+            "op-b".to_string(),
+            "tool".to_string(),
+            "".to_string(),
+            None,
+        );
+        s.on_op_finished("i1", "op-a", "Completed", None, 0);
 
         let ops = s.all_ops();
         assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0].status, OpStatus::Running, "running first; got {:?}", ops[0].id);
+        assert_eq!(
+            ops[0].status,
+            OpStatus::Running,
+            "running first; got {:?}",
+            ops[0].id
+        );
     }
 
     #[test]
@@ -349,8 +456,20 @@ mod tests {
         let mut s = DaemonState::new();
         s.add_instance(inst("i1", "VS Code"));
         s.add_instance(inst("i2", "Cursor"));
-        s.on_op_started("i1", "op-x".to_string(), "tool".to_string(), "".to_string());
-        s.on_op_started("i2", "op-y".to_string(), "tool".to_string(), "".to_string());
+        s.on_op_started(
+            "i1",
+            "op-x".to_string(),
+            "tool".to_string(),
+            "".to_string(),
+            None,
+        );
+        s.on_op_started(
+            "i2",
+            "op-y".to_string(),
+            "tool".to_string(),
+            "".to_string(),
+            None,
+        );
         assert_eq!(s.all_ops().len(), 2);
     }
 
@@ -358,9 +477,28 @@ mod tests {
     fn prune_terminal_removes_non_running() {
         let mut s = DaemonState::new();
         s.add_instance(inst("i1", "Test"));
-        s.on_op_started("i1", "op-1".to_string(), "tool".to_string(), "".to_string());
-        s.on_op_started("i1", "op-2".to_string(), "tool".to_string(), "".to_string());
-        s.on_op_finished("i1", "op-2", "Failed");
+        s.on_op_started(
+            "i1",
+            "op-1".to_string(),
+            "tool".to_string(),
+            "".to_string(),
+            None,
+        );
+        s.on_op_started(
+            "i1",
+            "op-2".to_string(),
+            "tool".to_string(),
+            "".to_string(),
+            None,
+        );
+        s.on_op_finished("i1", "op-2", "Failed", None, 0);
+
+        // Modify completed_at so it is older than 300s to trigger pruning
+        if let Some(ops) = s.ops.get_mut("i1")
+            && let Some(op) = ops.get_mut("op-2")
+        {
+            op.completed_at = Some(std::time::Instant::now() - Duration::from_secs(301));
+        }
 
         s.prune_terminal();
         let ops = s.all_ops();
@@ -374,7 +512,10 @@ mod tests {
         s.add_instance(inst("i1", "Test"));
         let mut op = Operation::new("op-p", "tool", OpStatus::Pending);
         op.instance_id = Some("i1".to_string());
-        s.ops.entry("i1".to_string()).or_default().insert("op-p".to_string(), op);
+        s.ops
+            .entry("i1".to_string())
+            .or_default()
+            .insert("op-p".to_string(), op);
 
         s.prune_terminal();
         assert_eq!(s.all_ops().len(), 1, "Pending ops survive prune");
@@ -385,9 +526,12 @@ mod tests {
     #[test]
     fn apply_msg_instance_list_initial_snapshot() {
         let mut s = DaemonState::new();
-        let changed = apply_msg(&mut s, DaemonMsg::InstanceList {
-            instances: vec![inst("i1", "IDE")],
-        });
+        let changed = apply_msg(
+            &mut s,
+            DaemonMsg::InstanceList {
+                instances: vec![inst("i1", "IDE")],
+            },
+        );
         assert!(changed, "InstanceList should flag change");
         assert_eq!(s.instances.len(), 1);
     }
@@ -397,13 +541,21 @@ mod tests {
         // Empty InstanceList = "daemon connected" signal → changed = true.
         let mut s = DaemonState::new();
         let changed = apply_msg(&mut s, DaemonMsg::InstanceList { instances: vec![] });
-        assert!(changed, "empty InstanceList is still a change (daemon-connected signal)");
+        assert!(
+            changed,
+            "empty InstanceList is still a change (daemon-connected signal)"
+        );
     }
 
     #[test]
     fn apply_msg_instance_registered() {
         let mut s = DaemonState::new();
-        let changed = apply_msg(&mut s, DaemonMsg::InstanceRegistered { instance: inst("i2", "IDE") });
+        let changed = apply_msg(
+            &mut s,
+            DaemonMsg::InstanceRegistered {
+                instance: inst("i2", "IDE"),
+            },
+        );
         assert!(changed);
         assert!(s.instances.contains_key("i2"));
     }
@@ -412,7 +564,12 @@ mod tests {
     fn apply_msg_instance_unregistered() {
         let mut s = DaemonState::new();
         s.add_instance(inst("i3", "X"));
-        let changed = apply_msg(&mut s, DaemonMsg::InstanceUnregistered { id: "i3".to_string() });
+        let changed = apply_msg(
+            &mut s,
+            DaemonMsg::InstanceUnregistered {
+                id: "i3".to_string(),
+            },
+        );
         assert!(changed);
         assert!(s.instances.is_empty());
     }
@@ -422,38 +579,54 @@ mod tests {
         let mut s = DaemonState::new();
         s.add_instance(inst("i1", "Test"));
 
-        let c1 = apply_msg(&mut s, DaemonMsg::Event {
-            instance_id: "i1".to_string(),
-            payload: DaemonEvent::OpStarted {
-                id: "op-1".to_string(),
-                tool_name: "tool".to_string(),
-                description: "".to_string(),
+        let c1 = apply_msg(
+            &mut s,
+            DaemonMsg::Event {
+                instance_id: "i1".to_string(),
+                payload: DaemonEvent::OpStarted {
+                    id: "op-1".to_string(),
+                    tool_name: "tool".to_string(),
+                    description: "".to_string(),
+                    scope: "/test/scope".to_string(),
+                },
             },
-        });
+        );
         assert!(c1);
         assert_eq!(s.all_ops().len(), 1);
+        assert_eq!(s.all_ops()[0].scope, Some("/test/scope".to_string()));
 
-        let c2 = apply_msg(&mut s, DaemonMsg::Event {
-            instance_id: "i1".to_string(),
-            payload: DaemonEvent::OpFinished {
-                id: "op-1".to_string(),
-                status: "Completed".to_string(),
+        let c2 = apply_msg(
+            &mut s,
+            DaemonMsg::Event {
+                instance_id: "i1".to_string(),
+                payload: DaemonEvent::OpFinished {
+                    id: "op-1".to_string(),
+                    status: "Completed".to_string(),
+                    result_summary: Some("success".to_string()),
+                    duration_ms: 1200,
+                },
             },
-        });
+        );
         assert!(c2);
         assert_eq!(s.all_ops()[0].status, OpStatus::Succeeded);
+        assert_eq!(s.all_ops()[0].result_summary, Some("success".to_string()));
+        assert_eq!(s.all_ops()[0].duration_ms, Some(1200));
+        assert!(s.all_ops()[0].completed_at.is_some());
     }
 
     #[test]
     fn apply_msg_log_line_returns_false() {
         let mut s = DaemonState::new();
-        let changed = apply_msg(&mut s, DaemonMsg::Event {
-            instance_id: "x".to_string(),
-            payload: DaemonEvent::LogLine {
-                level: "info".to_string(),
-                message: "hello".to_string(),
+        let changed = apply_msg(
+            &mut s,
+            DaemonMsg::Event {
+                instance_id: "x".to_string(),
+                payload: DaemonEvent::LogLine {
+                    level: "info".to_string(),
+                    message: "hello".to_string(),
+                },
             },
-        });
+        );
         assert!(!changed, "LogLine should not trigger state change");
     }
 
@@ -464,8 +637,16 @@ mod tests {
         assert_eq!(parse_op_status("Completed"), OpStatus::Succeeded);
         assert_eq!(parse_op_status("Failed"), OpStatus::Failed);
         assert_eq!(parse_op_status("Cancelled"), OpStatus::Cancelled);
-        assert_eq!(parse_op_status("TimedOut"), OpStatus::Failed, "TimedOut → Failed");
-        assert_eq!(parse_op_status("Unknown"), OpStatus::Failed, "Unknown → Failed");
+        assert_eq!(
+            parse_op_status("TimedOut"),
+            OpStatus::Failed,
+            "TimedOut → Failed"
+        );
+        assert_eq!(
+            parse_op_status("Unknown"),
+            OpStatus::Failed,
+            "Unknown → Failed"
+        );
         assert_eq!(parse_op_status(""), OpStatus::Failed, "empty → Failed");
     }
 }

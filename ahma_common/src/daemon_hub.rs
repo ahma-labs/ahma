@@ -61,6 +61,9 @@ use tracing::{debug, info, warn};
 /// TCP port used on Windows (unix sockets not supported there).
 pub const WINDOWS_DAEMON_PORT: u16 = 7395;
 
+/// Interval at which the hub sends liveness pings to connected instances.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Protocol types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,11 +90,14 @@ pub enum DaemonEvent {
         id: String,
         tool_name: String,
         description: String,
+        scope: String,
     },
     OpFinished {
         id: String,
         /// "Completed", "Failed", "Cancelled", "TimedOut"
         status: String,
+        result_summary: Option<String>,
+        duration_ms: u64,
     },
     LogLine {
         level: String,
@@ -118,6 +124,8 @@ pub enum ClientMsg {
     ListInstances,
     /// An instance gracefully unregistering (optional — EOF works too).
     Unregister,
+    /// Liveness response to a hub [`DaemonMsg::Ping`].
+    Pong { seq: u32 },
 }
 
 /// Message from the daemon to a subscriber (TUI).
@@ -135,6 +143,9 @@ pub enum DaemonMsg {
         instance_id: String,
         payload: DaemonEvent,
     },
+    /// Liveness probe sent from hub to a connected instance.
+    /// The instance should respond with a matching [`ClientMsg::Pong`].
+    Ping { seq: u32 },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -338,7 +349,6 @@ pub async fn run_daemon() -> Result<()> {
 /// Exposed for testing — callers can pass a temp-directory path to avoid
 /// colliding with a real daemon running on the default socket.
 pub async fn run_daemon_at(socket_path: PathBuf) -> Result<()> {
-
     // ── Bind (the mutex): try, handle EADDRINUSE ──────────────────────────────
     #[cfg(unix)]
     let listener = bind_unix(&socket_path).await?;
@@ -377,6 +387,91 @@ pub async fn run_daemon_at(socket_path: PathBuf) -> Result<()> {
     accept_loop(listener, hub).await
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Embedded hub — TUI-owned server whose lifecycle matches the TUI process
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handle for a hub server running inside the TUI process.
+///
+/// The server binds the same Unix socket (macOS/Linux) or TCP loopback port
+/// (Windows) as the standalone `ahma daemon`.  When this handle is dropped the
+/// accept-loop task is aborted and the socket file is removed, so no IPC
+/// resources are left behind after the TUI exits — even on a panic.
+///
+/// Subscribers (ahma instances) see an EOF when the socket is removed and
+/// reconnect cleanly when a new TUI starts.
+pub struct EmbeddedHub {
+    broadcast: broadcast::Sender<DaemonMsg>,
+    abort: tokio::task::AbortHandle,
+    #[cfg(unix)]
+    socket_path: PathBuf,
+}
+
+impl EmbeddedHub {
+    /// Subscribe to the event stream **directly** through an in-process
+    /// channel, with no socket round-trip.
+    pub fn subscribe(&self) -> broadcast::Receiver<DaemonMsg> {
+        self.broadcast.subscribe()
+    }
+}
+
+impl Drop for EmbeddedHub {
+    fn drop(&mut self) {
+        // Cancel the accept-loop task first so no new connections arrive
+        // while the socket file is being removed.
+        self.abort.abort();
+        // Best-effort removal — non-fatal if already gone.
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+/// Attempt to start a hub server embedded in the calling process.
+///
+/// Returns `Ok(Some(hub))` when the server is bound and running.
+/// Returns `Ok(None)` when another server (a running TUI or standalone
+/// `ahma daemon`) already owns the socket — the caller should fall back to
+/// [`spawn_daemon_source`] (subscriber mode).
+/// Returns `Err` only for unexpected OS errors (e.g. permission denied).
+pub async fn try_start_hub_server() -> Result<Option<EmbeddedHub>> {
+    try_start_hub_server_at(default_socket_path()).await
+}
+
+/// Like [`try_start_hub_server`] but binds at `socket_path` instead of the
+/// platform default.  Exposed for testing.
+pub async fn try_start_hub_server_at(socket_path: PathBuf) -> Result<Option<EmbeddedHub>> {
+    #[cfg(unix)]
+    let listener = match try_bind_unix(&socket_path).await? {
+        Some(l) => l,
+        None => return Ok(None),
+    };
+
+    #[cfg(not(unix))]
+    let listener = match try_bind_tcp().await? {
+        Some(l) => l,
+        None => return Ok(None),
+    };
+
+    info!(
+        "ahma hub: embedded server started on {}",
+        socket_path.display()
+    );
+
+    let (hub, _) = DaemonHub::new();
+    let hub = Arc::new(hub);
+    let broadcast = hub.broadcast.clone();
+
+    let task = tokio::spawn(accept_loop(listener, hub));
+    let abort = task.abort_handle();
+
+    Ok(Some(EmbeddedHub {
+        broadcast,
+        abort,
+        #[cfg(unix)]
+        socket_path,
+    }))
+}
+
 // ── Unix bind/accept ──────────────────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -403,6 +498,37 @@ async fn bind_unix(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
                 }
             }
             Err(e) => bail!("ahma daemon: failed to bind unix socket: {e}"),
+        }
+    }
+}
+
+/// Try to bind the Unix socket for the embedded hub.
+/// Returns `None` when another server is already running (caller should subscribe instead).
+#[cfg(unix)]
+async fn try_bind_unix(path: &std::path::Path) -> Result<Option<tokio::net::UnixListener>> {
+    use tokio::net::UnixListener;
+    loop {
+        match UnixListener::bind(path) {
+            Ok(l) => return Ok(Some(l)),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                match tokio::net::UnixStream::connect(path).await {
+                    Ok(_) => {
+                        // Another server owns the socket — caller should subscribe.
+                        debug!(
+                            "ahma hub: another server already running at {}",
+                            path.display()
+                        );
+                        return Ok(None);
+                    }
+                    Err(_) => {
+                        // Stale socket file — remove and retry.
+                        debug!("ahma hub: removing stale socket at {}", path.display());
+                        let _ = std::fs::remove_file(path);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 }
@@ -447,6 +573,34 @@ async fn bind_tcp() -> Result<tokio::net::TcpListener> {
             }
         }
         Err(e) => bail!("ahma daemon: failed to bind TCP socket: {e}"),
+    }
+}
+
+/// Try to bind the TCP loopback port for the embedded hub on Windows.
+/// Returns `None` when another server is already running (caller should subscribe instead).
+#[cfg(not(unix))]
+async fn try_bind_tcp() -> Result<Option<tokio::net::TcpListener>> {
+    use tokio::net::TcpListener;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], WINDOWS_DAEMON_PORT));
+    match TcpListener::bind(addr).await {
+        Ok(l) => Ok(Some(l)),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(_) => {
+                    // Another server owns the port — caller should subscribe.
+                    debug!(
+                        "ahma hub: another server already running on port {}",
+                        WINDOWS_DAEMON_PORT
+                    );
+                    Ok(None)
+                }
+                Err(_) => Err(anyhow::anyhow!(
+                    "port {} is in use by another process",
+                    WINDOWS_DAEMON_PORT
+                )),
+            }
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -507,17 +661,45 @@ where
                 .send(DaemonMsg::InstanceRegistered { instance: info });
             info!("daemon: instance registered id={id} pid={pid}");
 
-            // Read events until EOF or Unregister.
+            // Exchange events and liveness pings until the instance disconnects.
+            let mut ping_interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + PING_INTERVAL,
+                PING_INTERVAL,
+            );
+            ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut ping_seq: u32 = 0;
+
             loop {
-                match recv_msg::<_, ClientMsg>(&mut reader).await {
-                    Ok(ClientMsg::Event { payload }) => {
-                        let _ = hub.broadcast.send(DaemonMsg::Event {
-                            instance_id: id.clone(),
-                            payload,
-                        });
+                tokio::select! {
+                    biased;
+
+                    msg = recv_msg::<_, ClientMsg>(&mut reader) => {
+                        match msg {
+                            Ok(ClientMsg::Event { payload }) => {
+                                let _ = hub.broadcast.send(DaemonMsg::Event {
+                                    instance_id: id.clone(),
+                                    payload,
+                                });
+                            }
+                            Ok(ClientMsg::Pong { .. }) => {
+                                // Liveness confirmed — nothing else to do for now.
+                                debug!("daemon: pong received from id={id}");
+                            }
+                            Ok(ClientMsg::Unregister) | Err(_) => break,
+                            Ok(_) => {} // ignore unexpected messages
+                        }
                     }
-                    Ok(ClientMsg::Unregister) | Err(_) => break,
-                    Ok(_) => {} // ignore unexpected messages
+
+                    _ = ping_interval.tick() => {
+                        ping_seq = ping_seq.wrapping_add(1);
+                        debug!("daemon: sending ping to id={id} seq={ping_seq}");
+                        if send_msg(&mut writer, &DaemonMsg::Ping { seq: ping_seq })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -618,7 +800,12 @@ mod tests {
         let mut reader = BufReader::new(&buf[..]);
         let decoded: ClientMsg = recv_msg(&mut reader).await.unwrap();
         match decoded {
-            ClientMsg::Register { pid, mode, scope, label } => {
+            ClientMsg::Register {
+                pid,
+                mode,
+                scope,
+                label,
+            } => {
                 assert_eq!(pid, 42);
                 assert_eq!(mode, "stdio");
                 assert_eq!(scope, "/test");
@@ -662,6 +849,7 @@ mod tests {
                 id: "op-1".to_string(),
                 tool_name: "cargo_build".to_string(),
                 description: "Build workspace".to_string(),
+                scope: "/test/scope".to_string(),
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -689,6 +877,8 @@ mod tests {
             payload: DaemonEvent::OpFinished {
                 id: "op-2".to_string(),
                 status: "Completed".to_string(),
+                result_summary: Some("success".to_string()),
+                duration_ms: 1500,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -698,7 +888,7 @@ mod tests {
         let decoded: DaemonMsg = recv_msg(&mut reader).await.unwrap();
         match decoded {
             DaemonMsg::Event {
-                payload: DaemonEvent::OpFinished { id, status },
+                payload: DaemonEvent::OpFinished { id, status, .. },
                 ..
             } => {
                 assert_eq!(id, "op-2");
@@ -711,7 +901,11 @@ mod tests {
     #[tokio::test]
     async fn ndj_roundtrip_subscribe_and_unregister() {
         // Verify unit variants round-trip correctly.
-        for msg in [ClientMsg::Subscribe, ClientMsg::ListInstances, ClientMsg::Unregister] {
+        for msg in [
+            ClientMsg::Subscribe,
+            ClientMsg::ListInstances,
+            ClientMsg::Unregister,
+        ] {
             let mut buf = Vec::<u8>::new();
             send_msg(&mut buf, &msg).await.unwrap();
             assert!(buf.ends_with(b"\n"));
@@ -785,11 +979,15 @@ mod tests {
         wait_for_daemon(&sock).await;
 
         // ── Subscriber connects ────────────────────────────────────────────
-        let sub = tokio::net::UnixStream::connect(&sock).await.expect("connect subscriber");
+        let sub = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connect subscriber");
         let (sr, sw) = tokio::io::split(sub);
         let mut sub_reader = BufReader::new(sr);
         let mut sub_writer = sw;
-        send_msg(&mut sub_writer, &ClientMsg::Subscribe).await.unwrap();
+        send_msg(&mut sub_writer, &ClientMsg::Subscribe)
+            .await
+            .unwrap();
 
         // Initial InstanceList should be empty.
         let first: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
@@ -799,7 +997,9 @@ mod tests {
         assert!(instances.is_empty(), "no instances registered yet");
 
         // ── Instance registers ─────────────────────────────────────────────
-        let inst = tokio::net::UnixStream::connect(&sock).await.expect("connect instance");
+        let inst = tokio::net::UnixStream::connect(&sock)
+            .await
+            .expect("connect instance");
         let (_, mut iw) = tokio::io::split(inst);
         send_msg(
             &mut iw,
@@ -830,6 +1030,7 @@ mod tests {
                     id: "op-001".to_string(),
                     tool_name: "cargo_test".to_string(),
                     description: "Run tests".to_string(),
+                    scope: "/test/scope".to_string(),
                 },
             },
         )
@@ -856,6 +1057,8 @@ mod tests {
                 payload: DaemonEvent::OpFinished {
                     id: "op-001".to_string(),
                     status: "Completed".to_string(),
+                    result_summary: Some("success".to_string()),
+                    duration_ms: 1200,
                 },
             },
         )
@@ -865,7 +1068,7 @@ mod tests {
         let fin: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
         match fin {
             DaemonMsg::Event {
-                payload: DaemonEvent::OpFinished { id, status },
+                payload: DaemonEvent::OpFinished { id, status, .. },
                 ..
             } => {
                 assert_eq!(id, "op-001");
@@ -941,7 +1144,10 @@ mod tests {
         {
             let _listener = tokio::net::UnixListener::bind(&sock).unwrap();
         }
-        assert!(sock.exists(), "stale socket file should exist before daemon starts");
+        assert!(
+            sock.exists(),
+            "stale socket file should exist before daemon starts"
+        );
 
         // The daemon should detect ECONNREFUSED on the stale socket,
         // remove the file, and bind successfully.
@@ -953,6 +1159,9 @@ mod tests {
 
         // Verify a fresh connection works after cleanup.
         let conn = tokio::net::UnixStream::connect(&sock).await;
-        assert!(conn.is_ok(), "daemon should be running after stale socket cleanup");
+        assert!(
+            conn.is_ok(),
+            "daemon should be running after stale socket cleanup"
+        );
     }
 }
