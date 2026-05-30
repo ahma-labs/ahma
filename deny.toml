@@ -12,6 +12,10 @@ version = 2
 # Yanked crates are flagged as warnings (not hard errors) so a yanked patch
 # release in a transitive dep doesn't block the build unexpectedly.
 yanked = "warn"
+ignore = [
+    # paste is unmaintained but ratatui depends on it
+    "RUSTSEC-2024-0436",
+]
 
 # ---------------------------------------------------------------------------
 # Licenses – explicit allowlist; anything unlisted is denied

@@ -3,7 +3,7 @@
 #[cfg(feature = "tui")]
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::state::{Focus, PaletteState};
+use crate::state::{Focus, Mode, PaletteState};
 
 /// High-level action emitted from a key press.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +26,7 @@ pub enum Action {
     // Toggles
     ToggleHelp,
     ToggleDetail,
-    // Palette
+    // Old palette (`:`)
     OpenPalette,
     PaletteChar(char),
     PaletteBackspace,
@@ -40,20 +40,50 @@ pub enum Action {
     FilterChar(char),
     FilterBackspace,
     FilterEsc,
+    // Chat mode input
+    /// A printable character typed into the chat input box.
+    InputChar(char),
+    /// Backspace in the chat input box.
+    InputBackspace,
+    /// Submit the chat input (Enter without Shift).
+    InputSubmit,
+    /// Insert a real newline (Shift+Enter) in the chat input.
+    InputNewline,
+    /// Clear the chat input (Esc when non-empty, or double-Esc).
+    InputClear,
+    // `/` command navigator
+    OpenNavigator,
+    NavChar(char),
+    NavBackspace,
+    NavComplete,
+    NavEsc,
+    NavSubmit,
+    NavUp,
+    NavDown,
     Unknown,
 }
 
 /// Convert a raw crossterm `KeyEvent` into an `Action`.
 ///
-/// Palette mode and log-filter mode are checked first so those inputs do not
-/// accidentally trigger global shortcuts.
+/// Checked in priority order:
+/// 1. Command navigator (if visible)
+/// 2. Log filter (if active)
+/// 3. Chat input (if in Chat mode and input is focused)
+/// 4. Global / Monitor shortcuts
 #[cfg(feature = "tui")]
 pub fn map_key(
     key: KeyEvent,
+    mode: Mode,
     focus: Focus,
     palette: &PaletteState,
+    nav_visible: bool,
     log_filter_active: bool,
 ) -> Action {
+    // Navigator has highest priority when open.
+    if nav_visible {
+        return map_navigator_key(key);
+    }
+
     if palette.visible {
         return map_palette_key(key);
     }
@@ -62,6 +92,66 @@ pub fn map_key(
         return map_filter_key(key);
     }
 
+    // In Chat mode the input box handles most keys.
+    if mode == Mode::Chat && focus == Focus::Chat {
+        return map_chat_input_key(key);
+    }
+
+    map_global_key(key, focus)
+}
+
+// ─── Chat input ───────────────────────────────────────────────────────────────
+
+#[cfg(feature = "tui")]
+fn map_chat_input_key(key: KeyEvent) -> Action {
+    use KeyCode::*;
+    use KeyModifiers as KM;
+
+    match (key.code, key.modifiers) {
+        // Submit with Enter (no modifier).
+        (Enter, KM::NONE) => Action::InputSubmit,
+        // Real newline with Shift+Enter.
+        (Enter, KM::SHIFT) => Action::InputNewline,
+        // Ctrl-C always quits.
+        (Char('c'), KM::CONTROL) => Action::Quit,
+        // Esc clears input.
+        (Esc, _) => Action::InputClear,
+        // `/` at start of line opens the navigator.
+        // Detected at Action dispatch time (app.rs) because we can't easily
+        // check cursor position here; InputChar('/') is emitted and app.rs
+        // intercepts it when the input is empty.
+        (Backspace, _) => Action::InputBackspace,
+        // Tab cycles focus to monitor panels while keeping input context.
+        (Tab, KM::NONE) => Action::Tab,
+        (BackTab, _) => Action::BackTab,
+        (Char(c), KM::NONE) | (Char(c), KM::SHIFT) => Action::InputChar(c),
+        _ => Action::Unknown,
+    }
+}
+
+// ─── Navigator ────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "tui")]
+fn map_navigator_key(key: KeyEvent) -> Action {
+    use KeyCode::*;
+    use KeyModifiers as KM;
+
+    match (key.code, key.modifiers) {
+        (Esc, _) => Action::NavEsc,
+        (Enter, _) => Action::NavSubmit,
+        (Tab, _) => Action::NavComplete,
+        (Up, _) | (Char('k'), KM::NONE) => Action::NavUp,
+        (Down, _) | (Char('j'), KM::NONE) => Action::NavDown,
+        (Backspace, _) => Action::NavBackspace,
+        (Char(c), KM::NONE) | (Char(c), KM::SHIFT) => Action::NavChar(c),
+        _ => Action::Unknown,
+    }
+}
+
+// ─── Global (monitor) keys ───────────────────────────────────────────────────
+
+#[cfg(feature = "tui")]
+fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
     use KeyCode::*;
     use KeyModifiers as KM;
 
@@ -79,7 +169,7 @@ pub fn map_key(
         (BackTab, _) => Action::BackTab,
         (Enter, _) => Action::Enter,
 
-        // Approval (only meaningful when banner is visible; app handles guard)
+        // Approval
         (Char('y'), KM::NONE) => Action::Approve,
         (Char('n'), KM::NONE) => Action::Reject,
 
@@ -92,10 +182,13 @@ pub fn map_key(
         (Char('?'), _) => Action::ToggleHelp,
         (Char('d'), KM::NONE) => Action::ToggleDetail,
 
-        // Palette
+        // Old `:` palette (kept for backward compat in Monitor mode)
         (Char(':'), _) => Action::OpenPalette,
 
-        // Log filter
+        // Navigator via `/` in non-filter context
+        (Char('/'), KM::NONE) if focus != Focus::Log => Action::OpenNavigator,
+
+        // Log filter (`/` when Log pane is focused)
         (Char('/'), KM::NONE) if focus == Focus::Log => Action::StartFilter,
 
         _ => Action::Unknown,
@@ -138,8 +231,10 @@ fn map_filter_key(key: KeyEvent) -> Action {
 #[cfg(not(feature = "tui"))]
 pub fn map_key(
     _key: (),
+    _mode: Mode,
     _focus: Focus,
     _palette: &PaletteState,
+    _nav_visible: bool,
     _log_filter_active: bool,
 ) -> Action {
     Action::Unknown

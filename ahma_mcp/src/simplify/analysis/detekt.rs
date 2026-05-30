@@ -482,10 +482,10 @@ fn parse_leading_number(s: &str, allow_decimal: bool) -> Option<f64> {
 /// - `"…is too long (85/1)…"` → `85.0`
 fn extract_complexity_value(message: &str) -> Option<f64> {
     // Pattern: " of <N>" (used by CyclomaticComplexMethod, CognitiveComplexMethod)
-    if let Some(pos) = message.find(" of ") {
-        if let Some(v) = parse_leading_number(&message[pos + " of ".len()..], true) {
-            return Some(v);
-        }
+    if let Some(pos) = message.find(" of ")
+        && let Some(v) = parse_leading_number(&message[pos + " of ".len()..], true)
+    {
+        return Some(v);
     }
 
     // Pattern: "(<N>/<threshold>)" used by LongMethod and similar rules.

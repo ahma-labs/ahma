@@ -121,11 +121,19 @@ pub enum HookPlatform {
     Cursor,
     Claude,
     Codex,
+    Copilot,
+    Antigravity,
 }
 
 impl HookPlatform {
     fn all() -> Vec<Self> {
-        vec![Self::Cursor, Self::Claude, Self::Codex]
+        vec![
+            Self::Cursor,
+            Self::Claude,
+            Self::Codex,
+            Self::Copilot,
+            Self::Antigravity,
+        ]
     }
 
     fn label(self) -> &'static str {
@@ -133,21 +141,32 @@ impl HookPlatform {
             Self::Cursor => "Cursor",
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
+            Self::Copilot => "GitHub Copilot",
+            Self::Antigravity => "Antigravity",
         }
     }
 
-    fn config_path(self, scope_root: &Path) -> PathBuf {
+    fn config_path(self, scope_root: &Path, scope: HookScope) -> PathBuf {
         match self {
             Self::Cursor => scope_root.join(".cursor").join("hooks.json"),
             Self::Claude => scope_root.join(".claude").join("settings.json"),
             Self::Codex => scope_root.join(".codex").join("hooks.json"),
+            Self::Copilot => match scope {
+                HookScope::User => scope_root.join(".copilot").join("hooks").join("ahma.json"),
+                HookScope::Project => scope_root.join(".github").join("hooks").join("ahma.json"),
+            },
+            Self::Antigravity => match scope {
+                HookScope::User => scope_root.join(".gemini").join("config").join("hooks.json"),
+                HookScope::Project => scope_root.join(".agents").join("hooks.json"),
+            },
         }
     }
 
     fn event_key(self) -> &'static str {
         match self {
             Self::Cursor => "preToolUse",
-            Self::Claude | Self::Codex => "PreToolUse",
+            Self::Claude | Self::Codex | Self::Antigravity => "PreToolUse",
+            Self::Copilot => "preToolUse",
         }
     }
 
@@ -156,6 +175,8 @@ impl HookPlatform {
             Self::Cursor => "cursor",
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Copilot => "copilot",
+            Self::Antigravity => "antigravity",
         }
     }
 }
@@ -209,7 +230,7 @@ impl HookEnvironment {
     }
 
     fn config_path(&self, platform: HookPlatform, scope: HookScope) -> PathBuf {
-        platform.config_path(self.scope_root(scope))
+        platform.config_path(self.scope_root(scope), scope)
     }
 }
 
@@ -447,32 +468,53 @@ fn detect_project_root() -> Result<PathBuf> {
     Ok(cwd)
 }
 
+fn extract_tool_args(input: &Value) -> Result<(Map<String, Value>, String)> {
+    let raw_args = input
+        .get("tool_input")
+        .or_else(|| input.get("toolArgs"))
+        .ok_or_else(|| anyhow!("Hook input is missing tool_input or toolArgs"))?;
+
+    let args_val = if let Some(s) = raw_args.as_str() {
+        serde_json::from_str(s).context("Failed to parse toolArgs JSON string")?
+    } else {
+        raw_args.clone()
+    };
+
+    let args_obj = args_val
+        .as_object()
+        .ok_or_else(|| anyhow!("Tool arguments must be a JSON object"))?;
+
+    let command = args_obj
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Tool arguments are missing 'command' field"))?
+        .to_string();
+
+    Ok((args_obj.clone(), command))
+}
+
 fn build_exec_response(
     input: &Value,
     platform: HookPlatform,
     scope: HookScope,
     env: &HookEnvironment,
 ) -> Result<Value> {
-    let tool_input = input
-        .get("tool_input")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("Hook input is missing tool_input"))?;
-    let original_command = tool_input
-        .get("command")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("Hook input is missing tool_input.command"))?;
+    let (tool_input, original_command) = extract_tool_args(input)?;
 
-    let updated_input = if is_wrapped_shell_command(original_command) {
+    let updated_input = if is_wrapped_shell_command(&original_command) {
         None
     } else {
-        let cwd = extract_command_cwd(input, tool_input)?;
-        let wrapped_command = build_wrapped_shell_command(scope, env, &cwd, original_command)?;
-        Some(updated_tool_input(tool_input, wrapped_command))
+        let cwd = extract_command_cwd(input, &tool_input)?;
+        let wrapped_command = build_wrapped_shell_command(scope, env, &cwd, &original_command)?;
+        Some(updated_tool_input(&tool_input, wrapped_command))
     };
 
     Ok(match platform {
         HookPlatform::Cursor => build_cursor_hook_output(updated_input),
-        HookPlatform::Claude | HookPlatform::Codex => build_structured_hook_output(updated_input),
+        HookPlatform::Claude
+        | HookPlatform::Codex
+        | HookPlatform::Copilot
+        | HookPlatform::Antigravity => build_structured_hook_output(updated_input),
     })
 }
 
@@ -515,7 +557,8 @@ fn build_structured_hook_output(updated_input: Option<Value>) -> Value {
         Value::String("allow".to_string()),
     );
     if let Some(updated_input) = updated_input {
-        hook_output.insert("updatedInput".to_string(), updated_input);
+        hook_output.insert("updatedInput".to_string(), updated_input.clone());
+        hook_output.insert("modifiedArgs".to_string(), updated_input);
     }
 
     let mut root = Map::new();
@@ -567,6 +610,8 @@ fn install_platform_hook(
         HookPlatform::Cursor => install_cursor_hook(document, scope, env),
         HookPlatform::Claude => install_claude_hook(document, scope, env),
         HookPlatform::Codex => install_codex_hook(document, scope, env),
+        HookPlatform::Copilot => install_copilot_hook(document, scope, env),
+        HookPlatform::Antigravity => install_grouped_hook(document, platform, scope, env),
     }
 }
 
@@ -575,13 +620,18 @@ fn uninstall_platform_hook(document: &mut Value, platform: HookPlatform) -> Resu
         HookPlatform::Cursor => uninstall_cursor_hook(document),
         HookPlatform::Claude => uninstall_grouped_hook(document, platform),
         HookPlatform::Codex => uninstall_grouped_hook(document, platform),
+        HookPlatform::Copilot => uninstall_copilot_hook(document),
+        HookPlatform::Antigravity => uninstall_grouped_hook(document, platform),
     }
 }
 
 fn platform_hook_installed(document: &Value, platform: HookPlatform) -> bool {
     match platform {
         HookPlatform::Cursor => cursor_hook_installed(document),
-        HookPlatform::Claude | HookPlatform::Codex => grouped_hook_installed(document, platform),
+        HookPlatform::Claude | HookPlatform::Codex | HookPlatform::Antigravity => {
+            grouped_hook_installed(document, platform)
+        }
+        HookPlatform::Copilot => copilot_hook_installed(document),
     }
 }
 
@@ -742,10 +792,15 @@ fn codex_group_entry(scope: HookScope, env: &HookEnvironment) -> Value {
 
 fn managed_group_entry(platform: HookPlatform, scope: HookScope, env: &HookEnvironment) -> Value {
     match platform {
-        HookPlatform::Claude => {
+        HookPlatform::Claude | HookPlatform::Antigravity => {
             let (command, args) = exec_command_and_args(platform, scope, env);
+            let matcher = match platform {
+                HookPlatform::Claude => "Bash",
+                HookPlatform::Antigravity => "run_command",
+                _ => unreachable!(),
+            };
             json!({
-                "matcher": "Bash",
+                "matcher": matcher,
                 "hooks": [
                     {
                         "type": "command",
@@ -757,8 +812,111 @@ fn managed_group_entry(platform: HookPlatform, scope: HookScope, env: &HookEnvir
             })
         }
         HookPlatform::Codex => codex_group_entry(scope, env),
-        HookPlatform::Cursor => unreachable!("Cursor does not use grouped hooks"),
+        HookPlatform::Cursor | HookPlatform::Copilot => {
+            unreachable!("Cursor/Copilot do not use grouped hooks")
+        }
     }
+}
+
+fn install_copilot_hook(
+    document: &mut Value,
+    scope: HookScope,
+    env: &HookEnvironment,
+) -> Result<()> {
+    let root = ensure_root_object(document)?;
+    root.entry("version".to_string())
+        .or_insert_with(|| Value::Number(1.into()));
+
+    let hooks = ensure_child_object(root, "hooks")?;
+    let entries = ensure_child_array(hooks, HookPlatform::Copilot.event_key())?;
+    entries.retain(|entry| !is_managed_copilot_entry(entry));
+
+    let args = exec_args(HookPlatform::Copilot, scope);
+    let binary_ref = BinaryReference::for_scope(env, scope);
+
+    let bash_command = match &binary_ref {
+        BinaryReference::PathLookup => std::iter::once(PATH_LOOKUP_BINARY.to_string())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" "),
+        BinaryReference::Absolute(path) => {
+            std::iter::once(shell_quote_posix(&path.to_string_lossy()))
+                .chain(args.iter().map(|arg| shell_quote_posix(arg)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    };
+
+    let powershell_command = match &binary_ref {
+        BinaryReference::PathLookup => std::iter::once(PATH_LOOKUP_BINARY.to_string())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" "),
+        BinaryReference::Absolute(path) => build_windows_absolute_command(path, &args),
+    };
+
+    entries.push(json!({
+        "type": "command",
+        "bash": bash_command,
+        "powershell": powershell_command,
+        "timeoutSec": HOOK_TIMEOUT_SECS,
+    }));
+
+    Ok(())
+}
+
+fn uninstall_copilot_hook(document: &mut Value) -> Result<bool> {
+    let Some(root) = document.as_object_mut() else {
+        bail!("GitHub Copilot hook config must be a JSON object");
+    };
+    let Some(hooks) = root.get_mut("hooks") else {
+        return Ok(false);
+    };
+    let Some(hooks_object) = hooks.as_object_mut() else {
+        bail!("GitHub Copilot hook config field 'hooks' must be an object");
+    };
+    let Some(entries) = hooks_object.get_mut(HookPlatform::Copilot.event_key()) else {
+        return Ok(false);
+    };
+    let Some(entries_array) = entries.as_array_mut() else {
+        bail!("GitHub Copilot preToolUse hook list must be an array");
+    };
+
+    let changed = {
+        let before_len = entries_array.len();
+        entries_array.retain(|entry| !is_managed_copilot_entry(entry));
+        entries_array.len() != before_len
+    };
+    cleanup_empty_hook_tree(root, HookPlatform::Copilot.event_key());
+
+    Ok(changed)
+}
+
+fn copilot_hook_installed(document: &Value) -> bool {
+    document
+        .get("hooks")
+        .and_then(Value::as_object)
+        .and_then(|hooks| hooks.get(HookPlatform::Copilot.event_key()))
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().any(is_managed_copilot_entry))
+        .unwrap_or(false)
+}
+
+fn is_managed_copilot_entry(entry: &Value) -> bool {
+    let Some(object) = entry.as_object() else {
+        return false;
+    };
+
+    object
+        .get("bash")
+        .and_then(Value::as_str)
+        .map(is_managed_command)
+        .unwrap_or(false)
+        || object
+            .get("powershell")
+            .and_then(Value::as_str)
+            .map(is_managed_command)
+            .unwrap_or(false)
 }
 
 fn build_exec_command(platform: HookPlatform, scope: HookScope, env: &HookEnvironment) -> String {
@@ -1159,5 +1317,113 @@ mod tests {
 
         assert!(any_managed_hooks_installed_in_env(HookScope::User, &env).unwrap());
         assert!(!any_managed_hooks_installed_in_env(HookScope::Project, &env).unwrap());
+    }
+
+    #[test]
+    fn test_copilot_install_writes_bash_and_powershell() {
+        let env = test_env();
+        let path = env.config_path(HookPlatform::Copilot, HookScope::User);
+        let mut document = Value::Object(Map::new());
+
+        install_platform_hook(&mut document, HookPlatform::Copilot, HookScope::User, &env).unwrap();
+        write_hook_document(&path, &Value::Object(Map::new()), &document, false, false).unwrap();
+
+        let installed = load_hook_document(&path).unwrap();
+        assert!(platform_hook_installed(&installed, HookPlatform::Copilot));
+
+        let entry = &installed["hooks"]["preToolUse"][0];
+        let bash = entry["bash"].as_str().unwrap();
+        let powershell = entry["powershell"].as_str().unwrap();
+        assert!(bash.contains(MANAGED_ID_DEFAULT_SHELL_V1));
+        assert!(powershell.contains(MANAGED_ID_DEFAULT_SHELL_V1));
+    }
+
+    #[test]
+    fn test_copilot_uninstall_removes_managed_entries() {
+        let _env = test_env();
+        let mut document = json!({
+            "version": 1,
+            "hooks": {
+                "preToolUse": [
+                    {
+                        "type": "command",
+                        "bash": "echo non-managed",
+                        "powershell": "echo non-managed",
+                        "timeoutSec": 30
+                    },
+                    {
+                        "type": "command",
+                        "bash": "ahma hooks exec --platform copilot --scope user --managed-id ahma-default-shell-v1",
+                        "powershell": "powershell -Command ... ahma-default-shell-v1",
+                        "timeoutSec": 30
+                    }
+                ]
+            }
+        });
+
+        let changed = uninstall_platform_hook(&mut document, HookPlatform::Copilot).unwrap();
+        assert!(changed);
+        let entries = document["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["bash"].as_str().unwrap(), "echo non-managed");
+    }
+
+    #[test]
+    fn test_antigravity_config_path() {
+        let env = test_env();
+        let user_path = HookPlatform::Antigravity.config_path(&env.home_dir, HookScope::User);
+        assert_eq!(
+            user_path,
+            env.home_dir
+                .join(".gemini")
+                .join("config")
+                .join("hooks.json")
+        );
+
+        let project_path =
+            HookPlatform::Antigravity.config_path(&env.project_root, HookScope::Project);
+        assert_eq!(
+            project_path,
+            env.project_root.join(".agents").join("hooks.json")
+        );
+    }
+
+    #[test]
+    fn test_antigravity_install_writes_grouped_hook() {
+        let env = test_env();
+        let path = env.config_path(HookPlatform::Antigravity, HookScope::User);
+        let mut document = Value::Object(Map::new());
+
+        install_platform_hook(
+            &mut document,
+            HookPlatform::Antigravity,
+            HookScope::User,
+            &env,
+        )
+        .unwrap();
+        write_hook_document(&path, &Value::Object(Map::new()), &document, false, false).unwrap();
+
+        let installed = load_hook_document(&path).unwrap();
+        assert!(platform_hook_installed(
+            &installed,
+            HookPlatform::Antigravity
+        ));
+        let matcher = installed["hooks"]["PreToolUse"][0]["matcher"]
+            .as_str()
+            .unwrap();
+        assert_eq!(matcher, "run_command");
+
+        let command = installed["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.contains("bin space"));
+
+        let args = installed["hooks"]["PreToolUse"][0]["hooks"][0]["args"]
+            .as_array()
+            .unwrap();
+        assert!(
+            args.iter()
+                .any(|arg| arg.as_str() == Some(MANAGED_ID_DEFAULT_SHELL_V1))
+        );
     }
 }

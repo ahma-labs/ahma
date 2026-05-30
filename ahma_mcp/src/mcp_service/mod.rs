@@ -47,6 +47,7 @@ mod utils;
 
 pub use types::{GuidanceConfig, LegacyGuidanceConfig, META_PARAMS, SequenceKind};
 
+use chrono::Utc;
 use rmcp::{
     handler::server::ServerHandler,
     model::{
@@ -57,6 +58,7 @@ use rmcp::{
     service::{NotificationContext, Peer, RequestContext, RoleServer},
 };
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicU64, Ordering},
@@ -70,6 +72,77 @@ use crate::{
 };
 
 pub(crate) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+struct VaultAuditCallback {
+    inner: Option<Box<dyn CallbackSender>>,
+    audit_log_path: PathBuf,
+    operation_id: String,
+}
+
+impl VaultAuditCallback {
+    fn new(
+        inner: Option<Box<dyn CallbackSender>>,
+        audit_log_path: PathBuf,
+        operation_id: String,
+    ) -> Self {
+        Self {
+            inner,
+            audit_log_path,
+            operation_id,
+        }
+    }
+
+    async fn emit_completion_for_update(&self, update: &crate::callback_system::ProgressUpdate) {
+        let completion = match update {
+            crate::callback_system::ProgressUpdate::FinalResult {
+                success,
+                duration_ms,
+                ..
+            } => Some((*success, *duration_ms)),
+            crate::callback_system::ProgressUpdate::Completed { duration_ms, .. } => {
+                Some((true, *duration_ms))
+            }
+            crate::callback_system::ProgressUpdate::Failed { duration_ms, .. }
+            | crate::callback_system::ProgressUpdate::Cancelled { duration_ms, .. } => {
+                Some((false, *duration_ms))
+            }
+            _ => None,
+        };
+
+        if let Some((success, duration_ms)) = completion {
+            let _ = AhmaMcpService::append_tool_complete_event(
+                &self.audit_log_path,
+                &self.operation_id,
+                success,
+                duration_ms,
+            )
+            .await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CallbackSender for VaultAuditCallback {
+    async fn send_progress(
+        &self,
+        update: crate::callback_system::ProgressUpdate,
+    ) -> Result<(), crate::callback_system::CallbackError> {
+        self.emit_completion_for_update(&update).await;
+        if let Some(inner) = &self.inner {
+            inner.send_progress(update).await
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn should_cancel(&self) -> bool {
+        if let Some(inner) = &self.inner {
+            inner.should_cancel().await
+        } else {
+            false
+        }
+    }
+}
 
 /// `AhmaMcpService` is the server handler for the MCP service.
 #[derive(Clone)]
@@ -107,6 +180,289 @@ pub struct AhmaMcpService {
 }
 
 impl AhmaMcpService {
+    fn task_vault_root(&self) -> Option<PathBuf> {
+        let cfg_root = self
+            .app_config
+            .read()
+            .ok()
+            .and_then(|cfg| cfg.as_ref().and_then(|c| c.task_vault.clone()));
+
+        if cfg_root.is_some() {
+            return cfg_root;
+        }
+
+        let scope = self.adapter.sandbox().scopes().first()?.clone();
+        let is_workdir = scope
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == "workdir")
+            .unwrap_or(false);
+        if is_workdir {
+            scope.parent().map(|p| p.to_path_buf())
+        } else {
+            None
+        }
+    }
+
+    fn task_vault_audit_log_path(&self) -> Option<PathBuf> {
+        self.task_vault_root().map(|root| root.join("audit.jsonl"))
+    }
+
+    fn task_vault_trash_dir(&self) -> Option<PathBuf> {
+        self.task_vault_root().map(|root| root.join("trash"))
+    }
+
+    fn summarize_arguments(arguments: &serde_json::Map<String, serde_json::Value>) -> String {
+        serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    async fn append_audit_line(
+        audit_log_path: &Path,
+        payload: serde_json::Value,
+    ) -> Result<(), anyhow::Error> {
+        use tokio::fs::OpenOptions;
+        use tokio::io::AsyncWriteExt as _;
+
+        if let Some(parent) = audit_log_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let mut line = serde_json::to_string(&payload)?;
+        line.push('\n');
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(audit_log_path)
+            .await?;
+        file.write_all(line.as_bytes()).await?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    async fn append_tool_call_event(
+        audit_log_path: &Path,
+        operation_id: &str,
+        tool_name: &str,
+        args_summary: &str,
+    ) -> Result<(), anyhow::Error> {
+        Self::append_audit_line(
+            audit_log_path,
+            serde_json::json!({
+                "timestamp": Utc::now().to_rfc3339(),
+                "type": "tool_call",
+                "operation_id": operation_id,
+                "tool_name": tool_name,
+                "args_summary": args_summary,
+            }),
+        )
+        .await
+    }
+
+    async fn append_tool_complete_event(
+        audit_log_path: &Path,
+        operation_id: &str,
+        success: bool,
+        duration_ms: u64,
+    ) -> Result<(), anyhow::Error> {
+        Self::append_audit_line(
+            audit_log_path,
+            serde_json::json!({
+                "timestamp": Utc::now().to_rfc3339(),
+                "type": "tool_complete",
+                "operation_id": operation_id,
+                "success": success,
+                "duration_ms": duration_ms,
+            }),
+        )
+        .await
+    }
+
+    async fn emit_vault_tool_call(&self, operation_id: &str, tool_name: &str, args_summary: &str) {
+        let Some(audit_log_path) = self.task_vault_audit_log_path() else {
+            return;
+        };
+        if let Err(e) =
+            Self::append_tool_call_event(&audit_log_path, operation_id, tool_name, args_summary)
+                .await
+        {
+            tracing::warn!("Failed to append vault tool_call audit event: {}", e);
+        }
+    }
+
+    async fn emit_vault_tool_complete(&self, operation_id: &str, success: bool, duration_ms: u64) {
+        let Some(audit_log_path) = self.task_vault_audit_log_path() else {
+            return;
+        };
+        if let Err(e) =
+            Self::append_tool_complete_event(&audit_log_path, operation_id, success, duration_ms)
+                .await
+        {
+            tracing::warn!("Failed to append vault tool_complete audit event: {}", e);
+        }
+    }
+
+    async fn emit_vault_file_staged(&self, original_path: &str, trash_path: &str) {
+        let Some(audit_log_path) = self.task_vault_audit_log_path() else {
+            return;
+        };
+        if let Err(e) = Self::append_audit_line(
+            &audit_log_path,
+            serde_json::json!({
+                "timestamp": Utc::now().to_rfc3339(),
+                "type": "file_staged",
+                "original_path": original_path,
+                "trash_path": trash_path,
+            }),
+        )
+        .await
+        {
+            tracing::warn!("Failed to append vault file_staged audit event: {}", e);
+        }
+    }
+
+    fn wrap_callback_with_vault_audit(
+        &self,
+        callback: Option<Box<dyn CallbackSender>>,
+        operation_id: &str,
+    ) -> Option<Box<dyn CallbackSender>> {
+        let Some(audit_log_path) = self.task_vault_audit_log_path() else {
+            return callback;
+        };
+        Some(Box::new(VaultAuditCallback::new(
+            callback,
+            audit_log_path,
+            operation_id.to_string(),
+        )))
+    }
+
+    fn looks_like_rm_command(base_command: &str) -> bool {
+        let token = base_command.split_whitespace().next().unwrap_or_default();
+        token == "rm" || token.ends_with("/rm")
+    }
+
+    fn extract_rm_targets_from_arguments(
+        arguments: &serde_json::Map<String, serde_json::Value>,
+    ) -> Vec<String> {
+        let mut targets = Vec::new();
+        for (key, value) in arguments {
+            if Self::is_rm_meta_argument(key) {
+                continue;
+            }
+            Self::extend_rm_targets(&mut targets, value);
+        }
+        targets
+    }
+
+    fn is_rm_meta_argument(key: &str) -> bool {
+        matches!(
+            key,
+            "timeout_seconds" | "execution_mode" | "working_directory"
+        )
+    }
+
+    fn extend_rm_targets(targets: &mut Vec<String>, value: &serde_json::Value) {
+        match value {
+            serde_json::Value::String(candidate) => {
+                Self::maybe_push_rm_target(targets, candidate);
+            }
+            serde_json::Value::Array(values) => {
+                for candidate in values.iter().filter_map(serde_json::Value::as_str) {
+                    Self::maybe_push_rm_target(targets, candidate);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn maybe_push_rm_target(targets: &mut Vec<String>, candidate: &str) {
+        if !candidate.starts_with('-') {
+            targets.push(candidate.to_string());
+        }
+    }
+
+    fn stage_paths_into_vault_trash(
+        &self,
+        working_directory: &str,
+        targets: &[String],
+    ) -> Result<Vec<(String, String)>, anyhow::Error> {
+        use anyhow::Context;
+
+        let Some(trash_dir) = self.task_vault_trash_dir() else {
+            return Ok(Vec::new());
+        };
+        std::fs::create_dir_all(&trash_dir).with_context(|| {
+            format!("Failed to create vault trash dir: {}", trash_dir.display())
+        })?;
+
+        let mut staged = Vec::new();
+        for target in targets {
+            let mut source = PathBuf::from(target);
+            if source.is_relative() {
+                source = PathBuf::from(working_directory).join(source);
+            }
+            if !source.exists() {
+                continue;
+            }
+
+            let filename = source
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("staged-item");
+            let ts = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+            let dest = trash_dir.join(format!("{ts}_{filename}"));
+
+            std::fs::rename(&source, &dest).with_context(|| {
+                format!(
+                    "Failed to stage '{}' into '{}'",
+                    source.display(),
+                    dest.display()
+                )
+            })?;
+
+            staged.push((
+                source.to_string_lossy().to_string(),
+                dest.to_string_lossy().to_string(),
+            ));
+        }
+
+        Ok(staged)
+    }
+
+    async fn maybe_stage_configured_delete(
+        &self,
+        base_command: &str,
+        working_directory: &str,
+        arguments: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<CallToolResult>, McpError> {
+        if !Self::looks_like_rm_command(base_command) || self.task_vault_root().is_none() {
+            return Ok(None);
+        }
+
+        let targets = Self::extract_rm_targets_from_arguments(arguments);
+        if targets.is_empty() {
+            return Ok(None);
+        }
+
+        let staged = self
+            .stage_paths_into_vault_trash(working_directory, &targets)
+            .map_err(|e| {
+                handlers::common::mcp_internal(format!(
+                    "Failed to stage deletion to vault trash: {}",
+                    e
+                ))
+            })?;
+
+        for (original_path, trash_path) in &staged {
+            self.emit_vault_file_staged(original_path, trash_path).await;
+        }
+
+        Ok(Some(handlers::common::text_result(format!(
+            "Staged {} path(s) into vault trash instead of permanent delete.",
+            staged.len()
+        ))))
+    }
+
     /// Creates a new `AhmaMcpService` instance.
     ///
     /// This service implements the `rmcp::ServerHandler` trait and manages tool execution
@@ -531,6 +887,10 @@ impl AhmaMcpService {
         client_type: McpClientType,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        let started_at = std::time::Instant::now();
+        self.emit_vault_tool_call(&id, base_command, &Self::summarize_arguments(&arguments))
+            .await;
+
         if let Some(token) = progress_token.clone() {
             let callback =
                 McpCallbackSender::new(peer.clone(), id.clone(), Some(token), client_type);
@@ -552,6 +912,10 @@ impl AhmaMcpService {
                 timeout,
                 Some(subcommand_config),
             )
+            .await;
+
+        let duration_ms = started_at.elapsed().as_millis() as u64;
+        self.emit_vault_tool_complete(&id, result.is_ok(), duration_ms)
             .await;
 
         if let Some(token) = progress_token {
@@ -586,6 +950,9 @@ impl AhmaMcpService {
         client_type: McpClientType,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        self.emit_vault_tool_call(&id, tool_name, &Self::summarize_arguments(&arguments))
+            .await;
+
         let callback: Option<Box<dyn CallbackSender>> = progress_token.map(|token| {
             Box::new(McpCallbackSender::new(
                 peer,
@@ -594,6 +961,7 @@ impl AhmaMcpService {
                 client_type,
             )) as Box<dyn CallbackSender>
         });
+        let callback = self.wrap_callback_with_vault_audit(callback, &id);
 
         let log_monitor_config = config.monitor_level.as_deref().map(|level_str| {
             let level = level_str
@@ -618,7 +986,7 @@ impl AhmaMcpService {
                 base_command,
                 working_directory,
                 crate::adapter::AsyncExecOptions {
-                    id: Some(id),
+                    id: Some(id.clone()),
                     args: Some(arguments),
                     timeout,
                     callback,
@@ -643,6 +1011,7 @@ impl AhmaMcpService {
                 )))
             }
             Err(e) => {
+                self.emit_vault_tool_complete(&id, false, 0).await;
                 let error_message = format!("Failed to start asynchronous operation: {}", e);
                 tracing::error!("{}", error_message);
                 Err(handlers::common::mcp_internal(error_message))
@@ -726,41 +1095,46 @@ impl ServerHandler for AhmaMcpService {
                 }
             }
 
+            if self.defer_sandbox {
+                tracing::info!("Sandbox deferred - waiting for roots/list_changed notification");
+                return;
+            }
+
             // Query client for workspace roots and configure sandbox
             // Per MCP spec, server sends roots/list request to client
             // IMPORTANT: Only do this if sandbox is NOT deferred.
             // In HTTP bridge mode with --defer-sandbox, we wait for roots/list_changed
             // notification which is sent by the bridge when SSE connects.
-            if !self.defer_sandbox {
-                // IF scopes are already configured (e.g. via CLI --sandbox-scope), respect them
-                // and do not ask client for roots (which would overwrite CLI scopes).
-                // This also prevents hangs when testing with clients that don't support roots/list.
-                if !self.adapter.sandbox().scopes().is_empty() {
-                    tracing::info!(
-                        "Sandbox scopes already configured via CLI/Env ({:?}), skipping roots/list request",
-                        self.adapter.sandbox().scopes()
-                    );
-                } else if self.adapter.sandbox().is_test_mode() {
-                    // In test/disabled sandbox mode, skip the roots/list exchange.
-                    // Calling configure_sandbox_from_roots in test mode causes two issues:
-                    // 1) It blocks the event loop waiting for roots/list from a client that
-                    //    may not implement the handler (causing a 60s handshake timeout).
-                    // 2) On failure it calls emit_stdout_notification(), which writes raw
-                    //    bytes to the rmcp stdio pipe, corrupting the JSON-RPC framing
-                    //    and causing the client to hang on subsequent tool calls.
-                    // In test mode path validation is bypassed anyway, so this is safe.
-                    tracing::debug!(
-                        "Sandbox in test/disabled mode: skipping roots/list request. \
-                         Path validation bypassed for all paths."
-                    );
-                } else {
-                    // Run synchronously per R19.3 - sandbox configuration is a lifecycle
-                    // operation that should complete before we're "ready"
-                    self.configure_sandbox_from_roots(peer).await;
-                }
-            } else {
-                tracing::info!("Sandbox deferred - waiting for roots/list_changed notification");
+            // IF scopes are already configured (e.g. via CLI --sandbox-scope), respect them
+            // and do not ask client for roots (which would overwrite CLI scopes).
+            // This also prevents hangs when testing with clients that don't support roots/list.
+            if !self.adapter.sandbox().scopes().is_empty() {
+                tracing::info!(
+                    "Sandbox scopes already configured via CLI/Env ({:?}), skipping roots/list request",
+                    self.adapter.sandbox().scopes()
+                );
+                return;
             }
+
+            if self.adapter.sandbox().is_test_mode() {
+                // In test/disabled sandbox mode, skip the roots/list exchange.
+                // Calling configure_sandbox_from_roots in test mode causes two issues:
+                // 1) It blocks the event loop waiting for roots/list from a client that
+                //    may not implement the handler (causing a 60s handshake timeout).
+                // 2) On failure it calls emit_stdout_notification(), which writes raw
+                //    bytes to the rmcp stdio pipe, corrupting the JSON-RPC framing
+                //    and causing the client to hang on subsequent tool calls.
+                // In test mode path validation is bypassed anyway, so this is safe.
+                tracing::debug!(
+                    "Sandbox in test/disabled mode: skipping roots/list request. \
+                     Path validation bypassed for all paths."
+                );
+                return;
+            }
+
+            // Run synchronously per R19.3 - sandbox configuration is a lifecycle
+            // operation that should complete before we're "ready"
+            self.configure_sandbox_from_roots(peer).await;
         }
     }
 
@@ -1087,6 +1461,14 @@ impl AhmaMcpService {
 
         let base_command = command_parts.join(" ");
         let working_directory = self.resolve_working_directory(&arguments);
+
+        if let Some(staged_result) = self
+            .maybe_stage_configured_delete(&base_command, &working_directory, &arguments)
+            .await?
+        {
+            return Ok(staged_result);
+        }
+
         let timeout = arguments.get("timeout_seconds").and_then(|v| v.as_u64());
         let execution_mode = self.determine_execution_mode(
             subcommand_config,

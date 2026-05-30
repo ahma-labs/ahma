@@ -6,7 +6,7 @@ name = "ahma_tui"
 readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
-description = "Terminal dashboard (ratatui) for ahma: monitor active operations and handle approval gates."
+description = "Terminal dashboard and chat interface for ahma."
 
 [lib]
 name = "ahma_tui"
@@ -15,17 +15,19 @@ path = "src/lib.rs"
 [features]
 default = ["tui"]
 # Full ratatui terminal UI (disable for headless/CI builds)
-tui = ["dep:ratatui", "dep:crossterm", "dep:futures"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:futures", "dep:tui-textarea"]
 
 [dependencies]
 ahma_common = { path = "../ahma_common" }
+ahma_llm_monitor = { path = "../ahma_llm_monitor" }
 ahma_renewal = { path = "../ahma_renewal" }
 anyhow.workspace = true
 chrono = { workspace = true }
 crossterm = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 ratatui = { workspace = true, optional = true }
-reqwest = { workspace = true, features = ["json", "rustls"] }
+reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = [
     "rt-multi-thread",
@@ -33,7 +35,9 @@ tokio = { workspace = true, features = [
     "time",
     "net",
 ] }
+toml.workspace = true
 tracing.workspace = true
+tui-textarea = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

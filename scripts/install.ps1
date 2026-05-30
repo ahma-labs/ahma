@@ -350,7 +350,7 @@ function Invoke-AhmaMcpSetup {
     Write-Host "  1) VS Code      ($env:APPDATA\Code\User\mcp.json)"
     Write-Host "  2) Claude Code  ($HOME\.claude.json)"
     Write-Host "  3) Cursor       ($HOME\.cursor\mcp.json)"
-    Write-Host "  4) Antigravity  ($HOME\.antigravity\mcp.json)"
+    Write-Host "  4) Antigravity  ($HOME\.gemini\config\mcp_config.json)"
     Write-Host "  5) Codex CLI    ($HOME\.codex\config.toml)"
     Write-Host ""
     $platformsInput = Read-Host "  Selection [default: 1,2,3,4,5 -- all]"
@@ -400,7 +400,7 @@ function Invoke-AhmaMcpSetup {
         @{ Num = '1'; Display = 'VS Code';     Path = "$env:APPDATA\Code\User\mcp.json"; Key = 'servers';    Type = 'standard'    },
         @{ Num = '2'; Display = 'Claude Code'; Path = "$HOME\.claude.json";               Key = 'mcpServers'; Type = 'standard'    },
         @{ Num = '3'; Display = 'Cursor';      Path = "$HOME\.cursor\mcp.json";           Key = 'mcpServers'; Type = 'standard'    },
-        @{ Num = '4'; Display = 'Antigravity'; Path = "$HOME\.antigravity\mcp.json";      Key = 'mcpServers'; Type = 'antigravity' }
+        @{ Num = '4'; Display = 'Antigravity'; Path = "$HOME\.gemini\config\mcp_config.json";      Key = 'mcpServers'; Type = 'antigravity' }
     )
 
     foreach ($p in $platforms) {
@@ -978,7 +978,7 @@ function Invoke-AhmaSkillSetup {
 
     Write-Host ""
     Write-Host "  Installing skills..."
-    Install-OneSkill -Name 'ahma' -Version '0.7.4' -ContentFn { Get-AhmaMainSkillContent }
+    Install-OneSkill -Name 'ahma' -Version '0.7.5' -ContentFn { Get-AhmaMainSkillContent }
 
     Write-Host ""
     Write-Host "  Skills are automatically available in:"

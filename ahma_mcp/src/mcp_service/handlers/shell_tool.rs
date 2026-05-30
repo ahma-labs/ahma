@@ -16,6 +16,62 @@ use std::sync::atomic::Ordering;
 use tracing;
 
 impl AhmaMcpService {
+    fn command_has_shell_metacharacters(command: &str) -> bool {
+        command
+            .chars()
+            .any(|c| matches!(c, '|' | ';' | '&' | '>' | '<' | '`' | '$' | '\n' | '\r'))
+    }
+
+    fn parse_rm_targets_from_command(command: &str) -> Option<Vec<String>> {
+        if Self::command_has_shell_metacharacters(command) {
+            return None;
+        }
+
+        let tokens: Vec<&str> = command.split_whitespace().collect();
+        let first = tokens.first().copied().unwrap_or_default();
+        if first != "rm" {
+            return None;
+        }
+
+        let targets: Vec<String> = tokens
+            .iter()
+            .skip(1)
+            .filter(|t| !t.starts_with('-'))
+            .map(|t| (*t).to_string())
+            .collect();
+
+        (!targets.is_empty()).then_some(targets)
+    }
+
+    async fn maybe_stage_run_terminal_rm(
+        &self,
+        command: &str,
+        working_directory: &str,
+    ) -> Result<Option<CallToolResult>, McpError> {
+        if self.task_vault_root().is_none() {
+            return Ok(None);
+        }
+
+        let Some(targets) = Self::parse_rm_targets_from_command(command) else {
+            return Ok(None);
+        };
+
+        let staged = self
+            .stage_paths_into_vault_trash(working_directory, &targets)
+            .map_err(|e| {
+                common::mcp_internal(format!("Failed to stage deletion to vault trash: {}", e))
+            })?;
+
+        for (original_path, trash_path) in &staged {
+            self.emit_vault_file_staged(original_path, trash_path).await;
+        }
+
+        Ok(Some(common::text_result(format!(
+            "Staged {} path(s) into vault trash instead of permanent delete.",
+            staged.len()
+        ))))
+    }
+
     /// Generates the specific input schema for the `run_terminal_command` tool.
     pub fn generate_input_schema_for_run_terminal_command(&self) -> Arc<Map<String, Value>> {
         let mut properties = Map::new();
@@ -82,6 +138,13 @@ impl AhmaMcpService {
             .unwrap_or_else(|| ".".to_string());
 
         let timeout = args.get("timeout_seconds").and_then(|v| v.as_u64());
+
+        if let Some(staged) = self
+            .maybe_stage_run_terminal_rm(&command, &working_directory)
+            .await?
+        {
+            return Ok(staged);
+        }
 
         // Extract optional log monitoring parameters
         let log_monitor_config = common::opt_str(&args, "monitor_level").map(|level_str| {
@@ -202,6 +265,21 @@ impl AhmaMcpService {
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let id = format!("op_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
+        let started_at = std::time::Instant::now();
+        self.emit_vault_tool_call(
+            &id,
+            "run_terminal_command",
+            &format!(
+                "{{\"working_directory\":\"{}\",\"command\":\"{}\"}}",
+                working_directory,
+                adapter_args
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+            ),
+        )
+        .await;
+
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
         let description = format!(
@@ -231,6 +309,10 @@ impl AhmaMcpService {
                 timeout,
                 Some(subcommand_config),
             )
+            .await;
+
+        let duration_ms = started_at.elapsed().as_millis() as u64;
+        self.emit_vault_tool_complete(&id, result.is_ok(), duration_ms)
             .await;
 
         if let Some(token) = progress_token {
@@ -273,6 +355,20 @@ impl AhmaMcpService {
         log_monitor_config: Option<crate::log_monitor::LogMonitorConfig>,
     ) -> Result<CallToolResult, McpError> {
         let id = format!("op_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
+        self.emit_vault_tool_call(
+            &id,
+            "run_terminal_command",
+            &format!(
+                "{{\"working_directory\":\"{}\",\"command\":\"{}\"}}",
+                working_directory,
+                adapter_args
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+            ),
+        )
+        .await;
+
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
         let callback: Option<Box<dyn CallbackSender>> = progress_token.map(|token| {
@@ -283,6 +379,7 @@ impl AhmaMcpService {
                 client_type,
             )) as Box<dyn CallbackSender>
         });
+        let callback = self.wrap_callback_with_vault_audit(callback, &id);
 
         let job_id = self
             .adapter
@@ -291,7 +388,7 @@ impl AhmaMcpService {
                 platform_shell_program(),
                 working_directory,
                 crate::adapter::AsyncExecOptions {
-                    id: Some(id),
+                    id: Some(id.clone()),
                     args: Some(adapter_args),
                     timeout,
                     callback,
@@ -315,6 +412,7 @@ impl AhmaMcpService {
                 Ok(common::text_result(message))
             }
             Err(e) => {
+                self.emit_vault_tool_complete(&id, false, 0).await;
                 let error_message = format!("Async execution failed: {}", e);
                 tracing::error!("{}", error_message);
                 Err(common::mcp_internal(error_message))

@@ -15,7 +15,7 @@ set -euo pipefail
 
 # Skill version — keep in sync with [workspace.package] version in Cargo.toml.
 # CI guardrails verify this matches. Bump via: cargo xtask bump-version X.Y.Z
-AHMA_VERSION="0.7.4"
+AHMA_VERSION="0.7.5"
 
 # Detect OS and Architecture
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -530,7 +530,7 @@ setup_mcp() {
     echo "  1) VS Code       (${VSCODE_MCP_PATH})"
     echo "  2) Claude Code   (${HOME}/.claude.json)"
     echo "  3) Cursor        (${HOME}/.cursor/mcp.json)"
-    echo "  4) Antigravity   (${HOME}/.antigravity/mcp.json)"
+    echo "  4) Antigravity   (${HOME}/.gemini/config/mcp_config.json)"
     echo "  5) Codex CLI     (${HOME}/.codex/config.toml)"
     echo ""
     printf "  Selection [default: 1,2,3,4,5 — all]: "
@@ -632,7 +632,7 @@ PYEOF
         _ahma_configure_platform "Cursor"      "${HOME}/.cursor/mcp.json"     "mcpServers" "standard"
     fi
     if _ahma_list_has "$PLATFORMS" 4; then
-        _ahma_configure_platform "Antigravity" "${HOME}/.antigravity/mcp.json" "mcpServers" "antigravity"
+        _ahma_configure_platform "Antigravity" "${HOME}/.gemini/config/mcp_config.json" "mcpServers" "antigravity"
     fi
     if _ahma_list_has "$PLATFORMS" 5; then
         _ahma_configure_codex
@@ -684,7 +684,7 @@ setup_terminal_hooks() {
     echo "  Managed terminal hooks rewrite shell/Bash tool calls so ahma becomes"
     echo "  the default wrapper in supported AI tools."
     echo ""
-    printf "Install user-scoped terminal hooks for Cursor, Claude Code, and Codex? [y/N]: "
+    printf "Install user-scoped terminal hooks for Cursor, Claude Code, Codex, and GitHub Copilot? [y/N]: "
     local CHOICE
     IFS= read -r CHOICE < /dev/tty
     case "$CHOICE" in
@@ -700,12 +700,13 @@ setup_terminal_hooks() {
     echo "  1) Cursor        (${HOME}/.cursor/hooks.json)"
     echo "  2) Claude Code   (${HOME}/.claude/settings.json)"
     echo "  3) Codex         (${HOME}/.codex/hooks.json)"
+    echo "  4) GitHub Copilot (${HOME}/.copilot/hooks/ahma.json)"
     echo ""
-    printf "  Selection [default: 1,2,3 — all]: "
+    printf "  Selection [default: 1,2,3,4 — all]: "
     local PLATFORMS
     IFS= read -r PLATFORMS < /dev/tty
     case "$PLATFORMS" in
-        ""|all|ALL|All) PLATFORMS="1,2,3" ;;
+        ""|all|ALL|All) PLATFORMS="1,2,3,4" ;;
     esac
 
     local -a PLATFORM_ARGS=()
@@ -722,6 +723,10 @@ setup_terminal_hooks() {
     if _ahma_list_has "$PLATFORMS" 3; then
         PLATFORM_ARGS+=(--platform codex)
         HOOK_TOOLS="${HOOK_TOOLS}|Codex"
+    fi
+    if _ahma_list_has "$PLATFORMS" 4; then
+        PLATFORM_ARGS+=(--platform copilot)
+        HOOK_TOOLS="${HOOK_TOOLS}|GitHub Copilot"
     fi
 
     if [ "${#PLATFORM_ARGS[@]}" -eq 0 ]; then

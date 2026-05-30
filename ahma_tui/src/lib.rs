@@ -1,10 +1,11 @@
-//! # ahma_tui — Terminal dashboard
+//! # ahma_tui — Terminal dashboard and chat interface
 //!
-//! A `ratatui`-based 4-pane terminal dashboard for monitoring and controlling
-//! active ahma operations without leaving the terminal.
+//! A `ratatui`-based terminal UI with two modes:
 //!
-//! Panels: AI Activity feed · Operations DAG · Detail · Log (filterable).
-//! Non-modal approval banner · `:` command palette · context-sensitive footer.
+//! * **Chat mode** (default) — multi-line input sends messages to a local LLM;
+//!   `/` opens a Claude Code-style command navigator for all ahma features.
+//! * **Monitor mode** — 4-pane dashboard for watching active operations,
+//!   viewing logs, and handling approval gates.
 //!
 //! ## License
 //!
@@ -13,7 +14,10 @@
 pub mod app;
 pub mod connection;
 pub mod keymap;
+pub mod llm_bridge;
+// pub mod mcp_client;
 pub mod mcp_source;
+pub mod session_config;
 pub mod state;
 pub mod theme;
 pub mod ui;

@@ -7,10 +7,16 @@
 mod common;
 
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
-use common::{TransportMode, setup_test_mcp_for_tools, spawn_test_server};
+use common::{
+    McpTestClient, TransportMode, setup_test_mcp_for_tools,
+    spawn_server_guard_with_config_extra_env, spawn_test_server,
+};
 use futures::StreamExt;
 use serde_json::json;
+use std::fs;
+use std::path::PathBuf;
 use std::time::Instant;
+use tempfile::TempDir;
 use tokio::time::sleep;
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
@@ -388,6 +394,141 @@ async fn test_tools_call_with_timeout_seconds_json() {
 #[tokio::test]
 async fn test_tools_call_with_timeout_seconds_sse() {
     run_tools_call_timeout(TransportMode::Sse).await;
+}
+
+async fn run_task_vault_inheritance_and_staged_delete(mode: TransportMode) {
+    let vault = TempDir::new().expect("failed to create vault temp dir");
+    let vault_root = vault.path().to_path_buf();
+    let workdir = vault_root.join("workdir");
+    let trash = vault_root.join("trash");
+    let audit_log = vault_root.join("audit.jsonl");
+
+    fs::create_dir_all(&workdir).expect("failed to create vault workdir");
+    fs::create_dir_all(&trash).expect("failed to create vault trash");
+    fs::write(&audit_log, "").expect("failed to init vault audit log");
+
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let tools_dir = workspace_root.join(".ahma");
+    if !tools_dir.exists() {
+        eprintln!(
+            "WARNING  skipping task-vault inheritance test: tools dir missing at {}",
+            tools_dir.display()
+        );
+        return;
+    }
+
+    let extra_env = vec![(
+        "AHMA_TASK_VAULT".to_string(),
+        vault_root.to_string_lossy().to_string(),
+    )];
+
+    let server = match spawn_server_guard_with_config_extra_env(
+        &tools_dir,
+        &workdir,
+        Some(
+            TestTimeouts::get(TimeoutCategory::Handshake)
+                .as_secs()
+                .max(1),
+        ),
+        &extra_env,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "WARNING  skipping task-vault inheritance test: failed to spawn server: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    let mut mcp = McpTestClient::with_url(&server.base_url()).with_transport(mode);
+    if let Err(e) = mcp
+        .initialize_with_roots("task-vault-coverage", std::slice::from_ref(&workdir))
+        .await
+    {
+        eprintln!(
+            "WARNING  skipping task-vault inheritance test: handshake failed: {}",
+            e
+        );
+        return;
+    }
+
+    let echo_result = mcp
+        .call_tool(
+            "run_terminal_command",
+            json!({
+                "command": "echo vault-audit",
+                "working_directory": workdir.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+    assert!(
+        echo_result.success,
+        "echo command should succeed: {:?}",
+        echo_result.error
+    );
+
+    let delete_target = workdir.join("to-delete.txt");
+    fs::write(&delete_target, "delete me").expect("failed to create delete target");
+
+    let rm_result = mcp
+        .call_tool(
+            "run_terminal_command",
+            json!({
+                "command": "rm to-delete.txt",
+                "working_directory": workdir.to_string_lossy().to_string(),
+            }),
+        )
+        .await;
+    assert!(
+        rm_result.success,
+        "rm command should succeed: {:?}",
+        rm_result.error
+    );
+
+    assert!(
+        !delete_target.exists(),
+        "original file should no longer exist in workdir"
+    );
+    let staged_entries: Vec<_> = fs::read_dir(&trash)
+        .expect("failed to list trash entries")
+        .filter_map(|entry| entry.ok())
+        .collect();
+    assert!(
+        !staged_entries.is_empty(),
+        "trash should contain at least one staged entry"
+    );
+
+    sleep(TestTimeouts::short_delay()).await;
+    let audit = fs::read_to_string(&audit_log).expect("failed to read audit log");
+    assert!(
+        audit.contains("\"type\":\"tool_call\""),
+        "audit log should contain tool_call events"
+    );
+    assert!(
+        audit.contains("\"type\":\"tool_complete\""),
+        "audit log should contain tool_complete events"
+    );
+    assert!(
+        audit.contains("\"type\":\"file_staged\""),
+        "audit log should contain file_staged events"
+    );
+}
+
+#[tokio::test]
+async fn test_task_vault_inheritance_and_staged_delete_json() {
+    run_task_vault_inheritance_and_staged_delete(TransportMode::Json).await;
+}
+
+#[tokio::test]
+async fn test_task_vault_inheritance_and_staged_delete_sse() {
+    run_task_vault_inheritance_and_staged_delete(TransportMode::Sse).await;
 }
 
 /// Test: notifications/initialized with Accept: text/event-stream.
