@@ -124,11 +124,12 @@ impl ChatHistory {
                 failed: entry_failed,
                 ..
             } = entry
-                && entry_id == id {
-                    *entry_result = Some(result);
-                    *entry_failed = failed;
-                    break;
-                }
+                && entry_id == id
+            {
+                *entry_result = Some(result);
+                *entry_failed = failed;
+                break;
+            }
         }
     }
 }

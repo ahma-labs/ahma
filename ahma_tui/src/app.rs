@@ -1024,9 +1024,10 @@ fn open_model_picker(state: &mut crate::state::AppState) {
     if state.available_models.is_empty() {
         let (base_url, _) = parse_llm_selection(state);
         if !base_url.is_empty()
-            && let Some(tx) = &state.bridge_tx {
-                spawn_model_refresh(base_url, tx.clone());
-            }
+            && let Some(tx) = &state.bridge_tx
+        {
+            spawn_model_refresh(base_url, tx.clone());
+        }
         push_assistant_message(state, "Fetching model list…");
         return;
     }
@@ -1185,9 +1186,10 @@ fn save_session(state: &crate::state::AppState) {
     };
 
     if let Ok(cwd) = std::env::current_dir()
-        && let Err(e) = cfg.save(&cwd) {
-            debug!("Failed to save session config: {e}");
-        }
+        && let Err(e) = cfg.save(&cwd)
+    {
+        debug!("Failed to save session config: {e}");
+    }
 }
 
 // ─── Bridge event handler ─────────────────────────────────────────────────────
@@ -1240,13 +1242,13 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
                 && let Some(provider) = providers
                     .iter()
                     .find(|provider| &provider.base_url == current_url)
-                {
-                    let model = state.selected_model();
-                    state.available_models = provider.models.clone();
-                    if !model.is_empty() {
-                        state.llm_label = format!("{} / {}", provider.name, model);
-                    }
+            {
+                let model = state.selected_model();
+                state.available_models = provider.models.clone();
+                if !model.is_empty() {
+                    state.llm_label = format!("{} / {}", provider.name, model);
                 }
+            }
         }
         BridgeEvent::ModelsRefreshed { base_url, models } => {
             if state.current_provider_url.as_deref() == Some(base_url.as_str())

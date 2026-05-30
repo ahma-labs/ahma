@@ -235,6 +235,7 @@ fn push_assistant_chat_lines(
 }
 
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
 fn push_tool_call_chat_lines(
     lines: &mut Vec<Line<'static>>,
     name: &str,
