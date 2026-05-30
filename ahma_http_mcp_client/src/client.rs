@@ -604,4 +604,11 @@ mod tests {
         assert_eq!(cloned.expires_in, token.expires_in);
         assert_eq!(cloned.scopes, token.scopes);
     }
+
+    #[test]
+    fn test_reqwest_http3_feature_is_available() {
+        // Assert that reqwest has the http3 feature enabled.
+        // If it is disabled, this will fail to compile.
+        let _ = reqwest::Client::builder().http3_prior_knowledge();
+    }
 }
