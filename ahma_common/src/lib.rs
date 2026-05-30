@@ -17,6 +17,7 @@
 //! bridges behave consistently regardless of the OS they are running on.
 
 pub mod config;
+pub mod daemon_hub;
 pub mod file_uri;
 pub mod local_tls;
 pub mod observability;

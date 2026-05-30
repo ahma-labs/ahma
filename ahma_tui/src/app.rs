@@ -39,6 +39,7 @@ async fn run_ratatui(connection: &ResolvedConnection) -> Result<()> {
 
     use crate::keymap::map_key;
     use crate::llm_bridge::{BridgeEvent, spawn_discovery_task};
+    use crate::daemon_source::spawn_daemon_source;
     use crate::mcp_source::{SourceEvent, spawn_mcp_source};
     use crate::state::AppState;
     use crate::theme::Theme;
@@ -54,7 +55,9 @@ async fn run_ratatui(connection: &ResolvedConnection) -> Result<()> {
     state.mcp_http_base_url = http_base_url(connection);
 
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<SourceEvent>(256);
-    spawn_mcp_source(connection.clone(), mcp_tx);
+    spawn_mcp_source(connection.clone(), mcp_tx.clone());
+    // Also subscribe to the hub daemon so stdio instances spawned by IDEs are visible.
+    spawn_daemon_source(mcp_tx);
 
     // Bridge channel carries both provider discovery results and LLM tokens.
     let (bridge_tx, mut bridge_rx) = mpsc::channel::<BridgeEvent>(512);

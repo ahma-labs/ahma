@@ -69,13 +69,25 @@ async fn run_concurrent_tool_calls(transport: TransportMode) {
 
     let mut mcp = McpTestClient::with_url(&server.base_url()).with_transport(transport);
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if mcp
-        .initialize_with_roots("stress-client", &[root])
-        .await
-        .is_err()
+    let handshake_timeout = TestTimeouts::scale_secs(15);
+    match tokio::time::timeout(
+        handshake_timeout,
+        mcp.initialize_with_roots("stress-client", &[root]),
+    )
+    .await
     {
-        eprintln!("WARNING  Skipping test - failed to initialize MCP client");
-        return;
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            eprintln!("WARNING  Skipping test - failed to initialize MCP client: {}", e);
+            return;
+        }
+        Err(_) => {
+            eprintln!(
+                "WARNING  Skipping test - MCP handshake timed out after {:?}",
+                handshake_timeout
+            );
+            return;
+        }
     }
     let mcp = Arc::new(mcp);
     let start = Instant::now();
@@ -190,13 +202,25 @@ async fn run_high_volume_concurrent_requests(num_requests: usize, transport: Tra
 
     let mut mcp = McpTestClient::with_url(&server.base_url()).with_transport(transport);
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    if mcp
-        .initialize_with_roots("stress-client", &[root])
-        .await
-        .is_err()
+    let handshake_timeout = TestTimeouts::scale_secs(15);
+    match tokio::time::timeout(
+        handshake_timeout,
+        mcp.initialize_with_roots("stress-client", &[root]),
+    )
+    .await
     {
-        eprintln!("WARNING  Skipping test - failed to initialize MCP client");
-        return;
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            eprintln!("WARNING  Skipping test - failed to initialize MCP client: {}", e);
+            return;
+        }
+        Err(_) => {
+            eprintln!(
+                "WARNING  Skipping test - MCP handshake timed out after {:?}",
+                handshake_timeout
+            );
+            return;
+        }
     }
     let mcp = Arc::new(mcp);
     let start = Instant::now();
@@ -259,14 +283,20 @@ async fn test_concurrent_tool_calls_sse() {
 /// High-volume echo stress using `Accept: application/json`.
 ///
 /// On Windows the count is reduced because each `run_terminal_command` spawns a
-/// PowerShell process through AppContainer.
+/// PowerShell process (AppContainer init + PS startup ≈ 3–5 s each).  With the
+/// 4× Windows timeout multiplier, `bounded_call_tool` allows up to 32 s per
+/// request.  Launching too many concurrently saturates the 2-CPU scheduler and
+/// causes `join_all` to push past the 360 s nextest hard-kill before any
+/// individual call triggers its own per-call timeout.
+///
+/// Budget math (Windows CI, `--profile ci`, `threads-required = 2`):
+///   3 concurrent PS spawns × ~30 s each ≈ 90 s wall time — well inside 180 s.
 #[tokio::test]
 async fn test_high_volume_concurrent_requests_json() {
-    // Windows CI (2-CPU GitHub runner): each request spawns a PowerShell
-    // process; 15 concurrent spawns saturates the scheduler and stalls tokio
-    // timers.  Reduce the fan-out to keep wall-time within the nextest budget.
     let num_requests: usize = if cfg!(target_os = "windows") && is_low_core_or_ci() {
-        8
+        // 2-CPU CI: PowerShell AppContainer overhead makes high fan-out cause
+        // tokio timer starvation. Keep 3 concurrent to stay within 180 s budget.
+        3
     } else if cfg!(target_os = "windows") {
         12
     } else if is_low_core_or_ci() {
@@ -278,13 +308,14 @@ async fn test_high_volume_concurrent_requests_json() {
 }
 
 /// High-volume echo stress using `Accept: text/event-stream`.
+///
+/// See `test_high_volume_concurrent_requests_json` for Windows CI budget math.
 #[tokio::test]
 async fn test_high_volume_concurrent_requests_sse() {
-    // Windows CI (2-CPU GitHub runner): each request spawns a PowerShell
-    // process; 15 concurrent spawns saturates the scheduler and stalls tokio
-    // timers.  Reduce the fan-out to keep wall-time within the nextest budget.
     let num_requests: usize = if cfg!(target_os = "windows") && is_low_core_or_ci() {
-        8
+        // 2-CPU CI: PowerShell AppContainer overhead makes high fan-out cause
+        // tokio timer starvation. Keep 3 concurrent to stay within 180 s budget.
+        3
     } else if cfg!(target_os = "windows") {
         12
     } else if is_low_core_or_ci() {

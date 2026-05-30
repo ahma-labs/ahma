@@ -151,7 +151,7 @@ jobs:
           echo "SCCACHE_GHA_CACHE_FROM=${CACHE_FROM}" >> "$GITHUB_ENV"
 
       - name: Expose GitHub Actions cache environment variables for sccache
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -308,7 +308,7 @@ jobs:
           echo "SCCACHE_GHA_CACHE_FROM=sccache-macOS-ARM64-android-day${{ steps.day-number.outputs.day }},sccache-macOS-ARM64-android-day,sccache-macOS-ARM64-test-day" >> "$GITHUB_ENV"
 
       - name: Expose GitHub Actions cache environment variables for sccache
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -434,7 +434,7 @@ jobs:
           echo "SCCACHE_GHA_CACHE_FROM=sccache-Linux-X64-coverage-day${{ steps.day-number.outputs.day }},sccache-Linux-X64-coverage-day,sccache-Linux-X64-test-day" >> "$GITHUB_ENV"
 
       - name: Expose GitHub Actions cache environment variables for sccache
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -637,7 +637,7 @@ jobs:
 
       - name: Expose GitHub Actions cache environment variables for sccache
         if: "!matrix.use_cross"
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');

@@ -13,6 +13,7 @@
 
 pub mod app;
 pub mod connection;
+pub mod daemon_source;
 pub mod keymap;
 pub mod llm_bridge;
 // pub mod mcp_client;

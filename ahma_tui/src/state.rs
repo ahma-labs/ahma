@@ -497,6 +497,10 @@ pub struct Operation {
     pub stdout_tail: VecDeque<String>,
     pub pid: Option<u32>,
     pub pinned: bool,
+    /// UUID of the ahma instance this operation belongs to (set for daemon-sourced ops).
+    pub instance_id: Option<String>,
+    /// Short human-readable label for the owning instance (e.g. `"VS Code"`).
+    pub instance_label: Option<String>,
 }
 
 impl Operation {
@@ -512,6 +516,8 @@ impl Operation {
             stdout_tail: VecDeque::with_capacity(STDOUT_TAIL_CAP),
             pid: None,
             pinned: false,
+            instance_id: None,
+            instance_label: None,
         }
     }
 

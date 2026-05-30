@@ -8,7 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-coverage = ["dep:serde_json"]
+coverage = []
 
 [dependencies]
 anyhow.workspace = true
@@ -18,8 +18,8 @@ opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["sync"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "net", "time", "io-util", "process"] }
 toml.workspace = true
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }

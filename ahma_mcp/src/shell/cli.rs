@@ -629,6 +629,13 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in setup mode");
             crate::setup::run(args).await
         }
+        Subcommands::Daemon(_) => {
+            anyhow::bail!(
+                "daemon is provided by the ahma_bin crate. \
+                 If you are running a custom binary, implement daemon dispatch \
+                 using ahma_common::daemon_hub::run_daemon."
+            )
+        }
     }
 }
 
@@ -772,6 +779,13 @@ pub enum Subcommands {
     Update(crate::update::UpdateArgs),
     /// Run the interactive or automated setup wizard.
     Setup(SetupArgs),
+    /// Start the TUI hub daemon for multi-instance aggregation.
+    ///
+    /// The daemon is a lightweight process that collects operation events from
+    /// all running ahma instances (including stdio processes spawned by IDEs)
+    /// and fans them out to TUI subscribers.  It is started automatically on
+    /// first use and exits automatically after 60 s of idle.
+    Daemon(DaemonArgs),
 }
 
 /// Arguments for `ahma setup`.
@@ -797,6 +811,13 @@ pub struct SetupArgs {
     #[arg(long = "tls")]
     pub tls: bool,
 }
+
+/// Arguments for `ahma daemon`.
+///
+/// Currently no flags are needed; the daemon is configured entirely via
+/// environment variables (`AHMA_DAEMON_SOCK`).
+#[derive(clap::Args, Debug, Clone)]
+pub struct DaemonArgs {}
 
 // ── serve ────────────────────────────────────────────────────────────────────
 
