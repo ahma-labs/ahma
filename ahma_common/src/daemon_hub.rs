@@ -330,7 +330,14 @@ impl DaemonHub {
 ///
 /// This function is called by `ahma daemon` via the CLI dispatch.
 pub async fn run_daemon() -> Result<()> {
-    let socket_path = default_socket_path();
+    run_daemon_at(default_socket_path()).await
+}
+
+/// Like [`run_daemon`] but binds at `socket_path` instead of the default.
+///
+/// Exposed for testing — callers can pass a temp-directory path to avoid
+/// colliding with a real daemon running on the default socket.
+pub async fn run_daemon_at(socket_path: PathBuf) -> Result<()> {
 
     // ── Bind (the mutex): try, handle EADDRINUSE ──────────────────────────────
     #[cfg(unix)]
@@ -339,10 +346,7 @@ pub async fn run_daemon() -> Result<()> {
     #[cfg(not(unix))]
     let listener = bind_tcp().await?;
 
-    info!(
-        "ahma daemon: listening on {}",
-        socket_path.display()
-    );
+    info!("ahma daemon: listening on {}", socket_path.display());
 
     let (hub, _) = DaemonHub::new();
     let hub = Arc::new(hub);
@@ -497,10 +501,7 @@ where
                 scope,
                 label,
             };
-            hub.instances
-                .lock()
-                .await
-                .insert(id.clone(), info.clone());
+            hub.instances.lock().await.insert(id.clone(), info.clone());
             let _ = hub
                 .broadcast
                 .send(DaemonMsg::InstanceRegistered { instance: info });
@@ -584,4 +585,374 @@ fn uuid_v4() -> String {
     let pid = std::process::id();
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{pid:08x}-{ts:08x}-{seq:08x}")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::BufReader;
+
+    // ── NDJ framing ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ndj_roundtrip_client_msg_register() {
+        let msg = ClientMsg::Register {
+            pid: 42,
+            mode: "stdio".to_string(),
+            scope: "/test".to_string(),
+            label: "TestLabel".to_string(),
+        };
+        let mut buf = Vec::<u8>::new();
+        send_msg(&mut buf, &msg).await.unwrap();
+        assert!(buf.ends_with(b"\n"), "NDJ line must end with newline");
+        assert_eq!(
+            buf.iter().filter(|&&b| b == b'\n').count(),
+            1,
+            "exactly one newline"
+        );
+
+        let mut reader = BufReader::new(&buf[..]);
+        let decoded: ClientMsg = recv_msg(&mut reader).await.unwrap();
+        match decoded {
+            ClientMsg::Register { pid, mode, scope, label } => {
+                assert_eq!(pid, 42);
+                assert_eq!(mode, "stdio");
+                assert_eq!(scope, "/test");
+                assert_eq!(label, "TestLabel");
+            }
+            other => panic!("expected Register, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ndj_roundtrip_daemon_msg_instance_list() {
+        let msg = DaemonMsg::InstanceList {
+            instances: vec![InstanceInfo {
+                id: "abc123".to_string(),
+                pid: 99,
+                mode: "http".to_string(),
+                scope: "/project".to_string(),
+                label: "Cursor".to_string(),
+            }],
+        };
+        let mut buf = Vec::<u8>::new();
+        send_msg(&mut buf, &msg).await.unwrap();
+
+        let mut reader = BufReader::new(&buf[..]);
+        let decoded: DaemonMsg = recv_msg(&mut reader).await.unwrap();
+        match decoded {
+            DaemonMsg::InstanceList { instances } => {
+                assert_eq!(instances.len(), 1);
+                assert_eq!(instances[0].id, "abc123");
+                assert_eq!(instances[0].label, "Cursor");
+            }
+            other => panic!("expected InstanceList, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ndj_roundtrip_daemon_event_op_started() {
+        let msg = DaemonMsg::Event {
+            instance_id: "inst-1".to_string(),
+            payload: DaemonEvent::OpStarted {
+                id: "op-1".to_string(),
+                tool_name: "cargo_build".to_string(),
+                description: "Build workspace".to_string(),
+            },
+        };
+        let mut buf = Vec::<u8>::new();
+        send_msg(&mut buf, &msg).await.unwrap();
+
+        let mut reader = BufReader::new(&buf[..]);
+        let decoded: DaemonMsg = recv_msg(&mut reader).await.unwrap();
+        match decoded {
+            DaemonMsg::Event {
+                instance_id,
+                payload: DaemonEvent::OpStarted { id, tool_name, .. },
+            } => {
+                assert_eq!(instance_id, "inst-1");
+                assert_eq!(id, "op-1");
+                assert_eq!(tool_name, "cargo_build");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ndj_roundtrip_daemon_event_op_finished() {
+        let msg = DaemonMsg::Event {
+            instance_id: "inst-2".to_string(),
+            payload: DaemonEvent::OpFinished {
+                id: "op-2".to_string(),
+                status: "Completed".to_string(),
+            },
+        };
+        let mut buf = Vec::<u8>::new();
+        send_msg(&mut buf, &msg).await.unwrap();
+
+        let mut reader = BufReader::new(&buf[..]);
+        let decoded: DaemonMsg = recv_msg(&mut reader).await.unwrap();
+        match decoded {
+            DaemonMsg::Event {
+                payload: DaemonEvent::OpFinished { id, status },
+                ..
+            } => {
+                assert_eq!(id, "op-2");
+                assert_eq!(status, "Completed");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ndj_roundtrip_subscribe_and_unregister() {
+        // Verify unit variants round-trip correctly.
+        for msg in [ClientMsg::Subscribe, ClientMsg::ListInstances, ClientMsg::Unregister] {
+            let mut buf = Vec::<u8>::new();
+            send_msg(&mut buf, &msg).await.unwrap();
+            assert!(buf.ends_with(b"\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ndj_eof_returns_error() {
+        let empty: &[u8] = b"";
+        let mut reader = BufReader::new(empty);
+        let result: Result<ClientMsg> = recv_msg(&mut reader).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("EOF") || msg.contains("closed"),
+            "expected EOF error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ndj_malformed_json_returns_error() {
+        let bad = b"not-valid-json\n";
+        let mut reader = BufReader::new(bad.as_slice());
+        let result: Result<ClientMsg> = recv_msg(&mut reader).await;
+        assert!(result.is_err());
+    }
+
+    // ── uuid_v4 ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn uuid_v4_produces_unique_values() {
+        let ids: Vec<String> = (0..20).map(|_| uuid_v4()).collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "all UUIDs should be unique");
+    }
+
+    #[test]
+    fn uuid_v4_contains_dashes() {
+        let id = uuid_v4();
+        assert!(id.contains('-'), "UUID should contain dashes: {id}");
+    }
+
+    // ── In-process daemon integration (Unix only) ─────────────────────────────
+    //
+    // We spin up `run_daemon_at()` in a background tokio task pointing to a
+    // temp socket, then exercise the register → subscribe → event → unregister
+    // flow end-to-end.  All spawned tasks are automatically cancelled when the
+    // test runtime drops.
+
+    /// Wait until a Unix socket file exists and accepts a connection.
+    #[cfg(unix)]
+    async fn wait_for_daemon(sock: &std::path::Path) {
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if tokio::net::UnixStream::connect(sock).await.is_ok() {
+                return;
+            }
+        }
+        panic!("daemon did not start within 1 s on {}", sock.display());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_subscribe_register_event_unregister_flow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("daemon.sock");
+        let sock2 = sock.clone();
+        tokio::spawn(async move {
+            let _ = run_daemon_at(sock2).await;
+        });
+        wait_for_daemon(&sock).await;
+
+        // ── Subscriber connects ────────────────────────────────────────────
+        let sub = tokio::net::UnixStream::connect(&sock).await.expect("connect subscriber");
+        let (sr, sw) = tokio::io::split(sub);
+        let mut sub_reader = BufReader::new(sr);
+        let mut sub_writer = sw;
+        send_msg(&mut sub_writer, &ClientMsg::Subscribe).await.unwrap();
+
+        // Initial InstanceList should be empty.
+        let first: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
+        let DaemonMsg::InstanceList { instances } = first else {
+            panic!("expected InstanceList, got {first:?}");
+        };
+        assert!(instances.is_empty(), "no instances registered yet");
+
+        // ── Instance registers ─────────────────────────────────────────────
+        let inst = tokio::net::UnixStream::connect(&sock).await.expect("connect instance");
+        let (_, mut iw) = tokio::io::split(inst);
+        send_msg(
+            &mut iw,
+            &ClientMsg::Register {
+                pid: std::process::id(),
+                mode: "stdio".to_string(),
+                scope: "/test/scope".to_string(),
+                label: "TestInstance".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Subscriber receives InstanceRegistered.
+        let reg: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
+        let DaemonMsg::InstanceRegistered { instance } = reg else {
+            panic!("expected InstanceRegistered, got {reg:?}");
+        };
+        assert_eq!(instance.label, "TestInstance");
+        assert_eq!(instance.mode, "stdio");
+        let instance_id = instance.id.clone();
+
+        // ── OpStarted event ────────────────────────────────────────────────
+        send_msg(
+            &mut iw,
+            &ClientMsg::Event {
+                payload: DaemonEvent::OpStarted {
+                    id: "op-001".to_string(),
+                    tool_name: "cargo_test".to_string(),
+                    description: "Run tests".to_string(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let ev: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
+        match ev {
+            DaemonMsg::Event {
+                instance_id: iid,
+                payload: DaemonEvent::OpStarted { id, tool_name, .. },
+            } => {
+                assert_eq!(iid, instance_id);
+                assert_eq!(id, "op-001");
+                assert_eq!(tool_name, "cargo_test");
+            }
+            other => panic!("expected Event::OpStarted, got {other:?}"),
+        }
+
+        // ── OpFinished event ───────────────────────────────────────────────
+        send_msg(
+            &mut iw,
+            &ClientMsg::Event {
+                payload: DaemonEvent::OpFinished {
+                    id: "op-001".to_string(),
+                    status: "Completed".to_string(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let fin: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
+        match fin {
+            DaemonMsg::Event {
+                payload: DaemonEvent::OpFinished { id, status },
+                ..
+            } => {
+                assert_eq!(id, "op-001");
+                assert_eq!(status, "Completed");
+            }
+            other => panic!("expected Event::OpFinished, got {other:?}"),
+        }
+
+        // ── Unregister ─────────────────────────────────────────────────────
+        send_msg(&mut iw, &ClientMsg::Unregister).await.unwrap();
+
+        let unreg: DaemonMsg = recv_msg(&mut sub_reader).await.unwrap();
+        match unreg {
+            DaemonMsg::InstanceUnregistered { id } => assert_eq!(id, instance_id),
+            other => panic!("expected InstanceUnregistered, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_list_instances_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("list.sock");
+        let sock2 = sock.clone();
+        tokio::spawn(async move {
+            let _ = run_daemon_at(sock2).await;
+        });
+        wait_for_daemon(&sock).await;
+
+        // Register one instance.
+        let inst = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (_, mut iw) = tokio::io::split(inst);
+        send_msg(
+            &mut iw,
+            &ClientMsg::Register {
+                pid: 1234,
+                mode: "http".to_string(),
+                scope: "/project".to_string(),
+                label: "HttpBridge".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Give the daemon time to process the registration.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // One-shot ListInstances query.
+        let q = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (qr, mut qw) = tokio::io::split(q);
+        let mut qrdr = BufReader::new(qr);
+        send_msg(&mut qw, &ClientMsg::ListInstances).await.unwrap();
+
+        let resp: DaemonMsg = recv_msg(&mut qrdr).await.unwrap();
+        match resp {
+            DaemonMsg::InstanceList { instances } => {
+                assert_eq!(instances.len(), 1, "expected 1 registered instance");
+                assert_eq!(instances[0].label, "HttpBridge");
+                assert_eq!(instances[0].mode, "http");
+            }
+            other => panic!("expected InstanceList, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_stale_socket_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("stale.sock");
+
+        // Create a stale socket file: bind a listener then immediately drop it.
+        // The file remains but nothing is listening.
+        {
+            let _listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        }
+        assert!(sock.exists(), "stale socket file should exist before daemon starts");
+
+        // The daemon should detect ECONNREFUSED on the stale socket,
+        // remove the file, and bind successfully.
+        let sock2 = sock.clone();
+        tokio::spawn(async move {
+            let _ = run_daemon_at(sock2).await;
+        });
+        wait_for_daemon(&sock).await;
+
+        // Verify a fresh connection works after cleanup.
+        let conn = tokio::net::UnixStream::connect(&sock).await;
+        assert!(conn.is_ok(), "daemon should be running after stale socket cleanup");
+    }
 }

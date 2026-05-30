@@ -255,3 +255,217 @@ fn parse_op_status(s: &str) -> OpStatus {
         _ => OpStatus::Failed, // TimedOut → Failed for display
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ahma_common::daemon_hub::{DaemonEvent, DaemonMsg, InstanceInfo};
+    use crate::state::OpStatus;
+
+    fn inst(id: &str, label: &str) -> InstanceInfo {
+        InstanceInfo {
+            id: id.to_string(),
+            pid: 1,
+            mode: "stdio".to_string(),
+            scope: "/test".to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    // ── DaemonState structural mutations ──────────────────────────────────────
+
+    #[test]
+    fn add_and_remove_instance() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "VS Code"));
+        assert_eq!(s.instances.len(), 1);
+        assert!(s.ops.contains_key("i1"));
+
+        s.remove_instance("i1");
+        assert!(s.instances.is_empty());
+        assert!(s.ops.is_empty());
+    }
+
+    #[test]
+    fn remove_unknown_instance_is_noop() {
+        let mut s = DaemonState::new();
+        // Should not panic.
+        s.remove_instance("nonexistent");
+        assert!(s.instances.is_empty());
+    }
+
+    #[test]
+    fn op_started_sets_running_with_instance_metadata() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Cursor"));
+        s.on_op_started("i1", "op-1".to_string(), "cargo_build".to_string(), "Build".to_string());
+
+        let ops = s.all_ops();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].status, OpStatus::Running);
+        assert_eq!(ops[0].instance_label, Some("Cursor".to_string()));
+        assert_eq!(ops[0].instance_id, Some("i1".to_string()));
+        assert_eq!(ops[0].tool_name, "cargo_build");
+    }
+
+    #[test]
+    fn op_finished_updates_status() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Test"));
+        s.on_op_started("i1", "op-1".to_string(), "tool".to_string(), "".to_string());
+        s.on_op_finished("i1", "op-1", "Completed");
+
+        let ops = s.all_ops();
+        assert_eq!(ops[0].status, OpStatus::Succeeded);
+    }
+
+    #[test]
+    fn op_finished_on_unknown_op_is_noop() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Test"));
+        // Should not panic.
+        s.on_op_finished("i1", "nonexistent-op", "Completed");
+    }
+
+    #[test]
+    fn all_ops_running_sorted_before_terminal() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Test"));
+        s.on_op_started("i1", "op-a".to_string(), "tool".to_string(), "".to_string());
+        s.on_op_started("i1", "op-b".to_string(), "tool".to_string(), "".to_string());
+        s.on_op_finished("i1", "op-a", "Completed");
+
+        let ops = s.all_ops();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].status, OpStatus::Running, "running first; got {:?}", ops[0].id);
+    }
+
+    #[test]
+    fn all_ops_spans_multiple_instances() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "VS Code"));
+        s.add_instance(inst("i2", "Cursor"));
+        s.on_op_started("i1", "op-x".to_string(), "tool".to_string(), "".to_string());
+        s.on_op_started("i2", "op-y".to_string(), "tool".to_string(), "".to_string());
+        assert_eq!(s.all_ops().len(), 2);
+    }
+
+    #[test]
+    fn prune_terminal_removes_non_running() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Test"));
+        s.on_op_started("i1", "op-1".to_string(), "tool".to_string(), "".to_string());
+        s.on_op_started("i1", "op-2".to_string(), "tool".to_string(), "".to_string());
+        s.on_op_finished("i1", "op-2", "Failed");
+
+        s.prune_terminal();
+        let ops = s.all_ops();
+        assert_eq!(ops.len(), 1, "only running op remains");
+        assert_eq!(ops[0].id, "op-1");
+    }
+
+    #[test]
+    fn prune_terminal_keeps_pending() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Test"));
+        let mut op = Operation::new("op-p", "tool", OpStatus::Pending);
+        op.instance_id = Some("i1".to_string());
+        s.ops.entry("i1".to_string()).or_default().insert("op-p".to_string(), op);
+
+        s.prune_terminal();
+        assert_eq!(s.all_ops().len(), 1, "Pending ops survive prune");
+    }
+
+    // ── apply_msg routing ─────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_msg_instance_list_initial_snapshot() {
+        let mut s = DaemonState::new();
+        let changed = apply_msg(&mut s, DaemonMsg::InstanceList {
+            instances: vec![inst("i1", "IDE")],
+        });
+        assert!(changed, "InstanceList should flag change");
+        assert_eq!(s.instances.len(), 1);
+    }
+
+    #[test]
+    fn apply_msg_empty_instance_list_signals_change() {
+        // Empty InstanceList = "daemon connected" signal → changed = true.
+        let mut s = DaemonState::new();
+        let changed = apply_msg(&mut s, DaemonMsg::InstanceList { instances: vec![] });
+        assert!(changed, "empty InstanceList is still a change (daemon-connected signal)");
+    }
+
+    #[test]
+    fn apply_msg_instance_registered() {
+        let mut s = DaemonState::new();
+        let changed = apply_msg(&mut s, DaemonMsg::InstanceRegistered { instance: inst("i2", "IDE") });
+        assert!(changed);
+        assert!(s.instances.contains_key("i2"));
+    }
+
+    #[test]
+    fn apply_msg_instance_unregistered() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i3", "X"));
+        let changed = apply_msg(&mut s, DaemonMsg::InstanceUnregistered { id: "i3".to_string() });
+        assert!(changed);
+        assert!(s.instances.is_empty());
+    }
+
+    #[test]
+    fn apply_msg_op_started_then_finished() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Test"));
+
+        let c1 = apply_msg(&mut s, DaemonMsg::Event {
+            instance_id: "i1".to_string(),
+            payload: DaemonEvent::OpStarted {
+                id: "op-1".to_string(),
+                tool_name: "tool".to_string(),
+                description: "".to_string(),
+            },
+        });
+        assert!(c1);
+        assert_eq!(s.all_ops().len(), 1);
+
+        let c2 = apply_msg(&mut s, DaemonMsg::Event {
+            instance_id: "i1".to_string(),
+            payload: DaemonEvent::OpFinished {
+                id: "op-1".to_string(),
+                status: "Completed".to_string(),
+            },
+        });
+        assert!(c2);
+        assert_eq!(s.all_ops()[0].status, OpStatus::Succeeded);
+    }
+
+    #[test]
+    fn apply_msg_log_line_returns_false() {
+        let mut s = DaemonState::new();
+        let changed = apply_msg(&mut s, DaemonMsg::Event {
+            instance_id: "x".to_string(),
+            payload: DaemonEvent::LogLine {
+                level: "info".to_string(),
+                message: "hello".to_string(),
+            },
+        });
+        assert!(!changed, "LogLine should not trigger state change");
+    }
+
+    // ── parse_op_status ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_op_status_all_variants() {
+        assert_eq!(parse_op_status("Completed"), OpStatus::Succeeded);
+        assert_eq!(parse_op_status("Failed"), OpStatus::Failed);
+        assert_eq!(parse_op_status("Cancelled"), OpStatus::Cancelled);
+        assert_eq!(parse_op_status("TimedOut"), OpStatus::Failed, "TimedOut → Failed");
+        assert_eq!(parse_op_status("Unknown"), OpStatus::Failed, "Unknown → Failed");
+        assert_eq!(parse_op_status(""), OpStatus::Failed, "empty → Failed");
+    }
+}
