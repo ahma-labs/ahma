@@ -303,7 +303,7 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
     }
 }
 
-fn run_install(args: HooksInstallArgs) -> Result<()> {
+pub fn run_install(args: HooksInstallArgs) -> Result<()> {
     let env = HookEnvironment::detect()?;
 
     for platform in selected_platforms(&args.platforms) {
@@ -331,41 +331,51 @@ fn run_uninstall(args: HooksUninstallArgs) -> Result<()> {
     let env = HookEnvironment::detect()?;
 
     for platform in selected_platforms(&args.platforms) {
-        let path = env.config_path(platform, args.scope);
-        if !path.exists() {
-            println!(
-                "{} {} hook not installed (missing {})",
-                platform.label(),
-                args.scope.label(),
-                path.display()
-            );
-            continue;
-        }
-
-        let mut document = load_hook_document(&path)?;
-        let before = document.clone();
-        let changed = uninstall_platform_hook(&mut document, platform)?;
-
-        if !changed {
-            println!(
-                "{} {} hook already absent at {}",
-                platform.label(),
-                args.scope.label(),
-                path.display()
-            );
-            continue;
-        }
-
-        let action = write_hook_document(&path, &before, &document, args.dry_run, true)?;
-        println!(
-            "{} {} hook {} at {}",
-            platform.label(),
-            args.scope.label(),
-            action_message(action, args.dry_run),
-            path.display()
-        );
+        uninstall_single_platform_hook(platform, args.scope, args.dry_run, &env)?;
     }
 
+    Ok(())
+}
+
+fn uninstall_single_platform_hook(
+    platform: HookPlatform,
+    scope: HookScope,
+    dry_run: bool,
+    env: &HookEnvironment,
+) -> Result<()> {
+    let path = env.config_path(platform, scope);
+    if !path.exists() {
+        println!(
+            "{} {} hook not installed (missing {})",
+            platform.label(),
+            scope.label(),
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let mut document = load_hook_document(&path)?;
+    let before = document.clone();
+    let changed = uninstall_platform_hook(&mut document, platform)?;
+
+    if !changed {
+        println!(
+            "{} {} hook already absent at {}",
+            platform.label(),
+            scope.label(),
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let action = write_hook_document(&path, &before, &document, dry_run, true)?;
+    println!(
+        "{} {} hook {} at {}",
+        platform.label(),
+        scope.label(),
+        action_message(action, dry_run),
+        path.display()
+    );
     Ok(())
 }
 
@@ -1079,12 +1089,14 @@ fn write_hook_document(
         return Ok(FileAction::Unchanged);
     }
 
+    let action = if existed {
+        FileAction::Updated
+    } else {
+        FileAction::Created
+    };
+
     if dry_run {
-        return Ok(if existed {
-            FileAction::Updated
-        } else {
-            FileAction::Created
-        });
+        return Ok(action);
     }
 
     let parent = path
@@ -1093,18 +1105,29 @@ fn write_hook_document(
     fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
 
     if existed {
-        let backup = backup_path(path)?;
-        fs::copy(path, &backup).with_context(|| {
-            format!(
-                "Failed to create backup {} before updating hook config",
-                backup.display()
-            )
-        })?;
+        backup_existing_hook(path)?;
     }
 
+    persist_json_file(path, parent, after)?;
+
+    Ok(action)
+}
+
+fn backup_existing_hook(path: &Path) -> Result<()> {
+    let backup = backup_path(path)?;
+    fs::copy(path, &backup).with_context(|| {
+        format!(
+            "Failed to create backup {} before updating hook config",
+            backup.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn persist_json_file(path: &Path, parent: &Path, value: &Value) -> Result<()> {
     let mut temp = NamedTempFile::new_in(parent)
         .with_context(|| format!("Failed to create temp file in {}", parent.display()))?;
-    let formatted = serde_json::to_string_pretty(after)?;
+    let formatted = serde_json::to_string_pretty(value)?;
     temp.write_all(formatted.as_bytes())?;
     temp.write_all(b"\n")?;
     temp.flush()?;
@@ -1115,12 +1138,7 @@ fn write_hook_document(
             error.error
         )
     })?;
-
-    Ok(if existed {
-        FileAction::Updated
-    } else {
-        FileAction::Created
-    })
+    Ok(())
 }
 
 fn backup_path(path: &Path) -> Result<PathBuf> {

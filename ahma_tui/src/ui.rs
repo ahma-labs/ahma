@@ -74,20 +74,18 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
 #[cfg(feature = "tui")]
 fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let mcp_label = if state.mcp_enabled {
-        if state.unicode {
-            " · MCP ✓"
-        } else {
-            " · MCP on"
-        }
-    } else {
-        ""
+    let mcp_label = match (state.mcp_enabled, state.unicode) {
+        (true, true) => " · MCP ✓",
+        (true, false) => " · MCP on",
+        (false, _) => "",
     };
-    let health_span = if state.server_healthy {
-        Span::styled(if state.unicode { " ● " } else { " * " }, theme.healthy())
-    } else {
-        Span::styled(if state.unicode { " ○ " } else { " - " }, theme.unhealthy())
+    let (health_char, health_style) = match (state.server_healthy, state.unicode) {
+        (true, true) => (" ● ", theme.healthy()),
+        (true, false) => (" * ", theme.healthy()),
+        (false, true) => (" ○ ", theme.unhealthy()),
+        (false, false) => (" - ", theme.unhealthy()),
     };
+    let health_span = Span::styled(health_char, health_style);
 
     let line = Line::from(vec![
         Span::styled(" ahma chat", theme.title()),
@@ -211,10 +209,10 @@ fn push_assistant_chat_lines(
     state: &AppState,
     theme: &Theme,
 ) {
-    let cursor = if streaming {
-        if state.unicode { "▌" } else { "|" }
-    } else {
-        ""
+    let cursor = match (streaming, state.unicode) {
+        (true, true) => "▌",
+        (true, false) => "|",
+        (false, _) => "",
     };
     let display = format!("{content}{cursor}");
 
@@ -227,9 +225,10 @@ fn push_assistant_chat_lines(
     }
 
     if display.is_empty() && streaming {
+        let empty_cursor = if state.unicode { "▌" } else { "|" };
         lines.push(Line::from(vec![
             Span::styled(" ahma ", theme.running()),
-            Span::styled(if state.unicode { "▌" } else { "|" }, theme.dim()),
+            Span::styled(empty_cursor, theme.dim()),
         ]));
     }
 }
@@ -295,6 +294,22 @@ fn chat_history_scroll_offset(total: usize, visible_h: usize, from_bottom: usize
 }
 
 #[cfg(feature = "tui")]
+fn insert_input_cursor(lines: &mut Vec<String>, row: usize, col: usize, unicode: bool) {
+    let cursor = if unicode { '│' } else { '|' };
+    if let Some(line) = lines.get_mut(row) {
+        let insert_at = col.min(line.chars().count());
+        let byte_idx = line
+            .char_indices()
+            .nth(insert_at)
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| line.len());
+        line.insert(byte_idx, cursor);
+    } else {
+        lines.push(cursor.to_string());
+    }
+}
+
+#[cfg(feature = "tui")]
 fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Chat;
     let border_style = if focused {
@@ -319,18 +334,7 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     let (cursor_row, cursor_col) = state.chat_input.cursor();
     let mut rendered_lines: Vec<String> = state.chat_input.lines().to_vec();
     if focused {
-        let cursor = if state.unicode { '│' } else { '|' };
-        if let Some(line) = rendered_lines.get_mut(cursor_row) {
-            let insert_at = cursor_col.min(line.chars().count());
-            let byte_idx = line
-                .char_indices()
-                .nth(insert_at)
-                .map(|(idx, _)| idx)
-                .unwrap_or_else(|| line.len());
-            line.insert(byte_idx, cursor);
-        } else {
-            rendered_lines.push(cursor.to_string());
-        }
+        insert_input_cursor(&mut rendered_lines, cursor_row, cursor_col, state.unicode);
     }
 
     let text = rendered_lines.join("\n");
@@ -436,13 +440,10 @@ fn draw_navigator(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
 
     // Separator.
     let sep_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+    let sep_char = if state.unicode { "─" } else { "-" };
     frame.render_widget(
         Paragraph::new(Span::styled(
-            if state.unicode {
-                "─".repeat(inner.width as usize)
-            } else {
-                "-".repeat(inner.width as usize)
-            },
+            sep_char.repeat(inner.width as usize),
             theme.dim(),
         )),
         sep_area,
@@ -1232,13 +1233,10 @@ fn draw_palette(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
 
     // Separator
     let sep_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+    let sep_char = if state.unicode { "─" } else { "-" };
     frame.render_widget(
         Paragraph::new(Span::styled(
-            if state.unicode {
-                "─".repeat(inner.width as usize)
-            } else {
-                "-".repeat(inner.width as usize)
-            },
+            sep_char.repeat(inner.width as usize),
             theme.dim(),
         )),
         sep_area,

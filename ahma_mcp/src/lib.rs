@@ -132,6 +132,8 @@ pub mod sandbox;
 pub mod schema_validation;
 /// Unified service builder for all transport modes.
 pub mod service_builder;
+/// Setup wizard for MCP, hooks, TLS, and skills.
+pub mod setup;
 /// CLI shell entry points.
 pub mod shell;
 /// Shell pooling and execution.

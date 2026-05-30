@@ -108,40 +108,44 @@ fn bump_version(new_ver: &str) {
         .to_string();
 
     if cur_ver == new_ver {
-        // Cargo.toml is already at the target version, but the scripts and skill file may
-        // still be behind (e.g. the workspace version was bumped manually without running
-        // this task).  Scan each file for any semver-looking version string and replace it.
-        println!("Cargo.toml is already at {new_ver}; checking other files for stale versions…");
-        let other_files: &[(&str, &str)] = &[
-            ("skills/ahma/SKILL.md", "skills/ahma/SKILL.md"),
-            ("scripts/install.sh", "scripts/install.sh"),
-            ("scripts/install.ps1", "scripts/install.ps1"),
-        ];
-        let mut any_updated = false;
-        for (rel_path, label) in other_files {
-            let path = root.join(rel_path);
-            if let Some(stale) = find_stale_version(&path, new_ver) {
-                println!("  Updating {label}: {stale} → {new_ver}");
-                replace_all_version_occurrences(&path, &stale, new_ver, label);
-                any_updated = true;
-            } else {
-                println!("  {label}: already at {new_ver} ✓");
-            }
-        }
-        if !any_updated {
-            println!("All files already at {new_ver} — nothing to do.");
-        }
-        return;
+        update_other_stale_files(&root, new_ver);
+    } else {
+        perform_normal_bump(&root, &cargo_toml_path, &cur_ver, new_ver);
     }
+}
 
+fn update_other_stale_files(root: &Path, new_ver: &str) {
+    println!("Cargo.toml is already at {new_ver}; checking other files for stale versions…");
+    let other_files: &[(&str, &str)] = &[
+        ("skills/ahma/SKILL.md", "skills/ahma/SKILL.md"),
+        ("scripts/install.sh", "scripts/install.sh"),
+        ("scripts/install.ps1", "scripts/install.ps1"),
+    ];
+    let mut any_updated = false;
+    for (rel_path, label) in other_files {
+        let path = root.join(rel_path);
+        if let Some(stale) = find_stale_version(&path, new_ver) {
+            println!("  Updating {label}: {stale} → {new_ver}");
+            replace_all_version_occurrences(&path, &stale, new_ver, label);
+            any_updated = true;
+        } else {
+            println!("  {label}: already at {new_ver} ✓");
+        }
+    }
+    if !any_updated {
+        println!("All files already at {new_ver} — nothing to do.");
+    }
+}
+
+fn perform_normal_bump(root: &Path, cargo_toml_path: &Path, cur_ver: &str, new_ver: &str) {
     println!("Bumping {cur_ver} → {new_ver}");
     println!();
 
     // 1. Cargo.toml — only replace lines that start with `version = "` (workspace package line)
     replace_anchored_line(
-        &cargo_toml_path,
+        cargo_toml_path,
         "version = \"",
-        &cur_ver,
+        cur_ver,
         new_ver,
         "Cargo.toml",
     );
@@ -151,7 +155,7 @@ fn bump_version(new_ver: &str) {
     replace_anchored_line(
         &skill_path,
         "version: ",
-        &cur_ver,
+        cur_ver,
         new_ver,
         "skills/ahma/SKILL.md (YAML)",
     );
@@ -282,21 +286,7 @@ fn bump_android_version(android_dir: Option<&str>) {
         process::exit(1);
     });
 
-    // Parse VERSION_CODE
-    let current_code: u64 = content
-        .lines()
-        .find(|l| l.starts_with("VERSION_CODE="))
-        .unwrap_or_else(|| {
-            eprintln!("ERROR: VERSION_CODE not found in {}", props_path.display());
-            process::exit(1);
-        })
-        .trim_start_matches("VERSION_CODE=")
-        .trim()
-        .parse()
-        .unwrap_or_else(|e| {
-            eprintln!("ERROR: VERSION_CODE is not a valid integer: {e}");
-            process::exit(1);
-        });
+    let current_code = parse_version_properties(&props_path, &content);
 
     // Play Console hard limit is 2_100_000_000
     const PLAY_MAX: u64 = 2_100_000_000;
@@ -306,17 +296,7 @@ fn bump_android_version(android_dir: Option<&str>) {
         process::exit(1);
     }
 
-    // Read Cargo version for versionName
-    let cargo_toml_path = root.join("Cargo.toml");
-    let cargo_content = fs::read_to_string(&cargo_toml_path).expect("Failed to read Cargo.toml");
-    let cargo_ver = cargo_content
-        .lines()
-        .find(|l| l.starts_with("version = \""))
-        .expect("No version = \"...\" line found in Cargo.toml")
-        .split('"')
-        .nth(1)
-        .expect("Unexpected Cargo.toml version format")
-        .to_string();
+    let cargo_ver = get_cargo_version(&root);
 
     // Rebuild properties, updating VERSION_CODE and VERSION_NAME lines in-place
     // (preserves comments and ordering).
@@ -358,6 +338,36 @@ fn bump_android_version(android_dir: Option<&str>) {
         "  git add {} && git commit -m \"chore(android): bump Play versionCode to {new_code}\"",
         props_path.display()
     );
+}
+
+fn parse_version_properties(props_path: &Path, content: &str) -> u64 {
+    content
+        .lines()
+        .find(|l| l.starts_with("VERSION_CODE="))
+        .unwrap_or_else(|| {
+            eprintln!("ERROR: VERSION_CODE not found in {}", props_path.display());
+            process::exit(1);
+        })
+        .trim_start_matches("VERSION_CODE=")
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: VERSION_CODE is not a valid integer: {e}");
+            process::exit(1);
+        })
+}
+
+fn get_cargo_version(root: &Path) -> String {
+    let cargo_toml_path = root.join("Cargo.toml");
+    let cargo_content = fs::read_to_string(&cargo_toml_path).expect("Failed to read Cargo.toml");
+    cargo_content
+        .lines()
+        .find(|l| l.starts_with("version = \""))
+        .expect("No version = \"...\" line found in Cargo.toml")
+        .split('"')
+        .nth(1)
+        .expect("Unexpected Cargo.toml version format")
+        .to_string()
 }
 
 /// Replace ALL occurrences of `old` with `new` in `path`.
@@ -452,6 +462,16 @@ impl SafeUpdateOpts {
 }
 
 /// Entry point for the `safe-update` subcommand.
+#[derive(Debug)]
+struct Row {
+    name: String,
+    old_ver: String,
+    new_ver: String,
+    age_days: Option<i64>,
+    status: String,
+}
+
+/// Entry point for the `safe-update` subcommand.
 fn safe_update(args: &[String]) {
     let opts = SafeUpdateOpts::parse(args);
     check_prereqs();
@@ -479,94 +499,10 @@ fn safe_update(args: &[String]) {
     let vulnerable_pairs = parse_deny_advisories(&root);
 
     // --- Step 3: evaluate each candidate ---
-    #[derive(Debug)]
-    struct Row {
-        name: String,
-        old_ver: String,
-        new_ver: String,
-        age_days: Option<i64>,
-        status: String,
-    }
-
-    let mut rows: Vec<Row> = Vec::new();
-    let mut to_apply: Vec<(String, String)> = Vec::new();
-
-    for (name, old_ver, new_ver) in &candidates {
-        // Yanked / pre-release guard (quick local check before hitting the network)
-        if is_prerelease(new_ver) {
-            rows.push(Row {
-                name: name.clone(),
-                old_ver: old_ver.clone(),
-                new_ver: new_ver.clone(),
-                age_days: None,
-                status: "skipped:pre-release".into(),
-            });
-            continue;
-        }
-
-        // Advisory check
-        if is_vulnerable(name, new_ver, &vulnerable_pairs) {
-            rows.push(Row {
-                name: name.clone(),
-                old_ver: old_ver.clone(),
-                new_ver: new_ver.clone(),
-                age_days: None,
-                status: "skipped:advisory".into(),
-            });
-            continue;
-        }
-
-        // Age check (network call)
-        match fetch_crate_publish_age_days(name, new_ver) {
-            Err(e) => {
-                eprintln!("  WARN: could not fetch age for {name}@{new_ver}: {e}");
-                rows.push(Row {
-                    name: name.clone(),
-                    old_ver: old_ver.clone(),
-                    new_ver: new_ver.clone(),
-                    age_days: None,
-                    status: "skipped:age-fetch-failed".into(),
-                });
-            }
-            Ok(age) if age < opts.min_age_days => {
-                rows.push(Row {
-                    name: name.clone(),
-                    old_ver: old_ver.clone(),
-                    new_ver: new_ver.clone(),
-                    age_days: Some(age),
-                    status: format!("skipped:too-new ({age}d)"),
-                });
-            }
-            Ok(age) => {
-                rows.push(Row {
-                    name: name.clone(),
-                    old_ver: old_ver.clone(),
-                    new_ver: new_ver.clone(),
-                    age_days: Some(age),
-                    status: "upgrade".into(),
-                });
-                to_apply.push((name.clone(), new_ver.clone()));
-            }
-        }
-    }
+    let (rows, to_apply) = evaluate_candidates(&candidates, &vulnerable_pairs, &opts);
 
     // --- Step 4: print summary table ---
-    println!(
-        "{:<30} {:<12} {:<12} {:>8}  status",
-        "crate", "old", "new", "age(d)"
-    );
-    println!("{}", "-".repeat(80));
-    for row in &rows {
-        let age_str = row
-            .age_days
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        println!(
-            "{:<30} {:<12} {:<12} {:>8}  {}",
-            row.name, row.old_ver, row.new_ver, age_str, row.status
-        );
-    }
-    println!();
+    print_summary_table(&rows);
 
     if to_apply.is_empty() {
         println!("Nothing to upgrade.");
@@ -611,6 +547,93 @@ fn safe_update(args: &[String]) {
         "Done. {} crate(s) upgraded. Review `git diff Cargo.toml Cargo.lock` before committing.",
         to_apply.len()
     );
+}
+
+fn print_summary_table(rows: &[Row]) {
+    println!(
+        "{:<30} {:<12} {:<12} {:>8}  status",
+        "crate", "old", "new", "age(d)"
+    );
+    println!("{}", "-".repeat(80));
+    for row in rows {
+        let age_str = row
+            .age_days
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        println!(
+            "{:<30} {:<12} {:<12} {:>8}  {}",
+            row.name, row.old_ver, row.new_ver, age_str, row.status
+        );
+    }
+}
+
+fn evaluate_candidates(
+    candidates: &[(String, String, String)],
+    vulnerable_pairs: &std::collections::HashSet<(String, String)>,
+    opts: &SafeUpdateOpts,
+) -> (Vec<Row>, Vec<(String, String)>) {
+    let mut rows: Vec<Row> = Vec::new();
+    let mut to_apply: Vec<(String, String)> = Vec::new();
+
+    for (name, old_ver, new_ver) in candidates {
+        // Yanked / pre-release guard (quick local check before hitting the network)
+        if is_prerelease(new_ver) {
+            rows.push(Row {
+                name: name.clone(),
+                old_ver: old_ver.clone(),
+                new_ver: new_ver.clone(),
+                age_days: None,
+                status: "skipped:pre-release".into(),
+            });
+            continue;
+        }
+
+        // Advisory check
+        if is_vulnerable(name, new_ver, vulnerable_pairs) {
+            rows.push(Row {
+                name: name.clone(),
+                old_ver: old_ver.clone(),
+                new_ver: new_ver.clone(),
+                age_days: None,
+                status: "skipped:advisory".into(),
+            });
+            continue;
+        }
+
+        // Age check (network call)
+        match fetch_crate_publish_age_days(name, new_ver) {
+            Err(e) => {
+                eprintln!("  WARN: could not fetch age for {name}@{new_ver}: {e}");
+                rows.push(Row {
+                    name: name.clone(),
+                    old_ver: old_ver.clone(),
+                    new_ver: new_ver.clone(),
+                    age_days: None,
+                    status: "skipped:age-fetch-failed".into(),
+                });
+            }
+            Ok(age) if age < opts.min_age_days => {
+                rows.push(Row {
+                    name: name.clone(),
+                    old_ver: old_ver.clone(),
+                    new_ver: new_ver.clone(),
+                    age_days: Some(age),
+                    status: format!("skipped:too-new ({age}d)"),
+                });
+            }
+            Ok(age) => {
+                rows.push(Row {
+                    name: name.clone(),
+                    old_ver: old_ver.clone(),
+                    new_ver: new_ver.clone(),
+                    age_days: Some(age),
+                    status: "upgrade".into(),
+                });
+                to_apply.push((name.clone(), new_ver.clone()));
+            }
+        }
+    }
+    (rows, to_apply)
 }
 
 /// Verify that `cargo upgrade` (cargo-edit) and `cargo deny` are available.
@@ -739,25 +762,31 @@ fn parse_deny_advisories(root: &Path) -> std::collections::HashSet<(String, Stri
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
             if kind == "advisory" || kind == "diagnostic" {
-                // Try two common cargo-deny JSON layouts
-                let name = v
-                    .pointer("/fields/advisory/affected/functions/0/crate/name")
-                    .or_else(|| v.pointer("/fields/krate/name"))
-                    .or_else(|| v.pointer("/krate/name"))
-                    .or_else(|| v.pointer("/package/name"))
-                    .and_then(|n| n.as_str());
-                let ver = v
-                    .pointer("/fields/krate/version")
-                    .or_else(|| v.pointer("/krate/version"))
-                    .or_else(|| v.pointer("/package/version"))
-                    .and_then(|n| n.as_str());
-                if let (Some(n), Some(ver_str)) = (name, ver) {
-                    pairs.insert((n.to_string(), ver_str.to_string()));
+                if let Some((n, ver_str)) = extract_advisory_crate_ver(&v) {
+                    pairs.insert((n, ver_str));
                 }
             }
         }
     }
     pairs
+}
+
+fn extract_advisory_crate_ver(v: &serde_json::Value) -> Option<(String, String)> {
+    let name = v
+        .pointer("/fields/advisory/affected/functions/0/crate/name")
+        .or_else(|| v.pointer("/fields/krate/name"))
+        .or_else(|| v.pointer("/krate/name"))
+        .or_else(|| v.pointer("/package/name"))
+        .and_then(|n| n.as_str());
+    let ver = v
+        .pointer("/fields/krate/version")
+        .or_else(|| v.pointer("/krate/version"))
+        .or_else(|| v.pointer("/package/version"))
+        .and_then(|n| n.as_str());
+    match (name, ver) {
+        (Some(n), Some(ver_str)) => Some((n.to_string(), ver_str.to_string())),
+        _ => None,
+    }
 }
 
 /// Return `true` if `(name, ver)` appears in the known-vulnerable set.

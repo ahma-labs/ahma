@@ -525,54 +525,62 @@ fn check_powershell_available() {
     }
 }
 
+async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
+    match serve_args.transport {
+        ServeTransport::Stdio => {
+            let sandbox = initialize_sandbox(&cfg)?;
+            let sandbox =
+                sandbox.ok_or_else(|| anyhow!("Sandbox failed to initialize for stdio mode"))?;
+            check_stdio_not_interactive()?;
+            tracing::info!("Running in STDIO server mode");
+            modes::run_server_mode(cfg, sandbox).await
+        }
+        ServeTransport::Http(_) => {
+            tracing::info!("Running in HTTP bridge mode");
+            modes::run_http_bridge_mode(cfg).await
+        }
+        #[cfg(unix)]
+        ServeTransport::Unix(u) => {
+            let path = u.socket_path.as_deref().unwrap_or("/tmp/ahma.sock");
+            tracing::info!("Running in Unix socket bridge mode on {}", path);
+            modes::run_unix_bridge_mode(cfg).await
+        }
+    }
+}
+
+async fn dispatch_tool(tool_cmd: ToolArgs, cfg: AppConfig) -> Result<()> {
+    match tool_cmd.command {
+        ToolCommand::Validate(v) => {
+            tracing::info!("Running in validate mode");
+            run_validation_mode(&v.target.unwrap_or_else(|| ".ahma".to_string()))
+        }
+        ToolCommand::List(_) => {
+            tracing::info!("Running in list-tools mode");
+            modes::run_list_tools_mode(&cfg).await
+        }
+        ToolCommand::Run(run_args) => {
+            let cfg = AppConfig {
+                run_tool: Some(run_args.tool),
+                run_tool_args: run_args.tool_args,
+                ..cfg
+            };
+            let sandbox = initialize_sandbox(&cfg)?;
+            let sandbox = sandbox
+                .ok_or_else(|| anyhow!("Sandbox scopes must be initialized for run mode"))?;
+            tracing::info!("Running in CLI mode");
+            modes::run_cli_mode(cfg, sandbox).await
+        }
+        ToolCommand::Info(info_args) => {
+            tracing::info!("Running in tool-info mode");
+            run_tool_info_mode(info_args).await
+        }
+    }
+}
+
 pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()> {
     match cmd {
-        Subcommands::Serve(serve_args) => match serve_args.transport {
-            ServeTransport::Stdio => {
-                let sandbox = initialize_sandbox(&cfg)?;
-                let sandbox = sandbox
-                    .ok_or_else(|| anyhow!("Sandbox failed to initialize for stdio mode"))?;
-                check_stdio_not_interactive()?;
-                tracing::info!("Running in STDIO server mode");
-                modes::run_server_mode(cfg, sandbox).await
-            }
-            ServeTransport::Http(_) => {
-                tracing::info!("Running in HTTP bridge mode");
-                modes::run_http_bridge_mode(cfg).await
-            }
-            #[cfg(unix)]
-            ServeTransport::Unix(u) => {
-                let path = u.socket_path.as_deref().unwrap_or("/tmp/ahma.sock");
-                tracing::info!("Running in Unix socket bridge mode on {}", path);
-                modes::run_unix_bridge_mode(cfg).await
-            }
-        },
-        Subcommands::Tool(tool_cmd) => match tool_cmd.command {
-            ToolCommand::Validate(v) => {
-                tracing::info!("Running in validate mode");
-                run_validation_mode(&v.target.unwrap_or_else(|| ".ahma".to_string()))
-            }
-            ToolCommand::List(_) => {
-                tracing::info!("Running in list-tools mode");
-                modes::run_list_tools_mode(&cfg).await
-            }
-            ToolCommand::Run(run_args) => {
-                let cfg = AppConfig {
-                    run_tool: Some(run_args.tool),
-                    run_tool_args: run_args.tool_args,
-                    ..cfg
-                };
-                let sandbox = initialize_sandbox(&cfg)?;
-                let sandbox = sandbox
-                    .ok_or_else(|| anyhow!("Sandbox scopes must be initialized for run mode"))?;
-                tracing::info!("Running in CLI mode");
-                modes::run_cli_mode(cfg, sandbox).await
-            }
-            ToolCommand::Info(info_args) => {
-                tracing::info!("Running in tool-info mode");
-                run_tool_info_mode(info_args).await
-            }
-        },
+        Subcommands::Serve(serve_args) => dispatch_serve(serve_args, cfg).await,
+        Subcommands::Tool(tool_cmd) => dispatch_tool(tool_cmd, cfg).await,
         Subcommands::Vault(_) => {
             anyhow::bail!(
                 "vault commands are provided by the ahma_bin crate (includes ahma_vault). \
@@ -616,6 +624,10 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
         Subcommands::Update(args) => {
             tracing::info!("Running in update mode");
             crate::update::run(args).await
+        }
+        Subcommands::Setup(args) => {
+            tracing::info!("Running in setup mode");
+            crate::setup::run(args).await
         }
     }
 }
@@ -758,6 +770,32 @@ pub enum Subcommands {
     Simplify(crate::simplify::SimplifyArgs),
     /// Download or build and install ahma.
     Update(crate::update::UpdateArgs),
+    /// Run the interactive or automated setup wizard.
+    Setup(SetupArgs),
+}
+
+/// Arguments for `ahma setup`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct SetupArgs {
+    /// Skip prompts and set up automatically with default options.
+    #[arg(short = 'y', long = "auto")]
+    pub auto: bool,
+
+    /// Only configure MCP servers.
+    #[arg(long = "mcp")]
+    pub mcp: bool,
+
+    /// Only configure terminal hooks.
+    #[arg(long = "hooks")]
+    pub hooks: bool,
+
+    /// Only configure agent skills.
+    #[arg(long = "skills")]
+    pub skills: bool,
+
+    /// Only initialize TLS certificate.
+    #[arg(long = "tls")]
+    pub tls: bool,
 }
 
 // ── serve ────────────────────────────────────────────────────────────────────
@@ -1470,118 +1508,134 @@ fn unix_socket_path_from_cli(_cli: &Cli) -> String {
     String::new()
 }
 
-pub fn build_app_config(cli: &Cli) -> AppConfig {
-    // Gather serve-level fields if present
-    #[allow(clippy::type_complexity)]
-    let (
-        tool_bundles,
-        cli_tools_dir,
-        http_host,
-        http_port,
-        no_quic,
-        disable_http1_1,
-        cli_tmp,
-        cli_log_monitor,
-        cli_monitor_rate_limit,
-        cli_no_sandbox,
-        cli_timeout,
-        cli_sync,
-        cli_opentelemetry,
-    ) = match &cli.command {
-        Subcommands::Serve(s) => {
-            let (host, port, no_quic, disable_http1_1) = match &s.transport {
-                ServeTransport::Http(h) => (h.host.clone(), h.port, h.no_quic, h.disable_http1_1),
-                ServeTransport::Stdio => ("127.0.0.1".to_string(), 3000u16, false, false),
-                #[cfg(unix)]
-                ServeTransport::Unix(_) => ("127.0.0.1".to_string(), 3000u16, true, false),
-            };
-            (
-                s.tool_bundles.clone(),
-                s.tools_dir.clone(),
-                host,
-                port,
-                no_quic,
-                disable_http1_1,
-                s.tmp,
-                s.log_monitor,
-                s.monitor_rate_limit,
-                s.no_sandbox,
-                s.timeout,
-                s.sync,
-                s.opentelemetry.clone(),
-            )
+struct ServeFields {
+    tool_bundles: Vec<String>,
+    tools_dir: Option<PathBuf>,
+    http_host: String,
+    http_port: u16,
+    no_quic: bool,
+    disable_http1_1: bool,
+    tmp: bool,
+    log_monitor: bool,
+    monitor_rate_limit: Option<u64>,
+    no_sandbox: bool,
+    timeout: Option<u64>,
+    sync: bool,
+    opentelemetry: Option<String>,
+    task_vault: Option<PathBuf>,
+    auto_reveal: bool,
+}
+
+fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
+    if let Subcommands::Serve(s) = cmd {
+        let (host, port, no_quic, disable_http1_1) = match &s.transport {
+            ServeTransport::Http(h) => (h.host.clone(), h.port, h.no_quic, h.disable_http1_1),
+            ServeTransport::Stdio => ("127.0.0.1".to_string(), 3000u16, false, false),
+            #[cfg(unix)]
+            ServeTransport::Unix(_) => ("127.0.0.1".to_string(), 3000u16, true, false),
+        };
+        ServeFields {
+            tool_bundles: s.tool_bundles.clone(),
+            tools_dir: s.tools_dir.clone(),
+            http_host: host,
+            http_port: port,
+            no_quic,
+            disable_http1_1,
+            tmp: s.tmp,
+            log_monitor: s.log_monitor,
+            monitor_rate_limit: s.monitor_rate_limit,
+            no_sandbox: s.no_sandbox,
+            timeout: s.timeout,
+            sync: s.sync,
+            opentelemetry: s.opentelemetry.clone(),
+            task_vault: s.task_vault.clone(),
+            auto_reveal: s.auto_reveal,
         }
-        _ => (
-            vec![],
-            None,
-            "127.0.0.1".to_string(),
-            3000u16,
-            false,
-            false,
-            false,
-            false,
-            None,
-            false,
-            None,
-            false,
-            None::<String>,
-        ),
-    };
-
-    // task-vault from CLI
-    let cli_task_vault: Option<PathBuf> = if let Subcommands::Serve(s) = &cli.command {
-        s.task_vault.clone()
     } else {
-        None
-    };
+        ServeFields {
+            tool_bundles: vec![],
+            tools_dir: None,
+            http_host: "127.0.0.1".to_string(),
+            http_port: 3000u16,
+            no_quic: false,
+            disable_http1_1: false,
+            tmp: false,
+            log_monitor: false,
+            monitor_rate_limit: None,
+            no_sandbox: false,
+            timeout: None,
+            sync: false,
+            opentelemetry: None,
+            task_vault: None,
+            auto_reveal: false,
+        }
+    }
+}
 
-    // auto-reveal legacy alias from CLI
-    let cli_auto_reveal: bool = if let Subcommands::Serve(s) = &cli.command {
-        s.auto_reveal
-    } else {
-        false
-    };
+struct ToolFields {
+    list_server: Option<String>,
+    mcp_config: PathBuf,
+    list_http: Option<String>,
+    list_format: list_tools::OutputFormat,
+    run_tool: Option<String>,
+    run_tool_args: Vec<String>,
+}
 
-    // Tool list args
-    let (list_server, mcp_config, list_http, list_format) = if let Subcommands::Tool(ToolArgs {
-        command: ToolCommand::List(la),
-    }) = &cli.command
-    {
-        (
-            la.server.clone(),
-            la.mcp_config.clone(),
-            la.http.clone(),
-            la.format.clone(),
-        )
+fn extract_tool_fields(cmd: &Subcommands) -> ToolFields {
+    if let Subcommands::Tool(ToolArgs { command }) = cmd {
+        match command {
+            ToolCommand::List(la) => ToolFields {
+                list_server: la.server.clone(),
+                mcp_config: la.mcp_config.clone(),
+                list_http: la.http.clone(),
+                list_format: la.format.clone(),
+                run_tool: None,
+                run_tool_args: vec![],
+            },
+            ToolCommand::Run(r) => ToolFields {
+                list_server: None,
+                mcp_config: PathBuf::from("mcp.json"),
+                list_http: None,
+                list_format: list_tools::OutputFormat::Text,
+                run_tool: Some(r.tool.clone()),
+                run_tool_args: r.tool_args.clone(),
+            },
+            _ => ToolFields {
+                list_server: None,
+                mcp_config: PathBuf::from("mcp.json"),
+                list_http: None,
+                list_format: list_tools::OutputFormat::Text,
+                run_tool: None,
+                run_tool_args: vec![],
+            },
+        }
     } else {
-        (
-            None,
-            PathBuf::from("mcp.json"),
-            None,
-            list_tools::OutputFormat::Text,
-        )
-    };
+        ToolFields {
+            list_server: None,
+            mcp_config: PathBuf::from("mcp.json"),
+            list_http: None,
+            list_format: list_tools::OutputFormat::Text,
+            run_tool: None,
+            run_tool_args: vec![],
+        }
+    }
+}
 
-    // Run args (now under tool run)
-    let (run_tool, run_tool_args) = if let Subcommands::Tool(ToolArgs {
-        command: ToolCommand::Run(r),
-    }) = &cli.command
-    {
-        (Some(r.tool.clone()), r.tool_args.clone())
-    } else {
-        (None, vec![])
-    };
+pub fn build_app_config(cli: &Cli) -> AppConfig {
+    let serve = extract_serve_fields(&cli.command);
+    let tool = extract_tool_fields(&cli.command);
 
     // Env-var overrides for tools_dir
     let env_tools_dir = std::env::var("AHMA_TOOLS_DIR").ok().map(PathBuf::from);
-    let explicit_tools_dir = cli_tools_dir.is_some();
-    let raw_tools_dir = cli_tools_dir.or(env_tools_dir);
+    let explicit_tools_dir = serve.tools_dir.is_some();
+    let raw_tools_dir = serve.tools_dir.or(env_tools_dir);
     let tools_dir = resolution::normalize_tools_dir(raw_tools_dir);
 
     // Flatten and deduplicate tool bundles (support comma-separation already handled by clap delimiter)
     let tool_bundles = {
         let mut seen = std::collections::HashSet::new();
-        tool_bundles
+        serve
+            .tool_bundles
             .into_iter()
             .filter(|b| seen.insert(b.clone()))
             .collect()
@@ -1592,15 +1646,17 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     let working_dirs = AppConfig::env_working_dirs();
 
     // HTTP quic override from env
-    let no_quic = no_quic || AppConfig::env_flag("AHMA_DISABLE_QUIC");
-    let disable_http1_1 = disable_http1_1 || AppConfig::env_flag("AHMA_DISABLE_HTTP1_1");
+    let no_quic = serve.no_quic || AppConfig::env_flag("AHMA_DISABLE_QUIC");
+    let disable_http1_1 = serve.disable_http1_1 || AppConfig::env_flag("AHMA_DISABLE_HTTP1_1");
 
     AppConfig {
         tools_dir,
         explicit_tools_dir,
         tool_bundles,
-        timeout_secs: cli_timeout.unwrap_or_else(|| AppConfig::env_u64("AHMA_TIMEOUT", 360)),
-        force_sync: cli_sync || AppConfig::env_flag("AHMA_SYNC"),
+        timeout_secs: serve
+            .timeout
+            .unwrap_or_else(|| AppConfig::env_u64("AHMA_TIMEOUT", 360)),
+        force_sync: serve.sync || AppConfig::env_flag("AHMA_SYNC"),
         hot_reload_tools: AppConfig::env_flag("AHMA_HOT_RELOAD"),
         skip_availability_probes: AppConfig::env_flag("AHMA_SKIP_PROBES"),
         progressive_disclosure: !AppConfig::env_flag("AHMA_PROGRESSIVE_DISCLOSURE_OFF"),
@@ -1610,35 +1666,37 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         {
             "balanced" => StartupProfile::Balanced,
             "full" => StartupProfile::Full,
-            _ if cli_auto_reveal || AppConfig::env_flag("AHMA_AUTO_REVEAL") => {
+            _ if serve.auto_reveal || AppConfig::env_flag("AHMA_AUTO_REVEAL") => {
                 StartupProfile::Balanced
             }
             _ => StartupProfile::Minimal,
         },
-        no_sandbox: cli_no_sandbox || AppConfig::env_flag("AHMA_DISABLE_SANDBOX"),
+        no_sandbox: serve.no_sandbox || AppConfig::env_flag("AHMA_DISABLE_SANDBOX"),
         sandbox_scopes,
         defer_sandbox: AppConfig::env_flag("AHMA_SANDBOX_DEFER"),
         working_dirs,
-        tmp_access: cli_tmp || AppConfig::env_flag("AHMA_TMP_ACCESS"),
+        tmp_access: serve.tmp || AppConfig::env_flag("AHMA_TMP_ACCESS"),
         no_temp_files: AppConfig::env_flag("AHMA_DISABLE_TEMP"),
-        log_monitor: cli_log_monitor || AppConfig::env_flag("AHMA_LOG_MONITOR"),
-        monitor_rate_limit_secs: cli_monitor_rate_limit
+        log_monitor: serve.log_monitor || AppConfig::env_flag("AHMA_LOG_MONITOR"),
+        monitor_rate_limit_secs: serve
+            .monitor_rate_limit
             .unwrap_or_else(|| AppConfig::env_u64("AHMA_MONITOR_RATE_LIMIT", 60)),
-        http_host,
-        http_port,
+        http_host: serve.http_host,
+        http_port: serve.http_port,
         no_quic,
         disable_http1_1,
         handshake_timeout_secs: AppConfig::env_u64("AHMA_HANDSHAKE_TIMEOUT", 45),
         unix_socket_path: unix_socket_path_from_cli(cli),
         observability: ahma_common::observability::ObservabilityConfig::from_env("ahma_mcp")
-            .with_endpoint(cli_opentelemetry.as_deref()),
-        list_server,
-        mcp_config,
-        list_http,
-        list_format,
-        run_tool,
-        run_tool_args,
-        task_vault: cli_task_vault
+            .with_endpoint(serve.opentelemetry.as_deref()),
+        list_server: tool.list_server,
+        mcp_config: tool.mcp_config,
+        list_http: tool.list_http,
+        list_format: tool.list_format,
+        run_tool: tool.run_tool,
+        run_tool_args: tool.run_tool_args,
+        task_vault: serve
+            .task_vault
             .or_else(|| std::env::var("AHMA_TASK_VAULT").ok().map(PathBuf::from)),
     }
 }

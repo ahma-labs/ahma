@@ -106,7 +106,7 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     if outcome.binary_changed {
         print_post_install_details(&outcome.binary_path, &install_dir, args.dry_run).await;
     }
-    maybe_install_terminal_hooks(&args, &outcome.binary_path).await
+    maybe_run_setup_wizard(&args, &outcome.binary_path).await
 }
 
 async fn run_git_update(branch: &str, install_dir: &Path, dry_run: bool) -> Result<UpdateOutcome> {
@@ -208,11 +208,11 @@ async fn warn_if_running_binary_differs(install_dir: &std::path::Path) {
     }
 }
 
-async fn maybe_install_terminal_hooks(args: &UpdateArgs, binary_path: &Path) -> Result<()> {
+async fn maybe_run_setup_wizard(args: &UpdateArgs, binary_path: &Path) -> Result<()> {
     if args.dry_run {
         if args.install_hooks {
             println!(
-                "[dry-run] Would run {} hooks install --scope user",
+                "[dry-run] Would run {} setup --hooks --auto",
                 binary_path.display()
             );
         }
@@ -220,35 +220,34 @@ async fn maybe_install_terminal_hooks(args: &UpdateArgs, binary_path: &Path) -> 
     }
 
     if args.install_hooks {
-        install_user_hooks(binary_path).await?;
+        run_setup_hooks_only_auto(binary_path).await?;
         return Ok(());
     }
 
-    if !can_prompt_for_terminal_hooks()
-        || crate::hooks::any_managed_hooks_installed(crate::hooks::HookScope::User)?
-    {
+    if !can_prompt_for_setup() {
+        run_setup_skills_only_auto(binary_path).await?;
         return Ok(());
     }
 
     println!();
     println!(
-        "Optional: install user-scoped terminal hooks so Cursor, Claude Code, Codex, and GitHub Copilot route shell tool calls through ahma."
+        "Optional: run the setup wizard to configure MCP servers, terminal hooks, TLS, and agent skills."
     );
 
-    if !prompt_yes_no("Install user-scoped terminal hooks now? [y/N]: ").await? {
-        println!("Tip: run `ahma hooks install` later if you want ahma to wrap shell tool calls.");
+    if !prompt_yes_no("Run the setup wizard now? [y/N]: ").await? {
+        println!("Tip: run `ahma setup` later to configure your environment.");
         return Ok(());
     }
 
-    if let Err(error) = install_user_hooks(binary_path).await {
-        eprintln!("Warning: updated ahma but failed to install terminal hooks: {error}");
-        eprintln!("Run `ahma hooks install` later to retry.");
+    if let Err(error) = run_setup_interactive(binary_path).await {
+        eprintln!("Warning: updated ahma but failed to run setup: {error}");
+        eprintln!("Run `ahma setup` later to retry.");
     }
 
     Ok(())
 }
 
-fn can_prompt_for_terminal_hooks() -> bool {
+fn can_prompt_for_setup() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
@@ -266,35 +265,73 @@ async fn prompt_yes_no(prompt: &str) -> Result<bool> {
         Ok(matches!(input.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
     })
     .await
-    .context("Hook prompt task failed")?
+    .context("Setup prompt task failed")?
 }
 
-async fn install_user_hooks(binary_path: &Path) -> Result<()> {
+async fn run_setup_hooks_only_auto(binary_path: &Path) -> Result<()> {
     println!();
-    println!("Installing user-scoped terminal hooks...");
+    println!("Configuring terminal hooks automatically...");
 
     let status = tokio::process::Command::new(binary_path)
-        .args(["hooks", "install", "--scope", "user"])
+        .args(["setup", "--hooks", "--auto"])
         .status()
         .await
         .with_context(|| {
             format!(
-                "Failed to run {} hooks install --scope user",
+                "Failed to run {} setup --hooks --auto",
                 binary_path.display()
             )
         })?;
 
     if !status.success() {
         anyhow::bail!(
-            "{} hooks install --scope user exited with status {}",
+            "{} setup --hooks --auto exited with status {}",
             binary_path.display(),
             status
         );
     }
+    Ok(())
+}
 
-    println!(
-        "Restart Cursor, Claude Code, Codex, or GitHub Copilot to pick up the updated hook configuration."
-    );
+async fn run_setup_skills_only_auto(binary_path: &Path) -> Result<()> {
+    println!();
+    println!("Configuring agent skills automatically...");
+
+    let status = tokio::process::Command::new(binary_path)
+        .args(["setup", "--skills", "--auto"])
+        .status()
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to run {} setup --skills --auto",
+                binary_path.display()
+            )
+        })?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "{} setup --skills --auto exited with status {}",
+            binary_path.display(),
+            status
+        );
+    }
+    Ok(())
+}
+
+async fn run_setup_interactive(binary_path: &Path) -> Result<()> {
+    let status = tokio::process::Command::new(binary_path)
+        .arg("setup")
+        .status()
+        .await
+        .with_context(|| format!("Failed to run {} setup", binary_path.display()))?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "{} setup exited with status {}",
+            binary_path.display(),
+            status
+        );
+    }
     Ok(())
 }
 

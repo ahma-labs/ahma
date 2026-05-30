@@ -286,4 +286,141 @@ mod tests {
             "missing parent dir should produce an error"
         );
     }
+
+    #[tokio::test]
+    async fn test_all_audit_event_kinds_and_helpers() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("audit.jsonl");
+        let writer = AuditWriter::new(&log_path);
+
+        // 1. Test vault_created helper
+        writer
+            .vault_created("/path/to/vault", "my-slug")
+            .await
+            .unwrap();
+
+        // 2. Test renewal_checkpoint helper
+        writer
+            .renewal_checkpoint("op_2", 120, "/path/to/checkpoint")
+            .await
+            .unwrap();
+
+        // 3. Test emit_egress_decision helper
+        writer
+            .emit_egress_decision("example.com", true)
+            .await
+            .unwrap();
+
+        // 4. Test emit with ArtifactWritten
+        writer
+            .emit(AuditEventKind::ArtifactWritten {
+                path: "outputs/report.md".to_string(),
+                size_bytes: 2048,
+            })
+            .await
+            .unwrap();
+
+        // 5. Test emit with FileStaged
+        writer
+            .emit(AuditEventKind::FileStaged {
+                original_path: "src/old.rs".to_string(),
+                trash_path: "trash/old.rs".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // 6. Test emit with TrashPurged
+        writer
+            .emit(AuditEventKind::TrashPurged { count: 5 })
+            .await
+            .unwrap();
+
+        // 7. Test emit with ElevationRequested
+        writer
+            .emit(AuditEventKind::ElevationRequested {
+                reason: "Access system files".to_string(),
+                granted: false,
+            })
+            .await
+            .unwrap();
+
+        // 8. Test emit with SubTaskDispatched
+        writer
+            .emit(AuditEventKind::SubTaskDispatched {
+                parent_op: "parent_1".to_string(),
+                sub_op: "sub_1".to_string(),
+                model: "llama3".to_string(),
+                prompt_summary: "Summarize".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // 9. Test emit with SubTaskCompleted
+        writer
+            .emit(AuditEventKind::SubTaskCompleted {
+                sub_op: "sub_1".to_string(),
+                success: true,
+                result_summary: "Done".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // 10. Test emit with WorkerExecuted
+        writer
+            .emit(AuditEventKind::WorkerExecuted {
+                operation_id: "op_3".to_string(),
+                language: "rust".to_string(),
+                source_hash: "abc123hash".to_string(),
+                kept_source: true,
+            })
+            .await
+            .unwrap();
+
+        // Read and verify all written lines
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = contents.trim().split('\n').collect();
+        assert_eq!(lines.len(), 10);
+
+        let parsed: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        assert_eq!(parsed[0]["type"], "vault_created");
+        assert_eq!(parsed[0]["vault_path"], "/path/to/vault");
+        assert_eq!(parsed[0]["slug"], "my-slug");
+
+        assert_eq!(parsed[1]["type"], "renewal_checkpoint");
+        assert_eq!(parsed[1]["elapsed_secs"], 120);
+
+        assert_eq!(parsed[2]["type"], "egress_decision");
+        assert_eq!(parsed[2]["domain"], "example.com");
+        assert_eq!(parsed[2]["allowed"], true);
+
+        assert_eq!(parsed[3]["type"], "artifact_written");
+        assert_eq!(parsed[3]["size_bytes"], 2048);
+
+        assert_eq!(parsed[4]["type"], "file_staged");
+        assert_eq!(parsed[4]["original_path"], "src/old.rs");
+
+        assert_eq!(parsed[5]["type"], "trash_purged");
+        assert_eq!(parsed[5]["count"], 5);
+
+        assert_eq!(parsed[6]["type"], "elevation_requested");
+        assert_eq!(parsed[6]["granted"], false);
+
+        assert_eq!(parsed[7]["type"], "sub_task_dispatched");
+        assert_eq!(parsed[7]["parent_op"], "parent_1");
+
+        assert_eq!(parsed[8]["type"], "sub_task_completed");
+        assert_eq!(parsed[8]["success"], true);
+
+        assert_eq!(parsed[9]["type"], "worker_executed");
+        assert_eq!(parsed[9]["language"], "rust");
+        assert_eq!(parsed[9]["source_hash"], "abc123hash");
+        assert_eq!(parsed[9]["kept_source"], true);
+
+        // Verify the path getter
+        assert_eq!(writer.path(), &log_path);
+    }
 }

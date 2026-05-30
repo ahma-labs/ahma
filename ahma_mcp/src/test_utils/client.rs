@@ -322,12 +322,12 @@ impl McpClientFixture {
 /// On macOS this probes `sandbox-exec` directly; on other platforms we check for
 /// the `AHMA_DISABLE_SANDBOX` env var as a convention for nested callers.
 #[cfg(target_os = "macos")]
-fn is_nested_sandbox_environment() -> bool {
+pub(super) fn is_nested_sandbox_environment() -> bool {
     ahma_mcp_internal_sandbox_probe()
 }
 
 #[cfg(not(target_os = "macos"))]
-fn is_nested_sandbox_environment() -> bool {
+pub(super) fn is_nested_sandbox_environment() -> bool {
     // On Linux with Landlock unavailable, check sandbox prerequisites.
     #[cfg(target_os = "linux")]
     {

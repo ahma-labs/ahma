@@ -14,7 +14,7 @@ description: >
   "simplify", "reduce complexity", "too complex", "hard to read", "refactor",
   "maintainability", "cognitive complexity", "cyclomatic complexity", "simplicity score",
   "code quality metrics", "hotspot", "ahma simplify", "ahma help", "ahma ?",
-  "ahma update".
+  "ahma update", "ahma tui", "/ahma tui".
 user-invocable: true
 ---
 
@@ -530,7 +530,10 @@ The `/ahma` skill supports these user-invocable subcommands in chat:
 | Command | Alias | Purpose |
 |---------|-------|---------|
 | `/ahma help` | `/ahma ?` | List all available subcommands and their usage |
-| `/ahma simplify [lang] [n]` | — | Analyze code complexity and get fix instructions |
+| `/ahma simplify` | — | Auto-fix top 10 complexity issues concurrently via subagents |
+| `/ahma simplify top N` | — | Auto-fix top N complexity issues concurrently |
+| `/ahma simplify N` | — | Get fix instructions for issue #N only (manual mode) |
+| `/ahma tui` | — | Start the terminal user interface (TUI) control plane |
 | `/ahma update` | — | Update ahma to the latest version |
 
 ---
@@ -541,13 +544,37 @@ When the user types `/ahma help` or `/ahma ?`, respond with a concise list of al
 user-invocable subcommands and a one-line description of each:
 
 ```
-/ahma help         — Show this help list
-/ahma ?            — Alias for /ahma help
-/ahma simplify     — Analyze code complexity and get AI fix instructions for the worst file
-/ahma update       — Update ahma to the latest version
+/ahma help              — Show this help list
+/ahma ?                 — Alias for /ahma help
+/ahma simplify          — Auto-fix top 10 complexity issues concurrently via subagents
+/ahma simplify top 5    — Auto-fix top 5 issues concurrently
+/ahma simplify 3        — Manual mode: get fix instructions for issue #3 only
+/ahma simplify rust     — Auto-fix top 10 Rust issues concurrently
+/ahma tui               — Start the terminal user interface (TUI) control plane
+/ahma update            — Update ahma to the latest version
 ```
 
 Also mention the key flags for configure, e.g., `--tools`, `--tmp`, `--log-monitor`.
+
+---
+
+## `/ahma tui` — Start the TUI Dashboard
+
+### Syntax
+
+```
+/ahma tui
+```
+
+### Workflow
+
+When the user runs `/ahma tui`, the agent starts the TUI in the user's terminal:
+
+```bash
+ahma tui
+```
+
+This opens the terminal dashboard for monitoring active operations, viewing logs, and approving gates.
 
 ---
 
@@ -648,21 +675,28 @@ RUSTFLAGS='--cfg reqwest_unstable' \
 
 ---
 
-## `/ahma simplify` — Code Complexity Analysis
+## `/ahma simplify` — Automatic Code Simplification
 
-When the user types `/ahma simplify [language] [n]`, run the full code complexity workflow.
+When the user types `/ahma simplify`, automatically analyze the codebase, identify the
+top complexity issues, and spawn concurrent subagents to fix them — **no additional
+prompting required**.
 
 ### Syntax
 
 ```
-/ahma simplify              # Analyze all supported file types, fix worst file (#1)
-/ahma simplify rust         # Rust files only
-/ahma simplify kotlin 2     # Kotlin files, get fix prompt for 2nd worst file
-/ahma simplify rust python  # Multiple languages
+/ahma simplify                 # Auto-fix top 10 issues concurrently (DEFAULT)
+/ahma simplify top 5           # Auto-fix top 5 issues concurrently
+/ahma simplify rust            # Auto-fix top 10 Rust issues concurrently
+/ahma simplify rust top 3      # Auto-fix top 3 Rust issues concurrently
+/ahma simplify 3               # Manual mode: get fix prompt for issue #3 only
+/ahma simplify kotlin 2        # Manual mode: Kotlin issue #2 only
 ```
 
+**Mode selection rule:** If the command contains `top N` or has NO trailing integer,
+use **auto mode** (concurrent subagents). If a bare trailing integer is given without
+`top`, use **manual mode** (single-file sequential workflow).
+
 Language names are case-insensitive and expand to their extensions automatically.
-A trailing integer sets the `ai_fix` issue number (default: 1).
 
 ### Supported Languages
 
@@ -701,9 +735,16 @@ or `--tools rust,simplify`.
 
 **NEVER substitute shell heuristics** such as `find ... | wc -l` (line counts) or `wc -c` (file sizes) as a proxy for complexity. File length is not a complexity metric. Using it will produce incorrect rankings and mislead refactoring effort. If neither the tool nor the CLI is available, tell the user and stop — do not improvise.
 
-### Workflow — Follow This Sequence
+---
 
-#### Step 1 — Run complexity analysis
+### Auto Mode — Concurrent Simplification (DEFAULT)
+
+This is the default when the user types `/ahma simplify` with no trailing integer.
+The agent orchestrates the entire workflow automatically without additional prompting.
+
+#### Phase 1 — Analyze (parent agent)
+
+Run the complexity analysis once to get the full report:
 
 **Via MCP tool:**
 ```
@@ -715,11 +756,134 @@ simplify(directory="<project-root>", ai_fix=1)
 ahma simplify <project-root> --ai-fix 1
 ```
 
+If language filters were specified (e.g., `/ahma simplify rust`), add `--extensions rust`.
+
 The output contains:
 1. Overall project simplicity score (0–100%)
 2. Ranked file list (worst first)
-3. Function-level hotspots for the top issue (top 5 by cognitive complexity)
-4. A structured fix prompt for that specific file
+3. Function-level hotspots for the top issue
+4. A structured fix prompt for issue #1
+
+Parse the ranked file list to determine how many issues exist. Set `N` to
+`min(requested_count, total_issues)` — default `requested_count` is 10.
+
+Tell the user: "Analyzing codebase... Found N complexity issues. Spawning N
+concurrent subagents to fix them."
+
+#### Phase 2 — Spawn subagents (concurrent)
+
+Spawn **one subagent per issue**, all concurrently. Each subagent is independent
+and edits a different file, so there are no file conflicts.
+
+**How to spawn depends on your environment.** Use the first strategy that works:
+
+| If you have... | Then do... |
+|----------------|------------|
+| A subagent/agent spawning tool (e.g., `invoke_subagent`, `Agent` tool, `Task` tool) | Spawn N subagent tool calls **in the same response** so they run concurrently |
+| Background task capability but no subagent tool | Launch N background tasks, one per issue |
+| Neither | Run the N issues sequentially, one at a time |
+
+**Each subagent receives this prompt** (fill in the template for each issue number):
+
+```
+You are simplifying a codebase. Your task is to fix complexity issue #<N>.
+
+Project root: <PROJECT_ROOT>
+
+## Step 1 — Get your fix instructions
+
+Run this command to get the structured fix prompt for your assigned issue:
+
+    ahma simplify <PROJECT_ROOT> --ai-fix <N>
+
+Or via MCP tool:
+
+    simplify(directory="<PROJECT_ROOT>", ai_fix=<N>)
+
+Read the output. It contains:
+- The exact file path to edit
+- Hotspot functions (name, line range, metrics)
+- A structured evaluation and fix prompt
+
+## Step 2 — Read and evaluate the target file
+
+Read the target file identified in the fix prompt. Evaluate critically:
+- Are the hotspot functions genuinely hard to understand?
+- Or is the complexity score driven by volume/enumeration (many match arms, config fields)?
+- Would splitting them force readers to jump between more locations?
+
+If the code is already clear and metrics are driven by volume rather than genuine
+algorithmic complexity, report "No changes needed — complexity is structural, not
+cognitive" and STOP.
+
+## Step 3 — Apply focused changes (if warranted)
+
+Constraints:
+- Edit ONLY the hotspot functions listed in the fix prompt
+- Do NOT refactor surrounding code
+- Do NOT change function signatures, public APIs, or behavior
+- Do NOT run cargo fmt, cargo clippy, or cargo test (the parent agent will do this)
+- Prefer: early returns/guard clauses, helper extraction for self-contained logic,
+  named predicates for complex boolean chains
+
+For test files: skip unless a single test function is individually complex.
+
+## Step 4 — Report
+
+Report what you changed (file path, functions modified, patterns applied) or why
+no changes were needed.
+```
+
+#### Phase 3 — Verify (parent agent, after ALL subagents complete)
+
+After all subagents have finished, the parent agent runs a single verification pass:
+
+1. **Format and lint:**
+   ```bash
+   cargo fmt --all && cargo clippy --all-targets
+   ```
+
+2. **Run tests:**
+   ```bash
+   cargo nextest run
+   ```
+   If tests fail, identify which subagent's changes caused the failure and revert
+   or fix those specific changes.
+
+3. **Re-analyze to show improvement:**
+   ```bash
+   ahma simplify <project-root> --ai-fix 1
+   ```
+   Report the before/after project simplicity score to the user.
+
+4. **Summarize results** in a table:
+   ```
+   | Issue # | File | Action | Result |
+   |---------|------|--------|--------|
+   | 1 | src/foo.rs | Extracted 3 helpers | Improved |
+   | 2 | src/bar.rs | No changes needed | Skipped |
+   | ... | ... | ... | ... |
+   ```
+
+---
+
+### Manual Mode — Single-Issue Workflow
+
+Triggered when the user provides a bare trailing integer (e.g., `/ahma simplify 3`
+or `/ahma simplify rust 2`). This follows the original sequential workflow for
+targeted single-file work.
+
+#### Step 1 — Run complexity analysis
+
+**Via MCP tool:**
+```
+simplify(directory="<project-root>", ai_fix=<N>)
+```
+
+**Via CLI:**
+```bash
+ahma simplify <project-root> --ai-fix <N>
+```
 
 #### Step 2 — Read and follow the structured fix prompt
 
@@ -765,10 +929,12 @@ ahma simplify <project-root> --verify <path-to-edited-file>
 #### Step 5 — Iterate
 
 ```
-simplify(directory="<project-root>", ai_fix=2)
+simplify(directory="<project-root>", ai_fix=<N+1>)
 ```
 
 Continue until the project score is satisfactory.
+
+---
 
 ### Score Interpretation
 
@@ -831,7 +997,8 @@ ahma simplify . --exclude '**/generated/**,**/vendor/**' --ai-fix 1
 2. **Do not add comments to improve scores** — structural change is needed.
 3. **Do not inline complex logic** — fewer functions with more complexity each makes scores worse.
 4. **Do not run `--ai-fix` without reading the structured prompt.**
-5. **Do not skip Step 4 (verify)** — complexity improvements must be confirmed by metrics.
+5. **Do not skip verification** — complexity improvements must be confirmed by metrics.
+6. **Do not have subagents run cargo fmt/clippy/test** — the parent agent runs these once after all subagents complete to avoid build lock contention.
 
 ---
 
