@@ -1047,6 +1047,21 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
+    /// Return the appropriate Python interpreter name for the current platform.
+    ///
+    /// Windows: `"python"` — the Python Launcher ships `python.exe`, not `python3.exe`.
+    /// Unix:    `"python3"` — standard name on Linux/macOS.
+    fn python_cmd() -> &'static str {
+        #[cfg(windows)]
+        {
+            "python"
+        }
+        #[cfg(not(windows))]
+        {
+            "python3"
+        }
+    }
+
     fn is_uri_safe_byte(b: u8) -> bool {
         matches!(
             b,
@@ -1237,7 +1252,7 @@ for line in sys.stdin:
         let script_path = write_mock_mcp_server_script(&temp_dir);
 
         let session_manager = Arc::new(SessionManager::new(SessionManagerConfig {
-            server_command: "python3".to_string(),
+            server_command: python_cmd().to_string(),
             server_args: vec![script_path.to_string_lossy().to_string()],
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
@@ -1407,7 +1422,7 @@ for line in sys.stdin:
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let script_path = write_mock_mcp_server_script(&temp_dir);
         let session_manager = Arc::new(SessionManager::new(SessionManagerConfig {
-            server_command: "python3".to_string(),
+            server_command: python_cmd().to_string(),
             server_args: vec![script_path.to_string_lossy().to_string()],
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
@@ -1491,7 +1506,7 @@ for line in sys.stdin:
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let script_path = write_mock_mcp_server_script(&temp_dir);
         let session_manager = Arc::new(SessionManager::new(SessionManagerConfig {
-            server_command: "python3".to_string(),
+            server_command: python_cmd().to_string(),
             server_args: vec![script_path.to_string_lossy().to_string()],
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
@@ -1533,7 +1548,7 @@ for line in sys.stdin:
         let script_path = write_mock_mcp_server_script(&temp_dir);
 
         let session_manager = Arc::new(SessionManager::new(SessionManagerConfig {
-            server_command: "python3".to_string(),
+            server_command: python_cmd().to_string(),
             server_args: vec![script_path.to_string_lossy().to_string()],
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
