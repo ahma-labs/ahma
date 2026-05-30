@@ -812,6 +812,7 @@ started_rx.await.ok();  // Don't return until spawn is live
 - **R14.2**: Tests should be: Fast (<100ms), Isolated, Deterministic, Documented.
 - **R14.3**: Bug fixes **must** include a regression test.
 - **R14.4**: Prefer in-memory unit tests over subprocess E2E tests. A test that validates static configuration, schema generation, path security, tool dispatch, argument parsing, async operation lifecycle, or any pure logic **must not** spawn an OS process. Only use `ClientBuilder`/`spawn_http_bridge` when the test specifically validates binary wiring or CLI flag behaviour that cannot be exercised via the in-process API.
+- **R14.5**: Tests **must not** depend on an external Python runtime (`python3`, `pip`, or any `.py` script). Python is a supported _execution target_ for worker synthesis, but CI test suites assume only a Rust toolchain is present. Use Rust-native equivalents in tests; if a feature requires Python at runtime, make the test conditional and document the external prerequisite explicitly.
 
 ### 10.1.1 The Test Pyramid
 
