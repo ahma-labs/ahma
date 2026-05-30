@@ -267,6 +267,47 @@ suppress the warning message.
 
 ---
 
+## Terminal Hooks — Shell Interception & Security
+
+For AI agents that run commands natively in your local terminal (like Claude Code, Cursor, Codex, or GitHub Copilot CLI), they execute commands directly in your shell rather than via an MCP server.
+
+To extend Ahma's **kernel sandbox** to these native shell tools, you can install **managed terminal hooks**.
+
+### How it works
+1. **Intercept**: The hook intercepts bash/shell execution requests from the AI agent.
+2. **Rewrite**: It wraps the command with `ahma hooks run-shell` and passes it to `ahma`'s sandboxed terminal runner.
+3. **Execute**: The command runs inside the kernel sandbox, preventing escapes outside the allowed scope.
+
+### Configuration Scopes
+- **User scope** (machine-level): Configures the hook globally for all projects.
+- **Project scope** (repo-level): Configures the hook only for the current project repository.
+
+### Setup & Management
+
+Use the `hooks` subcommand to configure and verify hooks:
+
+```bash
+# Check current hook installation status across all platforms
+ahma hooks status
+
+# Install user-scoped hooks for all supported tools (Cursor, Claude, Codex, Copilot)
+ahma hooks install --scope user
+
+# Install project-scoped hooks for GitHub Copilot specifically
+ahma hooks install --platform copilot --scope project
+
+# Uninstall hooks
+ahma hooks uninstall --platform copilot --scope user
+```
+
+Supported Hook Platforms:
+- **Cursor**: Configures `${HOME}/.cursor/hooks.json`
+- **Claude Code**: Configures `${HOME}/.claude/settings.json`
+- **Codex**: Configures `${HOME}/.codex/hooks.json`
+- **GitHub Copilot / Copilot CLI**: Configures `${HOME}/.copilot/hooks/ahma.json` (user) and `.github/hooks/ahma.json` (project)
+
+---
+
 ## Live Log Monitoring
 
 Two flavors of log monitoring:

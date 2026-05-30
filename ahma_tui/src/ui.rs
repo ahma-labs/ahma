@@ -127,7 +127,8 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     let visible_h = inner.height as usize;
     let lines = build_chat_history_lines(state, theme, inner.width as usize);
     let scroll = chat_history_scroll_offset(lines.len(), visible_h, state.chat_scroll);
-    let visible_lines: Vec<Line<'static>> = lines.into_iter().skip(scroll).take(visible_h).collect();
+    let visible_lines: Vec<Line<'static>> =
+        lines.into_iter().skip(scroll).take(visible_h).collect();
     frame.render_widget(
         Paragraph::new(Text::from(visible_lines)).wrap(Wrap { trim: false }),
         inner,
@@ -841,7 +842,13 @@ fn render_selected_detail(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = build_detail_lines(op, state, theme, inner.width as usize, inner.height as usize);
+    let lines = build_detail_lines(
+        op,
+        state,
+        theme,
+        inner.width as usize,
+        inner.height as usize,
+    );
     let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
 }
@@ -927,7 +934,10 @@ fn push_stdout_tail_lines(
     } else {
         "-".repeat(width.saturating_sub(4))
     };
-    lines.push(Line::from(Span::styled(format!("  {separator}"), theme.dim())));
+    lines.push(Line::from(Span::styled(
+        format!("  {separator}"),
+        theme.dim(),
+    )));
 
     let tail_height = height.saturating_sub(lines.len());
     let visible_tail: Vec<_> = op.stdout_tail.iter().rev().take(tail_height).collect();

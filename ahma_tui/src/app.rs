@@ -649,6 +649,7 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
             Some(McpChatConfig {
                 base_url: state.mcp_http_base_url.clone(),
                 workspace_root: std::path::PathBuf::from(&state.workspace),
+                session_id: state.session_id.clone(),
             })
         } else {
             None
@@ -881,7 +882,11 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
     match cmd {
         "/help" => state.show_help = true,
         "/clear" => state.chat.clear(),
-        "/operations" => set_mode_and_focus(state, crate::state::Mode::Monitor, crate::state::Focus::OpsDag),
+        "/operations" => set_mode_and_focus(
+            state,
+            crate::state::Mode::Monitor,
+            crate::state::Focus::OpsDag,
+        ),
         "/logs" => set_mode_and_focus(state, crate::state::Mode::Monitor, crate::state::Focus::Log),
         _ => return false,
     }
@@ -892,8 +897,14 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
 #[cfg(feature = "tui")]
 fn handle_mode_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     match cmd {
-        "/mode chat" => set_mode_and_focus(state, crate::state::Mode::Chat, crate::state::Focus::Chat),
-        "/mode monitor" => set_mode_and_focus(state, crate::state::Mode::Monitor, crate::state::Focus::AiActivity),
+        "/mode chat" => {
+            set_mode_and_focus(state, crate::state::Mode::Chat, crate::state::Focus::Chat)
+        }
+        "/mode monitor" => set_mode_and_focus(
+            state,
+            crate::state::Mode::Monitor,
+            crate::state::Focus::AiActivity,
+        ),
         _ => return false,
     }
 
@@ -1012,11 +1023,10 @@ fn open_model_picker(state: &mut crate::state::AppState) {
 
     if state.available_models.is_empty() {
         let (base_url, _) = parse_llm_selection(state);
-        if !base_url.is_empty() {
-            if let Some(tx) = &state.bridge_tx {
+        if !base_url.is_empty()
+            && let Some(tx) = &state.bridge_tx {
                 spawn_model_refresh(base_url, tx.clone());
             }
-        }
         push_assistant_message(state, "Fetching model list…");
         return;
     }
@@ -1075,16 +1085,14 @@ fn run_nav_tool(rest: &str, state: &mut crate::state::AppState) {
         crate::llm_bridge::McpChatConfig {
             base_url: state.mcp_http_base_url.clone(),
             workspace_root: std::path::PathBuf::from(&state.workspace),
+            session_id: state.session_id.clone(),
         },
         tx.clone(),
     );
 }
 
 #[cfg(feature = "tui")]
-fn push_assistant_message(
-    state: &mut crate::state::AppState,
-    content: impl Into<String>,
-) {
+fn push_assistant_message(state: &mut crate::state::AppState, content: impl Into<String>) {
     state.chat.push(crate::state::ChatEntry::Assistant {
         content: content.into(),
         streaming: false,
@@ -1176,11 +1184,10 @@ fn save_session(state: &crate::state::AppState) {
         mcp_enabled: state.mcp_enabled,
     };
 
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Err(e) = cfg.save(&cwd) {
+    if let Ok(cwd) = std::env::current_dir()
+        && let Err(e) = cfg.save(&cwd) {
             debug!("Failed to save session config: {e}");
         }
-    }
 }
 
 // ─── Bridge event handler ─────────────────────────────────────────────────────
@@ -1229,8 +1236,8 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
                     state.llm_label = format!("{} / {}", p.name, model);
                     save_session(state);
                 }
-            } else if let Some(current_url) = &state.current_provider_url {
-                if let Some(provider) = providers
+            } else if let Some(current_url) = &state.current_provider_url
+                && let Some(provider) = providers
                     .iter()
                     .find(|provider| &provider.base_url == current_url)
                 {
@@ -1240,7 +1247,6 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
                         state.llm_label = format!("{} / {}", provider.name, model);
                     }
                 }
-            }
         }
         BridgeEvent::ModelsRefreshed { base_url, models } => {
             if state.current_provider_url.as_deref() == Some(base_url.as_str())

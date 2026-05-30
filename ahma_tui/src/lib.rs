@@ -15,7 +15,7 @@ pub mod app;
 pub mod connection;
 pub mod keymap;
 pub mod llm_bridge;
-pub mod mcp_client;
+// pub mod mcp_client;
 pub mod mcp_source;
 pub mod session_config;
 pub mod state;

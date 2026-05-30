@@ -232,7 +232,7 @@ async fn maybe_install_terminal_hooks(args: &UpdateArgs, binary_path: &Path) -> 
 
     println!();
     println!(
-        "Optional: install user-scoped terminal hooks so Cursor, Claude Code, and Codex route shell tool calls through ahma."
+        "Optional: install user-scoped terminal hooks so Cursor, Claude Code, Codex, and GitHub Copilot route shell tool calls through ahma."
     );
 
     if !prompt_yes_no("Install user-scoped terminal hooks now? [y/N]: ").await? {
@@ -292,7 +292,9 @@ async fn install_user_hooks(binary_path: &Path) -> Result<()> {
         );
     }
 
-    println!("Restart Cursor, Claude Code, or Codex to pick up the updated hook configuration.");
+    println!(
+        "Restart Cursor, Claude Code, Codex, or GitHub Copilot to pick up the updated hook configuration."
+    );
     Ok(())
 }
 
