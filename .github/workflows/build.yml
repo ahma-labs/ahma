@@ -50,6 +50,7 @@ env:
   IS_DEV_BUILD: "true" # Set "true" to speed up builds for CI testing
   RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_DIRECT: "true"
 jobs:
   job-cargo-nextest:
     name: Cargo Nextest (${{ matrix.os }})
@@ -148,6 +149,13 @@ jobs:
           fi
           echo "SCCACHE_GHA_CACHE_TO=${CACHE_TO}" >> "$GITHUB_ENV"
           echo "SCCACHE_GHA_CACHE_FROM=${CACHE_FROM}" >> "$GITHUB_ENV"
+
+      - name: Expose GitHub Actions cache environment variables for sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: sccache-action
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -299,6 +307,13 @@ jobs:
           echo "SCCACHE_GHA_CACHE_TO=sccache-macOS-ARM64-android-day${{ steps.day-number.outputs.day }}" >> "$GITHUB_ENV"
           echo "SCCACHE_GHA_CACHE_FROM=sccache-macOS-ARM64-android-day${{ steps.day-number.outputs.day }},sccache-macOS-ARM64-android-day,sccache-macOS-ARM64-test-day" >> "$GITHUB_ENV"
 
+      - name: Expose GitHub Actions cache environment variables for sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
       - name: sccache-action
         uses: mozilla-actions/sccache-action@v0.0.10
 
@@ -417,6 +432,13 @@ jobs:
         run: |
           echo "SCCACHE_GHA_CACHE_TO=sccache-Linux-X64-coverage-day${{ steps.day-number.outputs.day }}" >> "$GITHUB_ENV"
           echo "SCCACHE_GHA_CACHE_FROM=sccache-Linux-X64-coverage-day${{ steps.day-number.outputs.day }},sccache-Linux-X64-coverage-day,sccache-Linux-X64-test-day" >> "$GITHUB_ENV"
+
+      - name: Expose GitHub Actions cache environment variables for sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: sccache-action
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -612,6 +634,14 @@ jobs:
           CACHE_FROM="${CACHE_TO},sccache-${{ matrix.platform }}-release-day,sccache-${{ runner.os }}-${{ runner.arch }}-test-day"
           echo "SCCACHE_GHA_CACHE_TO=${CACHE_TO}" >> "$GITHUB_ENV"
           echo "SCCACHE_GHA_CACHE_FROM=${CACHE_FROM}" >> "$GITHUB_ENV"
+
+      - name: Expose GitHub Actions cache environment variables for sccache
+        if: "!matrix.use_cross"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: sccache-action
         if: "!matrix.use_cross"

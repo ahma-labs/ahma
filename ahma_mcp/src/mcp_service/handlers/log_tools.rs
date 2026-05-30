@@ -395,3 +395,122 @@ fn search_log_file(
         results.join("\n")
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_collect_log_sources() {
+        let dir = tempdir().unwrap();
+        // empty dir
+        let sources = collect_log_sources(dir.path()).unwrap();
+        assert!(sources.is_empty());
+
+        // write some files
+        let f1 = dir.path().join("a.log");
+        let f2 = dir.path().join("b.log");
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(&f1, "hello").unwrap();
+        std::fs::write(&f2, "world").unwrap();
+
+        let sources = collect_log_sources(dir.path()).unwrap();
+        assert_eq!(sources.len(), 2);
+        // Assert we have both filenames
+        let names: Vec<String> = sources.iter().map(|s| s.name.clone()).collect();
+        assert!(names.contains(&"a.log".to_string()));
+        assert!(names.contains(&"b.log".to_string()));
+    }
+
+    #[test]
+    fn test_read_log_window() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.log");
+        std::fs::write(&file, "line 1\npassword=secret123\nline 3").unwrap();
+
+        // test normal read (redacted)
+        let content = read_log_window(&file, 0, 10, false).unwrap();
+        assert!(content.contains("line 1"));
+        assert!(content.contains("password="));
+        assert!(!content.contains("secret123")); // should be redacted
+        assert!(content.contains("line 3"));
+
+        // test raw read
+        let content_raw = read_log_window(&file, 0, 10, true).unwrap();
+        assert!(content_raw.contains("secret123")); // should not be redacted
+
+        // test offset/limit
+        let window = read_log_window(&file, 1, 1, true).unwrap();
+        assert_eq!(window, "password=secret123");
+    }
+
+    #[test]
+    fn test_search_log_file() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.log");
+        std::fs::write(&file, "Apple\nbanana\npassword=secret").unwrap();
+
+        // Case insensitive search
+        let res = search_log_file(&file, "apple", 10, false, false).unwrap();
+        assert!(res.contains("Apple"));
+
+        // Case sensitive search
+        let res_sens = search_log_file(&file, "apple", 10, false, true).unwrap();
+        assert!(res_sens.contains("No lines matching"));
+
+        // Limit results
+        std::fs::write(&file, "apple\napple\napple").unwrap();
+        let res_limit = search_log_file(&file, "apple", 2, false, false).unwrap();
+        assert!(res_limit.contains("2 match(es)"));
+
+        // Redaction
+        std::fs::write(&file, "password=secret").unwrap();
+        let res_redact = search_log_file(&file, "password", 10, false, false).unwrap();
+        assert!(!res_redact.contains("secret"));
+
+        let res_raw = search_log_file(&file, "password", 10, true, false).unwrap();
+        assert!(res_raw.contains("secret"));
+    }
+
+    #[test]
+    fn test_require_safe_log_path() {
+        let dir = tempdir().unwrap();
+        let log_dir = dir.path();
+        let file_path = log_dir.join("test.log");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        // Canonicalized directory
+        let canonical_dir = std::fs::canonicalize(log_dir).unwrap();
+
+        // 1. Safe path inside
+        let mut args = Map::new();
+        args.insert("file".to_string(), Value::String("test.log".to_string()));
+        let res = require_safe_log_path(&args, &canonical_dir);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), std::fs::canonicalize(&file_path).unwrap());
+
+        // 2. Absolute path rejection
+        let mut args = Map::new();
+        args.insert("file".to_string(), Value::String("/etc/passwd".to_string()));
+        let res = require_safe_log_path(&args, &canonical_dir);
+        assert!(res.is_err());
+
+        // 3. Traversal rejection (starts with dot or contains slashes)
+        let mut args = Map::new();
+        args.insert("file".to_string(), Value::String("../passwd".to_string()));
+        let res = require_safe_log_path(&args, &canonical_dir);
+        assert!(res.is_err());
+
+        // 4. Missing file returns error
+        let mut args = Map::new();
+        args.insert(
+            "file".to_string(),
+            Value::String("nonexistent.log".to_string()),
+        );
+        let res = require_safe_log_path(&args, &canonical_dir);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().message.contains("does not exist"));
+    }
+}

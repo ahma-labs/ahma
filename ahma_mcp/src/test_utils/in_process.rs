@@ -46,9 +46,14 @@ pub async fn create_in_process_mcp_from_dir(tools_dir: &Path) -> Result<InProces
     let configs = load_tool_configs(&AppConfig::default(), Some(tools_dir))
         .await
         .unwrap_or_default();
+    let mode = if super::client::is_nested_sandbox_environment() {
+        SandboxMode::Test
+    } else {
+        SandboxMode::Strict
+    };
     let sandbox = Sandbox::new(
         vec![default_scope_for_tools_dir(tools_dir)?],
-        SandboxMode::Strict,
+        mode,
         false,
         false,
         false,
@@ -61,13 +66,12 @@ pub async fn create_in_process_mcp_from_dir(tools_dir: &Path) -> Result<InProces
 /// Both the MCP initialize/initialized handshake and any subsequent requests
 /// go through the in-memory channel – no subprocess is spawned.
 pub async fn create_in_process_mcp(configs: HashMap<String, ToolConfig>) -> Result<InProcessMcp> {
-    let sandbox = Sandbox::new(
-        vec![std::env::current_dir()?],
-        SandboxMode::Strict,
-        false,
-        false,
-        false,
-    )?;
+    let mode = if super::client::is_nested_sandbox_environment() {
+        SandboxMode::Test
+    } else {
+        SandboxMode::Strict
+    };
+    let sandbox = Sandbox::new(vec![std::env::current_dir()?], mode, false, false, false)?;
     wire_in_process_mcp(configs, sandbox).await
 }
 
@@ -83,7 +87,12 @@ pub async fn create_in_process_mcp_with_scope(
     let configs = load_tool_configs(&AppConfig::default(), Some(tools_dir))
         .await
         .unwrap_or_default();
-    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, false)?;
+    let mode = if super::client::is_nested_sandbox_environment() {
+        SandboxMode::Test
+    } else {
+        SandboxMode::Strict
+    };
+    let sandbox = Sandbox::new(scopes, mode, false, false, false)?;
     wire_in_process_mcp(configs, sandbox).await
 }
 

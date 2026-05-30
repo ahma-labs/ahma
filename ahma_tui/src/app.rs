@@ -640,20 +640,15 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
 
     if let Some(tx) = &state.bridge_tx {
         let client = LlmClient::new(base_url, model, None);
-        let system = if state.mcp_enabled {
-            Some("Use ahma tools when they would materially improve the answer. Prefer direct answers when no tool is needed.".to_string())
-        } else {
-            None
-        };
-        let mcp = if state.mcp_enabled && !state.mcp_http_base_url.is_empty() {
-            Some(McpChatConfig {
+        let system = state.mcp_enabled.then(|| {
+            "Use ahma tools when they would materially improve the answer. Prefer direct answers when no tool is needed.".to_string()
+        });
+        let mcp =
+            (state.mcp_enabled && !state.mcp_http_base_url.is_empty()).then(|| McpChatConfig {
                 base_url: state.mcp_http_base_url.clone(),
                 workspace_root: std::path::PathBuf::from(&state.workspace),
                 session_id: state.session_id.clone(),
-            })
-        } else {
-            None
-        };
+            });
         spawn_chat_task(client, messages, system, mcp, tx.clone());
     }
 }
@@ -726,21 +721,17 @@ fn handle_help_key(key: crossterm::event::KeyEvent, state: &mut crate::state::Ap
 fn handle_picker_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    if active_picker_mut(state).is_none() {
+    let Some(picker) = active_picker_mut(state) else {
         return false;
-    }
+    };
 
     match (key.code, key.modifiers) {
         (KeyCode::Up, _) => {
-            if let Some(picker) = active_picker_mut(state) {
-                picker.select_prev();
-            }
+            picker.select_prev();
             true
         }
         (KeyCode::Down, _) => {
-            if let Some(picker) = active_picker_mut(state) {
-                picker.select_next();
-            }
+            picker.select_next();
             true
         }
         (KeyCode::Enter, _) => {
@@ -752,15 +743,11 @@ fn handle_picker_key(key: crossterm::event::KeyEvent, state: &mut crate::state::
             true
         }
         (KeyCode::Backspace, _) => {
-            if let Some(picker) = active_picker_mut(state) {
-                picker.filter_pop();
-            }
+            picker.filter_pop();
             true
         }
         (KeyCode::Char(c), KeyModifiers::NONE) | (KeyCode::Char(c), KeyModifiers::SHIFT) => {
-            if let Some(picker) = active_picker_mut(state) {
-                picker.filter_push(c);
-            }
+            picker.filter_push(c);
             true
         }
         _ => false,
@@ -1195,6 +1182,56 @@ fn save_session(state: &crate::state::AppState) {
 // ─── Bridge event handler ─────────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
+fn handle_providers_discovered(
+    providers: Vec<ahma_llm_monitor::LocalProvider>,
+    state: &mut crate::state::AppState,
+) {
+    let first = providers.first().cloned();
+    state.available_providers = providers
+        .iter()
+        .map(|p| (p.name.clone(), p.base_url.clone()))
+        .collect();
+
+    if state.llm_label == "no LLM" {
+        if let Some(p) = first {
+            let model = p.models.first().cloned().unwrap_or_default();
+            state.available_models = p.models;
+            state.current_provider_url = Some(p.base_url.clone());
+            state.llm_label = format!("{} / {}", p.name, model);
+            save_session(state);
+        }
+    } else if let Some(current_url) = &state.current_provider_url
+        && let Some(provider) = providers
+            .iter()
+            .find(|provider| &provider.base_url == current_url)
+    {
+        let model = state.selected_model();
+        state.available_models = provider.models.clone();
+        if !model.is_empty() {
+            state.llm_label = format!("{} / {}", provider.name, model);
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_models_refreshed(
+    base_url: String,
+    models: Vec<String>,
+    state: &mut crate::state::AppState,
+) {
+    if state.current_provider_url.as_deref() == Some(base_url.as_str()) && !models.is_empty() {
+        use crate::state::PickerState;
+        state.available_models = models.clone();
+        let mut picker = PickerState::new("Select model", models);
+        let selected_model = state.selected_model();
+        if !selected_model.is_empty() {
+            picker.select_exact(&selected_model);
+        }
+        state.model_picker = Some(picker);
+    }
+}
+
+#[cfg(feature = "tui")]
 fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate::state::AppState) {
     use crate::llm_bridge::BridgeEvent;
     use crate::state::ChatEntry;
@@ -1224,45 +1261,10 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             state.chat_scroll = 0;
         }
         BridgeEvent::ProvidersDiscovered(providers) => {
-            let first = providers.first().cloned();
-            state.available_providers = providers
-                .iter()
-                .map(|p| (p.name.clone(), p.base_url.clone()))
-                .collect();
-
-            if state.llm_label == "no LLM" {
-                if let Some(p) = first {
-                    let model = p.models.first().cloned().unwrap_or_default();
-                    state.available_models = p.models;
-                    state.current_provider_url = Some(p.base_url.clone());
-                    state.llm_label = format!("{} / {}", p.name, model);
-                    save_session(state);
-                }
-            } else if let Some(current_url) = &state.current_provider_url
-                && let Some(provider) = providers
-                    .iter()
-                    .find(|provider| &provider.base_url == current_url)
-            {
-                let model = state.selected_model();
-                state.available_models = provider.models.clone();
-                if !model.is_empty() {
-                    state.llm_label = format!("{} / {}", provider.name, model);
-                }
-            }
+            handle_providers_discovered(providers, state);
         }
         BridgeEvent::ModelsRefreshed { base_url, models } => {
-            if state.current_provider_url.as_deref() == Some(base_url.as_str())
-                && !models.is_empty()
-            {
-                use crate::state::PickerState;
-                state.available_models = models.clone();
-                let mut picker = PickerState::new("Select model", models);
-                let selected_model = state.selected_model();
-                if !selected_model.is_empty() {
-                    picker.select_exact(&selected_model);
-                }
-                state.model_picker = Some(picker);
-            }
+            handle_models_refreshed(base_url, models, state);
         }
     }
 }
