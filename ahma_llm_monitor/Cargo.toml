@@ -9,7 +9,9 @@ version.workspace = true
 
 [dependencies]
 ahma_common = { path = "../ahma_common" }
-reqwest = { workspace = true, features = ["json", "rustls"] }
+bytes = "1"
+futures.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true

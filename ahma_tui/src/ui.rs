@@ -1,22 +1,7 @@
 //! Ratatui rendering — all panel draw functions.
 //!
-//! The top-level [`draw`] function is called every redraw tick and delegates
-//! to per-panel helpers.
-//!
-//! Layout (from top to bottom):
-//! ```text
-//! ┌─ header (1 line) ──────────────────────────────────────────────────────┐
-//! │ session · sandbox · workspace · transport · health                     │
-//! ├─ AI Activity (8 lines) ────────────────────────────────────────────────┤
-//! │ Most-recent MCP tool calls, newest first                               │
-//! ├─ Operations DAG (40%) ──┬─ Detail (60%) ─────────────────────────────┤
-//! │ Live ops tree           │ Selected op metadata + stdout tail           │
-//! ├─ Log (fill) ────────────┴────────────────────────────────────────────┤
-//! │ Scrollable, filterable log ring-buffer                                │
-//! ├─ Approval banner (0 or 3 lines) ─────────────────────────────────────┤
-//! ├─ Footer (1 line) ─────────────────────────────────────────────────────┤
-//! └────────────────────────────────────────────────────────────────────────┘
-//! ```
+//! The top-level [`draw`] function dispatches to either the chat or monitor
+//! layout based on `state.mode`.
 
 #[cfg(feature = "tui")]
 use ratatui::{
@@ -30,7 +15,7 @@ use ratatui::{
     },
 };
 
-use crate::state::{AppState, Focus};
+use crate::state::{AppState, ChatEntry, Focus, Mode};
 use crate::theme::Theme;
 
 // ─── Top-level draw ───────────────────────────────────────────────────────────
@@ -38,6 +23,345 @@ use crate::theme::Theme;
 /// Called every redraw tick — the only public entry point in this module.
 #[cfg(feature = "tui")]
 pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    match state.mode {
+        Mode::Chat => draw_chat_layout(frame, state, theme),
+        Mode::Monitor => draw_monitor_layout(frame, state, theme),
+    }
+
+    // Overlays drawn on top of whichever layout is active.
+    let full = frame.area();
+    if state.show_help {
+        draw_help(frame, theme, full);
+    }
+    if state.navigator.visible {
+        draw_navigator(frame, state, theme, full);
+    }
+    if let Some(picker) = &state.provider_picker {
+        draw_picker(frame, picker, theme, full);
+    } else if let Some(picker) = &state.model_picker {
+        draw_picker(frame, picker, theme, full);
+    }
+}
+
+// ─── Chat layout ──────────────────────────────────────────────────────────────
+
+#[cfg(feature = "tui")]
+fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    let full = frame.area();
+    let approval_h: u16 = if state.approval.is_some() { 3 } else { 0 };
+
+    // Input height: 1–6 lines depending on content, always at least 3 (borders).
+    let input_lines = state.chat_input_line_count().clamp(1, 6) as u16;
+    let input_h = input_lines + 2; // borders
+
+    let [header_a, chat_a, approval_a, input_a, footer_a] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(4),
+        Constraint::Length(approval_h),
+        Constraint::Length(input_h),
+        Constraint::Length(1),
+    ])
+    .areas(full);
+
+    draw_chat_header(frame, state, theme, header_a);
+    draw_chat_history(frame, state, theme, chat_a);
+    if state.approval.is_some() {
+        draw_approval(frame, state, theme, approval_a);
+    }
+    draw_input_box(frame, state, theme, input_a);
+    draw_chat_footer(frame, state, theme, footer_a);
+}
+
+#[cfg(feature = "tui")]
+fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let mcp_label = if state.mcp_enabled {
+        if state.unicode {
+            " · MCP ✓"
+        } else {
+            " · MCP on"
+        }
+    } else {
+        ""
+    };
+    let health_span = if state.server_healthy {
+        Span::styled(if state.unicode { " ● " } else { " * " }, theme.healthy())
+    } else {
+        Span::styled(if state.unicode { " ○ " } else { " - " }, theme.unhealthy())
+    };
+
+    let line = Line::from(vec![
+        Span::styled(" ahma chat", theme.title()),
+        Span::styled(format!("  {}", state.llm_label), theme.normal()),
+        Span::styled(mcp_label, theme.dim()),
+        health_span,
+        Span::styled(
+            format!("{}  q quit  ? help", state.transport_label),
+            theme.dim(),
+        ),
+    ]);
+
+    frame.render_widget(Paragraph::new(line).style(theme.header_bar()), area);
+}
+
+#[cfg(feature = "tui")]
+fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let focused = state.focus == Focus::Chat;
+    let border_style = if focused {
+        theme.border_focused()
+    } else {
+        theme.border_unfocused()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if state.chat.is_empty() {
+        let hint = chat_history_hint(state);
+        frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
+        return;
+    }
+
+    let visible_h = inner.height as usize;
+    let lines = build_chat_history_lines(state, theme, inner.width as usize);
+    let scroll = chat_history_scroll_offset(lines.len(), visible_h, state.chat_scroll);
+    let visible_lines: Vec<Line<'static>> = lines.into_iter().skip(scroll).take(visible_h).collect();
+    frame.render_widget(
+        Paragraph::new(Text::from(visible_lines)).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+#[cfg(feature = "tui")]
+fn chat_history_hint(state: &AppState) -> &'static str {
+    if state.llm_label == "no LLM" {
+        if state.unicode {
+            "  No LLM configured — use /provider to select one"
+        } else {
+            "  No LLM configured - use /provider to select one"
+        }
+    } else {
+        "  Type a message and press Enter to start chatting"
+    }
+}
+
+#[cfg(feature = "tui")]
+fn build_chat_history_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    for entry in state.chat.entries() {
+        push_chat_entry_lines(&mut lines, entry, state, theme, width);
+        lines.push(Line::default());
+    }
+
+    lines
+}
+
+#[cfg(feature = "tui")]
+fn push_chat_entry_lines(
+    lines: &mut Vec<Line<'static>>,
+    entry: &ChatEntry,
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+) {
+    match entry {
+        ChatEntry::User(text) => push_user_chat_lines(lines, text, theme),
+        ChatEntry::Assistant { content, streaming } => {
+            push_assistant_chat_lines(lines, content, *streaming, state, theme)
+        }
+        ChatEntry::ToolCall {
+            id: _,
+            name,
+            args,
+            result,
+            failed,
+        } => push_tool_call_chat_lines(
+            lines,
+            name,
+            args,
+            result.as_deref(),
+            *failed,
+            state,
+            theme,
+            width,
+        ),
+    }
+}
+
+#[cfg(feature = "tui")]
+fn push_user_chat_lines(lines: &mut Vec<Line<'static>>, text: &str, theme: &Theme) {
+    for (index, line_str) in text.lines().enumerate() {
+        let prefix = if index == 0 { " you  " } else { "      " };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, theme.dim()),
+            Span::styled(line_str.to_string(), theme.normal()),
+        ]));
+    }
+}
+
+#[cfg(feature = "tui")]
+fn push_assistant_chat_lines(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    streaming: bool,
+    state: &AppState,
+    theme: &Theme,
+) {
+    let cursor = if streaming {
+        if state.unicode { "▌" } else { "|" }
+    } else {
+        ""
+    };
+    let display = format!("{content}{cursor}");
+
+    for (index, line_str) in display.lines().enumerate() {
+        let prefix = if index == 0 { " ahma " } else { "      " };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, theme.running()),
+            Span::styled(line_str.to_string(), theme.normal()),
+        ]));
+    }
+
+    if display.is_empty() && streaming {
+        lines.push(Line::from(vec![
+            Span::styled(" ahma ", theme.running()),
+            Span::styled(if state.unicode { "▌" } else { "|" }, theme.dim()),
+        ]));
+    }
+}
+
+#[cfg(feature = "tui")]
+fn push_tool_call_chat_lines(
+    lines: &mut Vec<Line<'static>>,
+    name: &str,
+    args: &str,
+    result: Option<&str>,
+    failed: bool,
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+) {
+    let (glyph, status_style) = tool_call_status(result.is_some(), failed, state, theme);
+    lines.push(Line::from(vec![
+        Span::styled(" tool ", theme.dim()),
+        Span::styled(glyph, status_style),
+        Span::styled(format!(" {name}"), theme.dim()),
+    ]));
+
+    if !args.trim().is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("       {}", truncate(args, width.saturating_sub(8))),
+            theme.dim(),
+        )));
+    }
+
+    if let Some(result) = result {
+        lines.push(Line::from(Span::styled(
+            format!("       {}", truncate(result, width.saturating_sub(8))),
+            theme.dim(),
+        )));
+    }
+}
+
+#[cfg(feature = "tui")]
+fn tool_call_status(
+    has_result: bool,
+    failed: bool,
+    state: &AppState,
+    theme: &Theme,
+) -> (&'static str, Style) {
+    match (has_result, failed, state.unicode) {
+        (true, true, true) => ("✗", theme.failed()),
+        (true, true, false) => ("x", theme.failed()),
+        (true, false, true) => ("✓", theme.success()),
+        (true, false, false) => ("v", theme.success()),
+        (false, _, true) => ("⟳", theme.running()),
+        (false, _, false) => (">", theme.running()),
+    }
+}
+
+#[cfg(feature = "tui")]
+fn chat_history_scroll_offset(total: usize, visible_h: usize, from_bottom: usize) -> usize {
+    if total > visible_h {
+        total.saturating_sub(visible_h).saturating_sub(from_bottom)
+    } else {
+        0
+    }
+}
+
+#[cfg(feature = "tui")]
+fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let focused = state.focus == Focus::Chat;
+    let border_style = if focused {
+        theme.border_focused()
+    } else {
+        theme.border_unfocused()
+    };
+
+    let title = if state.llm_label == "no LLM" {
+        " no LLM — /provider to configure ".to_string()
+    } else {
+        " message ".to_string()
+    };
+
+    let block = Block::default()
+        .title(Span::styled(title, theme.dim()))
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let (cursor_row, cursor_col) = state.chat_input.cursor();
+    let mut rendered_lines: Vec<String> = state.chat_input.lines().to_vec();
+    if focused {
+        let cursor = if state.unicode { '│' } else { '|' };
+        if let Some(line) = rendered_lines.get_mut(cursor_row) {
+            let insert_at = cursor_col.min(line.chars().count());
+            let byte_idx = line
+                .char_indices()
+                .nth(insert_at)
+                .map(|(idx, _)| idx)
+                .unwrap_or_else(|| line.len());
+            line.insert(byte_idx, cursor);
+        } else {
+            rendered_lines.push(cursor.to_string());
+        }
+    }
+
+    let text = rendered_lines.join("\n");
+    let para = Paragraph::new(Span::styled(text, theme.normal())).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
+}
+
+#[cfg(feature = "tui")]
+fn draw_chat_footer(frame: &mut Frame, _state: &AppState, theme: &Theme, area: Rect) {
+    let keys: &[(&str, &str)] = &[
+        ("Enter", "send"),
+        ("Shift+Enter", "newline"),
+        ("/", "commands"),
+        ("Tab", "monitor panels"),
+        ("q", "quit"),
+    ];
+
+    let mut spans: Vec<Span> = vec![];
+    for (key, desc) in keys {
+        spans.push(Span::styled(format!("  {key} "), theme.footer_key()));
+        spans.push(Span::styled(desc.to_string(), theme.footer()));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(theme.footer()),
+        area,
+    );
+}
+
+// ─── Monitor layout ───────────────────────────────────────────────────────────
+
+#[cfg(feature = "tui")]
+fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
     let approval_h: u16 = if state.approval.is_some() { 3 } else { 0 };
 
@@ -66,13 +390,182 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     }
 
     draw_footer(frame, state, theme, footer_a);
-
-    if state.show_help {
-        draw_help(frame, theme, full);
-    }
     if state.palette.visible {
         draw_palette(frame, state, theme, full);
     }
+}
+
+// ─── Navigator overlay ────────────────────────────────────────────────────────
+
+#[cfg(feature = "tui")]
+fn draw_navigator(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let w = 64u16.min(area.width);
+    let max_items = 12u16;
+    let h = (3 + max_items).min(area.height);
+    let popup = centered_rect(w, h, area);
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled(" / Commands ", theme.title()))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    // Input line.
+    let cursor = if state.unicode { "│" } else { "|" };
+    let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!("/ {}{cursor}", state.navigator.input),
+            theme.running(),
+        )),
+        input_area,
+    );
+
+    if inner.height < 3 {
+        return;
+    }
+
+    // Separator.
+    let sep_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            if state.unicode {
+                "─".repeat(inner.width as usize)
+            } else {
+                "-".repeat(inner.width as usize)
+            },
+            theme.dim(),
+        )),
+        sep_area,
+    );
+
+    let list_h = inner.height.saturating_sub(2);
+    if list_h == 0 || state.navigator.completions.is_empty() {
+        return;
+    }
+    let list_area = Rect::new(inner.x, inner.y + 2, inner.width, list_h);
+
+    let desc_col = (inner.width as usize).saturating_sub(32).max(20);
+
+    let items: Vec<ListItem> = state
+        .navigator
+        .completions
+        .iter()
+        .take(list_h as usize)
+        .enumerate()
+        .map(|(i, cmd)| {
+            let style = if i == state.navigator.selected {
+                theme.selected_item()
+            } else {
+                theme.normal()
+            };
+            let cmd_str = truncate(&cmd.command, desc_col);
+            let desc_str = truncate(cmd.description, inner.width as usize - desc_col - 2);
+            let line = Line::from(vec![
+                Span::styled(format!(" {:<width$}", cmd_str, width = desc_col), style),
+                Span::styled(
+                    format!(" {desc_str}"),
+                    if i == state.navigator.selected {
+                        style
+                    } else {
+                        theme.dim()
+                    },
+                ),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let mut list_state = ListState::default().with_selected(Some(state.navigator.selected));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(theme.selected_item()),
+        list_area,
+        &mut list_state,
+    );
+}
+
+// ─── Inline picker overlay ────────────────────────────────────────────────────
+
+#[cfg(feature = "tui")]
+fn draw_picker(frame: &mut Frame, picker: &crate::state::PickerState, theme: &Theme, area: Rect) {
+    let w = 60u16.min(area.width);
+    let max_items = 10u16;
+    let h = (4 + max_items).min(area.height);
+    let popup = centered_rect(w, h, area);
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled(format!(" {} ", picker.title), theme.title()))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let [filter_area, list_area, hint_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let filter_text = if picker.filter.is_empty() {
+        " filter: type to narrow".to_string()
+    } else {
+        format!(" filter: {}", picker.filter)
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(filter_text, theme.dim())),
+        filter_area,
+    );
+
+    let items_filtered = picker.filtered_items();
+    let items: Vec<ListItem> = items_filtered
+        .iter()
+        .take(list_area.height as usize)
+        .enumerate()
+        .map(|(i, name)| {
+            let style = if i == picker.selected {
+                theme.selected_item()
+            } else {
+                theme.normal()
+            };
+            ListItem::new(Span::styled(format!(" {name}"), style))
+        })
+        .collect();
+
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("  (none available)", theme.dim())),
+            list_area,
+        );
+        return;
+    }
+
+    let mut list_state = ListState::default().with_selected(Some(picker.selected));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(theme.selected_item()),
+        list_area,
+        &mut list_state,
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "  type filter  ↑↓ navigate  Enter select  Esc cancel",
+            theme.dim(),
+        )),
+        hint_area,
+    );
 }
 
 // ─── Header ───────────────────────────────────────────────────────────────────
@@ -241,43 +734,7 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
         return;
     }
 
-    let items: Vec<ListItem> = state
-        .operations
-        .iter()
-        .enumerate()
-        .map(|(i, op)| {
-            let glyph = op.status.glyph(state.unicode);
-            let is_child = op.parent_id.is_some();
-            let prefix = if is_child {
-                if state.unicode { "  └ " } else { "  L " }
-            } else {
-                " "
-            };
-            let pinned = if op.pinned {
-                if state.unicode { "📌" } else { "P" }
-            } else {
-                ""
-            };
-            let id_short = &op.id[..op.id.len().min(6)];
-            let name_short = truncate(&op.tool_name, (inner.width as usize).saturating_sub(22));
-            let elapsed = op.elapsed_display();
-
-            let row_style = if i == state.ops_selected {
-                theme.selected_item()
-            } else {
-                theme.normal()
-            };
-
-            let line = Line::from(vec![
-                Span::styled(prefix, theme.dim()),
-                Span::styled(format!("{glyph} "), theme.op_status_style(&op.status)),
-                Span::styled(format!("{id_short} "), theme.dim()),
-                Span::styled(format!("{pinned}{name_short}"), row_style),
-                Span::styled(format!("  {elapsed}"), theme.dim()),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
+    let items = build_ops_dag_items(state, theme, inner.width as usize);
 
     let mut list_state = ListState::default().with_selected(Some(state.ops_selected));
     let list = List::new(items)
@@ -285,6 +742,55 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
         .highlight_symbol(if state.unicode { "▶ " } else { "> " });
 
     frame.render_stateful_widget(list, inner, &mut list_state);
+}
+
+#[cfg(feature = "tui")]
+fn build_ops_dag_items(state: &AppState, theme: &Theme, width: usize) -> Vec<ListItem<'static>> {
+    state
+        .operations
+        .iter()
+        .enumerate()
+        .map(|(index, op)| build_ops_dag_item(index, op, state, theme, width))
+        .collect()
+}
+
+#[cfg(feature = "tui")]
+fn build_ops_dag_item(
+    index: usize,
+    op: &crate::state::Operation,
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+) -> ListItem<'static> {
+    let prefix = match (op.parent_id.is_some(), state.unicode) {
+        (true, true) => "  └ ",
+        (true, false) => "  L ",
+        (false, _) => " ",
+    };
+    let pinned = match (op.pinned, state.unicode) {
+        (true, true) => "📌",
+        (true, false) => "P",
+        (false, _) => "",
+    };
+    let id_short = &op.id[..op.id.len().min(6)];
+    let name_short = truncate(&op.tool_name, width.saturating_sub(22));
+    let row_style = if index == state.ops_selected {
+        theme.selected_item()
+    } else {
+        theme.normal()
+    };
+
+    let line = Line::from(vec![
+        Span::styled(prefix, theme.dim()),
+        Span::styled(
+            format!("{} ", op.status.glyph(state.unicode)),
+            theme.op_status_style(&op.status),
+        ),
+        Span::styled(format!("{id_short} "), theme.dim()),
+        Span::styled(format!("{pinned}{name_short}"), row_style),
+        Span::styled(format!("  {}", op.elapsed_display()), theme.dim()),
+    ]);
+    ListItem::new(line)
 }
 
 // ─── Detail pane ──────────────────────────────────────────────────────────────
@@ -299,102 +805,137 @@ fn draw_detail(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     };
 
     match state.selected_op() {
-        None => {
-            let block = Block::default()
-                .title(Span::styled(" Detail ", theme.title()))
-                .borders(Borders::ALL)
-                .border_style(border_style);
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-            frame.render_widget(
-                Paragraph::new(Span::styled("  Select an operation", theme.dim())),
-                inner,
-            );
-        }
-        Some(op) => {
-            let title = format!(" {}  {} ", op.id, op.tool_name);
-            let block = Block::default()
-                .title(Span::styled(title, theme.title()))
-                .borders(Borders::ALL)
-                .border_style(border_style);
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
+        None => render_empty_detail(frame, theme, area, border_style),
+        Some(op) => render_selected_detail(frame, state, theme, area, border_style, op),
+    }
+}
 
-            let mut lines: Vec<Line> = vec![];
-            let glyph = op.status.glyph(state.unicode);
-            lines.push(Line::from(vec![
-                Span::styled("  status  ", theme.dim()),
-                Span::styled(
-                    format!("{glyph} {:?}", op.status),
-                    theme.op_status_style(&op.status),
-                ),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("  elapsed ", theme.dim()),
-                Span::styled(op.elapsed_display(), theme.normal()),
-            ]));
-            if let Some(ref cwd) = op.cwd {
-                lines.push(Line::from(vec![
-                    Span::styled("  cwd     ", theme.dim()),
-                    Span::styled(shorten_path(cwd, 40), theme.normal()),
-                ]));
-            }
-            if let Some(pid) = op.pid {
-                lines.push(Line::from(vec![
-                    Span::styled("  pid     ", theme.dim()),
-                    Span::styled(pid.to_string(), theme.normal()),
-                ]));
-            }
-            if !op.args.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled("  args    ", theme.dim()),
-                    Span::styled(
-                        truncate(
-                            &op.args.join(" "),
-                            (inner.width as usize).saturating_sub(12),
-                        ),
-                        theme.normal(),
-                    ),
-                ]));
-            }
-            if let Some(ref parent) = op.parent_id {
-                lines.push(Line::from(vec![
-                    Span::styled("  waits   ", theme.dim()),
-                    Span::styled(parent.clone(), theme.pending()),
-                ]));
-            }
+#[cfg(feature = "tui")]
+fn render_empty_detail(frame: &mut Frame, theme: &Theme, area: Rect, border_style: Style) {
+    let block = Block::default()
+        .title(Span::styled(" Detail ", theme.title()))
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(Span::styled("  Select an operation", theme.dim())),
+        inner,
+    );
+}
 
-            // Stdout tail
-            if !op.stdout_tail.is_empty() {
-                let sep = if state.unicode {
-                    "─".repeat((inner.width as usize).saturating_sub(4))
-                } else {
-                    "-".repeat((inner.width as usize).saturating_sub(4))
-                };
-                lines.push(Line::from(Span::styled(format!("  {sep}"), theme.dim())));
-                let tail_h = (inner.height as usize).saturating_sub(lines.len());
-                for s in op
-                    .stdout_tail
-                    .iter()
-                    .rev()
-                    .take(tail_h)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "  {}",
-                            truncate(s, (inner.width as usize).saturating_sub(4))
-                        ),
-                        theme.dim(),
-                    )));
-                }
-            }
+#[cfg(feature = "tui")]
+fn render_selected_detail(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    area: Rect,
+    border_style: Style,
+    op: &crate::state::Operation,
+) {
+    let title = format!(" {}  {} ", op.id, op.tool_name);
+    let block = Block::default()
+        .title(Span::styled(title, theme.title()))
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-            let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-            frame.render_widget(para, inner);
-        }
+    let lines = build_detail_lines(op, state, theme, inner.width as usize, inner.height as usize);
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
+}
+
+#[cfg(feature = "tui")]
+fn build_detail_lines(
+    op: &crate::state::Operation,
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    push_detail_summary_lines(&mut lines, op, state, theme, width);
+    push_stdout_tail_lines(&mut lines, op, state, theme, width, height);
+    lines
+}
+
+#[cfg(feature = "tui")]
+fn push_detail_summary_lines(
+    lines: &mut Vec<Line<'static>>,
+    op: &crate::state::Operation,
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+) {
+    lines.push(Line::from(vec![
+        Span::styled("  status  ", theme.dim()),
+        Span::styled(
+            format!("{} {:?}", op.status.glyph(state.unicode), op.status),
+            theme.op_status_style(&op.status),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  elapsed ", theme.dim()),
+        Span::styled(op.elapsed_display(), theme.normal()),
+    ]));
+
+    if let Some(cwd) = &op.cwd {
+        lines.push(Line::from(vec![
+            Span::styled("  cwd     ", theme.dim()),
+            Span::styled(shorten_path(cwd, 40), theme.normal()),
+        ]));
+    }
+    if let Some(pid) = op.pid {
+        lines.push(Line::from(vec![
+            Span::styled("  pid     ", theme.dim()),
+            Span::styled(pid.to_string(), theme.normal()),
+        ]));
+    }
+    if !op.args.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  args    ", theme.dim()),
+            Span::styled(
+                truncate(&op.args.join(" "), width.saturating_sub(12)),
+                theme.normal(),
+            ),
+        ]));
+    }
+    if let Some(parent) = &op.parent_id {
+        lines.push(Line::from(vec![
+            Span::styled("  waits   ", theme.dim()),
+            Span::styled(parent.clone(), theme.pending()),
+        ]));
+    }
+}
+
+#[cfg(feature = "tui")]
+fn push_stdout_tail_lines(
+    lines: &mut Vec<Line<'static>>,
+    op: &crate::state::Operation,
+    state: &AppState,
+    theme: &Theme,
+    width: usize,
+    height: usize,
+) {
+    if op.stdout_tail.is_empty() {
+        return;
+    }
+
+    let separator = if state.unicode {
+        "─".repeat(width.saturating_sub(4))
+    } else {
+        "-".repeat(width.saturating_sub(4))
+    };
+    lines.push(Line::from(Span::styled(format!("  {separator}"), theme.dim())));
+
+    let tail_height = height.saturating_sub(lines.len());
+    let visible_tail: Vec<_> = op.stdout_tail.iter().rev().take(tail_height).collect();
+    for line in visible_tail.into_iter().rev() {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", truncate(line, width.saturating_sub(4))),
+            theme.dim(),
+        )));
     }
 }
 
@@ -540,6 +1081,7 @@ fn draw_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
             ("q", "quit"),
         ],
         Focus::Palette => &[("Esc", "close"), ("Tab", "complete"), ("Enter", "run")],
+        Focus::Chat => &[("/", "commands"), ("Tab", "monitor panels"), ("q", "quit")],
     };
 
     let mut spans: Vec<Span> = vec![];
@@ -560,7 +1102,7 @@ fn draw_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 #[cfg(feature = "tui")]
 fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
     let w = 62u16.min(area.width);
-    let h = 28u16.min(area.height);
+    let h = 38u16.min(area.height);
     let popup = centered_rect(w, h, area);
 
     frame.render_widget(Clear, popup);
@@ -577,7 +1119,20 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("q / Ctrl-C", "Quit"),
         ("Tab / Shift-Tab", "Cycle focus"),
         ("?", "Toggle this help"),
+        ("Esc / ? (when help open)", "Close help overlay"),
         (":", "Open command palette"),
+        ("", ""),
+        ("CHAT", ""),
+        ("Enter", "Send message"),
+        ("Shift+Enter", "Insert newline"),
+        ("/", "Open command navigator from empty input"),
+        ("Esc", "Clear current input"),
+        ("Arrow keys / Home / End", "Move within the editor"),
+        ("", ""),
+        ("PICKERS", ""),
+        ("Type", "Filter providers or models"),
+        ("Up / Down", "Move selection"),
+        ("Enter / Esc", "Choose / cancel"),
         ("", ""),
         ("AI ACTIVITY", ""),
         ("j / k", "Scroll entries"),
@@ -597,6 +1152,12 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("APPROVAL BANNER", ""),
         ("y", "Approve gate"),
         ("n", "Reject gate"),
+        ("", ""),
+        ("COMMAND NAVIGATOR (/)", ""),
+        ("Type", "Narrow commands and tools"),
+        ("Tab", "Complete selected command"),
+        ("Enter", "Run selected command"),
+        ("/run <tool> {json}", "Run a tool manually with JSON args"),
         ("", ""),
         ("COMMAND PALETTE (:)", ""),
         ("Tab", "Next completion"),
@@ -747,4 +1308,4 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 /// No-op stub so the crate compiles without the `tui` feature.
 #[cfg(not(feature = "tui"))]
-pub fn draw(_state: &AppState, _theme: &Theme) {}
+pub fn draw(_frame: &mut (), _state: &AppState, _theme: &Theme) {}

@@ -5,18 +5,373 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::session_config::TuiSessionConfig;
+#[cfg(feature = "tui")]
+use tui_textarea::TextArea;
+
 // ─── Ring-buffer capacities ───────────────────────────────────────────────────
 
 pub const ACTIVITY_RING_CAP: usize = 64;
 pub const LOG_RING_CAP: usize = 500;
 pub const STDOUT_TAIL_CAP: usize = 100;
+pub const CHAT_HISTORY_CAP: usize = 200;
+
+// ─── TUI mode ─────────────────────────────────────────────────────────────────
+
+/// Top-level mode of the TUI.  Switched with `/mode chat` / `/mode monitor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Chat-first interface: multi-line input → LLM, `/` opens command navigator.
+    #[default]
+    Chat,
+    /// Original 4-pane monitoring dashboard (AI Activity, Ops DAG, Detail, Log).
+    Monitor,
+}
+
+// ─── Chat history ─────────────────────────────────────────────────────────────
+
+/// A single entry in the chat history.
+#[derive(Debug, Clone)]
+pub enum ChatEntry {
+    /// A message submitted by the user.
+    User(String),
+    /// A response from the LLM, potentially still streaming.
+    Assistant {
+        content: String,
+        /// True while tokens are still arriving.
+        streaming: bool,
+    },
+    /// An ahma tool call issued by the LLM (MCP bridge).
+    ToolCall {
+        id: String,
+        name: String,
+        args: String,
+        /// `None` while the call is in flight; `Some(result)` when done.
+        result: Option<String>,
+        failed: bool,
+    },
+}
+
+/// Ring buffer of chat history entries (capped at `CHAT_HISTORY_CAP`).
+#[derive(Debug, Default)]
+pub struct ChatHistory {
+    entries: VecDeque<ChatEntry>,
+}
+
+impl ChatHistory {
+    pub fn push(&mut self, entry: ChatEntry) {
+        if self.entries.len() >= CHAT_HISTORY_CAP {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(entry);
+    }
+
+    pub fn entries(&self) -> &VecDeque<ChatEntry> {
+        &self.entries
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Append a token to the last `Assistant` entry if it's still streaming.
+    /// If no such entry exists, creates a new one.
+    pub fn append_token(&mut self, token: &str) {
+        if let Some(ChatEntry::Assistant {
+            content,
+            streaming: true,
+        }) = self.entries.back_mut()
+        {
+            content.push_str(token);
+        } else {
+            self.push(ChatEntry::Assistant {
+                content: token.to_string(),
+                streaming: true,
+            });
+        }
+    }
+
+    /// Mark the last assistant entry as no longer streaming.
+    pub fn finish_stream(&mut self) {
+        if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.back_mut() {
+            *streaming = false;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn start_tool_call(&mut self, id: String, name: String, args: String) {
+        self.push(ChatEntry::ToolCall {
+            id,
+            name,
+            args,
+            result: None,
+            failed: false,
+        });
+    }
+
+    pub fn finish_tool_call(&mut self, id: &str, result: String, failed: bool) {
+        for entry in self.entries.iter_mut().rev() {
+            if let ChatEntry::ToolCall {
+                id: entry_id,
+                result: entry_result,
+                failed: entry_failed,
+                ..
+            } = entry
+            {
+                if entry_id == id {
+                    *entry_result = Some(result);
+                    *entry_failed = failed;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ─── Command navigator ────────────────────────────────────────────────────────
+
+/// A command available in the `/` navigator.
+#[derive(Debug, Clone)]
+pub struct NavCommand {
+    /// The full command string, e.g. `/help`.
+    pub command: String,
+    /// Short description shown in the picker.
+    pub description: &'static str,
+}
+
+/// The full set of built-in `/` commands.
+pub fn builtin_commands() -> Vec<NavCommand> {
+    vec![
+        NavCommand {
+            command: "/help".into(),
+            description: "show keyboard reference",
+        },
+        NavCommand {
+            command: "/mode chat".into(),
+            description: "switch to chat interface",
+        },
+        NavCommand {
+            command: "/mode monitor".into(),
+            description: "switch to monitor dashboard",
+        },
+        NavCommand {
+            command: "/provider".into(),
+            description: "select LLM provider",
+        },
+        NavCommand {
+            command: "/model".into(),
+            description: "select model for current provider",
+        },
+        NavCommand {
+            command: "/mcp on".into(),
+            description: "enable ahma as MCP tool server",
+        },
+        NavCommand {
+            command: "/mcp off".into(),
+            description: "disable ahma MCP tool server",
+        },
+        NavCommand {
+            command: "/run <tool> {json}".into(),
+            description: "invoke an ahma tool directly with optional JSON args",
+        },
+        NavCommand {
+            command: "/tools".into(),
+            description: "list available ahma tools",
+        },
+        NavCommand {
+            command: "/operations".into(),
+            description: "jump to operations panel",
+        },
+        NavCommand {
+            command: "/logs".into(),
+            description: "jump to log panel",
+        },
+        NavCommand {
+            command: "/approve".into(),
+            description: "approve pending gate",
+        },
+        NavCommand {
+            command: "/reject".into(),
+            description: "reject pending gate",
+        },
+        NavCommand {
+            command: "/clear".into(),
+            description: "clear chat history",
+        },
+    ]
+}
+
+/// State for the `/` command navigator overlay.
+#[derive(Debug, Clone, Default)]
+pub struct CommandNavigator {
+    /// Text typed after `/`.
+    pub input: String,
+    /// Filtered list of matching commands.
+    pub completions: Vec<NavCommand>,
+    /// Index of the highlighted completion.
+    pub selected: usize,
+    /// True when the overlay is visible.
+    pub visible: bool,
+}
+
+impl CommandNavigator {
+    pub fn open(&mut self, tools: &[String]) {
+        self.visible = true;
+        self.input.clear();
+        self.selected = 0;
+        self.refresh_completions(tools);
+    }
+
+    pub fn close(&mut self) {
+        self.visible = false;
+        self.input.clear();
+        self.completions.clear();
+    }
+
+    /// Rebuild completions from builtins + dynamic `/run <tool>` entries.
+    pub fn refresh_completions(&mut self, tools: &[String]) {
+        let mut cmds = builtin_commands();
+        // Add a `/run <tool>` entry for every known ahma tool.
+        for t in tools {
+            cmds.push(NavCommand {
+                command: format!("/run {t}"),
+                description: "run ahma tool",
+            });
+        }
+
+        if self.input.is_empty() {
+            self.completions = cmds;
+        } else {
+            let q = self.input.to_lowercase();
+            self.completions = cmds
+                .into_iter()
+                .filter(|c| {
+                    c.command.to_lowercase().contains(&q)
+                        || c.description.to_lowercase().contains(&q)
+                })
+                .collect();
+        }
+        self.selected = self.selected.min(self.completions.len().saturating_sub(1));
+    }
+
+    pub fn select_next(&mut self) {
+        let n = self.completions.len();
+        if n > 0 {
+            self.selected = (self.selected + 1) % n;
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        let n = self.completions.len();
+        if n > 0 {
+            self.selected = self.selected.checked_sub(1).unwrap_or(n - 1);
+        }
+    }
+
+    /// Apply the selected completion to the input field (TAB).
+    pub fn tab_complete(&mut self) {
+        if let Some(cmd) = self.completions.get(self.selected) {
+            self.input = cmd.command.trim_start_matches('/').to_string();
+        }
+    }
+
+    /// The command string of the currently selected entry, or the raw input.
+    pub fn selected_command(&self) -> String {
+        self.completions
+            .get(self.selected)
+            .map(|c| c.command.clone())
+            .unwrap_or_else(|| format!("/{}", self.input))
+    }
+}
+
+// ─── Inline picker ────────────────────────────────────────────────────────────
+
+/// Generic inline picker (used for provider and model selection).
+#[derive(Debug, Clone)]
+pub struct PickerState {
+    pub title: String,
+    pub items: Vec<String>,
+    pub selected: usize,
+    pub filter: String,
+}
+
+impl PickerState {
+    pub fn new(title: impl Into<String>, items: Vec<String>) -> Self {
+        Self {
+            title: title.into(),
+            items,
+            selected: 0,
+            filter: String::new(),
+        }
+    }
+
+    pub fn filtered_items(&self) -> Vec<&str> {
+        if self.filter.is_empty() {
+            self.items.iter().map(|s| s.as_str()).collect()
+        } else {
+            let q = self.filter.to_lowercase();
+            self.items
+                .iter()
+                .filter(|s| s.to_lowercase().contains(&q))
+                .map(|s| s.as_str())
+                .collect()
+        }
+    }
+
+    pub fn selected_item(&self) -> Option<&str> {
+        self.filtered_items().get(self.selected).copied()
+    }
+
+    pub fn select_next(&mut self) {
+        let n = self.filtered_items().len();
+        if n > 0 {
+            self.selected = (self.selected + 1) % n;
+        }
+    }
+
+    pub fn select_prev(&mut self) {
+        let n = self.filtered_items().len();
+        if n > 0 {
+            self.selected = self.selected.checked_sub(1).unwrap_or(n - 1);
+        }
+    }
+
+    pub fn filter_push(&mut self, c: char) {
+        self.filter.push(c);
+        self.selected = 0;
+    }
+
+    pub fn filter_pop(&mut self) {
+        self.filter.pop();
+        self.selected = 0;
+    }
+
+    pub fn select_exact(&mut self, item: &str) {
+        if let Some(index) = self
+            .filtered_items()
+            .iter()
+            .position(|candidate| *candidate == item)
+        {
+            self.selected = index;
+        }
+    }
+}
 
 // ─── Focus ────────────────────────────────────────────────────────────────────
 
 /// Which panel currently receives keyboard input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Focus {
+    /// Chat input box (default in Chat mode).
     #[default]
+    Chat,
     AiActivity,
     OpsDag,
     Log,
@@ -24,21 +379,24 @@ pub enum Focus {
 }
 
 impl Focus {
+    /// Cycle through monitor panels (skips Chat — return there with Esc).
     pub fn cycle_next(self) -> Self {
         match self {
+            Self::Chat => Self::AiActivity,
             Self::AiActivity => Self::OpsDag,
             Self::OpsDag => Self::Log,
-            Self::Log => Self::AiActivity,
-            Self::Palette => Self::AiActivity,
+            Self::Log => Self::Chat,
+            Self::Palette => Self::Chat,
         }
     }
 
     pub fn cycle_prev(self) -> Self {
         match self {
-            Self::AiActivity => Self::Log,
+            Self::Chat => Self::Log,
+            Self::AiActivity => Self::Chat,
             Self::OpsDag => Self::AiActivity,
             Self::Log => Self::OpsDag,
-            Self::Palette => Self::AiActivity,
+            Self::Palette => Self::Chat,
         }
     }
 }
@@ -273,6 +631,7 @@ impl PaletteState {
 pub struct AppState {
     // ── Connection ──
     pub server_url: String,
+    pub mcp_http_base_url: String,
     pub transport_label: String,
     pub server_healthy: bool,
     pub session_id: Option<String>,
@@ -285,6 +644,33 @@ pub struct AppState {
     pub log: VecDeque<LogEntry>,
     pub approval: Option<ApprovalGate>,
     pub tools_list: Vec<String>,
+
+    // ── Chat ──
+    pub mode: Mode,
+    pub chat: ChatHistory,
+    /// Current text in the multi-line input box.
+    #[cfg(feature = "tui")]
+    pub chat_input: TextArea<'static>,
+    #[cfg(not(feature = "tui"))]
+    pub chat_input: (),
+    /// LLM provider label shown in header (e.g. "Ollama / llama3.2").
+    pub llm_label: String,
+    /// Concrete provider URL used for API calls and persisted in session config.
+    pub current_provider_url: Option<String>,
+    /// True when ahma-as-MCP is active.
+    pub mcp_enabled: bool,
+    /// Discovered + configured providers (name → base_url).
+    pub available_providers: Vec<(String, String)>,
+    /// Available models for the current provider.
+    pub available_models: Vec<String>,
+    /// Chat scroll offset (lines from bottom = 0 is newest).
+    pub chat_scroll: usize,
+    /// Command navigator state.
+    pub navigator: CommandNavigator,
+    /// Inline provider picker (Some when active).
+    pub provider_picker: Option<PickerState>,
+    /// Inline model picker (Some when active).
+    pub model_picker: Option<PickerState>,
 
     // ── UI state ──
     pub focus: Focus,
@@ -299,6 +685,11 @@ pub struct AppState {
     // ── Config ──
     pub unicode: bool,
     pub should_quit: bool,
+    /// Sender half of the bridge channel; set by app.rs after spawning.
+    #[cfg(feature = "tui")]
+    pub bridge_tx: Option<tokio::sync::mpsc::Sender<crate::llm_bridge::BridgeEvent>>,
+    #[cfg(not(feature = "tui"))]
+    pub bridge_tx: Option<()>,
 }
 
 impl AppState {
@@ -311,8 +702,29 @@ impl AppState {
             .ok()
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_default();
+
+        // Try to load per-directory session config.
+        let session = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| TuiSessionConfig::load(&cwd).ok().flatten());
+        let llm_label = session
+            .as_ref()
+            .map(|s| format!("{} / {}", s.provider, s.model))
+            .unwrap_or_else(|| "no LLM".to_string());
+        let current_provider_url = session.as_ref().and_then(|s| {
+            s.provider_url.clone().or_else(|| {
+                if s.provider.starts_with("http") {
+                    Some(s.provider.clone())
+                } else {
+                    None
+                }
+            })
+        });
+        let mcp_enabled = session.as_ref().map(|s| s.mcp_enabled).unwrap_or(false);
+
         Self {
             server_url: server_url.into(),
+            mcp_http_base_url: String::new(),
             transport_label: transport_label.into(),
             server_healthy: false,
             session_id: None,
@@ -323,6 +735,19 @@ impl AppState {
             log: VecDeque::with_capacity(LOG_RING_CAP),
             approval: None,
             tools_list: vec![],
+
+            mode: Mode::default(),
+            chat: ChatHistory::default(),
+            chat_input: TextArea::default(),
+            llm_label,
+            current_provider_url,
+            mcp_enabled,
+            available_providers: vec![],
+            available_models: vec![],
+            chat_scroll: 0,
+            navigator: CommandNavigator::default(),
+            provider_picker: None,
+            model_picker: None,
 
             focus: Focus::default(),
             ops_selected: 0,
@@ -335,7 +760,52 @@ impl AppState {
 
             unicode,
             should_quit: false,
+            bridge_tx: None,
         }
+    }
+
+    pub fn chat_input_text(&self) -> String {
+        #[cfg(feature = "tui")]
+        {
+            self.chat_input.lines().join("\n")
+        }
+        #[cfg(not(feature = "tui"))]
+        {
+            String::new()
+        }
+    }
+
+    pub fn chat_input_line_count(&self) -> usize {
+        #[cfg(feature = "tui")]
+        {
+            self.chat_input.lines().len().max(1)
+        }
+        #[cfg(not(feature = "tui"))]
+        {
+            1
+        }
+    }
+
+    pub fn chat_input_is_empty(&self) -> bool {
+        self.chat_input_text().is_empty()
+    }
+
+    pub fn chat_input_is_blank(&self) -> bool {
+        self.chat_input_text().trim().is_empty()
+    }
+
+    pub fn clear_chat_input(&mut self) {
+        #[cfg(feature = "tui")]
+        {
+            self.chat_input = TextArea::default();
+        }
+    }
+
+    pub fn selected_model(&self) -> String {
+        self.llm_label
+            .rsplit_once(" / ")
+            .map(|(_, model)| model.trim().to_string())
+            .unwrap_or_default()
     }
 
     pub fn push_activity(&mut self, entry: AiActivityEntry) {
@@ -417,10 +887,12 @@ mod tests {
 
     #[test]
     fn focus_cycles_correctly() {
+        assert_eq!(Focus::Chat.cycle_next(), Focus::AiActivity);
         assert_eq!(Focus::AiActivity.cycle_next(), Focus::OpsDag);
         assert_eq!(Focus::OpsDag.cycle_next(), Focus::Log);
-        assert_eq!(Focus::Log.cycle_next(), Focus::AiActivity);
+        assert_eq!(Focus::Log.cycle_next(), Focus::Chat);
         assert_eq!(Focus::Log.cycle_prev(), Focus::OpsDag);
+        assert_eq!(Focus::Chat.cycle_prev(), Focus::Log);
     }
 
     #[test]

@@ -26,7 +26,11 @@ use crate::{sandbox, utils::logging::init_logging_with_observability};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use dunce;
-use std::{io::IsTerminal, path::PathBuf, sync::Arc};
+use std::{
+    io::IsTerminal,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AppConfig — single immutable application configuration
@@ -309,7 +313,57 @@ fn canonicalize_paths(paths: &[PathBuf], context: &str) -> Result<Vec<PathBuf>> 
         .collect()
 }
 
+fn ensure_task_vault_layout(task_vault_root: &Path) -> Result<PathBuf> {
+    let workdir = task_vault_root.join("workdir");
+    let inputs = task_vault_root.join("inputs");
+    let outputs = task_vault_root.join("outputs");
+    let trash = task_vault_root.join("trash");
+    let audit_log = task_vault_root.join("audit.jsonl");
+
+    std::fs::create_dir_all(&inputs).with_context(|| {
+        format!(
+            "Failed to create task vault inputs dir: {}",
+            inputs.display()
+        )
+    })?;
+    std::fs::create_dir_all(&workdir)
+        .with_context(|| format!("Failed to create task vault workdir: {}", workdir.display()))?;
+    std::fs::create_dir_all(&outputs).with_context(|| {
+        format!(
+            "Failed to create task vault outputs dir: {}",
+            outputs.display()
+        )
+    })?;
+    std::fs::create_dir_all(&trash)
+        .with_context(|| format!("Failed to create task vault trash dir: {}", trash.display()))?;
+    if !audit_log.exists() {
+        std::fs::write(&audit_log, b"").with_context(|| {
+            format!(
+                "Failed to initialize task vault audit log: {}",
+                audit_log.display()
+            )
+        })?;
+    }
+
+    dunce::canonicalize(&workdir).with_context(|| {
+        format!(
+            "Failed to canonicalize task vault workdir: {}",
+            workdir.display()
+        )
+    })
+}
+
 fn resolve_sandbox_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
+    if let Some(task_vault_root) = &cfg.task_vault {
+        let workdir = ensure_task_vault_layout(task_vault_root)?;
+        tracing::info!(
+            "Task vault mode active: root={}, sandbox_scope={}",
+            task_vault_root.display(),
+            workdir.display()
+        );
+        return Ok(Some(vec![workdir]));
+    }
+
     if cfg.defer_sandbox {
         return resolve_deferred_scopes(cfg);
     }
@@ -2078,6 +2132,30 @@ mod tests {
         let scopes = resolve_sandbox_scopes(&cfg).unwrap();
         assert!(scopes.is_some());
         assert_eq!(scopes.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_sandbox_scopes_task_vault_precedence_and_layout() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let vault_root = tmp.path().join("task-vault");
+        let cfg = AppConfig {
+            no_sandbox: true,
+            sandbox_scopes: vec![tmp.path().to_path_buf()],
+            task_vault: Some(vault_root.clone()),
+            ..make_cfg()
+        };
+
+        let scopes = resolve_sandbox_scopes(&cfg).unwrap().unwrap();
+        assert_eq!(scopes.len(), 1);
+
+        let expected_workdir = dunce::canonicalize(vault_root.join("workdir")).unwrap();
+        assert_eq!(scopes[0], expected_workdir);
+        assert!(vault_root.join("inputs").is_dir());
+        assert!(vault_root.join("workdir").is_dir());
+        assert!(vault_root.join("outputs").is_dir());
+        assert!(vault_root.join("trash").is_dir());
+        assert!(vault_root.join("audit.jsonl").is_file());
     }
 
     #[test]

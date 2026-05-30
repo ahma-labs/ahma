@@ -3,11 +3,14 @@ name: ahmadev
 version: 0.1.0
 author: Paul Houghton
 description: >
-  Repo-local development skill for the ahma workspace. NOT distributed. USE THIS SKILL for
-  safe dependency updates (/ahmadev update) and help (/ahmadev help).
-  Trigger phrases: "ahmadev", "ahmadev update", "ahmadev help", "safe dep update",
-  "update rust dependencies safely", "safe dependency upgrade", "cargo safe update",
-  "update dependencies", "bump deps", "upgrade workspace deps".
+   Repo-local development skill for the ahma workspace. NOT distributed.
+   USE THIS SKILL for safe dependency updates (/ahmadev update),
+   version bumping (/ahmadev bump), and help (/ahmadev help).
+   Trigger phrases: "ahmadev", "ahmadev update", "ahmadev help",
+   "safe dep update", "ahmadev bump", "bump version", "version bump",
+   "update rust dependencies safely", "safe dependency upgrade",
+   "cargo safe update", "update dependencies", "bump deps",
+   "upgrade workspace deps".
 user-invocable: true
 scope: repo
 ---
@@ -29,6 +32,7 @@ It is **not** part of the distributed ahma skill bundle.
 |---------|---------|
 | `/ahmadev help` | List all available subcommands and their usage |
 | `/ahmadev update` | Upgrade workspace deps that are ≥14 days old and advisory-clean |
+| `/ahmadev bump <X.Y.Z>` | Bump ahma version in Cargo.toml |
 
 ---
 
@@ -38,11 +42,65 @@ When the user types `/ahmadev help`, respond with:
 
 ```
 /ahmadev help      — Show this help list
+/ahmadev bump      — Bump ahma version in Cargo.toml (workspace.package.version)
 /ahmadev update    — Upgrade workspace dependencies (safe: ≥14d old, no known advisories)
 ```
 
 Reference `/ahma help` for general ahma tooling (sandbox, livelog, run_terminal_command,
 simplify, ahma update, etc.).
+
+---
+
+## `/ahmadev bump <X.Y.Z>` — Bump ahma Version
+
+### What it does
+
+Updates the ahma workspace version in `Cargo.toml` by setting:
+
+```
+[workspace.package]
+version = "X.Y.Z"
+```
+
+This subcommand intentionally targets `Cargo.toml` version bumping only.
+
+### Usage examples
+
+```
+/ahmadev bump 0.7.6
+/ahmadev bump 1.0.0
+```
+
+### Workflow (how to invoke as an agent)
+
+1. Validate version format (expect `X.Y.Z`, numeric semver core).
+2. Apply the bump by updating `Cargo.toml` `[workspace.package].version`.
+3. Verify the workspace still compiles:
+
+   ```
+   run_terminal_command("cargo check --workspace", working_directory=".")
+   ```
+
+4. Review only the version-line diff:
+
+   ```
+   run_terminal_command("git diff Cargo.toml", working_directory=".")
+   ```
+
+### Failure recovery
+
+If the change is incorrect, revert the file and retry with the intended version:
+
+```bash
+git checkout -- Cargo.toml
+```
+
+Then run `/ahmadev bump <X.Y.Z>` again.
+
+### Notes
+
+- Scope is limited to `Cargo.toml` version updates by design.
+- For broad release-version synchronization across additional files, use the repo's dedicated release workflow.
 
 ---
 

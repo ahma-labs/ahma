@@ -58,6 +58,11 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
         server_args.push(tools_dir.to_string_lossy().to_string());
     }
 
+    if let Some(ref task_vault) = config.task_vault {
+        server_args.push("--task-vault".to_string());
+        server_args.push(task_vault.to_string_lossy().to_string());
+    }
+
     server_args.push("stdio".to_string());
 
     // Pass through tool bundle selection
