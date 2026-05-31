@@ -95,7 +95,7 @@ jobs:
           key: cargo-registry-test-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
           restore-keys: |
             cargo-registry-test-${{ runner.os }}-${{ runner.arch }}-
-            cargo-registry-
+            cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Cache sccache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
@@ -104,7 +104,7 @@ jobs:
           key: sccache-test-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
           restore-keys: |
             sccache-test-${{ runner.os }}-${{ runner.arch }}-
-            sccache-
+            sccache-${{ runner.os }}-${{ runner.arch }}-
 
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
@@ -274,7 +274,7 @@ jobs:
           key: cargo-registry-android-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
           restore-keys: |
             cargo-registry-android-${{ runner.os }}-${{ runner.arch }}-
-            cargo-registry-
+            cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Cache sccache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
@@ -283,7 +283,7 @@ jobs:
           key: sccache-android-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
           restore-keys: |
             sccache-android-${{ runner.os }}-${{ runner.arch }}-
-            sccache-
+            sccache-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Cache Android build artifacts
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
@@ -360,7 +360,7 @@ jobs:
           key: cargo-registry-coverage-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
           restore-keys: |
             cargo-registry-coverage-${{ runner.os }}-${{ runner.arch }}-
-            cargo-registry-
+            cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Cache sccache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
@@ -369,7 +369,7 @@ jobs:
           key: sccache-coverage-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
           restore-keys: |
             sccache-coverage-${{ runner.os }}-${{ runner.arch }}-
-            sccache-
+            sccache-${{ runner.os }}-${{ runner.arch }}-
 
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
@@ -515,7 +515,7 @@ jobs:
           restore-keys: |
             cargo-registry-release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
             cargo-registry-release-${{ runner.os }}-${{ runner.arch }}-
-            cargo-registry-
+            cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Cache sccache
         if: "!matrix.use_cross"
@@ -525,7 +525,7 @@ jobs:
           key: sccache-release-${{ matrix.platform }}-day${{ steps.day-number.outputs.day }}
           restore-keys: |
             sccache-release-${{ matrix.platform }}-day
-            sccache-
+            sccache-release-${{ matrix.platform }}-
 
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
