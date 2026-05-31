@@ -64,24 +64,50 @@ version = "X.Y.Z"
 
 This subcommand intentionally targets `Cargo.toml` version bumping only.
 
+### Default: bump the minor version
+
+**When the user says "bump to the next version" or gives no explicit version, always increment the
+minor component** (`Y` in `X.Y.Z`), resetting the patch to `0`.
+Example: `0.7.5` → `0.8.0`, **not** `0.7.6`.
+
+Only deviate from this rule when the user explicitly specifies a different version string.
+
 ### Usage examples
 
 ```
+# Unqualified "bump" or "bump to next version": increment minor, reset patch
+/ahmadev bump          → reads current version, adds 1 to Y, sets Z=0 (e.g. 0.7.5 → 0.8.0)
+
+# Explicit version override
 /ahmadev bump 0.7.6
 /ahmadev bump 1.0.0
 ```
 
 ### Workflow (how to invoke as an agent)
 
-1. Validate version format (expect `X.Y.Z`, numeric semver core).
-2. Apply the bump by updating `Cargo.toml` `[workspace.package].version`.
+1. Determine target version:
+   - If the user provided `X.Y.Z` explicitly, use it as-is.
+   - Otherwise ("next version", no argument, etc.) read the current `[workspace.package].version`
+     from `Cargo.toml`, increment `Y` by 1, and set `Z` to `0`.
+2. Validate format (expect `X.Y.Z`, numeric semver core).
+3. Apply the bump by updating `Cargo.toml` `[workspace.package].version`.
 3. Verify the workspace still compiles:
 
    ```
    run_terminal_command("cargo check --workspace", working_directory=".")
    ```
 
-4. Review only the version-line diff:
+4. Sync all other version-bearing files via xtask:
+
+   ```
+   run_terminal_command("cargo xtask bump-version <X.Y.Z>", working_directory=".")
+   ```
+
+   This updates `skills/ahma/SKILL.md`, `scripts/install.sh`, and `scripts/install.ps1`
+   automatically. The build script enforces consistency and will fail `cargo check` if any
+   file still references the old version.
+
+5. Review only the version-line diff:
 
    ```
    run_terminal_command("git diff Cargo.toml", working_directory=".")

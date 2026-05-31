@@ -9,15 +9,62 @@
 #   - Internet access to GitHub releases
 #
 # Version indicator for build script check:
-# -Version '0.7.5'
-# Install-OneSkill -Version '0.7.5'
+# -Version '0.8.0'
+# Install-OneSkill -Version '0.8.0'
 #
 # Environment variables:
 #   AHMA_INSTALL_DIR     - Override install directory (default: $HOME\.local\bin)
 
 #Requires -Version 5
 
+[CmdletBinding()]
+param(
+    [switch]$Verify,
+    [string]$Mode = ""
+)
+
 $ErrorActionPreference = 'Stop'
+
+# Public key for release verification
+$PUB_KEY_XML = '<RSAKeyValue><Modulus>5veFxEchlM3iyFx8BQzsf+yn6ZNJygRwfOfLS901Rxm/I3YRwn2Jksyp2bVckjgDeGJVK7IPGaHe1dL7+Ljn5V3zvU9B7CLeeIGdZRRngV/n6r+dsGy0FWQIcN/+dfKPWvhz4m/4QMTLXL05WK8jiI/Qatp2Fs32CUJTJ6NpIDQZi4xd1xhQbF/jk2+pwgwpup7kAVKPa49QegFQEQcSi8duqBKX2ynTA6QhknBX1fY+6vEFLh6uMePjzGyHLax8mMg8sk2WU59bgMGgtPPyle7gp692r3UaP9YgzuNDTyDSoU4gJmOOYYAtMWkNOyD2Bcr8JndwPXG0CD3Hj+j0Gw==</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
+
+$shouldVerify = $Verify
+if ($args -contains "--verify" -or $args -contains "-v" -or $Mode -eq "verify") {
+    $shouldVerify = $true
+}
+
+# ── Cryptographic Helpers ─────────────────────────────────────────────────────
+function Verify-Signature {
+    param (
+        [string]$dataPath,
+        [string]$sigPath
+    )
+    
+    try {
+        $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider
+        $rsa.FromXmlString($PUB_KEY_XML)
+        
+        $dataBytes = [System.IO.File]::ReadAllBytes($dataPath)
+        $sigBytes = [System.IO.File]::ReadAllBytes($sigPath)
+        
+        $hashAlg = [System.Security.Cryptography.CryptoConfig]::MapNameToOID("SHA256")
+        $isValid = $rsa.VerifyData($dataBytes, $hashAlg, $sigBytes)
+        
+        $rsa.Dispose()
+        return $isValid
+    } catch {
+        Write-Warning "Signature verification error: $_"
+        return $false
+    }
+}
+
+function Get-FileSha256 {
+    param (
+        [string]$path
+    )
+    $hash = Get-FileHash -Path $path -Algorithm SHA256
+    return $hash.Hash.ToLower()
+}
 
 # ── Detect architecture ────────────────────────────────────────────────────────
 $arch = $env:PROCESSOR_ARCHITECTURE
@@ -33,6 +80,90 @@ $installDir = if ($env:AHMA_INSTALL_DIR) {
     $env:AHMA_INSTALL_DIR
 } else {
     Join-Path $HOME ".local\bin"
+}
+
+# ── Verification-Only Mode ─────────────────────────────────────────────────────
+if ($shouldVerify) {
+    Write-Host "Checking installed binary signature..."
+    
+    $existingBin = $null
+    $existingCmd = Get-Command ahma -ErrorAction SilentlyContinue
+    $existingInDir = Join-Path $installDir 'ahma.exe'
+    if ($existingCmd) {
+        $existingBin = $existingCmd.Source
+    } elseif (Test-Path $existingInDir) {
+        $existingBin = $existingInDir
+    }
+    
+    if (-not $existingBin) {
+        Write-Error "ahma is not currently installed or not in PATH."
+        exit 1
+    }
+    
+    Write-Host "Found binary at: $existingBin"
+    $localHash = Get-FileSha256 -path $existingBin
+    Write-Host "Local SHA-256: $localHash"
+    
+    $releasesUrl = "https://api.github.com/repos/paulirotta/ahma/releases/latest"
+    Write-Host "Fetching latest release info..."
+    try {
+        $releaseJson = Invoke-RestMethod -Uri $releasesUrl -UseBasicParsing
+    } catch {
+        Write-Error "Failed to fetch release info: $_"
+        exit 1
+    }
+    
+    $sumsAsset = $releaseJson.assets | Where-Object { $_.name -eq "SHA256SUMS" } | Select-Object -First 1
+    $sigAsset  = $releaseJson.assets | Where-Object { $_.name -eq "SHA256SUMS.sig" } | Select-Object -First 1
+    
+    if (-not $sumsAsset -or -not $sigAsset) {
+        Write-Error "Could not find SHA256SUMS or SHA256SUMS.sig in the latest release."
+        exit 1
+    }
+    
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+    
+    try {
+        $sumsPath = Join-Path $tempDir "SHA256SUMS"
+        $sigPath = Join-Path $tempDir "SHA256SUMS.sig"
+        
+        Write-Host "Downloading release manifest and signature..."
+        Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsPath -UseBasicParsing
+        Invoke-WebRequest -Uri $sigAsset.browser_download_url -OutFile $sigPath -UseBasicParsing
+        
+        $isValid = Verify-Signature -dataPath $sumsPath -sigPath $sigPath
+        if (-not $isValid) {
+            Write-Error @"
+########################################################################
+CRITICAL SECURITY ERROR: Release signature verification FAILED!
+The checksums file is NOT signed by the official private key.
+This release might be compromised or tampered with.
+########################################################################
+"@
+            exit 1
+        }
+        Write-Host "Authenticity verified: Release signature is valid."
+        
+        $matchedLine = $sumsContent | Where-Object { $_ -match "^$localHash\s+" }
+        
+        if ($matchedLine) {
+            Write-Host "Success: Installed binary matches a verified release entry!"
+            Write-Host "Verified: $($matchedLine.Trim())"
+            exit 0
+        } else {
+            Write-Error @"
+########################################################################
+SECURITY WARNING: Local binary verification FAILED!
+The local hash '$localHash' does not match any entry in the verified release manifest.
+The binary may have been modified or is a different/unreleased version.
+########################################################################
+"@
+            exit 1
+        }
+    } finally {
+        Remove-Item -Recurse -Force -Path $tempDir -ErrorAction SilentlyContinue
+    }
 }
 
 # ── Fetch latest release metadata ─────────────────────────────────────────────
@@ -88,6 +219,14 @@ Please check https://github.com/paulirotta/ahma/releases for available binaries.
     exit 1
 }
 
+$sumsAsset = $releaseJson.assets | Where-Object { $_.name -eq "SHA256SUMS" } | Select-Object -First 1
+$sigAsset  = $releaseJson.assets | Where-Object { $_.name -eq "SHA256SUMS.sig" } | Select-Object -First 1
+
+if (-not $sumsAsset -or -not $sigAsset) {
+    Write-Error "Could not find SHA256SUMS or SHA256SUMS.sig in the latest release."
+    exit 1
+}
+
 $downloadUrl = $asset.browser_download_url
 Write-Host "Downloading $downloadUrl ..."
 
@@ -96,8 +235,55 @@ $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRan
 New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
 
 try {
+    $sumsPath = Join-Path $tempDir "SHA256SUMS"
+    $sigPath = Join-Path $tempDir "SHA256SUMS.sig"
     $zipPath = Join-Path $tempDir $assetName
+    
+    Write-Host "Downloading release manifest and signature..."
+    Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsPath -UseBasicParsing
+    Invoke-WebRequest -Uri $sigAsset.browser_download_url -OutFile $sigPath -UseBasicParsing
+    
+    # Verify signature
+    $isValid = Verify-Signature -dataPath $sumsPath -sigPath $sigPath
+    if (-not $isValid) {
+        Write-Error @"
+########################################################################
+CRITICAL SECURITY ERROR: Release signature verification FAILED!
+The checksums file is NOT signed by the official private key.
+This release might be compromised or tampered with.
+########################################################################
+"@
+        exit 1
+    }
+    Write-Host "Authenticity verified: Release signature is valid."
+    
+    # Extract expected hash
+    $matchedLine = $sumsContent | Where-Object { $_ -match "\s+$([regex]::Escape($assetName))$" }
+    if (-not $matchedLine) {
+        Write-Error "Error: Checksum entry for '$assetName' not found in release manifest."
+        exit 1
+    }
+    $expectedHash = ($matchedLine -split '\s+')[0].Trim().ToLower()
+    
+    # Download zip file
     Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
+    
+    # Verify zip file hash
+    $actualHash = Get-FileSha256 -path $zipPath
+    if ($expectedHash -ne $actualHash) {
+        Write-Error @"
+########################################################################
+CRITICAL SECURITY ERROR: Archive integrity check failed!
+Checksum mismatch for $assetName.
+Expected: $expectedHash
+Actual:   $actualHash
+########################################################################
+"@
+        exit 1
+    }
+    Write-Host "Integrity verified: Archive hash matches release manifest."
+    
+    # Expand
     Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
 
     # ── Install binaries ───────────────────────────────────────────────────────
@@ -115,6 +301,11 @@ try {
             }
         }
     }
+    
+    # Verify the installed binary hash and print it
+    $mcpBin = Join-Path $installDir "ahma.exe"
+    $installedHash = Get-FileSha256 -path $mcpBin
+    Write-Host "Installed binary hash: $installedHash"
 } finally {
     Remove-Item -Recurse -Force -Path $tempDir -ErrorAction SilentlyContinue
 }

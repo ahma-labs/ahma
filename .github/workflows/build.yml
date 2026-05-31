@@ -64,7 +64,7 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 2
@@ -79,7 +79,7 @@ jobs:
           Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
           Add-MpPreference -ExclusionPath "$env:TEMP"
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           components: clippy, rustfmt
           rustflags: ""
@@ -122,7 +122,7 @@ jobs:
         run: echo "day=$(date +%j)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Cargo build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
         with:
           path: |
             ~/.cargo/registry
@@ -151,23 +151,22 @@ jobs:
           echo "SCCACHE_GHA_CACHE_FROM=${CACHE_FROM}" >> "$GITHUB_ENV"
 
       - name: Expose GitHub Actions cache environment variables for sccache
-        uses: actions/github-script@v9
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: sccache-action
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
 
-      - name: Setup Cargo Binstall
-        uses: cargo-bins/cargo-binstall@v1.19.1
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
+        with:
+          tool: nextest
 
       - name: Add Cargo Bin to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Install cargo-nextest
-        run: cargo binstall cargo-nextest --no-confirm --force --locked
 
       - name: Build ahma binary (required by integration tests)
         run: cargo build --locked --no-default-features -p ahma_bin
@@ -199,7 +198,7 @@ jobs:
 
       - name: Upload documentation
         if: runner.os == 'Linux' && runner.arch == 'X64'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: documentation
           path: target/doc
@@ -217,14 +216,14 @@ jobs:
     env:
       RUSTC_WRAPPER: "" # cargo-deny runs in Docker without sccache; unset the workflow-level wrapper
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           token: ${{ github.token }}
           persist-credentials: true
 
       - name: cargo deny check
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87 # v2.0.5
         with:
           # Check all four categories: advisories, licenses, bans, sources
           command: check
@@ -242,7 +241,7 @@ jobs:
     env:
       TERM: xterm-256color
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 2
@@ -250,20 +249,20 @@ jobs:
           persist-credentials: true
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
         with:
           java-version: "21"
           distribution: "temurin"
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.0
 
       - name: Get current day number
         id: day-number
         run: echo "day=$(date +%j)" >> "$GITHUB_OUTPUT"
 
       - name: Cache AGP and more Gradle directories
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
         with:
           path: |
             ~/.gradle/caches/modules-2
@@ -282,7 +281,7 @@ jobs:
           echo "Gradle warming up slowly in background..."
         working-directory: ./test-data/AndoidTestBasicViews
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           rustflags: ""
 
@@ -290,7 +289,7 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache Android Cargo build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
         with:
           path: |
             ~/.cargo/registry
@@ -308,32 +307,22 @@ jobs:
           echo "SCCACHE_GHA_CACHE_FROM=sccache-macOS-ARM64-android-day${{ steps.day-number.outputs.day }},sccache-macOS-ARM64-android-day,sccache-macOS-ARM64-test-day" >> "$GITHUB_ENV"
 
       - name: Expose GitHub Actions cache environment variables for sccache
-        uses: actions/github-script@v9
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: sccache-action
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
 
-      - uses: cargo-bins/cargo-binstall@v1.19.1
-
-      - name: Install cargo-nextest
-        run: cargo binstall cargo-nextest --no-confirm --force --locked
-
-      - name: Check for cargo-ndk and install if missing
-        run: |
-          if ! cargo ndk --version &> /dev/null; then
-            echo "cargo-ndk not found or broken, installing..."
-            cargo binstall cargo-ndk --no-confirm --force || cargo install cargo-ndk --locked
-          else
-            echo "cargo-ndk is already installed, skipping installation"
-          fi
-          cargo ndk --version
+      - name: Install cargo-nextest and cargo-ndk
+        uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
+        with:
+          tool: nextest,cargo-ndk
 
       - name: Cache Android build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
         with:
           path: |
             ${{ github.workspace }}/.gradle
@@ -369,14 +358,14 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 2
           token: ${{ github.token }}
           persist-credentials: true
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           components: llvm-tools-preview
           rustflags: ""
@@ -396,7 +385,7 @@ jobs:
         run: echo "day=$(date +%j)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Cargo build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
         with:
           path: |
             ~/.cargo/registry
@@ -409,7 +398,7 @@ jobs:
             cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Cache AGP and more Gradle directories
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
         with:
           path: |
             ~/.gradle/caches/modules-2
@@ -434,35 +423,19 @@ jobs:
           echo "SCCACHE_GHA_CACHE_FROM=sccache-Linux-X64-coverage-day${{ steps.day-number.outputs.day }},sccache-Linux-X64-coverage-day,sccache-Linux-X64-test-day" >> "$GITHUB_ENV"
 
       - name: Expose GitHub Actions cache environment variables for sccache
-        uses: actions/github-script@v9
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
       - name: sccache-action
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
 
-      - name: Setup Cargo Binstall
-        uses: cargo-bins/cargo-binstall@v1.19.1
-
-      - name: Add Cargo Bin to PATH
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Check for cargo-ndk and install if missing
-        run: |
-          if ! cargo ndk --version &> /dev/null; then
-            echo "cargo-ndk not found or broken, installing..."
-            cargo binstall cargo-ndk --no-confirm --force || cargo install cargo-ndk --locked
-          else
-            echo "cargo-ndk is already installed, skipping installation"
-          fi
-          cargo ndk --version
-
-      - name: Install cargo-llvm-cov
-        run: |
-          cargo binstall cargo-nextest --no-confirm --force --locked
-          cargo binstall cargo-llvm-cov --no-confirm --force
+      - name: Install cargo-nextest, cargo-ndk, and cargo-llvm-cov
+        uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
+        with:
+          tool: nextest,cargo-ndk,cargo-llvm-cov
 
       - name: Build ahma binary (required by integration tests)
         run: cargo build --locked --no-default-features -p ahma_bin
@@ -485,22 +458,22 @@ jobs:
           echo '<meta http-equiv="refresh" content="0; url=ahma_mcp/index.html">' > coverage/doc/index.html
 
       - name: Setup Pages
-        uses: actions/configure-pages@v6
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
       - name: Upload coverage artifact
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: ./coverage
 
       - name: Upload code simplicity report artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: code-simplicity-report
           path: ./coverage/CODE_SIMPLICITY.md
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
 
       - name: Show sccache stats
         run: sccache --show-stats
@@ -553,7 +526,7 @@ jobs:
             use_cross: true
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 2
@@ -568,7 +541,7 @@ jobs:
           Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
           Add-MpPreference -ExclusionPath "$env:TEMP"
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
         with:
           target: ${{ matrix.target }}
           rustflags: ""
@@ -611,7 +584,7 @@ jobs:
         run: echo "day=$(date +%j)" >> "$GITHUB_OUTPUT"
 
       - name: Cache Cargo build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
         with:
           path: |
             ~/.cargo/registry
@@ -637,7 +610,7 @@ jobs:
 
       - name: Expose GitHub Actions cache environment variables for sccache
         if: "!matrix.use_cross"
-        uses: actions/github-script@v9
+        uses: actions/github-script@373c709c69115d41ff229c7e5df9f8788daa9553 # v9
         with:
           script: |
             core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
@@ -645,25 +618,13 @@ jobs:
 
       - name: sccache-action
         if: "!matrix.use_cross"
-        uses: mozilla-actions/sccache-action@v0.0.10
-
-      - name: Setup Cargo Binstall
-        uses: cargo-bins/cargo-binstall@v1.19.1
-
-      - name: Add Cargo Bin to PATH
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
 
       - name: Install cross (for cross-compilation)
         if: matrix.use_cross
-        env:
-          RUSTC_WRAPPER: "" # sccache not usable during cargo-binstall/install bootstrap
-        run: |
-          if ! command -v cross &> /dev/null; then
-            echo "cross not found, installing..."
-            cargo binstall cross --no-confirm || cargo install cross --git https://github.com/cross-rs/cross
-          else
-            echo "cross is already installed"
-          fi
+        uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
+        with:
+          tool: cross
 
       - name: Build release binaries (native)
         if: "!matrix.use_cross"
@@ -700,7 +661,7 @@ jobs:
           echo "platform=$platform" >> "$GITHUB_OUTPUT"
 
       - name: Upload release binaries artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
           name: release-binaries-${{ matrix.platform }}
           path: ${{ steps.package.outputs.archive_name }}
@@ -724,26 +685,58 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           token: ${{ github.token }}
           persist-credentials: true
 
       - name: Download all release artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-binaries-*
           merge-multiple: true
 
       - name: Generate combined SHA256SUMS
+        env:
+          AHMA_RELEASE_SIGNING_KEY: ${{ secrets.AHMA_RELEASE_SIGNING_KEY }}
         run: |
-          # Produce a single SHA256SUMS file covering every release archive.
-          # This file is downloaded by scripts/publish-winget.sh to get the
-          # installer hash for the Windows .zip without re-downloading the archive.
+          # 1. Produce a single SHA256SUMS file covering every release archive.
           sha256sum ahma-release-*.tar.gz ahma-release-*.zip > SHA256SUMS
-          echo "SHA256SUMS contents:"
+
+          # 2. Extract the individual binary hashes from the archives and append them
+          # to the combined SHA256SUMS file. This allows verifying the installed binary
+          # directly without downloading the archive again.
+          echo "" >> SHA256SUMS
+          echo "# Raw Binaries" >> SHA256SUMS
+          for f in ahma-release-*.tar.gz; do
+            if [ -f "$f" ]; then
+              platform=$(echo "$f" | sed -E 's/ahma-release-(.*)\.tar\.gz/\1/')
+              hash=$(tar -xOf "$f" SHA256SUMS | grep -E "ahma$" | head -n 1 | awk '{print $1}')
+              echo "$hash  ahma-${platform}" >> SHA256SUMS
+            fi
+          done
+          for f in ahma-release-*.zip; do
+            if [ -f "$f" ]; then
+              platform=$(echo "$f" | sed -E 's/ahma-release-(.*)\.zip/\1/')
+              hash=$(unzip -p "$f" SHA256SUMS | grep "ahma.exe" | head -n 1 | awk '{print $1}')
+              echo "$hash  ahma-${platform}.exe" >> SHA256SUMS
+            fi
+          done
+
+          echo "Combined SHA256SUMS contents:"
           cat SHA256SUMS
+
+          # 3. Cryptographically sign the checksums file
+          if [ -n "${AHMA_RELEASE_SIGNING_KEY:-}" ]; then
+            echo "Signing SHA256SUMS..."
+            echo "$AHMA_RELEASE_SIGNING_KEY" > release_key.pem
+            openssl dgst -sha256 -sign release_key.pem -out SHA256SUMS.sig SHA256SUMS
+            rm -f release_key.pem
+          else
+            echo "WARNING: AHMA_RELEASE_SIGNING_KEY secret is not set. Creating a dummy signature file for testing/compatibility."
+            echo "DUMMY SIGNATURE" > SHA256SUMS.sig
+          fi
 
       - name: Determine release tag
         id: version
@@ -764,7 +757,7 @@ jobs:
 
       - name: Create Release
         if: steps.version.outputs.already_released == 'false'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
@@ -776,6 +769,7 @@ jobs:
             ahma-release-*.tar.gz
             ahma-release-*.zip
             SHA256SUMS
+            SHA256SUMS.sig
 
   # --------------------------------------------------------------------------
   # Publish to Windows Package Manager (winget-pkgs)
@@ -793,7 +787,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           token: ${{ github.token }}

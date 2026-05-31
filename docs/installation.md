@@ -107,3 +107,22 @@ Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 Supported prebuilt release platforms: Linux x86_64/arm64/armv7, macOS Apple Silicon, Windows x86_64. Musl builds are available for Linux x86_64 and ARM64 (`AHMA_PREFER_MUSL=1` during platform detection in `ahma update`).
 
 For sandbox behavior and day-to-day usage, see [README.md](../README.md) and [security-sandbox.md](security-sandbox.md).
+
+## Release verification
+
+Official prebuilt binaries are cryptographically signed during the release pipeline. The installer script downloads the release manifest (`SHA256SUMS`) and its signature (`SHA256SUMS.sig`), verifying the authenticity of the manifest before comparing the local binary's SHA-256 hash against it.
+
+You can manually trigger release signature verification of your currently installed binary at any time.
+
+**Linux / macOS:**
+
+```bash
+curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash -s -- --verify
+```
+
+**Windows (PowerShell):**
+
+```powershell
+$Mode = "verify"; irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
+```
+
