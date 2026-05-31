@@ -90,7 +90,7 @@ pub async fn setup_test_mcp(
     transport: TransportMode,
 ) -> Option<(TestServerInstance, McpTestClient)> {
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let handshake_timeout = TestTimeouts::scale_secs(15);
+    let handshake_timeout = TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Handshake);
     let mut last_error = String::new();
     for attempt in 1..=2u32 {
         let server = match spawn_test_server().await {

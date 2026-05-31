@@ -43,6 +43,7 @@ rust-code-analysis = { git = "https://github.com/paulirotta/rust-code-analysis.g
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+ring = { version = "0.17", features = ["std"] }
 sha2 = "0.10"
 tar = "0.4"
 tempfile.workspace = true

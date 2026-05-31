@@ -242,7 +242,7 @@ async fn run_mcp_tools_list(mode: TransportMode) {
         .unwrap()
         .to_path_buf();
 
-    let init_timeout = TestTimeouts::scale_secs(15);
+    let init_timeout = TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Handshake);
     let init = tokio::time::timeout(
         init_timeout,
         mcp.initialize_with_roots("http3-test-client", &[workspace]),

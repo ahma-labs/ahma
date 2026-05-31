@@ -425,7 +425,7 @@ async fn run_task_vault_inheritance_and_staged_delete(mode: TransportMode) {
         vault_root.to_string_lossy().to_string(),
     )];
 
-    let handshake_timeout = TestTimeouts::scale_secs(15);
+    let handshake_timeout = TestTimeouts::get(TimeoutCategory::Handshake);
     let mut last_error = String::new();
     let mut server_and_client = None;
 
