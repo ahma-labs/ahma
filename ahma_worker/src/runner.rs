@@ -239,14 +239,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn python_runner_runs_hello_world() {
+    async fn rust_runner_runs_hello_world() {
         let tmp = TempDir::new().unwrap();
-        let runner = make_runner(&tmp, WorkerLanguage::Python);
-        let result = runner.run("print('hello from python')").await;
-        if let Ok(r) = result {
-            assert!(r.output.contains("hello from python"));
-            assert_eq!(r.exit_code, 0);
-        }
-        // If python3 isn't installed, the test is skipped gracefully.
+        let runner = make_runner(&tmp, WorkerLanguage::Rust);
+        let result = runner
+            .run(r#"fn main() { println!("hello from rust worker"); }"#)
+            .await
+            .expect("Rust worker should run successfully");
+        assert_eq!(result.exit_code, 0, "worker exited non-zero: {}", result.output);
+        assert!(
+            result.output.contains("hello from rust worker"),
+            "unexpected output: {}",
+            result.output
+        );
     }
 }

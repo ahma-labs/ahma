@@ -128,6 +128,7 @@ cargo clippy --fix --allow-dirty   # Auto-fix lints
 - **Never add or commit Python scripts (`*.py`) to this repository.**
 - Temporary Python scripts may be created and run for one-off local tasks (debugging, data inspection, quick transformations).
 - After use, delete any temporary Python script before finishing work, and ensure no `.py` files are staged or committed.
+- **Tests must never depend on the system `python3` binary or any external Python runtime.** Python is a supported execution target for worker synthesis (`WorkerLanguage::Python`), but the test suite assumes only a Rust toolchain is present. Write Rust-native equivalents; do not rely on a silent graceful skip as a substitute for a real assertion.
 
 #### Error Handling
 - Use `anyhow::Result` for internal error propagation
