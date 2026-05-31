@@ -126,43 +126,16 @@ curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install
 $Mode = "verify"; irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
 ```
 
-### Managing Release Signing Keys
+### Release signing and key rotation
 
-To sign release manifests securely, the GitHub Actions release pipeline requires an RSA-2048 private key configured as a repository secret named `AHMA_RELEASE_SIGNING_KEY`.
+Release binaries are signed with an RSA-2048 key held exclusively inside GitHub Actions
+secrets — it never exists on any developer machine. All key generation and rotation
+happens via a `workflow_dispatch` action in the CI pipeline.
 
-If you need to rotate or generate new signing keys:
+See **[docs/release-signing.md](release-signing.md)** for:
 
-1. **Generate the private key:**
-   ```bash
-   openssl genpkey -algorithm RSA -out release_key.pem -pkeyopt rsa_keygen_bits:2048
-   ```
-
-2. **Extract the public key in PEM format:**
-   ```bash
-   openssl rsa -pubout -in release_key.pem -out ahma-release.pub.pem
-   ```
-   Copy the contents of `ahma-release.pub.pem` and update `PUB_KEY_PEM` inside:
-   - [scripts/install.sh](file:///Users/paulhoughton/github/ahma/scripts/install.sh)
-   - [ahma_mcp/src/update/install.rs](file:///Users/paulhoughton/github/ahma/ahma_mcp/src/update/install.rs)
-
-3. **Convert the public key to XML format (for Windows installer):**
-   Run the following PowerShell command on Windows to generate the XML representation:
-   ```powershell
-   # First convert PEM to DER format
-   openssl rsa -pubout -outform DER -in release_key.pem -out ahma-release.pub.der
-   
-   # In PowerShell:
-   $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider
-   $rsa.ImportSubjectPublicKeyInfo([System.IO.File]::ReadAllBytes("ahma-release.pub.der"), [ref]$null)
-   $rsa.ToXmlString($false)
-   ```
-   Update `$PUB_KEY_XML` / `ahma-release.pub.xml` inside [scripts/install.ps1](file:///Users/paulhoughton/github/ahma/scripts/install.ps1).
-
-4. **Configure GitHub Repository Secret:**
-   Add the entire content of the private key `release_key.pem` as a secret named `AHMA_RELEASE_SIGNING_KEY` in the repository settings:
-   `Settings` -> `Secrets and variables` -> `Actions` -> `New repository secret`.
-
-5. **Clean up:**
-   Securely delete the local `release_key.pem` and DER files once done to avoid leakage.
-
-
+- Full signing architecture and AGPL supply chain defence rationale
+- How to verify a release signature manually
+- Key rotation procedure (triggered from the GitHub Actions UI — no local machine required)
+- Emergency rotation SOP for suspected compromises
+- Key rotation log

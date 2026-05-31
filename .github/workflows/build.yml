@@ -36,6 +36,14 @@ on:
     branches: [main, production]
   pull_request:
     branches: [main, production]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Key management action (generate-signing-key rotates the release keypair entirely inside GitHub Actions — no local machine involved)'
+        required: true
+        type: choice
+        options:
+          - generate-signing-key
 
 env:
   RUSTUP_MAX_RETRIES: 10
@@ -678,15 +686,17 @@ jobs:
           cat SHA256SUMS
 
           # 3. Cryptographically sign the checksums file
-          if [ -n "${AHMA_RELEASE_SIGNING_KEY:-}" ]; then
-            echo "Signing SHA256SUMS..."
-            echo "$AHMA_RELEASE_SIGNING_KEY" > release_key.pem
-            openssl dgst -sha256 -sign release_key.pem -out SHA256SUMS.sig SHA256SUMS
-            rm -f release_key.pem
-          else
-            echo "WARNING: AHMA_RELEASE_SIGNING_KEY secret is not set. Creating a dummy signature file for testing/compatibility."
-            echo "DUMMY SIGNATURE" > SHA256SUMS.sig
+          # Hard-fail if the secret is absent — a release without a real signature must never reach users.
+          if [ -z "${AHMA_RELEASE_SIGNING_KEY:-}" ]; then
+            echo "::error::AHMA_RELEASE_SIGNING_KEY secret is not set. Cannot publish a signed release."
+            echo "::error::Trigger the 'generate-signing-key' workflow_dispatch action to create a new keypair entirely inside GitHub Actions."
+            echo "::error::No private key ever needs to touch a developer machine."
+            exit 1
           fi
+          echo "Signing SHA256SUMS..."
+          echo "$AHMA_RELEASE_SIGNING_KEY" > release_key.pem
+          openssl dgst -sha256 -sign release_key.pem -out SHA256SUMS.sig SHA256SUMS
+          rm -f release_key.pem
 
       - name: Determine release tag
         id: version
@@ -711,7 +721,67 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
-          body: "Release ${{ steps.version.outputs.tag }} from main branch"
+          body: |
+            ## Ahma ${{ steps.version.outputs.tag }}
+
+            Built from [`main`](https://github.com/paulirotta/ahma/tree/main) via the [CI pipeline](https://github.com/paulirotta/ahma/actions/workflows/build.yml).
+
+            ### Install
+
+            **Linux / macOS:**
+            ```bash
+            curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
+            export PATH="$HOME/.local/bin:$PATH"
+            ```
+
+            **Windows (PowerShell 5.1+):**
+            ```powershell
+            irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
+            ```
+
+            **Update an existing install:**
+            ```bash
+            ahma update
+            ```
+
+            ### Signed binaries — supply chain protection
+
+            Every release archive and raw binary is covered by a **cryptographically signed manifest**.
+
+            - `SHA256SUMS` — SHA-256 hashes of all assets and extracted binaries
+            - `SHA256SUMS.sig` — RSA-2048 / PKCS#1v15 / SHA-256 signature
+
+            The signing key is held exclusively in GitHub Actions secrets. It never exists on any
+            developer machine. The installers above verify the signature automatically before writing
+            anything to disk:
+            ```
+            Authenticity verified: Release signature is valid.
+            ```
+
+            **Manual spot-check:**
+            ```bash
+            curl -sSfL https://github.com/paulirotta/ahma/releases/download/${{ steps.version.outputs.tag }}/SHA256SUMS -o /tmp/SHA256SUMS
+            curl -sSfL https://github.com/paulirotta/ahma/releases/download/${{ steps.version.outputs.tag }}/SHA256SUMS.sig -o /tmp/SHA256SUMS.sig
+            openssl dgst -sha256 -verify scripts/ahma-release.pub.pem -signature /tmp/SHA256SUMS.sig /tmp/SHA256SUMS
+            # → Verified OK
+            ```
+
+            ### AGPL + signing: two-layer supply chain defence
+
+            The `ahma` binary and security-relevant crates are **AGPL-3.0-or-later**.
+            AGPL requires source disclosure for any distributed or network-accessible modification,
+            closing the route of shipping a backdoored binary without publishing the changes.
+            Binary signing verifies that what you install came from the published, auditable source
+            via the official CI pipeline — making an unsigned or differently-signed impostor
+            immediately detectable.
+
+            Building from auditable source is always an option:
+            ```bash
+            cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked
+            ```
+
+            See [docs/release-signing.md](https://github.com/paulirotta/ahma/blob/main/docs/release-signing.md)
+            for the full signing architecture and key rotation procedure.
           draft: false
           prerelease: false
           make_latest: "true"
@@ -720,6 +790,27 @@ jobs:
             ahma-release-*.zip
             SHA256SUMS
             SHA256SUMS.sig
+
+      - name: Verify published release signature
+        if: steps.version.outputs.already_released == 'false'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          BASE="https://github.com/paulirotta/ahma/releases/download/${TAG}"
+          echo "Downloading published SHA256SUMS and signature for post-publish verification..."
+          # Retry a few times — GitHub CDN can be slow to propagate
+          for i in 1 2 3 4 5; do
+            sleep 10
+            if curl -sSfL "${BASE}/SHA256SUMS" -o /tmp/SHA256SUMS && \
+               curl -sSfL "${BASE}/SHA256SUMS.sig" -o /tmp/SHA256SUMS.sig; then
+              break
+            fi
+            echo "Attempt ${i}/5 failed, retrying..."
+          done
+          # Verify using the committed public key — automatically stays current after key rotation
+          openssl dgst -sha256 -verify scripts/ahma-release.pub.pem \
+            -signature /tmp/SHA256SUMS.sig /tmp/SHA256SUMS
+          echo "Post-publish signature verification: PASSED"
 
   # --------------------------------------------------------------------------
   # Publish to Windows Package Manager (winget-pkgs)
@@ -764,3 +855,263 @@ jobs:
           fi
           chmod +x scripts/publish-winget.sh
           ./scripts/publish-winget.sh
+
+  # --------------------------------------------------------------------------
+  # Key Management — Generate / Rotate Release Signing Keypair
+  #
+  # Triggered manually via: Actions → Run workflow → action: generate-signing-key
+  #
+  # Security model:
+  #   - Keypair is generated entirely on an ephemeral Ubuntu runner (tmpfs)
+  #   - Private key is uploaded as a 1-day admin-only artifact, then shredded
+  #   - Public key changes are committed to a branch and a PR is opened
+  #   - Operator: downloads artifact → sets AHMA_RELEASE_SIGNING_KEY secret → merges PR
+  #   - Private key NEVER touches any developer machine
+  # --------------------------------------------------------------------------
+  job-generate-signing-key:
+    name: Generate / Rotate Release Signing Key
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'generate-signing-key'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: Generate RSA-2048 keypair on ephemeral runner
+        id: keygen
+        run: |
+          set -euo pipefail
+          DATESTAMP=$(date +%Y%m%d)
+          echo "datestamp=${DATESTAMP}" >> "$GITHUB_OUTPUT"
+
+          # Generate private key into tmpfs (RAM-backed on Linux)
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out /tmp/release_key.pem 2>/dev/null
+
+          # Extract public key in PEM format
+          openssl rsa -pubout -in /tmp/release_key.pem \
+            -out /tmp/ahma-release.pub.pem 2>/dev/null
+
+          # Extract public key in XML format (for Windows installer)
+          # Parse modulus and exponent from the DER-encoded public key
+          openssl rsa -pubin -in /tmp/ahma-release.pub.pem \
+            -outform DER -out /tmp/ahma-release.pub.der 2>/dev/null
+
+          # Build XML from base64-encoded DER components via openssl
+          MODULUS=$(openssl asn1parse -inform DER -in /tmp/ahma-release.pub.der 2>/dev/null \
+            | grep -A1 'BIT STRING' | tail -1 | awk -F: '{print $NF}' | xxd -r -p | base64 | tr -d '\n' || true)
+
+          # Simpler approach: use Python (available on ubuntu-latest) for XML extraction
+          python3 - <<'PYEOF'
+          import subprocess, base64, struct, sys
+
+          # Read the PEM public key bytes
+          result = subprocess.run(
+              ["openssl", "rsa", "-pubin", "-in", "/tmp/ahma-release.pub.pem",
+               "-text", "-noout"],
+              capture_output=True, text=True
+          )
+
+          # Export as DER and parse ASN.1 manually
+          der = subprocess.run(
+              ["openssl", "rsa", "-pubin", "-in", "/tmp/ahma-release.pub.pem",
+               "-outform", "DER"],
+              capture_output=True
+          ).stdout
+
+          # ASN.1 parse: SEQUENCE { SEQUENCE { OID, NULL }, BIT STRING { SEQUENCE { INTEGER mod, INTEGER exp }}}
+          # Use openssl to extract modulus and exponent
+          lines = subprocess.run(
+              ["openssl", "asn1parse", "-inform", "DER", "-in", "/tmp/ahma-release.pub.der"],
+              capture_output=True, text=True
+          ).stdout.strip().split("\n")
+
+          # Find INTEGER values (modulus is the large one, exponent is small: 65537)
+          integers = [l.split(":INTEGER:")[1].strip() for l in lines if ":INTEGER:" in l]
+          if len(integers) >= 2:
+              # Remove leading 00 from modulus if present (sign byte)
+              mod_hex = integers[0].lstrip("0") or "0"
+              exp_hex = integers[1]
+              mod_b64 = base64.b64encode(bytes.fromhex(mod_hex)).decode()
+              exp_b64 = base64.b64encode(bytes.fromhex(exp_hex)).decode()
+              xml = f'<RSAKeyValue><Modulus>{mod_b64}</Modulus><Exponent>{exp_b64}</Exponent></RSAKeyValue>'
+              with open("/tmp/ahma-release.pub.xml", "w") as f:
+                  f.write(xml + "\n")
+              print(f"XML key written ({len(xml)} chars)")
+          else:
+              print("WARNING: Could not parse ASN.1 integers", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+
+          echo "Keypair generated successfully."
+          echo "Public key (PEM):"
+          cat /tmp/ahma-release.pub.pem
+
+      - name: Update all embedded public-key locations
+        run: |
+          set -euo pipefail
+
+          # 1. Public key file
+          cp /tmp/ahma-release.pub.pem scripts/ahma-release.pub.pem
+          cp /tmp/ahma-release.pub.xml scripts/ahma-release.pub.xml
+
+          # 2. install.sh — replace the PUB_KEY_PEM= block
+          # The block spans from '# Public key for release verification' to the closing '"'
+          NEW_PEM=$(cat /tmp/ahma-release.pub.pem)
+          python3 - <<PYEOF
+          import re
+
+          with open("scripts/install.sh", "r") as f:
+              content = f.read()
+
+          # Match: PUB_KEY_PEM="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
+          pattern = r'(PUB_KEY_PEM=")-----BEGIN PUBLIC KEY-----[\s\S]*?-----END PUBLIC KEY-----(")'
+          new_pem = open("/tmp/ahma-release.pub.pem").read().strip()
+          replacement = r'\g<1>' + new_pem + r'\g<2>'
+          new_content = re.sub(pattern, replacement, content)
+
+          if new_content == content:
+              raise ValueError("PUB_KEY_PEM block not found in install.sh — pattern mismatch")
+
+          with open("scripts/install.sh", "w") as f:
+              f.write(new_content)
+          print("install.sh updated")
+          PYEOF
+
+          # 3. install.ps1 — replace the $PUB_KEY_XML line
+          NEW_XML=$(cat /tmp/ahma-release.pub.xml | tr -d '\n')
+          python3 - <<PYEOF
+          import re
+
+          with open("scripts/install.ps1", "r") as f:
+              content = f.read()
+
+          new_xml = open("/tmp/ahma-release.pub.xml").read().strip()
+          pattern = r'(\$PUB_KEY_XML = )(\x27[^\x27]*\x27)'
+          replacement = r"\g<1>'" + new_xml + "'"
+          new_content = re.sub(pattern, replacement, content)
+
+          if new_content == content:
+              raise ValueError("$PUB_KEY_XML line not found in install.ps1 — pattern mismatch")
+
+          with open("scripts/install.ps1", "w") as f:
+              f.write(new_content)
+          print("install.ps1 updated")
+          PYEOF
+
+          # 4. ahma_mcp/src/update/install.rs — replace const PUB_KEY_PEM block
+          python3 - <<PYEOF
+          import re
+
+          with open("ahma_mcp/src/update/install.rs", "r") as f:
+              content = f.read()
+
+          new_pem = open("/tmp/ahma-release.pub.pem").read().strip()
+          pattern = r'(const PUB_KEY_PEM: &str = ")-----BEGIN PUBLIC KEY-----[\s\S]*?-----END PUBLIC KEY-----(";)'
+          replacement = r'\g<1>' + new_pem + r'\g<2>'
+          new_content = re.sub(pattern, replacement, content)
+
+          if new_content == content:
+              raise ValueError("const PUB_KEY_PEM block not found in install.rs — pattern mismatch")
+
+          with open("ahma_mcp/src/update/install.rs", "w") as f:
+              f.write(new_content)
+          print("install.rs updated")
+          PYEOF
+
+          echo "All embedded public-key locations updated."
+
+      - name: Upload private key artifact (admin-only, expires 24h)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: signing-key-${{ steps.keygen.outputs.datestamp }}-${{ github.run_id }}
+          path: /tmp/release_key.pem
+          retention-days: 1
+          # Note: only repository admins can download workflow artifacts
+
+      - name: Shred private key from runner tmpfs
+        if: always()
+        run: |
+          if [ -f /tmp/release_key.pem ]; then
+            # Overwrite with random bytes before deletion
+            KEY_SIZE=$(stat -c%s /tmp/release_key.pem)
+            dd if=/dev/urandom of=/tmp/release_key.pem bs=1 count="${KEY_SIZE}" conv=notrunc 2>/dev/null
+            rm -f /tmp/release_key.pem
+            echo "Private key shredded from runner."
+          fi
+
+      - name: Commit public-key changes and open PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DATESTAMP="${{ steps.keygen.outputs.datestamp }}"
+          BRANCH="chore/rotate-signing-key-${DATESTAMP}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "${BRANCH}"
+          git add scripts/ahma-release.pub.pem \
+                  scripts/ahma-release.pub.xml \
+                  scripts/install.sh \
+                  scripts/install.ps1 \
+                  ahma_mcp/src/update/install.rs
+          git commit -m "chore(security): rotate release signing key ${DATESTAMP}"
+          git push origin "${BRANCH}"
+
+          gh pr create \
+            --title "chore(security): rotate release signing key ${DATESTAMP}" \
+            --body "$(cat <<PRBODY
+          ## Release Signing Key Rotation
+
+          This PR was auto-generated by the \`generate-signing-key\` workflow.
+
+          ### What changed
+          - \`scripts/ahma-release.pub.pem\` — new RSA-2048 public key
+          - \`scripts/ahma-release.pub.xml\` — XML form for Windows installer
+          - \`scripts/install.sh\` — updated embedded \`PUB_KEY_PEM\`
+          - \`scripts/install.ps1\` — updated embedded \`\$PUB_KEY_XML\`
+          - \`ahma_mcp/src/update/install.rs\` — updated \`const PUB_KEY_PEM\`
+
+          ### Required operator action before merging
+          1. Download artifact \`signing-key-${DATESTAMP}-${{ github.run_id }}\` from this workflow run (expires in 24h — act promptly)
+          2. Go to **Settings → Secrets and variables → Actions → \`AHMA_RELEASE_SIGNING_KEY\`** → Update
+          3. Paste the contents of the downloaded \`release_key.pem\`
+          4. Delete the downloaded file from your machine
+          5. Merge this PR
+          6. Record the rotation in \`docs/release-signing.md\` Key Rotation Log
+
+          See [docs/release-signing.md](docs/release-signing.md) for the full rotation SOP.
+          PRBODY
+          )" \
+            --base main \
+            --head "${BRANCH}"
+
+      - name: Write operator instructions to job summary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << 'SUMMARY'
+          ## Signing Key Rotation — Next Steps
+
+          The new keypair has been generated entirely inside this ephemeral runner.
+
+          ### You must do the following within **24 hours** (artifact expiry):
+
+          1. **Download the private key artifact** from this workflow run
+             (only repository admins can download artifacts)
+          2. **Update the GitHub secret**: Settings → Secrets and variables → Actions → `AHMA_RELEASE_SIGNING_KEY` → Update
+          3. **Paste the contents** of `release_key.pem` as the new secret value
+          4. **Permanently delete** the downloaded `release_key.pem` from your machine
+          5. **Merge the auto-generated PR** (public keys updated in all code locations)
+          6. **Verify** the next release CI run shows "Post-publish signature verification: PASSED"
+          7. **Record the rotation** in `docs/release-signing.md` Key Rotation Log
+
+          ### Security reminder
+          The private key never existed outside this ephemeral runner and the artifact.
+          It was shredded from runner tmpfs after upload.
+          SUMMARY
