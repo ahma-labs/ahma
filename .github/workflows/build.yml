@@ -898,34 +898,15 @@ jobs:
 
           # Extract public key in XML format (for Windows installer)
           # openssl rsa -modulus gives the hex modulus reliably; exponent is always 65537 for RSA-2048
-          python3 - <<'PYEOF'
-          import subprocess, base64, sys
-
-          # Extract modulus hex via openssl — format: "Modulus=AABB..."
-          result = subprocess.run(
-              ["openssl", "rsa", "-pubin", "-in", "/tmp/ahma-release.pub.pem",
-               "-modulus", "-noout"],
-              capture_output=True, text=True
-          )
-          if result.returncode != 0:
-              print("ERROR: openssl rsa -modulus failed:", result.stderr, file=sys.stderr)
-              sys.exit(1)
-
-          mod_hex = result.stdout.strip().split("=")[1]
+          MOD_HEX=$(openssl rsa -pubin -in /tmp/ahma-release.pub.pem -modulus -noout | cut -d= -f2)
           # Strip leading 00 sign byte if present
-          if mod_hex.startswith("00"):
-              mod_hex = mod_hex[2:]
-
-          mod_b64 = base64.b64encode(bytes.fromhex(mod_hex)).decode()
-
-          # RSA public exponent is always 65537 = 0x010001
-          exp_b64 = base64.b64encode(bytes.fromhex("010001")).decode()
-
-          xml = f'<RSAKeyValue><Modulus>{mod_b64}</Modulus><Exponent>{exp_b64}</Exponent></RSAKeyValue>'
-          with open("/tmp/ahma-release.pub.xml", "w") as f:
-              f.write(xml + "\n")
-          print(f"XML key written successfully ({len(xml)} chars)")
-          PYEOF
+          MOD_HEX="${MOD_HEX#00}"
+          # Convert hex to base64
+          MOD_B64=$(echo -n "$MOD_HEX" | xxd -r -p | base64 | tr -d '\n')
+          EXP_B64="AQAB"
+          XML="<RSAKeyValue><Modulus>${MOD_B64}</Modulus><Exponent>${EXP_B64}</Exponent></RSAKeyValue>"
+          echo "$XML" > /tmp/ahma-release.pub.xml
+          echo "XML key written successfully ($(wc -c < /tmp/ahma-release.pub.xml) chars)"
 
           echo "Keypair generated successfully."
           echo "Public key (PEM):"
@@ -940,68 +921,81 @@ jobs:
           cp /tmp/ahma-release.pub.xml scripts/ahma-release.pub.xml
 
           # 2. install.sh — replace the PUB_KEY_PEM= block
-          # The block spans from '# Public key for release verification' to the closing '"'
-          NEW_PEM=$(cat /tmp/ahma-release.pub.pem)
-          python3 - <<PYEOF
-          import re
-
-          with open("scripts/install.sh", "r") as f:
-              content = f.read()
-
-          # Match: PUB_KEY_PEM="-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----"
-          pattern = r'(PUB_KEY_PEM=")-----BEGIN PUBLIC KEY-----[\s\S]*?-----END PUBLIC KEY-----(")'
-          new_pem = open("/tmp/ahma-release.pub.pem").read().strip()
-          replacement = r'\g<1>' + new_pem + r'\g<2>'
-          new_content = re.sub(pattern, replacement, content)
-
-          if new_content == content:
-              raise ValueError("PUB_KEY_PEM block not found in install.sh — pattern mismatch")
-
-          with open("scripts/install.sh", "w") as f:
-              f.write(new_content)
-          print("install.sh updated")
-          PYEOF
+          awk -v new_pem_file="/tmp/ahma-release.pub.pem" '
+            BEGIN {
+              while ((getline line < new_pem_file) > 0) {
+                  new_pem = new_pem (new_pem == "" ? "" : "\n") line
+              }
+              close(new_pem_file)
+              in_key = 0
+              replaced = 0
+            }
+            /^PUB_KEY_PEM="-----BEGIN PUBLIC KEY-----/ {
+              print "PUB_KEY_PEM=\"" new_pem "\""
+              in_key = 1; replaced = 1; next
+            }
+            in_key && /-----END PUBLIC KEY-----"$/ {
+              in_key = 0; next
+            }
+            !in_key { print }
+            END {
+              if (!replaced) {
+                  print "ERROR: PUB_KEY_PEM block not found in install.sh" > "/dev/stderr"
+                  exit 1
+              }
+            }
+          ' scripts/install.sh > /tmp/install.sh.new && mv /tmp/install.sh.new scripts/install.sh
+          echo "install.sh updated"
 
           # 3. install.ps1 — replace the $PUB_KEY_XML line
-          NEW_XML=$(cat /tmp/ahma-release.pub.xml | tr -d '\n')
-          python3 - <<PYEOF
-          import re
-
-          with open("scripts/install.ps1", "r") as f:
-              content = f.read()
-
-          new_xml = open("/tmp/ahma-release.pub.xml").read().strip()
-          pattern = r'(\$PUB_KEY_XML = )(\x27[^\x27]*\x27)'
-          replacement = r"\g<1>'" + new_xml + "'"
-          new_content = re.sub(pattern, replacement, content)
-
-          if new_content == content:
-              raise ValueError("$PUB_KEY_XML line not found in install.ps1 — pattern mismatch")
-
-          with open("scripts/install.ps1", "w") as f:
-              f.write(new_content)
-          print("install.ps1 updated")
-          PYEOF
+          awk -v new_xml_file="/tmp/ahma-release.pub.xml" -v sq="'" '
+            BEGIN {
+              getline new_xml < new_xml_file
+              close(new_xml_file)
+              gsub(/\r|\n/, "", new_xml)
+              replaced = 0
+            }
+            /^\$PUB_KEY_XML = / {
+              print "$PUB_KEY_XML = " sq new_xml sq
+              replaced = 1
+              next
+            }
+            { print }
+            END {
+              if (!replaced) {
+                  print "ERROR: $PUB_KEY_XML not found in install.ps1" > "/dev/stderr"
+                  exit 1
+              }
+            }
+          ' scripts/install.ps1 > /tmp/install.ps1.new && mv /tmp/install.ps1.new scripts/install.ps1
+          echo "install.ps1 updated"
 
           # 4. ahma_mcp/src/update/install.rs — replace const PUB_KEY_PEM block
-          python3 - <<PYEOF
-          import re
-
-          with open("ahma_mcp/src/update/install.rs", "r") as f:
-              content = f.read()
-
-          new_pem = open("/tmp/ahma-release.pub.pem").read().strip()
-          pattern = r'(const PUB_KEY_PEM: &str = ")-----BEGIN PUBLIC KEY-----[\s\S]*?-----END PUBLIC KEY-----(";)'
-          replacement = r'\g<1>' + new_pem + r'\g<2>'
-          new_content = re.sub(pattern, replacement, content)
-
-          if new_content == content:
-              raise ValueError("const PUB_KEY_PEM block not found in install.rs — pattern mismatch")
-
-          with open("ahma_mcp/src/update/install.rs", "w") as f:
-              f.write(new_content)
-          print("install.rs updated")
-          PYEOF
+          awk -v new_pem_file="/tmp/ahma-release.pub.pem" -v dq='"' '
+            BEGIN {
+              while ((getline line < new_pem_file) > 0) {
+                  new_pem = new_pem (new_pem == "" ? "" : "\n") line
+              }
+              close(new_pem_file)
+              in_key = 0
+              replaced = 0
+            }
+            /^const PUB_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----/ {
+              print "const PUB_KEY_PEM: &str = " dq new_pem dq ";"
+              in_key = 1; replaced = 1; next
+            }
+            in_key && /-----END PUBLIC KEY-----";$/ {
+              in_key = 0; next
+            }
+            !in_key { print }
+            END {
+              if (!replaced) {
+                  print "ERROR: const PUB_KEY_PEM not found in install.rs" > "/dev/stderr"
+                  exit 1
+              }
+            }
+          ' ahma_mcp/src/update/install.rs > /tmp/install.rs.new && mv /tmp/install.rs.new ahma_mcp/src/update/install.rs
+          echo "install.rs updated"
 
           echo "All embedded public-key locations updated."
 
