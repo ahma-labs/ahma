@@ -171,6 +171,7 @@ fn try_create_file_appender() -> Option<tracing_appender::rolling::RollingFileAp
 
     // Create a stable `ahma_mcp.log` symlink pointing to today's dated rolling file.
     // This lets `tail -F ./log/ahma_mcp.log` work even though the actual file is dated.
+    #[cfg(unix)]
     try_update_current_log_symlink(&log_dir);
 
     Some(appender)
@@ -180,22 +181,20 @@ fn try_create_file_appender() -> Option<tracing_appender::rolling::RollingFileAp
 /// rolling file (e.g. `ahma_mcp.log.2026-05-24`).
 ///
 /// This is a best-effort operation — failure is logged at debug level and ignored.
+#[cfg(unix)]
 fn try_update_current_log_symlink(log_dir: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
+    use std::os::unix::fs::symlink;
 
-        let today = chrono::Local::now().format("%Y-%m-%d");
-        let dated_name = format!("ahma_mcp.log.{today}");
-        let symlink_path = log_dir.join("ahma_mcp.log");
+    let today = chrono::Local::now().format("%Y-%m-%d");
+    let dated_name = format!("ahma_mcp.log.{today}");
+    let symlink_path = log_dir.join("ahma_mcp.log");
 
-        // Remove any existing file/symlink at the stable path.
-        let _ = std::fs::remove_file(&symlink_path);
+    // Remove any existing file/symlink at the stable path.
+    let _ = std::fs::remove_file(&symlink_path);
 
-        // Create a relative symlink so the log dir is portable.
-        if let Err(e) = symlink(&dated_name, &symlink_path) {
-            eprintln!("ahma: could not create log symlink {symlink_path:?} → {dated_name}: {e}");
-        }
+    // Create a relative symlink so the log dir is portable.
+    if let Err(e) = symlink(&dated_name, &symlink_path) {
+        eprintln!("ahma: could not create log symlink {symlink_path:?} → {dated_name}: {e}");
     }
 }
 

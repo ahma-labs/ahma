@@ -288,10 +288,11 @@ async fn setup_mcp_config(interactive: bool) -> Result<()> {
                 "--tools",
                 "rust,simplify",
                 "--tmp",
-                "--log-monitor",
-                "--sandbox-scope",
-                home.to_string_lossy()
-            ]
+                "--log-monitor"
+            ],
+            "env": {
+                "AHMA_SANDBOX_SCOPE": "~"
+            }
         }),
     };
 

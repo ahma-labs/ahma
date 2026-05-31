@@ -337,6 +337,7 @@ async fn probe_unix_socket(socket_path: &str) -> bool {
 }
 
 /// Parse the first line of an HTTP response and return `true` for 2xx codes.
+#[cfg(any(unix, test))]
 fn parse_status_2xx(response: &[u8]) -> bool {
     let text = std::str::from_utf8(response).unwrap_or("");
     let first_line = text.lines().next().unwrap_or("");

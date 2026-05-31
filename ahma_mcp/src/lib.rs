@@ -108,6 +108,8 @@ pub mod client_type;
 pub mod config;
 /// Constants used for guidance and tool hints.
 pub mod constants;
+/// Background reporter that registers this instance with the hub daemon.
+pub mod daemon_reporter;
 /// External terminal hook management for supported AI tools.
 pub mod hooks;
 /// Live log monitoring pipeline (LLM-powered issue detection).

@@ -225,6 +225,22 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         .await?;
     let service_handler = service;
 
+    // Register this stdio instance with the hub daemon so TUI can see it.
+    {
+        let scope_str = config
+            .sandbox_scopes
+            .first()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        let label = std::env::var("AHMA_INSTANCE_LABEL").unwrap_or_else(|_| "ahma".to_string());
+        crate::daemon_reporter::spawn_reporter(
+            operation_monitor.clone(),
+            "stdio",
+            scope_str,
+            label,
+        );
+    }
+
     // Hot-reload is opt-in because runtime writes can change tool behavior mid-session.
     if config.hot_reload_tools {
         if let Some(tools_dir) = config.tools_dir.clone() {

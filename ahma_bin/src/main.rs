@@ -55,6 +55,10 @@ async fn main() -> Result<()> {
             tracing::info!("Dispatching cluster subcommand");
             dispatch_cluster(cluster_args).await
         }
+        Subcommands::Daemon(_) => {
+            tracing::info!("Starting TUI hub daemon");
+            ahma_common::daemon_hub::run_daemon().await
+        }
         other => dispatch_subcommand(other, cfg).await,
     }
 }

@@ -28,8 +28,8 @@ pub use list_tools::{
 
 pub use cli::{
     CertCommand, Cli, ClusterAddPeerArgs, ClusterAnnounceArgs, ClusterArgs, ClusterCommand,
-    ClusterPingArgs, LlmAddArgs, LlmArgs, LlmCommand, LlmRemoveArgs, LlmTestArgs, Subcommands,
-    TlsArgs, TlsCommand, TuiArgs, VaultArgs, VaultCommand, VaultCreateArgs,
+    ClusterPingArgs, DaemonArgs, LlmAddArgs, LlmArgs, LlmCommand, LlmRemoveArgs, LlmTestArgs,
+    Subcommands, TlsArgs, TlsCommand, TuiArgs, VaultArgs, VaultCommand, VaultCreateArgs,
 };
 pub use cli::{build_app_config, dispatch_subcommand, run};
 

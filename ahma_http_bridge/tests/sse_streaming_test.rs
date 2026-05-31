@@ -329,7 +329,7 @@ for line in sys.stdin:
     .unwrap();
 
     let sm = Arc::new(SessionManager::new(SessionManagerConfig {
-        server_command: "python3".to_string(),
+        server_command: if cfg!(windows) { "python" } else { "python3" }.to_string(),
         server_args: vec![script_path.to_string_lossy().to_string()],
         default_scope: Some(temp_dir.path().to_path_buf()),
         enable_colored_output: false,

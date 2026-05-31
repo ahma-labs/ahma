@@ -231,6 +231,7 @@ impl AppConfig {
             .map(|paths| {
                 std::env::split_paths(&paths)
                     .filter(|path| !path.as_os_str().is_empty())
+                    .map(expand_tilde)
                     .collect()
             })
             .unwrap_or_default()
@@ -242,10 +243,27 @@ impl AppConfig {
             .map(|paths| {
                 std::env::split_paths(&paths)
                     .filter(|path| !path.as_os_str().is_empty())
+                    .map(expand_tilde)
                     .collect()
             })
             .unwrap_or_default()
     }
+}
+
+fn expand_tilde(path: PathBuf) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if path_str == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    } else if (path_str.starts_with("~/") || path_str.starts_with("~\\"))
+        && let Some(home) = dirs::home_dir()
+    {
+        let mut expanded = home;
+        expanded.push(&path_str[2..]);
+        return expanded;
+    }
+    path
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -629,6 +647,13 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in setup mode");
             crate::setup::run(args).await
         }
+        Subcommands::Daemon(_) => {
+            anyhow::bail!(
+                "daemon is provided by the ahma_bin crate. \
+                 If you are running a custom binary, implement daemon dispatch \
+                 using ahma_common::daemon_hub::run_daemon."
+            )
+        }
     }
 }
 
@@ -772,6 +797,13 @@ pub enum Subcommands {
     Update(crate::update::UpdateArgs),
     /// Run the interactive or automated setup wizard.
     Setup(SetupArgs),
+    /// Start the TUI hub daemon for multi-instance aggregation.
+    ///
+    /// The daemon is a lightweight process that collects operation events from
+    /// all running ahma instances (including stdio processes spawned by IDEs)
+    /// and fans them out to TUI subscribers.  It is started automatically on
+    /// first use and exits automatically after 60 s of idle.
+    Daemon(DaemonArgs),
 }
 
 /// Arguments for `ahma setup`.
@@ -797,6 +829,13 @@ pub struct SetupArgs {
     #[arg(long = "tls")]
     pub tls: bool,
 }
+
+/// Arguments for `ahma daemon`.
+///
+/// Currently no flags are needed; the daemon is configured entirely via
+/// environment variables (`AHMA_DAEMON_SOCK`).
+#[derive(clap::Args, Debug, Clone)]
+pub struct DaemonArgs {}
 
 // ── serve ────────────────────────────────────────────────────────────────────
 
@@ -2042,6 +2081,28 @@ mod tests {
         unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
 
         assert_eq!(scopes, vec![temp.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn test_env_sandbox_scopes_tilde() {
+        unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", "~") };
+        let scopes = AppConfig::env_sandbox_scopes();
+        unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
+
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(scopes, vec![home]);
+        }
+    }
+
+    #[test]
+    fn test_env_sandbox_scopes_tilde_slash() {
+        unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", "~/test_sandbox") };
+        let scopes = AppConfig::env_sandbox_scopes();
+        unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
+
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(scopes, vec![home.join("test_sandbox")]);
+        }
     }
 
     #[test]

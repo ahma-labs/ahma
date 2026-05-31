@@ -59,6 +59,14 @@ filter = "package(ahma_http_bridge)"
 threads-required = 4
 slow-timeout = { period = "120s", terminate-after = 2 }
 
+# Stress tests fan out concurrent PowerShell spawns.  Even at the reduced
+# Windows CI count (3 requests) the join_all wall-time can exceed 120 s on a
+# cold 2-CPU runner.  Grant extra headroom via a more specific filter.
+[[profile.default.overrides]]
+filter = "binary_id(ahma_http_bridge::bridge_stress_tests)"
+threads-required = 4
+slow-timeout = { period = "240s", terminate-after = 2 }
+
 # Many ahma_mcp integration test binaries spawn ahma subprocess.
 # Throttle all integration tests (binary_id "ahma_mcp::*") to prevent
 # scheduler starvation when running concurrently with bridge tests.
@@ -85,6 +93,18 @@ retries = 0
 filter = "package(ahma_http_bridge)"
 threads-required = 2
 slow-timeout = { period = "180s", terminate-after = 2 }
+
+# Stress tests fan out concurrent PowerShell spawns.  Even at the reduced
+# Windows CI count (3 requests), an SSE handshake that stalls (e.g. the
+# sandbox-configured notification is delayed) can block until the package-level
+# 360s hard kill (period * terminate-after = 180 * 2) fires with no diagnostic.
+# The per-test initialize_with_roots call is now wrapped in a 60s timeout so
+# the test skips gracefully.  This override reduces the nextest backstop from
+# 360s to 240s as a secondary safety net.
+[[profile.ci.overrides]]
+filter = "binary_id(ahma_http_bridge::bridge_stress_tests)"
+threads-required = 2
+slow-timeout = { period = "120s", terminate-after = 2 }
 
 # Many ahma_mcp integration test binaries spawn ahma subprocess.
 # Throttle all integration tests (binary_id "ahma_mcp::*") to 1 at a time.

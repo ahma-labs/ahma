@@ -37,12 +37,14 @@ async fn run_ratatui(connection: &ResolvedConnection) -> Result<()> {
     use ratatui::{Terminal, backend::CrosstermBackend};
     use tokio::sync::mpsc;
 
+    use crate::daemon_source::{spawn_daemon_source, spawn_embedded_hub_source};
     use crate::keymap::map_key;
     use crate::llm_bridge::{BridgeEvent, spawn_discovery_task};
     use crate::mcp_source::{SourceEvent, spawn_mcp_source};
     use crate::state::AppState;
     use crate::theme::Theme;
     use crate::ui;
+    use ahma_common::daemon_hub::try_start_hub_server;
 
     let unicode = detect_unicode();
     let theme = Theme::new(unicode);
@@ -54,7 +56,28 @@ async fn run_ratatui(connection: &ResolvedConnection) -> Result<()> {
     state.mcp_http_base_url = http_base_url(connection);
 
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<SourceEvent>(256);
-    spawn_mcp_source(connection.clone(), mcp_tx);
+    spawn_mcp_source(connection.clone(), mcp_tx.clone());
+    // Start the hub server inside this TUI process so its lifecycle matches the
+    // TUI — no dangling socket if the TUI crashes. ahma instances connect via
+    // Unix socket (macOS/Linux) or TCP loopback (Windows) using push messaging.
+    // If another TUI or standalone daemon already owns the socket, we fall back
+    // to subscriber mode so both TUI instances still receive events.
+    let _hub = match try_start_hub_server().await {
+        Ok(Some(hub)) => {
+            spawn_embedded_hub_source(hub.subscribe(), mcp_tx.clone());
+            Some(hub)
+        }
+        Ok(None) => {
+            // Another server owns the socket — subscribe instead.
+            debug!("hub: another server already running; connecting as subscriber");
+            spawn_daemon_source(mcp_tx.clone());
+            None
+        }
+        Err(e) => {
+            debug!("hub: could not start embedded server ({e}); no multi-instance aggregation");
+            None
+        }
+    };
 
     // Bridge channel carries both provider discovery results and LLM tokens.
     let (bridge_tx, mut bridge_rx) = mpsc::channel::<BridgeEvent>(512);
