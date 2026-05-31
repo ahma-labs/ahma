@@ -40,3 +40,10 @@ CODE_SIMPLICITY.*
 log
 temp
 .sccache/
+
+# Release signing private keys — NEVER commit
+# Keys are generated and stored exclusively inside GitHub Actions secrets.
+# Only the public key files are committed (scripts/ahma-release.pub.pem, .pub.xml).
+release_key.pem
+ahma-release-new.pem
+*.private.pem

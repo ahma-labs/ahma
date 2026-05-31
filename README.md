@@ -322,24 +322,61 @@ option used by many libraries.
 that define the shipped product surface and security-relevant runtime behavior.
 That includes the shipped `ahma` binary and the crates that define vaults,
 worker execution, renewal gates, cluster scheduling, and the user-facing TUI.
-By requiring complete source disclosure for any distributed or network-accessible modifications, the AGPL safeguards this security-first toolset against supply chain or impostor attacks—including closed-source backdoored forks, malicious runtime wrappers, or tampered control planes—and ensures users can verify their installation against cryptographically signed official release binaries as detailed in the [Release Verification section of the Installation Guide](docs/installation.md#release-verification).
 
+### AGPL + Cryptographic Signing: Supply Chain Defense
+
+AGPL and binary signing work together as a two-layer supply chain defense:
+
+- **AGPL requires source disclosure**: anyone distributing a modified `ahma` binary or
+  running a modified version over a network must publish the corresponding source.
+  Closed-source backdoored forks cannot be legally distributed as "ahma".
+
+- **Binary signing closes the gap AGPL cannot**: source transparency is only useful if
+  you can verify the binary you installed actually came from that source.
+  Every prebuilt release is signed with an RSA-2048 key held exclusively inside
+  GitHub Actions secrets — never on any developer machine. The installer verifies
+  this signature before writing anything to disk.
+
+Together they protect against:
+
+| Attack | AGPL | Signing |
+|--------|------|---------|
+| Backdoored binary from unofficial mirror | — | ✓ Signature fails |
+| Closed-source fork distributed as "ahma" | ✓ AGPL violation | ✓ Signature fails |
+| DNS/CDN hijack serving a tampered binary | — | ✓ Hash mismatch |
+| Compromised GitHub release assets | — | ✓ Signature fails (key in Actions secret, not assets) |
+| Modified binary without modified source | ✓ AGPL violation | ✓ Signature fails |
+
+Building from source is always an option. AGPL means the source is always
+public and auditable:
+```bash
+cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked
+```
+
+See [docs/release-signing.md](docs/release-signing.md) for the full signing
+architecture, verification commands, and key rotation procedure.
 
 ### Common uses
 
 | If you want to... | Typical answer |
 |---|---|
 | Embed `ahma_mcp`, `ahma_core`, or `ahma_http_mcp_client` in your own application | Allowed under **MIT OR Apache-2.0** for those crates |
-| Distribute a modified `ahma` binary | Allowed under **AGPL-3.0-or-later** for the combined binary |
-| Offer a modified `ahma` service or modified `ahma_cluster` to remote users | Allowed, subject to the AGPL terms for those crates, including source-availability obligations |
-| Use Ahma internally for local or private workflows | Allowed subject to the applicable crate terms and your own compliance requirements |
+| Distribute a modified `ahma` binary | Allowed under **AGPL-3.0-or-later** — source must be published |
+| Offer a modified `ahma` service or modified `ahma_cluster` to remote users | Allowed under AGPL — source-availability obligations apply |
+| Use Ahma internally for local or private workflows | Allowed subject to the applicable crate terms |
 
-### Security note
+### Security provenance
+
+Trust in Ahma comes from three independently verifiable facts:
+
+1. **Published source** — GitHub, auditable by anyone, required open by AGPL for any fork
+2. **Signed binaries** — RSA-2048 signature from a key held only in GitHub Actions secrets
+3. **Reproducible build** — `--locked` Cargo.lock, deterministic CI pipeline in `build.yml`
 
 The license split supports a single published origin for the security-focused
-product crates, but the license does not by itself make a modified fork safe.
-Trust in Ahma comes from the published source, the default sandbox and approval
-controls, and the provenance of the specific build you run.
+product crates. The license does not by itself make a modified fork safe — but
+combined with cryptographic signing it makes an unsigned or differently-signed
+impostor immediately detectable.
 
 The repository root includes `MIT_LICENSE.txt`, `APACHE_LICENSE.txt`, and
 `AGPL_LICENSE.txt` because different workspace crates use different licenses.
