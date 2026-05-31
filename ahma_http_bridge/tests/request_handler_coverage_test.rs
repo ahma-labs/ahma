@@ -425,39 +425,68 @@ async fn run_task_vault_inheritance_and_staged_delete(mode: TransportMode) {
         vault_root.to_string_lossy().to_string(),
     )];
 
-    let server = match spawn_server_guard_with_config_extra_env(
-        &tools_dir,
-        &workdir,
-        Some(
-            TestTimeouts::get(TimeoutCategory::Handshake)
-                .as_secs()
-                .max(1),
-        ),
-        &extra_env,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "WARNING  skipping task-vault inheritance test: failed to spawn server: {}",
-                e
-            );
-            return;
-        }
-    };
+    let handshake_timeout = TestTimeouts::scale_secs(15);
+    let mut last_error = String::new();
+    let mut server_and_client = None;
 
-    let mut mcp = McpTestClient::with_url(&server.base_url()).with_transport(mode);
-    if let Err(e) = mcp
-        .initialize_with_roots("task-vault-coverage", std::slice::from_ref(&workdir))
+    for attempt in 1..=2u32 {
+        let server = match spawn_server_guard_with_config_extra_env(
+            &tools_dir,
+            &workdir,
+            Some(
+                TestTimeouts::get(TimeoutCategory::Handshake)
+                    .as_secs()
+                    .max(1),
+            ),
+            &extra_env,
+        )
         .await
-    {
+        {
+            Ok(s) => s,
+            Err(e) => {
+                last_error = format!("failed to spawn server: {}", e);
+                continue;
+            }
+        };
+
+        let mut mcp = McpTestClient::with_url(&server.base_url()).with_transport(mode);
+        match tokio::time::timeout(
+            handshake_timeout,
+            mcp.initialize_with_roots("task-vault-coverage", std::slice::from_ref(&workdir)),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                server_and_client = Some((server, mcp));
+                break;
+            }
+            Ok(Err(e)) => last_error = e.to_string(),
+            Err(_) => last_error = format!("handshake timed out after {:?}", handshake_timeout),
+        }
+
+        if attempt == 1 {
+            eprintln!(
+                "WARNING  task-vault inheritance test handshake attempt {} failed: {}. Retrying...",
+                attempt, last_error
+            );
+        }
+    }
+
+    let Some((_server, mcp)) = server_and_client else {
+        let in_ci =
+            std::env::var("CI").is_ok() || std::env::var("AHMA_TEST_FAIL_ON_SETUP_ERROR").is_ok();
+        if in_ci {
+            panic!(
+                "task-vault inheritance test: setup failed in CI — aborting: {}",
+                last_error
+            );
+        }
         eprintln!(
-            "WARNING  skipping task-vault inheritance test: handshake failed: {}",
-            e
+            "WARNING  skipping task-vault inheritance test: setup failed: {}",
+            last_error
         );
         return;
-    }
+    };
 
     let echo_result = mcp
         .call_tool(

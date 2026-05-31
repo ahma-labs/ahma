@@ -106,10 +106,14 @@ pub async fn wait_for_health(base_url: &str) {
     let url = format!("{base_url}/health");
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Ok(r) = client.get(&url).send().await {
-            if r.status().is_success() {
-                return;
-            }
+        if client
+            .get(&url)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            return;
         }
     }
     panic!("Server at {base_url} did not become healthy within 5 seconds");

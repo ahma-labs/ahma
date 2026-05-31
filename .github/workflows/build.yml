@@ -167,7 +167,15 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install cargo-nextest
-        run: cargo binstall cargo-nextest --no-confirm --force --locked
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! cargo nextest --version &> /dev/null; then
+            echo "cargo-nextest not found, installing..."
+            cargo binstall cargo-nextest --no-confirm --locked || cargo install cargo-nextest --locked
+          else
+            echo "cargo-nextest is already installed, skipping installation"
+          fi
 
       - name: Build ahma binary (required by integration tests)
         run: cargo build --locked --no-default-features -p ahma_bin
@@ -320,13 +328,23 @@ jobs:
       - uses: cargo-bins/cargo-binstall@v1.19.1
 
       - name: Install cargo-nextest
-        run: cargo binstall cargo-nextest --no-confirm --force --locked
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! cargo nextest --version &> /dev/null; then
+            echo "cargo-nextest not found, installing..."
+            cargo binstall cargo-nextest --no-confirm --locked || cargo install cargo-nextest --locked
+          else
+            echo "cargo-nextest is already installed, skipping installation"
+          fi
 
       - name: Check for cargo-ndk and install if missing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if ! cargo ndk --version &> /dev/null; then
             echo "cargo-ndk not found or broken, installing..."
-            cargo binstall cargo-ndk --no-confirm --force || cargo install cargo-ndk --locked
+            cargo binstall cargo-ndk --no-confirm || cargo install cargo-ndk --locked
           else
             echo "cargo-ndk is already installed, skipping installation"
           fi
@@ -450,19 +468,29 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Check for cargo-ndk and install if missing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if ! cargo ndk --version &> /dev/null; then
             echo "cargo-ndk not found or broken, installing..."
-            cargo binstall cargo-ndk --no-confirm --force || cargo install cargo-ndk --locked
+            cargo binstall cargo-ndk --no-confirm || cargo install cargo-ndk --locked
           else
             echo "cargo-ndk is already installed, skipping installation"
           fi
           cargo ndk --version
 
       - name: Install cargo-llvm-cov
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cargo binstall cargo-nextest --no-confirm --force --locked
-          cargo binstall cargo-llvm-cov --no-confirm --force
+          if ! cargo nextest --version &> /dev/null; then
+            echo "cargo-nextest not found, installing..."
+            cargo binstall cargo-nextest --no-confirm --locked || cargo install cargo-nextest --locked
+          fi
+          if ! cargo llvm-cov --version &> /dev/null; then
+            echo "cargo-llvm-cov not found, installing..."
+            cargo binstall cargo-llvm-cov --no-confirm || cargo install cargo-llvm-cov --locked
+          fi
 
       - name: Build ahma binary (required by integration tests)
         run: cargo build --locked --no-default-features -p ahma_bin
@@ -657,6 +685,7 @@ jobs:
         if: matrix.use_cross
         env:
           RUSTC_WRAPPER: "" # sccache not usable during cargo-binstall/install bootstrap
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if ! command -v cross &> /dev/null; then
             echo "cross not found, installing..."
@@ -737,13 +766,45 @@ jobs:
           merge-multiple: true
 
       - name: Generate combined SHA256SUMS
+        env:
+          AHMA_RELEASE_SIGNING_KEY: ${{ secrets.AHMA_RELEASE_SIGNING_KEY }}
         run: |
-          # Produce a single SHA256SUMS file covering every release archive.
-          # This file is downloaded by scripts/publish-winget.sh to get the
-          # installer hash for the Windows .zip without re-downloading the archive.
+          # 1. Produce a single SHA256SUMS file covering every release archive.
           sha256sum ahma-release-*.tar.gz ahma-release-*.zip > SHA256SUMS
-          echo "SHA256SUMS contents:"
+
+          # 2. Extract the individual binary hashes from the archives and append them
+          # to the combined SHA256SUMS file. This allows verifying the installed binary
+          # directly without downloading the archive again.
+          echo "" >> SHA256SUMS
+          echo "# Raw Binaries" >> SHA256SUMS
+          for f in ahma-release-*.tar.gz; do
+            if [ -f "$f" ]; then
+              platform=$(echo "$f" | sed -E 's/ahma-release-(.*)\.tar\.gz/\1/')
+              hash=$(tar -xOf "$f" SHA256SUMS | grep -E "ahma$" | head -n 1 | awk '{print $1}')
+              echo "$hash  ahma-${platform}" >> SHA256SUMS
+            fi
+          done
+          for f in ahma-release-*.zip; do
+            if [ -f "$f" ]; then
+              platform=$(echo "$f" | sed -E 's/ahma-release-(.*)\.zip/\1/')
+              hash=$(unzip -p "$f" SHA256SUMS | grep "ahma.exe" | head -n 1 | awk '{print $1}')
+              echo "$hash  ahma-${platform}.exe" >> SHA256SUMS
+            fi
+          done
+
+          echo "Combined SHA256SUMS contents:"
           cat SHA256SUMS
+
+          # 3. Cryptographically sign the checksums file
+          if [ -n "${AHMA_RELEASE_SIGNING_KEY:-}" ]; then
+            echo "Signing SHA256SUMS..."
+            echo "$AHMA_RELEASE_SIGNING_KEY" > release_key.pem
+            openssl dgst -sha256 -sign release_key.pem -out SHA256SUMS.sig SHA256SUMS
+            rm -f release_key.pem
+          else
+            echo "WARNING: AHMA_RELEASE_SIGNING_KEY secret is not set. Creating a dummy signature file for testing/compatibility."
+            echo "DUMMY SIGNATURE" > SHA256SUMS.sig
+          fi
 
       - name: Determine release tag
         id: version
@@ -776,6 +837,7 @@ jobs:
             ahma-release-*.tar.gz
             ahma-release-*.zip
             SHA256SUMS
+            SHA256SUMS.sig
 
   # --------------------------------------------------------------------------
   # Publish to Windows Package Manager (winget-pkgs)

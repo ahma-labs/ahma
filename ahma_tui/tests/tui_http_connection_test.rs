@@ -18,11 +18,11 @@ use std::time::Duration;
 
 use ahma_tui::connection::{ResolvedConnection, ResolvedTransport, probe_candidate};
 use ahma_tui::mcp_source::{SourceEvent, spawn_mcp_source};
+use axum::Json;
 use axum::Router;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Json;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -147,8 +147,7 @@ async fn resolve_explicit_url_returns_http_transport() {
 #[tokio::test]
 async fn resolve_explicit_url_unreachable_returns_helpful_error() {
     // Port 1 is reserved and not bindable in user space; always unreachable.
-    let result =
-        ahma_tui::connection::resolve_connection(Some("http://127.0.0.1:1")).await;
+    let result = ahma_tui::connection::resolve_connection(Some("http://127.0.0.1:1")).await;
     assert!(result.is_err(), "expected Err for unreachable server");
     let msg = result.unwrap_err().to_string();
     assert!(
