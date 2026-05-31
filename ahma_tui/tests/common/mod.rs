@@ -1,8 +1,8 @@
 //! Shared test helpers for ahma_tui integration tests.
 #![allow(dead_code)] // helpers are selectively used by cfg-gated test binaries
+use ahma_http_bridge::{BridgeConfig, ListenerKind, start_bridge};
 use std::net::SocketAddr;
 use std::time::Duration;
-use ahma_http_bridge::{BridgeConfig, ListenerKind, start_bridge};
 
 /// In-process bridge handle that aborts the server task when dropped.
 pub struct BridgeHandle {

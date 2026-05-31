@@ -246,7 +246,11 @@ mod tests {
             .run(r#"fn main() { println!("hello from rust worker"); }"#)
             .await
             .expect("Rust worker should run successfully");
-        assert_eq!(result.exit_code, 0, "worker exited non-zero: {}", result.output);
+        assert_eq!(
+            result.exit_code, 0,
+            "worker exited non-zero: {}",
+            result.output
+        );
         assert!(
             result.output.contains("hello from rust worker"),
             "unexpected output: {}",
