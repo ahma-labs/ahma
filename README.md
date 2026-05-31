@@ -322,6 +322,8 @@ option used by many libraries.
 that define the shipped product surface and security-relevant runtime behavior.
 That includes the shipped `ahma` binary and the crates that define vaults,
 worker execution, renewal gates, cluster scheduling, and the user-facing TUI.
+By requiring complete source disclosure for any distributed or network-accessible modifications, the AGPL safeguards this security-first toolset against supply chain or impostor attacks—including closed-source backdoored forks, malicious runtime wrappers, or tampered control planes—and ensures users can verify their installation against cryptographically signed official release binaries as detailed in the [Release Verification section of the Installation Guide](docs/installation.md#release-verification).
+
 
 ### Common uses
 
