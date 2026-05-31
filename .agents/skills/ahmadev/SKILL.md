@@ -64,22 +64,22 @@ version = "X.Y.Z"
 
 This subcommand intentionally targets `Cargo.toml` version bumping only.
 
-### Default: bump the minor version
+### Default: bump the patch version
 
 **When the user says "bump to the next version" or gives no explicit version, always increment the
-minor component** (`Y` in `X.Y.Z`), resetting the patch to `0`.
-Example: `0.7.5` → `0.8.0`, **not** `0.7.6`.
+patch component** (`Z` in `X.Y.Z`), keeping the major and minor components unchanged.
+Example: `0.9.1` → `0.9.2`, **not** `0.10.0`.
 
 Only deviate from this rule when the user explicitly specifies a different version string.
 
 ### Usage examples
 
 ```
-# Unqualified "bump" or "bump to next version": increment minor, reset patch
-/ahmadev bump          → reads current version, adds 1 to Y, sets Z=0 (e.g. 0.7.5 → 0.8.0)
+# Unqualified "bump" or "bump to next version": increment patch
+/ahmadev bump          → reads current version, adds 1 to Z (e.g. 0.9.1 → 0.9.2)
 
 # Explicit version override
-/ahmadev bump 0.7.6
+/ahmadev bump 0.9.2
 /ahmadev bump 1.0.0
 ```
 
@@ -88,7 +88,7 @@ Only deviate from this rule when the user explicitly specifies a different versi
 1. Determine target version:
    - If the user provided `X.Y.Z` explicitly, use it as-is.
    - Otherwise ("next version", no argument, etc.) read the current `[workspace.package].version`
-     from `Cargo.toml`, increment `Y` by 1, and set `Z` to `0`.
+     from `Cargo.toml`, and increment `Z` by 1.
 2. Validate format (expect `X.Y.Z`, numeric semver core).
 3. Apply the bump by updating `Cargo.toml` `[workspace.package].version`.
 3. Verify the workspace still compiles:
