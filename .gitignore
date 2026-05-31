@@ -39,3 +39,4 @@ CODE_SIMPLICITY.*
 # Local Ahma Logs and temporary files during development
 log
 temp
+.sccache/
