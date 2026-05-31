@@ -231,7 +231,7 @@ async fn test_proper_vscode_handshake_allows_tool_calls() {
     let mut client = McpTestClient::for_server(&server);
 
     // This performs the full handshake: initialize → SSE → initialized → roots/list response
-    let handshake_timeout = TestTimeouts::scale_secs(15);
+    let handshake_timeout = TestTimeouts::get(TimeoutCategory::Handshake);
     match tokio::time::timeout(
         handshake_timeout,
         client.initialize_with_roots("vscode-handshake-test", std::slice::from_ref(&root_path)),

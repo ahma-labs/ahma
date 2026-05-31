@@ -370,7 +370,7 @@ async fn test_post_sse_streams_response() {
         .parent()
         .unwrap()
         .to_path_buf();
-    let init_timeout = TestTimeouts::scale_secs(15);
+    let init_timeout = TestTimeouts::get(TimeoutCategory::Handshake);
 
     let Some((server, client)) = try_setup_for_sse_stream_test(&workspace, init_timeout).await
     else {

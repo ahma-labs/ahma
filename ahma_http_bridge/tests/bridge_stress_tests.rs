@@ -69,7 +69,7 @@ async fn run_concurrent_tool_calls(transport: TransportMode) {
 
     let mut mcp = McpTestClient::with_url(&server.base_url()).with_transport(transport);
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let handshake_timeout = TestTimeouts::scale_secs(15);
+    let handshake_timeout = TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Handshake);
     match tokio::time::timeout(
         handshake_timeout,
         mcp.initialize_with_roots("stress-client", &[root]),
@@ -205,7 +205,7 @@ async fn run_high_volume_concurrent_requests(num_requests: usize, transport: Tra
 
     let mut mcp = McpTestClient::with_url(&server.base_url()).with_transport(transport);
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let handshake_timeout = TestTimeouts::scale_secs(15);
+    let handshake_timeout = TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Handshake);
     match tokio::time::timeout(
         handshake_timeout,
         mcp.initialize_with_roots("stress-client", &[root]),

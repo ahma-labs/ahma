@@ -175,8 +175,15 @@ async fn run_release_update(
     }
 
     println!("Installing Ahma {} for {}...", asset.version, platform.id);
-    let installed =
-        install_release_asset(&client, &asset, platform, install_dir, args.dry_run, insecure_skip_signature).await?;
+    let installed = install_release_asset(
+        &client,
+        &asset,
+        platform,
+        install_dir,
+        args.dry_run,
+        insecure_skip_signature,
+    )
+    .await?;
 
     Ok(UpdateOutcome {
         binary_path: installed,
@@ -200,7 +207,9 @@ async fn print_post_install_details(
 
     if let Some(verified) = signature_verified {
         if verified {
-            println!("Authenticity verified: Release signature is valid (signed by the official private key).");
+            println!(
+                "Authenticity verified: Release signature is valid (signed by the official private key)."
+            );
         } else {
             println!("WARNING: Cryptographic signature verification was bypassed.");
         }
