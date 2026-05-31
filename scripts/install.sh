@@ -15,7 +15,7 @@ set -euo pipefail
 
 # Skill version — keep in sync with [workspace.package] version in Cargo.toml.
 # CI guardrails verify this matches. Bump via: cargo xtask bump-version X.Y.Z
-AHMA_VERSION="0.8.0"
+AHMA_VERSION="0.9.0"
 
 # Public key for release verification (RSA-2048)
 PUB_KEY_PEM="-----BEGIN PUBLIC KEY-----

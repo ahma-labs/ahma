@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_bin"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_cluster",
  "ahma_common",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_cluster"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_common",
  "ahma_decompose",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_common"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_common",
  "ahma_llm_monitor",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_decompose"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_common",
  "ahma_llm_monitor",
@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_http_bridge"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_common",
  "ahma_mcp",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_http_mcp_client"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_common",
  "anyhow",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_llm_monitor"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_common",
  "bytes",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_mcp"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_common",
  "ahma_http_bridge",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_renewal"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_vault",
  "anyhow",
@@ -280,11 +280,11 @@ dependencies = [
 
 [[package]]
 name = "ahma_test_support"
-version = "0.8.0"
+version = "0.9.0"
 
 [[package]]
 name = "ahma_tui"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_common",
  "ahma_http_bridge",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_vault"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_worker"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_vault",
  "anyhow",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "generate_tool_schema"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ahma_mcp",
  "schemars",
@@ -6048,7 +6048,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "regex",
