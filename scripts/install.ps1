@@ -20,6 +20,7 @@
 [CmdletBinding()]
 param(
     [switch]$Verify,
+    [switch]$InsecureSkipSignature,
     [string]$Mode = ""
 )
 
@@ -33,12 +34,22 @@ if ($args -contains "--verify" -or $args -contains "-v" -or $Mode -eq "verify") 
     $shouldVerify = $true
 }
 
+$shouldSkipSignature = $InsecureSkipSignature
+if ($args -contains "--insecure-skip-signature" -or $args -contains "-insecure-skip-signature") {
+    $shouldSkipSignature = $true
+}
+
 # ── Cryptographic Helpers ─────────────────────────────────────────────────────
 function Verify-Signature {
     param (
         [string]$dataPath,
         [string]$sigPath
     )
+    
+    if ($shouldSkipSignature -or $env:AHMA_INSECURE_SKIP_SIGNATURE -eq "1" -or $env:AHMA_INSECURE_SKIP_SIGNATURE -eq "true") {
+        Write-Warning "Skipping cryptographic release signature verification!"
+        return $true
+    }
     
     try {
         $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider
@@ -131,6 +142,8 @@ if ($shouldVerify) {
         Write-Host "Downloading release manifest and signature..."
         Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsPath -UseBasicParsing
         Invoke-WebRequest -Uri $sigAsset.browser_download_url -OutFile $sigPath -UseBasicParsing
+        
+        $sumsContent = Get-Content -Path $sumsPath
         
         $isValid = Verify-Signature -dataPath $sumsPath -sigPath $sigPath
         if (-not $isValid) {
@@ -242,6 +255,8 @@ try {
     Write-Host "Downloading release manifest and signature..."
     Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $sumsPath -UseBasicParsing
     Invoke-WebRequest -Uri $sigAsset.browser_download_url -OutFile $sigPath -UseBasicParsing
+    
+    $sumsContent = Get-Content -Path $sumsPath
     
     # Verify signature
     $isValid = Verify-Signature -dataPath $sumsPath -sigPath $sigPath

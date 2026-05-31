@@ -70,6 +70,11 @@ verify_signature() {
     local sig_file="$2"
     local temp_dir="$3"
     
+    if [ "${AHMA_INSECURE_SKIP_SIGNATURE:-}" = "1" ] || [ "${AHMA_INSECURE_SKIP_SIGNATURE:-}" = "true" ]; then
+        echo "WARNING: Skipping cryptographic release signature verification!" >&2
+        return 0
+    fi
+    
     echo "$PUB_KEY_PEM" > "$temp_dir/pubkey.pem"
     
     if ! command -v openssl >/dev/null 2>&1; then

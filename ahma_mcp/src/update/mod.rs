@@ -72,11 +72,16 @@ pub struct UpdateArgs {
     /// Print planned actions without downloading or installing
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Skip release cryptographic signature verification (insecure)
+    #[arg(long)]
+    pub insecure_skip_signature: bool,
 }
 
 struct UpdateOutcome {
     binary_path: PathBuf,
     binary_changed: bool,
+    signature_verified: Option<bool>,
 }
 
 /// Entry point for `ahma update`.
@@ -104,7 +109,13 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
     }?;
 
     if outcome.binary_changed {
-        print_post_install_details(&outcome.binary_path, &install_dir, args.dry_run).await;
+        print_post_install_details(
+            &outcome.binary_path,
+            &install_dir,
+            args.dry_run,
+            outcome.signature_verified,
+        )
+        .await;
     }
     maybe_run_setup_wizard(&args, &outcome.binary_path).await
 }
@@ -114,6 +125,7 @@ async fn run_git_update(branch: &str, install_dir: &Path, dry_run: bool) -> Resu
     Ok(UpdateOutcome {
         binary_path: installed,
         binary_changed: !dry_run,
+        signature_verified: None,
     })
 }
 
@@ -123,6 +135,11 @@ async fn run_release_update(
     install_dir: &Path,
     mode: &UpdateMode,
 ) -> Result<UpdateOutcome> {
+    let insecure_skip_signature = args.insecure_skip_signature
+        || std::env::var("AHMA_INSECURE_SKIP_SIGNATURE")
+            .map(|val| val == "1" || val == "true")
+            .unwrap_or(false);
+
     let client = reqwest::Client::builder()
         .user_agent("ahma-updater")
         .build()
@@ -151,6 +168,7 @@ async fn run_release_update(
             return Ok(UpdateOutcome {
                 binary_path: target,
                 binary_changed: false,
+                signature_verified: Some(!insecure_skip_signature),
             });
         }
         println!("Upgrading ahma from {installed} to {}...", asset.version);
@@ -158,21 +176,49 @@ async fn run_release_update(
 
     println!("Installing Ahma {} for {}...", asset.version, platform.id);
     let installed =
-        install_release_asset(&client, &asset, platform, install_dir, args.dry_run).await?;
+        install_release_asset(&client, &asset, platform, install_dir, args.dry_run, insecure_skip_signature).await?;
 
     Ok(UpdateOutcome {
         binary_path: installed,
         binary_changed: !args.dry_run,
+        signature_verified: Some(!insecure_skip_signature),
     })
 }
 
-async fn print_post_install_details(installed: &Path, install_dir: &Path, dry_run: bool) {
+async fn print_post_install_details(
+    installed: &Path,
+    install_dir: &Path,
+    dry_run: bool,
+    signature_verified: Option<bool>,
+) {
     if dry_run {
         return;
     }
 
     let version = read_installed_version(installed).await;
     println!("{}", format_install_success(installed, version.as_deref()));
+
+    if let Some(verified) = signature_verified {
+        if verified {
+            println!("Authenticity verified: Release signature is valid (signed by the official private key).");
+        } else {
+            println!("WARNING: Cryptographic signature verification was bypassed.");
+        }
+    }
+
+    println!();
+    println!(
+        "Tip: If you suspect your existing local binary was compromised, you can verify it directly using:"
+    );
+    #[cfg(not(windows))]
+    println!(
+        "  curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash -s -- --verify"
+    );
+    #[cfg(windows)]
+    println!(
+        "  $Mode = \"verify\"; irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex"
+    );
+
     print_path_hint(install_dir);
     print_restart_hint();
 }
@@ -374,6 +420,7 @@ mod tests {
         assert!(!args.force);
         assert!(!args.install_hooks);
         assert!(!args.dry_run);
+        assert!(!args.insecure_skip_signature);
     }
 
     #[test]
