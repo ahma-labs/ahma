@@ -38,7 +38,17 @@ pub async fn run_list_tools_mode(config: &AppConfig) -> Result<()> {
             .await?
     } else {
         return Err(anyhow!(
-            "No connection method specified for tool list. Use --http, --mcp-config with --server, or provide command after --"
+            "No connection method specified for tool list.\n\n\
+             Suggestions:\n\
+             1. To list locally configured tools in this project, use:\n\
+                ahma tool info\n\n\
+             2. To query a running HTTP MCP server:\n\
+                ahma tool list --http http://localhost:3000\n\n\
+             3. To query a stdio MCP server command directly:\n\
+                ahma tool list -- <command> [args...]\n\n\
+             4. To query an MCP server defined in a config file:\n\
+                ahma tool list --mcp-config mcp.json --server <name>\n\n\
+             For more help, run: ahma tool list --help"
         ));
     };
 
