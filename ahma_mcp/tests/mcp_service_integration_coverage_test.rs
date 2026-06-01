@@ -376,7 +376,9 @@ async fn client_has_tool_prefix(
     prefix: &str,
 ) -> Result<bool> {
     let tools: Vec<rmcp::model::Tool> = client.list_all_tools().await?;
-    Ok(tools.iter().any(|t| (t.name.as_ref() as &str).starts_with(prefix)))
+    Ok(tools
+        .iter()
+        .any(|t| (t.name.as_ref() as &str).starts_with(prefix)))
 }
 
 // ============================================================================

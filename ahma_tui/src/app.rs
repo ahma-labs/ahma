@@ -621,9 +621,9 @@ fn backspace_chat_input(state: &mut crate::state::AppState) {
 
 #[cfg(feature = "tui")]
 fn submit_chat_input(state: &mut crate::state::AppState) {
-    use crate::llm_bridge::{McpChatConfig, spawn_chat_task};
+    use crate::llm_bridge::spawn_chat_task;
     use crate::state::ChatEntry;
-    use ahma_llm_monitor::{ChatMessage, LlmClient};
+    use ahma_llm_monitor::LlmClient;
 
     let text = state.chat_input_text().trim().to_string();
     if text.is_empty() {
@@ -633,21 +633,40 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
 
     let (base_url, model) = parse_llm_selection(state);
     if base_url.is_empty() {
-        state.chat.push(ChatEntry::Assistant {
-            content: "No LLM configured. Use /provider to select one.".to_string(),
-            streaming: false,
-        });
+        push_assistant_message(state, "No LLM configured. Use /provider to select one.");
         return;
     }
 
-    state.chat.push(ChatEntry::User(text.clone()));
+    state.chat.push(ChatEntry::User(text));
     state.chat.push(ChatEntry::Assistant {
         content: String::new(),
         streaming: true,
     });
     state.chat_scroll = 0;
 
-    let messages: Vec<ChatMessage> = state
+    let Some(tx) = &state.bridge_tx else {
+        return;
+    };
+
+    let client = LlmClient::new(base_url, model, None);
+    let system = state.mcp_enabled.then(|| {
+        "Use ahma tools when they would materially improve the answer. Prefer direct answers when no tool is needed.".to_string()
+    });
+    spawn_chat_task(
+        client,
+        collect_chat_history(state),
+        system,
+        optional_mcp_chat_config(state),
+        tx.clone(),
+    );
+}
+
+#[cfg(feature = "tui")]
+fn collect_chat_history(state: &crate::state::AppState) -> Vec<ahma_llm_monitor::ChatMessage> {
+    use crate::state::ChatEntry;
+    use ahma_llm_monitor::ChatMessage;
+
+    state
         .chat
         .entries()
         .iter()
@@ -659,20 +678,22 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
             } => Some(ChatMessage::assistant(content.clone())),
             _ => None,
         })
-        .collect();
+        .collect()
+}
 
-    if let Some(tx) = &state.bridge_tx {
-        let client = LlmClient::new(base_url, model, None);
-        let system = state.mcp_enabled.then(|| {
-            "Use ahma tools when they would materially improve the answer. Prefer direct answers when no tool is needed.".to_string()
-        });
-        let mcp =
-            (state.mcp_enabled && !state.mcp_http_base_url.is_empty()).then(|| McpChatConfig {
-                base_url: state.mcp_http_base_url.clone(),
-                workspace_root: std::path::PathBuf::from(&state.workspace),
-                session_id: state.session_id.clone(),
-            });
-        spawn_chat_task(client, messages, system, mcp, tx.clone());
+#[cfg(feature = "tui")]
+fn optional_mcp_chat_config(
+    state: &crate::state::AppState,
+) -> Option<crate::llm_bridge::McpChatConfig> {
+    (state.mcp_enabled && !state.mcp_http_base_url.is_empty()).then(|| mcp_chat_config(state))
+}
+
+#[cfg(feature = "tui")]
+fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChatConfig {
+    crate::llm_bridge::McpChatConfig {
+        base_url: state.mcp_http_base_url.clone(),
+        workspace_root: std::path::PathBuf::from(&state.workspace),
+        session_id: state.session_id.clone(),
     }
 }
 
@@ -960,17 +981,20 @@ fn handle_tools_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
         return false;
     }
 
-    let message = if state.tools_list.is_empty() {
-        "No tools discovered yet.".to_string()
-    } else {
-        let mut content = format!("{} tool(s) available:\n", state.tools_list.len());
-        for tool in &state.tools_list {
-            content.push_str(&format!("- {tool}\n"));
-        }
-        content.trim_end().to_string()
-    };
-    push_assistant_message(state, message);
+    push_assistant_message(state, format_tools_list_message(&state.tools_list));
     true
+}
+
+#[cfg(feature = "tui")]
+fn format_tools_list_message(tools: &[String]) -> String {
+    if tools.is_empty() {
+        return "No tools discovered yet.".to_string();
+    }
+    let mut content = format!("{} tool(s) available:\n", tools.len());
+    for tool in tools {
+        content.push_str(&format!("- {tool}\n"));
+    }
+    content.trim_end().to_string()
 }
 
 #[cfg(feature = "tui")]
@@ -1070,36 +1094,34 @@ fn run_nav_tool(rest: &str, state: &mut crate::state::AppState) {
         }
     };
 
+    if let Err(message) = validate_nav_tool_run(tool, state) {
+        push_assistant_message(state, message);
+        return;
+    }
+
     let Some(tx) = &state.bridge_tx else {
         return;
     };
 
-    if state.mcp_http_base_url.is_empty() {
-        push_assistant_message(
-            state,
-            "Cannot run tools because the ahma MCP bridge URL is unavailable.",
-        );
-        return;
-    }
-
-    if !state.tools_list.is_empty() && !state.tools_list.iter().any(|known| known == tool) {
-        push_assistant_message(
-            state,
-            format!("Unknown tool `{tool}`. Use /tools to inspect the current tool list."),
-        );
-        return;
-    }
-
     crate::llm_bridge::spawn_tool_call_task(
         tool.to_string(),
         arguments,
-        crate::llm_bridge::McpChatConfig {
-            base_url: state.mcp_http_base_url.clone(),
-            workspace_root: std::path::PathBuf::from(&state.workspace),
-            session_id: state.session_id.clone(),
-        },
+        mcp_chat_config(state),
         tx.clone(),
     );
+}
+
+#[cfg(feature = "tui")]
+fn validate_nav_tool_run(tool: &str, state: &crate::state::AppState) -> Result<(), String> {
+    if state.mcp_http_base_url.is_empty() {
+        return Err("Cannot run tools because the ahma MCP bridge URL is unavailable.".to_string());
+    }
+    if !state.tools_list.is_empty() && !state.tools_list.iter().any(|known| known == tool) {
+        return Err(format!(
+            "Unknown tool `{tool}`. Use /tools to inspect the current tool list."
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "tui")]
@@ -1147,22 +1169,30 @@ fn parse_llm_selection(state: &crate::state::AppState) -> (String, String) {
     if state.llm_label == "no LLM" || state.llm_label.is_empty() {
         return (String::new(), String::new());
     }
+
     let model = state.selected_model();
     if let Some(base_url) = &state.current_provider_url {
         return (base_url.clone(), model);
     }
+
     let provider_name = provider_label(&state.llm_label);
-    if provider_name.starts_with("http") {
-        return (provider_name, model);
-    }
-    let base_url = if provider_name.to_lowercase().contains("ollama") {
-        "http://localhost:11434/v1".to_string()
-    } else if provider_name.to_lowercase().contains("llama") {
-        "http://localhost:8080/v1".to_string()
-    } else {
+    let base_url = if provider_name.starts_with("http") {
         provider_name
+    } else {
+        default_provider_base_url(&provider_name)
     };
     (base_url, model)
+}
+
+fn default_provider_base_url(provider_name: &str) -> String {
+    let lower = provider_name.to_lowercase();
+    if lower.contains("ollama") {
+        "http://localhost:11434/v1".to_string()
+    } else if lower.contains("llama") {
+        "http://localhost:8080/v1".to_string()
+    } else {
+        provider_name.to_string()
+    }
 }
 
 fn provider_label(label: &str) -> String {
@@ -1209,30 +1239,48 @@ fn handle_providers_discovered(
     providers: Vec<ahma_llm_monitor::LocalProvider>,
     state: &mut crate::state::AppState,
 ) {
-    let first = providers.first().cloned();
     state.available_providers = providers
         .iter()
         .map(|p| (p.name.clone(), p.base_url.clone()))
         .collect();
 
     if state.llm_label == "no LLM" {
-        if let Some(p) = first {
-            let model = p.models.first().cloned().unwrap_or_default();
-            state.available_models = p.models;
-            state.current_provider_url = Some(p.base_url.clone());
-            state.llm_label = format!("{} / {}", p.name, model);
-            save_session(state);
+        if let Some(provider) = providers.first() {
+            auto_select_first_provider(state, provider);
         }
-    } else if let Some(current_url) = &state.current_provider_url
-        && let Some(provider) = providers
-            .iter()
-            .find(|provider| &provider.base_url == current_url)
-    {
-        let model = state.selected_model();
-        state.available_models = provider.models.clone();
-        if !model.is_empty() {
-            state.llm_label = format!("{} / {}", provider.name, model);
-        }
+        return;
+    }
+
+    if let Some(current_url) = state.current_provider_url.clone() {
+        refresh_current_provider_models(state, &providers, &current_url);
+    }
+}
+
+#[cfg(feature = "tui")]
+fn auto_select_first_provider(
+    state: &mut crate::state::AppState,
+    provider: &ahma_llm_monitor::LocalProvider,
+) {
+    let model = provider.models.first().cloned().unwrap_or_default();
+    state.available_models = provider.models.clone();
+    state.current_provider_url = Some(provider.base_url.clone());
+    state.llm_label = format!("{} / {}", provider.name, model);
+    save_session(state);
+}
+
+#[cfg(feature = "tui")]
+fn refresh_current_provider_models(
+    state: &mut crate::state::AppState,
+    providers: &[ahma_llm_monitor::LocalProvider],
+    current_url: &str,
+) {
+    let Some(provider) = providers.iter().find(|p| p.base_url == current_url) else {
+        return;
+    };
+    state.available_models = provider.models.clone();
+    let model = state.selected_model();
+    if !model.is_empty() {
+        state.llm_label = format!("{} / {}", provider.name, model);
     }
 }
 

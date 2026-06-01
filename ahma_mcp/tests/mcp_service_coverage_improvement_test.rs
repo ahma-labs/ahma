@@ -47,7 +47,9 @@ async fn test_schema_generation_normalizes_option_types() {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
     let tools = mcp.client.list_all_tools().await.unwrap();
-    let test_tool = tools.iter().find(|t| t.name.as_ref() as &str == "test_types");
+    let test_tool = tools
+        .iter()
+        .find(|t| t.name.as_ref() as &str == "test_types");
     assert!(test_tool.is_some(), "test_types tool should be registered");
 
     let tool = test_tool.unwrap();
@@ -148,7 +150,9 @@ async fn test_schema_generation_array_with_items() {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
     let tools = mcp.client.list_all_tools().await.unwrap();
-    let test_tool = tools.iter().find(|t| t.name.as_ref() as &str == "test_arrays");
+    let test_tool = tools
+        .iter()
+        .find(|t| t.name.as_ref() as &str == "test_arrays");
     assert!(test_tool.is_some(), "test_arrays tool should be registered");
 
     let tool = test_tool.unwrap();
@@ -227,7 +231,9 @@ async fn test_schema_generation_positional_args() {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
     let tools = mcp.client.list_all_tools().await.unwrap();
-    let test_tool = tools.iter().find(|t| t.name.as_ref() as &str == "test_positional");
+    let test_tool = tools
+        .iter()
+        .find(|t| t.name.as_ref() as &str == "test_positional");
     assert!(
         test_tool.is_some(),
         "test_positional tool should be registered"
@@ -508,8 +514,12 @@ async fn test_disabled_tools_not_in_list() {
 
     let tools = mcp.client.list_all_tools().await.unwrap();
 
-    let disabled = tools.iter().find(|t| t.name.as_ref() as &str == "disabled_tool");
-    let enabled = tools.iter().find(|t| t.name.as_ref() as &str == "enabled_tool");
+    let disabled = tools
+        .iter()
+        .find(|t| t.name.as_ref() as &str == "disabled_tool");
+    let enabled = tools
+        .iter()
+        .find(|t| t.name.as_ref() as &str == "enabled_tool");
 
     assert!(disabled.is_none(), "Disabled tool should not be in list");
     assert!(enabled.is_some(), "Enabled tool should be in list");
@@ -740,7 +750,9 @@ async fn test_required_options_in_schema() {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
     let tools = mcp.client.list_all_tools().await.unwrap();
-    let test_tool = tools.iter().find(|t| t.name.as_ref() as &str == "test_required");
+    let test_tool = tools
+        .iter()
+        .find(|t| t.name.as_ref() as &str == "test_required");
     assert!(test_tool.is_some());
 
     let tool = test_tool.unwrap();

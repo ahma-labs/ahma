@@ -191,6 +191,15 @@ fn perform_normal_bump(root: &Path, cargo_toml_path: &Path, cur_ver: &str, new_v
     println!("  git commit -m \"chore(release): bump version to {new_ver}\"");
 }
 
+/// Re-apply the source file's trailing newline after line-oriented edits.
+fn restore_trailing_newline(edited: &str, original: &str) -> String {
+    if original.ends_with('\n') {
+        format!("{edited}\n")
+    } else {
+        edited.to_string()
+    }
+}
+
 /// Replace the first occurrence of `old` with `new` within lines that start with `prefix`.
 /// Preserves the original file's trailing newline.
 fn replace_anchored_line(path: &Path, prefix: &str, old: &str, new: &str, label: &str) {
@@ -198,8 +207,26 @@ fn replace_anchored_line(path: &Path, prefix: &str, old: &str, new: &str, label:
         eprintln!("ERROR: Failed to read {}: {e}", path.display());
         process::exit(1);
     });
+    let (new_content, replaced) = transform_first_anchored_match(&content, prefix, old, new);
+    if !replaced {
+        eprintln!("WARNING: No line starting with '{prefix}' containing '{old}' found in {label}");
+        return;
+    }
+    fs::write(path, new_content).unwrap_or_else(|e| {
+        eprintln!("ERROR: Failed to write {}: {e}", path.display());
+        process::exit(1);
+    });
+    println!("  OK {label}");
+}
+
+fn transform_first_anchored_match(
+    content: &str,
+    prefix: &str,
+    old: &str,
+    new: &str,
+) -> (String, bool) {
     let mut replaced = false;
-    let new_content: String = content
+    let body: String = content
         .lines()
         .map(|line| {
             if !replaced && line.starts_with(prefix) && line.contains(old) {
@@ -211,21 +238,7 @@ fn replace_anchored_line(path: &Path, prefix: &str, old: &str, new: &str, label:
         })
         .collect::<Vec<_>>()
         .join("\n");
-    // Preserve trailing newline
-    let new_content = if content.ends_with('\n') {
-        new_content + "\n"
-    } else {
-        new_content
-    };
-    if !replaced {
-        eprintln!("WARNING: No line starting with '{prefix}' containing '{old}' found in {label}");
-        return;
-    }
-    fs::write(path, new_content).unwrap_or_else(|e| {
-        eprintln!("ERROR: Failed to write {}: {e}", path.display());
-        process::exit(1);
-    });
-    println!("  OK {label}");
+    (restore_trailing_newline(&body, content), replaced)
 }
 
 /// Replace the first exact substring occurrence of `old` with `new`.
@@ -297,28 +310,7 @@ fn bump_android_version(android_dir: Option<&str>) {
     }
 
     let cargo_ver = get_cargo_version(&root);
-
-    // Rebuild properties, updating VERSION_CODE and VERSION_NAME lines in-place
-    // (preserves comments and ordering).
-    let new_content: String = content
-        .lines()
-        .map(|line| {
-            if line.starts_with("VERSION_CODE=") {
-                format!("VERSION_CODE={new_code}")
-            } else if line.starts_with("VERSION_NAME=") {
-                format!("VERSION_NAME={cargo_ver}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    // Preserve trailing newline
-    let new_content = if content.ends_with('\n') {
-        new_content + "\n"
-    } else {
-        new_content
-    };
+    let new_content = rewrite_android_version_properties(&content, new_code, &cargo_ver);
 
     fs::write(&props_path, new_content).unwrap_or_else(|e| {
         eprintln!("ERROR: Failed to write {}: {e}", props_path.display());
@@ -338,6 +330,23 @@ fn bump_android_version(android_dir: Option<&str>) {
         "  git add {} && git commit -m \"chore(android): bump Play versionCode to {new_code}\"",
         props_path.display()
     );
+}
+
+fn rewrite_android_version_properties(content: &str, new_code: u64, cargo_ver: &str) -> String {
+    let body: String = content
+        .lines()
+        .map(|line| {
+            if line.starts_with("VERSION_CODE=") {
+                format!("VERSION_CODE={new_code}")
+            } else if line.starts_with("VERSION_NAME=") {
+                format!("VERSION_NAME={cargo_ver}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    restore_trailing_newline(&body, content)
 }
 
 fn parse_version_properties(props_path: &Path, content: &str) -> u64 {
@@ -567,70 +576,78 @@ fn print_summary_table(rows: &[Row]) {
     }
 }
 
+fn candidate_row(
+    name: &str,
+    old_ver: &str,
+    new_ver: &str,
+    age_days: Option<i64>,
+    status: impl Into<String>,
+) -> Row {
+    Row {
+        name: name.to_string(),
+        old_ver: old_ver.to_string(),
+        new_ver: new_ver.to_string(),
+        age_days,
+        status: status.into(),
+    }
+}
+
+fn evaluate_one_candidate(
+    name: &str,
+    old_ver: &str,
+    new_ver: &str,
+    vulnerable_pairs: &std::collections::HashSet<(String, String)>,
+    opts: &SafeUpdateOpts,
+) -> (Row, Option<(String, String)>) {
+    if is_prerelease(new_ver) {
+        return (
+            candidate_row(name, old_ver, new_ver, None, "skipped:pre-release"),
+            None,
+        );
+    }
+    if is_vulnerable(name, new_ver, vulnerable_pairs) {
+        return (
+            candidate_row(name, old_ver, new_ver, None, "skipped:advisory"),
+            None,
+        );
+    }
+    match fetch_crate_publish_age_days(name, new_ver) {
+        Err(e) => {
+            eprintln!("  WARN: could not fetch age for {name}@{new_ver}: {e}");
+            (
+                candidate_row(name, old_ver, new_ver, None, "skipped:age-fetch-failed"),
+                None,
+            )
+        }
+        Ok(age) if age < opts.min_age_days => (
+            candidate_row(
+                name,
+                old_ver,
+                new_ver,
+                Some(age),
+                format!("skipped:too-new ({age}d)"),
+            ),
+            None,
+        ),
+        Ok(age) => (
+            candidate_row(name, old_ver, new_ver, Some(age), "upgrade"),
+            Some((name.to_string(), new_ver.to_string())),
+        ),
+    }
+}
+
 fn evaluate_candidates(
     candidates: &[(String, String, String)],
     vulnerable_pairs: &std::collections::HashSet<(String, String)>,
     opts: &SafeUpdateOpts,
 ) -> (Vec<Row>, Vec<(String, String)>) {
-    let mut rows: Vec<Row> = Vec::new();
-    let mut to_apply: Vec<(String, String)> = Vec::new();
-
+    let mut rows = Vec::with_capacity(candidates.len());
+    let mut to_apply = Vec::new();
     for (name, old_ver, new_ver) in candidates {
-        // Yanked / pre-release guard (quick local check before hitting the network)
-        if is_prerelease(new_ver) {
-            rows.push(Row {
-                name: name.clone(),
-                old_ver: old_ver.clone(),
-                new_ver: new_ver.clone(),
-                age_days: None,
-                status: "skipped:pre-release".into(),
-            });
-            continue;
-        }
-
-        // Advisory check
-        if is_vulnerable(name, new_ver, vulnerable_pairs) {
-            rows.push(Row {
-                name: name.clone(),
-                old_ver: old_ver.clone(),
-                new_ver: new_ver.clone(),
-                age_days: None,
-                status: "skipped:advisory".into(),
-            });
-            continue;
-        }
-
-        // Age check (network call)
-        match fetch_crate_publish_age_days(name, new_ver) {
-            Err(e) => {
-                eprintln!("  WARN: could not fetch age for {name}@{new_ver}: {e}");
-                rows.push(Row {
-                    name: name.clone(),
-                    old_ver: old_ver.clone(),
-                    new_ver: new_ver.clone(),
-                    age_days: None,
-                    status: "skipped:age-fetch-failed".into(),
-                });
-            }
-            Ok(age) if age < opts.min_age_days => {
-                rows.push(Row {
-                    name: name.clone(),
-                    old_ver: old_ver.clone(),
-                    new_ver: new_ver.clone(),
-                    age_days: Some(age),
-                    status: format!("skipped:too-new ({age}d)"),
-                });
-            }
-            Ok(age) => {
-                rows.push(Row {
-                    name: name.clone(),
-                    old_ver: old_ver.clone(),
-                    new_ver: new_ver.clone(),
-                    age_days: Some(age),
-                    status: "upgrade".into(),
-                });
-                to_apply.push((name.clone(), new_ver.clone()));
-            }
+        let (row, apply) = evaluate_one_candidate(name, old_ver, new_ver, vulnerable_pairs, opts);
+        rows.push(row);
+        if let Some(pair) = apply {
+            to_apply.push(pair);
         }
     }
     (rows, to_apply)
@@ -666,9 +683,11 @@ fn check_prereqs() {
 /// Run `cargo upgrade --dry-run` (cargo-edit ≥0.12) and parse its output into
 /// a list of `(name, old_version, new_version)` triples.
 ///
-/// The output format from cargo-edit looks like:
-///   name  old_req -> new_req   (current: old_ver, latest: new_ver)
-/// We parse both the simplified "name old -> new" form and the verbose form.
+/// Supports cargo-edit output formats:
+/// - Table (≥0.13): `name old_req compatible latest new_req`
+/// - Legacy arrow: `serde 1.0.210 -> 1.0.215` or `Upgrading serde v1.0.210 -> v1.0.215`
+///
+/// For safe updates we target the **compatible** column (not `new_req` when it is a major bump).
 fn proposed_upgrades(root: &Path, opts: &SafeUpdateOpts) -> Vec<(String, String, String)> {
     let mut cmd = std::process::Command::new("cargo");
     cmd.args([
@@ -692,40 +711,88 @@ fn proposed_upgrades(root: &Path, opts: &SafeUpdateOpts) -> Vec<(String, String,
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
 
-    // cargo-edit ≥0.12 prints lines like:
-    //   Upgrading serde v1.0.210 -> v1.0.215
-    // Older versions print:
-    //   serde 1.0.210 -> 1.0.215
-    // We handle both with a flexible regex.
-    let re = regex::Regex::new(r"(?i)(?:Upgrading\s+)?([a-zA-Z0-9_\-]+)\s+v?(\S+)\s+->\s+v?(\S+)")
-        .expect("static regex");
+    let arrow_re =
+        regex::Regex::new(r"(?i)(?:Upgrading\s+)?([a-zA-Z0-9_\-]+)\s+v?(\S+)\s+->\s+v?(\S+)")
+            .expect("static arrow regex");
+    let table_re = regex::Regex::new(r"^(.+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*$")
+        .expect("static table regex");
 
-    let mut results: Vec<(String, String, String)> = Vec::new();
-    for line in combined.lines() {
-        if let Some(cap) = re.captures(line) {
-            let name = cap[1].to_string();
-            let old_ver = cap[2].trim_start_matches('v').to_string();
-            let new_ver = cap[3].trim_start_matches('v').to_string();
+    let mut seen = std::collections::HashSet::new();
+    combined
+        .lines()
+        .filter_map(|line| {
+            upgrade_triple_from_table_line(line, &table_re)
+                .or_else(|| upgrade_triple_from_arrow_line(line, &arrow_re))
+        })
+        .filter(|(name, _, _)| passes_upgrade_filters(name, opts))
+        .filter(|(name, _, _)| seen.insert(name.clone()))
+        .collect()
+}
 
-            // Apply include/exclude filters
-            if let Some(ref inc) = opts.include
-                && !inc.contains(&name)
-            {
-                continue;
-            }
-            if let Some(ref exc) = opts.exclude
-                && exc.contains(&name)
-            {
-                continue;
-            }
+fn should_skip_cargo_upgrade_line(line: &str) -> bool {
+    line.starts_with("Checking ")
+        || line.starts_with("note:")
+        || line.starts_with("warning:")
+        || line.starts_with("error:")
+        || line.starts_with("  git:")
+        || line.starts_with("  incompatible:")
+        || line.starts_with("  latest:")
+        || line.starts_with("  local:")
+        || line.starts_with("  pinned:")
+        || line == "name"
+        || line.starts_with("====")
+        || line.contains("old req")
+}
 
-            // Skip if the versions are the same (no actual upgrade)
-            if old_ver != new_ver {
-                results.push((name, old_ver, new_ver));
-            }
-        }
+/// Strip cargo-edit's `rename (crates.io-name)` display suffix for `-p` flags.
+fn normalize_upgrade_package_name(raw: &str) -> String {
+    raw.split(" (").next().unwrap_or(raw).trim().to_string()
+}
+
+fn upgrade_triple_from_table_line(
+    line: &str,
+    re: &regex::Regex,
+) -> Option<(String, String, String)> {
+    let line = line.trim();
+    if line.is_empty() || should_skip_cargo_upgrade_line(line) {
+        return None;
     }
-    results
+    let cap = re.captures(line)?;
+    let name = normalize_upgrade_package_name(cap[1].trim());
+    let old_ver = cap[2].trim().to_string();
+    let compatible = cap[3].trim().to_string();
+    if old_ver == compatible {
+        return None;
+    }
+    Some((name, old_ver, compatible))
+}
+
+fn passes_upgrade_filters(name: &str, opts: &SafeUpdateOpts) -> bool {
+    if let Some(ref inc) = opts.include
+        && !inc.iter().any(|c| c == name)
+    {
+        return false;
+    }
+    if let Some(ref exc) = opts.exclude
+        && exc.iter().any(|c| c == name)
+    {
+        return false;
+    }
+    true
+}
+
+fn upgrade_triple_from_arrow_line(
+    line: &str,
+    re: &regex::Regex,
+) -> Option<(String, String, String)> {
+    let cap = re.captures(line)?;
+    let name = cap[1].to_string();
+    let old_ver = cap[2].trim_start_matches('v').to_string();
+    let new_ver = cap[3].trim_start_matches('v').to_string();
+    if old_ver == new_ver {
+        return None;
+    }
+    Some((name, old_ver, new_ver))
 }
 
 /// Return `true` if the semver string has a pre-release component (e.g. `1.0.0-alpha.1`).
@@ -750,25 +817,23 @@ fn parse_deny_advisories(root: &Path) -> std::collections::HashSet<(String, Stri
 
     // cargo-deny exits non-zero when advisories are found; that's expected.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut pairs: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    stdout
+        .lines()
+        .filter_map(advisory_pair_from_ndjson_line)
+        .collect()
+}
 
-    // Parse NDJSON: each line is a JSON object.  We look for objects with
-    // `"type": "advisory"` and extract `krate.name` + `krate.version`.
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
-            if kind == "advisory" || kind == "diagnostic" {
-                if let Some((n, ver_str)) = extract_advisory_crate_ver(&v) {
-                    pairs.insert((n, ver_str));
-                }
-            }
-        }
+fn advisory_pair_from_ndjson_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
     }
-    pairs
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let kind = v.get("type").and_then(|t| t.as_str())?;
+    if kind != "advisory" && kind != "diagnostic" {
+        return None;
+    }
+    extract_advisory_crate_ver(&v)
 }
 
 fn extract_advisory_crate_ver(v: &serde_json::Value) -> Option<(String, String)> {

@@ -29,52 +29,144 @@ fn prompt_transport() -> &'static str {
     }
 }
 
-fn configure_mcp_platform(
-    idx: usize,
-    transport: &str,
-    servers_entry: &serde_json::Value,
-    ant_servers_entry: &serde_json::Value,
-    home: &Path,
-) -> Result<Option<&'static str>> {
-    match idx {
-        0 => {
-            // VS Code
-            if let Some(path) = vscode_mcp_path() {
-                merge_mcp_json(&path, "servers", servers_entry.clone())?;
-                return Ok(Some("VS Code"));
-            }
+/// A thing the wizard can set up. Listed in alphabetical order (by label) for
+/// uniform, simple presentation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupAction {
+    Skills,
+    Mcp,
+    Hooks,
+    Tls,
+}
+
+const SETUP_ACTIONS: &[SetupAction] = &[
+    SetupAction::Skills, // "Agent skills"
+    SetupAction::Mcp,    // "MCP servers"
+    SetupAction::Hooks,  // "Terminal hooks"
+    SetupAction::Tls,    // "TLS certificates"
+];
+
+impl SetupAction {
+    fn label(self) -> &'static str {
+        match self {
+            SetupAction::Skills => "Agent skills",
+            SetupAction::Mcp => "MCP servers",
+            SetupAction::Hooks => "Terminal hooks",
+            SetupAction::Tls => "TLS certificates",
         }
-        1 => {
-            // Claude Code
-            let path = home.join(".claude.json");
-            merge_mcp_json(&path, "mcpServers", servers_entry.clone())?;
-            return Ok(Some("Claude Code"));
-        }
-        2 => {
-            // Cursor
-            let path = home.join(".cursor").join("mcp.json");
-            merge_mcp_json(&path, "mcpServers", servers_entry.clone())?;
-            return Ok(Some("Cursor"));
-        }
-        3 => {
-            // Antigravity
-            let path = home.join(".gemini").join("config").join("mcp_config.json");
-            merge_mcp_json(&path, "mcpServers", ant_servers_entry.clone())?;
-            return Ok(Some("Antigravity"));
-        }
-        4 => {
-            // Codex CLI
-            let path = home.join(".codex").join("config.toml");
-            let toml_val = build_codex_toml_value(transport);
-            merge_codex_toml(&path, toml_val)?;
-            return Ok(Some("Codex CLI"));
-        }
-        _ => {}
     }
-    Ok(None)
+
+    /// Whether this action is applied per-platform (and therefore needs the
+    /// "which platforms?" question). TLS and skills are global.
+    fn is_platform_specific(self) -> bool {
+        matches!(self, SetupAction::Mcp | SetupAction::Hooks)
+    }
+}
+
+/// An AI tool the wizard can target. Listed in alphabetical order (by label)
+/// for uniform, simple presentation. Not every platform supports every action:
+/// GitHub Copilot has no MCP config target here, and VS Code is configured via
+/// MCP only (no terminal hook wrapper).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    Antigravity,
+    ClaudeCode,
+    Codex,
+    Cursor,
+    Copilot,
+    VsCode,
+}
+
+const PLATFORMS: &[Platform] = &[
+    Platform::Antigravity,
+    Platform::ClaudeCode,
+    Platform::Codex,
+    Platform::Cursor,
+    Platform::Copilot,
+    Platform::VsCode,
+];
+
+impl Platform {
+    fn label(self) -> &'static str {
+        match self {
+            Platform::Antigravity => "Antigravity",
+            Platform::ClaudeCode => "Claude Code",
+            Platform::Codex => "Codex",
+            Platform::Cursor => "Cursor",
+            Platform::Copilot => "GitHub Copilot",
+            Platform::VsCode => "VS Code",
+        }
+    }
+
+    fn supports_mcp(self) -> bool {
+        !matches!(self, Platform::Copilot)
+    }
+
+    fn supports_hooks(self) -> bool {
+        !matches!(self, Platform::VsCode)
+    }
+
+    fn hook_platform(self) -> Option<HookPlatform> {
+        match self {
+            Platform::Antigravity => Some(HookPlatform::Antigravity),
+            Platform::ClaudeCode => Some(HookPlatform::Claude),
+            Platform::Codex => Some(HookPlatform::Codex),
+            Platform::Cursor => Some(HookPlatform::Cursor),
+            Platform::Copilot => Some(HookPlatform::Copilot),
+            Platform::VsCode => None,
+        }
+    }
+
+    /// Apply MCP server configuration for this platform. Returns the display
+    /// name on success, or `None` if there was nothing to configure.
+    fn configure_mcp(
+        self,
+        transport: &str,
+        servers_entry: &serde_json::Value,
+        ant_servers_entry: &serde_json::Value,
+        home: &Path,
+    ) -> Result<Option<&'static str>> {
+        match self {
+            Platform::VsCode => {
+                if let Some(path) = vscode_mcp_path() {
+                    merge_mcp_json(&path, "servers", servers_entry.clone())?;
+                    return Ok(Some("VS Code"));
+                }
+            }
+            Platform::ClaudeCode => {
+                let path = home.join(".claude.json");
+                merge_mcp_json(&path, "mcpServers", servers_entry.clone())?;
+                return Ok(Some("Claude Code"));
+            }
+            Platform::Cursor => {
+                let path = home.join(".cursor").join("mcp.json");
+                merge_mcp_json(&path, "mcpServers", servers_entry.clone())?;
+                return Ok(Some("Cursor"));
+            }
+            Platform::Antigravity => {
+                let path = home.join(".gemini").join("config").join("mcp_config.json");
+                merge_mcp_json(&path, "mcpServers", ant_servers_entry.clone())?;
+                return Ok(Some("Antigravity"));
+            }
+            Platform::Codex => {
+                let path = home.join(".codex").join("config.toml");
+                let toml_val = build_codex_toml_value(transport);
+                merge_codex_toml(&path, toml_val)?;
+                return Ok(Some("Codex CLI"));
+            }
+            Platform::Copilot => {}
+        }
+        Ok(None)
+    }
 }
 
 /// Runs the setup wizard.
+///
+/// Interactively this asks just two questions: **what** to set up (actions),
+/// then **where** to apply it (platforms). Only per-platform actions (MCP
+/// servers, terminal hooks) trigger the platform question; TLS and skills are
+/// global. When MCP is selected, the connection transport is requested as a
+/// follow-up detail of that action.
 pub async fn run(args: SetupArgs) -> Result<()> {
     let interactive = !args.auto && io::stdin().is_terminal() && io::stdout().is_terminal();
 
@@ -85,65 +177,40 @@ pub async fn run(args: SetupArgs) -> Result<()> {
         println!();
     }
 
-    // 1. Configure MCP Servers
-    if !args.hooks && !args.skills && !args.tls {
-        let configure_mcp = if interactive {
-            prompt_yes_no(
-                "Configure ahma as a global MCP server for your AI tools?",
-                true,
-            )
-        } else {
-            true
-        };
-
-        if configure_mcp {
-            setup_mcp_config(interactive).await?;
+    // Question 1: which actions to perform.
+    let actions = select_actions(&args, interactive);
+    if actions.is_empty() {
+        if interactive {
+            println!("Nothing selected — exiting without changes.\n");
         }
+        return Ok(());
     }
 
-    // 2. Configure Terminal Hooks
-    if !args.mcp && !args.skills && !args.tls {
-        let configure_hooks = if interactive {
-            prompt_yes_no(
-                "Install user-scoped terminal hooks for Cursor, Claude Code, Codex, and GitHub Copilot?",
-                false,
-            )
-        } else {
-            true
-        };
+    // Question 2: which platforms to apply the per-platform actions to.
+    let platforms = if actions.iter().any(|a| a.is_platform_specific()) {
+        select_platforms(&actions, interactive)
+    } else {
+        Vec::new()
+    };
 
-        if configure_hooks {
-            setup_terminal_hooks(interactive).await?;
-        }
+    // The MCP transport is a required detail of the MCP action only.
+    let transport = if actions.contains(&SetupAction::Mcp) && interactive {
+        prompt_transport()
+    } else {
+        "stdio"
+    };
+
+    if actions.contains(&SetupAction::Mcp) {
+        setup_mcp_config(&platforms, transport, interactive).await?;
     }
-
-    // 3. Configure TLS Certificates
-    if !args.mcp && !args.hooks && !args.skills {
-        let configure_tls = if interactive {
-            prompt_yes_no(
-                "Initialize local TLS certificates for QUIC/HTTP3 transport?",
-                false,
-            )
-        } else {
-            true
-        };
-
-        if configure_tls {
-            setup_tls()?;
-        }
+    if actions.contains(&SetupAction::Hooks) {
+        setup_terminal_hooks(&platforms, interactive).await?;
     }
-
-    // 4. Configure Agent Skills
-    if !args.mcp && !args.hooks && !args.tls {
-        let configure_skills = if interactive {
-            prompt_yes_no("Install Ahma agent skills to ~/.agents/skills/?", true)
-        } else {
-            true
-        };
-
-        if configure_skills {
-            setup_agent_skills(interactive).await?;
-        }
+    if actions.contains(&SetupAction::Skills) {
+        setup_agent_skills(interactive).await?;
+    }
+    if actions.contains(&SetupAction::Tls) {
+        setup_tls()?;
     }
 
     if interactive {
@@ -156,19 +223,65 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     Ok(())
 }
 
-fn prompt_yes_no(question: &str, default_yes: bool) -> bool {
-    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
-    print!("{} {}: ", question, suffix);
-    let _ = io::stdout().flush();
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return default_yes;
+/// Question 1: determine which actions to run.
+///
+/// Explicit `--mcp`/`--hooks`/`--skills`/`--tls` flags select a fixed subset
+/// (for scripting). Otherwise the user is asked interactively; `--auto` and
+/// non-interactive sessions default to all actions.
+fn select_actions(args: &SetupArgs, interactive: bool) -> Vec<SetupAction> {
+    let mut flagged = Vec::new();
+    if args.skills {
+        flagged.push(SetupAction::Skills);
     }
-    let trimmed = input.trim().to_lowercase();
-    if trimmed.is_empty() {
-        return default_yes;
+    if args.mcp {
+        flagged.push(SetupAction::Mcp);
     }
-    trimmed.starts_with('y')
+    if args.hooks {
+        flagged.push(SetupAction::Hooks);
+    }
+    if args.tls {
+        flagged.push(SetupAction::Tls);
+    }
+    if !flagged.is_empty() {
+        return flagged;
+    }
+
+    let labels: Vec<&str> = SETUP_ACTIONS.iter().map(|a| a.label()).collect();
+    let chosen = prompt_multi_select_all(
+        interactive,
+        "What would you like to set up? (comma-separated numbers):",
+        &labels,
+    );
+    chosen
+        .into_iter()
+        .filter_map(|i| SETUP_ACTIONS.get(i).copied())
+        .collect()
+}
+
+/// Question 2: determine which platforms to apply per-platform actions to.
+///
+/// The offered list is the union of platforms relevant to the selected actions,
+/// so unsupported combinations are never shown.
+fn select_platforms(actions: &[SetupAction], interactive: bool) -> Vec<Platform> {
+    let want_mcp = actions.contains(&SetupAction::Mcp);
+    let want_hooks = actions.contains(&SetupAction::Hooks);
+
+    let relevant: Vec<Platform> = PLATFORMS
+        .iter()
+        .copied()
+        .filter(|p| (want_mcp && p.supports_mcp()) || (want_hooks && p.supports_hooks()))
+        .collect();
+
+    let labels: Vec<&str> = relevant.iter().map(|p| p.label()).collect();
+    let chosen = prompt_multi_select_all(
+        interactive,
+        "On which platforms? (comma-separated numbers):",
+        &labels,
+    );
+    chosen
+        .into_iter()
+        .filter_map(|i| relevant.get(i).copied())
+        .collect()
 }
 
 fn prompt_multi_select(question: &str, options: &[&str], default: &str) -> Vec<usize> {
@@ -185,6 +298,13 @@ fn prompt_multi_select(question: &str, options: &[&str], default: &str) -> Vec<u
     parse_selection_string(&input, options.len())
 }
 
+fn default_all_selection(count: usize) -> String {
+    (1..=count)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn parse_selection_string(input: &str, max_val: usize) -> Vec<usize> {
     let mut selections = Vec::new();
     let normalized = input.replace(',', " ");
@@ -198,6 +318,82 @@ fn parse_selection_string(input: &str, max_val: usize) -> Vec<usize> {
         }
     }
     selections
+}
+
+/// Prompt a multi-select that defaults to "all" options. Non-interactive
+/// sessions select everything without prompting.
+fn prompt_multi_select_all(interactive: bool, question: &str, labels: &[&str]) -> Vec<usize> {
+    if !interactive {
+        return (0..labels.len()).collect();
+    }
+    let default = default_all_selection(labels.len());
+    prompt_multi_select(question, labels, &default)
+}
+
+fn mcp_shared_transport_url(transport: &str) -> Option<&'static str> {
+    match transport {
+        "http" => Some("http://localhost:3000/mcp"),
+        "unix" => Some("unix:///tmp/ahma.sock#/mcp"),
+        _ => None,
+    }
+}
+
+fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
+    if let Some(url) = mcp_shared_transport_url(transport) {
+        return json!({ "type": "http", "url": url });
+    }
+    json!({
+        "type": "stdio",
+        "command": "ahma",
+        "args": [
+            "serve",
+            "stdio",
+            "--tools",
+            "rust,simplify",
+            "--tmp",
+            "--log-monitor"
+        ]
+    })
+}
+
+fn build_antigravity_servers_entry(transport: &str) -> serde_json::Value {
+    if let Some(url) = mcp_shared_transport_url(transport) {
+        return json!({ "url": url });
+    }
+    json!({
+        "command": "ahma",
+        "args": [
+            "serve",
+            "stdio",
+            "--tools",
+            "rust,simplify",
+            "--tmp",
+            "--log-monitor"
+        ],
+        "env": {
+            "AHMA_SANDBOX_SCOPE": "~"
+        }
+    })
+}
+
+fn print_mcp_restart_hints(interactive: bool, configured: &[&str], transport: &str) {
+    if !interactive || configured.is_empty() {
+        return;
+    }
+    println!("\n✓ MCP setup complete! Restart these tools to apply changes:");
+    for platform in configured {
+        println!("    - {}", platform);
+    }
+    match transport {
+        "http" => println!(
+            "  Start the HTTP server before opening tools: ahma serve http --tools rust,simplify"
+        ),
+        "unix" => println!(
+            "  Start the Unix socket server before opening tools: ahma serve unix --socket-path /tmp/ahma.sock --tools rust,simplify"
+        ),
+        _ => {}
+    }
+    println!();
 }
 
 fn vscode_mcp_path() -> Option<PathBuf> {
@@ -216,112 +412,27 @@ fn vscode_mcp_path() -> Option<PathBuf> {
     }
 }
 
-async fn setup_mcp_config(interactive: bool) -> Result<()> {
+async fn setup_mcp_config(
+    platforms: &[Platform],
+    transport: &str,
+    interactive: bool,
+) -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
-    let platforms = vec![
-        "VS Code",
-        "Claude Code",
-        "Cursor",
-        "Antigravity",
-        "Codex CLI",
-    ];
-
-    let selected = if interactive {
-        prompt_multi_select(
-            "Select platforms to configure (comma-separated numbers):",
-            &platforms,
-            "1,2,3,4,5",
-        )
-    } else {
-        vec![0, 1, 2, 3, 4]
-    };
-
-    if selected.is_empty() {
-        return Ok(());
-    }
-
-    let transport = if interactive {
-        prompt_transport()
-    } else {
-        "stdio"
-    };
-
-    let servers_entry = match transport {
-        "http" => json!({
-            "type": "http",
-            "url": "http://localhost:3000/mcp"
-        }),
-        "unix" => json!({
-            "type": "http",
-            "url": "unix:///tmp/ahma.sock#/mcp"
-        }),
-        _ => {
-            // Default stdio
-            json!({
-                "type": "stdio",
-                "command": "ahma",
-                "args": [
-                    "serve",
-                    "stdio",
-                    "--tools",
-                    "rust,simplify",
-                    "--tmp",
-                    "--log-monitor"
-                ]
-            })
-        }
-    };
-
-    let ant_servers_entry = match transport {
-        "http" => json!({
-            "url": "http://localhost:3000/mcp"
-        }),
-        "unix" => json!({
-            "url": "unix:///tmp/ahma.sock#/mcp"
-        }),
-        _ => json!({
-            "command": "ahma",
-            "args": [
-                "serve",
-                "stdio",
-                "--tools",
-                "rust,simplify",
-                "--tmp",
-                "--log-monitor"
-            ],
-            "env": {
-                "AHMA_SANDBOX_SCOPE": "~"
-            }
-        }),
-    };
+    let servers_entry = build_mcp_servers_entry(transport);
+    let ant_servers_entry = build_antigravity_servers_entry(transport);
 
     let mut configured = Vec::new();
 
-    for idx in selected {
+    for platform in platforms.iter().copied().filter(|p| p.supports_mcp()) {
         if let Some(name) =
-            configure_mcp_platform(idx, transport, &servers_entry, &ant_servers_entry, &home)?
+            platform.configure_mcp(transport, &servers_entry, &ant_servers_entry, &home)?
         {
             configured.push(name);
         }
     }
 
-    if interactive && !configured.is_empty() {
-        println!("\n✓ MCP setup complete! Restart these tools to apply changes:");
-        for p in configured {
-            println!("    - {}", p);
-        }
-        if transport == "http" {
-            println!(
-                "  Start the HTTP server before opening tools: ahma serve http --tools rust,simplify"
-            );
-        } else if transport == "unix" {
-            println!(
-                "  Start the Unix socket server before opening tools: ahma serve unix --socket-path /tmp/ahma.sock --tools rust,simplify"
-            );
-        }
-        println!();
-    }
+    print_mcp_restart_hints(interactive, &configured, transport);
 
     Ok(())
 }
@@ -429,52 +540,23 @@ fn merge_codex_toml(path: &Path, value: toml::Value) -> Result<()> {
     Ok(())
 }
 
-fn platform_from_index(idx: usize) -> Option<(HookPlatform, &'static str)> {
-    match idx {
-        0 => Some((HookPlatform::Cursor, "Cursor")),
-        1 => Some((HookPlatform::Claude, "Claude Code")),
-        2 => Some((HookPlatform::Codex, "Codex")),
-        3 => Some((HookPlatform::Copilot, "GitHub Copilot")),
-        4 => Some((HookPlatform::Antigravity, "Antigravity")),
-        _ => None,
-    }
-}
-
-async fn setup_terminal_hooks(interactive: bool) -> Result<()> {
-    let tools = vec![
-        "Cursor",
-        "Claude Code",
-        "Codex",
-        "GitHub Copilot",
-        "Antigravity",
-    ];
-
-    let selected = if interactive {
-        prompt_multi_select(
-            "Select platforms to configure hooks (comma-separated numbers):",
-            &tools,
-            "1,2,3,4,5",
-        )
-    } else {
-        vec![0, 1, 2, 3, 4]
-    };
-
-    if selected.is_empty() {
-        return Ok(());
-    }
-
-    let mut platforms = Vec::new();
+async fn setup_terminal_hooks(platforms: &[Platform], interactive: bool) -> Result<()> {
+    let mut hook_platforms = Vec::new();
     let mut names = Vec::new();
 
-    for idx in selected {
-        if let Some((platform, name)) = platform_from_index(idx) {
-            platforms.push(platform);
-            names.push(name);
+    for platform in platforms.iter().copied().filter(|p| p.supports_hooks()) {
+        if let Some(hook_platform) = platform.hook_platform() {
+            hook_platforms.push(hook_platform);
+            names.push(platform.label());
         }
     }
 
+    if hook_platforms.is_empty() {
+        return Ok(());
+    }
+
     let install_args = HooksInstallArgs {
-        platforms,
+        platforms: hook_platforms,
         scope: HookScope::User,
         dry_run: false,
     };

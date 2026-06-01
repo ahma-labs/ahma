@@ -99,7 +99,10 @@ async fn test_tool_schema_generation_comprehensive() -> Result<()> {
         }
     }
 
-    let tool_names: Vec<&str> = tools_result.iter().map(|t| t.name.as_ref() as &str).collect();
+    let tool_names: Vec<&str> = tools_result
+        .iter()
+        .map(|t| t.name.as_ref() as &str)
+        .collect();
     assert!(tool_names.contains(&"await"), "Should have await tool");
     assert!(tool_names.contains(&"status"), "Should have status tool");
 

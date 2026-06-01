@@ -34,7 +34,7 @@ opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true }
 opener = { version = "0.8", optional = true }
 pulldown-cmark = { version = "0.13", optional = true }
-quick-xml = { version = "0.37", optional = true }
+quick-xml = { version = "0.37.5", optional = true }
 rand = "0.10.1"
 regex.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls", "http2", "http3"] }
@@ -44,11 +44,11 @@ schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 ring = { version = "0.17", features = ["std"] }
-sha2 = "0.10"
+sha2 = "0.10.9"
 sigstore-verification = { version = "0.2", default-features = false, features = ["rustls"] }
 tar = "0.4"
 tempfile.workspace = true
-zip = "2.4"
+zip = "2.4.2"
 thiserror.workspace = true
 tokio-util.workspace = true
 tokio = "1.52"

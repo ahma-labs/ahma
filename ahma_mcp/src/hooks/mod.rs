@@ -147,17 +147,21 @@ impl HookPlatform {
     }
 
     fn config_path(self, scope_root: &Path, scope: HookScope) -> PathBuf {
+        scope_root.join(self.config_relative_path(scope))
+    }
+
+    fn config_relative_path(self, scope: HookScope) -> PathBuf {
         match self {
-            Self::Cursor => scope_root.join(".cursor").join("hooks.json"),
-            Self::Claude => scope_root.join(".claude").join("settings.json"),
-            Self::Codex => scope_root.join(".codex").join("hooks.json"),
+            Self::Cursor => PathBuf::from(".cursor/hooks.json"),
+            Self::Claude => PathBuf::from(".claude/settings.json"),
+            Self::Codex => PathBuf::from(".codex/hooks.json"),
             Self::Copilot => match scope {
-                HookScope::User => scope_root.join(".copilot").join("hooks").join("ahma.json"),
-                HookScope::Project => scope_root.join(".github").join("hooks").join("ahma.json"),
+                HookScope::User => PathBuf::from(".copilot/hooks/ahma.json"),
+                HookScope::Project => PathBuf::from(".github/hooks/ahma.json"),
             },
             Self::Antigravity => match scope {
-                HookScope::User => scope_root.join(".gemini").join("config").join("hooks.json"),
-                HookScope::Project => scope_root.join(".agents").join("hooks.json"),
+                HookScope::User => PathBuf::from(".gemini/config/hooks.json"),
+                HookScope::Project => PathBuf::from(".agents/hooks.json"),
             },
         }
     }
@@ -280,16 +284,10 @@ pub fn any_managed_hooks_installed(scope: HookScope) -> Result<bool> {
 fn any_managed_hooks_installed_in_env(scope: HookScope, env: &HookEnvironment) -> Result<bool> {
     for platform in HookPlatform::all() {
         let path = env.config_path(platform, scope);
-        if !path.exists() {
-            continue;
-        }
-
-        let document = load_hook_document(&path)?;
-        if platform_hook_installed(&document, platform) {
+        if path.exists() && platform_hook_installed(&load_hook_document(&path)?, platform) {
             return Ok(true);
         }
     }
-
     Ok(false)
 }
 
@@ -502,29 +500,29 @@ fn extract_tool_args(input: &Value) -> Result<Option<(Map<String, Value>, String
     Ok(Some((args_obj.clone(), command.to_string())))
 }
 
+fn resolve_exec_updated_input(
+    input: &Value,
+    scope: HookScope,
+    env: &HookEnvironment,
+) -> Result<Option<Value>> {
+    let Some((tool_input, original_command)) = extract_tool_args(input)? else {
+        return Ok(None);
+    };
+    if is_wrapped_shell_command(&original_command) {
+        return Ok(None);
+    }
+    let cwd = extract_command_cwd(input, &tool_input)?;
+    let wrapped_command = build_wrapped_shell_command(scope, env, &cwd, &original_command)?;
+    Ok(Some(updated_tool_input(&tool_input, wrapped_command)))
+}
+
 fn build_exec_response(
     input: &Value,
     platform: HookPlatform,
     scope: HookScope,
     env: &HookEnvironment,
 ) -> Result<Value> {
-    let updated_input = match extract_tool_args(input)? {
-        None => {
-            // Non-shell tool (e.g. editFiles, createFile) — allow through unchanged
-            None
-        }
-        Some((tool_input, original_command)) => {
-            if is_wrapped_shell_command(&original_command) {
-                None
-            } else {
-                let cwd = extract_command_cwd(input, &tool_input)?;
-                let wrapped_command =
-                    build_wrapped_shell_command(scope, env, &cwd, &original_command)?;
-                Some(updated_tool_input(&tool_input, wrapped_command))
-            }
-        }
-    };
-
+    let updated_input = resolve_exec_updated_input(input, scope, env)?;
     Ok(match platform {
         HookPlatform::Cursor => build_cursor_hook_output(updated_input),
         HookPlatform::Claude
@@ -673,30 +671,12 @@ fn install_cursor_hook(
 }
 
 fn uninstall_cursor_hook(document: &mut Value) -> Result<bool> {
-    let Some(root) = document.as_object_mut() else {
-        bail!("Cursor hook config must be a JSON object");
-    };
-    let Some(hooks) = root.get_mut("hooks") else {
-        return Ok(false);
-    };
-    let Some(hooks_object) = hooks.as_object_mut() else {
-        bail!("Cursor hook config field 'hooks' must be an object");
-    };
-    let Some(entries) = hooks_object.get_mut(HookPlatform::Cursor.event_key()) else {
-        return Ok(false);
-    };
-    let Some(entries_array) = entries.as_array_mut() else {
-        bail!("Cursor preToolUse hook list must be an array");
-    };
-
-    let changed = {
-        let before_len = entries_array.len();
-        entries_array.retain(|entry| !is_managed_cursor_entry(entry));
-        entries_array.len() != before_len
-    };
-    cleanup_empty_hook_tree(root, HookPlatform::Cursor.event_key());
-
-    Ok(changed)
+    remove_managed_hook_entries(
+        document,
+        "Cursor",
+        HookPlatform::Cursor.event_key(),
+        is_managed_cursor_entry,
+    )
 }
 
 fn cursor_hook_installed(document: &Value) -> bool {
@@ -736,32 +716,40 @@ fn install_grouped_hook(
 }
 
 fn uninstall_grouped_hook(document: &mut Value, platform: HookPlatform) -> Result<bool> {
+    remove_managed_hook_entries(
+        document,
+        platform.label(),
+        platform.event_key(),
+        is_managed_group_entry,
+    )
+}
+
+fn remove_managed_hook_entries(
+    document: &mut Value,
+    config_label: &str,
+    event_key: &str,
+    is_managed: fn(&Value) -> bool,
+) -> Result<bool> {
     let Some(root) = document.as_object_mut() else {
-        bail!("{} hook config must be a JSON object", platform.label());
+        bail!("{config_label} hook config must be a JSON object");
     };
     let Some(hooks) = root.get_mut("hooks") else {
         return Ok(false);
     };
     let Some(hooks_object) = hooks.as_object_mut() else {
-        bail!(
-            "{} hook config field 'hooks' must be an object",
-            platform.label()
-        );
+        bail!("{config_label} hook config field 'hooks' must be an object");
     };
-    let Some(entries) = hooks_object.get_mut(platform.event_key()) else {
+    let Some(entries) = hooks_object.get_mut(event_key) else {
         return Ok(false);
     };
     let Some(entries_array) = entries.as_array_mut() else {
-        bail!("{} hook list must be an array", platform.label());
+        bail!("{config_label} hook list must be an array");
     };
 
-    let changed = {
-        let before_len = entries_array.len();
-        entries_array.retain(|entry| !is_managed_group_entry(entry));
-        entries_array.len() != before_len
-    };
-    cleanup_empty_hook_tree(root, platform.event_key());
-
+    let before_len = entries_array.len();
+    entries_array.retain(|entry| !is_managed(entry));
+    let changed = entries_array.len() != before_len;
+    cleanup_empty_hook_tree(root, event_key);
     Ok(changed)
 }
 

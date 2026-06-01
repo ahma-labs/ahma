@@ -297,13 +297,7 @@ impl Adapter {
         // the caller has NOT already added the -c flag via a subcommand config.
         // For bash/powershell the preparer already embeds -c/-Command; always
         // use create_command so the sandbox wrapper is applied without double-wrapping.
-        let mut cmd = if program == "/bin/sh" {
-            let full_command = args_vec.join(" ");
-            self.sandbox
-                .create_shell_command(&program, &full_command, &safe_wd)?
-        } else {
-            self.sandbox.create_command(&program, &args_vec, &safe_wd)?
-        };
+        let mut cmd = build_sandboxed_command(&self.sandbox, &program, &args_vec, &safe_wd)?;
 
         let output_res = tokio::time::timeout(timeout, cmd.output()).await;
 
@@ -318,19 +312,7 @@ impl Adapter {
             Ok(Ok(output)) => output,
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "Command failed with exit code {}: stderr: {}, stdout: {}",
-                output.status.code().unwrap_or(-1),
-                stderr,
-                stdout
-            ));
-        }
-
-        Ok(combine_stdout_stderr(stdout, stderr))
+        interpret_sync_command_output(output)
     }
 
     /// Synchronously executes a command with optional retry logic for transient errors.
@@ -475,122 +457,20 @@ impl Adapter {
 
         let task_handles = self.task_handles.clone();
 
-        let handle = tokio::spawn(async move {
-            // Get the cancellation token from the operation
-            let cancellation_token = {
-                if let Some(operation) = monitor.get_operation(&op_id).await {
-                    operation.cancellation_token.clone()
-                } else {
-                    tracing::error!("Could not find operation {} for cancellation token", op_id);
-                    return;
-                }
-            };
-
-            monitor
-                .update_status(&op_id, OperationStatus::InProgress, None)
-                .await;
-
-            // Send an immediate 'Started' notification if a callback is provided
-            if let Some(callback) = &callback {
-                let _ = callback
-                    .send_progress(crate::callback_system::ProgressUpdate::Started {
-                        id: op_id.clone(),
-                        command: command.clone(),
-                        description: execution_description(&command, &wd_clone),
-                    })
-                    .await;
-            }
-
-            // Check for cancellation before starting
-            if cancellation_token.is_cancelled() {
-                tracing::info!("Operation {} was cancelled before execution started", op_id);
-                handle_cancellation(&monitor, &callback, &op_id, 0).await;
-                return;
-            }
-
-            let start_time = Instant::now();
-
-            // Build sandboxed process command.
-            // `create_shell_command` injects -c (Unix) or -NoProfile … -Command (Windows).
-            // Only use it for raw /bin/sh invocations where no -c flag was pre-added.
-            // For bash/powershell the preparer already adds the flag; create_command
-            // applies the sandbox wrapper without double-wrapping.
-            let wd_path = std::path::PathBuf::from(&wd_clone);
-            let proc_cmd_result = if program_with_subcommand == "/bin/sh" {
-                let full_command = args_vec.join(" ");
-                sandbox.create_shell_command(&program_with_subcommand, &full_command, &wd_path)
-            } else {
-                sandbox.create_command(&program_with_subcommand, &args_vec, &wd_path)
-            };
-
-            let mut proc_cmd: tokio::process::Command = match proc_cmd_result {
-                Ok(cmd) => cmd,
-                Err(e) => {
-                    let error_message = format!("Failed to create sandboxed command: {}", e);
-                    tracing::error!("{}", error_message);
-                    monitor
-                        .update_status(
-                            &op_id,
-                            OperationStatus::Failed,
-                            Some(Value::String(error_message.clone())),
-                        )
-                        .await;
-                    send_progress_best_effort(
-                        &callback,
-                        final_result_progress_update(
-                            &op_id,
-                            &program_with_subcommand,
-                            &wd_clone,
-                            false,
-                            0,
-                            format!("Error: {}", error_message),
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            };
-
-            // Resolve timeout in milliseconds
-            let timeout_ms: u64 = timeout
-                .map(|t| t * 1000)
-                .unwrap_or_else(|| shell_pool.config().command_timeout.as_millis() as u64);
-
-            // Branch: streaming execution for log monitoring vs. batch execution
-            if let Some(monitor_config) = log_monitor_config {
-                // === STREAMING PATH: line-by-line output with log monitoring ===
-                execute_with_streaming(
-                    &mut proc_cmd,
-                    timeout_ms,
-                    monitor_config,
-                    &cancellation_token,
-                    &callback,
-                    &op_id,
-                    &program_with_subcommand,
-                    &wd_clone,
-                    start_time,
-                    &monitor,
-                )
-                .await;
-            } else {
-                // === BATCH PATH: existing behavior, collect all output at once ===
-                execute_batch(
-                    &mut proc_cmd,
-                    timeout_ms,
-                    &cancellation_token,
-                    &callback,
-                    &op_id,
-                    &program_with_subcommand,
-                    &wd_clone,
-                    start_time,
-                    &monitor,
-                )
-                .await;
-            }
-
-            // Remove the task handle from the map once it's complete
-            task_handles.lock().await.remove(&op_id);
-        });
+        let handle = tokio::spawn(run_async_operation(AsyncOperationRun {
+            op_id,
+            command,
+            program: program_with_subcommand,
+            args_vec,
+            working_dir: wd_clone,
+            timeout_secs: timeout,
+            callback,
+            log_monitor_config,
+            monitor,
+            shell_pool,
+            sandbox,
+            task_handles,
+        }));
 
         // Store the handle for graceful shutdown
         self.task_handles
@@ -630,6 +510,186 @@ impl Adapter {
 // Extracted execution helpers (batch vs streaming)
 // ---------------------------------------------------------------------------
 
+/// Build a sandbox-wrapped `tokio::process::Command` for the given program and args.
+///
+/// Raw `/bin/sh` invocations use `create_shell_command` (injects `-c`); all other
+/// programs use `create_command` so the preparer's shell flags are not doubled.
+fn build_sandboxed_command(
+    sandbox: &sandbox::Sandbox,
+    program: &str,
+    args_vec: &[String],
+    working_dir: &std::path::Path,
+) -> Result<tokio::process::Command> {
+    if program == "/bin/sh" {
+        let full_command = args_vec.join(" ");
+        sandbox.create_shell_command(program, &full_command, working_dir)
+    } else {
+        sandbox.create_command(program, args_vec, working_dir)
+    }
+}
+
+/// Interpret a completed synchronous process output as success text or an error.
+fn interpret_sync_command_output(output: std::process::Output) -> Result<String, anyhow::Error> {
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "Command failed with exit code {}: stderr: {}, stdout: {}",
+            output.status.code().unwrap_or(-1),
+            stderr,
+            stdout
+        ));
+    }
+    Ok(combine_stdout_stderr(stdout, stderr))
+}
+
+/// Context for a single background async operation task.
+struct AsyncOperationRun {
+    op_id: String,
+    command: String,
+    program: String,
+    args_vec: Vec<String>,
+    working_dir: String,
+    timeout_secs: Option<u64>,
+    callback: Option<Box<dyn crate::callback_system::CallbackSender>>,
+    log_monitor_config: Option<crate::log_monitor::LogMonitorConfig>,
+    monitor: Arc<OperationMonitor>,
+    shell_pool: Arc<ShellPoolManager>,
+    sandbox: Arc<sandbox::Sandbox>,
+    task_handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+}
+
+async fn run_async_operation(ctx: AsyncOperationRun) {
+    let AsyncOperationRun {
+        op_id,
+        command,
+        program,
+        args_vec,
+        working_dir,
+        timeout_secs,
+        callback,
+        log_monitor_config,
+        monitor,
+        shell_pool,
+        sandbox,
+        task_handles,
+    } = ctx;
+
+    let cancellation_token = match monitor.get_operation(&op_id).await {
+        Some(operation) => operation.cancellation_token.clone(),
+        None => {
+            tracing::error!("Could not find operation {} for cancellation token", op_id);
+            return;
+        }
+    };
+
+    monitor
+        .update_status(&op_id, OperationStatus::InProgress, None)
+        .await;
+
+    if let Some(callback) = &callback {
+        let _ = callback
+            .send_progress(crate::callback_system::ProgressUpdate::Started {
+                id: op_id.clone(),
+                command: command.clone(),
+                description: execution_description(&command, &working_dir),
+            })
+            .await;
+    }
+
+    if cancellation_token.is_cancelled() {
+        tracing::info!("Operation {} was cancelled before execution started", op_id);
+        handle_cancellation(&monitor, &callback, &op_id, 0).await;
+        return;
+    }
+
+    let start_time = Instant::now();
+    let wd_path = std::path::PathBuf::from(&working_dir);
+    let mut proc_cmd = match build_sandboxed_command(&sandbox, &program, &args_vec, &wd_path) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            fail_operation_with_error(
+                &monitor,
+                &callback,
+                &op_id,
+                &program,
+                &working_dir,
+                0,
+                format!("Failed to create sandboxed command: {}", e),
+            )
+            .await;
+            task_handles.lock().await.remove(&op_id);
+            return;
+        }
+    };
+
+    let timeout_ms = timeout_secs
+        .map(|t| t * 1000)
+        .unwrap_or_else(|| shell_pool.config().command_timeout.as_millis() as u64);
+
+    if let Some(monitor_config) = log_monitor_config {
+        execute_with_streaming(
+            &mut proc_cmd,
+            timeout_ms,
+            monitor_config,
+            &cancellation_token,
+            &callback,
+            &op_id,
+            &program,
+            &working_dir,
+            start_time,
+            &monitor,
+        )
+        .await;
+    } else {
+        execute_batch(
+            &mut proc_cmd,
+            timeout_ms,
+            &cancellation_token,
+            &callback,
+            &op_id,
+            &program,
+            &working_dir,
+            start_time,
+            &monitor,
+        )
+        .await;
+    }
+
+    task_handles.lock().await.remove(&op_id);
+}
+
+async fn fail_operation_with_error(
+    monitor: &Arc<OperationMonitor>,
+    callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
+    op_id: &str,
+    program: &str,
+    working_dir: &str,
+    duration_ms: u64,
+    error_message: String,
+) {
+    tracing::error!("{}", error_message);
+    monitor
+        .update_status(
+            op_id,
+            OperationStatus::Failed,
+            Some(Value::String(error_message.clone())),
+        )
+        .await;
+    send_progress_best_effort(
+        callback,
+        final_result_progress_update(
+            op_id,
+            program,
+            working_dir,
+            false,
+            duration_ms,
+            format!("Error: {}", error_message),
+        ),
+    )
+    .await;
+}
+
 /// Give a task a 250 ms grace period then abort it if still running,
 /// waiting up to 2 s for the abort to complete.
 async fn drain_task_handle(id: &str, mut handle: JoinHandle<()>) {
@@ -656,16 +716,10 @@ async fn drain_task_handle(id: &str, mut handle: JoinHandle<()>) {
 
 /// Combine stdout and stderr into a single string, preferring stdout.
 fn combine_stdout_stderr(stdout: String, stderr: String) -> String {
-    if stdout.is_empty() && !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() && !stderr.is_empty() {
-        format!(
-            "{}
-{}",
-            stdout, stderr
-        )
-    } else {
-        stdout
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}\n{stderr}"),
+        _ => stdout,
     }
 }
 
@@ -756,83 +810,99 @@ async fn execute_batch(
 
     match proc_result {
         Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let final_output = json!({
-                "stdout": stdout,
-                "stderr": stderr,
-                "exit_code": output.status.code().unwrap_or(-1),
-            });
-            let success = output.status.success();
-            let status = if success {
-                OperationStatus::Completed
-            } else {
-                OperationStatus::Failed
-            };
-            monitor
-                .update_status(op_id, status, Some(final_output.clone()))
-                .await;
-
-            send_final_result_progress(
+            complete_operation_with_output(
+                monitor,
                 callback,
-                final_result_progress_update(
-                    op_id,
-                    program,
-                    working_dir,
-                    success,
-                    duration_ms,
-                    format!(
-                        "Exit code: {}\nStdout:\n{}\nStderr:\n{}",
-                        final_output["exit_code"], final_output["stdout"], final_output["stderr"]
-                    ),
-                ),
                 op_id,
+                program,
+                working_dir,
+                duration_ms,
+                output,
             )
             .await;
         }
         Ok(Err(e)) => {
-            let error_message = e.to_string();
-            monitor
-                .update_status(
-                    op_id,
-                    OperationStatus::Failed,
-                    Some(Value::String(error_message.clone())),
-                )
-                .await;
-
-            send_progress_best_effort(
+            fail_operation_with_error(
+                monitor,
                 callback,
-                final_result_progress_update(
-                    op_id,
-                    program,
-                    working_dir,
-                    false,
-                    duration_ms,
-                    format!("Error: {}", error_message),
-                ),
+                op_id,
+                program,
+                working_dir,
+                duration_ms,
+                e.to_string(),
             )
             .await;
         }
         Err(_) => {
-            let timeout_reason = format!(
-                "Operation timed out after {}ms (exceeded timeout limit)",
-                duration_ms
-            );
-            monitor
-                .update_status(
-                    op_id,
-                    OperationStatus::Cancelled,
-                    Some(Value::String(timeout_reason.clone())),
-                )
-                .await;
-
-            send_progress_best_effort(
-                callback,
-                cancelled_progress_update(op_id, timeout_reason, duration_ms),
-            )
-            .await;
+            cancel_operation_timed_out(monitor, callback, op_id, duration_ms).await;
         }
     }
+}
+
+async fn complete_operation_with_output(
+    monitor: &Arc<OperationMonitor>,
+    callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
+    op_id: &str,
+    program: &str,
+    working_dir: &str,
+    duration_ms: u64,
+    output: std::process::Output,
+) {
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+    let success = output.status.success();
+    let final_output = json!({
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": exit_code,
+    });
+    let status = if success {
+        OperationStatus::Completed
+    } else {
+        OperationStatus::Failed
+    };
+    monitor
+        .update_status(op_id, status, Some(final_output))
+        .await;
+
+    send_final_result_progress(
+        callback,
+        final_result_progress_update(
+            op_id,
+            program,
+            working_dir,
+            success,
+            duration_ms,
+            format!("Exit code: {exit_code}\nStdout:\n{stdout}\nStderr:\n{stderr}"),
+        ),
+        op_id,
+    )
+    .await;
+}
+
+async fn cancel_operation_timed_out(
+    monitor: &Arc<OperationMonitor>,
+    callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
+    op_id: &str,
+    duration_ms: u64,
+) {
+    let timeout_reason = format!(
+        "Operation timed out after {}ms (exceeded timeout limit)",
+        duration_ms
+    );
+    monitor
+        .update_status(
+            op_id,
+            OperationStatus::Cancelled,
+            Some(Value::String(timeout_reason.clone())),
+        )
+        .await;
+    send_progress_best_effort(
+        callback,
+        cancelled_progress_update(op_id, timeout_reason, duration_ms),
+    )
+    .await;
 }
 
 /// Execute a command with line-by-line streaming and log monitoring.
@@ -859,29 +929,17 @@ async fn execute_with_streaming(
     proc_cmd.stdout(std::process::Stdio::piped());
     proc_cmd.stderr(std::process::Stdio::piped());
 
-    let spawn_result = proc_cmd.spawn();
-    let mut child = match spawn_result {
+    let mut child = match proc_cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            let error_message = format!("Failed to spawn process: {}", e);
-            tracing::error!("{}", error_message);
-            op_monitor
-                .update_status(
-                    op_id,
-                    OperationStatus::Failed,
-                    Some(Value::String(error_message.clone())),
-                )
-                .await;
-            send_progress_best_effort(
+            fail_operation_with_error(
+                op_monitor,
                 callback,
-                final_result_progress_update(
-                    op_id,
-                    program,
-                    working_dir,
-                    false,
-                    0,
-                    format!("Error: {}", error_message),
-                ),
+                op_id,
+                program,
+                working_dir,
+                0,
+                format!("Failed to spawn process: {}", e),
             )
             .await;
             return;
@@ -921,21 +979,7 @@ async fn execute_with_streaming(
                 tracing::warn!("Operation {} timed out during streaming", op_id);
                 let _ = child.kill().await;
                 let duration_ms = start_time.elapsed().as_millis() as u64;
-                let timeout_reason = format!(
-                    "Operation timed out after {}ms (exceeded timeout limit)", duration_ms
-                );
-                op_monitor
-                    .update_status(
-                        op_id,
-                        OperationStatus::Cancelled,
-                        Some(Value::String(timeout_reason.clone())),
-                    )
-                    .await;
-                send_progress_best_effort(
-                    callback,
-                    cancelled_progress_update(op_id, timeout_reason, duration_ms),
-                )
-                .await;
+                cancel_operation_timed_out(op_monitor, callback, op_id, duration_ms).await;
                 return;
             }
 
@@ -955,29 +999,16 @@ async fn execute_with_streaming(
         // have already exited.
         match child.try_wait() {
             Ok(Some(_status)) => {
-                // Process exited. Drain remaining lines from both streams.
-                while let Ok(Some(line)) = stderr_reader.next_line().await {
-                    process_streaming_line(
-                        &line,
-                        true,
-                        &mut collected_stderr,
-                        &mut log_monitor,
-                        callback,
-                        op_id,
-                    )
-                    .await;
-                }
-                while let Ok(Some(line)) = stdout_reader.next_line().await {
-                    process_streaming_line(
-                        &line,
-                        false,
-                        &mut collected_stdout,
-                        &mut log_monitor,
-                        callback,
-                        op_id,
-                    )
-                    .await;
-                }
+                drain_remaining_stream_lines(
+                    &mut stderr_reader,
+                    &mut stdout_reader,
+                    &mut collected_stdout,
+                    &mut collected_stderr,
+                    &mut log_monitor,
+                    callback,
+                    op_id,
+                )
+                .await;
                 break;
             }
             Ok(None) => {
@@ -990,14 +1021,55 @@ async fn execute_with_streaming(
         }
     }
 
-    // Wait for the process to finish and get the exit status
+    finalize_streaming_operation(
+        &mut child,
+        start_time,
+        &collected_stdout,
+        &collected_stderr,
+        op_monitor,
+        callback,
+        op_id,
+        program,
+        working_dir,
+    )
+    .await;
+}
+
+async fn drain_remaining_stream_lines(
+    stderr_reader: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStderr>>,
+    stdout_reader: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    collected_stdout: &mut BoundedLineCollector,
+    collected_stderr: &mut BoundedLineCollector,
+    log_monitor: &mut crate::log_monitor::LogMonitor,
+    callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
+    op_id: &str,
+) {
+    while let Ok(Some(line)) = stderr_reader.next_line().await {
+        process_streaming_line(&line, true, collected_stderr, log_monitor, callback, op_id).await;
+    }
+    while let Ok(Some(line)) = stdout_reader.next_line().await {
+        process_streaming_line(&line, false, collected_stdout, log_monitor, callback, op_id).await;
+    }
+}
+
+async fn finalize_streaming_operation(
+    child: &mut tokio::process::Child,
+    start_time: Instant,
+    collected_stdout: &BoundedLineCollector,
+    collected_stderr: &BoundedLineCollector,
+    op_monitor: &Arc<OperationMonitor>,
+    callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
+    op_id: &str,
+    program: &str,
+    working_dir: &str,
+) {
     let exit_status = child.wait().await;
     let duration_ms = start_time.elapsed().as_millis() as u64;
-
-    let exit_code = match &exit_status {
-        Ok(status) => status.code().unwrap_or(-1),
-        Err(_) => -1,
-    };
+    let exit_code = exit_status
+        .as_ref()
+        .ok()
+        .and_then(|s| s.code())
+        .unwrap_or(-1);
     let success = exit_status.as_ref().is_ok_and(|s| s.success());
 
     let stdout_str = collected_stdout.rendered_output();
@@ -1019,7 +1091,7 @@ async fn execute_with_streaming(
         OperationStatus::Failed
     };
     op_monitor
-        .update_status(op_id, status, Some(final_output.clone()))
+        .update_status(op_id, status, Some(final_output))
         .await;
 
     send_final_result_progress(
@@ -1030,10 +1102,7 @@ async fn execute_with_streaming(
             working_dir,
             success,
             duration_ms,
-            format!(
-                "Exit code: {}\nStdout:\n{}\nStderr:\n{}",
-                exit_code, stdout_str, stderr_str
-            ),
+            format!("Exit code: {exit_code}\nStdout:\n{stdout_str}\nStderr:\n{stderr_str}"),
         ),
         op_id,
     )

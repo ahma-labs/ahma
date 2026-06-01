@@ -224,7 +224,9 @@ async fn test_mcp_tool_descriptions_populated() -> Result<()> {
     .map_err(|_| anyhow::anyhow!("list_all_tools timed out"))??;
 
     // Find the test_echo tool
-    let echo_tool = tools.iter().find(|t| (t.name.as_ref() as &str).contains("test_echo"));
+    let echo_tool = tools
+        .iter()
+        .find(|t| (t.name.as_ref() as &str).contains("test_echo"));
     assert!(echo_tool.is_some(), "Should find test_echo tool");
 
     let tool = echo_tool.unwrap();
