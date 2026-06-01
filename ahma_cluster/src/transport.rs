@@ -297,9 +297,10 @@ mod tests {
 
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let mut buf = [0; 1024];
                 let _ = stream.read(&mut buf).await;
-                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"task_id\":\"t1\"}\r\n";
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"task_id\":\"t1\"}\r\n";
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.flush().await;
             }
