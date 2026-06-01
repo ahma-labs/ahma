@@ -95,11 +95,14 @@ Alternatively, in a terminal run `ahma --mode http` for visibility of all action
         "--log-monitor"
       ],
       "env": {
-        "AHMA_SANDBOX_SCOPE": "~"
+        "AHMA_SANDBOX_SCOPE": "/Users/username"
       }
     }
   }
 }
+
+> [!NOTE]
+> Replace `/Users/username` with your actual absolute home or project directory. Tilde expansion may not be supported depending on your MCP client's execution environment.
 ```
 
 ## 2. HTTP Mode (EXPERIMENTAL)

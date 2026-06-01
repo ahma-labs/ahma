@@ -620,4 +620,119 @@ mod tests {
             "error must mention signature mismatch: {err}"
         );
     }
+
+    #[test]
+    fn test_hostname_string() {
+        let orig_host = std::env::var("HOSTNAME").ok();
+        let orig_comp = std::env::var("COMPUTERNAME").ok();
+
+        unsafe {
+            // 1. Hostname with dot
+            std::env::set_var("HOSTNAME", "myhost.");
+            std::env::remove_var("COMPUTERNAME");
+            assert_eq!(hostname_string(), "myhost.");
+
+            // 2. Hostname with internal dot
+            std::env::set_var("HOSTNAME", "myhost.foo.bar");
+            assert_eq!(hostname_string(), "myhost.foo.bar.");
+
+            // 3. Hostname without dot
+            std::env::set_var("HOSTNAME", "myhost");
+            assert_eq!(hostname_string(), "myhost.local.");
+
+            // 4. Fallback to COMPUTERNAME
+            std::env::remove_var("HOSTNAME");
+            std::env::set_var("COMPUTERNAME", "winhost");
+            assert_eq!(hostname_string(), "winhost.local.");
+
+            // Restore env vars
+            if let Some(h) = orig_host {
+                std::env::set_var("HOSTNAME", h);
+            } else {
+                std::env::remove_var("HOSTNAME");
+            }
+            if let Some(c) = orig_comp {
+                std::env::set_var("COMPUTERNAME", c);
+            } else {
+                std::env::remove_var("COMPUTERNAME");
+            }
+        }
+    }
+
+    #[test]
+    fn test_mdns_info_to_peer() {
+        let mut properties = HashMap::new();
+        properties.insert("id".to_owned(), "node-abc".to_owned());
+        properties.insert("models".to_owned(), "gemma,llama3.2".to_owned());
+
+        let info = ServiceInfo::new(
+            MDNS_SERVICE_TYPE,
+            "node-abc",
+            "mymac.local.",
+            "192.168.1.50",
+            8000,
+            Some(properties),
+        )
+        .expect("failed to create ServiceInfo");
+
+        let peer = mdns_info_to_peer(&info).expect("conversion failed");
+        assert_eq!(peer.id, "node-abc");
+        assert_eq!(peer.addr, "http://192.168.1.50:8000");
+        assert_eq!(peer.models, vec!["gemma", "llama3.2"]);
+        assert!(peer.reachable);
+        assert!(peer.capabilities.is_none());
+
+        // Test with empty properties fallback to instance name
+        let info_no_props = ServiceInfo::new(
+            MDNS_SERVICE_TYPE,
+            "node-fallback",
+            "mymac.local.",
+            "192.168.1.50",
+            8000,
+            None::<HashMap<String, String>>,
+        )
+        .expect("failed to create ServiceInfo");
+        let peer_no_props = mdns_info_to_peer(&info_no_props).expect("conversion failed");
+        assert_eq!(peer_no_props.id, "node-fallback");
+    }
+
+    #[test]
+    fn test_load_static_peers() {
+        let temp = tempfile::tempdir().unwrap();
+        let ahma_dir = temp.path().join(".ahma").join("cluster");
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+
+        let peers_json = r#"[
+            {
+                "id": "static-peer-1",
+                "addr": "http://10.0.0.10:9000",
+                "models": ["gemma"],
+                "active_ops": 0,
+                "reachable": true
+            }
+        ]"#;
+        std::fs::write(ahma_dir.join("peers.json"), peers_json).unwrap();
+
+        let orig_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+        }
+
+        let reg = WorkerRegistry::new(60);
+        let count = reg.load_static_peers().unwrap();
+
+        unsafe {
+            if let Some(h) = orig_home {
+                std::env::set_var("HOME", h);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+
+        assert_eq!(count, 1);
+        let peers = reg.peers_for_model("gemma");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, "static-peer-1");
+        assert_eq!(peers[0].addr, "http://10.0.0.10:9000");
+    }
 }

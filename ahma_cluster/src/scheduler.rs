@@ -456,4 +456,47 @@ mod tests {
             .verify_with_nonce_cache(b"correct-key", &cache)
             .expect("correct-key retry must succeed after failed wrong-key attempt");
     }
+
+    #[tokio::test]
+    async fn test_scheduler_schedule_success() {
+        use tokio::net::TcpListener;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0; 1024];
+                let _ = stream.read(&mut buf).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 76\r\nConnection: close\r\n\r\n{\"task_id\":\"t1\",\"text\":\"scheduler success\",\"success\":true,\"worker_id\":\"node-a\"}\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let reg = WorkerRegistry::new(60);
+        let peer = PeerInfo {
+            id: "node-a".to_string(),
+            addr: format!("http://127.0.0.1:{port}"),
+            models: vec!["gemma:4b".to_string()],
+            active_ops: 0,
+            reachable: true,
+            capabilities: None,
+        };
+        reg.upsert(peer);
+
+        let shared_key = b"cluster-key".to_vec();
+        let scheduler = ClusterScheduler::new(reg, shared_key)
+            .with_transport(vec![TransportMode::Http1], None);
+
+        let manifest = base_manifest();
+        let result = scheduler.schedule(manifest).await.expect("scheduling failed");
+
+        assert_eq!(result.task_id, "t1");
+        assert_eq!(result.text, "scheduler success");
+        assert!(result.success);
+        assert_eq!(result.worker_id, "node-a");
+    }
 }

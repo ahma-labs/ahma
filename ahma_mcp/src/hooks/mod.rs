@@ -141,7 +141,7 @@ impl HookPlatform {
             Self::Cursor => "Cursor",
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
-            Self::Copilot => "GitHub Copilot",
+            Self::Copilot => "GitHub Copilot CLI",
             Self::Antigravity => "Antigravity",
         }
     }

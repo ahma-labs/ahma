@@ -93,8 +93,8 @@ impl Platform {
             Platform::ClaudeCode => "Claude Code",
             Platform::Codex => "Codex",
             Platform::Cursor => "Cursor",
-            Platform::Copilot => "GitHub Copilot",
-            Platform::VsCode => "VS Code",
+            Platform::Copilot => "GitHub Copilot CLI",
+            Platform::VsCode => "VS Code (GitHub Copilot Chat)",
         }
     }
 
@@ -130,7 +130,7 @@ impl Platform {
             Platform::VsCode => {
                 if let Some(path) = vscode_mcp_path() {
                     merge_mcp_json(&path, "servers", servers_entry.clone())?;
-                    return Ok(Some("VS Code"));
+                    return Ok(Some("VS Code (GitHub Copilot Chat)"));
                 }
             }
             Platform::ClaudeCode => {
@@ -298,25 +298,52 @@ fn prompt_multi_select(question: &str, options: &[&str], default: &str) -> Vec<u
     parse_selection_string(&input, options.len())
 }
 
-fn default_all_selection(count: usize) -> String {
-    (1..=count)
-        .map(|n| n.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
+fn default_all_selection(_count: usize) -> String {
+    "all".to_string()
 }
 
 fn parse_selection_string(input: &str, max_val: usize) -> Vec<usize> {
+    let input_trimmed = input.trim();
+    if input_trimmed.eq_ignore_ascii_case("all") {
+        return (0..max_val).collect();
+    }
+
     let mut selections = Vec::new();
-    let normalized = input.replace(',', " ");
-    for part in normalized.split_whitespace() {
-        if let Some(num) = part
-            .parse::<usize>()
-            .ok()
-            .filter(|&n| n >= 1 && n <= max_val)
-        {
-            selections.push(num - 1);
+
+    // Check if the input is purely numeric digits without any spaces or other separator characters
+    let is_pure_digits =
+        !input_trimmed.is_empty() && input_trimmed.chars().all(|c| c.is_ascii_digit());
+
+    if is_pure_digits && max_val < 10 {
+        // If it's a sequence of digits and max_val is single-digit, treat each digit as a selection
+        for c in input_trimmed.chars() {
+            if let Some(digit) = c.to_digit(10) {
+                let num = digit as usize;
+                if num >= 1 && num <= max_val {
+                    let idx = num - 1;
+                    if !selections.contains(&idx) {
+                        selections.push(idx);
+                    }
+                }
+            }
+        }
+    } else {
+        // Otherwise, normalize common separators (comma, dot, semicolon) to spaces and split
+        let normalized = input_trimmed.replace([',', '.', ';'], " ");
+        for part in normalized.split_whitespace() {
+            if let Some(num) = part
+                .parse::<usize>()
+                .ok()
+                .filter(|&n| n >= 1 && n <= max_val)
+            {
+                let idx = num - 1;
+                if !selections.contains(&idx) {
+                    selections.push(idx);
+                }
+            }
         }
     }
+
     selections
 }
 
@@ -356,7 +383,7 @@ fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
     })
 }
 
-fn build_antigravity_servers_entry(transport: &str) -> serde_json::Value {
+fn build_antigravity_servers_entry(transport: &str, home: &Path) -> serde_json::Value {
     if let Some(url) = mcp_shared_transport_url(transport) {
         return json!({ "url": url });
     }
@@ -371,7 +398,7 @@ fn build_antigravity_servers_entry(transport: &str) -> serde_json::Value {
             "--log-monitor"
         ],
         "env": {
-            "AHMA_SANDBOX_SCOPE": "~"
+            "AHMA_SANDBOX_SCOPE": home.to_string_lossy().to_string()
         }
     })
 }
@@ -420,7 +447,7 @@ async fn setup_mcp_config(
     let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
     let servers_entry = build_mcp_servers_entry(transport);
-    let ant_servers_entry = build_antigravity_servers_entry(transport);
+    let ant_servers_entry = build_antigravity_servers_entry(transport, &home);
 
     let mut configured = Vec::new();
 
@@ -697,5 +724,23 @@ mod tests {
             Some("http://localhost:3000/mcp")
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_parse_selection_string() {
+        assert_eq!(parse_selection_string("all", 5), vec![0, 1, 2, 3, 4]);
+        assert_eq!(parse_selection_string("ALL", 3), vec![0, 1, 2]);
+        assert_eq!(parse_selection_string("135", 5), vec![0, 2, 4]);
+        assert_eq!(parse_selection_string("1 3 5", 5), vec![0, 2, 4]);
+        assert_eq!(parse_selection_string("1,3.5", 5), vec![0, 2, 4]);
+        assert_eq!(parse_selection_string("1;3;5", 5), vec![0, 2, 4]);
+        assert_eq!(parse_selection_string("1, 2 , 3", 3), vec![0, 1, 2]);
+        assert_eq!(parse_selection_string("12", 2), vec![0, 1]);
+        assert_eq!(parse_selection_string("0 1 6", 5), vec![0]);
+    }
+
+    #[test]
+    fn test_default_all_selection() {
+        assert_eq!(default_all_selection(5), "all");
     }
 }
