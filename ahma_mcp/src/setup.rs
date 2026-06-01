@@ -29,47 +29,71 @@ fn prompt_transport() -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+enum McpPlatform {
+    Antigravity,
+    ClaudeCode,
+    CodexCli,
+    Cursor,
+    VsCode,
+}
+
+/// MCP platform options in alphabetical order for uniform presentation.
+const MCP_PLATFORMS: &[McpPlatform] = &[
+    McpPlatform::Antigravity,
+    McpPlatform::ClaudeCode,
+    McpPlatform::CodexCli,
+    McpPlatform::Cursor,
+    McpPlatform::VsCode,
+];
+
+impl McpPlatform {
+    fn label(self) -> &'static str {
+        match self {
+            McpPlatform::Antigravity => "Antigravity",
+            McpPlatform::ClaudeCode => "Claude Code",
+            McpPlatform::CodexCli => "Codex CLI",
+            McpPlatform::Cursor => "Cursor",
+            McpPlatform::VsCode => "VS Code",
+        }
+    }
+}
+
 fn configure_mcp_platform(
-    idx: usize,
+    platform: McpPlatform,
     transport: &str,
     servers_entry: &serde_json::Value,
     ant_servers_entry: &serde_json::Value,
     home: &Path,
 ) -> Result<Option<&'static str>> {
-    match idx {
-        0 => {
-            // VS Code
+    match platform {
+        McpPlatform::VsCode => {
             if let Some(path) = vscode_mcp_path() {
                 merge_mcp_json(&path, "servers", servers_entry.clone())?;
                 return Ok(Some("VS Code"));
             }
         }
-        1 => {
-            // Claude Code
+        McpPlatform::ClaudeCode => {
             let path = home.join(".claude.json");
             merge_mcp_json(&path, "mcpServers", servers_entry.clone())?;
             return Ok(Some("Claude Code"));
         }
-        2 => {
-            // Cursor
+        McpPlatform::Cursor => {
             let path = home.join(".cursor").join("mcp.json");
             merge_mcp_json(&path, "mcpServers", servers_entry.clone())?;
             return Ok(Some("Cursor"));
         }
-        3 => {
-            // Antigravity
+        McpPlatform::Antigravity => {
             let path = home.join(".gemini").join("config").join("mcp_config.json");
             merge_mcp_json(&path, "mcpServers", ant_servers_entry.clone())?;
             return Ok(Some("Antigravity"));
         }
-        4 => {
-            // Codex CLI
+        McpPlatform::CodexCli => {
             let path = home.join(".codex").join("config.toml");
             let toml_val = build_codex_toml_value(transport);
             merge_codex_toml(&path, toml_val)?;
             return Ok(Some("Codex CLI"));
         }
-        _ => {}
     }
     Ok(None)
 }
@@ -105,7 +129,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     if !args.mcp && !args.skills && !args.tls {
         let configure_hooks = if interactive {
             prompt_yes_no(
-                "Install user-scoped terminal hooks for Cursor, Claude Code, Codex, and GitHub Copilot?",
+                "Install user-scoped terminal hooks for Antigravity, Claude Code, Codex, Cursor, and GitHub Copilot?",
                 false,
             )
         } else {
@@ -185,6 +209,13 @@ fn prompt_multi_select(question: &str, options: &[&str], default: &str) -> Vec<u
     parse_selection_string(&input, options.len())
 }
 
+fn default_all_selection(count: usize) -> String {
+    (1..=count)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn parse_selection_string(input: &str, max_val: usize) -> Vec<usize> {
     let mut selections = Vec::new();
     let normalized = input.replace(',', " ");
@@ -219,22 +250,17 @@ fn vscode_mcp_path() -> Option<PathBuf> {
 async fn setup_mcp_config(interactive: bool) -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
-    let platforms = vec![
-        "VS Code",
-        "Claude Code",
-        "Cursor",
-        "Antigravity",
-        "Codex CLI",
-    ];
+    let platform_labels: Vec<&str> = MCP_PLATFORMS.iter().map(|p| p.label()).collect();
+    let default_selection = default_all_selection(MCP_PLATFORMS.len());
 
     let selected = if interactive {
         prompt_multi_select(
             "Select platforms to configure (comma-separated numbers):",
-            &platforms,
-            "1,2,3,4,5",
+            &platform_labels,
+            &default_selection,
         )
     } else {
-        vec![0, 1, 2, 3, 4]
+        (0..MCP_PLATFORMS.len()).collect()
     };
 
     if selected.is_empty() {
@@ -299,10 +325,16 @@ async fn setup_mcp_config(interactive: bool) -> Result<()> {
     let mut configured = Vec::new();
 
     for idx in selected {
-        if let Some(name) =
-            configure_mcp_platform(idx, transport, &servers_entry, &ant_servers_entry, &home)?
-        {
-            configured.push(name);
+        if let Some(platform) = MCP_PLATFORMS.get(idx) {
+            if let Some(name) = configure_mcp_platform(
+                *platform,
+                transport,
+                &servers_entry,
+                &ant_servers_entry,
+                &home,
+            )? {
+                configured.push(name);
+            }
         }
     }
 
@@ -429,34 +461,58 @@ fn merge_codex_toml(path: &Path, value: toml::Value) -> Result<()> {
     Ok(())
 }
 
-fn platform_from_index(idx: usize) -> Option<(HookPlatform, &'static str)> {
-    match idx {
-        0 => Some((HookPlatform::Cursor, "Cursor")),
-        1 => Some((HookPlatform::Claude, "Claude Code")),
-        2 => Some((HookPlatform::Codex, "Codex")),
-        3 => Some((HookPlatform::Copilot, "GitHub Copilot")),
-        4 => Some((HookPlatform::Antigravity, "Antigravity")),
-        _ => None,
+#[derive(Clone, Copy)]
+enum HookSetupPlatform {
+    Antigravity,
+    ClaudeCode,
+    Codex,
+    Cursor,
+    Copilot,
+}
+
+/// Hook platform options in alphabetical order for uniform presentation.
+const HOOK_PLATFORMS: &[HookSetupPlatform] = &[
+    HookSetupPlatform::Antigravity,
+    HookSetupPlatform::ClaudeCode,
+    HookSetupPlatform::Codex,
+    HookSetupPlatform::Cursor,
+    HookSetupPlatform::Copilot,
+];
+
+impl HookSetupPlatform {
+    fn label(self) -> &'static str {
+        match self {
+            HookSetupPlatform::Antigravity => "Antigravity",
+            HookSetupPlatform::ClaudeCode => "Claude Code",
+            HookSetupPlatform::Codex => "Codex",
+            HookSetupPlatform::Cursor => "Cursor",
+            HookSetupPlatform::Copilot => "GitHub Copilot",
+        }
+    }
+
+    fn hook_platform(self) -> HookPlatform {
+        match self {
+            HookSetupPlatform::Antigravity => HookPlatform::Antigravity,
+            HookSetupPlatform::ClaudeCode => HookPlatform::Claude,
+            HookSetupPlatform::Codex => HookPlatform::Codex,
+            HookSetupPlatform::Cursor => HookPlatform::Cursor,
+            HookSetupPlatform::Copilot => HookPlatform::Copilot,
+        }
     }
 }
 
 async fn setup_terminal_hooks(interactive: bool) -> Result<()> {
-    let tools = vec![
-        "Cursor",
-        "Claude Code",
-        "Codex",
-        "GitHub Copilot",
-        "Antigravity",
-    ];
+    let tool_labels: Vec<&str> = HOOK_PLATFORMS.iter().map(|p| p.label()).collect();
+    let default_selection = default_all_selection(HOOK_PLATFORMS.len());
 
     let selected = if interactive {
         prompt_multi_select(
             "Select platforms to configure hooks (comma-separated numbers):",
-            &tools,
-            "1,2,3,4,5",
+            &tool_labels,
+            &default_selection,
         )
     } else {
-        vec![0, 1, 2, 3, 4]
+        (0..HOOK_PLATFORMS.len()).collect()
     };
 
     if selected.is_empty() {
@@ -467,9 +523,9 @@ async fn setup_terminal_hooks(interactive: bool) -> Result<()> {
     let mut names = Vec::new();
 
     for idx in selected {
-        if let Some((platform, name)) = platform_from_index(idx) {
-            platforms.push(platform);
-            names.push(name);
+        if let Some(platform) = HOOK_PLATFORMS.get(idx) {
+            platforms.push(platform.hook_platform());
+            names.push(platform.label());
         }
     }
 
