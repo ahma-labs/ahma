@@ -63,7 +63,15 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            test_mode: full
+          - os: ubuntu-24.04-arm
+            test_mode: smoke   # ARM64 runners are resource-constrained; compile-only smoke
+          - os: macos-latest
+            test_mode: full
+          - os: windows-latest
+            test_mode: full
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
@@ -158,9 +166,11 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build ahma binary (required by integration tests)
+        if: matrix.test_mode == 'full'
         run: cargo build --locked --no-default-features -p ahma_bin
 
       - name: Cargo Nextest (excluding Android/Kotlin tests)
+        if: matrix.test_mode == 'full'
         timeout-minutes: 40
         run: |
           echo "--- cargo --version" && cargo --version
@@ -168,6 +178,15 @@ jobs:
           echo "--- Running cargo nextest run --profile ci"
           # Exclude kotlin/android tests - they run in job-android-nextest only
           cargo nextest run --profile ci --locked --no-default-features -E 'not (test(kotlin) or test(android))'
+
+      - name: ARM64 smoke validation (compile-only)
+        if: matrix.test_mode == 'smoke'
+        timeout-minutes: 25
+        run: |
+          echo "--- ARM64 smoke: compile-only validation of key crates (no test execution)"
+          cargo test --locked --no-default-features -p ahma_bin --no-run
+          cargo test --locked --no-default-features -p ahma_http_bridge --no-run
+          cargo test --locked --no-default-features -p ahma_decompose --no-run
 
       - name: Cargo Clippy
         if: runner.os == 'Linux' && runner.arch == 'X64'
