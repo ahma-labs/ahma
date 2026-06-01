@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.9.3
+version: 0.10.0
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -18,7 +18,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.9.3 | author: Paul Houghton -->
+<!-- version: 0.10.0 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -439,7 +439,7 @@ Full reference: [environment-variables.md](https://github.com/paulirotta/ahma/bl
 ahma serve stdio [--tools rust,git] [--tmp] [--log-monitor]
 
 # Start HTTP server (local development, multiple clients)
-ahma serve http [--port 3000] [--host 127.0.0.1] [--disable-quic]
+ahma serve http [--port 3000] [--host 0.10.0.1] [--disable-quic]
 
 # Start Unix socket server (IPC / Kubernetes sidecars)
 ahma serve unix [--socket-path /tmp/ahma.sock]

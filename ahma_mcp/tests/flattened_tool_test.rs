@@ -54,7 +54,7 @@ async fn test_flattened_tool_calling() -> Result<()> {
         eprintln!("WARNING  test_flattened_tool_calling: list_tools failed: {e}. Skipping.");
         e
     })?;
-    let tool_names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
+    let tool_names: Vec<_> = tools.iter().map(|t| t.name.as_ref() as &str).collect();
 
     assert!(
         tool_names.contains(&"file-tools_hello"),

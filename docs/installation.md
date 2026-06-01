@@ -110,21 +110,23 @@ For sandbox behavior and day-to-day usage, see [README.md](../README.md) and [se
 
 ## Release verification
 
-Official prebuilt binaries are cryptographically signed during the release pipeline. The installer script downloads the release manifest (`SHA256SUMS`) and its signature (`SHA256SUMS.sig`), verifying the authenticity of the manifest before comparing the local binary's SHA-256 hash against it.
+Official prebuilt binaries are attested with **GitHub Build Provenance Attestations**
+(Sigstore SLSA Level 3). The installer script verifies the Sigstore attestation after
+download — no embedded keys, no rotation, no private secrets.
 
-You can manually trigger release signature verification of your currently installed binary at any time.
-
-**Linux / macOS:**
+Verify your installed binary at any time:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash -s -- --verify
+ahma verify --self
 ```
 
-**Windows (PowerShell):**
+Or use the `gh` CLI for out-of-band verification:
 
-```powershell
-$Mode = "verify"; irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
+```bash
+gh attestation verify ahma-release-linux-x86_64.tar.gz --repo paulirotta/ahma
 ```
+
+See [docs/release-signing.md](release-signing.md) for the full trust model.
 
 ### Release signing and key rotation
 

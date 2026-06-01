@@ -17,7 +17,7 @@ async fn test_list_tools() -> Result<()> {
 
     // Should have at least the built-in 'await' tool
     assert!(!result.is_empty());
-    let tool_names: Vec<_> = result.iter().map(|t| t.name.as_ref()).collect();
+    let tool_names: Vec<_> = result.iter().map(|t| t.name.as_ref() as &str).collect();
     assert!(tool_names.contains(&"await"));
     Ok(())
 }

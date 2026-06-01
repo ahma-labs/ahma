@@ -1322,9 +1322,9 @@ impl ServerHandler for AhmaMcpService {
         params: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
-        let span = tracing::info_span!("call_tool", tool = params.name.as_ref());
+        let span = tracing::info_span!("call_tool", tool = &*params.name);
         async move {
-            match params.name.as_ref() {
+            match params.name.as_ref() as &str {
                 "status" => {
                     self.handle_status(params.arguments.unwrap_or_default())
                         .await
@@ -1367,7 +1367,7 @@ impl AhmaMcpService {
         params: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let tool_name = params.name.as_ref();
+        let tool_name: &str = &params.name;
 
         // Delay tool execution until sandbox is initialized from roots/list.
         // This is critical in HTTP bridge mode with deferred sandbox initialization.
@@ -1428,7 +1428,7 @@ impl AhmaMcpService {
         config: ToolConfig,
         flattened_subcommand: Option<String>,
     ) -> Result<CallToolResult, McpError> {
-        let tool_name = params.name.as_ref().to_string();
+        let tool_name = params.name.to_string();
         let mut arguments = params.arguments.clone().unwrap_or_default();
         let subcommand_name = flattened_subcommand.or_else(|| {
             arguments

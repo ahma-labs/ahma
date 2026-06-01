@@ -5,6 +5,7 @@ mod platform;
 mod ref_mode;
 mod release;
 mod source;
+pub mod verify;
 
 use anyhow::{Context, Result};
 use clap::Args;
@@ -73,15 +74,18 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Skip release cryptographic signature verification (insecure)
-    #[arg(long)]
-    pub insecure_skip_signature: bool,
+    /// Skip Sigstore attestation verification (insecure — for offline/air-gapped use only).
+    ///
+    /// Equivalent to setting `AHMA_INSECURE_SKIP_VERIFY=1`.
+    #[arg(long, alias = "insecure-skip-signature")]
+    pub insecure_skip_verify: bool,
 }
 
 struct UpdateOutcome {
     binary_path: PathBuf,
     binary_changed: bool,
-    signature_verified: Option<bool>,
+    /// `Some(true)` = attestation verified, `Some(false)` = verification skipped, `None` = git install (no attestation).
+    attestation_verified: Option<bool>,
 }
 
 /// Entry point for `ahma update`.
@@ -113,7 +117,7 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
             &outcome.binary_path,
             &install_dir,
             args.dry_run,
-            outcome.signature_verified,
+            outcome.attestation_verified,
         )
         .await;
     }
@@ -125,7 +129,7 @@ async fn run_git_update(branch: &str, install_dir: &Path, dry_run: bool) -> Resu
     Ok(UpdateOutcome {
         binary_path: installed,
         binary_changed: !dry_run,
-        signature_verified: None,
+        attestation_verified: None, // cargo install builds don't have GitHub attestations
     })
 }
 
@@ -135,9 +139,10 @@ async fn run_release_update(
     install_dir: &Path,
     mode: &UpdateMode,
 ) -> Result<UpdateOutcome> {
-    let insecure_skip_signature = args.insecure_skip_signature
-        || std::env::var("AHMA_INSECURE_SKIP_SIGNATURE")
-            .map(|val| val == "1" || val == "true")
+    let insecure_skip_verify = args.insecure_skip_verify
+        || std::env::var("AHMA_INSECURE_SKIP_VERIFY")
+            .or_else(|_| std::env::var("AHMA_INSECURE_SKIP_SIGNATURE"))
+            .map(|val| matches!(val.trim(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
 
     let client = reqwest::Client::builder()
@@ -168,7 +173,7 @@ async fn run_release_update(
             return Ok(UpdateOutcome {
                 binary_path: target,
                 binary_changed: false,
-                signature_verified: Some(!insecure_skip_signature),
+                attestation_verified: Some(!insecure_skip_verify),
             });
         }
         println!("Upgrading ahma from {installed} to {}...", asset.version);
@@ -181,14 +186,14 @@ async fn run_release_update(
         platform,
         install_dir,
         args.dry_run,
-        insecure_skip_signature,
+        insecure_skip_verify,
     )
     .await?;
 
     Ok(UpdateOutcome {
         binary_path: installed,
         binary_changed: !args.dry_run,
-        signature_verified: Some(!insecure_skip_signature),
+        attestation_verified: Some(!insecure_skip_verify),
     })
 }
 
@@ -196,7 +201,7 @@ async fn print_post_install_details(
     installed: &Path,
     install_dir: &Path,
     dry_run: bool,
-    signature_verified: Option<bool>,
+    attestation_verified: Option<bool>,
 ) {
     if dry_run {
         return;
@@ -205,27 +210,24 @@ async fn print_post_install_details(
     let version = read_installed_version(installed).await;
     println!("{}", format_install_success(installed, version.as_deref()));
 
-    if let Some(verified) = signature_verified {
+    if let Some(verified) = attestation_verified {
         if verified {
             println!(
-                "Authenticity verified: Release signature is valid (signed by the official private key)."
+                "Authenticity verified: GitHub Build Provenance Attestation (Sigstore SLSA Level 3) confirmed."
             );
         } else {
-            println!("WARNING: Cryptographic signature verification was bypassed.");
+            println!(
+                "WARNING: Sigstore attestation verification was bypassed (--insecure-skip-verify)."
+            );
         }
     }
 
     println!();
+    println!("Tip: To verify the installed binary against GitHub's attestation API:");
+    println!("  ahma verify --self");
     println!(
-        "Tip: If you suspect your existing local binary was compromised, you can verify it directly using:"
-    );
-    #[cfg(not(windows))]
-    println!(
-        "  curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash -s -- --verify"
-    );
-    #[cfg(windows)]
-    println!(
-        "  $Mode = \"verify\"; irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex"
+        "  # or: gh attestation verify {} --repo paulirotta/ahma",
+        installed.display()
     );
 
     print_path_hint(install_dir);
@@ -429,7 +431,7 @@ mod tests {
         assert!(!args.force);
         assert!(!args.install_hooks);
         assert!(!args.dry_run);
-        assert!(!args.insecure_skip_signature);
+        assert!(!args.insecure_skip_verify);
     }
 
     #[test]

@@ -735,7 +735,7 @@ mod tests {
         let adapter = create_test_config(&workspace).unwrap();
         let params = CallToolRequestParams::new("test".to_string());
         let wd = extract_working_directory(&adapter, &params);
-        assert_eq!(wd, workspace.to_string_lossy().as_ref());
+        assert_eq!(wd, workspace.to_string_lossy().as_ref() as &str);
     }
 
     // ============= find_step_subcommand tests =============
