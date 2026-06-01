@@ -100,7 +100,7 @@ cargo llvm-cov --html
 ```bash
 # Preferred: run multi-step pipelines via run_terminal_command
 ahma run_terminal_command --working-directory . -- \
-  "cargo fmt --all && cargo clippy --all-targets && cargo nextest run"
+  "cargo fmt --all && cargo clippy --fix --allow-dirty && cargo clippy --fix --allow-dirty --tests && cargo clippy --all-targets && cargo nextest run"
 
 # Individual quality checks (direct)
 cargo fmt --all                    # Format code

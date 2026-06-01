@@ -1195,6 +1195,10 @@ pub struct ListArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = list_tools::OutputFormat::Text)]
     pub format: list_tools::OutputFormat,
+
+    /// Command and arguments to run a stdio MCP server (after --).
+    #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+    pub server_args: Vec<String>,
 }
 
 /// Arguments for `ahma tool info`.
@@ -1623,14 +1627,22 @@ struct ToolFields {
 fn extract_tool_fields(cmd: &Subcommands) -> ToolFields {
     if let Subcommands::Tool(ToolArgs { command }) = cmd {
         match command {
-            ToolCommand::List(la) => ToolFields {
-                list_server: la.server.clone(),
-                mcp_config: la.mcp_config.clone(),
-                list_http: la.http.clone(),
-                list_format: la.format.clone(),
-                run_tool: None,
-                run_tool_args: vec![],
-            },
+            ToolCommand::List(la) => {
+                let mut run_tool = None;
+                let mut run_tool_args = vec![];
+                if !la.server_args.is_empty() {
+                    run_tool = Some(la.server_args[0].clone());
+                    run_tool_args = la.server_args[1..].to_vec();
+                }
+                ToolFields {
+                    list_server: la.server.clone(),
+                    mcp_config: la.mcp_config.clone(),
+                    list_http: la.http.clone(),
+                    list_format: la.format.clone(),
+                    run_tool,
+                    run_tool_args,
+                }
+            }
             ToolCommand::Run(r) => ToolFields {
                 list_server: None,
                 mcp_config: PathBuf::from("mcp.json"),

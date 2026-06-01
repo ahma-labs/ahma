@@ -231,3 +231,106 @@ fn test_list_tools_output_format() {
         stderr
     );
 }
+
+/// Test that we can list tools by running a command directly via trailing args
+#[test]
+fn test_list_tools_trailing_args() {
+    let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let ahma_binary = get_ahma_mcp_binary();
+    let tools_dir = project_root.join(".ahma");
+
+    // Check if pre-built binary exists
+    if !ahma_binary.exists() {
+        let build_output = Command::new("cargo")
+            .args(["build", "-p", "ahma_mcp"])
+            .output()
+            .expect("Failed to build");
+        assert!(build_output.status.success(), "Failed to build");
+    }
+
+    // Run ahma tool list -- <command>
+    let output = Command::new(&ahma_binary)
+        .args([
+            "tool",
+            "list",
+            "--",
+            ahma_binary.to_str().unwrap(),
+            "serve",
+            "stdio",
+        ])
+        .env("AHMA_DISABLE_SANDBOX", "1")
+        .env("AHMA_SKIP_PROBES", "1")
+        .env("AHMA_TOOLS_DIR", tools_dir.to_str().unwrap())
+        .current_dir(&project_root)
+        .output()
+        .expect("Failed to execute ahma tool list with trailing args");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        eprintln!("stdout: {}", stdout);
+        eprintln!("stderr: {}", stderr);
+    }
+
+    assert!(output.status.success());
+    assert!(
+        stdout.contains("Tool:") || stdout.contains("tools"),
+        "Output should contain tool listings. stdout: {}, stderr: {}",
+        stdout,
+        stderr
+    );
+}
+
+/// Test that run_list_tools_mode exits with the new helpful suggestions
+/// when no connection method is specified
+#[test]
+fn test_list_tools_no_connection_suggestions() {
+    let ahma_binary = get_ahma_mcp_binary();
+
+    // Check if pre-built binary exists
+    if !ahma_binary.exists() {
+        let build_output = Command::new("cargo")
+            .args(["build", "-p", "ahma_mcp"])
+            .output()
+            .expect("Failed to build");
+        assert!(build_output.status.success(), "Failed to build");
+    }
+
+    // Create a temp directory to run from so no mcp.json is found
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+
+    let output = Command::new(&ahma_binary)
+        .args([
+            "tool",
+            "list",
+            "--mcp-config",
+            "nonexistent-mcp.json", // Ensure it doesn't fall back to an existing mcp.json
+        ])
+        .env("AHMA_DISABLE_SANDBOX", "1")
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("Failed to execute ahma tool list");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("No connection method specified for tool list"),
+        "Stderr should contain the error, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Suggestions:"),
+        "Stderr should contain Suggestions section, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("ahma tool info"),
+        "Stderr should suggest ahma tool info, got: {}",
+        stderr
+    );
+}

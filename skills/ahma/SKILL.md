@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.9.2
+version: 0.9.3
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -18,7 +18,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.9.2 | author: Paul Houghton -->
+<!-- version: 0.9.3 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -530,6 +530,7 @@ The `/ahma` skill supports these user-invocable subcommands in chat:
 | Command | Alias | Purpose |
 |---------|-------|---------|
 | `/ahma help` | `/ahma ?` | List all available subcommands and their usage |
+| `/ahma tool list` | `/ahma tools` | Show all available tools in the current project |
 | `/ahma simplify` | — | Auto-fix top 10 complexity issues concurrently via subagents |
 | `/ahma simplify top N` | — | Auto-fix top N complexity issues concurrently |
 | `/ahma simplify N` | — | Get fix instructions for issue #N only (manual mode) |
@@ -546,6 +547,7 @@ user-invocable subcommands and a one-line description of each:
 ```
 /ahma help              — Show this help list
 /ahma ?                 — Alias for /ahma help
+/ahma tool list         — Show all available tools in the current project
 /ahma simplify          — Auto-fix top 10 complexity issues concurrently via subagents
 /ahma simplify top 5    — Auto-fix top 5 issues concurrently
 /ahma simplify 3        — Manual mode: get fix instructions for issue #3 only
@@ -555,6 +557,25 @@ user-invocable subcommands and a one-line description of each:
 ```
 
 Also mention the key flags for configure, e.g., `--tools`, `--tmp`, `--log-monitor`.
+
+---
+
+## `/ahma tool list` — List Configured Tools
+
+### Syntax
+
+```
+/ahma tool list
+/ahma tools
+```
+
+### Workflow
+
+When the user runs `/ahma tool list` or `/ahma tools`, the agent lists all configured tools (both built-in bundles and local `.ahma/` configurations).
+
+To list them, the agent:
+1. Loads the tool configurations using `ahma tool info`.
+2. Presents them in a clean markdown table, showing the tool name, description, and available subcommands.
 
 ---
 
