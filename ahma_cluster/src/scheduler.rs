@@ -459,8 +459,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_schedule_success() {
-        use tokio::net::TcpListener;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -489,11 +489,14 @@ mod tests {
         reg.upsert(peer);
 
         let shared_key = b"cluster-key".to_vec();
-        let scheduler = ClusterScheduler::new(reg, shared_key)
-            .with_transport(vec![TransportMode::Http1], None);
+        let scheduler =
+            ClusterScheduler::new(reg, shared_key).with_transport(vec![TransportMode::Http1], None);
 
         let manifest = base_manifest();
-        let result = scheduler.schedule(manifest).await.expect("scheduling failed");
+        let result = scheduler
+            .schedule(manifest)
+            .await
+            .expect("scheduling failed");
 
         assert_eq!(result.task_id, "t1");
         assert_eq!(result.text, "scheduler success");
