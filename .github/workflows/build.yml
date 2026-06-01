@@ -479,10 +479,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
             platform: linux-x86_64
             use_cross: false
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            platform: linux-arm64
-            use_cross: false
           - os: macos-latest
             target: aarch64-apple-darwin
             platform: darwin-arm64
@@ -492,6 +488,15 @@ jobs:
             target: x86_64-pc-windows-msvc
             platform: windows-x86_64
             use_cross: false
+          # Cross-compiled aarch64 glibc build.
+          # We deliberately do NOT build natively on `ubuntu-24.04-arm` because
+          # GitHub's hosted ARM64 runners terminate during the heavy release
+          # compilation of this workspace (e.g. `ahma_mcp`), see commit 9a315fc
+          # and the failure of run 26750268775 for prior evidence.
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+            use_cross: true
           # Cross-compiled musl builds (portable, no glibc dependency)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
