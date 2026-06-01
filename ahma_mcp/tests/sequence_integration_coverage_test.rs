@@ -194,7 +194,7 @@ async fn test_sync_sequence_tool_execution() -> Result<()> {
 
     // List tools to verify our sequence tool is loaded
     let tools = mcp.client.list_all_tools().await?;
-    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref() as &str).collect();
 
     assert!(
         tool_names.contains(&"sync_sequence"),
@@ -312,7 +312,7 @@ async fn test_subcommand_sequence_execution() -> Result<()> {
     let tools = mcp.client.list_all_tools().await?;
     let has_multi_step = tools
         .iter()
-        .any(|t| t.name.as_ref().starts_with("multi_step"));
+        .any(|t| (t.name.as_ref() as &str).starts_with("multi_step"));
 
     if has_multi_step {
         // Call the pipeline subcommand which is a sequence
@@ -368,7 +368,7 @@ async fn test_sequence_with_missing_tool_reference() -> Result<()> {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await?;
 
     let tools = mcp.client.list_all_tools().await?;
-    let has_bad_seq = tools.iter().any(|t| t.name.as_ref() == "bad_sequence");
+    let has_bad_seq = tools.iter().any(|t| (t.name.as_ref() as &str) == "bad_sequence");
 
     if has_bad_seq {
         let params = CallToolRequestParams::new(Cow::Borrowed("bad_sequence"))
@@ -436,7 +436,7 @@ async fn test_sequence_skip_if_file_exists() -> Result<()> {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await?;
 
     let tools = mcp.client.list_all_tools().await?;
-    let has_skip_seq = tools.iter().any(|t| t.name.as_ref() == "skip_sequence");
+    let has_skip_seq = tools.iter().any(|t| (t.name.as_ref() as &str) == "skip_sequence");
 
     if has_skip_seq {
         let params = CallToolRequestParams::new(Cow::Borrowed("skip_sequence")).with_arguments(
@@ -513,7 +513,7 @@ async fn test_sequence_skip_if_file_missing_with_default_wd() -> Result<()> {
     let tools = mcp.client.list_all_tools().await?;
     let has_skip_miss_seq = tools
         .iter()
-        .any(|t| t.name.as_ref() == "skip_missing_sequence");
+        .any(|t| (t.name.as_ref() as &str) == "skip_missing_sequence");
 
     if has_skip_miss_seq {
         let params = CallToolRequestParams::new(Cow::Borrowed("skip_missing_sequence"))

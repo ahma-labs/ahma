@@ -15,6 +15,7 @@
 //! ahma tool info [--tools rust,git] [--format json|text] [TOOL]
 //! ahma hooks install [--platform cursor,claude,codex] [--scope user|project]
 //! ahma update [REF] [--force] [--dry-run] [--install-dir PATH]
+//! ahma verify [PATH] [--self]
 //! ```
 //!
 //! Niche options that rarely need changing are controlled via environment variables.
@@ -643,6 +644,10 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in update mode");
             crate::update::run(args).await
         }
+        Subcommands::Verify(args) => {
+            tracing::info!("Running in verify mode");
+            crate::update::verify::run_cli(args).await
+        }
         Subcommands::Setup(args) => {
             tracing::info!("Running in setup mode");
             crate::setup::run(args).await
@@ -795,6 +800,8 @@ pub enum Subcommands {
     Simplify(crate::simplify::SimplifyArgs),
     /// Download or build and install ahma.
     Update(crate::update::UpdateArgs),
+    /// Verify an artifact's GitHub Build Provenance Attestation (Sigstore SLSA Level 3).
+    Verify(crate::update::verify::VerifyArgs),
     /// Run the interactive or automated setup wizard.
     Setup(SetupArgs),
     /// Start the TUI hub daemon for multi-instance aggregation.

@@ -64,7 +64,7 @@ async fn test_client_start_process_with_tools_dir() -> Result<()> {
     let tools = client.list_all_tools().await?;
 
     // Should have default tools available
-    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref() as &str).collect();
     assert!(
         tool_names.contains(&"run_terminal_command")
             || tool_names.contains(&"await")
@@ -374,7 +374,7 @@ async fn test_list_tools_format() -> Result<()> {
     assert!(!tools.is_empty());
 
     // Should contain standard tools
-    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref() as &str).collect();
     assert!(
         tool_names.contains(&"run_terminal_command")
             || tool_names.contains(&"await")
@@ -418,7 +418,7 @@ async fn test_client_with_custom_tools_dir() -> Result<()> {
     assert!(!tools.is_empty());
 
     // Should list the echo tool from custom config or at least the built-in tools
-    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref() as &str).collect();
     assert!(
         tool_names.contains(&"echo") || tool_names.contains(&"await"),
         "Expected tools from config, got: {:?}",

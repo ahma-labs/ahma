@@ -45,6 +45,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 ring = { version = "0.17", features = ["std"] }
 sha2 = "0.10"
+sigstore-verification = { version = "0.2", default-features = false, features = ["rustls"] }
 tar = "0.4"
 tempfile.workspace = true
 zip = "2.4"

@@ -291,7 +291,7 @@ async fn client_has_tool(
     name: &str,
 ) -> Result<bool> {
     let tools: Vec<rmcp::model::Tool> = client.list_all_tools().await?;
-    Ok(tools.iter().any(|t| t.name.as_ref() == name))
+    Ok(tools.iter().any(|t| t.name.as_ref() as &str == name))
 }
 
 /// Test cancel tool with non-existent id
@@ -376,7 +376,7 @@ async fn client_has_tool_prefix(
     prefix: &str,
 ) -> Result<bool> {
     let tools: Vec<rmcp::model::Tool> = client.list_all_tools().await?;
-    Ok(tools.iter().any(|t| t.name.as_ref().starts_with(prefix)))
+    Ok(tools.iter().any(|t| (t.name.as_ref() as &str).starts_with(prefix)))
 }
 
 // ============================================================================
@@ -390,7 +390,7 @@ async fn test_list_tools_includes_builtin_tools() -> Result<()> {
     let mcp = create_in_process_mcp_empty().await?;
 
     let tools = mcp.client.list_all_tools().await?;
-    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref() as &str).collect();
 
     assert!(
         tool_names.contains(&"await"),
@@ -413,7 +413,7 @@ async fn test_list_tools_await_schema() -> Result<()> {
     let tools = mcp.client.list_all_tools().await?;
     let await_tool = tools
         .iter()
-        .find(|t| t.name.as_ref() == "await")
+        .find(|t| t.name.as_ref() as &str == "await")
         .expect("Should find await tool");
 
     assert!(
@@ -439,7 +439,7 @@ async fn test_list_tools_status_schema() -> Result<()> {
     let tools = mcp.client.list_all_tools().await?;
     let status_tool = tools
         .iter()
-        .find(|t| t.name.as_ref() == "status")
+        .find(|t| t.name.as_ref() as &str == "status")
         .expect("Should find status tool");
 
     assert!(

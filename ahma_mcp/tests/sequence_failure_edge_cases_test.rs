@@ -181,12 +181,12 @@ async fn test_sequence_step_failure_stops_subsequent_steps() -> Result<()> {
 
     // List tools to verify our sequence is loaded
     let tools = mcp.client.list_all_tools().await?;
-    let has_failing_seq = tools.iter().any(|t| t.name.as_ref() == "failing_sequence");
+    let has_failing_seq = tools.iter().any(|t| t.name.as_ref() as &str == "failing_sequence");
 
     assert!(
         has_failing_seq,
         "Should have failing_sequence tool loaded. Available: {:?}",
-        tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>()
+        tools.iter().map(|t| t.name.as_ref() as &str).collect::<Vec<_>>()
     );
 
     // Call the failing sequence
@@ -246,7 +246,7 @@ async fn test_sequence_with_missing_subcommand_reference() -> Result<()> {
     let tools = mcp.client.list_all_tools().await?;
     let has_seq = tools
         .iter()
-        .any(|t| t.name.as_ref() == "missing_subcommand_seq");
+        .any(|t| t.name.as_ref() as &str == "missing_subcommand_seq");
 
     if !has_seq {
         // Tool might not load due to validation - this is also acceptable behavior
@@ -346,7 +346,7 @@ async fn test_sequence_failure_with_filesystem_markers() -> Result<()> {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await?;
 
     let tools = mcp.client.list_all_tools().await?;
-    let has_marker_seq = tools.iter().any(|t| t.name.as_ref() == "marker_sequence");
+    let has_marker_seq = tools.iter().any(|t| t.name.as_ref() as &str == "marker_sequence");
 
     if !has_marker_seq {
         eprintln!("marker_sequence not loaded, skipping filesystem marker test");
@@ -415,7 +415,7 @@ async fn test_empty_sequence_handling() -> Result<()> {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await?;
 
     let tools = mcp.client.list_all_tools().await?;
-    let has_empty_seq = tools.iter().any(|t| t.name.as_ref() == "empty_sequence");
+    let has_empty_seq = tools.iter().any(|t| t.name.as_ref() as &str == "empty_sequence");
 
     if has_empty_seq {
         let params = CallToolRequestParams::new("empty_sequence")

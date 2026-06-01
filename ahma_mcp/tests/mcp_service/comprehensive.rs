@@ -17,7 +17,7 @@ async fn test_hardcoded_tools_listing() -> Result<()> {
 
     // Should have the hardcoded tools (await, status)
     assert!(!result.is_empty());
-    let tool_names: Vec<_> = result.iter().map(|t| t.name.as_ref()).collect();
+    let tool_names: Vec<_> = result.iter().map(|t| t.name.as_ref() as &str).collect();
 
     // Verify hardcoded tools are present
     assert!(tool_names.contains(&"await"));

@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 
 use super::platform::{ArchiveFormat, Platform};
 use super::release::{ReleaseAsset, parse_checksum_line};
+use super::verify;
 
 /// Install a release archive into `install_dir`.
 pub async fn install_release_asset(
@@ -16,7 +17,7 @@ pub async fn install_release_asset(
     platform: &Platform,
     install_dir: &Path,
     dry_run: bool,
-    insecure_skip_signature: bool,
+    insecure_skip_verify: bool,
 ) -> Result<PathBuf> {
     let temp_dir = tempfile::tempdir().context("Failed to create temporary directory")?;
     let archive_path = temp_dir.path().join(&asset.asset_name);
@@ -30,13 +31,23 @@ pub async fn install_release_asset(
     println!("Downloading {}...", asset.download_url);
     download_file(client, &asset.download_url, &archive_path).await?;
 
-    if let Some(expected) =
-        fetch_archive_checksum(client, asset, platform, insecure_skip_signature).await?
-    {
+    // Sanity-check the archive hash against the SHA256SUMS manifest (defense in depth).
+    if let Some(expected) = fetch_archive_checksum(client, asset, platform).await? {
         verify_file_checksum(&archive_path, &expected)?;
         println!("Checksum verified.");
     } else {
-        eprintln!("Warning: no SHA256 checksum found; skipping verification.");
+        eprintln!("Warning: no SHA256 checksum found in release manifest; skipping hash check.");
+    }
+
+    // Cryptographic verification: confirm the archive has a valid GitHub Build Provenance
+    // Attestation (Sigstore SLSA Level 3) from the official paulirotta/ahma pipeline.
+    if !insecure_skip_verify {
+        verify::verify_artifact(&archive_path)
+            .await
+            .context("Release attestation verification failed; aborting install")?;
+        println!("Attestation verified: archive was built by the official CI pipeline.");
+    } else {
+        eprintln!("WARNING: Sigstore attestation verification skipped (--insecure-skip-verify).");
     }
 
     let extracted = extract_archive(&archive_path, platform, temp_dir.path()).await?;
@@ -73,14 +84,15 @@ async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Resu
     Ok(())
 }
 
+/// Fetch the expected SHA256 hash for the release archive from the combined SHA256SUMS manifest.
+///
+/// Returns `None` if the manifest is unavailable (older release or network issue).
+/// Cryptographic verification is handled separately by [`verify::verify_artifact`].
 async fn fetch_archive_checksum(
     client: &reqwest::Client,
     asset: &ReleaseAsset,
     platform: &Platform,
-    insecure_skip_signature: bool,
 ) -> Result<Option<String>> {
-    // Per-archive SHA256SUMS is bundled inside the release archive; for pre-check we
-    // attempt the combined root SHA256SUMS published alongside release assets.
     let sums_url = asset
         .download_url
         .rsplit_once('/')
@@ -98,29 +110,6 @@ async fn fetch_archive_checksum(
     }
 
     let body = response.text().await.unwrap_or_default();
-
-    if insecure_skip_signature {
-        eprintln!("WARNING: Skipping cryptographic release signature verification!");
-    } else {
-        let sig_url = format!("{sums_url}.sig");
-        let sig_response = client.get(&sig_url).send().await?;
-        if !sig_response.status().is_success() {
-            bail!(
-                "Failed to download release signature file from {sig_url} (HTTP {}).\n\
-                 This might be because the release is unsigned or the signing key is not configured.\n\
-                 If you trust this build and wish to bypass, use --insecure-skip-signature.",
-                sig_response.status()
-            );
-        }
-        let sig_bytes = sig_response.bytes().await?;
-
-        // Cryptographically verify signature
-        verify_release_signature(body.as_bytes(), &sig_bytes)?;
-        println!(
-            "Release signature verified: SHA256SUMS.sig is signed by the official private key."
-        );
-    }
-
     let binary_name = platform.binary_name();
     for line in body.lines() {
         if let Some(hash) = parse_checksum_line(line, &asset.asset_name) {
@@ -273,39 +262,6 @@ pub async fn read_installed_version(binary: &Path) -> Option<String> {
     text.split_whitespace().nth(1).map(str::to_string)
 }
 
-const PUB_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5veFxEchlM3iyFx8BQzs
-f+yn6ZNJygRwfOfLS901Rxm/I3YRwn2Jksyp2bVckjgDeGJVK7IPGaHe1dL7+Ljn
-5V3zvU9B7CLeeIGdZRRngV/n6r+dsGy0FWQIcN/+dfKPWvhz4m/4QMTLXL05WK8j
-iI/Qatp2Fs32CUJTJ6NpIDQZi4xd1xhQbF/jk2+pwgwpup7kAVKPa49QegFQEQcS
-i8duqBKX2ynTA6QhknBX1fY+6vEFLh6uMePjzGyHLax8mMg8sk2WU59bgMGgtPPy
-le7gp692r3UaP9YgzuNDTyDSoU4gJmOOYYAtMWkNOyD2Bcr8JndwPXG0CD3Hj+j0
-GwIDAQAB
------END PUBLIC KEY-----";
-
-fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
-    let mut base64_content = String::new();
-    for line in pem.lines() {
-        let line = line.trim();
-        if !line.is_empty() && !line.starts_with("-----") {
-            base64_content.push_str(line);
-        }
-    }
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(&base64_content)
-        .context("Failed to decode public key base64")
-}
-
-pub fn verify_release_signature(data: &[u8], sig: &[u8]) -> Result<()> {
-    let der = pem_to_der(PUB_KEY_PEM)?;
-    let public_key =
-        ring::signature::UnparsedPublicKey::new(&ring::signature::RSA_PKCS1_2048_8192_SHA256, &der);
-    public_key
-        .verify(data, sig)
-        .context("Release signature verification failed: SHA256SUMS is NOT signed by the official private key")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,18 +284,17 @@ mod tests {
     }
 
     #[test]
-    fn test_pem_to_der_success() {
-        let der = pem_to_der(PUB_KEY_PEM).unwrap();
-        assert!(!der.is_empty());
-    }
-
-    #[test]
-    fn test_verify_release_signature_fails_on_invalid_sig() {
-        let data = b"some release manifest data";
-        let invalid_sig = b"invalid signature bytes here";
-        let result = verify_release_signature(data, invalid_sig);
+    fn test_verify_file_checksum_fails_on_wrong_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.bin");
+        std::fs::write(&file, b"hello").unwrap();
+        let result = verify_file_checksum(&file, "deadbeefdeadbeefdeadbeefdeadbeef");
         assert!(result.is_err());
-        let err_msg = result.err().unwrap().to_string();
-        assert!(err_msg.contains("verification failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Checksum mismatch")
+        );
     }
 }

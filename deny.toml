@@ -13,8 +13,18 @@ version = 2
 # release in a transitive dep doesn't block the build unexpectedly.
 yanked = "warn"
 ignore = [
-    # paste is unmaintained but ratatui depends on it
-    "RUSTSEC-2024-0436",
+    # rsa 0.9.x has a timing side-channel in private-key operations (Marvin Attack).
+    # No patch is available. Our exposure is read-only: sigstore-verification →
+    # sigstore → openidconnect uses rsa only for JWT *signature verification*
+    # (public-key operations), never decryption with a private key.  The attack
+    # surface is therefore not present in ahma's execution path.
+    { id = "RUSTSEC-2023-0071", reason = "rsa used for public-key JWT verify only via openidconnect; no private-key ops in this path; no fix available upstream" },
+
+    # proc-macro-error 1.x is unmaintained. No fix available.
+    # Pulled transitively: sigstore-verification → sigstore → json-syntax →
+    # locspan-derive → proc-macro-error.  This is a build-time procedural macro
+    # crate; it has no runtime attack surface.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error is a build-time-only proc-macro dep via sigstore transitive chain; unmaintained but no runtime exposure; no fix available upstream" },
 ]
 
 # ---------------------------------------------------------------------------

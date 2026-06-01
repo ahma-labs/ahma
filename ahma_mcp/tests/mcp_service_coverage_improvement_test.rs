@@ -47,7 +47,7 @@ async fn test_schema_generation_normalizes_option_types() {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
     let tools = mcp.client.list_all_tools().await.unwrap();
-    let test_tool = tools.iter().find(|t| t.name.as_ref() == "test_types");
+    let test_tool = tools.iter().find(|t| t.name.as_ref() as &str == "test_types");
     assert!(test_tool.is_some(), "test_types tool should be registered");
 
     let tool = test_tool.unwrap();
@@ -148,7 +148,7 @@ async fn test_schema_generation_array_with_items() {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
     let tools = mcp.client.list_all_tools().await.unwrap();
-    let test_tool = tools.iter().find(|t| t.name.as_ref() == "test_arrays");
+    let test_tool = tools.iter().find(|t| t.name.as_ref() as &str == "test_arrays");
     assert!(test_tool.is_some(), "test_arrays tool should be registered");
 
     let tool = test_tool.unwrap();
@@ -227,7 +227,7 @@ async fn test_schema_generation_positional_args() {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
     let tools = mcp.client.list_all_tools().await.unwrap();
-    let test_tool = tools.iter().find(|t| t.name.as_ref() == "test_positional");
+    let test_tool = tools.iter().find(|t| t.name.as_ref() as &str == "test_positional");
     assert!(
         test_tool.is_some(),
         "test_positional tool should be registered"
@@ -329,13 +329,13 @@ async fn test_schema_generation_multiple_subcommands() {
     // Subcommands are flattened into individual tools: <parent>_<subcommand>
     let build_tool = tools
         .iter()
-        .find(|t| t.name.as_ref() == "test_multi_sub_build");
+        .find(|t| t.name.as_ref() as &str == "test_multi_sub_build");
     let test_tool = tools
         .iter()
-        .find(|t| t.name.as_ref() == "test_multi_sub_test");
+        .find(|t| t.name.as_ref() as &str == "test_multi_sub_test");
     let run_tool = tools
         .iter()
-        .find(|t| t.name.as_ref() == "test_multi_sub_run");
+        .find(|t| t.name.as_ref() as &str == "test_multi_sub_run");
 
     assert!(
         build_tool.is_some(),
@@ -428,10 +428,10 @@ async fn test_schema_generation_nested_subcommands() {
     // Nested subcommands flatten to <parent>_<sub>_<child> tools
     let child1_tool = tools
         .iter()
-        .find(|t| t.name.as_ref() == "test_nested_parent_child1");
+        .find(|t| t.name.as_ref() as &str == "test_nested_parent_child1");
     let child2_tool = tools
         .iter()
-        .find(|t| t.name.as_ref() == "test_nested_parent_child2");
+        .find(|t| t.name.as_ref() as &str == "test_nested_parent_child2");
 
     assert!(
         child1_tool.is_some(),
@@ -508,8 +508,8 @@ async fn test_disabled_tools_not_in_list() {
 
     let tools = mcp.client.list_all_tools().await.unwrap();
 
-    let disabled = tools.iter().find(|t| t.name.as_ref() == "disabled_tool");
-    let enabled = tools.iter().find(|t| t.name.as_ref() == "enabled_tool");
+    let disabled = tools.iter().find(|t| t.name.as_ref() as &str == "disabled_tool");
+    let enabled = tools.iter().find(|t| t.name.as_ref() as &str == "enabled_tool");
 
     assert!(disabled.is_none(), "Disabled tool should not be in list");
     assert!(enabled.is_some(), "Enabled tool should be in list");
@@ -555,10 +555,10 @@ async fn test_disabled_subcommands_skipped() {
     // Subcommands are flattened into individual tools: <parent>_<subcommand>
     let enabled_tool = tools
         .iter()
-        .find(|t| t.name.as_ref() == "test_disabled_sub_enabled_sub");
+        .find(|t| t.name.as_ref() as &str == "test_disabled_sub_enabled_sub");
     let disabled_tool = tools
         .iter()
-        .find(|t| t.name.as_ref() == "test_disabled_sub_disabled_sub");
+        .find(|t| t.name.as_ref() as &str == "test_disabled_sub_disabled_sub");
 
     assert!(
         enabled_tool.is_some(),
@@ -603,7 +603,7 @@ async fn test_default_subcommand_no_enum() {
     let tools = mcp.client.list_all_tools().await.unwrap();
     let test_tool = tools
         .iter()
-        .find(|t| t.name.as_ref() == "test_default_only");
+        .find(|t| t.name.as_ref() as &str == "test_default_only");
     assert!(
         test_tool.is_some(),
         "test_default_only tool should be registered"
@@ -651,7 +651,7 @@ async fn test_working_directory_added_for_non_cargo_tools() {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
     let tools = mcp.client.list_all_tools().await.unwrap();
-    let test_tool = tools.iter().find(|t| t.name.as_ref() == "test_wd");
+    let test_tool = tools.iter().find(|t| t.name.as_ref() as &str == "test_wd");
     assert!(test_tool.is_some());
 
     let tool = test_tool.unwrap();
@@ -681,8 +681,8 @@ async fn test_hardwired_tools_always_present() {
 
     let tools = mcp.client.list_all_tools().await.unwrap();
 
-    let await_tool = tools.iter().find(|t| t.name.as_ref() == "await");
-    let status_tool = tools.iter().find(|t| t.name.as_ref() == "status");
+    let await_tool = tools.iter().find(|t| t.name.as_ref() as &str == "await");
+    let status_tool = tools.iter().find(|t| t.name.as_ref() as &str == "status");
 
     assert!(await_tool.is_some(), "await tool should always be present");
     assert!(
@@ -740,7 +740,7 @@ async fn test_required_options_in_schema() {
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
     let tools = mcp.client.list_all_tools().await.unwrap();
-    let test_tool = tools.iter().find(|t| t.name.as_ref() == "test_required");
+    let test_tool = tools.iter().find(|t| t.name.as_ref() as &str == "test_required");
     assert!(test_tool.is_some());
 
     let tool = test_tool.unwrap();

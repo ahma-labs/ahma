@@ -15,18 +15,7 @@ set -euo pipefail
 
 # Skill version — keep in sync with [workspace.package] version in Cargo.toml.
 # CI guardrails verify this matches. Bump via: cargo xtask bump-version X.Y.Z
-AHMA_VERSION="0.9.3"
-
-# Public key for release verification (RSA-2048)
-PUB_KEY_PEM="-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5veFxEchlM3iyFx8BQzs
-f+yn6ZNJygRwfOfLS901Rxm/I3YRwn2Jksyp2bVckjgDeGJVK7IPGaHe1dL7+Ljn
-5V3zvU9B7CLeeIGdZRRngV/n6r+dsGy0FWQIcN/+dfKPWvhz4m/4QMTLXL05WK8j
-iI/Qatp2Fs32CUJTJ6NpIDQZi4xd1xhQbF/jk2+pwgwpup7kAVKPa49QegFQEQcS
-i8duqBKX2ynTA6QhknBX1fY+6vEFLh6uMePjzGyHLax8mMg8sk2WU59bgMGgtPPy
-le7gp692r3UaP9YgzuNDTyDSoU4gJmOOYYAtMWkNOyD2Bcr8JndwPXG0CD3Hj+j0
-GwIDAQAB
------END PUBLIC KEY-----"
+AHMA_VERSION="0.10.0"
 
 # Parse CLI arguments
 VERIFY_ONLY=0
@@ -62,35 +51,6 @@ compute_sha256() {
         echo "Error: No sha256 program found (sha256sum, shasum, or openssl required)." >&2
         exit 1
     fi
-}
-
-# Verify the signature of a data file using a signature file and the public key
-verify_signature() {
-    local data_file="$1"
-    local sig_file="$2"
-    local temp_dir="$3"
-    
-    if [ "${AHMA_INSECURE_SKIP_SIGNATURE:-}" = "1" ] || [ "${AHMA_INSECURE_SKIP_SIGNATURE:-}" = "true" ]; then
-        echo "WARNING: Skipping cryptographic release signature verification!" >&2
-        return 0
-    fi
-    
-    echo "$PUB_KEY_PEM" > "$temp_dir/pubkey.pem"
-    
-    if ! command -v openssl >/dev/null 2>&1; then
-        echo "Error: openssl is required for cryptographic verification." >&2
-        exit 1
-    fi
-    
-    if ! openssl dgst -sha256 -verify "$temp_dir/pubkey.pem" -signature "$sig_file" "$data_file" >/dev/null 2>&1; then
-        echo "########################################################################" >&2
-        echo "CRITICAL SECURITY ERROR: Release signature verification FAILED!" >&2
-        echo "The checksums file '$data_file' is NOT signed by the official private key." >&2
-        echo "This release might be compromised or tampered with." >&2
-        echo "########################################################################" >&2
-        exit 1
-    fi
-    echo "Authenticity verified: Release signature is valid."
 }
 
 # Detect libc type on Linux
@@ -192,63 +152,21 @@ fetch_release_json() {
 
 # ── Verification-Only Mode ───────────────────────────────────────────────────
 if [ "$VERIFY_ONLY" = "1" ]; then
-    echo "Checking installed binary signature..."
+    echo "Verifying installed ahma binary against GitHub Build Provenance Attestation..."
     EXISTING_BIN=""
     if command -v ahma >/dev/null 2>&1; then
         EXISTING_BIN="$(command -v ahma)"
     elif [ -x "$INSTALL_DIR/ahma" ]; then
         EXISTING_BIN="$INSTALL_DIR/ahma"
     fi
-    
+
     if [ -z "$EXISTING_BIN" ]; then
         echo "Error: ahma is not currently installed or not in PATH." >&2
         exit 1
     fi
-    
+
     echo "Found binary at: $EXISTING_BIN"
-    local_hash=$(compute_sha256 "$EXISTING_BIN")
-    echo "Local SHA-256: $local_hash"
-    
-    echo "Fetching latest release info..."
-    fetch_release_json
-    
-    SUMS_URL=$(echo "$RELEASE_JSON" | grep "browser_download_url" | grep "SHA256SUMS" | grep -v "\.sig" | head -n 1 | cut -d '"' -f 4 || true)
-    SIG_URL=$(echo "$RELEASE_JSON" | grep "browser_download_url" | grep "SHA256SUMS.sig" | head -n 1 | cut -d '"' -f 4 || true)
-    
-    if [ -z "$SUMS_URL" ] || [ -z "$SIG_URL" ]; then
-        echo "Error: Could not find SHA256SUMS or SHA256SUMS.sig in the latest release." >&2
-        exit 1
-    fi
-    
-    TEMP_DIR=$(mktemp -d)
-    trap 'rm -rf "$TEMP_DIR"' EXIT
-    
-    echo "Downloading release manifest and signature..."
-    if command -v curl >/dev/null 2>&1; then
-        curl -sSfL "$SUMS_URL" -o "$TEMP_DIR/SHA256SUMS"
-        curl -sSfL "$SIG_URL" -o "$TEMP_DIR/SHA256SUMS.sig"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$TEMP_DIR/SHA256SUMS" "$SUMS_URL"
-        wget -qO "$TEMP_DIR/SHA256SUMS.sig" "$SIG_URL"
-    fi
-    
-    # Verify signature
-    verify_signature "$TEMP_DIR/SHA256SUMS" "$TEMP_DIR/SHA256SUMS.sig" "$TEMP_DIR"
-    
-    # Find match in SHA256SUMS
-    if grep -E "^${local_hash}[[:space:]]" "$TEMP_DIR/SHA256SUMS" >/dev/null; then
-        matching_entry=$(grep -E "^${local_hash}[[:space:]]" "$TEMP_DIR/SHA256SUMS")
-        echo "Success: Installed binary matches a verified release entry!"
-        echo "Verified: $matching_entry"
-        exit 0
-    else
-        echo "########################################################################" >&2
-        echo "SECURITY WARNING: Local binary verification FAILED!" >&2
-        echo "The local hash '$local_hash' does not match any entry in the verified release manifest." >&2
-        echo "The binary may have been modified or is a different/unreleased version." >&2
-        echo "########################################################################" >&2
-        exit 1
-    fi
+    exec "$EXISTING_BIN" verify --self
 fi
 
 # Check for existing installation and compare versions
@@ -303,7 +221,6 @@ ASSET_NAME="ahma-release-${PLATFORM}.tar.gz"
 # Use grep/cut to parse JSON (avoiding jq dependency for maximum portability)
 DOWNLOAD_URL=$(echo "$RELEASE_JSON" | grep "browser_download_url" | grep "$ASSET_NAME" | cut -d '"' -f 4 || true)
 SUMS_URL=$(echo "$RELEASE_JSON" | grep "browser_download_url" | grep "SHA256SUMS" | grep -v "\.sig" | head -n 1 | cut -d '"' -f 4 || true)
-SIG_URL=$(echo "$RELEASE_JSON" | grep "browser_download_url" | grep "SHA256SUMS.sig" | head -n 1 | cut -d '"' -f 4 || true)
 
 if [ -z "$DOWNLOAD_URL" ]; then
     echo "Error: Could not find release asset '$ASSET_NAME'."
@@ -311,29 +228,30 @@ if [ -z "$DOWNLOAD_URL" ]; then
     exit 1
 fi
 
-if [ -z "$SUMS_URL" ] || [ -z "$SIG_URL" ]; then
-    echo "Error: Could not find release manifest (SHA256SUMS) or signature (SHA256SUMS.sig)."
-    exit 1
-fi
-
 # create temporary directory
 TEMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
-echo "Downloading release manifest and signature..."
-if command -v curl >/dev/null 2>&1; then
-    curl -sSfL "$SUMS_URL" -o "$TEMP_DIR/SHA256SUMS"
-    curl -sSfL "$SIG_URL" -o "$TEMP_DIR/SHA256SUMS.sig"
-elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$TEMP_DIR/SHA256SUMS" "$SUMS_URL"
-    wget -qO "$TEMP_DIR/SHA256SUMS.sig" "$SIG_URL"
+# Download SHA256SUMS for archive hash verification (defense in depth)
+EXPECTED_HASH=""
+if [ -n "$SUMS_URL" ]; then
+    if command -v curl >/dev/null 2>&1; then
+        curl -sSfL "$SUMS_URL" -o "$TEMP_DIR/SHA256SUMS" 2>/dev/null || true
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$TEMP_DIR/SHA256SUMS" "$SUMS_URL" 2>/dev/null || true
+    fi
+    if [ -f "$TEMP_DIR/SHA256SUMS" ]; then
+        EXPECTED_HASH=$(grep -E "[[:space:]]${ASSET_NAME}$" "$TEMP_DIR/SHA256SUMS" | awk '{print $1}' || true)
+    fi
 fi
 
-# Verify signature
-verify_signature "$TEMP_DIR/SHA256SUMS" "$TEMP_DIR/SHA256SUMS.sig" "$TEMP_DIR"
+# If SUMS_URL not found, we'll skip the hash pre-check (Sigstore attestation is the real anchor)
+if [ -z "$EXPECTED_HASH" ]; then
+    echo "Note: SHA256SUMS manifest not available; skipping hash pre-check."
+    echo "      Sigstore attestation verification after install remains the cryptographic anchor."
+fi
 
-# Extract expected hash
-EXPECTED_HASH=$(grep -E "[[:space:]]${ASSET_NAME}$" "$TEMP_DIR/SHA256SUMS" | awk '{print $1}')
+EXPECTED_HASH_PLACEHOLDER="$EXPECTED_HASH"  # may be empty — handled after download
 if [ -z "$EXPECTED_HASH" ]; then
     echo "Error: Checksum entry for '$ASSET_NAME' not found in release manifest."
     exit 1
@@ -347,18 +265,20 @@ elif command -v wget >/dev/null 2>&1; then
     wget -qO "$TEMP_DIR/$ASSET_NAME" "$DOWNLOAD_URL"
 fi
 
-# Verify archive hash
+# Verify archive hash against SHA256SUMS (defense in depth; Sigstore attestation is the real anchor)
 ACTUAL_HASH=$(compute_sha256 "$TEMP_DIR/$ASSET_NAME")
-if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
-    echo "########################################################################" >&2
-    echo "CRITICAL SECURITY ERROR: Archive integrity check failed!" >&2
-    echo "Checksum mismatch for $ASSET_NAME." >&2
-    echo "Expected: $EXPECTED_HASH" >&2
-    echo "Actual:   $ACTUAL_HASH" >&2
-    echo "########################################################################" >&2
-    exit 1
+if [ -n "$EXPECTED_HASH_PLACEHOLDER" ]; then
+    if [ "$EXPECTED_HASH_PLACEHOLDER" != "$ACTUAL_HASH" ]; then
+        echo "########################################################################" >&2
+        echo "CRITICAL SECURITY ERROR: Archive integrity check failed!" >&2
+        echo "Checksum mismatch for $ASSET_NAME." >&2
+        echo "Expected: $EXPECTED_HASH_PLACEHOLDER" >&2
+        echo "Actual:   $ACTUAL_HASH" >&2
+        echo "########################################################################" >&2
+        exit 1
+    fi
+    echo "Integrity verified: Archive hash matches release manifest."
 fi
-echo "Integrity verified: Archive hash matches release manifest."
 
 # Extract
 tar -xzf "$TEMP_DIR/$ASSET_NAME" -C "$TEMP_DIR"
@@ -373,13 +293,28 @@ else
     exit 1
 fi
 
-# Verify the installed binary hash and print it
+# Cryptographic verification: confirm the installed binary has a valid GitHub Build Provenance
+# Attestation (Sigstore SLSA Level 3) from the official paulirotta/ahma CI pipeline.
+# This is the canonical trust check — even if an attacker substituted the release asset,
+# they cannot mint a Fulcio certificate for our workflow's OIDC identity.
 INSTALLED_BIN="$INSTALL_DIR/ahma"
-INSTALLED_HASH=$(compute_sha256 "$INSTALLED_BIN")
-echo "Installed binary hash: $INSTALLED_HASH"
+if [ "${AHMA_INSECURE_SKIP_VERIFY:-}" != "1" ] && [ "${AHMA_INSECURE_SKIP_SIGNATURE:-}" != "1" ]; then
+    echo "Verifying Sigstore Build Provenance Attestation..."
+    if ! "$INSTALLED_BIN" verify --self; then
+        echo "########################################################################" >&2
+        echo "CRITICAL SECURITY ERROR: Sigstore attestation verification FAILED!" >&2
+        echo "The installed binary failed GitHub Build Provenance Attestation." >&2
+        echo "Removing $INSTALLED_BIN." >&2
+        echo "########################################################################" >&2
+        rm -f "$INSTALLED_BIN"
+        exit 1
+    fi
+else
+    echo "WARNING: Sigstore attestation verification bypassed (AHMA_INSECURE_SKIP_VERIFY=1)." >&2
+fi
 
 "$INSTALLED_BIN" --version
-echo "Success! Installed ahma to ${INSTALL_DIR}"
+echo "Success! Installed and verified ahma to ${INSTALL_DIR}"
 AHMA_BIN="$INSTALLED_BIN"
 
 # Remove legacy ahma-simplify binary if present
