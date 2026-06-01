@@ -714,8 +714,10 @@ mod tests {
         std::fs::write(ahma_dir.join("peers.json"), peers_json).unwrap();
 
         let orig_home = std::env::var("HOME").ok();
+        let orig_userprofile = std::env::var("USERPROFILE").ok();
         unsafe {
             std::env::set_var("HOME", temp.path());
+            std::env::set_var("USERPROFILE", temp.path());
         }
 
         let reg = WorkerRegistry::new(60);
@@ -726,6 +728,11 @@ mod tests {
                 std::env::set_var("HOME", h);
             } else {
                 std::env::remove_var("HOME");
+            }
+            if let Some(up) = orig_userprofile {
+                std::env::set_var("USERPROFILE", up);
+            } else {
+                std::env::remove_var("USERPROFILE");
             }
         }
 
