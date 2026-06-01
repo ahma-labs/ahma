@@ -216,28 +216,14 @@ impl LlmClient {
         messages: Vec<ChatMessage>,
         system_prompt: Option<&str>,
     ) -> impl Stream<Item = Result<String, LlmMonitorError>> + '_ {
+        use futures::StreamExt as _;
         use futures::stream;
 
-        let mut all_messages: Vec<Value> = vec![];
-        if let Some(sys) = system_prompt {
-            all_messages.push(json!({"role": "system", "content": sys}));
-        }
-        for m in &messages {
-            all_messages.push(m.as_openai_message());
-        }
-
-        let body = json!({
-            "model": self.model,
-            "messages": all_messages,
-            "stream": true,
-            "temperature": 0.7,
-        });
-
+        let body = build_chat_stream_body(&self.model, &messages, system_prompt);
         let http = self.http.clone();
         let url = format!("{}/chat/completions", self.base_url);
         let api_key = self.api_key.clone();
 
-        use futures::StreamExt as _;
         stream::unfold(
             ChatStreamState::Starting {
                 http,
@@ -252,78 +238,9 @@ impl LlmClient {
                         url,
                         api_key,
                         body,
-                    } => {
-                        let mut req = http
-                            .post(&url)
-                            .json(&body)
-                            .header("Accept", "text/event-stream");
-                        if let Some(key) = &api_key {
-                            req = req.bearer_auth(key);
-                        }
-                        match req.send().await {
-                            Err(e) => Some((Err(LlmMonitorError::Http(e)), ChatStreamState::Done)),
-                            Ok(resp) if !resp.status().is_success() => {
-                                let status = resp.status();
-                                let body = resp.text().await.unwrap_or_default();
-                                Some((
-                                    Err(LlmMonitorError::Parse(format!("HTTP {status}: {body}"))),
-                                    ChatStreamState::Done,
-                                ))
-                            }
-                            Ok(resp) => {
-                                use futures::TryStreamExt;
-                                let byte_stream =
-                                    resp.bytes_stream().map_err(LlmMonitorError::Http);
-                                Some((
-                                    Ok(String::new()), // empty first yield to advance state
-                                    ChatStreamState::Streaming {
-                                        stream: Box::pin(byte_stream),
-                                        buffer: String::new(),
-                                    },
-                                ))
-                            }
-                        }
-                    }
-                    ChatStreamState::Streaming {
-                        mut stream,
-                        mut buffer,
-                    } => {
-                        use futures::StreamExt;
-                        loop {
-                            // First drain any complete SSE lines from the buffer.
-                            if let Some(newline_pos) = buffer.find('\n') {
-                                let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
-                                buffer = buffer[newline_pos + 1..].to_string();
-                                let next_state = ChatStreamState::Streaming { stream, buffer };
-                                if let Some(token) = parse_sse_line(&line) {
-                                    if token == "__DONE__" {
-                                        return Some((Ok(String::new()), ChatStreamState::Done));
-                                    }
-                                    return Some((Ok(token), next_state));
-                                }
-                                // Empty or comment line — keep iterating.
-                                // Recover state from next_state:
-                                if let ChatStreamState::Streaming {
-                                    stream: s,
-                                    buffer: b,
-                                } = next_state
-                                {
-                                    stream = s;
-                                    buffer = b;
-                                } else {
-                                    return None;
-                                }
-                                continue;
-                            }
-                            // No newline in buffer — fetch more bytes.
-                            match stream.next().await {
-                                None => return None,
-                                Some(Err(e)) => return Some((Err(e), ChatStreamState::Done)),
-                                Some(Ok(bytes)) => {
-                                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                                }
-                            }
-                        }
+                    } => chat_stream_start(http, url, api_key, body).await,
+                    ChatStreamState::Streaming { stream, buffer } => {
+                        chat_stream_poll(stream, buffer).await
                     }
                     ChatStreamState::Done => None,
                 }
@@ -433,6 +350,96 @@ enum ChatStreamState {
         buffer: String,
     },
     Done,
+}
+
+fn build_chat_stream_body(
+    model: &str,
+    messages: &[ChatMessage],
+    system_prompt: Option<&str>,
+) -> Value {
+    let mut all_messages: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+    if let Some(sys) = system_prompt {
+        all_messages.push(json!({"role": "system", "content": sys}));
+    }
+    for message in messages {
+        all_messages.push(message.as_openai_message());
+    }
+    json!({
+        "model": model,
+        "messages": all_messages,
+        "stream": true,
+        "temperature": 0.7,
+    })
+}
+
+async fn chat_stream_start(
+    http: Client,
+    url: String,
+    api_key: Option<String>,
+    body: Value,
+) -> Option<(Result<String, LlmMonitorError>, ChatStreamState)> {
+    let mut req = http
+        .post(&url)
+        .json(&body)
+        .header("Accept", "text/event-stream");
+    if let Some(key) = &api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let resp = match req.send().await {
+        Err(e) => return Some((Err(LlmMonitorError::Http(e)), ChatStreamState::Done)),
+        Ok(resp) => resp,
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Some((
+            Err(LlmMonitorError::Parse(format!("HTTP {status}: {body}"))),
+            ChatStreamState::Done,
+        ));
+    }
+
+    use futures::TryStreamExt as _;
+    let byte_stream = resp.bytes_stream().map_err(LlmMonitorError::Http);
+    Some((
+        Ok(String::new()), // empty first yield to advance state
+        ChatStreamState::Streaming {
+            stream: Box::pin(byte_stream),
+            buffer: String::new(),
+        },
+    ))
+}
+
+fn take_sse_line(buffer: &mut String) -> Option<String> {
+    let newline_pos = buffer.find('\n')?;
+    let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
+    *buffer = buffer[newline_pos + 1..].to_string();
+    Some(line)
+}
+
+async fn chat_stream_poll(
+    mut stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, LlmMonitorError>> + Send>>,
+    mut buffer: String,
+) -> Option<(Result<String, LlmMonitorError>, ChatStreamState)> {
+    use futures::StreamExt as _;
+    loop {
+        if let Some(line) = take_sse_line(&mut buffer) {
+            if let Some(token) = parse_sse_line(&line) {
+                if token == "__DONE__" {
+                    return Some((Ok(String::new()), ChatStreamState::Done));
+                }
+                return Some((Ok(token), ChatStreamState::Streaming { stream, buffer }));
+            }
+            continue;
+        }
+
+        match stream.next().await {
+            None => return None,
+            Some(Err(e)) => return Some((Err(e), ChatStreamState::Done)),
+            Some(Ok(bytes)) => buffer.push_str(&String::from_utf8_lossy(&bytes)),
+        }
+    }
 }
 
 /// Parse one SSE `data:` line into a token string.

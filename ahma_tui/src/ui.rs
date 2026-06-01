@@ -15,7 +15,7 @@ use ratatui::{
     },
 };
 
-use crate::state::{AppState, ChatEntry, Focus, Mode};
+use crate::state::{AppState, ChatEntry, Focus, Mode, NavCommand};
 use crate::theme::Theme;
 
 // ─── Top-level draw ───────────────────────────────────────────────────────────
@@ -202,6 +202,14 @@ fn push_user_chat_lines(lines: &mut Vec<Line<'static>>, text: &str, theme: &Them
 }
 
 #[cfg(feature = "tui")]
+fn assistant_stream_cursor(streaming: bool, unicode: bool) -> &'static str {
+    match (streaming, unicode) {
+        (true, true) => "▌",
+        (true, false) => "|",
+        (false, _) => "",
+    }
+}
+
 fn push_assistant_chat_lines(
     lines: &mut Vec<Line<'static>>,
     content: &str,
@@ -209,11 +217,7 @@ fn push_assistant_chat_lines(
     state: &AppState,
     theme: &Theme,
 ) {
-    let cursor = match (streaming, state.unicode) {
-        (true, true) => "▌",
-        (true, false) => "|",
-        (false, _) => "",
-    };
+    let cursor = assistant_stream_cursor(streaming, state.unicode);
     let display = format!("{content}{cursor}");
 
     for (index, line_str) in display.lines().enumerate() {
@@ -225,10 +229,9 @@ fn push_assistant_chat_lines(
     }
 
     if display.is_empty() && streaming {
-        let empty_cursor = if state.unicode { "▌" } else { "|" };
         lines.push(Line::from(vec![
             Span::styled(" ahma ", theme.running()),
-            Span::styled(empty_cursor, theme.dim()),
+            Span::styled(assistant_stream_cursor(true, state.unicode), theme.dim()),
         ]));
     }
 }
@@ -404,6 +407,54 @@ fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
 // ─── Navigator overlay ────────────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
+fn overlay_bar_cursor(unicode: bool) -> &'static str {
+    if unicode { "│" } else { "|" }
+}
+
+#[cfg(feature = "tui")]
+fn render_horizontal_rule(frame: &mut Frame, area: Rect, unicode: bool, theme: &Theme) {
+    let sep_char = if unicode { "─" } else { "-" };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            sep_char.repeat(area.width as usize),
+            theme.dim(),
+        )),
+        area,
+    );
+}
+
+#[cfg(feature = "tui")]
+fn navigator_list_items(
+    completions: &[NavCommand],
+    selected: usize,
+    desc_col: usize,
+    inner_width: usize,
+    limit: usize,
+    theme: &Theme,
+) -> Vec<ListItem<'static>> {
+    completions
+        .iter()
+        .take(limit)
+        .enumerate()
+        .map(|(i, cmd)| {
+            let selected_row = i == selected;
+            let style = if selected_row {
+                theme.selected_item()
+            } else {
+                theme.normal()
+            };
+            let cmd_str = truncate(&cmd.command, desc_col);
+            let desc_str = truncate(cmd.description, inner_width.saturating_sub(desc_col + 2));
+            let desc_style = if selected_row { style } else { theme.dim() };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {:<width$}", cmd_str, width = desc_col), style),
+                Span::styled(format!(" {desc_str}"), desc_style),
+            ]))
+        })
+        .collect()
+}
+
+#[cfg(feature = "tui")]
 fn draw_navigator(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let w = 64u16.min(area.width);
     let max_items = 12u16;
@@ -424,7 +475,7 @@ fn draw_navigator(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     }
 
     // Input line.
-    let cursor = if state.unicode { "│" } else { "|" };
+    let cursor = overlay_bar_cursor(state.unicode);
     let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(
         Paragraph::new(Span::styled(
@@ -438,16 +489,8 @@ fn draw_navigator(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
         return;
     }
 
-    // Separator.
     let sep_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
-    let sep_char = if state.unicode { "─" } else { "-" };
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            sep_char.repeat(inner.width as usize),
-            theme.dim(),
-        )),
-        sep_area,
-    );
+    render_horizontal_rule(frame, sep_area, state.unicode, theme);
 
     let list_h = inner.height.saturating_sub(2);
     if list_h == 0 || state.navigator.completions.is_empty() {
@@ -456,35 +499,14 @@ fn draw_navigator(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     let list_area = Rect::new(inner.x, inner.y + 2, inner.width, list_h);
 
     let desc_col = (inner.width as usize).saturating_sub(32).max(20);
-
-    let items: Vec<ListItem> = state
-        .navigator
-        .completions
-        .iter()
-        .take(list_h as usize)
-        .enumerate()
-        .map(|(i, cmd)| {
-            let style = if i == state.navigator.selected {
-                theme.selected_item()
-            } else {
-                theme.normal()
-            };
-            let cmd_str = truncate(&cmd.command, desc_col);
-            let desc_str = truncate(cmd.description, inner.width as usize - desc_col - 2);
-            let line = Line::from(vec![
-                Span::styled(format!(" {:<width$}", cmd_str, width = desc_col), style),
-                Span::styled(
-                    format!(" {desc_str}"),
-                    if i == state.navigator.selected {
-                        style
-                    } else {
-                        theme.dim()
-                    },
-                ),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
+    let items = navigator_list_items(
+        &state.navigator.completions,
+        state.navigator.selected,
+        desc_col,
+        inner.width as usize,
+        list_h as usize,
+        theme,
+    );
 
     let mut list_state = ListState::default().with_selected(Some(state.navigator.selected));
     frame.render_stateful_widget(
@@ -574,26 +596,27 @@ fn draw_picker(frame: &mut Frame, picker: &crate::state::PickerState, theme: &Th
 // ─── Header ───────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
-fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let health_span = if state.server_healthy {
-        Span::styled(
-            if state.unicode {
-                " ● HEALTHY"
-            } else {
-                " * HEALTHY"
-            },
-            theme.healthy(),
-        )
+fn header_health_span(state: &AppState, theme: &Theme) -> Span<'static> {
+    if state.server_healthy {
+        let label = if state.unicode {
+            " ● HEALTHY"
+        } else {
+            " * HEALTHY"
+        };
+        Span::styled(label, theme.healthy())
     } else {
-        Span::styled(
-            if state.unicode {
-                " ○ OFFLINE"
-            } else {
-                " - OFFLINE"
-            },
-            theme.unhealthy(),
-        )
-    };
+        let label = if state.unicode {
+            " ○ OFFLINE"
+        } else {
+            " - OFFLINE"
+        };
+        Span::styled(label, theme.unhealthy())
+    }
+}
+
+#[cfg(feature = "tui")]
+fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let health_span = header_health_span(state, theme);
 
     let sandbox_style = match state.sandbox_status.as_str() {
         "LOCKED" => theme.success(),
@@ -954,6 +977,17 @@ fn push_stdout_tail_lines(
 // ─── Log pane ─────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
+fn log_filter_indicator(state: &AppState) -> String {
+    if state.log_filter_active {
+        format!(" filter: {}_", state.log_filter)
+    } else if !state.log_filter.is_empty() {
+        format!(" filter: {}", state.log_filter)
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(feature = "tui")]
 fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Log;
     let border_style = if focused {
@@ -962,13 +996,7 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         theme.border_unfocused()
     };
 
-    let filter_indicator = if state.log_filter_active {
-        format!(" filter: {}_", state.log_filter)
-    } else if !state.log_filter.is_empty() {
-        format!(" filter: {}", state.log_filter)
-    } else {
-        String::new()
-    };
+    let filter_indicator = log_filter_indicator(state);
 
     let block = Block::default()
         .title(Span::styled(
@@ -1199,6 +1227,28 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
 // ─── Command palette overlay ──────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
+fn palette_list_items(
+    completions: &[String],
+    selected: usize,
+    limit: usize,
+    theme: &Theme,
+) -> Vec<ListItem<'static>> {
+    completions
+        .iter()
+        .take(limit)
+        .enumerate()
+        .map(|(i, name)| {
+            let style = if i == selected {
+                theme.selected_item()
+            } else {
+                theme.normal()
+            };
+            ListItem::new(Span::styled(format!(" {name}"), style))
+        })
+        .collect()
+}
+
+#[cfg(feature = "tui")]
 fn draw_palette(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let w = 60u16.min(area.width);
     let max_items = 10u16;
@@ -1219,7 +1269,7 @@ fn draw_palette(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
     }
 
     // Input line with blinking cursor illusion
-    let cursor = if state.unicode { "│" } else { "|" };
+    let cursor = overlay_bar_cursor(state.unicode);
     let input_display = format!("> {}{cursor}", state.palette.input);
     let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(
@@ -1231,39 +1281,21 @@ fn draw_palette(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
         return;
     }
 
-    // Separator
     let sep_area = Rect::new(inner.x, inner.y + 1, inner.width, 1);
-    let sep_char = if state.unicode { "─" } else { "-" };
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            sep_char.repeat(inner.width as usize),
-            theme.dim(),
-        )),
-        sep_area,
-    );
+    render_horizontal_rule(frame, sep_area, state.unicode, theme);
 
-    // Completions
     let list_h = inner.height.saturating_sub(2);
     if list_h == 0 {
         return;
     }
     let list_area = Rect::new(inner.x, inner.y + 2, inner.width, list_h);
 
-    let items: Vec<ListItem> = state
-        .palette
-        .completions
-        .iter()
-        .take(list_h as usize)
-        .enumerate()
-        .map(|(i, name)| {
-            let style = if i == state.palette.selected_completion {
-                theme.selected_item()
-            } else {
-                theme.normal()
-            };
-            ListItem::new(Span::styled(format!(" {name}"), style))
-        })
-        .collect();
+    let items = palette_list_items(
+        &state.palette.completions,
+        state.palette.selected_completion,
+        list_h as usize,
+        theme,
+    );
 
     let mut list_state =
         ListState::default().with_selected(Some(state.palette.selected_completion));

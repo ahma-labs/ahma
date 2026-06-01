@@ -208,6 +208,47 @@ impl AhmaMcpService {
         self.task_vault_root().map(|root| root.join("audit.jsonl"))
     }
 
+    fn store_peer_handle_if_unset(&self, peer: &Peer<RoleServer>) {
+        let mut peer_guard = self.peer.write().unwrap();
+        if peer_guard.is_none() {
+            *peer_guard = Some(peer.clone());
+            tracing::info!("Successfully captured MCP peer handle for async notifications.");
+        }
+    }
+
+    fn should_skip_client_roots_sandbox_setup(&self) -> bool {
+        if !self.adapter.sandbox().scopes().is_empty() {
+            tracing::info!(
+                "Sandbox scopes already configured via CLI/Env ({:?}), skipping roots/list request",
+                self.adapter.sandbox().scopes()
+            );
+            return true;
+        }
+
+        if self.adapter.sandbox().is_test_mode() {
+            tracing::debug!(
+                "Sandbox in test/disabled mode: skipping roots/list request. \
+                 Path validation bypassed for all paths."
+            );
+            return true;
+        }
+
+        false
+    }
+
+    fn is_sync_meta_tool_for_protocol_cancel(tool_name: &str) -> bool {
+        matches!(
+            tool_name,
+            "await"
+                | "status"
+                | "cancel"
+                | "activate_tools"
+                | "logs_list"
+                | "logs_read"
+                | "logs_search"
+        )
+    }
+
     fn task_vault_trash_dir(&self) -> Option<PathBuf> {
         self.task_vault_root().map(|root| root.join("trash"))
     }
@@ -381,6 +422,45 @@ impl AhmaMcpService {
         }
     }
 
+    fn resolve_delete_source_path(target: &str, working_directory: &str) -> PathBuf {
+        let mut source = PathBuf::from(target);
+        if source.is_relative() {
+            source = PathBuf::from(working_directory).join(source);
+        }
+        source
+    }
+
+    fn stage_single_path_into_trash(
+        source: PathBuf,
+        trash_dir: &Path,
+    ) -> Result<Option<(String, String)>, anyhow::Error> {
+        use anyhow::Context;
+
+        if !source.exists() {
+            return Ok(None);
+        }
+
+        let filename = source
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("staged-item");
+        let ts = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+        let dest = trash_dir.join(format!("{ts}_{filename}"));
+
+        std::fs::rename(&source, &dest).with_context(|| {
+            format!(
+                "Failed to stage '{}' into '{}'",
+                source.display(),
+                dest.display()
+            )
+        })?;
+
+        Ok(Some((
+            source.to_string_lossy().to_string(),
+            dest.to_string_lossy().to_string(),
+        )))
+    }
+
     fn stage_paths_into_vault_trash(
         &self,
         working_directory: &str,
@@ -397,33 +477,10 @@ impl AhmaMcpService {
 
         let mut staged = Vec::new();
         for target in targets {
-            let mut source = PathBuf::from(target);
-            if source.is_relative() {
-                source = PathBuf::from(working_directory).join(source);
+            let source = Self::resolve_delete_source_path(target, working_directory);
+            if let Some(pair) = Self::stage_single_path_into_trash(source, &trash_dir)? {
+                staged.push(pair);
             }
-            if !source.exists() {
-                continue;
-            }
-
-            let filename = source
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("staged-item");
-            let ts = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
-            let dest = trash_dir.join(format!("{ts}_{filename}"));
-
-            std::fs::rename(&source, &dest).with_context(|| {
-                format!(
-                    "Failed to stage '{}' into '{}'",
-                    source.display(),
-                    dest.display()
-                )
-            })?;
-
-            staged.push((
-                source.to_string_lossy().to_string(),
-                dest.to_string_lossy().to_string(),
-            ));
         }
 
         Ok(staged)
@@ -1083,52 +1140,17 @@ impl ServerHandler for AhmaMcpService {
                 }
             );
 
-            // Get the peer from the context
             let peer = &context.peer;
-            if self.peer.read().unwrap().is_none() {
-                let mut peer_guard = self.peer.write().unwrap();
-                if peer_guard.is_none() {
-                    *peer_guard = Some(peer.clone());
-                    tracing::info!(
-                        "Successfully captured MCP peer handle for async notifications."
-                    );
-                }
-            }
+            self.store_peer_handle_if_unset(peer);
 
             if self.defer_sandbox {
                 tracing::info!("Sandbox deferred - waiting for roots/list_changed notification");
                 return;
             }
 
-            // Query client for workspace roots and configure sandbox
-            // Per MCP spec, server sends roots/list request to client
-            // IMPORTANT: Only do this if sandbox is NOT deferred.
-            // In HTTP bridge mode with --defer-sandbox, we wait for roots/list_changed
-            // notification which is sent by the bridge when SSE connects.
-            // IF scopes are already configured (e.g. via CLI --sandbox-scope), respect them
-            // and do not ask client for roots (which would overwrite CLI scopes).
-            // This also prevents hangs when testing with clients that don't support roots/list.
-            if !self.adapter.sandbox().scopes().is_empty() {
-                tracing::info!(
-                    "Sandbox scopes already configured via CLI/Env ({:?}), skipping roots/list request",
-                    self.adapter.sandbox().scopes()
-                );
-                return;
-            }
-
-            if self.adapter.sandbox().is_test_mode() {
-                // In test/disabled sandbox mode, skip the roots/list exchange.
-                // Calling configure_sandbox_from_roots in test mode causes two issues:
-                // 1) It blocks the event loop waiting for roots/list from a client that
-                //    may not implement the handler (causing a 60s handshake timeout).
-                // 2) On failure it calls emit_stdout_notification(), which writes raw
-                //    bytes to the rmcp stdio pipe, corrupting the JSON-RPC framing
-                //    and causing the client to hang on subsequent tool calls.
-                // In test mode path validation is bypassed anyway, so this is safe.
-                tracing::debug!(
-                    "Sandbox in test/disabled mode: skipping roots/list request. \
-                     Path validation bypassed for all paths."
-                );
+            // Query client for workspace roots and configure sandbox (see
+            // `should_skip_client_roots_sandbox_setup` for defer/CLI/test cases).
+            if self.should_skip_client_roots_sandbox_setup() {
                 return;
             }
 
@@ -1188,33 +1210,18 @@ impl ServerHandler for AhmaMcpService {
                 return;
             }
 
-            // Filter for operations that are actually background processes
-            // vs. synchronous MCP tools like 'await' that don't have processes
             let background_ops: Vec<_> = active_ops
                 .iter()
                 .filter(|op| {
-                    // Only cancel operations that represent actual background processes.
-                    // Exclude synchronous / meta tools that never create OperationMonitor
-                    // entries — cancelling them would incorrectly kill the most-recent
-                    // background process instead.
-                    let is_sync_meta = matches!(
-                        op.tool_name.as_str(),
-                        "await"
-                            | "status"
-                            | "cancel"
-                            | "activate_tools"
-                            | "logs_list"
-                            | "logs_read"
-                            | "logs_search"
-                    );
-                    if is_sync_meta {
+                    if Self::is_sync_meta_tool_for_protocol_cancel(&op.tool_name) {
                         tracing::debug!(
                             "on_cancelled: skipping sync/meta tool '{}' (op {})",
                             op.tool_name,
                             op.id
                         );
+                        return false;
                     }
-                    !is_sync_meta
+                    true
                 })
                 .collect();
 
@@ -1359,25 +1366,21 @@ impl ServerHandler for AhmaMcpService {
 }
 
 impl AhmaMcpService {
-    /// Routes a `tools/call` for a configured (non-built-in) tool. Validates
-    /// the sandbox is locked, resolves the tool config, and dispatches by
-    /// tool type (sequence / livelog / subcommand).
-    async fn dispatch_configured_tool(
-        &self,
-        params: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let tool_name: &str = &params.name;
-
-        // Delay tool execution until sandbox is initialized from roots/list.
-        // This is critical in HTTP bridge mode with deferred sandbox initialization.
-        if !self.adapter.sandbox().is_ready_for_tool_calls() {
-            let error_message = "Sandbox initializing from client roots - retry tools/call after roots/list completes".to_string();
-            tracing::warn!("{}", error_message);
-            return Err(handlers::common::mcp_internal(error_message));
+    fn guard_sandbox_ready_for_tool_calls(&self) -> Result<(), McpError> {
+        if self.adapter.sandbox().is_ready_for_tool_calls() {
+            return Ok(());
         }
+        let error_message =
+            "Sandbox initializing from client roots - retry tools/call after roots/list completes"
+                .to_string();
+        tracing::warn!("{}", error_message);
+        Err(handlers::common::mcp_internal(error_message))
+    }
 
-        // Resolve the tool name (handling flattened `parent_sub` subcommand names).
+    fn resolve_configured_tool(
+        &self,
+        tool_name: &str,
+    ) -> Result<(ToolConfig, Option<String>), McpError> {
         let (config, flattened_subcommand) = match self.find_tool_config(tool_name) {
             Some(pair) => pair,
             None => {
@@ -1399,6 +1402,16 @@ impl AhmaMcpService {
             return Err(McpError::invalid_request(error_message, None));
         }
 
+        Ok((config, flattened_subcommand))
+    }
+
+    async fn dispatch_resolved_configured_tool(
+        &self,
+        params: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+        config: ToolConfig,
+        flattened_subcommand: Option<String>,
+    ) -> Result<CallToolResult, McpError> {
         if config.sequence.is_some() {
             return sequence::handle_sequence_tool(
                 &self.adapter,
@@ -1416,6 +1429,20 @@ impl AhmaMcpService {
         }
 
         self.dispatch_subcommand_tool(params, context, config, flattened_subcommand)
+            .await
+    }
+
+    /// Routes a `tools/call` for a configured (non-built-in) tool. Validates
+    /// the sandbox is locked, resolves the tool config, and dispatches by
+    /// tool type (sequence / livelog / subcommand).
+    async fn dispatch_configured_tool(
+        &self,
+        params: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        self.guard_sandbox_ready_for_tool_calls()?;
+        let (config, flattened_subcommand) = self.resolve_configured_tool(&params.name)?;
+        self.dispatch_resolved_configured_tool(params, context, config, flattened_subcommand)
             .await
     }
 
