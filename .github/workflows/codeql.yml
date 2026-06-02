@@ -103,21 +103,29 @@ jobs:
             echo "LANG=C"
           } >> "$GITHUB_ENV"
 
-      - name: sccache-action
+      - name: Install sccache
         if: matrix.language == 'rust'
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
+        with:
+          tool: sccache
 
       - name: Run cargo check (Rust only)
         if: matrix.language == 'rust'
         run: cargo check --locked --all-targets
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+        uses: github/codeql-action/init@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
+        uses: github/codeql-action/analyze@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
         with:
           category: "/language:${{ matrix.language }}"
+
+      - name: Show sccache stats
+        if: always() && matrix.language == 'rust'
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true

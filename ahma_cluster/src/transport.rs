@@ -285,4 +285,35 @@ mod tests {
         assert!(cfg.transport_preference.contains(&TransportMode::Http2));
         assert!(cfg.transport_preference.contains(&TransportMode::Http1));
     }
+
+    #[tokio::test]
+    async fn test_transport_post_success() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let mut buf = [0; 1024];
+                let _ = stream.read(&mut buf).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"task_id\":\"t1\"}\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let transport = ClusterTransport::new(vec![TransportMode::Http1], None);
+        let resp = transport
+            .post(&format!("http://127.0.0.1:{port}"), "/tasks", &"payload")
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("t1"));
+    }
 }

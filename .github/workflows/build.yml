@@ -53,6 +53,7 @@ env:
   SCCACHE_DIR: ${{ github.workspace }}/.sccache
   SCCACHE_MAX_SIZE: 2G
   SCCACHE_DIRECT: "true"
+  VSCMD_SKIP_SENDTELEMETRY: 1
 jobs:
   job-cargo-nextest:
     name: Cargo Nextest (${{ matrix.os }})
@@ -154,13 +155,10 @@ jobs:
             exit 1
           fi
 
-      - name: sccache-action
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
-
-      - name: Install cargo-nextest
+      - name: Install cargo-nextest and sccache
         uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
         with:
-          tool: nextest
+          tool: nextest,sccache
 
       - name: Add Cargo Bin to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -212,7 +210,10 @@ jobs:
           path: target/doc
 
       - name: Show sccache stats
-        run: sccache --show-stats
+        if: always()
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true
 
   #######################################
 
@@ -329,13 +330,10 @@ jobs:
           rustflags: ""
           cache: false
 
-      - name: sccache-action
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
-
-      - name: Install cargo-nextest and cargo-ndk
+      - name: Install cargo-nextest, cargo-ndk and sccache
         uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
         with:
-          tool: nextest,cargo-ndk
+          tool: nextest,cargo-ndk,sccache
 
       - name: Add Cargo Bin to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -346,7 +344,10 @@ jobs:
           cargo nextest run --profile ci --locked -p ahma_mcp --features android -E 'test(kotlin) or test(android)'
 
       - name: Show sccache stats
-        run: sccache --show-stats
+        if: always()
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true
 
   #######################################
 
@@ -407,13 +408,10 @@ jobs:
             echo "LANG=C"
           } >> "$GITHUB_ENV"
 
-      - name: sccache-action
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
-
-      - name: Install cargo-nextest, cargo-ndk, and cargo-llvm-cov
+      - name: Install cargo-nextest, cargo-ndk, cargo-llvm-cov and sccache
         uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
         with:
-          tool: nextest,cargo-ndk,cargo-llvm-cov
+          tool: nextest,cargo-ndk,cargo-llvm-cov,sccache
 
       - name: Build ahma binary (required by integration tests)
         run: cargo build --locked --no-default-features -p ahma_bin
@@ -454,7 +452,10 @@ jobs:
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
 
       - name: Show sccache stats
-        run: sccache --show-stats
+        if: always()
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true
 
   #######################################
 
@@ -595,9 +596,11 @@ jobs:
             exit 1
           fi
 
-      - name: sccache-action
+      - name: Install sccache
         if: "!matrix.use_cross"
-        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+        uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
+        with:
+          tool: sccache
 
       - name: Install cross (for cross-compilation)
         if: matrix.use_cross
@@ -646,15 +649,17 @@ jobs:
           path: ${{ steps.package.outputs.archive_name }}
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
         with:
           subject-path: |
             ${{ steps.package.outputs.archive_name }}
             dist/ahma*
 
       - name: Show sccache stats
-        if: "!matrix.use_cross"
-        run: sccache --show-stats
+        if: always() && !matrix.use_cross
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true
 
   #######################################
 
@@ -804,7 +809,7 @@ jobs:
     name: Publish Winget Manifest
     needs: [job-publish-release]
     # Enable by defining repository variable WINGET_PUBLISH_ENABLED=true.
-    if: ${{ vars.WINGET_PUBLISH_ENABLED == 'true' }}
+    if: vars.WINGET_PUBLISH_ENABLED == 'true'
     runs-on: windows-latest
     defaults:
       run:
