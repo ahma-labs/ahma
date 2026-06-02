@@ -239,6 +239,11 @@ impl WorkerRegistry {
         let Some(home) = dirs::home_dir() else {
             return Ok(0);
         };
+        self.load_static_peers_from(&home)
+    }
+
+    /// Load static peers from a custom base directory.
+    pub fn load_static_peers_from(&self, home: &std::path::Path) -> Result<usize> {
         let path = home.join(".ahma").join("cluster").join("peers.json");
         if !path.exists() {
             return Ok(0);
@@ -713,28 +718,8 @@ mod tests {
         ]"#;
         std::fs::write(ahma_dir.join("peers.json"), peers_json).unwrap();
 
-        let orig_home = std::env::var("HOME").ok();
-        let orig_userprofile = std::env::var("USERPROFILE").ok();
-        unsafe {
-            std::env::set_var("HOME", temp.path());
-            std::env::set_var("USERPROFILE", temp.path());
-        }
-
         let reg = WorkerRegistry::new(60);
-        let count = reg.load_static_peers().unwrap();
-
-        unsafe {
-            if let Some(h) = orig_home {
-                std::env::set_var("HOME", h);
-            } else {
-                std::env::remove_var("HOME");
-            }
-            if let Some(up) = orig_userprofile {
-                std::env::set_var("USERPROFILE", up);
-            } else {
-                std::env::remove_var("USERPROFILE");
-            }
-        }
+        let count = reg.load_static_peers_from(temp.path()).unwrap();
 
         assert_eq!(count, 1);
         let peers = reg.peers_for_model("gemma");
