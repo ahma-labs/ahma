@@ -631,7 +631,10 @@ async fn setup_agent_skills(interactive: bool) -> Result<()> {
         match install_claude_code_plugin(&home) {
             Ok(plugin_dir) => {
                 if interactive {
-                    println!("✓ Installed ahma as Claude Code plugin at {}", plugin_dir.display());
+                    println!(
+                        "✓ Installed ahma as Claude Code plugin at {}",
+                        plugin_dir.display()
+                    );
                 }
             }
             Err(e) => {
@@ -709,11 +712,7 @@ fn install_claude_code_plugin(home: &Path) -> Result<PathBuf> {
 }
 
 /// Adds or replaces the `plugin_key` entry in `installed_plugins.json`.
-fn merge_installed_plugins(
-    path: &Path,
-    plugin_key: &str,
-    entry: serde_json::Value,
-) -> Result<()> {
+fn merge_installed_plugins(path: &Path, plugin_key: &str, entry: serde_json::Value) -> Result<()> {
     let mut config: serde_json::Value = if path.exists() {
         let content = std::fs::read_to_string(path)?;
         serde_json::from_str(&content).unwrap_or_else(|_| json!({"version": 2, "plugins": {}}))
@@ -897,7 +896,10 @@ mod tests {
 
         let content = std::fs::read_to_string(&path)?;
         let parsed: serde_json::Value = serde_json::from_str(&content)?;
-        assert_eq!(parsed["plugins"]["other@marketplace"][0]["version"], "2.0.0");
+        assert_eq!(
+            parsed["plugins"]["other@marketplace"][0]["version"],
+            "2.0.0"
+        );
         assert_eq!(parsed["plugins"]["ahma@local"][0]["version"], "0.11.0");
         Ok(())
     }
@@ -929,7 +931,10 @@ mod tests {
         let content = std::fs::read_to_string(&path)?;
         let parsed: serde_json::Value = serde_json::from_str(&content)?;
         assert_eq!(parsed["model"], "sonnet");
-        assert_eq!(parsed["enabledPlugins"]["github@claude-plugins-official"], true);
+        assert_eq!(
+            parsed["enabledPlugins"]["github@claude-plugins-official"],
+            true
+        );
         assert_eq!(parsed["enabledPlugins"]["ahma@local"], true);
         Ok(())
     }
@@ -945,7 +950,13 @@ mod tests {
         let plugin_dir = install_claude_code_plugin(home)?;
 
         // Check SKILL.md was written
-        assert!(plugin_dir.join("skills").join("ahma").join("SKILL.md").exists());
+        assert!(
+            plugin_dir
+                .join("skills")
+                .join("ahma")
+                .join("SKILL.md")
+                .exists()
+        );
         // Check plugin.json was written
         let plugin_json_path = plugin_dir.join(".claude-plugin").join("plugin.json");
         assert!(plugin_json_path.exists());
@@ -954,7 +965,9 @@ mod tests {
         assert_eq!(meta["name"], "ahma");
         // Check installed_plugins.json was updated
         let plugins_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
-            home.join(".claude").join("plugins").join("installed_plugins.json"),
+            home.join(".claude")
+                .join("plugins")
+                .join("installed_plugins.json"),
         )?)?;
         assert!(plugins_json["plugins"]["ahma@local"].is_array());
         // Check settings.json was updated
