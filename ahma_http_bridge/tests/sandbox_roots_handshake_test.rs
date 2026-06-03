@@ -363,42 +363,70 @@ fn parse_sse_event_data(raw_event: &str) -> Option<Value> {
 
 /// Dispatch a parsed SSE event. Returns `Some(result)` when the exchange is
 /// complete (success or error) and `None` to keep reading the stream.
+///
+/// Completion requires BOTH:
+/// - `roots/list` has been answered, AND
+/// - `notifications/sandbox/configured` has been received
+///
+/// This mirrors `common/client.rs::handle_roots_handshake_event` and prevents
+/// `wait_for_tool_ready` from polling while the sandbox is still in `Configuring`
+/// state on slow Windows CI runners.
 async fn handle_sse_event(
     value: Value,
     client: &Client,
     base_url: &str,
     session_id: &str,
     root_uris: &[String],
+    roots_answered: &mut bool,
+    configured_seen: &mut bool,
 ) -> Option<Result<(), String>> {
     let method = value.get("method").and_then(|m| m.as_str());
 
     if method == Some("notifications/sandbox/failed") {
-        let error = value["params"]["error"].as_str().unwrap_or("unknown");
+        let error = value
+            .get("params")
+            .and_then(|p| p.get("error"))
+            .and_then(|e| e.as_str())
+            .unwrap_or("unknown");
         return Some(Err(format!("Sandbox configuration failed: {}", error)));
     }
 
-    if method != Some("roots/list") {
+    if method == Some("notifications/sandbox/configured") {
+        *configured_seen = true;
+        if *roots_answered {
+            return Some(Ok(()));
+        }
         return None;
     }
 
-    let id = match value.get("id").cloned() {
-        Some(id) => id,
-        None => return Some(Err("roots/list must include id".to_string())),
-    };
-    let roots_json: Vec<Value> = root_uris
-        .iter()
-        .map(|uri| json!({"uri": uri, "name": "root"}))
-        .collect();
-    let response = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {"roots": roots_json}
-    });
-    Some(
-        send_mcp_request(client, base_url, &response, Some(session_id))
+    if method == Some("roots/list") {
+        let id = match value.get("id").cloned() {
+            Some(id) => id,
+            None => return Some(Err("roots/list must include id".to_string())),
+        };
+        let roots_json: Vec<Value> = root_uris
+            .iter()
+            .map(|uri| json!({"uri": uri, "name": "root"}))
+            .collect();
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {"roots": roots_json}
+        });
+        if let Err(e) = send_mcp_request(client, base_url, &response, Some(session_id))
             .await
-            .map(|_| ()),
-    )
+            .map(|_| ())
+        {
+            return Some(Err(e));
+        }
+        *roots_answered = true;
+        if *configured_seen {
+            return Some(Ok(()));
+        }
+        return None;
+    }
+
+    None
 }
 
 async fn open_roots_sse_stream(
@@ -426,6 +454,22 @@ async fn open_roots_sse_stream(
     Ok(resp)
 }
 
+/// Return the position and byte-length of the first SSE event boundary in `buffer`.
+///
+/// The SSE spec allows either LF-only (`\n\n`) or CRLF (`\r\n\r\n`) as the blank-line
+/// separator between events. Both forms must be handled to avoid missing events when
+/// the OS or HTTP stack uses CRLF line endings (observed on Windows CI runners).
+fn first_sse_boundary(buffer: &str) -> Option<(usize, usize)> {
+    let lf = buffer.find("\n\n").map(|i| (i, 2usize));
+    let crlf = buffer.find("\r\n\r\n").map(|i| (i, 4usize));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
 /// Drain complete SSE events from `buffer`, dispatching each via `handle_sse_event`.
 /// Returns `Some(result)` when the exchange completes, or `None` to keep reading.
 async fn drain_sse_buffer(
@@ -434,21 +478,32 @@ async fn drain_sse_buffer(
     base_url: &str,
     session_id: &str,
     root_uris: &[String],
+    roots_answered: &mut bool,
+    configured_seen: &mut bool,
 ) -> Option<Result<(), String>> {
-    while let Some(idx) = buffer.find("\n\n") {
+    loop {
+        let (idx, delim_len) = first_sse_boundary(buffer)?;
         let raw_event = buffer[..idx].to_string();
-        *buffer = buffer[idx + 2..].to_string();
+        *buffer = buffer[idx + delim_len..].to_string();
 
         let Some(value) = parse_sse_event_data(&raw_event) else {
             continue;
         };
 
-        if let Some(result) = handle_sse_event(value, client, base_url, session_id, root_uris).await
+        if let Some(result) = handle_sse_event(
+            value,
+            client,
+            base_url,
+            session_id,
+            root_uris,
+            roots_answered,
+            configured_seen,
+        )
+        .await
         {
             return Some(result);
         }
     }
-    None
 }
 
 async fn process_roots_list_response(
@@ -460,6 +515,62 @@ async fn process_roots_list_response(
 ) -> Result<(), String> {
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
+    let mut roots_answered = false;
+    let mut configured_seen = false;
+    let deadline = tokio::time::Instant::now() + roots_handshake_timeout();
+
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            return Err("Timeout waiting for roots/list + sandbox/configured over SSE".to_string());
+        }
+
+        let chunk = match tokio::time::timeout(TestTimeouts::poll_interval(), stream.next()).await {
+            Err(_elapsed) => continue, // poll window elapsed, no data yet — try again
+            Ok(None) => {
+                return Err(
+                    "SSE handshake stream closed by server before handshake completed".to_string(),
+                );
+            }
+            Ok(Some(chunk)) => chunk,
+        };
+
+        let bytes = chunk.map_err(|e| format!("SSE read error: {}", e))?;
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+        if let Some(result) = drain_sse_buffer(
+            &mut buffer,
+            client,
+            base_url,
+            session_id,
+            root_uris,
+            &mut roots_answered,
+            &mut configured_seen,
+        )
+        .await
+        {
+            return result;
+        }
+    }
+}
+
+/// Process the SSE stream for the roots/list exchange ONLY.
+///
+/// Returns after the `roots/list` response POST succeeds, without waiting for
+/// `notifications/sandbox/configured`. Use this for failure-path tests where the
+/// sandbox will never configure (empty roots, all-malformed URIs) so that the
+/// test does not wait for a `notifications/sandbox/configured` that will never arrive.
+async fn process_roots_exchange_stream(
+    resp: reqwest::Response,
+    client: &Client,
+    base_url: &str,
+    session_id: &str,
+    root_uris: &[String],
+) -> Result<(), String> {
+    let mut stream = resp.bytes_stream();
+    let mut buffer = String::new();
+    let mut roots_answered = false;
+    // configured_seen is intentionally unused: we return as soon as roots are answered.
+    let mut configured_seen = false;
     let deadline = tokio::time::Instant::now() + roots_handshake_timeout();
 
     loop {
@@ -467,21 +578,34 @@ async fn process_roots_list_response(
             return Err("Timeout waiting for roots/list over SSE".to_string());
         }
 
-        let chunk = tokio::time::timeout(TestTimeouts::poll_interval(), stream.next())
-            .await
-            .ok()
-            .flatten();
-
-        let Some(next) = chunk else {
-            continue;
+        let chunk = match tokio::time::timeout(TestTimeouts::poll_interval(), stream.next()).await {
+            Err(_elapsed) => continue,
+            Ok(None) => {
+                return Err("SSE stream closed before roots/list arrived".to_string());
+            }
+            Ok(Some(chunk)) => chunk,
         };
-        let bytes = next.map_err(|e| format!("SSE read error: {}", e))?;
+
+        let bytes = chunk.map_err(|e| format!("SSE read error: {}", e))?;
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-        if let Some(result) =
-            drain_sse_buffer(&mut buffer, client, base_url, session_id, root_uris).await
+        // After roots_answered, stop — do not wait for sandbox/configured.
+        if let Some(result) = drain_sse_buffer(
+            &mut buffer,
+            client,
+            base_url,
+            session_id,
+            root_uris,
+            &mut roots_answered,
+            &mut configured_seen,
+        )
+        .await
         {
             return result;
+        }
+
+        if roots_answered {
+            return Ok(());
         }
     }
 }
@@ -498,6 +622,9 @@ async fn answer_roots_list_with_uris(
 }
 
 /// Complete the normal roots handshake in the safe order: open SSE first, then send initialized.
+///
+/// Waits for BOTH `roots/list` and `notifications/sandbox/configured` before returning, so
+/// callers can be certain the sandbox is `Active` when this resolves.
 async fn complete_roots_handshake_with_uris(
     client: &Client,
     base_url: &str,
@@ -508,6 +635,36 @@ async fn complete_roots_handshake_with_uris(
     sleep(TestTimeouts::short_delay()).await;
     send_initialized_notification(client, base_url, session_id).await?;
     process_roots_list_response(resp, client, base_url, session_id, root_uris).await
+}
+
+/// Complete only the roots/list exchange (no `notifications/sandbox/configured` wait).
+///
+/// Use this for failure-path tests (empty roots, all-malformed URIs) where the sandbox
+/// will never reach `Active` and `notifications/sandbox/configured` will never arrive.
+async fn complete_roots_exchange_with_uris(
+    client: &Client,
+    base_url: &str,
+    session_id: &str,
+    root_uris: &[String],
+) -> Result<(), String> {
+    let resp = open_roots_sse_stream(client, base_url, session_id).await?;
+    sleep(TestTimeouts::short_delay()).await;
+    send_initialized_notification(client, base_url, session_id).await?;
+    process_roots_exchange_stream(resp, client, base_url, session_id, root_uris).await
+}
+
+fn spawn_complete_roots_exchange(
+    client: &Client,
+    base_url: &str,
+    session_id: &str,
+    root_uris: Vec<String>,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    let client = client.clone();
+    let base_url = base_url.to_string();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        complete_roots_exchange_with_uris(&client, &base_url, &session_id, &root_uris).await
+    })
 }
 
 // =============================================================================
@@ -527,7 +684,9 @@ async fn test_empty_roots_rejection() {
 
     let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
 
-    let sse_task = spawn_complete_roots_handshake(&client, &base_url, &session_id, vec![]);
+    // Use exchange-only variant: sandbox/configured will never arrive for empty roots,
+    // so we must not wait for it.
+    let sse_task = spawn_complete_roots_exchange(&client, &base_url, &session_id, vec![]);
 
     // Give time for roots/list exchange
     sleep(TestTimeouts::short_delay()).await;
@@ -645,7 +804,8 @@ async fn test_session_with_only_malformed_uris() {
         "".to_string(),
     ];
 
-    let sse_task = spawn_complete_roots_handshake(&client, &base_url, &session_id, malformed_uris);
+    // Use exchange-only variant: all URIs are malformed, sandbox/configured will never arrive.
+    let sse_task = spawn_complete_roots_exchange(&client, &base_url, &session_id, malformed_uris);
 
     sleep(TestTimeouts::short_delay()).await;
     let _ = sse_task.await;
