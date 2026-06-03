@@ -783,6 +783,13 @@ async fn send_final_result_progress(
     }
 }
 
+/// Identity fields for a running operation, passed as a bundle to avoid argument-count warnings.
+struct StreamingOpContext<'a> {
+    op_id: &'a str,
+    program: &'a str,
+    working_dir: &'a str,
+}
+
 /// Execute a command in batch mode (existing behavior): collect all output at once.
 #[allow(clippy::too_many_arguments)]
 async fn execute_batch(
@@ -1028,9 +1035,11 @@ async fn execute_with_streaming(
         &collected_stderr,
         op_monitor,
         callback,
-        op_id,
-        program,
-        working_dir,
+        &StreamingOpContext {
+            op_id,
+            program,
+            working_dir,
+        },
     )
     .await;
 }
@@ -1059,10 +1068,11 @@ async fn finalize_streaming_operation(
     collected_stderr: &BoundedLineCollector,
     op_monitor: &Arc<OperationMonitor>,
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
-    op_id: &str,
-    program: &str,
-    working_dir: &str,
+    ctx: &StreamingOpContext<'_>,
 ) {
+    let op_id = ctx.op_id;
+    let program = ctx.program;
+    let working_dir = ctx.working_dir;
     let exit_status = child.wait().await;
     let duration_ms = start_time.elapsed().as_millis() as u64;
     let exit_code = exit_status
