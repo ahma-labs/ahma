@@ -582,7 +582,16 @@ async fn test_special_characters_in_arguments() {
         Duration::from_secs(30),
     )));
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
-    let sandbox = Arc::new(Sandbox::new_test());
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![std::env::temp_dir()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
 
     let adapter = Adapter::new(monitor, shell_pool, sandbox).expect("Failed to create adapter");
 

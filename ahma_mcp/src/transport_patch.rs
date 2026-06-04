@@ -47,12 +47,20 @@ where
 }
 
 /// Convenience alias for stdio-based patched transport.
-pub type PatchedStdioTransport = PatchedTransport<BufReader<tokio::io::Stdin>, tokio::io::Stdout>;
+pub type PatchedStdioTransport = PatchedTransport<
+    BufReader<tokio::io::Stdin>,
+    tokio_util::either::Either<tokio::io::Stdout, tokio::fs::File>,
+>;
 
 impl PatchedStdioTransport {
     /// Create a patched transport bound to process stdin/stdout.
     pub fn new_stdio() -> Self {
-        Self::new(BufReader::new(tokio::io::stdin()), tokio::io::stdout())
+        let writer = if let Some(saved_stdout) = crate::utils::stdio_redirect::get_saved_stdout() {
+            tokio_util::either::Either::Right(tokio::fs::File::from_std(saved_stdout))
+        } else {
+            tokio_util::either::Either::Left(tokio::io::stdout())
+        };
+        Self::new(BufReader::new(tokio::io::stdin()), writer)
     }
 }
 

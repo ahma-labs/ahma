@@ -104,7 +104,7 @@ pub struct AppConfig {
     pub hot_reload_tools: bool,
     /// Skip tool availability probes at startup (AHMA_SKIP_PROBES=1).
     pub skip_availability_probes: bool,
-    /// Show all tools without progressive disclosure (AHMA_PROGRESSIVE_DISCLOSURE=0).
+    /// Enable progressive disclosure (AHMA_PROGRESSIVE_DISCLOSURE=1).
     pub progressive_disclosure: bool,
     /// Startup visibility profile (AHMA_REVEAL_PROFILE: minimal|balanced|full).
     pub reveal_profile: StartupProfile,
@@ -167,6 +167,18 @@ pub struct AppConfig {
     /// When set, the sandbox scope is set to <vault>/workdir/ and an audit
     /// log is initialized at <vault>/audit.jsonl.
     pub task_vault: Option<PathBuf>,
+
+    // ── HTTP authentication / rate limiting / daemon ────────────────────────
+    /// Required token for HTTP access (AHMA_REQUIRE_TOKEN).
+    pub require_token: Option<String>,
+    /// Path to a file containing the required token (AHMA_REQUIRE_TOKEN_PATH).
+    pub require_token_path: Option<PathBuf>,
+    /// Rate limit requests per second (AHMA_RATE_LIMIT_RPS).
+    pub rate_limit_rps: u64,
+    /// Rate limit burst allowance (AHMA_RATE_LIMIT_BURST).
+    pub rate_limit_burst: u32,
+    /// Daemon instance label (AHMA_INSTANCE_LABEL).
+    pub instance_label: String,
 }
 
 impl Default for AppConfig {
@@ -203,6 +215,11 @@ impl Default for AppConfig {
             run_tool: None,
             run_tool_args: vec![],
             task_vault: None,
+            require_token: None,
+            require_token_path: None,
+            rate_limit_rps: 0,
+            rate_limit_burst: 10,
+            instance_label: "ahma".to_string(),
         }
     }
 }
@@ -1717,7 +1734,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         force_sync: serve.sync || AppConfig::env_flag("AHMA_SYNC"),
         hot_reload_tools: AppConfig::env_flag("AHMA_HOT_RELOAD"),
         skip_availability_probes: AppConfig::env_flag("AHMA_SKIP_PROBES"),
-        progressive_disclosure: !AppConfig::env_flag("AHMA_PROGRESSIVE_DISCLOSURE_OFF"),
+        progressive_disclosure: AppConfig::env_flag("AHMA_PROGRESSIVE_DISCLOSURE"),
         reveal_profile: match std::env::var("AHMA_REVEAL_PROFILE")
             .as_deref()
             .unwrap_or("")
@@ -1756,6 +1773,22 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         task_vault: serve
             .task_vault
             .or_else(|| std::env::var("AHMA_TASK_VAULT").ok().map(PathBuf::from)),
+        require_token: std::env::var("AHMA_REQUIRE_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        require_token_path: std::env::var("AHMA_REQUIRE_TOKEN_PATH")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
+        rate_limit_rps: std::env::var("AHMA_RATE_LIMIT_RPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        rate_limit_burst: std::env::var("AHMA_RATE_LIMIT_BURST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10),
+        instance_label: std::env::var("AHMA_INSTANCE_LABEL").unwrap_or_else(|_| "ahma".to_string()),
     }
 }
 
@@ -1951,6 +1984,7 @@ fn print_tool_info_header(total_tools: usize) {
     println!();
 }
 
+#[allow(deprecated)]
 fn print_tool_info_entry(name: &str, config: &crate::config::ToolConfig) {
     println!("Tool: {}", name);
     println!("  Description: {}", config.description);
@@ -1983,6 +2017,7 @@ fn print_tool_info_text(tools: &[(&String, &crate::config::ToolConfig)]) {
     }
 }
 
+#[allow(deprecated)]
 fn print_tool_info_json(tools: &[(&String, &crate::config::ToolConfig)]) -> Result<()> {
     let output: Vec<_> = tools
         .iter()
@@ -2152,7 +2187,7 @@ mod tests {
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
-            progressive_disclosure: true,
+            progressive_disclosure: false,
             reveal_profile: StartupProfile::Minimal,
             no_sandbox: false,
             sandbox_scopes: vec![],
@@ -2176,6 +2211,11 @@ mod tests {
             run_tool_args: vec![],
             observability: ahma_common::observability::ObservabilityConfig::default(),
             task_vault: None,
+            require_token: None,
+            require_token_path: None,
+            rate_limit_rps: 0,
+            rate_limit_burst: 10,
+            instance_label: "ahma".to_string(),
         }
     }
 

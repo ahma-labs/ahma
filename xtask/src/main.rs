@@ -497,8 +497,14 @@ fn safe_update(args: &[String]) {
     );
     println!();
 
-    // --- Step 1: discover proposed upgrades via `cargo upgrade --dry-run` ---
-    let candidates = proposed_upgrades(&root, &opts);
+    // Discover direct dependency candidates so we know which ones need Cargo.toml updates
+    let direct_upgrades: std::collections::HashSet<String> = proposed_upgrades(&root, &opts)
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
+
+    // Discover all lockfile upgrades (direct + transitive)
+    let candidates = proposed_lockfile_updates(&root, &opts);
     if candidates.is_empty() {
         println!("No upgradeable dependencies found.");
         return;
@@ -526,10 +532,27 @@ fn safe_update(args: &[String]) {
         return;
     }
 
+    // Pin skipped/unsafe candidates to their old versions in Cargo.lock to prevent transitives/resolver from upgrading them
+    println!("Pinning skipped/unsafe dependencies to current versions in Cargo.lock…");
+    for row in &rows {
+        if row.status.starts_with("skipped:") {
+            println!(
+                "  Pinning {name} to {version}…",
+                name = row.name,
+                version = row.old_ver
+            );
+            let _ = std::process::Command::new("cargo")
+                .args(["update", "-p", &row.name, "--precise", &row.old_ver])
+                .current_dir(&root)
+                .status();
+        }
+    }
+
     // --- Step 5: apply upgrades ---
     println!("Applying {} upgrade(s)…", to_apply.len());
     for (name, ver) in &to_apply {
-        apply_upgrade(&root, name, ver);
+        let is_direct = direct_upgrades.contains(name);
+        apply_upgrade(&root, name, ver, is_direct);
     }
 
     // --- Step 6: verify workspace still compiles ---
@@ -729,6 +752,44 @@ fn proposed_upgrades(root: &Path, opts: &SafeUpdateOpts) -> Vec<(String, String,
         .collect()
 }
 
+/// Run `cargo update --dry-run` and parse its output to discover upgrades for both direct
+/// and transitive/upstream dependencies.
+fn proposed_lockfile_updates(root: &Path, opts: &SafeUpdateOpts) -> Vec<(String, String, String)> {
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.args(["update", "--dry-run"]).current_dir(root);
+
+    let output = cmd.output().unwrap_or_else(|e| {
+        eprintln!("ERROR: failed to run `cargo update --dry-run`: {e}");
+        process::exit(1);
+    });
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+
+    // Look for lines like "    Updating bitflags v2.11.1 -> v2.12.1"
+    let update_re =
+        regex::Regex::new(r"(?i)^\s*Updating\s+([a-zA-Z0-9_\-]+)\s+v?([^\s]+)\s+->\s+v?([^\s]+)")
+            .expect("static update regex");
+
+    let mut seen = std::collections::HashSet::new();
+    combined
+        .lines()
+        .filter_map(|line| {
+            let cap = update_re.captures(line)?;
+            let name = cap[1].to_string();
+            let old_ver = cap[2].trim_start_matches('v').to_string();
+            let new_ver = cap[3].trim_start_matches('v').to_string();
+            if old_ver == new_ver {
+                return None;
+            }
+            Some((name, old_ver, new_ver))
+        })
+        .filter(|(name, _, _)| passes_upgrade_filters(name, opts))
+        .filter(|(name, _, _)| seen.insert(name.clone()))
+        .collect()
+}
+
 fn should_skip_cargo_upgrade_line(line: &str) -> bool {
     line.starts_with("Checking ")
         || line.starts_with("note:")
@@ -900,23 +961,26 @@ fn fetch_crate_publish_age_days(name: &str, version: &str) -> Result<i64, String
     Ok(age)
 }
 
-/// Apply a single upgrade: bump Cargo.toml via `cargo upgrade -p name@version`
-/// then tighten Cargo.lock via `cargo update -p name --precise version`.
-fn apply_upgrade(root: &Path, name: &str, version: &str) {
-    println!("  Upgrading {name} → {version}");
-
-    // cargo upgrade -p name@version writes Cargo.toml requirement
-    let exit = std::process::Command::new("cargo")
-        .args(["upgrade", "-p", &format!("{name}@{version}")])
-        .current_dir(root)
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("ERROR: `cargo upgrade -p {name}@{version}` failed: {e}");
+/// Apply a single upgrade: bump Cargo.toml via `cargo upgrade -p name@version` (if direct),
+/// then tighten/pin Cargo.lock via `cargo update -p name --precise version`.
+fn apply_upgrade(root: &Path, name: &str, version: &str, is_direct: bool) {
+    if is_direct {
+        println!("  Upgrading direct dependency {name} → {version}");
+        // cargo upgrade -p name@version writes Cargo.toml requirement
+        let exit = std::process::Command::new("cargo")
+            .args(["upgrade", "-p", &format!("{name}@{version}")])
+            .current_dir(root)
+            .status()
+            .unwrap_or_else(|e| {
+                eprintln!("ERROR: `cargo upgrade -p {name}@{version}` failed: {e}");
+                process::exit(1);
+            });
+        if !exit.success() {
+            eprintln!("ERROR: `cargo upgrade -p {name}@{version}` exited with: {exit}");
             process::exit(1);
-        });
-    if !exit.success() {
-        eprintln!("ERROR: `cargo upgrade -p {name}@{version}` exited with: {exit}");
-        process::exit(1);
+        }
+    } else {
+        println!("  Upgrading transitive dependency {name} → {version}");
     }
 
     // cargo update -p name --precise version pins Cargo.lock
@@ -931,5 +995,51 @@ fn apply_upgrade(root: &Path, name: &str, version: &str) {
     if !exit.success() {
         eprintln!("WARN: `cargo update -p {name} --precise {version}` exited with: {exit}");
         // Non-fatal — Cargo.lock will still be resolved on next build
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn test_proposed_lockfile_updates_parsing() {
+        let sample_output = r#"
+    Updating bitflags v2.11.1 -> v2.12.1
+    Updating cc v1.2.62 -> v1.2.63
+    Removing scc v2.4.0
+    Adding shlex v2.0.1
+"#;
+        let update_re = regex::Regex::new(
+            r"(?i)^\s*Updating\s+([a-zA-Z0-9_\-]+)\s+v?([^\s]+)\s+->\s+v?([^\s]+)",
+        )
+        .unwrap();
+
+        let parsed: Vec<(String, String, String)> = sample_output
+            .lines()
+            .filter_map(|line| {
+                let cap = update_re.captures(line)?;
+                let name = cap[1].to_string();
+                let old_ver = cap[2].trim_start_matches('v').to_string();
+                let new_ver = cap[3].trim_start_matches('v').to_string();
+                if old_ver == new_ver {
+                    return None;
+                }
+                Some((name, old_ver, new_ver))
+            })
+            .collect();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0],
+            (
+                "bitflags".to_string(),
+                "2.11.1".to_string(),
+                "2.12.1".to_string()
+            )
+        );
+        assert_eq!(
+            parsed[1],
+            ("cc".to_string(), "1.2.62".to_string(), "1.2.63".to_string())
+        );
     }
 }

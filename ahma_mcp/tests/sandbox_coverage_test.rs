@@ -124,10 +124,17 @@ fn test_validate_path_symlink_traversal() {
 
 #[test]
 fn test_sandbox_test_mode_bypass() {
-    // Test sandboxes include practical local scopes but must not be globally rooted.
-    let sandbox = Sandbox::new_test();
+    let td = tempfile::tempdir().unwrap();
+    let sandbox = Sandbox::new(
+        vec![td.path().to_path_buf()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
 
-    let path = std::env::current_dir().unwrap();
+    let path = td.path().to_path_buf();
     let res = sandbox.validate_path(&path);
     assert!(res.is_ok());
 
@@ -135,6 +142,6 @@ fn test_sandbox_test_mode_bypass() {
     let res = sandbox.validate_path(&outside);
     assert!(
         res.is_err(),
-        "new_test should not bypass validation for out-of-scope paths"
+        "Test sandbox should not bypass validation for out-of-scope paths"
     );
 }

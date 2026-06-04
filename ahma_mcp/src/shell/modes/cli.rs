@@ -150,6 +150,7 @@ fn is_top_level_sequence(config: &crate::config::ToolConfig) -> bool {
     config.command == "sequence" && config.sequence.is_some()
 }
 
+#[allow(deprecated)]
 fn sequence_subcommand_config(config: &crate::config::ToolConfig) -> SubcommandConfig {
     SubcommandConfig {
         name: config.name.clone(),

@@ -176,7 +176,7 @@ cargo clippy --fix --allow-dirty   # Auto-fix lints
 
 **⚠️ `setup_mcp_service_with_client()` spawns a subprocess** — it is NOT an in-process helper despite the name. It belongs in the E2E row.
 
-**Sandbox bypass trap**: `create_in_process_mcp_from_dir` uses `Sandbox::new_test()` which bypasses all path validation. Tests that assert a path/symlink is **rejected** must use `create_in_process_mcp_with_scope(tools_dir, scopes)` (strict mode) or the assertion silently passes even when the sandbox is broken.
+Both helpers strictly enforce path validation since `new_test` and validation bypasses have been removed. Tests must ensure that input files and working directories are correctly scoped.
 
 ### Test Organization
 Tests are organized into three categories:

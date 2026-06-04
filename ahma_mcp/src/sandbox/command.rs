@@ -123,8 +123,15 @@ mod tests {
     /// create_command in Test mode delegates directly to base_command.
     #[test]
     fn test_create_command_test_mode_succeeds() {
-        let sandbox = Sandbox::new_test();
         let td = tempdir().unwrap();
+        let sandbox = Sandbox::new(
+            vec![td.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         let result = sandbox.create_command("echo", &["hello".to_string()], td.path());
         assert!(result.is_ok(), "create_command in Test mode should succeed");
     }
@@ -132,8 +139,15 @@ mod tests {
     /// create_command recognizes "cargo" and sets CARGO_TARGET_DIR env var.
     #[test]
     fn test_create_command_cargo_sets_target_dir() {
-        let sandbox = Sandbox::new_test();
         let td = tempdir().unwrap();
+        let sandbox = Sandbox::new(
+            vec![td.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         // We can only observe the resulting Command via Debug since the env is private,
         // but at minimum this should not panic and return a valid Command.
         let result = sandbox.create_command("cargo", &["build".to_string()], td.path());
@@ -143,8 +157,15 @@ mod tests {
     /// create_shell_command in Test mode produces a valid command.
     #[test]
     fn test_create_shell_command_test_mode_succeeds() {
-        let sandbox = Sandbox::new_test();
         let td = tempdir().unwrap();
+        let sandbox = Sandbox::new(
+            vec![td.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
 
         // Use platform-appropriate shell
         #[cfg(not(target_os = "windows"))]

@@ -73,6 +73,10 @@ pub struct ToolConfig {
         skip_serializing_if = "Option::is_none",
         alias = "force_synchronous"
     )]
+    #[deprecated(
+        since = "0.11.2",
+        note = "Use dynamic 'blocking' argument in tools/call instead"
+    )]
     pub synchronous: Option<bool>,
     #[serde(default)]
     pub hints: ToolHints,
@@ -270,6 +274,10 @@ pub struct SubcommandConfig {
         default,
         skip_serializing_if = "Option::is_none",
         alias = "force_synchronous"
+    )]
+    #[deprecated(
+        since = "0.11.2",
+        note = "Use dynamic 'blocking' argument in tools/call instead"
     )]
     pub synchronous: Option<bool>,
     #[serde(default = "default_enabled")]

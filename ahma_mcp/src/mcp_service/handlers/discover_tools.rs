@@ -34,6 +34,9 @@ impl AhmaMcpService {
         &self,
         args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
+        tracing::warn!(
+            "Deprecation Warning: the `activate_tools` tool is deprecated and will be removed in a future release."
+        );
         let action = common::opt_str(&args, "action").unwrap_or_else(|| "list".to_string());
 
         match action.as_str() {

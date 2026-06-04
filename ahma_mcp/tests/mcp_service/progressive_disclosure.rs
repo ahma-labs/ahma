@@ -24,7 +24,17 @@ async fn create_pd_service() -> AhmaMcpService {
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-    let sandbox = Arc::new(ahma_mcp::sandbox::Sandbox::new_test());
+    let _temp = tempfile::tempdir().unwrap();
+    let sandbox = Arc::new(
+        ahma_mcp::sandbox::Sandbox::new(
+            vec![_temp.path().to_path_buf()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
 
@@ -58,7 +68,17 @@ async fn create_legacy_service() -> AhmaMcpService {
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-    let sandbox = Arc::new(ahma_mcp::sandbox::Sandbox::new_test());
+    let _temp = tempfile::tempdir().unwrap();
+    let sandbox = Arc::new(
+        ahma_mcp::sandbox::Sandbox::new(
+            vec![_temp.path().to_path_buf()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
 
@@ -400,7 +420,17 @@ async fn create_pd_service_with_auto_reveal() -> AhmaMcpService {
     ));
     let shell_config = ahma_mcp::shell_pool::ShellPoolConfig::default();
     let shell_pool = Arc::new(ahma_mcp::shell_pool::ShellPoolManager::new(shell_config));
-    let sandbox = Arc::new(ahma_mcp::sandbox::Sandbox::new_test());
+    let _temp = tempfile::tempdir().unwrap();
+    let sandbox = Arc::new(
+        ahma_mcp::sandbox::Sandbox::new(
+            vec![_temp.path().to_path_buf()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
 
@@ -496,7 +526,17 @@ async fn test_non_flagged_bundles_remain_hidden_with_auto_reveal() {
     ));
     let shell_config = ahma_mcp::shell_pool::ShellPoolConfig::default();
     let shell_pool = Arc::new(ahma_mcp::shell_pool::ShellPoolManager::new(shell_config));
-    let sandbox = Arc::new(ahma_mcp::sandbox::Sandbox::new_test());
+    let _temp = tempfile::tempdir().unwrap();
+    let sandbox = Arc::new(
+        ahma_mcp::sandbox::Sandbox::new(
+            vec![_temp.path().to_path_buf()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
 
@@ -559,7 +599,17 @@ async fn test_balanced_profile_reveals_cli_bundles() {
     ));
     let shell_config = ahma_mcp::shell_pool::ShellPoolConfig::default();
     let shell_pool = Arc::new(ahma_mcp::shell_pool::ShellPoolManager::new(shell_config));
-    let sandbox = Arc::new(ahma_mcp::sandbox::Sandbox::new_test());
+    let _temp = tempfile::tempdir().unwrap();
+    let sandbox = Arc::new(
+        ahma_mcp::sandbox::Sandbox::new(
+            vec![_temp.path().to_path_buf()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
 
@@ -619,7 +669,17 @@ async fn test_minimal_profile_hides_cli_bundles() {
     ));
     let shell_config = ahma_mcp::shell_pool::ShellPoolConfig::default();
     let shell_pool = Arc::new(ahma_mcp::shell_pool::ShellPoolManager::new(shell_config));
-    let sandbox = Arc::new(ahma_mcp::sandbox::Sandbox::new_test());
+    let _temp = tempfile::tempdir().unwrap();
+    let sandbox = Arc::new(
+        ahma_mcp::sandbox::Sandbox::new(
+            vec![_temp.path().to_path_buf()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
 

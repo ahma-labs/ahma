@@ -21,7 +21,16 @@ async fn create_test_adapter() -> Arc<Adapter> {
     let monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_pool_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_pool_config));
-    let sandbox = Arc::new(Sandbox::new_test());
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![std::env::temp_dir()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
 
     Arc::new(Adapter::new(monitor, shell_pool, sandbox).unwrap())
 }

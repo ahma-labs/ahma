@@ -35,7 +35,15 @@ fn test_normalize_path_multiple_parent_dirs() {
 
 #[test]
 fn test_is_test_mode_on_sandbox_instance() {
-    let sandbox = Sandbox::new_test();
+    let temp_test = tempdir().unwrap();
+    let sandbox = Sandbox::new(
+        vec![temp_test.path().to_path_buf()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
     assert!(sandbox.is_test_mode());
 
     let temp = tempdir().unwrap();

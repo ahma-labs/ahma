@@ -102,23 +102,11 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
         enable_quic: !config.no_quic,
         disable_http1_1: config.disable_http1_1,
         listener_kind: ahma_http_bridge::ListenerKind::Tcp(bind_addr),
-        // Allow test harnesses (and operator overrides) to configure auth + rate
-        // limiting via environment variables without modifying the CLI args.
-        require_token: std::env::var("AHMA_REQUIRE_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty()),
-        require_token_path: std::env::var("AHMA_REQUIRE_TOKEN_PATH")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(std::path::PathBuf::from),
-        rate_limit_rps: std::env::var("AHMA_RATE_LIMIT_RPS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
-        rate_limit_burst: std::env::var("AHMA_RATE_LIMIT_BURST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10),
+        // Configured auth + rate limiting passed down from AppConfig.
+        require_token: config.require_token.clone(),
+        require_token_path: config.require_token_path.clone(),
+        rate_limit_rps: config.rate_limit_rps,
+        rate_limit_burst: config.rate_limit_burst,
     };
 
     start_bridge(bridge_config).await?;

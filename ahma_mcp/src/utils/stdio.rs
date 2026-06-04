@@ -38,19 +38,37 @@ use std::io::{self, ErrorKind, Write};
 /// `Ok(())` on success or broken pipe, `Err(io::Error)` on unexpected
 /// write failures.
 pub fn emit_stdout_notification(json: &str) -> io::Result<()> {
-    let mut stdout = io::stdout().lock();
-    match writeln!(stdout, "\n{}", json) {
-        Ok(()) => {
-            let _ = stdout.flush();
-            Ok(())
+    if let Some(saved_stdout) = super::stdio_redirect::get_saved_stdout() {
+        let mut stdout = saved_stdout;
+        match writeln!(stdout, "\n{}", json) {
+            Ok(()) => {
+                let _ = stdout.flush();
+                Ok(())
+            }
+            Err(e) if is_broken_pipe(&e) => {
+                tracing::debug!("stdout pipe closed (broken pipe) — notification not delivered");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("Unexpected stdout write error: {}", e);
+                Err(e)
+            }
         }
-        Err(e) if is_broken_pipe(&e) => {
-            tracing::debug!("stdout pipe closed (broken pipe) — notification not delivered");
-            Ok(())
-        }
-        Err(e) => {
-            tracing::warn!("Unexpected stdout write error: {}", e);
-            Err(e)
+    } else {
+        let mut stdout = io::stdout().lock();
+        match writeln!(stdout, "\n{}", json) {
+            Ok(()) => {
+                let _ = stdout.flush();
+                Ok(())
+            }
+            Err(e) if is_broken_pipe(&e) => {
+                tracing::debug!("stdout pipe closed (broken pipe) — notification not delivered");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("Unexpected stdout write error: {}", e);
+                Err(e)
+            }
         }
     }
 }

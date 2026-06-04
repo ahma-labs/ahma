@@ -131,10 +131,15 @@ pub async fn handle_sequence_tool(
     let sequence = config.sequence.as_ref().unwrap(); // Safe due to prior check
     let step_delay_ms = config.step_delay_ms.unwrap_or(SEQUENCE_STEP_DELAY_MS);
 
-    // Determine if sequence should run synchronously
-    // - If synchronous is true, run sync
-    // - If synchronous is false or None, default is async for sequence tools
-    let run_synchronously = config.synchronous.unwrap_or(false);
+    let dynamic_blocking = params
+        .arguments
+        .as_ref()
+        .and_then(|args| args.get("blocking"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    #[allow(deprecated)]
+    let run_synchronously = dynamic_blocking || config.synchronous.unwrap_or(false);
 
     if run_synchronously {
         handle_sequence_tool_sync(adapter, configs, config, params, sequence, step_delay_ms).await

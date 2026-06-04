@@ -46,7 +46,16 @@ async fn make_service(initial_configs: HashMap<String, ToolConfig>) -> AhmaMcpSe
     let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
-    let sandbox = Arc::new(Sandbox::new_test());
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![std::env::temp_dir()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
     let configs = Arc::new(initial_configs);

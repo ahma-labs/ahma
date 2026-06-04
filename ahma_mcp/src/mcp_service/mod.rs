@@ -377,138 +377,35 @@ impl AhmaMcpService {
         )))
     }
 
-    fn looks_like_rm_command(base_command: &str) -> bool {
-        let token = base_command.split_whitespace().next().unwrap_or_default();
-        token == "rm" || token.ends_with("/rm")
-    }
-
-    fn extract_rm_targets_from_arguments(
-        arguments: &serde_json::Map<String, serde_json::Value>,
-    ) -> Vec<String> {
-        let mut targets = Vec::new();
-        for (key, value) in arguments {
-            if Self::is_rm_meta_argument(key) {
-                continue;
-            }
-            Self::extend_rm_targets(&mut targets, value);
-        }
-        targets
-    }
-
-    fn is_rm_meta_argument(key: &str) -> bool {
-        matches!(
-            key,
-            "timeout_seconds" | "execution_mode" | "working_directory"
-        )
-    }
-
-    fn extend_rm_targets(targets: &mut Vec<String>, value: &serde_json::Value) {
-        match value {
-            serde_json::Value::String(candidate) => {
-                Self::maybe_push_rm_target(targets, candidate);
-            }
-            serde_json::Value::Array(values) => {
-                for candidate in values.iter().filter_map(serde_json::Value::as_str) {
-                    Self::maybe_push_rm_target(targets, candidate);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn maybe_push_rm_target(targets: &mut Vec<String>, candidate: &str) {
-        if !candidate.starts_with('-') {
-            targets.push(candidate.to_string());
-        }
-    }
-
-    fn resolve_delete_source_path(target: &str, working_directory: &str) -> PathBuf {
-        let mut source = PathBuf::from(target);
-        if source.is_relative() {
-            source = PathBuf::from(working_directory).join(source);
-        }
-        source
-    }
-
-    fn stage_single_path_into_trash(
-        source: PathBuf,
-        trash_dir: &Path,
-    ) -> Result<Option<(String, String)>, anyhow::Error> {
-        use anyhow::Context;
-
-        if !source.exists() {
-            return Ok(None);
-        }
-
-        let filename = source
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("staged-item");
-        let ts = Utc::now().format("%Y%m%dT%H%M%S%3fZ");
-        let dest = trash_dir.join(format!("{ts}_{filename}"));
-
-        std::fs::rename(&source, &dest).with_context(|| {
-            format!(
-                "Failed to stage '{}' into '{}'",
-                source.display(),
-                dest.display()
-            )
-        })?;
-
-        Ok(Some((
-            source.to_string_lossy().to_string(),
-            dest.to_string_lossy().to_string(),
-        )))
-    }
-
-    fn stage_paths_into_vault_trash(
-        &self,
-        working_directory: &str,
-        targets: &[String],
-    ) -> Result<Vec<(String, String)>, anyhow::Error> {
-        use anyhow::Context;
-
-        let Some(trash_dir) = self.task_vault_trash_dir() else {
-            return Ok(Vec::new());
-        };
-        std::fs::create_dir_all(&trash_dir).with_context(|| {
-            format!("Failed to create vault trash dir: {}", trash_dir.display())
-        })?;
-
-        let mut staged = Vec::new();
-        for target in targets {
-            let source = Self::resolve_delete_source_path(target, working_directory);
-            if let Some(pair) = Self::stage_single_path_into_trash(source, &trash_dir)? {
-                staged.push(pair);
-            }
-        }
-
-        Ok(staged)
-    }
-
     async fn maybe_stage_configured_delete(
         &self,
         base_command: &str,
         working_directory: &str,
         arguments: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Option<CallToolResult>, McpError> {
-        if !Self::looks_like_rm_command(base_command) || self.task_vault_root().is_none() {
+        use crate::vault::rm_interceptor::RmInterceptor;
+
+        if !RmInterceptor::looks_like_rm_command(base_command) || self.task_vault_root().is_none() {
             return Ok(None);
         }
 
-        let targets = Self::extract_rm_targets_from_arguments(arguments);
+        let targets = RmInterceptor::extract_rm_targets_from_arguments(arguments);
         if targets.is_empty() {
             return Ok(None);
         }
 
-        let staged = self
-            .stage_paths_into_vault_trash(working_directory, &targets)
-            .map_err(|e| {
-                handlers::common::mcp_internal(format!(
-                    "Failed to stage deletion to vault trash: {}",
-                    e
-                ))
-            })?;
+        let trash_dir = self.task_vault_trash_dir().ok_or_else(|| {
+            handlers::common::mcp_internal("Task vault trash directory not configured")
+        })?;
+
+        let staged =
+            RmInterceptor::stage_paths_into_vault_trash(&trash_dir, working_directory, &targets)
+                .map_err(|e| {
+                    handlers::common::mcp_internal(format!(
+                        "Failed to stage deletion to vault trash: {}",
+                        e
+                    ))
+                })?;
 
         for (original_path, trash_path) in &staged {
             self.emit_vault_file_staged(original_path, trash_path).await;
@@ -543,6 +440,12 @@ impl AhmaMcpService {
         defer_sandbox: bool,
         progressive_disclosure: bool,
     ) -> Result<Self, anyhow::Error> {
+        if progressive_disclosure {
+            tracing::warn!(
+                "Deprecation Warning: Progressive disclosure of tool bundles is deprecated and will be removed in a future release. All tools are now shown by default."
+            );
+        }
+
         // Start the background monitor for operation timeouts
         crate::operation_monitor::OperationMonitor::start_background_monitor(
             operation_monitor.clone(),
@@ -827,12 +730,12 @@ impl AhmaMcpService {
         let loaded = bundle_registry::loaded_bundle_names(&config_keys);
 
         if loaded.is_empty() {
-            return "Discover and activate tool bundles. Call with action 'list' to see available bundles and their status, or 'reveal' with a bundle name to activate its tools. Bundles are revealed progressively to minimize context usage.".to_string();
+            return "⚠️ [DEPRECATED] Discover and activate tool bundles. Call with action 'list' to see available bundles and their status, or 'reveal' with a bundle name to activate its tools. Bundles are revealed progressively to minimize context usage.".to_string();
         }
 
         let mut parts = Vec::new();
         parts.push(
-            "Activate additional tool bundles to extend available capabilities. Available bundles:"
+            "⚠️ [DEPRECATED] Activate additional tool bundles to extend available capabilities. Available bundles:"
                 .to_string(),
         );
 
@@ -848,6 +751,7 @@ impl AhmaMcpService {
         parts.join("\n")
     }
 
+    #[allow(deprecated)]
     fn sync_override_from_config(
         subcommand_config: &crate::config::SubcommandConfig,
         tool_config: &ToolConfig,
@@ -855,33 +759,29 @@ impl AhmaMcpService {
         subcommand_config.synchronous.or(tool_config.synchronous)
     }
 
-    fn execution_mode_from_preferences(
-        sync_override: Option<bool>,
-        force_synchronous: bool,
-        explicit_mode_str: Option<&str>,
-    ) -> crate::adapter::ExecutionMode {
-        match sync_override {
-            Some(true) => crate::adapter::ExecutionMode::Synchronous,
-            Some(false) => crate::adapter::ExecutionMode::AsyncResultPush,
-            None if force_synchronous || explicit_mode_str == Some("Synchronous") => {
-                crate::adapter::ExecutionMode::Synchronous
-            }
-            None => crate::adapter::ExecutionMode::AsyncResultPush,
-        }
-    }
-
     fn determine_execution_mode(
         &self,
         subcommand_config: &crate::config::SubcommandConfig,
         tool_config: &ToolConfig,
-        explicit_mode_str: Option<&str>,
+        arguments: &serde_json::Map<String, serde_json::Value>,
     ) -> crate::adapter::ExecutionMode {
+        let dynamic_blocking = arguments
+            .get("blocking")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        #[allow(deprecated)]
         let sync_override = Self::sync_override_from_config(subcommand_config, tool_config);
-        Self::execution_mode_from_preferences(
-            sync_override,
-            self.force_synchronous,
-            explicit_mode_str,
-        )
+        let explicit_mode_str = arguments.get("execution_mode").and_then(|v| v.as_str());
+
+        if self.force_synchronous || dynamic_blocking || sync_override == Some(true) {
+            crate::adapter::ExecutionMode::Synchronous
+        } else if sync_override == Some(false) {
+            crate::adapter::ExecutionMode::AsyncResultPush
+        } else if explicit_mode_str == Some("Synchronous") {
+            crate::adapter::ExecutionMode::Synchronous
+        } else {
+            crate::adapter::ExecutionMode::AsyncResultPush
+        }
     }
 
     fn sync_tool_progress_description(base_command: &str, working_directory: &str) -> String {
@@ -1497,11 +1397,7 @@ impl AhmaMcpService {
         }
 
         let timeout = arguments.get("timeout_seconds").and_then(|v| v.as_u64());
-        let execution_mode = self.determine_execution_mode(
-            subcommand_config,
-            &config,
-            arguments.get("execution_mode").and_then(|v| v.as_str()),
-        );
+        let execution_mode = self.determine_execution_mode(subcommand_config, &config, &arguments);
 
         let id = format!("op_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
         let progress_token = context.meta.get_progress_token();

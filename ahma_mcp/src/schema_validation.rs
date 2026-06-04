@@ -354,6 +354,7 @@ impl MtdfValidator {
         validate_timeout_lower_bound(timeout, errors);
     }
 
+    #[allow(deprecated)]
     fn validate_subcommand_list(
         &self,
         config: &crate::config::ToolConfig,
@@ -411,6 +412,7 @@ impl MtdfValidator {
     }
 
     /// Validate a subcommand configuration
+    #[allow(deprecated)]
     fn validate_subcommand(
         &self,
         subcommand: &crate::config::SubcommandConfig,

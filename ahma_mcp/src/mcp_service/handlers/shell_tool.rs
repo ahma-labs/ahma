@@ -56,11 +56,18 @@ impl AhmaMcpService {
             return Ok(None);
         };
 
-        let staged = self
-            .stage_paths_into_vault_trash(working_directory, &targets)
-            .map_err(|e| {
-                common::mcp_internal(format!("Failed to stage deletion to vault trash: {}", e))
-            })?;
+        let trash_dir = self
+            .task_vault_trash_dir()
+            .ok_or_else(|| common::mcp_internal("Task vault trash directory not configured"))?;
+
+        let staged = crate::vault::rm_interceptor::RmInterceptor::stage_paths_into_vault_trash(
+            &trash_dir,
+            working_directory,
+            &targets,
+        )
+        .map_err(|e| {
+            common::mcp_internal(format!("Failed to stage deletion to vault trash: {}", e))
+        })?;
 
         for (original_path, trash_path) in &staged {
             self.emit_vault_file_staged(original_path, trash_path).await;
@@ -211,6 +218,7 @@ impl AhmaMcpService {
         }
     }
 
+    #[allow(deprecated)]
     pub fn build_shell_subcommand_config(
         timeout: Option<u64>,
         execution_mode: &crate::adapter::ExecutionMode,

@@ -28,6 +28,7 @@
 //! ```
 
 pub mod audit;
+pub mod rm_interceptor;
 pub mod trash;
 
 use std::path::{Path, PathBuf};

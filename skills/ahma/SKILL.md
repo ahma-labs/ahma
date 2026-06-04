@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.11.1
+version: 0.11.2
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -18,7 +18,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.11.1 | author: Paul Houghton -->
+<!-- version: 0.11.2 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -129,20 +129,11 @@ If a user asks you to use Ahma but it isn't configured, help them by:
 
 ---
 
-## Tool Bundles & Progressive Disclosure
+## Tool Bundles & Progressive Disclosure (DEPRECATED)
 
-By default, Ahma shows only built-in tools (`run_terminal_command`, `status`, `await`) plus
-`activate_tools` (when bundles are loaded but not yet specified via `--tools`).
-Bundles specified with `--tools` are **always revealed immediately** — no extra flag needed.
-Bundles NOT in `--tools` remain hidden and can be unlocked on demand via `activate_tools`.
-
-### Discovering and Activating Bundles
-
-```
-activate_tools(action="list")           # See available bundles
-activate_tools(action="reveal", bundle="rust")   # Unlock Cargo tools
-activate_tools(action="reveal", bundle="git")    # Unlock Git tools
-```
+> [!IMPORTANT]
+> **Progressive disclosure is deprecated and disabled by default.**
+> All tools in loaded bundles (e.g., specified via `--tools`) are visible immediately at startup.
 
 ### Available Bundles
 
@@ -156,14 +147,17 @@ activate_tools(action="reveal", bundle="git")    # Unlock Git tools
 | `github` | `--tools github` | gh pr/issue/run/release | GitHub CLI operations |
 | `simplify` | `--tools simplify` | Code complexity analysis | Code quality work |
 
-**Specify bundles at startup** (tools visible immediately — no extra step required):
+To enable bundles at startup (making all their tools immediately visible):
 ```json
 "args": ["serve", "stdio", "--tools", "rust,git,fileutils"]
 ```
 
-**Disable progressive disclosure entirely** (show all loaded tools, no `activate_tools`):
-```json
-"args": ["serve", "stdio", "--tools", "rust,git", "--disable-progressive-disclosure"]
+### Legacy Progressive Disclosure Mode (Explicit Opt-in Only)
+If progressive disclosure is explicitly enabled (e.g., via the `AHMA_PROGRESSIVE_DISCLOSURE` env var), only the core built-in tools and the deprecated `activate_tools` meta-tool are visible initially. Calling `activate_tools` triggers a deprecation warning in the logs:
+```
+activate_tools(action="list")           # See available bundles
+activate_tools(action="reveal", bundle="rust")   # Unlock Cargo tools
+activate_tools(action="reveal", bundle="git")    # Unlock Git tools
 ```
 
 ---
@@ -425,7 +419,7 @@ Hot-reload while authoring (dev only): `AHMA_HOT_RELOAD=1 ahma serve stdio`
 | `AHMA_LOG_TARGET` | file | Set `stderr` to log to stderr |
 | `AHMA_LOG_MONITOR` | off | Enable live log monitoring |
 | `AHMA_MONITOR_RATE_LIMIT` | `60` | Min seconds between log alerts |
-| `AHMA_PROGRESSIVE_DISCLOSURE_OFF` | off | Expose all tools immediately |
+| `AHMA_PROGRESSIVE_DISCLOSURE` | off | Enable progressive disclosure (DEPRECATED) |
 | `RUST_LOG` | `info` | Log verbosity (e.g., `ahma_mcp=debug`) |
 
 Full reference: [environment-variables.md](https://github.com/paulirotta/ahma/blob/main/docs/environment-variables.md)
@@ -470,8 +464,6 @@ ahma tls status    # Show cert path, age, and rotation recommendation
 ### Rust project — full quality pipeline
 
 ```
-activate_tools(action="reveal", bundle="rust")
-activate_tools(action="reveal", bundle="git")
 cargo_fmt(subcommand="fmt")
 cargo_clippy(subcommand="clippy")
 cargo_nextest_run(subcommand="nextest run")
@@ -484,18 +476,9 @@ run_terminal_command(command="npm ci && npm run build", working_directory="/proj
 run_terminal_command(command="docker compose up -d", timeout_seconds=60)
 ```
 
-### Check what bundles are available
-
-```
-activate_tools(action="list")
-```
-
-Returns: bundle names, descriptions, AI hints for when each is useful.
-
 ### Monitor Android app logs
 
 ```
-activate_tools(action="reveal", bundle="kotlin")
 android_logcat(...)   # if defined in .ahma/android-logcat.json
 ```
 
@@ -503,8 +486,7 @@ android_logcat(...)   # if defined in .ahma/android-logcat.json
 
 ## Troubleshooting
 
-**Tool not found**: Call `activate_tools(action="list")` to see unrevealed bundles.
-Then `activate_tools(action="reveal", bundle="<name>")`.
+**Tool not found**: Make sure the bundle is specified in the `--tools` parameter at startup (e.g., `--tools rust,git`). If progressive disclosure is explicitly enabled, use the deprecated `activate_tools(action="reveal", bundle="<name>")` to unlock it.
 
 **Timeout**: Set `AHMA_TIMEOUT=600` in mcp.json env, or pass `timeout_seconds` per tool call.
 
@@ -751,7 +733,7 @@ or `--tools rust,simplify`.
 ### CRITICAL: Fail-Closed Rule
 
 **If the `simplify` MCP tool is not available:**
-1. Call `activate_tools(action="reveal", bundle="simplify")` to unlock it, OR
+1. Ensure `simplify` is listed in `--tools` at startup (e.g. `--tools rust,simplify`), or if progressive disclosure is explicitly enabled, call `activate_tools(action="reveal", bundle="simplify")` to unlock it, OR
 2. Run `ahma simplify <directory> --ai-fix 1` directly via the sandboxed shell.
 
 **NEVER substitute shell heuristics** such as `find ... | wc -l` (line counts) or `wc -c` (file sizes) as a proxy for complexity. File length is not a complexity metric. Using it will produce incorrect rankings and mislead refactoring effort. If neither the tool nor the CLI is available, tell the user and stop — do not improvise.

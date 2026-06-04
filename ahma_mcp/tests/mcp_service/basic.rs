@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod mcp_service_tests {
-    use ahma_mcp::sandbox::Sandbox;
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     use ahma_mcp::utils::logging::init_test_logging;
     use ahma_mcp::{
         adapter::Adapter,
@@ -11,6 +11,7 @@ mod mcp_service_tests {
     use rmcp::model::ProtocolVersion;
     use serde_json::json;
     use std::{collections::HashMap, sync::Arc};
+    use tempfile::tempdir;
 
     #[test]
     fn test_guidance_config_deserialization() {
@@ -230,7 +231,17 @@ mod mcp_service_tests {
         let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
         let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
         let shell_pool = Arc::new(ShellPoolManager::new(Default::default()));
-        let sandbox = Arc::new(Sandbox::new_test());
+        let _temp = tempdir().unwrap();
+        let sandbox = Arc::new(
+            Sandbox::new(
+                vec![_temp.path().to_path_buf()],
+                SandboxMode::Test,
+                false,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
         let adapter = Arc::new(
             Adapter::new(
                 Arc::clone(&operation_monitor),
@@ -272,7 +283,17 @@ mod mcp_service_tests {
         let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
         let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
         let shell_pool = Arc::new(ShellPoolManager::new(Default::default()));
-        let sandbox = Arc::new(Sandbox::new_test());
+        let _temp = tempdir().unwrap();
+        let sandbox = Arc::new(
+            Sandbox::new(
+                vec![_temp.path().to_path_buf()],
+                SandboxMode::Test,
+                false,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
         let adapter = Arc::new(
             Adapter::new(
                 Arc::clone(&operation_monitor),
@@ -319,7 +340,17 @@ mod mcp_service_tests {
         let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
         let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
         let shell_pool = Arc::new(ShellPoolManager::new(Default::default()));
-        let sandbox = Arc::new(Sandbox::new_test());
+        let _temp = tempdir().unwrap();
+        let sandbox = Arc::new(
+            Sandbox::new(
+                vec![_temp.path().to_path_buf()],
+                SandboxMode::Test,
+                false,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
         let adapter = Arc::new(
             Adapter::new(
                 Arc::clone(&operation_monitor),

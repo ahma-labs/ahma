@@ -51,7 +51,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 rust-version = "1.95.0"
-version = "0.11.1"
+version = "0.11.2"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -67,12 +67,14 @@ hmac = "0.13.0"
 landlock = "0.4.5"
 opentelemetry = { version = "0.32.0", features = ["trace"] }
 # Windows-only kernel binding crate (only fetched when compiling for Windows)
+libc = "0.2"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Isolation",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }

@@ -110,7 +110,8 @@
       "type": [
         "boolean",
         "null"
-      ]
+      ],
+      "deprecated": true
     },
     "timeout_seconds": {
       "description": "Default timeout for operations in seconds",
@@ -502,7 +503,8 @@
           "type": [
             "boolean",
             "null"
-          ]
+          ],
+          "deprecated": true
         },
         "timeout_seconds": {
           "description": "Override timeout for this specific subcommand",
