@@ -1,0 +1,210 @@
+# Ahma Settings File (`~/.ahma/settings.toml`)
+
+The settings file is the primary way to configure Ahma's behaviour.  
+It replaces the old `AHMA_*` environment variables with a single, self-documenting file.
+
+## Getting started
+
+```bash
+ahma settings init        # create with all defaults commented out
+ahma settings show        # print effective configuration (with source annotations)
+ahma --no-settings serve stdio  # ignore settings file for one invocation
+```
+
+## File location
+
+| Platform | Default path |
+|----------|--------------|
+| macOS / Linux | `~/.ahma/settings.toml` |
+| Windows | `%USERPROFILE%\.ahma\settings.toml` |
+
+Override the path for a single invocation:
+```bash
+ahma --settings-path /path/to/my.toml serve stdio
+```
+
+---
+
+## Priority order (highest wins)
+
+1. **CLI flags** (`--timeout 600`, `--no-sandbox`, `--tmp`, …)
+2. **`~/.ahma/settings.toml`**
+3. **`AHMA_*` environment variables** _(deprecated — emit a warning)_
+4. **Compiled-in defaults**
+
+---
+
+## Full schema
+
+All options are commented out by default.  
+Run `ahma settings init` to generate this file automatically.
+
+```toml
+# ~/.ahma/settings.toml — Ahma user settings
+#
+# All options are commented out.  Uncomment and edit any value to override
+# the compiled-in default.  CLI flags always take highest priority, followed
+# by this file, followed by deprecated AHMA_* environment variables.
+
+# ── oMLX (Apple Silicon mlx_lm.server) ──────────────────────────────────────
+# Start the server with:
+#   mlx_lm.server --model mlx-community/gemma-4-12B-it-8bit
+#
+# [omlx]
+# base_url = "http://localhost:8080/v1"          # default: 8080 (mlx_lm.server)
+# model    = "mlx-community/gemma-4-12B-it-8bit" # default model
+
+# ── Tool execution ───────────────────────────────────────────────────────────
+# [tools]
+# timeout_secs = 360      # default tool timeout (seconds)
+# force_sync   = false    # run all tools synchronously instead of async-first
+# hot_reload   = false    # reload tools from disk on change — INSECURE in production
+# skip_probes  = false    # skip availability probes at startup
+
+# ── Sandbox & filesystem security ────────────────────────────────────────────
+# [sandbox]
+# disable      = false    # UNSAFE: disable kernel sandbox entirely
+# tmp_access   = false    # add system temp dir to sandbox scope
+# disable_temp = false    # block all access to system temp dir (overrides tmp_access)
+# defer        = false    # defer sandbox lock until client provides roots/list
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# [logging]
+# target                  = "file"   # "file" (rolling) or "stderr"
+# log_monitor             = false    # enable live log monitoring via LLM
+# monitor_rate_limit_secs = 60       # min seconds between log-monitor alerts
+
+# ── Progressive disclosure ────────────────────────────────────────────────────
+# [disclosure]
+# reveal_profile = "minimal"   # "minimal" | "balanced" | "full"
+
+# ── HTTP server (ahma serve http only) ───────────────────────────────────────
+# [http]
+# handshake_timeout_secs = 45      # MCP handshake timeout
+# disable_quic           = false   # disable HTTP/3 QUIC; fall back to HTTP/2 TCP
+# disable_http1_1        = false   # reject HTTP/1.1; require HTTP/2+
+
+# ── HTTP authentication & rate limiting ──────────────────────────────────────
+# [auth]
+# require_token_path = ""   # path to file containing required bearer token
+# rate_limit_rps     = 0    # max requests/second (0 = no limit)
+# rate_limit_burst   = 10   # burst allowance
+
+# ── Instance identity ────────────────────────────────────────────────────────
+# [instance]
+# label = "ahma"   # instance name shown in TUI and daemon event stream
+```
+
+---
+
+## oMLX configuration
+
+`oMLX` refers to running a local LLM via Apple's [MLX framework](https://github.com/ml-explore/mlx)
+using the [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) OpenAI-compatible server.
+
+### Starting the server
+
+```bash
+# Install (requires Python + pip)
+pip install mlx-lm
+
+# Start with the default model
+mlx_lm.server --model mlx-community/gemma-4-12B-it-8bit
+
+# Or use a smaller model
+mlx_lm.server --model mlx-community/gemma-3-4B-it-4bit
+```
+
+The server listens on `http://localhost:8080/v1` by default.
+
+### Changing the model in settings.toml
+
+```toml
+[omlx]
+model = "mlx-community/llama-3.2-3B-Instruct-4bit"
+```
+
+### Using oMLX as a named provider in tool definitions
+
+The oMLX settings are exposed as a named provider available in decompose and livelog tools:
+
+```json
+{
+  "decompose": {
+    "llm_provider": {
+      "base_url": "http://localhost:8080/v1",
+      "model": "mlx-community/gemma-4-12B-it-8bit"
+    }
+  }
+}
+```
+
+> **Tip**: You can reference the oMLX base URL and model from `settings.toml` directly —
+> the `ahma settings show` command prints the currently configured values.
+
+---
+
+## Migration from environment variables
+
+If you previously used `AHMA_*` environment variables, Ahma will emit a
+`WARN` log entry for each one it reads as a fallback, guiding you to move
+it to settings.
+
+| Old env var | New settings.toml key |
+|-------------|----------------------|
+| `AHMA_TIMEOUT` | `[tools] timeout_secs` |
+| `AHMA_SYNC` | `[tools] force_sync` |
+| `AHMA_HOT_RELOAD` | `[tools] hot_reload` |
+| `AHMA_SKIP_PROBES` | `[tools] skip_probes` |
+| `AHMA_DISABLE_SANDBOX` | `[sandbox] disable` |
+| `AHMA_TMP_ACCESS` | `[sandbox] tmp_access` |
+| `AHMA_DISABLE_TEMP` | `[sandbox] disable_temp` |
+| `AHMA_SANDBOX_DEFER` | `[sandbox] defer` |
+| `AHMA_LOG_TARGET` | `[logging] target` |
+| `AHMA_LOG_MONITOR` | `[logging] log_monitor` |
+| `AHMA_MONITOR_RATE_LIMIT` | `[logging] monitor_rate_limit_secs` |
+| `AHMA_REVEAL_PROFILE` | `[disclosure] reveal_profile` |
+| `AHMA_HANDSHAKE_TIMEOUT` | `[http] handshake_timeout_secs` |
+| `AHMA_DISABLE_QUIC` | `[http] disable_quic` |
+| `AHMA_DISABLE_HTTP1_1` | `[http] disable_http1_1` |
+| `AHMA_REQUIRE_TOKEN_PATH` | `[auth] require_token_path` |
+| `AHMA_RATE_LIMIT_RPS` | `[auth] rate_limit_rps` |
+| `AHMA_RATE_LIMIT_BURST` | `[auth] rate_limit_burst` |
+| `AHMA_INSTANCE_LABEL` | `[instance] label` |
+
+### Env vars that are NOT migrated (still required)
+
+These are system/process-level conventions that belong in the environment, not a user file:
+
+| Variable | Purpose |
+|----------|---------|
+| `RUST_LOG` | Standard Rust log filter (e.g. `debug`, `info`) |
+| `OTEL_*` | OpenTelemetry standard variables |
+| `AHMA_TOOLS_DIR` | Override the tools directory (useful in CI scripts) |
+| `AHMA_SANDBOX_SCOPE` | Colon-separated sandbox scope paths (multi-path lists don't fit well in TOML) |
+| `AHMA_WORKING_DIRS` | Fallback working directories for deferred sandbox |
+| `AHMA_DAEMON_SOCK` | Unix socket path for daemon IPC (low-level override) |
+| `AHMA_TASK_VAULT` | Task vault root path (typically set by orchestration scripts) |
+
+---
+
+## Relationship with `~/.ahma/config.toml`
+
+`~/.ahma/config.toml` is the **provider registry** file — it stores named LLM providers and cluster peers.  
+`~/.ahma/settings.toml` is the **behaviour configuration** file — it stores runtime options.
+
+Both files coexist independently.
+
+| File | Purpose | Managed with |
+|------|---------|-------------|
+| `~/.ahma/config.toml` | LLM providers, cluster peers | `ahma llm add/remove`, `ahma cluster add-peer` |
+| `~/.ahma/settings.toml` | Runtime behaviour defaults | `ahma settings init` + text editor |
+
+---
+
+## See also
+
+- [environment-variables.md](environment-variables.md) — remaining env vars reference
+- [llm-providers.md](llm-providers.md) — LLM provider configuration
+- [security-sandbox.md](security-sandbox.md) — sandbox security details
+- [live-log-monitoring.md](live-log-monitoring.md) — log monitor setup

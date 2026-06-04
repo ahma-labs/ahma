@@ -29,9 +29,10 @@ pub use list_tools::{
 pub use cli::{
     CertCommand, Cli, ClusterAddPeerArgs, ClusterAnnounceArgs, ClusterArgs, ClusterCommand,
     ClusterPingArgs, DaemonArgs, LlmAddArgs, LlmArgs, LlmCommand, LlmRemoveArgs, LlmTestArgs,
-    Subcommands, TlsArgs, TlsCommand, TuiArgs, VaultArgs, VaultCommand, VaultCreateArgs,
+    SettingsArgs, SettingsCommand, Subcommands, TlsArgs, TlsCommand, TuiArgs, VaultArgs,
+    VaultCommand, VaultCreateArgs,
 };
-pub use cli::{build_app_config, dispatch_subcommand, run};
+pub use cli::{build_app_config, dispatch_subcommand, load_settings, run};
 
 pub use resolution::{
     find_matching_tool, find_tool_config, normalize_tools_dir, resolve_cli_subcommand,

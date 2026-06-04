@@ -186,6 +186,11 @@ impl Sandbox {
         self.mode == SandboxMode::Test
     }
 
+    /// Get the sandbox mode.
+    pub fn mode(&self) -> SandboxMode {
+        self.mode
+    }
+
     /// Returns true when tool calls can execute against sandboxed roots.
     ///
     /// In test mode, tool calls are always allowed. In normal modes, at least one
@@ -197,6 +202,11 @@ impl Sandbox {
     /// Check if no-temp-files mode is enabled.
     pub fn is_no_temp_files(&self) -> bool {
         self.no_temp_files
+    }
+
+    /// Check if tmp_access is enabled.
+    pub fn is_tmp_access(&self) -> bool {
+        self.tmp_access
     }
 
     /// Get the allowed scopes.

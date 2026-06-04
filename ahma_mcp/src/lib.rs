@@ -194,3 +194,4 @@ pub mod vault;
 pub use adapter::Adapter;
 
 pub use mcp_service::AhmaMcpService;
+pub use mcp_service::{ExtensionToolHandler, register_global_extension_handler};

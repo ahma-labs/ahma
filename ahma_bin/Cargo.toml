@@ -6,10 +6,10 @@ name = "ahma_bin"
 readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
-description = "The ahma binary: wires the MIT ahma_mcp library with the AGPL-licensed feature crates (vault, decompose, worker, cluster, renewal, tui)."
+description = "The ahma binary: wires the MIT ahma_mcp library with the AGPL-licensed feature crates (vault, decompose, task_tree, worker, cluster, renewal, tui)."
 
-# All first-party copyleft crates (ahma_vault, ahma_decompose, ahma_worker,
-# ahma_renewal, ahma_tui, ahma_cluster) are AGPL-3.0-or-later. The compiled
+# All first-party copyleft crates (ahma_vault, ahma_decompose, ahma_task_tree,
+# ahma_worker, ahma_renewal, ahma_tui, ahma_cluster) are AGPL-3.0-or-later. The compiled
 # ahma binary is therefore AGPL-3.0-or-later. See README for details.
 
 [[bin]]
@@ -20,6 +20,7 @@ path = "src/main.rs"
 ahma_mcp = { path = "../ahma_mcp" }
 ahma_vault = { path = "../ahma_vault" }
 ahma_decompose = { path = "../ahma_decompose" }
+ahma_task_tree = { path = "../ahma_task_tree" }
 ahma_worker = { path = "../ahma_worker" }
 ahma_cluster = { path = "../ahma_cluster" }
 ahma_renewal = { path = "../ahma_renewal" }

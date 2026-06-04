@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.11.2
+version: 0.11.3
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -18,7 +18,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.11.2 | author: Paul Houghton -->
+<!-- version: 0.11.3 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 

@@ -2,8 +2,11 @@
 //!
 //! Contains configuration structs and enums used throughout the MCP service.
 
+use rmcp::model::{CallToolRequestParams, CallToolResult};
+use rmcp::service::{RequestContext, RoleServer};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::config::ToolConfig;
 
@@ -157,6 +160,37 @@ impl Default for LegacyGuidanceConfig {
 
 /// Meta-parameters that control execution environment but should not be passed as CLI args
 pub const META_PARAMS: &[&str] = &["working_directory", "execution_mode", "timeout_seconds"];
+
+/// A trait for executing extension tool types implemented in separate sibling crates.
+#[async_trait::async_trait]
+pub trait ExtensionToolHandler: Send + Sync {
+    async fn call(
+        &self,
+        params: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+        config: ToolConfig,
+        adapter: Arc<crate::adapter::Adapter>,
+        operation_monitor: Arc<crate::operation_monitor::OperationMonitor>,
+    ) -> Result<CallToolResult, rmcp::model::ErrorData>;
+}
+
+static GLOBAL_EXTENSION_HANDLERS: std::sync::LazyLock<
+    std::sync::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+/// Register an extension handler globally so that new MCP service instances can retrieve it.
+pub fn register_global_extension_handler(name: String, handler: Arc<dyn ExtensionToolHandler>) {
+    GLOBAL_EXTENSION_HANDLERS
+        .write()
+        .unwrap()
+        .insert(name, handler);
+}
+
+/// Retrieve the global map of extension handlers.
+pub fn get_global_extension_handlers()
+-> &'static std::sync::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>> {
+    &GLOBAL_EXTENSION_HANDLERS
+}
 
 #[cfg(test)]
 mod tests {

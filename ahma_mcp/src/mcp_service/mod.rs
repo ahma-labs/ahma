@@ -45,7 +45,10 @@ mod subcommand;
 mod types;
 mod utils;
 
-pub use types::{GuidanceConfig, LegacyGuidanceConfig, META_PARAMS, SequenceKind};
+pub use types::{
+    ExtensionToolHandler, GuidanceConfig, LegacyGuidanceConfig, META_PARAMS, SequenceKind,
+    register_global_extension_handler,
+};
 
 use chrono::Utc;
 use rmcp::{
@@ -177,6 +180,8 @@ pub struct AhmaMcpService {
     /// Used by `configure_sandbox_from_roots` to detect when the per-client
     /// `.ahma/` differs from the currently-loaded one and reload is needed.
     pub current_tools_dir: Arc<RwLock<Option<std::path::PathBuf>>>,
+    /// Registered handlers for extension tool types (e.g. task_tree, decompose)
+    pub extension_handlers: Arc<std::sync::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>>>,
 }
 
 impl AhmaMcpService {
@@ -464,6 +469,12 @@ impl AhmaMcpService {
             disclosed_bundles: Arc::new(RwLock::new(HashSet::new())),
             app_config: Arc::new(RwLock::new(None)),
             current_tools_dir: Arc::new(RwLock::new(None)),
+            extension_handlers: Arc::new(std::sync::RwLock::new(
+                types::get_global_extension_handlers()
+                    .read()
+                    .unwrap()
+                    .clone(),
+            )),
         })
     }
 
@@ -474,6 +485,14 @@ impl AhmaMcpService {
             *self.current_tools_dir.write().unwrap() = Some(dir);
         }
         *self.app_config.write().unwrap() = Some(config);
+    }
+
+    /// Register an extension handler for custom tool routing.
+    pub fn register_extension_handler(&self, name: String, handler: Arc<dyn ExtensionToolHandler>) {
+        self.extension_handlers
+            .write()
+            .unwrap()
+            .insert(name, handler);
     }
 
     /// Pre-discloses the given bundle names so their tools appear in the first
@@ -1312,6 +1331,33 @@ impl AhmaMcpService {
         config: ToolConfig,
         flattened_subcommand: Option<String>,
     ) -> Result<CallToolResult, McpError> {
+        if config.tool_type == Some(crate::config::ToolType::Extension) {
+            let extension_key = if config.task_tree.is_some() {
+                Some("task_tree")
+            } else if config.decompose.is_some() {
+                Some("decompose")
+            } else if config.worker.is_some() {
+                Some("worker")
+            } else {
+                None
+            };
+
+            if let Some(key) = extension_key {
+                let handler_opt = self.extension_handlers.read().unwrap().get(key).cloned();
+                if let Some(handler) = handler_opt {
+                    return handler
+                        .call(
+                            params,
+                            context,
+                            config,
+                            self.adapter.clone(),
+                            self.operation_monitor.clone(),
+                        )
+                        .await;
+                }
+            }
+        }
+
         if config.sequence.is_some() {
             return sequence::handle_sequence_tool(
                 &self.adapter,

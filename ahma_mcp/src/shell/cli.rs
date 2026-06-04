@@ -235,14 +235,6 @@ impl AppConfig {
             .unwrap_or(false)
     }
 
-    /// Read a u64 env var, returning `default` if absent or unparseable.
-    fn env_u64(name: &str, default: u64) -> u64 {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(default)
-    }
-
     /// Parse `AHMA_SANDBOX_SCOPE` using the platform path-list separator.
     fn env_sandbox_scopes() -> Vec<PathBuf> {
         std::env::var_os("AHMA_SANDBOX_SCOPE")
@@ -676,6 +668,127 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
                  using ahma_common::daemon_hub::run_daemon."
             )
         }
+        Subcommands::Settings(args) => {
+            tracing::info!("Running in settings mode");
+            run_settings_command(args)
+        }
+    }
+}
+
+fn run_settings_command(args: SettingsArgs) -> Result<()> {
+    use ahma_common::config::{AhmaSettings, settings_path};
+
+    match args.command {
+        SettingsCommand::Init { force, path } => {
+            let target = path.unwrap_or_else(|| {
+                settings_path().unwrap_or_else(|| PathBuf::from(".ahma/settings.toml"))
+            });
+            AhmaSettings::write_defaults(&target, force)?;
+            println!("Settings file written to: {}", target.display());
+            println!();
+            println!("Edit the file to override defaults.");
+            println!("Run `ahma settings show` to see the effective configuration.");
+            Ok(())
+        }
+        SettingsCommand::Show => {
+            // Load from the standard location and print each field with its source.
+            let s = AhmaSettings::load();
+            let d = AhmaSettings::default();
+
+            println!("# Effective Ahma settings");
+            println!(
+                "# Sources: [file] = ~/.ahma/settings.toml  [env] = AHMA_* (deprecated)  [default] = compiled-in"
+            );
+            println!();
+
+            macro_rules! show_field {
+                ($label:expr, $val:expr, $def:expr) => {
+                    let source = if $val != $def { "[file]" } else { "[default]" };
+                    println!("{:<45} = {:?}  # {}", $label, $val, source);
+                };
+            }
+
+            println!("[omlx]");
+            show_field!("base_url", &s.omlx.base_url, &d.omlx.base_url);
+            show_field!("model", &s.omlx.model, &d.omlx.model);
+            println!();
+            println!("[tools]");
+            show_field!("timeout_secs", s.tools.timeout_secs, d.tools.timeout_secs);
+            show_field!("force_sync", s.tools.force_sync, d.tools.force_sync);
+            show_field!("hot_reload", s.tools.hot_reload, d.tools.hot_reload);
+            show_field!("skip_probes", s.tools.skip_probes, d.tools.skip_probes);
+            println!();
+            println!("[sandbox]");
+            show_field!("disable", s.sandbox.disable, d.sandbox.disable);
+            show_field!("tmp_access", s.sandbox.tmp_access, d.sandbox.tmp_access);
+            show_field!(
+                "disable_temp",
+                s.sandbox.disable_temp,
+                d.sandbox.disable_temp
+            );
+            show_field!("defer", s.sandbox.defer, d.sandbox.defer);
+            println!();
+            println!("[logging]");
+            show_field!("target", &s.logging.target, &d.logging.target);
+            show_field!("log_monitor", s.logging.log_monitor, d.logging.log_monitor);
+            show_field!(
+                "monitor_rate_limit_secs",
+                s.logging.monitor_rate_limit_secs,
+                d.logging.monitor_rate_limit_secs
+            );
+            println!();
+            println!("[disclosure]");
+            show_field!(
+                "reveal_profile",
+                &s.disclosure.reveal_profile,
+                &d.disclosure.reveal_profile
+            );
+            println!();
+            println!("[http]");
+            show_field!(
+                "handshake_timeout_secs",
+                s.http.handshake_timeout_secs,
+                d.http.handshake_timeout_secs
+            );
+            show_field!("disable_quic", s.http.disable_quic, d.http.disable_quic);
+            show_field!(
+                "disable_http1_1",
+                s.http.disable_http1_1,
+                d.http.disable_http1_1
+            );
+            println!();
+            println!("[auth]");
+            show_field!(
+                "require_token_path",
+                &s.auth.require_token_path,
+                &d.auth.require_token_path
+            );
+            show_field!(
+                "rate_limit_rps",
+                s.auth.rate_limit_rps,
+                d.auth.rate_limit_rps
+            );
+            show_field!(
+                "rate_limit_burst",
+                s.auth.rate_limit_burst,
+                d.auth.rate_limit_burst
+            );
+            println!();
+            println!("[instance]");
+            show_field!("label", &s.instance.label, &d.instance.label);
+
+            if let Some(p) = settings_path() {
+                println!();
+                if p.exists() {
+                    println!("# Settings file: {}", p.display());
+                } else {
+                    println!("# Settings file not found: {}", p.display());
+                    println!("# Run `ahma settings init` to create it.");
+                }
+            }
+
+            Ok(())
+        }
     }
 }
 
@@ -770,8 +883,9 @@ fn check_stdio_not_interactive() -> Result<()> {
 
 /// Ahma MCP: A secure, config-driven adapter for CLI tools.
 ///
-/// Environment variables control all non-essential options.
-/// See docs/environment-variables.md for the full reference.
+/// User-configurable defaults live in `~/.ahma/settings.toml`.
+/// Run `ahma settings init` to create it with all defaults commented out.
+/// Use `ahma --no-settings` to ignore the settings file for one invocation.
 #[derive(Parser, Debug)]
 #[command(
     name = "ahma",
@@ -787,6 +901,20 @@ pub struct Cli {
     ///   ahma --markdown-help > docs/cli-reference.md
     #[arg(long, global = true, hide = true)]
     pub markdown_help: bool,
+
+    /// Ignore `~/.ahma/settings.toml` for this invocation.
+    ///
+    /// All settings fall back to their compiled-in defaults (and any deprecated
+    /// `AHMA_*` environment variables that are still set).
+    #[arg(long, global = true)]
+    pub no_settings: bool,
+
+    /// Path to the settings file to use instead of `~/.ahma/settings.toml`.
+    ///
+    /// Useful for testing or per-project settings files.
+    /// Ignored when `--no-settings` is also supplied.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub settings_path: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Subcommands,
@@ -828,6 +956,12 @@ pub enum Subcommands {
     /// and fans them out to TUI subscribers.  It is started automatically on
     /// first use and exits automatically after 60 s of idle.
     Daemon(DaemonArgs),
+    /// Manage the user settings file (`~/.ahma/settings.toml`).
+    ///
+    /// The settings file is the primary place to configure Ahma behaviour.
+    /// It supersedes most `AHMA_*` environment variables and provides a
+    /// single, auditable, self-documented source of truth for all options.
+    Settings(SettingsArgs),
 }
 
 /// Arguments for `ahma setup`.
@@ -856,10 +990,44 @@ pub struct SetupArgs {
 
 /// Arguments for `ahma daemon`.
 ///
-/// Currently no flags are needed; the daemon is configured entirely via
-/// environment variables (`AHMA_DAEMON_SOCK`).
+/// The daemon is configured via `~/.ahma/settings.toml` or the `AHMA_DAEMON_SOCK`
+/// environment variable (socket path override only).
 #[derive(clap::Args, Debug, Clone)]
 pub struct DaemonArgs {}
+
+// ── settings ─────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma settings`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct SettingsArgs {
+    #[command(subcommand)]
+    pub command: SettingsCommand,
+}
+
+/// Subcommands for `ahma settings`.
+#[derive(Subcommand, Debug, Clone)]
+pub enum SettingsCommand {
+    /// Write the settings file with all defaults commented out.
+    ///
+    /// Creates `~/.ahma/settings.toml` with every available option shown as a
+    /// comment, making it easy to discover and override defaults.
+    ///
+    /// Use `--force` to overwrite an existing file.
+    /// Use `--path` to write to a custom location.
+    Init {
+        /// Overwrite the file if it already exists.
+        #[arg(long)]
+        force: bool,
+        /// Write to this path instead of `~/.ahma/settings.toml`.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+    /// Print the effective settings resolved from all sources.
+    ///
+    /// Shows the current value of each setting and where it came from:
+    /// settings file, deprecated environment variable, or compiled-in default.
+    Show,
+}
 
 // ── serve ────────────────────────────────────────────────────────────────────
 
@@ -1696,17 +1864,53 @@ fn extract_tool_fields(cmd: &Subcommands) -> ToolFields {
     }
 }
 
+/// Emit a deprecation warning when an `AHMA_*` environment variable is set
+/// and used as a fallback.  This guides users toward `~/.ahma/settings.toml`.
+macro_rules! deprecated_env {
+    ($name:expr) => {
+        tracing::warn!(concat!(
+            "Deprecated: the ",
+            $name,
+            " environment variable is set. ",
+            "Move this setting to ~/.ahma/settings.toml and run `ahma settings init` ",
+            "to create the file with all options documented."
+        ))
+    };
+}
+
+/// Load `AhmaSettings` from the path determined by the CLI flags.
+///
+/// Respects `--no-settings` (skip loading entirely) and `--settings-path`
+/// (load from an alternate path instead of `~/.ahma/settings.toml`).
+pub fn load_settings(cli: &Cli) -> ahma_common::config::AhmaSettings {
+    if cli.no_settings {
+        tracing::debug!("--no-settings: using compiled-in defaults");
+        return ahma_common::config::AhmaSettings::default();
+    }
+    match &cli.settings_path {
+        Some(p) => ahma_common::config::AhmaSettings::load_from(p),
+        None => ahma_common::config::AhmaSettings::load(),
+    }
+}
+
 pub fn build_app_config(cli: &Cli) -> AppConfig {
     let serve = extract_serve_fields(&cli.command);
     let tool = extract_tool_fields(&cli.command);
 
-    // Env-var overrides for tools_dir
+    // Load user settings (priority layer 2: below CLI flags, above env vars)
+    let s = load_settings(cli);
+
+    // ── Tool loading ────────────────────────────────────────────────────────
+    // Priority: CLI > AHMA_TOOLS_DIR (deprecated env) > auto-detect
+    if std::env::var_os("AHMA_TOOLS_DIR").is_some() {
+        deprecated_env!("AHMA_TOOLS_DIR");
+    }
     let env_tools_dir = std::env::var("AHMA_TOOLS_DIR").ok().map(PathBuf::from);
     let explicit_tools_dir = serve.tools_dir.is_some();
     let raw_tools_dir = serve.tools_dir.or(env_tools_dir);
     let tools_dir = resolution::normalize_tools_dir(raw_tools_dir);
 
-    // Flatten and deduplicate tool bundles (support comma-separation already handled by clap delimiter)
+    // Flatten and deduplicate tool bundles
     let tool_bundles = {
         let mut seen = std::collections::HashSet::new();
         serve
@@ -1716,51 +1920,246 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
             .collect()
     };
 
-    // Sandbox scopes: --sandbox-scope CLI flag is gone; use AHMA_SANDBOX_SCOPE env var
+    // ── Sandbox scope ───────────────────────────────────────────────────────
+    // (No settings.toml key for sandbox scope paths; AHMA_SANDBOX_SCOPE still
+    //  the right mechanism for path lists, which aren't well expressed in TOML.)
     let sandbox_scopes = AppConfig::env_sandbox_scopes();
     let working_dirs = AppConfig::env_working_dirs();
 
-    // HTTP quic override from env
-    let no_quic = serve.no_quic || AppConfig::env_flag("AHMA_DISABLE_QUIC");
-    let disable_http1_1 = serve.disable_http1_1 || AppConfig::env_flag("AHMA_DISABLE_HTTP1_1");
+    // ── Helpers for 3-layer env-var fallback with deprecation warnings ───────
+    // Each macro call: CLI-flag || settings-file || deprecated-env || default
+
+    // timeout_secs: CLI > settings > AHMA_TIMEOUT (deprecated) > 360
+    let timeout_secs = if let Some(t) = serve.timeout {
+        t
+    } else {
+        let from_env = std::env::var("AHMA_TIMEOUT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if let Some(t) = from_env {
+            deprecated_env!("AHMA_TIMEOUT");
+            t
+        } else {
+            s.tools.timeout_secs
+        }
+    };
+
+    // force_sync: CLI > settings > AHMA_SYNC (deprecated)
+    let force_sync = if serve.sync {
+        true
+    } else if AppConfig::env_flag("AHMA_SYNC") {
+        deprecated_env!("AHMA_SYNC");
+        true
+    } else {
+        s.tools.force_sync
+    };
+
+    // hot_reload_tools: settings > AHMA_HOT_RELOAD (deprecated)
+    let hot_reload_tools = if AppConfig::env_flag("AHMA_HOT_RELOAD") {
+        deprecated_env!("AHMA_HOT_RELOAD");
+        true
+    } else {
+        s.tools.hot_reload
+    };
+
+    // skip_availability_probes: settings > AHMA_SKIP_PROBES (deprecated)
+    let skip_availability_probes = if AppConfig::env_flag("AHMA_SKIP_PROBES") {
+        deprecated_env!("AHMA_SKIP_PROBES");
+        true
+    } else {
+        s.tools.skip_probes
+    };
+
+    // progressive_disclosure: settings > AHMA_PROGRESSIVE_DISCLOSURE (deprecated legacy)
+    let progressive_disclosure = if AppConfig::env_flag("AHMA_PROGRESSIVE_DISCLOSURE") {
+        deprecated_env!("AHMA_PROGRESSIVE_DISCLOSURE");
+        true
+    } else {
+        // Always enabled; reveal_profile controls granularity
+        true
+    };
+
+    // reveal_profile: AHMA_REVEAL_PROFILE (env) > CLI (auto_reveal) / AHMA_AUTO_REVEAL (env) > settings
+    let env_profile = std::env::var("AHMA_REVEAL_PROFILE").ok();
+    let env_auto = AppConfig::env_flag("AHMA_AUTO_REVEAL");
+
+    let reveal_profile = if let Some(ref p) = env_profile {
+        deprecated_env!("AHMA_REVEAL_PROFILE");
+        match p.as_str() {
+            "balanced" => StartupProfile::Balanced,
+            "full" => StartupProfile::Full,
+            _ => StartupProfile::Minimal,
+        }
+    } else if serve.auto_reveal || env_auto {
+        if env_auto {
+            deprecated_env!("AHMA_AUTO_REVEAL");
+        }
+        StartupProfile::Balanced
+    } else {
+        match s.disclosure.reveal_profile.as_str() {
+            "balanced" => StartupProfile::Balanced,
+            "full" => StartupProfile::Full,
+            _ => StartupProfile::Minimal,
+        }
+    };
+
+    // no_sandbox: CLI > settings > AHMA_DISABLE_SANDBOX (deprecated)
+    let no_sandbox = if serve.no_sandbox {
+        true
+    } else if AppConfig::env_flag("AHMA_DISABLE_SANDBOX") {
+        deprecated_env!("AHMA_DISABLE_SANDBOX");
+        true
+    } else {
+        s.sandbox.disable
+    };
+
+    // defer_sandbox: settings > AHMA_SANDBOX_DEFER (deprecated)
+    let defer_sandbox = if AppConfig::env_flag("AHMA_SANDBOX_DEFER") {
+        deprecated_env!("AHMA_SANDBOX_DEFER");
+        true
+    } else {
+        s.sandbox.defer
+    };
+
+    // tmp_access: CLI > settings > AHMA_TMP_ACCESS (deprecated)
+    let tmp_access = if serve.tmp {
+        true
+    } else if AppConfig::env_flag("AHMA_TMP_ACCESS") {
+        deprecated_env!("AHMA_TMP_ACCESS");
+        true
+    } else {
+        s.sandbox.tmp_access
+    };
+
+    // no_temp_files: settings > AHMA_DISABLE_TEMP (deprecated)
+    let no_temp_files = if AppConfig::env_flag("AHMA_DISABLE_TEMP") {
+        deprecated_env!("AHMA_DISABLE_TEMP");
+        true
+    } else {
+        s.sandbox.disable_temp
+    };
+
+    // log_monitor: CLI > settings > AHMA_LOG_MONITOR (deprecated)
+    let log_monitor = if serve.log_monitor {
+        true
+    } else if AppConfig::env_flag("AHMA_LOG_MONITOR") {
+        deprecated_env!("AHMA_LOG_MONITOR");
+        true
+    } else {
+        s.logging.log_monitor
+    };
+
+    // monitor_rate_limit_secs: CLI > settings > AHMA_MONITOR_RATE_LIMIT (deprecated)
+    let monitor_rate_limit_secs = if let Some(r) = serve.monitor_rate_limit {
+        r
+    } else {
+        let from_env = std::env::var("AHMA_MONITOR_RATE_LIMIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if let Some(r) = from_env {
+            deprecated_env!("AHMA_MONITOR_RATE_LIMIT");
+            r
+        } else {
+            s.logging.monitor_rate_limit_secs
+        }
+    };
+
+    // HTTP transport flags: CLI > settings > deprecated env
+    let no_quic = if serve.no_quic {
+        true
+    } else if AppConfig::env_flag("AHMA_DISABLE_QUIC") {
+        deprecated_env!("AHMA_DISABLE_QUIC");
+        true
+    } else {
+        s.http.disable_quic
+    };
+
+    let disable_http1_1 = if serve.disable_http1_1 {
+        true
+    } else if AppConfig::env_flag("AHMA_DISABLE_HTTP1_1") {
+        deprecated_env!("AHMA_DISABLE_HTTP1_1");
+        true
+    } else {
+        s.http.disable_http1_1
+    };
+
+    // handshake_timeout_secs: settings > AHMA_HANDSHAKE_TIMEOUT (deprecated)
+    let handshake_timeout_secs = {
+        let from_env = std::env::var("AHMA_HANDSHAKE_TIMEOUT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if let Some(t) = from_env {
+            deprecated_env!("AHMA_HANDSHAKE_TIMEOUT");
+            t
+        } else {
+            s.http.handshake_timeout_secs
+        }
+    };
+
+    // Auth: settings > deprecated env vars
+    let require_token = std::env::var("AHMA_REQUIRE_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .inspect(|_| deprecated_env!("AHMA_REQUIRE_TOKEN"));
+
+    let require_token_path_env = std::env::var("AHMA_REQUIRE_TOKEN_PATH")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .inspect(|_| deprecated_env!("AHMA_REQUIRE_TOKEN_PATH"))
+        .map(PathBuf::from);
+
+    let require_token_path = require_token_path_env.or_else(|| {
+        if s.auth.require_token_path.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(&s.auth.require_token_path))
+        }
+    });
+
+    let rate_limit_rps = std::env::var("AHMA_RATE_LIMIT_RPS")
+        .ok()
+        .and_then(|v| {
+            deprecated_env!("AHMA_RATE_LIMIT_RPS");
+            v.parse().ok()
+        })
+        .unwrap_or(s.auth.rate_limit_rps);
+
+    let rate_limit_burst = std::env::var("AHMA_RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|v| {
+            deprecated_env!("AHMA_RATE_LIMIT_BURST");
+            v.parse().ok()
+        })
+        .unwrap_or(s.auth.rate_limit_burst);
+
+    let instance_label = std::env::var("AHMA_INSTANCE_LABEL")
+        .ok()
+        .inspect(|_| deprecated_env!("AHMA_INSTANCE_LABEL"))
+        .unwrap_or_else(|| s.instance.label.clone());
 
     AppConfig {
         tools_dir,
         explicit_tools_dir,
         tool_bundles,
-        timeout_secs: serve
-            .timeout
-            .unwrap_or_else(|| AppConfig::env_u64("AHMA_TIMEOUT", 360)),
-        force_sync: serve.sync || AppConfig::env_flag("AHMA_SYNC"),
-        hot_reload_tools: AppConfig::env_flag("AHMA_HOT_RELOAD"),
-        skip_availability_probes: AppConfig::env_flag("AHMA_SKIP_PROBES"),
-        progressive_disclosure: AppConfig::env_flag("AHMA_PROGRESSIVE_DISCLOSURE"),
-        reveal_profile: match std::env::var("AHMA_REVEAL_PROFILE")
-            .as_deref()
-            .unwrap_or("")
-        {
-            "balanced" => StartupProfile::Balanced,
-            "full" => StartupProfile::Full,
-            _ if serve.auto_reveal || AppConfig::env_flag("AHMA_AUTO_REVEAL") => {
-                StartupProfile::Balanced
-            }
-            _ => StartupProfile::Minimal,
-        },
-        no_sandbox: serve.no_sandbox || AppConfig::env_flag("AHMA_DISABLE_SANDBOX"),
+        timeout_secs,
+        force_sync,
+        hot_reload_tools,
+        skip_availability_probes,
+        progressive_disclosure,
+        reveal_profile,
+        no_sandbox,
         sandbox_scopes,
-        defer_sandbox: AppConfig::env_flag("AHMA_SANDBOX_DEFER"),
+        defer_sandbox,
         working_dirs,
-        tmp_access: serve.tmp || AppConfig::env_flag("AHMA_TMP_ACCESS"),
-        no_temp_files: AppConfig::env_flag("AHMA_DISABLE_TEMP"),
-        log_monitor: serve.log_monitor || AppConfig::env_flag("AHMA_LOG_MONITOR"),
-        monitor_rate_limit_secs: serve
-            .monitor_rate_limit
-            .unwrap_or_else(|| AppConfig::env_u64("AHMA_MONITOR_RATE_LIMIT", 60)),
+        tmp_access,
+        no_temp_files,
+        log_monitor,
+        monitor_rate_limit_secs,
         http_host: serve.http_host,
         http_port: serve.http_port,
         no_quic,
         disable_http1_1,
-        handshake_timeout_secs: AppConfig::env_u64("AHMA_HANDSHAKE_TIMEOUT", 45),
+        handshake_timeout_secs,
         unix_socket_path: unix_socket_path_from_cli(cli),
         observability: ahma_common::observability::ObservabilityConfig::from_env("ahma_mcp")
             .with_endpoint(serve.opentelemetry.as_deref()),
@@ -1773,22 +2172,11 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         task_vault: serve
             .task_vault
             .or_else(|| std::env::var("AHMA_TASK_VAULT").ok().map(PathBuf::from)),
-        require_token: std::env::var("AHMA_REQUIRE_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty()),
-        require_token_path: std::env::var("AHMA_REQUIRE_TOKEN_PATH")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from),
-        rate_limit_rps: std::env::var("AHMA_RATE_LIMIT_RPS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
-        rate_limit_burst: std::env::var("AHMA_RATE_LIMIT_BURST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10),
-        instance_label: std::env::var("AHMA_INSTANCE_LABEL").unwrap_or_else(|_| "ahma".to_string()),
+        require_token,
+        require_token_path,
+        rate_limit_rps,
+        rate_limit_burst,
+        instance_label,
     }
 }
 
@@ -1797,13 +2185,26 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub async fn run() -> Result<()> {
-    // Determine log target before parsing full CLI so logging works for all subcommands.
-    // RUST_LOG controls verbosity; AHMA_LOG_TARGET=stderr routes to stderr (default: file).
-    let log_to_stderr = std::env::var("AHMA_LOG_TARGET")
-        .map(|v| v.trim().eq_ignore_ascii_case("stderr"))
-        .unwrap_or(false);
-
+    // Load settings early so we can determine log target before initialising logging.
+    // We do a minimal Cli parse just to capture --no-settings / --settings-path; the
+    // full parse happens below.  We also honour the legacy AHMA_LOG_TARGET env var with
+    // a deprecation-friendly approach: settings file wins, env var is a fallback.
     let cli = Cli::parse();
+
+    // Settings-first log target: settings.toml > AHMA_LOG_TARGET (deprecated) > "file"
+    let settings_for_log = load_settings(&cli);
+    let log_to_stderr = if settings_for_log.log_to_stderr() {
+        true
+    } else if std::env::var("AHMA_LOG_TARGET")
+        .map(|v| v.trim().eq_ignore_ascii_case("stderr"))
+        .unwrap_or(false)
+    {
+        // AHMA_LOG_TARGET is still accepted but should be migrated to settings.toml
+        true
+    } else {
+        false
+    };
+
     let cfg = build_app_config(&cli);
     let subcommand = cli.command;
 

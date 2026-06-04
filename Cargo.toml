@@ -12,6 +12,7 @@ default-members = [
     # AGPL-3.0-or-later crates (end-user product surface)
     "ahma_vault",
     "ahma_decompose",
+    "ahma_task_tree",
     "ahma_worker",
     "ahma_renewal",
     "ahma_tui",
@@ -33,6 +34,7 @@ members = [
     # AGPL-3.0-or-later crates (end-user product surface)
     "ahma_vault",
     "ahma_decompose",
+    "ahma_task_tree",
     "ahma_worker",
     "ahma_renewal",
     "ahma_tui",
@@ -51,7 +53,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 rust-version = "1.95.0"
-version = "0.11.2"
+version = "0.11.3"
 
 [workspace.dependencies]
 anyhow = "1.0"

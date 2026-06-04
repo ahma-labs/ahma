@@ -45,7 +45,10 @@
 mod preparer;
 mod types;
 
-pub use preparer::{escape_shell_argument, format_option_flag, needs_file_handling};
+pub use preparer::{
+    TempFileManager, escape_shell_argument, format_option_flag, needs_file_handling,
+    prepare_command_and_args,
+};
 pub use types::{AsyncExecOptions, ExecutionMode};
 
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
