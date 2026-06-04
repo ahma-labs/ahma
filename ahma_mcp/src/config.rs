@@ -124,6 +124,10 @@ pub struct ToolConfig {
     /// Required when `tool_type` is `worker`; stored as raw JSON for GPL-crate consumption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<serde_json::Value>,
+    /// Task tree configuration (opaque — parsed by `ahma_task_tree` crate).
+    /// Required when `tool_type` is `task_tree`; stored as raw JSON for GPL-crate consumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_tree: Option<serde_json::Value>,
 }
 
 /// Classifier that determines how the MCP service routes a tool invocation.

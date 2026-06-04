@@ -113,6 +113,9 @@
       ],
       "deprecated": true
     },
+    "task_tree": {
+      "description": "Task tree configuration (opaque — parsed by `ahma_task_tree` crate).\nRequired when `tool_type` is `task_tree`; stored as raw JSON for GPL-crate consumption."
+    },
     "timeout_seconds": {
       "description": "Default timeout for operations in seconds",
       "type": [

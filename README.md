@@ -306,6 +306,7 @@ The root `Cargo.toml` groups crates in one workspace, but each member crate's
 | `generate_tool_schema` | MIT OR Apache-2.0 | Schema generation utility |
 | `ahma_vault` | AGPL-3.0-or-later | Task vaults and audit trail |
 | `ahma_decompose` | AGPL-3.0-or-later | Multi-step decomposition runtime |
+| `ahma_task_tree` | AGPL-3.0-or-later | Recursive task decomposition and execution |
 | `ahma_worker` | AGPL-3.0-or-later | Ephemeral code synthesis workers |
 | `ahma_renewal` | AGPL-3.0-or-later | Renewal / unattended-session controls |
 | `ahma_tui` | AGPL-3.0-or-later | Terminal dashboard and approval flow |

@@ -1,0 +1,35 @@
+[package]
+authors.workspace = true
+edition.workspace = true
+license = "AGPL-3.0-or-later"
+name = "ahma_task_tree"
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+description = "Recursive task decomposition and execution runtime for ahma, combining LLM reasoning, sandboxed command execution, and dynamic scoping."
+
+[lib]
+name = "ahma_task_tree"
+path = "src/lib.rs"
+
+[dependencies]
+ahma_common = { path = "../ahma_common" }
+ahma_llm_monitor = { path = "../ahma_llm_monitor" }
+ahma_vault = { path = "../ahma_vault" }
+ahma_mcp = { path = "../ahma_mcp" }
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+schemars.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
+tracing.workspace = true
+rmcp.workspace = true
+dunce.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = "0.6"
+tempfile.workspace = true
+uuid = { workspace = true, features = ["v4"] }

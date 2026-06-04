@@ -7,15 +7,12 @@ use clap::Parser as _;
 
 use ahma_mcp::shell::cli::{
     Cli, ClusterCommand, LlmCommand, Subcommands, TlsCommand, VaultCommand, build_app_config,
-    dispatch_subcommand,
+    dispatch_subcommand, load_settings,
 };
+
 use ahma_mcp::utils::logging::init_logging_with_observability;
 #[tokio::main]
 async fn main() -> Result<()> {
-    let log_to_stderr = std::env::var("AHMA_LOG_TARGET")
-        .map(|v| v.trim().eq_ignore_ascii_case("stderr"))
-        .unwrap_or(false);
-
     let cli = Cli::parse();
 
     // --markdown-help: emit the full CLI reference as Markdown and exit.
@@ -25,11 +22,27 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Settings-first log target: settings.toml [logging.target] > AHMA_LOG_TARGET (deprecated) > "file"
+    let settings_for_log = load_settings(&cli);
+    let log_to_stderr = if settings_for_log.log_to_stderr() {
+        true
+    } else {
+        std::env::var("AHMA_LOG_TARGET")
+            .map(|v| v.trim().eq_ignore_ascii_case("stderr"))
+            .unwrap_or(false)
+    };
+
     let cfg = build_app_config(&cli);
     let subcommand = cli.command;
 
     let _telemetry_guard =
         init_logging_with_observability("info", !log_to_stderr, Some(cfg.observability.clone()))?;
+
+    // Register the task tree extension handler
+    ahma_mcp::register_global_extension_handler(
+        "task_tree".to_string(),
+        std::sync::Arc::new(ahma_task_tree::TaskTreeExtensionHandler),
+    );
 
     #[cfg(target_os = "windows")]
     check_powershell_available();

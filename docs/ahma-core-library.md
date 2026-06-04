@@ -33,6 +33,7 @@ those crates.
 |-------|---------|----------|
 | `ahma_vault` | AGPL-3.0-or-later | `TaskVault`, `AuditWriter`, `TrashManager` |
 | `ahma_decompose` | AGPL-3.0-or-later | `DecomposeOrchestrator`, `DecomposeConfig`, `Reducer`, `ReduceMode` |
+| `ahma_task_tree` | AGPL-3.0-or-later | `TaskTreeOrchestrator`, `TaskTree`, `TaskNode` |
 | `ahma_worker` | AGPL-3.0-or-later | `WorkerRunner`, `WorkerConfig`, `WorkerLanguage` |
 | `ahma_renewal` | AGPL-3.0-or-later | `RenewalWatcher`, `RenewalConfig`, `RenewalHaltEvent` |
 | `ahma_tui` | AGPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |

@@ -1,8 +1,10 @@
 # Ahma Environment Variables
 
-All non-essential runtime options in `ahma` are controlled via environment variables.
-The CLI itself handles subcommand selection and frequently changed options (tool bundles,
-HTTP host/port). Everything else — sandbox policy, logging, execution tuning — lives here.
+> [!NOTE]
+> Most `AHMA_*` variables are **deprecated** in favour of `~/.ahma/settings.toml`.
+> When a deprecated variable is set, Ahma emits a `WARN` log entry pointing you to the settings file.
+> See [docs/settings.md](settings.md) for the migration table and the full settings reference.
+> The variables listed here remain accepted as fallbacks for backward compatibility.
 
 ## Boolean flags
 
