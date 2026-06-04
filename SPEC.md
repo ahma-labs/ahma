@@ -164,20 +164,20 @@ These tools are always available regardless of JSON configuration:
 - **R1.2.2**: When `--tools-dir` is explicitly provided via CLI argument, that path **must** take precedence over auto-detection.
 - **R1.3**: The system **must not** be recompiled to add, remove, or modify a tool.
 - **R1.4**: **Hot-Reloading**: The system **must** watch the `tools/` directory and send `notifications/tools/list_changed` when files change.
-- **R1.5**: **Progressive Disclosure** (default enabled): When progressive disclosure is active, `tools/list` **must** return only built-in tools (`await`, `status`, `run_terminal_command`, `cancel`) and the `activate_tools` meta-tool. Bundled tools are hidden until their bundle is explicitly revealed.
-- **R1.5.1**: The `activate_tools` meta-tool **must** support two actions: `list` (enumerate available bundles with name, description, tool count, and revealed status) and `reveal` (activate a named bundle).
-- **R1.5.2**: After a bundle is revealed via `activate_tools reveal`, the server **must** send `notifications/tools/list_changed` and include the bundle's tools in subsequent `tools/list` responses.
-- **R1.5.3**: The `--disable-progressive-disclosure` CLI flag **must** restore legacy behavior where all enabled tools are listed immediately.
-- **R1.5.4**: The `instructions` field in the MCP `initialize` response **must** contain sandbox routing directives instructing the model to use `run_terminal_command` for all command execution.
-- **R1.5.5**: The `activate_tools` description **must** dynamically list all loaded bundles with action-oriented hints (`ai_hint`) so the AI knows exactly when to activate each bundle.
-- **R1.5.6**: CLI-enabled bundles (e.g., `--tools rust,git`) are **loaded but hidden by default**. The startup visibility profile is controlled by the `AHMA_REVEAL_PROFILE` environment variable (`minimal` | `balanced` | `full`). Setting `AHMA_REVEAL_PROFILE=balanced` (or the legacy `--auto-reveal` CLI flag / `AHMA_AUTO_REVEAL=1` env var) makes all loaded bundles immediately visible at startup, bypassing the progressive disclosure step. Without any of these, the LLM must call `activate_tools` to reveal them. Precedence: `AHMA_REVEAL_PROFILE` > `--auto-reveal` / `AHMA_AUTO_REVEAL=1` > default (`minimal`).
+- **R1.5**: **Progressive Disclosure** (DEPRECATED, default disabled): By default, progressive disclosure is disabled and all tools are visible from startup. When progressive disclosure is explicitly configured (e.g., via the `AHMA_PROGRESSIVE_DISCLOSURE=1` environment variable), a deprecation warning is logged, and only built-in tools (`await`, `status`, `run_terminal_command`, `cancel`) and the `activate_tools` meta-tool are listed initially.
+- **R1.5.1**: The `activate_tools` meta-tool is deprecated. If active, it supports `list` (enumerate available bundles) and `reveal` (activate a named bundle). Calling it triggers a deprecation warning.
+- **R1.5.2**: When a bundle is revealed via `activate_tools reveal`, the server sends `notifications/tools/list_changed`.
+- **R1.5.3**: Progressive disclosure is disabled by default, making `--disable-progressive-disclosure` or `AHMA_PROGRESSIVE_DISCLOSURE_OFF` redundant.
+- **R1.5.4**: The `instructions` field in the MCP `initialize` response contains sandbox routing directives instructing the model to use `run_terminal_command` for all command execution.
+- **R1.5.5**: If progressive disclosure is active, the `activate_tools` description dynamically lists all loaded bundles with a deprecation notice.
+- **R1.5.6**: CLI-enabled bundles (e.g., `--tools rust,git`) are fully visible by default since progressive disclosure is disabled by default. If progressive disclosure is explicitly enabled, the startup visibility profile is controlled by `AHMA_REVEAL_PROFILE` (defaults to `minimal` where bundles are hidden, while `balanced` or `full` reveals them immediately).
 
 ### R2: Async-First Architecture
 
 - **R2.1**: Operations **must** execute asynchronously by default, returning an `id` immediately.
 - **R2.2**: On completion, the system **must** store results reliably in `OperationMonitor` (pull channel) and **should** push a best-effort MCP progress notification. Clients rely on the `await` tool for guaranteed result delivery; the push notification is an optimistic shortcut to avoid a round-trip` (pull channel) and **should** push a best-effort MCP progress notification. Clients rely on the `await` tool for guaranteed result delivery; the push notification is an optimistic shortcut to avoid a round-trip.
-- **R2.3**: Commands that modify config files (e.g., `cargo add`) **should** use `"synchronous": true` to prevent race conditions.
-- **R2.4**: **Inheritance**: Subcommand-level `synchronous` overrides tool-level; tool-level overrides default (async).
+- **R2.3**: **Static Synchronous Flag (DEPRECATED)**: The static `"synchronous": true/false` configuration in tool and subcommand JSON definitions is deprecated. Code calling tools should not rely on static config.
+- **R2.4**: **Dynamic Resolution**: Execution mode (blocking/synchronous vs non-blocking/asynchronous) is resolved dynamically per-invocation using the `blocking` boolean parameter in the MCP `tools/call` arguments. If not specified, tool execution defaults to asynchronous.
 
 ### R3: Performance
 
@@ -795,6 +795,7 @@ started_rx.await.ok();  // Don't return until spawn is live
 - **R21.3**: The following patterns are **FORBIDDEN**:
   - Any different behavior based on automatic "test mode" detection from environment variables like `NEXTEST`, `CARGO_TARGET_DIR`, etc.
   - Any environment variable that bypasses security checks
+- **R21.4**: **Environment Variable Minimization**: The system **must** minimize configuration via environment variables to prevent security side-channel attacks and configuration clutter. Configuration parameters **must** be declared on the command line or in explicit configuration structures (`AppConfig`) and passed down through constructor arguments rather than being queried directly from the environment at execution time.
 
 #### R22: Visual Minimalism
 
@@ -834,10 +835,10 @@ Both helpers live in `ahma_mcp::test_utils::in_process`:
 
 | Helper | Sandbox | Use when |
 |--------|---------|----------|
-| `create_in_process_mcp_from_dir(tools_dir)` | `Sandbox::new_test()` — **path validation BYPASSED** | Tool dispatch, arg parsing, async lifecycle, schema tests |
+| `create_in_process_mcp_from_dir(tools_dir)` | `Sandbox::new(Test)` — **path validation ENFORCED** | Tool dispatch, arg parsing, async lifecycle, schema tests |
 | `create_in_process_mcp_with_scope(tools_dir, scopes)` | `Sandbox::new(Strict)` — **path validation ENFORCED** | Tests that assert a path or symlink is **rejected** |
 
-**Sandbox bypass trap**: `create_in_process_mcp_from_dir` silently passes every `assert!(result.is_err(), "should be rejected")` because the test-mode sandbox accepts all paths. If a test verifies that sandbox enforcement works, it **must** use `create_in_process_mcp_with_scope`. Using the wrong helper is a silent false-positive — the test passes even when the sandbox is broken.
+Both helpers strictly enforce path validation since `new_test` and validation bypasses have been removed. Tests must ensure that input files and working directories are correctly scoped.
 
 
 ### 10.2 Test File Isolation (CRITICAL)

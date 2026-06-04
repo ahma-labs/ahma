@@ -82,6 +82,9 @@ fn build_deferred_sandbox_command(
     SandboxTestEnv::configure(&mut cmd);
     // Allow start inside nested sandboxes (app-level path security still active)
     SandboxTestEnv::apply_nested_sandbox_override(&mut cmd);
+    // Ensure we do not inherit a fallback scope or temp access from the parent test process
+    cmd.env_remove("AHMA_SANDBOX_SCOPE");
+    cmd.env_remove("AHMA_TMP_ACCESS");
     cmd
 }
 

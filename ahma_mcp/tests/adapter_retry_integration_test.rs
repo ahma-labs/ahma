@@ -49,7 +49,16 @@ fn create_test_adapter_with_retry(retry_config: Option<RetryConfig>) -> ahma_mcp
         Duration::from_secs(30),
     )));
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
-    let sandbox = Arc::new(Sandbox::new_test());
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![std::env::temp_dir()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
 
     let mut adapter = ahma_mcp::adapter::Adapter::new(monitor, shell_pool, sandbox)
         .expect("Failed to create adapter");

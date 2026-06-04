@@ -13,8 +13,17 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn adapter_uses_global_sandbox_scope_not_adapter_root_path() {
-    // Initialize sandbox scopes for tests. This sets sandbox scope to "/" and enables test mode.
-    let sandbox = Arc::new(Sandbox::new_test());
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![temp_dir.path().to_path_buf()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
 
     let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(5));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
@@ -38,7 +47,6 @@ async fn adapter_uses_global_sandbox_scope_not_adapter_root_path() {
     // The prior version passed "/tmp" which is invalid on Windows and required
     // #[cfg(unix)].  A tempdir works on all platforms without the \\?\ UNC-prefix
     // problem that std::fs::canonicalize introduces on Windows (OS error 267).
-    let temp_dir = tempfile::tempdir().expect("tempdir");
     let work_dir = temp_dir.path().to_string_lossy().to_string();
     let dir_name = temp_dir
         .path()

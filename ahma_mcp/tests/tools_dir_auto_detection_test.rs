@@ -170,7 +170,11 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     let cwd = temp_dir.path();
 
     // Start server with CWD set and no --tools-dir
-    let service = ClientBuilder::new().working_dir(cwd).build().await?;
+    let service = ClientBuilder::new()
+        .working_dir(cwd)
+        .env("AHMA_PROGRESSIVE_DISCLOSURE", "1")
+        .build()
+        .await?;
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 

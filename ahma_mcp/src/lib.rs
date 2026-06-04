@@ -187,6 +187,9 @@ pub mod bundle;
 /// Test helpers for integration and unit tests.
 pub mod test_utils;
 
+/// Task vault: audit logging and trash.
+pub mod vault;
+
 // Re-export main types for easier use
 pub use adapter::Adapter;
 

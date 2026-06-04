@@ -17,6 +17,8 @@
 pub mod logging;
 /// Safe stdout notification delivery for the subprocess-to-bridge protocol.
 pub mod stdio;
+/// Redirection of standard output to standard error.
+pub mod stdio_redirect;
 /// Serde helpers for `SystemTime` values.
 pub mod time;
 /// Timestamp formatting helpers.

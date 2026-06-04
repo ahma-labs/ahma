@@ -201,6 +201,11 @@ async fn run_shutdown_handler(
 /// # Errors
 /// Returns an error if the server fails to start or encounters a fatal error.
 pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
+    // Redirect stdout to stderr to prevent protocol stream corruption by standard prints
+    if let Err(e) = crate::utils::stdio_redirect::redirect_stdout_to_stderr() {
+        tracing::error!("Failed to redirect stdout to stderr: {}", e);
+    }
+
     tracing::info!("Starting ahma_mcp v{}", env!("CARGO_PKG_VERSION"));
     if let Some(ref tools_dir) = config.tools_dir {
         tracing::info!("Tools directory: {:?}", tools_dir);
@@ -232,7 +237,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
             .first()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| ".".to_string());
-        let label = std::env::var("AHMA_INSTANCE_LABEL").unwrap_or_else(|_| "ahma".to_string());
+        let label = config.instance_label.clone();
         crate::daemon_reporter::spawn_reporter(
             operation_monitor.clone(),
             "stdio",

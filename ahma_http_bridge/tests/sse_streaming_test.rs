@@ -420,7 +420,9 @@ async fn test_post_sse_streams_response() {
     // Parse SSE stream to find the tools/list response
     let mut stream = resp.bytes_stream();
     let deadline = tokio::time::Instant::now() + TestTimeouts::scale_secs(30);
-    let buffer = collect_sse_stream(&mut stream, deadline, |b| b.contains("\"tools\"")).await;
+    let buffer = collect_sse_stream(&mut stream, deadline, |b| {
+        b.contains("\"tools\"") && (b.ends_with("\n\n") || b.ends_with("\r\n\r\n") || b.ends_with("\n\r\n"))
+    }).await;
 
     // Extract data: lines and parse JSON
     let data_lines: Vec<&str> = buffer

@@ -160,20 +160,6 @@ impl Sandbox {
         })
     }
 
-    /// Create a sandbox in Test mode scoped to the current workspace and temp dir.
-    ///
-    /// This is intentionally not rooted at `/`: tests should exercise normal
-    /// path validation unless they explicitly construct broader scopes.
-    pub fn new_test() -> Self {
-        Self {
-            scopes: std::sync::RwLock::new(default_test_scopes()),
-            read_scopes: Vec::new(),
-            mode: SandboxMode::Test,
-            no_temp_files: false,
-            tmp_access: false,
-        }
-    }
-
     /// Update the sandbox scopes, preserving the temp directory if `--tmp` was set.
     pub fn update_scopes(&self, scopes: Vec<PathBuf>) -> Result<()> {
         let mut canonicalized = scopes::canonicalize_scopes(
@@ -227,10 +213,6 @@ impl Sandbox {
     pub fn validate_path(&self, path: &Path) -> Result<PathBuf> {
         let scopes_guard = self.scopes();
 
-        if self.should_bypass_validation(&scopes_guard) {
-            return self.resolve_test_path(path);
-        }
-
         let canonical = self.resolve_path(path, &scopes_guard)?;
 
         if !self.is_path_allowed(&canonical, &scopes_guard) {
@@ -243,18 +225,6 @@ impl Sandbox {
 
         self.check_security_policies(path, &canonical)?;
         Ok(canonical)
-    }
-
-    fn should_bypass_validation(&self, scopes_guard: &[PathBuf]) -> bool {
-        self.mode == SandboxMode::Test && is_test_root_scope(scopes_guard)
-    }
-
-    fn resolve_test_path(&self, path: &Path) -> Result<PathBuf> {
-        // Use dunce::canonicalize to avoid the \\?\ extended-length prefix that
-        // std::fs::canonicalize adds on Windows; that prefix is accepted by most
-        // Windows APIs but rejected by CreateProcess as a working directory
-        // (OS error 267 "The directory name is invalid").
-        dunce::canonicalize(path).or_else(|_| Ok(path.to_path_buf()))
     }
 
     fn resolve_path(&self, path: &Path, scopes_guard: &[PathBuf]) -> Result<PathBuf> {
@@ -303,25 +273,6 @@ impl Sandbox {
 
         let canonical_temp = dunce::canonicalize(std::env::temp_dir()).ok()?;
         (!canonicalized.contains(&canonical_temp)).then_some(canonical_temp)
-    }
-}
-
-fn is_test_root_scope(scopes_guard: &[PathBuf]) -> bool {
-    scopes_guard.is_empty() || scopes_guard.iter().any(|scope| scope == Path::new("/"))
-}
-
-fn default_test_scopes() -> Vec<PathBuf> {
-    let mut scopes = Vec::new();
-    push_existing_scope(&mut scopes, std::env::current_dir().ok());
-    push_existing_scope(&mut scopes, Some(std::env::temp_dir()));
-    scopes
-}
-
-fn push_existing_scope(scopes: &mut Vec<PathBuf>, path: Option<PathBuf>) {
-    let Some(path) = path else { return };
-    let scope = dunce::canonicalize(&path).unwrap_or(path);
-    if !scopes.contains(&scope) {
-        scopes.push(scope);
     }
 }
 

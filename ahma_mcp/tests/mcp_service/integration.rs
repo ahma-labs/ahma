@@ -18,7 +18,17 @@ async fn create_test_service() -> AhmaMcpService {
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-    let sandbox = Arc::new(ahma_mcp::sandbox::Sandbox::new_test());
+    let _temp = tempfile::tempdir().expect("Failed to create temp directory");
+    let sandbox = Arc::new(
+        ahma_mcp::sandbox::Sandbox::new(
+            vec![_temp.path().to_path_buf()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
 
@@ -128,7 +138,17 @@ async fn test_mcp_service_with_tool_configs() {
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-    let sandbox = Arc::new(ahma_mcp::sandbox::Sandbox::new_test());
+    let _temp = tempfile::tempdir().expect("Failed to create temp directory");
+    let sandbox = Arc::new(
+        ahma_mcp::sandbox::Sandbox::new(
+            vec![_temp.path().to_path_buf()],
+            ahma_mcp::sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
     let configs = Arc::new(HashMap::new());

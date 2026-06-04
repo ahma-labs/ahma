@@ -1279,7 +1279,17 @@ mod tests {
         let shell_pool = Arc::new(ShellPoolManager::new(
             crate::shell_pool::ShellPoolConfig::default(),
         ));
-        let sandbox = Arc::new(crate::sandbox::Sandbox::new_test());
+        let td = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(
+            crate::sandbox::Sandbox::new(
+                vec![td.path().to_path_buf()],
+                crate::sandbox::SandboxMode::Test,
+                false,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
         let adapter = Adapter::new(monitor, shell_pool, sandbox).unwrap();
         assert!(adapter.retry_config().is_none());
     }
@@ -1292,7 +1302,17 @@ mod tests {
         let shell_pool = Arc::new(ShellPoolManager::new(
             crate::shell_pool::ShellPoolConfig::default(),
         ));
-        let sandbox = Arc::new(crate::sandbox::Sandbox::new_test());
+        let td = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(
+            crate::sandbox::Sandbox::new(
+                vec![td.path().to_path_buf()],
+                crate::sandbox::SandboxMode::Test,
+                false,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
         let adapter = Adapter::new(monitor, shell_pool, sandbox)
             .unwrap()
             .with_retry_config(RetryConfig::default());
@@ -1307,7 +1327,17 @@ mod tests {
         let shell_pool = Arc::new(ShellPoolManager::new(
             crate::shell_pool::ShellPoolConfig::default(),
         ));
-        let sandbox = Arc::new(crate::sandbox::Sandbox::new_test());
+        let td = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(
+            crate::sandbox::Sandbox::new(
+                vec![td.path().to_path_buf()],
+                crate::sandbox::SandboxMode::Test,
+                false,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
         let adapter = Adapter::new(monitor, shell_pool, sandbox).unwrap();
         // Just verify accessors don't panic
         let _ref = adapter.sandbox();
@@ -1322,7 +1352,17 @@ mod tests {
         let shell_pool = Arc::new(ShellPoolManager::new(
             crate::shell_pool::ShellPoolConfig::default(),
         ));
-        let sandbox = Arc::new(crate::sandbox::Sandbox::new_test());
+        let td = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(
+            crate::sandbox::Sandbox::new(
+                vec![td.path().to_path_buf()],
+                crate::sandbox::SandboxMode::Test,
+                false,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
         let adapter = Adapter::new(monitor, shell_pool, sandbox).unwrap();
         // Shutdown with no active tasks should complete without error
         adapter.shutdown().await;

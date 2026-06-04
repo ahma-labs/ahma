@@ -4,7 +4,7 @@ use ahma_mcp::adapter::Adapter;
 use ahma_mcp::config::{CommandOption, SubcommandConfig, ToolConfig, ToolHints};
 use ahma_mcp::mcp_service::{AhmaMcpService, GuidanceConfig};
 use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
-use ahma_mcp::sandbox::Sandbox;
+use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 use ahma_mcp::schema_validation::MtdfValidator;
 use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
 use ahma_mcp::utils::logging::init_test_logging;
@@ -13,6 +13,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tempfile::tempdir;
 
 #[test]
 fn test_guidance_config_deserialization() {
@@ -208,7 +209,17 @@ async fn test_service_creation_and_basic_functionality() {
     let shell_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
 
-    let sandbox = Arc::new(Sandbox::new_test());
+    let _temp = tempdir().unwrap();
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![_temp.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
     let configs = Arc::new(HashMap::new());
@@ -240,7 +251,17 @@ async fn test_service_with_configs() {
     let shell_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
 
-    let sandbox = Arc::new(Sandbox::new_test());
+    let _temp = tempdir().unwrap();
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![_temp.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter = Arc::new(
         Adapter::new(
             Arc::clone(&operation_monitor),
@@ -477,7 +498,17 @@ async fn test_service_with_tool_configs() {
     let shell_config = ShellPoolConfig::default();
     let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
 
-    let sandbox = Arc::new(Sandbox::new_test());
+    let _temp = tempdir().unwrap();
+    let sandbox = Arc::new(
+        Sandbox::new(
+            vec![_temp.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
     let configs = Arc::new(configs);

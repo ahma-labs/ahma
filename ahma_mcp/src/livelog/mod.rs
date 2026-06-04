@@ -4,6 +4,10 @@
 //! reads its output line-by-line, accumulates lines into time/size-bounded chunks, and
 //! periodically sends each chunk to an OpenAI-compatible LLM for issue detection.
 //!
+//! TODO: Deprecate direct LLM orchestration in the runner/adapter and extract this
+//! logic to a standalone worker process or companion MCP server to achieve a cleaner
+//! segregation of duties and allow better sandboxing boundaries.
+//!
 //! When the LLM reports an issue, a [`ProgressUpdate::LogAlert`] notification is pushed
 //! to the MCP client via the registered callback.  A cooldown window prevents alert
 //! storms when many problematic lines arrive in rapid succession.

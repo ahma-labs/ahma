@@ -308,34 +308,23 @@ fn parse_selection_string(input: &str, max_val: usize) -> Vec<usize> {
         return (0..max_val).collect();
     }
 
-    let mut selections = Vec::new();
-
     // Check if the input is purely numeric digits without any spaces or other separator characters
     let is_pure_digits =
         !input_trimmed.is_empty() && input_trimmed.chars().all(|c| c.is_ascii_digit());
 
     if is_pure_digits && max_val < 10 {
-        // If it's a sequence of digits and max_val is single-digit, treat each digit as a selection
-        for c in input_trimmed.chars() {
-            if let Some(digit) = c.to_digit(10) {
-                let num = digit as usize;
-                if num >= 1 && num <= max_val {
-                    let idx = num - 1;
-                    if !selections.contains(&idx) {
-                        selections.push(idx);
-                    }
-                }
-            }
-        }
+        parse_digit_sequence(input_trimmed, max_val)
     } else {
-        // Otherwise, normalize common separators (comma, dot, semicolon) to spaces and split
-        let normalized = input_trimmed.replace([',', '.', ';'], " ");
-        for part in normalized.split_whitespace() {
-            if let Some(num) = part
-                .parse::<usize>()
-                .ok()
-                .filter(|&n| n >= 1 && n <= max_val)
-            {
+        parse_separated_list(input_trimmed, max_val)
+    }
+}
+
+fn parse_digit_sequence(input: &str, max_val: usize) -> Vec<usize> {
+    let mut selections = Vec::new();
+    for c in input.chars() {
+        if let Some(digit) = c.to_digit(10) {
+            let num = digit as usize;
+            if num >= 1 && num <= max_val {
                 let idx = num - 1;
                 if !selections.contains(&idx) {
                     selections.push(idx);
@@ -343,7 +332,24 @@ fn parse_selection_string(input: &str, max_val: usize) -> Vec<usize> {
             }
         }
     }
+    selections
+}
 
+fn parse_separated_list(input: &str, max_val: usize) -> Vec<usize> {
+    let mut selections = Vec::new();
+    let normalized = input.replace([',', '.', ';'], " ");
+    for part in normalized.split_whitespace() {
+        if let Some(num) = part
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n >= 1 && n <= max_val)
+        {
+            let idx = num - 1;
+            if !selections.contains(&idx) {
+                selections.push(idx);
+            }
+        }
+    }
     selections
 }
 

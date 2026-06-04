@@ -51,7 +51,13 @@ async fn test_tool_availability_integration_with_tempfile() -> Result<()> {
 
     // 5. Evaluate availability
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
-    let sandbox = ahma_mcp::sandbox::Sandbox::new_test();
+    let sandbox = ahma_mcp::sandbox::Sandbox::new(
+        vec![temp_dir.path().to_path_buf()],
+        ahma_mcp::sandbox::SandboxMode::Test,
+        false,
+        false,
+        false,
+    )?;
     let working_dir = std::path::Path::new(".");
 
     let summary: AvailabilitySummary =

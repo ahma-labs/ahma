@@ -66,6 +66,9 @@ landlock.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 ahma_test_support = { path = "../ahma_test_support" }
 futures.workspace = true

@@ -252,6 +252,16 @@ fn add_working_directory_property(properties: &mut Map<String, Value>) {
     );
 }
 
+fn add_blocking_property(properties: &mut Map<String, Value>) {
+    properties.insert(
+        "blocking".to_string(),
+        serde_json::json!({
+            "type": "boolean",
+            "description": "Execute the tool synchronously and wait for the result before returning. Default is false (asynchronous background execution)."
+        }),
+    );
+}
+
 fn build_schema_object(properties: Map<String, Value>, required: Vec<Value>) -> Map<String, Value> {
     let mut schema = Map::new();
     schema.insert("type".to_string(), Value::String("object".to_string()));
@@ -272,6 +282,7 @@ fn generate_single_command_schema(
     if tool_config.name != "cargo" {
         add_working_directory_property(&mut properties);
     }
+    add_blocking_property(&mut properties);
 
     build_schema_object(properties, required)
 }
@@ -332,6 +343,7 @@ fn generate_multi_command_schema(
     if tool_config.name != "cargo" {
         add_working_directory_property(&mut all_properties);
     }
+    add_blocking_property(&mut all_properties);
 
     let required = if has_subcommands {
         vec![Value::String("subcommand".to_string())]
