@@ -253,16 +253,8 @@ mod mcp_service_tests {
         let configs = Arc::new(HashMap::new());
         let guidance = Arc::new(None);
 
-        let service = AhmaMcpService::new(
-            adapter,
-            operation_monitor,
-            configs,
-            guidance,
-            false,
-            false,
-            false,
-        )
-        .await;
+        let service =
+            AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false).await;
 
         assert!(service.is_ok());
         let service = service.unwrap();
@@ -307,17 +299,9 @@ mod mcp_service_tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let service = rt.block_on(async {
-            AhmaMcpService::new(
-                adapter,
-                operation_monitor,
-                configs,
-                guidance,
-                false,
-                false,
-                false,
-            )
-            .await
-            .unwrap()
+            AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
+                .await
+                .unwrap()
         });
 
         let info = service.get_info();
@@ -362,17 +346,10 @@ mod mcp_service_tests {
         let configs = Arc::new(HashMap::new());
         let guidance = Arc::new(None);
 
-        let service = AhmaMcpService::new(
-            adapter,
-            operation_monitor,
-            configs,
-            guidance,
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
+        let service =
+            AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
+                .await
+                .unwrap();
 
         // Test that service was created successfully with empty config
         // The actual list_tools call requires complex MCP context setup

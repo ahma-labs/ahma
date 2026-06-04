@@ -60,7 +60,7 @@ use rmcp::{
     },
     service::{NotificationContext, Peer, RequestContext, RoleServer},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, RwLock,
@@ -165,11 +165,6 @@ pub struct AhmaMcpService {
     pub peer: Arc<RwLock<Option<Peer<RoleServer>>>>,
     /// Minimum seconds between successive log monitoring alerts (default: 60).
     pub monitor_rate_limit_seconds: u64,
-    /// When true, only built-in tools and `activate_tools` are shown initially.
-    /// Bundled tools are revealed on demand via `activate_tools reveal <bundle>`.
-    pub progressive_disclosure: bool,
-    /// Set of bundle names whose tools have been disclosed to the client.
-    pub disclosed_bundles: Arc<RwLock<HashSet<String>>>,
     /// Optional snapshot of the AppConfig used to construct this service.
     /// Stored so that runtime events (e.g. `roots/list` arrival) can rediscover
     /// a per-client `.ahma/` directory and reload tool configs against it
@@ -244,13 +239,7 @@ impl AhmaMcpService {
     fn is_sync_meta_tool_for_protocol_cancel(tool_name: &str) -> bool {
         matches!(
             tool_name,
-            "await"
-                | "status"
-                | "cancel"
-                | "activate_tools"
-                | "logs_list"
-                | "logs_read"
-                | "logs_search"
+            "await" | "status" | "cancel" | "logs_list" | "logs_read" | "logs_search"
         )
     }
 
@@ -443,14 +432,7 @@ impl AhmaMcpService {
         guidance: Arc<Option<GuidanceConfig>>,
         force_synchronous: bool,
         defer_sandbox: bool,
-        progressive_disclosure: bool,
     ) -> Result<Self, anyhow::Error> {
-        if progressive_disclosure {
-            tracing::warn!(
-                "Deprecation Warning: Progressive disclosure of tool bundles is deprecated and will be removed in a future release. All tools are now shown by default."
-            );
-        }
-
         // Start the background monitor for operation timeouts
         crate::operation_monitor::OperationMonitor::start_background_monitor(
             operation_monitor.clone(),
@@ -465,8 +447,6 @@ impl AhmaMcpService {
             defer_sandbox,
             peer: Arc::new(RwLock::new(None)),
             monitor_rate_limit_seconds: crate::log_monitor::DEFAULT_RATE_LIMIT_SECONDS,
-            progressive_disclosure,
-            disclosed_bundles: Arc::new(RwLock::new(HashSet::new())),
             app_config: Arc::new(RwLock::new(None)),
             current_tools_dir: Arc::new(RwLock::new(None)),
             extension_handlers: Arc::new(std::sync::RwLock::new(
@@ -493,24 +473,6 @@ impl AhmaMcpService {
             .write()
             .unwrap()
             .insert(name, handler);
-    }
-
-    /// Pre-discloses the given bundle names so their tools appear in the first
-    /// `tools/list` response without requiring an `activate_tools reveal` call.
-    ///
-    /// Used for bundles explicitly requested via CLI flags (e.g. `--rust`).
-    pub fn pre_disclose(&self, bundles: &std::collections::HashSet<String>) {
-        if bundles.is_empty() {
-            return;
-        }
-        let mut disclosed = self.disclosed_bundles.write().unwrap();
-        for name in bundles {
-            disclosed.insert(name.clone());
-        }
-        tracing::info!(
-            "Auto-revealed CLI-flagged bundles: {}",
-            bundles.iter().cloned().collect::<Vec<_>>().join(", ")
-        );
     }
 
     fn leaf_subcommands(
@@ -639,41 +601,6 @@ impl AhmaMcpService {
         None
     }
 
-    fn current_peer(&self) -> Option<Peer<RoleServer>> {
-        self.peer.read().unwrap().clone()
-    }
-
-    /// Sends a `notifications/tools/list_changed` notification to the connected client.
-    ///
-    /// Called after bundle disclosure state changes (e.g., via `activate_tools reveal`).
-    pub async fn notify_tools_changed(&self) {
-        let Some(peer) = self.current_peer() else {
-            tracing::debug!("No peer connected, skipping tools/list_changed notification");
-            return;
-        };
-
-        if let Err(e) = peer.notify_tool_list_changed().await {
-            tracing::error!("Failed to send tools/list_changed notification: {}", e);
-        } else {
-            tracing::info!("Sent tools/list_changed notification after bundle reveal");
-        }
-    }
-
-    /// Returns true if the given tool config name belongs to a known bundle.
-    fn is_bundle_tool(&self, config_name: &str) -> bool {
-        bundle_registry::BUNDLES
-            .iter()
-            .any(|b| b.config_tool_name == config_name)
-    }
-
-    /// Returns true if the tool's parent bundle has been disclosed.
-    fn is_tool_disclosed(&self, config_name: &str, disclosed: &HashSet<String>) -> bool {
-        bundle_registry::BUNDLES
-            .iter()
-            .find(|b| b.config_tool_name == config_name)
-            .is_some_and(|b| disclosed.contains(b.name))
-    }
-
     /// Names that are always hard-wired in the protocol layer and must not
     /// appear in user/bundled configs (we skip duplicates here).
     const HARDCODED_TOOLS: &'static [&'static str] = &[
@@ -681,42 +608,20 @@ impl AhmaMcpService {
         "status",
         "run_terminal_command",
         "cancel",
-        "activate_tools",
         "logs_list",
         "logs_read",
         "logs_search",
     ];
 
-    /// Returns a snapshot of the disclosed-bundle set when progressive
-    /// disclosure is on, or `None` when every loaded tool is visible.
-    fn disclosed_snapshot(&self) -> Option<HashSet<String>> {
-        if self.progressive_disclosure {
-            Some(self.disclosed_bundles.read().unwrap().clone())
-        } else {
-            None
-        }
-    }
-
     /// Returns true if a configured tool should be exposed to the client
     /// given the current disclosure state. Centralises the filter so
     /// `list_tools()` and `list_tool_names()` cannot drift apart.
-    fn is_config_visible_to_client(
-        &self,
-        config: &ToolConfig,
-        disclosed: &Option<HashSet<String>>,
-    ) -> bool {
+    fn is_config_visible_to_client(&self, config: &ToolConfig) -> bool {
         if Self::HARDCODED_TOOLS.contains(&config.name.as_str()) {
             return false;
         }
         if !config.enabled {
             tracing::debug!("Skipping disabled tool '{}'", config.name);
-            return false;
-        }
-        if let Some(set) = disclosed
-            && self.is_bundle_tool(&config.name)
-            && !self.is_tool_disclosed(&config.name, set)
-        {
-            tracing::debug!("Skipping undisclosed bundle tool '{}'", config.name);
             return false;
         }
         true
@@ -733,41 +638,6 @@ impl AhmaMcpService {
             Self::resolve_flattened_tool(tool_name, &configs_lock)
                 .map(|(parent, sub_path)| (parent.clone(), Some(sub_path)))
         }
-    }
-
-    /// Generates a rich, action-oriented description for the `activate_tools` meta-tool.
-    ///
-    /// The description dynamically lists all loaded bundles with their `ai_hint` text,
-    /// giving the AI immediate awareness of what capabilities are available and when
-    /// to activate each one.
-    fn generate_activate_tools_description(&self) -> String {
-        let config_keys: std::collections::HashSet<String> = {
-            let configs_lock = self.configs.read().unwrap();
-            configs_lock.keys().cloned().collect()
-        };
-
-        let loaded = bundle_registry::loaded_bundle_names(&config_keys);
-
-        if loaded.is_empty() {
-            return "⚠️ [DEPRECATED] Discover and activate tool bundles. Call with action 'list' to see available bundles and their status, or 'reveal' with a bundle name to activate its tools. Bundles are revealed progressively to minimize context usage.".to_string();
-        }
-
-        let mut parts = Vec::new();
-        parts.push(
-            "⚠️ [DEPRECATED] Activate additional tool bundles to extend available capabilities. Available bundles:"
-                .to_string(),
-        );
-
-        for bundle in &loaded {
-            parts.push(format!("- '{}': {}", bundle.name, bundle.ai_hint));
-        }
-
-        parts.push(
-            "Call with action 'list' for details, or 'reveal' with a bundle name to activate."
-                .to_string(),
-        );
-
-        parts.join("\n")
     }
 
     #[allow(deprecated)]
@@ -1003,7 +873,7 @@ impl AhmaMcpService {
 )]
 impl ServerHandler for AhmaMcpService {
     fn get_info(&self) -> ServerInfo {
-        let base_instructions = "Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
+        let instructions = "Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
                   kernel-enforced workspace sandbox (Landlock on Linux, Seatbelt on macOS, \
                   Job Objects on Windows). Prefer `run_terminal_command` over the native terminal when: \
                   (1) the command writes to disk — the sandbox guarantees the write stays inside the workspace; \
@@ -1013,17 +883,7 @@ impl ServerHandler for AhmaMcpService {
                   streams alerts when matching lines appear; \
                   (4) multiple commands should run concurrently — each call gets its own operation_id. \
                   For read-only file inspection (read, grep, glob, replace) keep using the IDE's native \
-                  file tools — that is what they are for.";
-
-        let instructions = if self.progressive_disclosure {
-            format!(
-                "{base_instructions} \
-                  Bundles for cargo, git, python, kotlin, github, fileutils, and simplify are revealed \
-                  on demand via `activate_tools` (action `list` then `reveal`)."
-            )
-        } else {
-            base_instructions.to_string()
-        };
+                  file tools — that is what they are for.".to_string();
 
         let capabilities = ServerCapabilities::builder()
             .enable_tools_with(ToolsCapability {
@@ -1211,24 +1071,9 @@ impl ServerHandler for AhmaMcpService {
                 .with_title("logs_search"),
             ];
 
-            // When progressive disclosure is enabled, expose the activate_tools meta-tool
-            // with a dynamically generated description listing all loaded bundles
-            if self.progressive_disclosure {
-                let description = self.generate_activate_tools_description();
-                tools.push(
-                    Tool::new(
-                        "activate_tools",
-                        description,
-                        self.generate_input_schema_for_discover_tools(),
-                    )
-                    .with_title("activate_tools"),
-                );
-            }
-
-            let disclosed = self.disclosed_snapshot();
             let configs_lock = self.configs.read().unwrap();
             for config in configs_lock.values() {
-                if !self.is_config_visible_to_client(config, &disclosed) {
+                if !self.is_config_visible_to_client(config) {
                     continue;
                 }
                 tools.extend(self.create_tools_from_config(config));
@@ -1261,10 +1106,7 @@ impl ServerHandler for AhmaMcpService {
                     self.handle_cancel(params.arguments.unwrap_or_default())
                         .await
                 }
-                "activate_tools" => {
-                    self.handle_discover_tools(params.arguments.unwrap_or_default())
-                        .await
-                }
+
                 "logs_list" => {
                     self.handle_logs_list(params.arguments.unwrap_or_default())
                         .await
@@ -1617,14 +1459,9 @@ impl AhmaMcpService {
             "run_terminal_command".into(),
         ];
 
-        if self.progressive_disclosure {
-            names.push("activate_tools".into());
-        }
-
-        let disclosed = self.disclosed_snapshot();
         let configs_lock = self.configs.read().unwrap();
         for config in configs_lock.values() {
-            if self.is_config_visible_to_client(config, &disclosed) {
+            if self.is_config_visible_to_client(config) {
                 names.push(config.name.clone());
             }
         }
@@ -1654,7 +1491,7 @@ mod tests {
         let adapter =
             crate::test_utils::client::create_test_config(Path::new(".")).expect("adapter");
         let configs: Arc<HashMap<String, ToolConfig>> = Arc::new(HashMap::new());
-        AhmaMcpService::new(adapter, monitor, configs, guidance, false, false, false)
+        AhmaMcpService::new(adapter, monitor, configs, guidance, false, false)
             .await
             .expect("service")
     }
@@ -2323,82 +2160,6 @@ mod tests {
         // Won't resolve because config has no subcommands
         let result = AhmaMcpService::resolve_flattened_tool("simple_sub", &configs);
         assert!(result.is_none());
-    }
-
-    // ============= is_bundle_tool / is_tool_disclosed tests =============
-
-    #[tokio::test]
-    async fn test_is_bundle_tool_known() {
-        let service = make_service().await;
-        // "cargo" is a known bundle config_tool_name
-        assert!(service.is_bundle_tool("cargo"));
-    }
-
-    #[tokio::test]
-    async fn test_is_bundle_tool_unknown() {
-        let service = make_service().await;
-        assert!(!service.is_bundle_tool("nonexistent_tool"));
-    }
-
-    #[tokio::test]
-    async fn test_is_tool_disclosed_not_disclosed() {
-        let service = make_service().await;
-        let disclosed = HashSet::new();
-        assert!(!service.is_tool_disclosed("cargo", &disclosed));
-    }
-
-    #[tokio::test]
-    async fn test_is_tool_disclosed_after_disclosure() {
-        let service = make_service().await;
-        let mut disclosed = HashSet::new();
-        // Bundle name for "cargo" config_tool_name is "rust"
-        disclosed.insert("rust".to_string());
-        assert!(service.is_tool_disclosed("cargo", &disclosed));
-    }
-
-    // ============= pre_disclose tests =============
-
-    #[tokio::test]
-    async fn test_pre_disclose_empty() {
-        let service = make_service().await;
-        let empty = HashSet::new();
-        service.pre_disclose(&empty);
-        // Should not panic and disclosed set should remain empty
-        let disclosed = service.disclosed_bundles.read().unwrap();
-        assert!(disclosed.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_pre_disclose_adds_bundles() {
-        let service = make_service().await;
-        let mut bundles = HashSet::new();
-        bundles.insert("cargo".to_string());
-        bundles.insert("git".to_string());
-        service.pre_disclose(&bundles);
-        let disclosed = service.disclosed_bundles.read().unwrap();
-        assert!(disclosed.contains("cargo"));
-        assert!(disclosed.contains("git"));
-    }
-
-    // ============= list_tool_names tests =============
-
-    #[tokio::test]
-    async fn test_list_tool_names_includes_hardcoded() {
-        let service = make_service().await;
-        let names = service.list_tool_names();
-        assert!(names.contains(&"await".to_string()));
-        assert!(names.contains(&"status".to_string()));
-        assert!(names.contains(&"run_terminal_command".to_string()));
-    }
-
-    // ============= generate_activate_tools_description tests =============
-
-    #[tokio::test]
-    async fn test_generate_activate_tools_description_no_bundles_loaded() {
-        let service = make_service().await;
-        let desc = service.generate_activate_tools_description();
-        // With empty configs, no bundles are loaded; should return default description
-        assert!(desc.contains("Discover and activate"));
     }
 
     // ============= get_info tests =============

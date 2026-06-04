@@ -164,13 +164,13 @@ These tools are always available regardless of JSON configuration:
 - **R1.2.2**: When `--tools-dir` is explicitly provided via CLI argument, that path **must** take precedence over auto-detection.
 - **R1.3**: The system **must not** be recompiled to add, remove, or modify a tool.
 - **R1.4**: **Hot-Reloading**: The system **must** watch the `tools/` directory and send `notifications/tools/list_changed` when files change.
-- **R1.5**: **Progressive Disclosure** (DEPRECATED, default disabled): By default, progressive disclosure is disabled and all tools are visible from startup. When progressive disclosure is explicitly configured (e.g., via the `AHMA_PROGRESSIVE_DISCLOSURE=1` environment variable), a deprecation warning is logged, and only built-in tools (`await`, `status`, `run_terminal_command`, `cancel`) and the `activate_tools` meta-tool are listed initially.
-- **R1.5.1**: The `activate_tools` meta-tool is deprecated. If active, it supports `list` (enumerate available bundles) and `reveal` (activate a named bundle). Calling it triggers a deprecation warning.
-- **R1.5.2**: When a bundle is revealed via `activate_tools reveal`, the server sends `notifications/tools/list_changed`.
-- **R1.5.3**: Progressive disclosure is disabled by default, making `--disable-progressive-disclosure` or `AHMA_PROGRESSIVE_DISCLOSURE_OFF` redundant.
+- **R1.5**: [REMOVED] Progressive disclosure and the `activate_tools` meta-tool have been removed from the server.
+- **R1.5.1**: [REMOVED]
+- **R1.5.2**: [REMOVED]
+- **R1.5.3**: [REMOVED]
 - **R1.5.4**: The `instructions` field in the MCP `initialize` response contains sandbox routing directives instructing the model to use `run_terminal_command` for all command execution.
-- **R1.5.5**: If progressive disclosure is active, the `activate_tools` description dynamically lists all loaded bundles with a deprecation notice.
-- **R1.5.6**: CLI-enabled bundles (e.g., `--tools rust,git`) are fully visible by default since progressive disclosure is disabled by default. If progressive disclosure is explicitly enabled, the startup visibility profile is controlled by `AHMA_REVEAL_PROFILE` (defaults to `minimal` where bundles are hidden, while `balanced` or `full` reveals them immediately).
+- **R1.5.5**: [REMOVED]
+- **R1.5.6**: [REMOVED]
 
 ### R2: Async-First Architecture
 
@@ -1154,7 +1154,7 @@ details behind shared helpers so core execution algorithms remain easy to read.
 - **R19.4**: Tool-call readiness checks **must** use
   `sandbox::Sandbox::is_ready_for_tool_calls()` instead of duplicating
   `scopes().is_empty() && !is_test_mode()` checks.
-- **R19.5**: Built-in tool input schemas (`await`, `status`, `run_terminal_command`, `activate_tools`)
+- **R19.5**: Built-in tool input schemas (`await`, `status`, `run_terminal_command`)
   **must** be generated with `mcp_service::schema` helper builders
   (`string_property`, `path_property`, enum helpers, `object_input_schema`).
 

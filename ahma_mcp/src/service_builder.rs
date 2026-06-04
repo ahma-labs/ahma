@@ -25,7 +25,7 @@ use crate::{
     mcp_service::{AhmaMcpService, GuidanceConfig},
     operation_monitor::{MonitorConfig, OperationMonitor},
     sandbox::Sandbox,
-    shell::cli::{AppConfig, StartupProfile},
+    shell::cli::AppConfig,
     shell_pool::{ShellPoolConfig, ShellPoolManager},
     tool_availability::{AvailabilitySummary, evaluate_tool_availability, format_install_guidance},
 };
@@ -75,7 +75,6 @@ pub struct ServiceBuilder<'a> {
     skip_availability_probes: bool,
     force_synchronous: bool,
     defer_sandbox: bool,
-    progressive_disclosure: bool,
     monitor_rate_limit: u64,
 }
 
@@ -89,7 +88,6 @@ impl<'a> ServiceBuilder<'a> {
             skip_availability_probes: config.skip_availability_probes,
             force_synchronous: config.force_sync,
             defer_sandbox: config.defer_sandbox,
-            progressive_disclosure: config.progressive_disclosure,
             monitor_rate_limit: config.monitor_rate_limit_secs,
         }
     }
@@ -115,12 +113,6 @@ impl<'a> ServiceBuilder<'a> {
     /// Override whether to defer sandbox initialisation until roots arrive.
     pub fn defer_sandbox(mut self, defer: bool) -> Self {
         self.defer_sandbox = defer;
-        self
-    }
-
-    /// Override progressive disclosure behaviour.
-    pub fn progressive_disclosure(mut self, pd: bool) -> Self {
-        self.progressive_disclosure = pd;
         self
     }
 
@@ -183,13 +175,6 @@ impl<'a> ServiceBuilder<'a> {
         let loaded_tools_count = configs.len();
         let configs_for_output = configs.clone();
 
-        // Compute the effective progressive-disclosure flag.
-        // StartupProfile::Full disables PD entirely (all tools visible from the start).
-        let pd_flag = match config.reveal_profile {
-            StartupProfile::Full => false,
-            _ => self.progressive_disclosure,
-        };
-
         let mut service = AhmaMcpService::new(
             adapter.clone(),
             operation_monitor.clone(),
@@ -197,27 +182,11 @@ impl<'a> ServiceBuilder<'a> {
             Arc::new(self.guidance),
             self.force_synchronous,
             self.defer_sandbox,
-            pd_flag,
         )
         .await?;
 
         service.monitor_rate_limit_seconds = self.monitor_rate_limit;
         service.set_app_config(std::sync::Arc::new(config.clone()));
-
-        // Apply the reveal profile:
-        //   Minimal  — no pre-disclosure; LLM must call `activate_tools reveal` explicitly.
-        //   Balanced — auto-reveal bundles that were requested via CLI --tools flags.
-        //   Full     — PD is already disabled above; nothing further needed.
-        match config.reveal_profile {
-            StartupProfile::Balanced => {
-                let cli_bundles = crate::config::cli_flagged_bundle_names(config);
-                service.pre_disclose(&cli_bundles);
-            }
-            StartupProfile::Minimal | StartupProfile::Full => {
-                // Minimal: keep all bundles hidden; LLM uses activate_tools or run_terminal_command.
-                // Full: PD disabled, everything visible already.
-            }
-        }
 
         Ok(BuiltService {
             service,

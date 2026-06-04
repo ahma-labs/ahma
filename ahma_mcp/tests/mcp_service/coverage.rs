@@ -225,17 +225,9 @@ async fn test_service_creation_and_basic_functionality() {
     let configs = Arc::new(HashMap::new());
     let guidance = Arc::new(None);
 
-    let service = AhmaMcpService::new(
-        adapter,
-        operation_monitor,
-        configs,
-        guidance,
-        false,
-        false,
-        false,
-    )
-    .await
-    .unwrap();
+    let service = AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
+        .await
+        .unwrap();
 
     // Test get_info
     let info = service.get_info();
@@ -338,7 +330,6 @@ async fn test_service_with_configs() {
         Arc::clone(&operation_monitor),
         Arc::new(configs),
         guidance,
-        false,
         false,
         false,
     )
@@ -514,17 +505,9 @@ async fn test_service_with_tool_configs() {
     let configs = Arc::new(configs);
     let guidance = Arc::new(None);
 
-    let service = AhmaMcpService::new(
-        adapter,
-        operation_monitor,
-        configs,
-        guidance,
-        false,
-        false,
-        false,
-    )
-    .await
-    .unwrap();
+    let service = AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
+        .await
+        .unwrap();
 
     assert!(service.configs.read().unwrap().contains_key("cargo"));
     let cargo_config = service

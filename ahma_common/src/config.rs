@@ -492,28 +492,6 @@ impl Default for LoggingSettings {
     }
 }
 
-/// Progressive disclosure / tool visibility profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct DisclosureSettings {
-    /// Startup visibility profile.
-    ///
-    /// | Value      | Behaviour |
-    /// |------------|-----------|
-    /// | `"minimal"` | (default) Only built-in tools visible at startup |
-    /// | `"balanced"` | `--tools` bundles revealed automatically |
-    /// | `"full"` | All tools visible; progressive disclosure disabled |
-    pub reveal_profile: String,
-}
-
-impl Default for DisclosureSettings {
-    fn default() -> Self {
-        Self {
-            reveal_profile: "minimal".to_string(),
-        }
-    }
-}
-
 /// HTTP server settings (applies to `ahma serve http`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -616,8 +594,7 @@ pub struct AhmaSettings {
     pub sandbox: SandboxSettings,
     /// Logging and live log-monitoring settings.
     pub logging: LoggingSettings,
-    /// Progressive disclosure / tool visibility profile.
-    pub disclosure: DisclosureSettings,
+
     /// HTTP server settings (applies to `ahma serve http` only).
     pub http: HttpSettings,
     /// HTTP authentication and rate-limiting settings.
@@ -736,9 +713,6 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # log_monitor            = false    # enable live log monitoring via LLM
 # monitor_rate_limit_secs = 60      # min seconds between log-monitor alerts
 
-# ── Progressive disclosure ────────────────────────────────────────────────────
-# [disclosure]
-# reveal_profile = "minimal"   # "minimal" | "balanced" | "full"
 
 # ── HTTP server (ahma serve http only) ───────────────────────────────────────
 # [http]

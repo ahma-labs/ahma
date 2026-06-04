@@ -170,11 +170,7 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     let cwd = temp_dir.path();
 
     // Start server with CWD set and no --tools-dir
-    let service = ClientBuilder::new()
-        .working_dir(cwd)
-        .env("AHMA_PROGRESSIVE_DISCLOSURE", "1")
-        .build()
-        .await?;
+    let service = ClientBuilder::new().working_dir(cwd).build().await?;
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -185,8 +181,8 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     // Verify only built-in tools are present
     assert_eq!(
         tools.len(),
-        7,
-        "Should have exactly 7 built-in tools when no .ahma exists. Got: {:?}",
+        6,
+        "Should have exactly 6 built-in tools when no .ahma exists. Got: {:?}",
         tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 
@@ -201,10 +197,6 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     assert!(
         tools.iter().any(|t| t.name == "run_terminal_command"),
         "Built-in 'run_terminal_command' tool should be present"
-    );
-    assert!(
-        tools.iter().any(|t| t.name == "activate_tools"),
-        "Built-in 'activate_tools' tool should be present"
     );
     assert!(
         tools.iter().any(|t| t.name == "logs_list"),

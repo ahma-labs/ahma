@@ -40,46 +40,6 @@ use std::{
 // Never mutated after startup.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Controls the initial tool-visibility profile for the MCP session.
-///
-/// In all profiles, built-in tools (`run_terminal_command`, `await`, `status`,
-/// `activate_tools`) are always visible.  The profile determines whether
-/// CLI-flagged bundles are auto-revealed at startup or kept hidden until an
-/// explicit `activate_tools reveal` call.
-///
-/// Controlled by the `AHMA_REVEAL_PROFILE` environment variable:
-///
-/// | Value      | Profile          |
-/// |------------|------------------|
-/// | `minimal`  | [`Minimal`]      |
-/// | `balanced` | [`Balanced`]     |
-/// | `full`     | [`Full`]         |
-/// | (absent)   | [`Minimal`]      |
-///
-/// [`Minimal`]: StartupProfile::Minimal
-/// [`Balanced`]: StartupProfile::Balanced
-/// [`Full`]: StartupProfile::Full
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum StartupProfile {
-    /// **Default.** Only built-in tools visible initially; CLI-flagged bundles
-    /// remain hidden until the LLM calls `activate_tools reveal <bundle>`.
-    ///
-    /// Best for local/small LLMs (Gemma, Qwen) and context-sensitive workflows.
-    #[default]
-    Minimal,
-    /// Built-in tools visible; CLI-flagged bundles auto-revealed at startup.
-    /// Other bundles still require an `activate_tools reveal` call.
-    ///
-    /// Equivalent to the previous default behaviour (`--tools rust` immediately
-    /// exposed cargo tools in the tool list).
-    Balanced,
-    /// All loaded tools visible immediately; progressive disclosure disabled.
-    ///
-    /// Equivalent to `AHMA_PROGRESSIVE_DISCLOSURE_OFF=1`.  Useful when the
-    /// client is a large-context model and tool-count does not matter.
-    Full,
-}
-
 /// Unified, immutable application configuration.
 ///
 /// Constructed once at startup from CLI flags and environment variables.
@@ -104,10 +64,6 @@ pub struct AppConfig {
     pub hot_reload_tools: bool,
     /// Skip tool availability probes at startup (AHMA_SKIP_PROBES=1).
     pub skip_availability_probes: bool,
-    /// Enable progressive disclosure (AHMA_PROGRESSIVE_DISCLOSURE=1).
-    pub progressive_disclosure: bool,
-    /// Startup visibility profile (AHMA_REVEAL_PROFILE: minimal|balanced|full).
-    pub reveal_profile: StartupProfile,
 
     // ── Sandbox ─────────────────────────────────────────────────────────────
     /// Disable the kernel sandbox entirely (AHMA_DISABLE_SANDBOX=1).
@@ -191,8 +147,7 @@ impl Default for AppConfig {
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
-            progressive_disclosure: true,
-            reveal_profile: StartupProfile::Minimal,
+
             no_sandbox: false,
             sandbox_scopes: vec![],
             defer_sandbox: false,
@@ -737,13 +692,7 @@ fn run_settings_command(args: SettingsArgs) -> Result<()> {
                 d.logging.monitor_rate_limit_secs
             );
             println!();
-            println!("[disclosure]");
-            show_field!(
-                "reveal_profile",
-                &s.disclosure.reveal_profile,
-                &d.disclosure.reveal_profile
-            );
-            println!();
+
             println!("[http]");
             show_field!(
                 "handshake_timeout_secs",
@@ -1145,15 +1094,6 @@ pub struct ServeArgs {
     /// The vault must exist (create with `ahma vault create <slug>` first).
     #[arg(long = "task-vault", value_name = "PATH", global = true)]
     pub task_vault: Option<PathBuf>,
-
-    /// Immediately reveal all loaded `--tools` bundles at startup without
-    /// requiring an `activate_tools` call. Equivalent to `AHMA_AUTO_REVEAL=1`
-    /// or `AHMA_REVEAL_PROFILE=balanced`.
-    ///
-    /// Deprecated: prefer the `AHMA_REVEAL_PROFILE=balanced` environment
-    /// variable; this flag is kept for backward compatibility.
-    #[arg(long = "auto-reveal", global = true)]
-    pub auto_reveal: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1758,7 +1698,6 @@ struct ServeFields {
     sync: bool,
     opentelemetry: Option<String>,
     task_vault: Option<PathBuf>,
-    auto_reveal: bool,
 }
 
 fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
@@ -1784,7 +1723,6 @@ fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
             sync: s.sync,
             opentelemetry: s.opentelemetry.clone(),
             task_vault: s.task_vault.clone(),
-            auto_reveal: s.auto_reveal,
         }
     } else {
         ServeFields {
@@ -1802,7 +1740,6 @@ fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
             sync: false,
             opentelemetry: None,
             task_vault: None,
-            auto_reveal: false,
         }
     }
 }
@@ -1970,39 +1907,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         s.tools.skip_probes
     };
 
-    // progressive_disclosure: settings > AHMA_PROGRESSIVE_DISCLOSURE (deprecated legacy)
-    let progressive_disclosure = if AppConfig::env_flag("AHMA_PROGRESSIVE_DISCLOSURE") {
-        deprecated_env!("AHMA_PROGRESSIVE_DISCLOSURE");
-        true
-    } else {
-        // Always enabled; reveal_profile controls granularity
-        true
-    };
-
-    // reveal_profile: AHMA_REVEAL_PROFILE (env) > CLI (auto_reveal) / AHMA_AUTO_REVEAL (env) > settings
-    let env_profile = std::env::var("AHMA_REVEAL_PROFILE").ok();
-    let env_auto = AppConfig::env_flag("AHMA_AUTO_REVEAL");
-
-    let reveal_profile = if let Some(ref p) = env_profile {
-        deprecated_env!("AHMA_REVEAL_PROFILE");
-        match p.as_str() {
-            "balanced" => StartupProfile::Balanced,
-            "full" => StartupProfile::Full,
-            _ => StartupProfile::Minimal,
-        }
-    } else if serve.auto_reveal || env_auto {
-        if env_auto {
-            deprecated_env!("AHMA_AUTO_REVEAL");
-        }
-        StartupProfile::Balanced
-    } else {
-        match s.disclosure.reveal_profile.as_str() {
-            "balanced" => StartupProfile::Balanced,
-            "full" => StartupProfile::Full,
-            _ => StartupProfile::Minimal,
-        }
-    };
-
     // no_sandbox: CLI > settings > AHMA_DISABLE_SANDBOX (deprecated)
     let no_sandbox = if serve.no_sandbox {
         true
@@ -2145,8 +2049,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         force_sync,
         hot_reload_tools,
         skip_availability_probes,
-        progressive_disclosure,
-        reveal_profile,
+
         no_sandbox,
         sandbox_scopes,
         defer_sandbox,
@@ -2588,8 +2491,7 @@ mod tests {
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
-            progressive_disclosure: false,
-            reveal_profile: StartupProfile::Minimal,
+
             no_sandbox: false,
             sandbox_scopes: vec![],
             defer_sandbox: false,
@@ -3159,73 +3061,5 @@ mod tests {
         unsafe { std::env::set_var("AHMA_TEST_CFG_FLAG", "yes") };
         assert!(AppConfig::env_flag("AHMA_TEST_CFG_FLAG"));
         unsafe { std::env::remove_var("AHMA_TEST_CFG_FLAG") };
-    }
-
-    // ─── --auto-reveal / AHMA_AUTO_REVEAL compatibility ──────────────────────
-
-    #[test]
-    fn test_cli_parse_auto_reveal_flag() {
-        // Regression: `--auto-reveal` must be accepted (not rejected) by clap.
-        let cli = Cli::try_parse_from(["ahma", "serve", "stdio", "--auto-reveal"]).unwrap();
-        if let Subcommands::Serve(s) = cli.command {
-            assert!(
-                s.auto_reveal,
-                "auto_reveal should be true when --auto-reveal is passed"
-            );
-        } else {
-            panic!("expected serve stdio subcommand");
-        }
-    }
-
-    #[test]
-    fn test_build_app_config_auto_reveal_flag_maps_to_balanced() {
-        let cli = Cli::try_parse_from(["ahma", "serve", "stdio", "--auto-reveal"]).unwrap();
-        let cfg = build_app_config(&cli);
-        assert_eq!(
-            cfg.reveal_profile,
-            StartupProfile::Balanced,
-            "--auto-reveal should set reveal_profile to Balanced"
-        );
-    }
-
-    #[test]
-    fn test_build_app_config_ahma_auto_reveal_env_maps_to_balanced() {
-        let cli = Cli::try_parse_from(["ahma", "serve", "stdio"]).unwrap();
-        unsafe { std::env::set_var("AHMA_AUTO_REVEAL", "1") };
-        let cfg = build_app_config(&cli);
-        unsafe { std::env::remove_var("AHMA_AUTO_REVEAL") };
-        assert_eq!(
-            cfg.reveal_profile,
-            StartupProfile::Balanced,
-            "AHMA_AUTO_REVEAL=1 should set reveal_profile to Balanced"
-        );
-    }
-
-    #[test]
-    fn test_build_app_config_reveal_profile_env_takes_precedence_over_auto_reveal() {
-        // AHMA_REVEAL_PROFILE wins; --auto-reveal should not override it.
-        let cli = Cli::try_parse_from(["ahma", "serve", "stdio", "--auto-reveal"]).unwrap();
-        unsafe { std::env::set_var("AHMA_REVEAL_PROFILE", "full") };
-        let cfg = build_app_config(&cli);
-        unsafe { std::env::remove_var("AHMA_REVEAL_PROFILE") };
-        assert_eq!(
-            cfg.reveal_profile,
-            StartupProfile::Full,
-            "AHMA_REVEAL_PROFILE=full should override --auto-reveal"
-        );
-    }
-
-    #[test]
-    fn test_build_app_config_default_reveal_profile_is_minimal() {
-        let cli = Cli::try_parse_from(["ahma", "serve", "stdio"]).unwrap();
-        // Ensure no relevant env vars are set
-        unsafe { std::env::remove_var("AHMA_REVEAL_PROFILE") };
-        unsafe { std::env::remove_var("AHMA_AUTO_REVEAL") };
-        let cfg = build_app_config(&cli);
-        assert_eq!(
-            cfg.reveal_profile,
-            StartupProfile::Minimal,
-            "default reveal_profile should be Minimal"
-        );
     }
 }

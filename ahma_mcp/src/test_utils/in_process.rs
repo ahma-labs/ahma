@@ -117,7 +117,6 @@ async fn wire_in_process_mcp(
         Arc::new(None::<GuidanceConfig>),
         false, // force_synchronous
         false, // defer_sandbox
-        false, // progressive_disclosure
     )
     .await?;
 

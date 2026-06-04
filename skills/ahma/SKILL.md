@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.11.3
+version: 0.11.4
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -18,7 +18,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.11.3 | author: Paul Houghton -->
+<!-- version: 0.11.4 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -127,37 +127,25 @@ If a user asks you to use Ahma but it isn't configured, help them by:
 2. Ask which bundles they need (rust, git, python, etc.)
 3. Create the config and tell them to reload the window (`Developer: Reload Window`)
 
----
+## Tool Bundles
 
-## Tool Bundles & Progressive Disclosure (DEPRECATED)
-
-> [!IMPORTANT]
-> **Progressive disclosure is deprecated and disabled by default.**
-> All tools in loaded bundles (e.g., specified via `--tools`) are visible immediately at startup.
+Ahma groups command-line tools into logical bundles that can be loaded at startup using the `--tools` parameter.
 
 ### Available Bundles
 
 | Bundle | Activate with | Key tools | When to use |
 |--------|--------------|-----------|-------------|
 | `rust` | `--tools rust` | cargo build/test/clippy/fmt/nextest/add | Rust/Cargo projects |
-| `git` | `--tools git` | git status/commit/push/log/diff | Version control |
 | `fileutils` | `--tools fileutils` | ls, cp, mv, rm, grep, find, diff | File operations |
-| `python` | `--tools python` | python script execution | Python projects |
-| `kotlin` | `--tools kotlin` | gradle build/test/lint | Android/Kotlin |
 | `github` | `--tools github` | gh pr/issue/run/release | GitHub CLI operations |
+| `git` | `--tools git` | git status/commit/push/log/diff | Version control |
+| `kotlin` | `--tools kotlin` | gradle build/test/lint | Android/Kotlin |
+| `python` | `--tools python` | python script execution | Python projects |
 | `simplify` | `--tools simplify` | Code complexity analysis | Code quality work |
 
-To enable bundles at startup (making all their tools immediately visible):
+To enable bundles at startup:
 ```json
 "args": ["serve", "stdio", "--tools", "rust,git,fileutils"]
-```
-
-### Legacy Progressive Disclosure Mode (Explicit Opt-in Only)
-If progressive disclosure is explicitly enabled (e.g., via the `AHMA_PROGRESSIVE_DISCLOSURE` env var), only the core built-in tools and the deprecated `activate_tools` meta-tool are visible initially. Calling `activate_tools` triggers a deprecation warning in the logs:
-```
-activate_tools(action="list")           # See available bundles
-activate_tools(action="reveal", bundle="rust")   # Unlock Cargo tools
-activate_tools(action="reveal", bundle="git")    # Unlock Git tools
 ```
 
 ---
@@ -486,7 +474,7 @@ android_logcat(...)   # if defined in .ahma/android-logcat.json
 
 ## Troubleshooting
 
-**Tool not found**: Make sure the bundle is specified in the `--tools` parameter at startup (e.g., `--tools rust,git`). If progressive disclosure is explicitly enabled, use the deprecated `activate_tools(action="reveal", bundle="<name>")` to unlock it.
+**Tool not found**: Make sure the bundle is specified in the `--tools` parameter at startup (e.g., `--tools rust,git`).
 
 **Timeout**: Set `AHMA_TIMEOUT=600` in mcp.json env, or pass `timeout_seconds` per tool call.
 
@@ -733,7 +721,7 @@ or `--tools rust,simplify`.
 ### CRITICAL: Fail-Closed Rule
 
 **If the `simplify` MCP tool is not available:**
-1. Ensure `simplify` is listed in `--tools` at startup (e.g. `--tools rust,simplify`), or if progressive disclosure is explicitly enabled, call `activate_tools(action="reveal", bundle="simplify")` to unlock it, OR
+1. Ensure `simplify` is listed in `--tools` at startup (e.g. `--tools rust,simplify`), OR
 2. Run `ahma simplify <directory> --ai-fix 1` directly via the sandboxed shell.
 
 **NEVER substitute shell heuristics** such as `find ... | wc -l` (line counts) or `wc -c` (file sizes) as a proxy for complexity. File length is not a complexity metric. Using it will produce incorrect rankings and mislead refactoring effort. If neither the tool nor the CLI is available, tell the user and stop — do not improvise.
@@ -785,6 +773,11 @@ and edits a different file, so there are no file conflicts.
 | A subagent/agent spawning tool (e.g., `invoke_subagent`, `Agent` tool, `Task` tool) | Spawn N subagent tool calls **in the same response** so they run concurrently |
 | Background task capability but no subagent tool | Launch N background tasks, one per issue |
 | Neither | Run the N issues sequentially, one at a time |
+
+> [!IMPORTANT]
+> **Antigravity Environment**: In Antigravity, there is no general-purpose code subagent spawning tool (the only subagent tool is `browser_subagent` which is for browser tasks only).
+> Therefore, you **MUST** run the N issues **sequentially, one at a time** yourself.
+> When running sequentially, do **not** stop after Phase 1 to ask the user for permission or confirmation. Proceed immediately to edit the first target file, run verification (`ahma simplify --verify <file>`), and then move on to the next worst file, until you have refactored all requested files. Only output the final results table once all sequential edits and verifications are complete.
 
 **Each subagent receives this prompt** (fill in the template for each issue number):
 
