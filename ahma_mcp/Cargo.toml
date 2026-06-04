@@ -7,6 +7,9 @@ readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[lints.rust]
+deprecated = "allow"
+
 [lib]
 name = "ahma_mcp"
 path = "src/lib.rs"

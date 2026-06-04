@@ -47,17 +47,9 @@ async fn create_test_service() -> AhmaMcpService {
     let configs = Arc::new(tool_configs);
     let guidance = Arc::new(None::<GuidanceConfig>);
 
-    AhmaMcpService::new(
-        adapter,
-        operation_monitor,
-        configs,
-        guidance,
-        false,
-        false,
-        false,
-    )
-    .await
-    .unwrap()
+    AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -154,17 +146,9 @@ async fn test_mcp_service_with_tool_configs() {
     let configs = Arc::new(HashMap::new());
     let guidance = Arc::new(None::<GuidanceConfig>);
 
-    let service = AhmaMcpService::new(
-        adapter,
-        operation_monitor,
-        configs,
-        guidance,
-        false,
-        false,
-        false,
-    )
-    .await
-    .unwrap();
+    let service = AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
+        .await
+        .unwrap();
 
     // Should still work with empty configs
     let info = service.get_info();

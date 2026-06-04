@@ -61,7 +61,6 @@
 //!         Arc::new(None), // Guidance
 //!         false, // force_synchronous
 //!         false, // defer_sandbox
-//!         true,  // progressive_disclosure
 //!     ).await?;
 //!
 //!     // Now you can run the service over Stdio or an HTTP transport.
@@ -77,7 +76,7 @@
 //!
 //! | Category | Variables |
 //! |---|---|
-//! | **Tool management** | `AHMA_TOOLS_DIR`, `AHMA_TIMEOUT`, `AHMA_SYNC`, `AHMA_HOT_RELOAD`, `AHMA_SKIP_PROBES`, `AHMA_PROGRESSIVE_DISCLOSURE_OFF` |
+//! | **Tool management** | `AHMA_TOOLS_DIR`, `AHMA_TIMEOUT`, `AHMA_SYNC`, `AHMA_HOT_RELOAD`, `AHMA_SKIP_PROBES` |
 //! | **Sandbox & security** | `AHMA_DISABLE_SANDBOX`, `AHMA_SANDBOX_SCOPE`, `AHMA_SANDBOX_DEFER`, `AHMA_WORKING_DIRS`, `AHMA_TMP_ACCESS`, `AHMA_DISABLE_TEMP` |
 //! | **Logging** | `RUST_LOG`, `AHMA_LOG_TARGET`, `AHMA_LOG_MONITOR`, `AHMA_MONITOR_RATE_LIMIT` |
 //! | **HTTP transport** | `AHMA_DISABLE_QUIC`, `AHMA_DISABLE_HTTP1_1`, `AHMA_HANDSHAKE_TIMEOUT` |

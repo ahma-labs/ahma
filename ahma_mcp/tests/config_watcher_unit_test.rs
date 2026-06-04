@@ -67,7 +67,6 @@ async fn make_service(initial_configs: HashMap<String, ToolConfig>) -> AhmaMcpSe
         Arc::new(None),
         false,
         false,
-        false,
     )
     .await
     .unwrap()

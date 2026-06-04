@@ -76,7 +76,6 @@ async fn test_mcp_cancellation_does_not_trigger_canceled_canceled_message() {
         guidance,
         false,
         false,
-        false,
     )
     .await
     .expect("Failed to create MCP service");
@@ -274,7 +273,6 @@ async fn test_on_cancelled_filter_excludes_activate_tools_and_log_tools() {
         "await",
         "status",
         "cancel",
-        "activate_tools",
         "logs_list",
         "logs_read",
         "logs_search",
@@ -297,13 +295,7 @@ async fn test_on_cancelled_filter_excludes_activate_tools_and_log_tools() {
             .filter(|op| {
                 !matches!(
                     op.tool_name.as_str(),
-                    "await"
-                        | "status"
-                        | "cancel"
-                        | "activate_tools"
-                        | "logs_list"
-                        | "logs_read"
-                        | "logs_search"
+                    "await" | "status" | "cancel" | "logs_list" | "logs_read" | "logs_search"
                 )
             })
             .collect();

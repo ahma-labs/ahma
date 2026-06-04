@@ -712,22 +712,6 @@ pub async fn load_tool_configs(
     Ok(configs)
 }
 
-/// Returns the set of bundle names that were explicitly requested via `--tool` flags.
-///
-/// These bundles are auto-revealed (pre-disclosed) when progressive
-/// disclosure is enabled, since the user explicitly requested them.
-pub fn cli_flagged_bundle_names(
-    config: &crate::shell::cli::AppConfig,
-) -> std::collections::HashSet<String> {
-    use crate::mcp_service::bundle_registry::BUNDLES;
-    config
-        .tool_bundles
-        .iter()
-        .filter(|name| BUNDLES.iter().any(|b| b.name == name.as_str()))
-        .cloned()
-        .collect()
-}
-
 /// Synchronous wrapper around `load_tool_configs` for test use only.
 ///
 /// Creates a one-shot Tokio runtime and delegates to the async version.

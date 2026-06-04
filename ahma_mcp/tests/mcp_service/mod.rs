@@ -14,5 +14,4 @@ mod comprehensive_security;
 mod coverage;
 mod coverage_expansion;
 mod integration;
-mod progressive_disclosure;
 mod shell_tool;
