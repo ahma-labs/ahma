@@ -84,7 +84,7 @@ fn do_redirect() -> io::Result<File> {
         }
 
         let current_process = GetCurrentProcess();
-        let mut saved_handle: HANDLE = 0;
+        let mut saved_handle: HANDLE = std::ptr::null_mut();
         let success = DuplicateHandle(
             current_process,
             stdout_handle as HANDLE,
