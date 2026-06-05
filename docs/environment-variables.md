@@ -82,7 +82,7 @@ ahma serve stdio --tmp
 | Variable | CLI equivalent | Default | Description |
 |---|---|---|---|
 | `RUST_LOG` | — | `info` | Standard Rust log filter. Controls verbosity for all crates. Common values: `debug`, `info`, `warn`, `error`. Crate-specific filters (e.g. `ahma_mcp=debug,rmcp=warn`) are also supported. |
-| `AHMA_LOG_TARGET` | — | file (rolling) | Set to `stderr` to route all log output to stderr instead of the default rotating log file under `./log/`. Useful for Docker, CI, or any environment where stdout/stderr is captured. |
+| `AHMA_LOG_TARGET` | — | file (rolling) | Set to `stderr` to route all log output to stderr instead of the default rotating log file under `./logs/`. Useful for Docker, CI, or any environment where stdout/stderr is captured. |
 | `AHMA_LOG_MONITOR` | `--log-monitor` | off | Enable live log monitoring. Ahma tails the configured log stream through an LLM to detect issues in real time and push alerts as MCP progress notifications. See [docs/live-log-monitoring.md](live-log-monitoring.md) for setup. |
 | `AHMA_MONITOR_RATE_LIMIT` | `--monitor-rate-limit` | `60` | Minimum seconds between successive log-monitor alerts. Prevents alert storms when a persistent issue triggers repeated pattern matches. |
 

@@ -466,7 +466,7 @@ pub struct SandboxSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggingSettings {
-    /// Log destination: `"file"` (rolling log under `./log/`) or `"stderr"`.
+    /// Log destination: `"file"` (rolling log under `./logs/`) or `"stderr"`.
     /// `"stderr"` is useful for Docker, CI, or any environment where
     /// stdout/stderr is captured.
     /// Default: `"file"`

@@ -127,3 +127,58 @@ pub fn build_recovery_prompt(
         Decide the recovery action and output the JSON now:"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_planning_prompt() {
+        let prompt = build_planning_prompt("Do X", "Step 1", "Completed step 0", 3);
+        assert!(prompt.contains("expert task planner"));
+        assert!(prompt.contains("at most 3 sequential steps"));
+        assert!(prompt.contains("Overall Goal: Do X"));
+        assert!(prompt.contains("Current Task: Step 1"));
+        assert!(prompt.contains("Context (Previous branch outcomes):\nCompleted step 0"));
+    }
+
+    #[test]
+    fn test_build_summarisation_prompt() {
+        let prompt = build_summarisation_prompt("success", "no error");
+        assert!(prompt.contains("concise, high-density summary"));
+        assert!(prompt.contains("STDOUT:\nsuccess"));
+        assert!(prompt.contains("STDERR:\nno error"));
+    }
+
+    #[test]
+    fn test_build_recovery_prompt_with_remaining_steps() {
+        let remaining = vec!["Step A".to_string(), "Step B".to_string()];
+        let prompt = build_recovery_prompt(
+            "Goal Y",
+            "Task 2",
+            "Context info",
+            "Failed task",
+            "Error log",
+            &remaining,
+            2,
+        );
+        assert!(prompt.contains("Failed Step Description: Failed task"));
+        assert!(prompt.contains("Failed Step Error/Outcome:\nError log"));
+        assert!(prompt.contains("Remaining Unexecuted Steps:\n1. Step A\n2. Step B"));
+        assert!(prompt.contains("at most 2 steps"));
+    }
+
+    #[test]
+    fn test_build_recovery_prompt_without_remaining_steps() {
+        let prompt = build_recovery_prompt(
+            "Goal Y",
+            "Task 2",
+            "Context info",
+            "Failed task",
+            "Error log",
+            &[],
+            2,
+        );
+        assert!(prompt.contains("Remaining Unexecuted Steps:\nNone (this was the last step)."));
+    }
+}

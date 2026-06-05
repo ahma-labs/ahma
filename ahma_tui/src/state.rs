@@ -661,6 +661,7 @@ pub struct TuiWindow {
     pub llm_model: Option<String>,
     pub visible: bool,
     pub abort_tx: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    pub op_id: Option<String>,
 }
 
 /// Top-level application state — owns all panel data and UI mode.

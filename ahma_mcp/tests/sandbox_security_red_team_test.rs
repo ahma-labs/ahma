@@ -430,7 +430,7 @@ async fn red_team_livelog_symlink_read_allowed() {
     use std::os::windows::fs::symlink_dir as symlink;
 
     let temp_dir = TempDir::new().unwrap(); // sandbox scope
-    let log_dir = temp_dir.path().join("log");
+    let log_dir = temp_dir.path().join("logs");
     std::fs::create_dir_all(&log_dir).unwrap();
 
     let outside_dir = create_non_tmp_tempdir();
