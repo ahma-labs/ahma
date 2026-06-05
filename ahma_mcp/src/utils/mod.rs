@@ -23,3 +23,5 @@ pub mod stdio_redirect;
 pub mod time;
 /// Timestamp formatting helpers.
 pub mod timestamp;
+/// Helper for generating descriptive operation IDs.
+pub mod operation;

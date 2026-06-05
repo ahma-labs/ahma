@@ -93,8 +93,10 @@ fn find_step_subcommand<'a>(
 }
 
 /// Generates a new unique operation ID.
-fn next_id() -> String {
-    format!("op_{}", SEQUENCE_ID.fetch_add(1, Ordering::SeqCst))
+fn next_id(tool_name: &str, subcommand: Option<&str>) -> String {
+    let counter_val = SEQUENCE_ID.fetch_add(1, Ordering::SeqCst);
+    let command = subcommand.unwrap_or("");
+    crate::utils::operation::generate_id_with_details(counter_val, tool_name, command)
 }
 
 /// Creates a callback sender if a progress token is available.
@@ -276,7 +278,7 @@ async fn handle_sequence_tool_async(
         let (subcommand_config, command_parts) =
             find_step_subcommand(&step_tool_config, &step.subcommand, &step.tool)?;
 
-        let id = next_id();
+        let id = next_id(&step.tool, Some(&step.subcommand));
         let callback = create_callback(&context, &id);
 
         let step_result = adapter
@@ -348,7 +350,7 @@ pub async fn handle_subcommand_sequence(
                 },
             )?;
 
-        let id = next_id();
+        let id = next_id(&config.name, Some(&step.subcommand));
         let callback = create_callback(&context, &id);
 
         let step_result = adapter
@@ -769,12 +771,14 @@ mod tests {
 
     #[test]
     fn test_next_id_format_and_increment() {
-        let id1 = next_id();
-        let id2 = next_id();
+        let id1 = next_id("test_tool", Some("test_sub"));
+        let id2 = next_id("test_tool", Some("test_sub"));
         assert!(id1.starts_with("op_"));
         assert!(id2.starts_with("op_"));
-        let n1: u64 = id1.trim_start_matches("op_").parse().unwrap();
-        let n2: u64 = id2.trim_start_matches("op_").parse().unwrap();
+        let parts1: Vec<&str> = id1.split('_').collect();
+        let parts2: Vec<&str> = id2.split('_').collect();
+        let n1: u64 = parts1[1].parse().unwrap();
+        let n2: u64 = parts2[1].parse().unwrap();
         assert!(n2 > n1);
     }
 

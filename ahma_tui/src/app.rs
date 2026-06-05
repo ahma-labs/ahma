@@ -1712,7 +1712,7 @@ mod tests {
     fn test_handle_window_nav_commands() {
         use crate::state::{AppState, TuiWindow};
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
-        
+
         let w = TuiWindow {
             id: 3,
             label: "Test Window".to_string(),
@@ -1740,7 +1740,7 @@ mod tests {
         assert!(handled_close);
         assert!(!state.windows[0].visible);
         assert_eq!(state.windows[0].status, "Cancelled");
-        
+
         // Test /exit to quit
         let handled_exit = super::handle_window_nav_commands("/exit", &mut state);
         assert!(handled_exit);

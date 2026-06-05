@@ -1287,7 +1287,8 @@ impl AhmaMcpService {
         let timeout = arguments.get("timeout_seconds").and_then(|v| v.as_u64());
         let execution_mode = self.determine_execution_mode(subcommand_config, &config, &arguments);
 
-        let id = format!("op_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
+        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let id = crate::utils::operation::generate_id_with_details(counter_val, &tool_name, &base_command);
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
 
