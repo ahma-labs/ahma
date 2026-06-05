@@ -182,4 +182,3 @@ mod tests {
         assert!(prompt.contains("Remaining Unexecuted Steps:\nNone (this was the last step)."));
     }
 }
-

@@ -16,7 +16,8 @@ pub fn clean_details(input: &str) -> Option<String> {
             word
         };
         // Clean characters: keep only alphanumeric and underscores
-        let cleaned: String = word_clean.chars()
+        let cleaned: String = word_clean
+            .chars()
             .filter(|c| c.is_alphanumeric() || *c == '_')
             .collect();
         if !cleaned.is_empty() {
@@ -52,9 +53,18 @@ mod tests {
 
     #[test]
     fn test_clean_details() {
-        assert_eq!(clean_details("cargo nextest run"), Some("cargo_nextest".to_string()));
-        assert_eq!(clean_details("git commit -m 'fix'"), Some("git_commit".to_string()));
-        assert_eq!(clean_details("/bin/sh -c 'cargo test'"), Some("sh_cargo".to_string()));
+        assert_eq!(
+            clean_details("cargo nextest run"),
+            Some("cargo_nextest".to_string())
+        );
+        assert_eq!(
+            clean_details("git commit -m 'fix'"),
+            Some("git_commit".to_string())
+        );
+        assert_eq!(
+            clean_details("/bin/sh -c 'cargo test'"),
+            Some("sh_cargo".to_string())
+        );
         assert_eq!(clean_details("echo hello"), Some("echo_hello".to_string()));
         assert_eq!(clean_details("cargo"), Some("cargo".to_string()));
         assert_eq!(clean_details("--version"), None);
@@ -62,8 +72,14 @@ mod tests {
 
     #[test]
     fn test_generate_id_with_details() {
-        assert_eq!(generate_id_with_details(42, "cargo", "cargo build"), "op_42_cargo_build");
-        assert_eq!(generate_id_with_details(4, "run_terminal_command", "cargo nextest run"), "op_4_cargo_nextest");
+        assert_eq!(
+            generate_id_with_details(42, "cargo", "cargo build"),
+            "op_42_cargo_build"
+        );
+        assert_eq!(
+            generate_id_with_details(4, "run_terminal_command", "cargo nextest run"),
+            "op_4_cargo_nextest"
+        );
         assert_eq!(generate_id_with_details(5, "--flag", ""), "op_5");
     }
 }

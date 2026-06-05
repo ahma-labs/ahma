@@ -1543,7 +1543,11 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
     let mut to_add = Vec::new();
 
     for op in &state.operations {
-        if let Some(w) = state.windows.iter_mut().find(|w| w.op_id.as_deref() == Some(&op.id)) {
+        if let Some(w) = state
+            .windows
+            .iter_mut()
+            .find(|w| w.op_id.as_deref() == Some(&op.id))
+        {
             w.status = match op.status {
                 crate::state::OpStatus::Running => "Running".to_string(),
                 crate::state::OpStatus::Pending => "Pending".to_string(),

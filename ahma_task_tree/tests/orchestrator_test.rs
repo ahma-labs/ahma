@@ -234,7 +234,11 @@ async fn test_task_tree_extension_handler_integration() {
             }
         }
     });
-    std::fs::write(tools_dir.join("task_tree.json"), serde_json::to_string(&tool_def).unwrap()).unwrap();
+    std::fs::write(
+        tools_dir.join("task_tree.json"),
+        serde_json::to_string(&tool_def).unwrap(),
+    )
+    .unwrap();
 
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
@@ -249,7 +253,12 @@ async fn test_task_tree_extension_handler_integration() {
 
     // Scenario B: Successful run using 'query' parameter
     let params = CallToolRequestParams::new(std::borrow::Cow::Borrowed("task_tree"))
-        .with_arguments(json!({"query": "Test query B"}).as_object().unwrap().clone());
+        .with_arguments(
+            json!({"query": "Test query B"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
     let result = mcp.client.call_tool(params).await.unwrap();
     assert!(!result.is_error.unwrap_or(false));
     let text = result.content[0].as_text().unwrap().text.clone();
@@ -257,7 +266,12 @@ async fn test_task_tree_extension_handler_integration() {
 
     // Scenario C: Successful run using 'instructions' parameter
     let params = CallToolRequestParams::new(std::borrow::Cow::Borrowed("task_tree"))
-        .with_arguments(json!({"instructions": "Test instructions C"}).as_object().unwrap().clone());
+        .with_arguments(
+            json!({"instructions": "Test instructions C"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
     let result = mcp.client.call_tool(params).await.unwrap();
     assert!(!result.is_error.unwrap_or(false));
     let text = result.content[0].as_text().unwrap().text.clone();
@@ -303,7 +317,11 @@ async fn test_task_tree_extension_handler_bad_config() {
         "tool_type": "extension",
         "task_tree": "invalid_config_payload"
     });
-    std::fs::write(tools_dir.join("task_tree_bad_config.json"), serde_json::to_string(&tool_def).unwrap()).unwrap();
+    std::fs::write(
+        tools_dir.join("task_tree_bad_config.json"),
+        serde_json::to_string(&tool_def).unwrap(),
+    )
+    .unwrap();
 
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
@@ -352,7 +370,11 @@ async fn test_task_tree_extension_handler_fail() {
             }
         }
     });
-    std::fs::write(tools_dir.join("task_tree_fail.json"), serde_json::to_string(&tool_def).unwrap()).unwrap();
+    std::fs::write(
+        tools_dir.join("task_tree_fail.json"),
+        serde_json::to_string(&tool_def).unwrap(),
+    )
+    .unwrap();
 
     let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
 
@@ -363,4 +385,3 @@ async fn test_task_tree_extension_handler_fail() {
     let err = result.unwrap_err();
     assert!(format!("{:?}", err).contains("Task tree execution failed"));
 }
-

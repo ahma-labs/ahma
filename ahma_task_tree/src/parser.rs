@@ -158,4 +158,3 @@ mod tests {
         assert_eq!(cleaned, "{\"steps\": []}");
     }
 }
-

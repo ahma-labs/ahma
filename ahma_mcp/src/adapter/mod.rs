@@ -437,7 +437,9 @@ impl Adapter {
             .prepare_command_and_args(command, args.as_ref(), subcommand_config, &safe_wd)
             .await?;
 
-        let op_id = id.map(|s| s.to_string()).unwrap_or_else(|| generate_id(tool_name, command));
+        let op_id = id
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| generate_id(tool_name, command));
         let op_id_clone = op_id.clone();
         let wd = safe_wd_str.clone();
 

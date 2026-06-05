@@ -15,6 +15,8 @@
 //!   upon the `chrono` crate to provide date and time manipulation features.
 
 pub mod logging;
+/// Helper for generating descriptive operation IDs.
+pub mod operation;
 /// Safe stdout notification delivery for the subprocess-to-bridge protocol.
 pub mod stdio;
 /// Redirection of standard output to standard error.
@@ -23,5 +25,3 @@ pub mod stdio_redirect;
 pub mod time;
 /// Timestamp formatting helpers.
 pub mod timestamp;
-/// Helper for generating descriptive operation IDs.
-pub mod operation;
