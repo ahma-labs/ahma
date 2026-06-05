@@ -11,7 +11,7 @@ pub fn clean_details(input: &str) -> Option<String> {
         }
         // If it looks like a path, try to extract the last component
         let word_clean = if word.contains('/') || word.contains('\\') {
-            word.split(&['/', '\\'][..]).last().unwrap_or(word)
+            word.split(&['/', '\\'][..]).next_back().unwrap_or(word)
         } else {
             word
         };

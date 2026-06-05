@@ -77,6 +77,10 @@ struct Args {
     /// Defaults to `10`.  Only effective when `--rate-limit-rps > 0`.
     #[arg(long, default_value = "10")]
     rate_limit_burst: u32,
+
+    /// Idle timeout in seconds before the background bridge shuts down.
+    #[arg(long)]
+    idle_timeout_secs: Option<u64>,
 }
 
 #[tokio::main]
@@ -138,6 +142,8 @@ async fn main() -> anyhow::Result<()> {
         require_token_path: args.require_token,
         rate_limit_rps: args.rate_limit_rps,
         rate_limit_burst: args.rate_limit_burst,
+        active_sessions: None,
+        idle_timeout_secs: args.idle_timeout_secs,
     };
 
     // Warn when listening on a non-loopback address without a token.

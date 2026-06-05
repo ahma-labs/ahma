@@ -135,6 +135,8 @@ pub struct AppConfig {
     pub rate_limit_burst: u32,
     /// Daemon instance label (AHMA_INSTANCE_LABEL).
     pub instance_label: String,
+    /// Idle timeout in seconds before the background bridge shuts down (default 10).
+    pub idle_timeout_secs: Option<u64>,
 }
 
 impl Default for AppConfig {
@@ -175,6 +177,7 @@ impl Default for AppConfig {
             rate_limit_rps: 0,
             rate_limit_burst: 10,
             instance_label: "ahma".to_string(),
+            idle_timeout_secs: Some(10),
         }
     }
 }
@@ -1062,6 +1065,12 @@ pub struct ServeArgs {
     #[arg(long = "monitor-rate-limit", value_name = "SECS", global = true)]
     pub monitor_rate_limit: Option<u64>,
 
+    /// Idle timeout in seconds for background servers.
+    /// If there are no active clients for this duration, the server exits.
+    /// Defaults to 10.
+    #[arg(long = "idle-timeout", value_name = "SECS", global = true)]
+    pub idle_timeout: Option<u64>,
+
     /// Disable the kernel sandbox entirely.
     /// UNSAFE: the AI can read and write anywhere on the filesystem.
     /// Use only in environments that provide their own containment (Docker, CI containers).
@@ -1698,6 +1707,7 @@ struct ServeFields {
     sync: bool,
     opentelemetry: Option<String>,
     task_vault: Option<PathBuf>,
+    idle_timeout: Option<u64>,
 }
 
 fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
@@ -1723,6 +1733,7 @@ fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
             sync: s.sync,
             opentelemetry: s.opentelemetry.clone(),
             task_vault: s.task_vault.clone(),
+            idle_timeout: s.idle_timeout,
         }
     } else {
         ServeFields {
@@ -1740,6 +1751,7 @@ fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
             sync: false,
             opentelemetry: None,
             task_vault: None,
+            idle_timeout: None,
         }
     }
 }
@@ -1968,6 +1980,8 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         }
     };
 
+    let idle_timeout_secs = serve.idle_timeout.or(Some(10));
+
     // HTTP transport flags: CLI > settings > deprecated env
     let no_quic = if serve.no_quic {
         true
@@ -2080,6 +2094,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         rate_limit_rps,
         rate_limit_burst,
         instance_label,
+        idle_timeout_secs,
     }
 }
 
@@ -2519,6 +2534,7 @@ mod tests {
             rate_limit_rps: 0,
             rate_limit_burst: 10,
             instance_label: "ahma".to_string(),
+            idle_timeout_secs: Some(10),
         }
     }
 

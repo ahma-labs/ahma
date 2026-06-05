@@ -107,6 +107,8 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
         require_token_path: config.require_token_path.clone(),
         rate_limit_rps: config.rate_limit_rps,
         rate_limit_burst: config.rate_limit_burst,
+        active_sessions: None,
+        idle_timeout_secs: config.idle_timeout_secs,
     };
 
     start_bridge(bridge_config).await?;

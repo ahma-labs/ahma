@@ -44,7 +44,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{collections::HashMap, path::Path};
 
-const RESERVED_TOOL_NAMES: &[&str] = &["await", "status", "run_terminal_command", "cancel"];
+const RESERVED_TOOL_NAMES: &[&str] = &[
+    "await",
+    "status",
+    "run_terminal_command",
+    "cancel",
+    "restart",
+];
 const TOOL_CONFIG_READ_MAX_ATTEMPTS: usize = 8;
 const TOOL_CONFIG_READ_BACKOFF_MS: u64 = 40;
 

@@ -200,7 +200,230 @@ async fn run_shutdown_handler(
 ///
 /// # Errors
 /// Returns an error if the server fails to start or encounters a fatal error.
+fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+#[cfg(unix)]
+async fn query_uds_health(path: &str) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connect = tokio::net::UnixStream::connect(path);
+    let mut stream = tokio::time::timeout(Duration::from_millis(200), connect)
+        .await
+        .ok()?
+        .ok()?;
+
+    let request = b"GET /health HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if stream.write_all(request).await.is_err() {
+        return None;
+    }
+
+    let mut buf = Vec::with_capacity(512);
+    let _ = tokio::time::timeout(Duration::from_millis(200), stream.read_to_end(&mut buf)).await;
+
+    let response_str = std::str::from_utf8(&buf).ok()?;
+    let body = response_str.split("\r\n\r\n").nth(1)?;
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    parsed.get("version")?.as_str().map(String::from)
+}
+
+async fn query_tcp_health(url: &str) -> Option<String> {
+    let health_url = format!("{}/health", url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap_or_default();
+    let resp = client.get(&health_url).send().await.ok()?;
+    if resp.status().is_success() {
+        let parsed: serde_json::Value = resp.json().await.ok()?;
+        return parsed.get("version")?.as_str().map(String::from);
+    }
+    None
+}
+
+pub async fn get_bridge_version(
+    socket_path: Option<&str>,
+    http_url: Option<&str>,
+) -> Option<String> {
+    #[cfg(unix)]
+    if let Some(path) = socket_path
+        && let Some(ver) = query_uds_health(path).await
+    {
+        return Some(ver);
+    }
+    if let Some(url) = http_url
+        && let Some(ver) = query_tcp_health(url).await
+    {
+        return Some(ver);
+    }
+    None
+}
+
+#[cfg(unix)]
+async fn trigger_uds_restart(path: &str) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connect = tokio::net::UnixStream::connect(path);
+    let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_millis(200), connect).await else {
+        return false;
+    };
+
+    let request = b"POST /restart HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    if stream.write_all(request).await.is_err() {
+        return false;
+    }
+
+    let mut buf = Vec::with_capacity(512);
+    let _ = tokio::time::timeout(Duration::from_millis(200), stream.read_to_end(&mut buf)).await;
+
+    let response_str = std::str::from_utf8(&buf).unwrap_or("");
+    response_str.starts_with("HTTP/1.") && response_str.contains(" 200 ")
+}
+
+async fn trigger_tcp_restart(url: &str) -> bool {
+    let restart_url = format!("{}/restart", url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap_or_default();
+    if let Ok(resp) = client.post(&restart_url).send().await {
+        return resp.status().is_success();
+    }
+    false
+}
+
+pub async fn trigger_bridge_restart(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
+    #[cfg(unix)]
+    if let Some(path) = socket_path
+        && trigger_uds_restart(path).await
+    {
+        return true;
+    }
+    if let Some(url) = http_url
+        && trigger_tcp_restart(url).await
+    {
+        return true;
+    }
+    false
+}
+
+async fn check_bridge_running(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
+    get_bridge_version(socket_path, http_url).await.is_some()
+}
+
+/// Run in server mode (stdio MCP server).
+///
+/// # Arguments
+/// * `config` - Immutable application configuration.
+/// * `sandbox` - Sandbox configuration.
+///
+/// # Errors
+/// Returns an error if the server fails to start or encounters a fatal error.
 pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
+    let is_test = std::env::var("NEXTEST").is_ok() || std::env::var("CARGO_MANIFEST_DIR").is_ok();
+
+    let socket_path = if let Ok(path) = std::env::var("AHMA_UNIX_SOCKET") {
+        path
+    } else if config.unix_socket_path.is_empty() {
+        "/tmp/ahma.sock".to_string()
+    } else {
+        config.unix_socket_path.clone()
+    };
+    let http_url = format!("http://{}:{}", config.http_host, config.http_port);
+
+    let socket_path_opt = if cfg!(unix) {
+        Some(socket_path.as_str())
+    } else {
+        None
+    };
+    let http_url_opt = Some(http_url.as_str());
+
+    let client_version = env!("CARGO_PKG_VERSION");
+    let bridge_version_opt = if is_test {
+        None
+    } else {
+        get_bridge_version(socket_path_opt, http_url_opt).await
+    };
+
+    if let Some(bridge_version) = bridge_version_opt {
+        if bridge_version == client_version {
+            tracing::info!(
+                "Local bridge server is already running (v{}). Forwarding stdio as a proxy client.",
+                bridge_version
+            );
+            return crate::shell::modes::proxy_client::run_proxy_client(
+                socket_path_opt,
+                http_url_opt,
+            )
+            .await;
+        }
+
+        let c_ver = parse_version(client_version);
+        let b_ver = parse_version(&bridge_version);
+        let client_is_newer = match (c_ver, b_ver) {
+            (Some(c), Some(b)) => c > b,
+            _ => true,
+        };
+
+        if client_is_newer {
+            tracing::info!(
+                "Client version (v{}) is newer than running bridge version (v{}). Requesting bridge restart...",
+                client_version,
+                bridge_version
+            );
+            if trigger_bridge_restart(socket_path_opt, http_url_opt).await {
+                let start = std::time::Instant::now();
+                while start.elapsed() < Duration::from_secs(2) {
+                    if !check_bridge_running(socket_path_opt, http_url_opt).await {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                tracing::info!("Old bridge stopped. Starting new bridge...");
+            } else {
+                tracing::warn!("Failed to request bridge restart. Attempting to start anyway.");
+            }
+        } else {
+            if std::env::var("AHMA_RESTARTED").is_err() {
+                tracing::info!(
+                    "Client version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
+                    client_version,
+                    bridge_version
+                );
+                let exe = std::env::current_exe()?;
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                let mut cmd = std::process::Command::new(exe);
+                cmd.args(&args);
+                cmd.env("AHMA_RESTARTED", "1");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    let err = cmd.exec();
+                    return Err(anyhow::anyhow!("Failed to re-exec client process: {}", err));
+                }
+                #[cfg(not(unix))]
+                {
+                    let mut child = cmd
+                        .stdin(std::process::Stdio::inherit())
+                        .stdout(std::process::Stdio::inherit())
+                        .stderr(std::process::Stdio::inherit())
+                        .spawn()?;
+                    let status = child.wait()?;
+                    std::process::exit(status.code().unwrap_or(0));
+                }
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Version mismatch: Client version (v{}) is older than running bridge version (v{}). Please update the client binary.",
+                    client_version,
+                    bridge_version
+                ));
+            }
+        }
+    }
+
     // Redirect stdout to stderr to prevent protocol stream corruption by standard prints
     if let Err(e) = crate::utils::stdio_redirect::redirect_stdout_to_stderr() {
         tracing::error!("Failed to redirect stdout to stderr: {}", e);
@@ -274,6 +497,87 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         loaded_tools_count,
     );
 
+    if !is_test {
+        // Start background bridge server
+        let server_command = std::env::current_exe()
+            .context("Failed to get current executable path")?
+            .to_string_lossy()
+            .to_string();
+
+        let mut server_args = vec!["serve".to_string()];
+
+        if config.explicit_tools_dir
+            && let Some(ref tools_dir) = config.tools_dir
+        {
+            server_args.push("--tools-dir".to_string());
+            server_args.push(tools_dir.to_string_lossy().to_string());
+        }
+
+        if let Some(ref task_vault) = config.task_vault {
+            server_args.push("--task-vault".to_string());
+            server_args.push(task_vault.to_string_lossy().to_string());
+        }
+
+        #[cfg(unix)]
+        server_args.push("unix".to_string());
+        #[cfg(not(unix))]
+        server_args.push("http".to_string());
+
+        for bundle in &config.tool_bundles {
+            server_args.push("--tool".to_string());
+            server_args.push(bundle.clone());
+        }
+
+        if let Some(timeout) = config.idle_timeout_secs {
+            server_args.push("--idle-timeout".to_string());
+            server_args.push(timeout.to_string());
+        }
+
+        let mut cmd = tokio::process::Command::new(&server_command);
+        cmd.args(&server_args);
+
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        // Do not inherit standard streams to fully detach
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        match cmd.spawn() {
+            Ok(_) => tracing::info!("Spawned background bridge server successfully"),
+            Err(e) => tracing::error!("Failed to spawn background bridge server: {}", e),
+        }
+
+        // Wait for the background bridge to be healthy/available
+        let start_time = std::time::Instant::now();
+        let mut healthy = false;
+        while start_time.elapsed() < Duration::from_secs(2) {
+            if check_bridge_running(socket_path_opt, http_url_opt).await {
+                healthy = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !healthy {
+            tracing::warn!("Background bridge server failed to become healthy within 2 seconds");
+        } else {
+            tracing::info!("Background bridge server started successfully and is healthy");
+        }
+
+        // Proceed with proxy setup
+        return crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
+            .await;
+    }
+
     use crate::transport_patch::PatchedStdioTransport;
     let service = service_handler
         .serve(PatchedStdioTransport::new_stdio())
@@ -294,5 +598,6 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     emit_sandbox_terminated(&reason);
     adapter.shutdown().await;
     result?;
+
     Ok(())
 }

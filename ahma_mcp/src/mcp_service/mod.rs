@@ -239,7 +239,7 @@ impl AhmaMcpService {
     fn is_sync_meta_tool_for_protocol_cancel(tool_name: &str) -> bool {
         matches!(
             tool_name,
-            "await" | "status" | "cancel" | "logs_list" | "logs_read" | "logs_search"
+            "await" | "status" | "cancel" | "logs_list" | "logs_read" | "logs_search" | "restart"
         )
     }
 
@@ -611,6 +611,7 @@ impl AhmaMcpService {
         "logs_list",
         "logs_read",
         "logs_search",
+        "restart",
     ];
 
     /// Returns true if a configured tool should be exposed to the client
@@ -1069,6 +1070,12 @@ impl ServerHandler for AhmaMcpService {
                     handlers::log_tools::logs_search_schema(),
                 )
                 .with_title("logs_search"),
+                Tool::new(
+                    "restart",
+                    "Force stop and restart the background bridge server, disconnecting all active sessions (including TUI and other IDEs) to apply updates or recover from a bad state.",
+                    handlers::restart_tool::restart_schema(),
+                )
+                .with_title("restart"),
             ];
 
             let configs_lock = self.configs.read().unwrap();
@@ -1117,6 +1124,10 @@ impl ServerHandler for AhmaMcpService {
                 }
                 "logs_search" => {
                     self.handle_logs_search(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "restart" => {
+                    self.handle_restart(params.arguments.unwrap_or_default())
                         .await
                 }
                 _ => self.dispatch_configured_tool(params, context).await,

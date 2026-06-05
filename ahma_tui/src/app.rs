@@ -287,13 +287,28 @@ fn submit_provider_picker(picker: crate::state::PickerState, state: &mut crate::
 
 #[cfg(feature = "tui")]
 fn submit_model_picker(picker: crate::state::PickerState, state: &mut crate::state::AppState) {
-    let Some(model) = picker.selected_item() else {
+    let Some(item) = picker.selected_item() else {
         return;
     };
 
-    let provider = provider_label(&state.llm_label);
-    state.llm_label = format!("{provider} / {model}");
-    save_session(state);
+    if let Some((provider_name, model_name)) = item.split_once(" / ") {
+        let provider_name = provider_name.trim();
+        let model_name = model_name.trim();
+        if let Some(provider) = state
+            .available_providers
+            .iter()
+            .find(|p| p.name == provider_name)
+        {
+            state.current_provider_url = Some(provider.base_url.clone());
+            state.available_models = provider.models.clone();
+            state.llm_label = format!("{provider_name} / {model_name}");
+            save_session(state);
+        }
+    } else {
+        let provider = provider_label(&state.llm_label);
+        state.llm_label = format!("{provider} / {item}");
+        save_session(state);
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -1126,7 +1141,7 @@ fn open_provider_picker(state: &mut crate::state::AppState) {
     let items: Vec<String> = state
         .available_providers
         .iter()
-        .map(|(name, url)| format!("{name}  {url}"))
+        .map(|p| format!("{}  {}", p.name, p.base_url))
         .collect();
 
     if items.is_empty() {
@@ -1142,8 +1157,8 @@ fn open_provider_picker(state: &mut crate::state::AppState) {
         let selected = state
             .available_providers
             .iter()
-            .find(|(_, url)| url == current_url)
-            .map(|(name, url)| format!("{name}  {url}"))
+            .find(|p| p.base_url == *current_url)
+            .map(|p| format!("{}  {}", p.name, p.base_url))
             .unwrap_or_default();
         picker.select_exact(&selected);
     }
@@ -1155,7 +1170,14 @@ fn open_model_picker(state: &mut crate::state::AppState) {
     use crate::llm_bridge::spawn_model_refresh;
     use crate::state::PickerState;
 
-    if state.available_models.is_empty() {
+    let mut items = Vec::new();
+    for provider in &state.available_providers {
+        for model in &provider.models {
+            items.push(format!("{} / {}", provider.name, model));
+        }
+    }
+
+    if items.is_empty() {
         let (base_url, _) = parse_llm_selection(state);
         if !base_url.is_empty()
             && let Some(tx) = &state.bridge_tx
@@ -1166,10 +1188,12 @@ fn open_model_picker(state: &mut crate::state::AppState) {
         return;
     }
 
-    let mut picker = PickerState::new("Select model", state.available_models.clone());
+    let mut picker = PickerState::new("Select model", items);
     let selected_model = state.selected_model();
-    if !selected_model.is_empty() {
-        picker.select_exact(&selected_model);
+    let selected_provider = provider_label(&state.llm_label);
+    if !selected_model.is_empty() && !selected_provider.is_empty() {
+        let exact = format!("{selected_provider} / {selected_model}");
+        picker.select_exact(&exact);
     }
     state.model_picker = Some(picker);
 }
@@ -1339,10 +1363,7 @@ fn handle_providers_discovered(
     providers: Vec<ahma_llm_monitor::LocalProvider>,
     state: &mut crate::state::AppState,
 ) {
-    state.available_providers = providers
-        .iter()
-        .map(|p| (p.name.clone(), p.base_url.clone()))
-        .collect();
+    state.available_providers = providers.clone();
 
     if state.llm_label == "no LLM" {
         if let Some(provider) = providers.first() {
@@ -1390,15 +1411,17 @@ fn handle_models_refreshed(
     models: Vec<String>,
     state: &mut crate::state::AppState,
 ) {
+    if let Some(provider) = state
+        .available_providers
+        .iter_mut()
+        .find(|p| p.base_url == base_url)
+    {
+        provider.models = models.clone();
+    }
+
     if state.current_provider_url.as_deref() == Some(base_url.as_str()) && !models.is_empty() {
-        use crate::state::PickerState;
         state.available_models = models.clone();
-        let mut picker = PickerState::new("Select model", models);
-        let selected_model = state.selected_model();
-        if !selected_model.is_empty() {
-            picker.select_exact(&selected_model);
-        }
-        state.model_picker = Some(picker);
+        open_model_picker(state);
     }
 }
 
@@ -1539,6 +1562,99 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
 }
 
 #[cfg(feature = "tui")]
+fn clean_up_summary(summary: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(summary) {
+        if let Some(msg) = val.get("message").and_then(|v| v.as_str()) {
+            return msg.to_string();
+        }
+        if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
+            return err.to_string();
+        }
+    }
+    if summary.starts_with('"') && summary.ends_with('"') && summary.len() >= 2 {
+        return summary[1..summary.len() - 1].to_string();
+    }
+    summary.to_string()
+}
+
+#[cfg(feature = "tui")]
+fn format_friendly_start(
+    tool_name: &str,
+    description: &str,
+    start_time: chrono::DateTime<chrono::Local>,
+) -> String {
+    let mut args_summary = String::new();
+    if let Some(start_idx) = description.find('{')
+        && let Some(end_idx) = description.rfind('}')
+        && start_idx < end_idx
+        && let Ok(val) =
+            serde_json::from_str::<serde_json::Value>(&description[start_idx..=end_idx])
+        && let Some(obj) = val.as_object()
+    {
+        if tool_name == "run_terminal_command" {
+            if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+                args_summary = format!("command: {cmd}");
+            }
+        } else {
+            let parts: Vec<String> = obj
+                .iter()
+                .filter(|(k, _)| {
+                    *k != "working_directory" && *k != "working_dir" && *k != "synchronous"
+                })
+                .map(|(k, v)| {
+                    let val_str = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => v.to_string(),
+                    };
+                    format!("{k}={val_str}")
+                })
+                .collect();
+            if !parts.is_empty() {
+                args_summary = parts.join(", ");
+            }
+        }
+    }
+
+    let time_str = start_time.format("%H:%M:%S").to_string();
+    if args_summary.is_empty() {
+        format!("Starting {tool_name} at {time_str}")
+    } else {
+        format!("Starting {tool_name} ({args_summary}) at {time_str}")
+    }
+}
+
+#[cfg(feature = "tui")]
+fn format_friendly_end(op: &crate::state::Operation) -> String {
+    let status_str = match op.status {
+        crate::state::OpStatus::Succeeded => "Finished successfully",
+        crate::state::OpStatus::Failed => "Failed",
+        crate::state::OpStatus::Cancelled => "Cancelled",
+        _ => "Finished",
+    };
+
+    let duration_str = if let Some(ms) = op.duration_ms {
+        if ms < 1000 {
+            format!("{ms}ms")
+        } else {
+            format!("{:.2}s", ms as f64 / 1000.0)
+        }
+    } else {
+        op.elapsed_display()
+    };
+
+    let mut end_text = format!("{status_str} in {duration_str}");
+
+    if let Some(summary) = &op.result_summary {
+        let clean_summary = clean_up_summary(summary);
+        if !clean_summary.is_empty() {
+            end_text.push_str(&format!(": {clean_summary}"));
+        }
+    }
+
+    end_text
+}
+
+#[cfg(feature = "tui")]
 fn sync_operations_to_windows(state: &mut crate::state::AppState) {
     let mut to_add = Vec::new();
 
@@ -1560,23 +1676,28 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
             if op.status != crate::state::OpStatus::Running
                 && op.status != crate::state::OpStatus::Pending
                 && op.status != crate::state::OpStatus::Waiting
+                && w.finished_at.is_none()
             {
-                if w.finished_at.is_none() {
-                    w.finished_at = Some(std::time::Instant::now());
-                }
+                w.finished_at = Some(std::time::Instant::now());
             }
 
             let mut content = vec![];
-            if let Some(cwd) = &op.cwd {
-                content.push(format!("cwd: {cwd}"));
+            let start_text = format_friendly_start(&op.tool_name, &op.description, op.started_time);
+            content.push(start_text);
+
+            if op.status != crate::state::OpStatus::Running
+                && op.status != crate::state::OpStatus::Pending
+                && op.status != crate::state::OpStatus::Waiting
+            {
+                let sep = if state.unicode {
+                    "────────────────────────────────────────".to_string()
+                } else {
+                    "----------------------------------------".to_string()
+                };
+                content.push(sep);
+                content.push(format_friendly_end(op));
             }
-            if !op.args.is_empty() {
-                content.push(format!("args: {}", op.args.join(" ")));
-            }
-            if let Some(summary) = &op.result_summary {
-                content.push(format!("summary: {summary}"));
-            }
-            content.extend(op.stdout_tail.iter().cloned());
+
             w.content = content;
         } else {
             let win_id = state.next_window_id;
@@ -1598,16 +1719,21 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
             };
 
             let mut content = vec![];
-            if let Some(cwd) = &op.cwd {
-                content.push(format!("cwd: {cwd}"));
+            let start_text = format_friendly_start(&op.tool_name, &op.description, op.started_time);
+            content.push(start_text);
+
+            if op.status != crate::state::OpStatus::Running
+                && op.status != crate::state::OpStatus::Pending
+                && op.status != crate::state::OpStatus::Waiting
+            {
+                let sep = if state.unicode {
+                    "────────────────────────────────────────".to_string()
+                } else {
+                    "----------------------------------------".to_string()
+                };
+                content.push(sep);
+                content.push(format_friendly_end(op));
             }
-            if !op.args.is_empty() {
-                content.push(format!("args: {}", op.args.join(" ")));
-            }
-            if let Some(summary) = &op.result_summary {
-                content.push(format!("summary: {summary}"));
-            }
-            content.extend(op.stdout_tail.iter().cloned());
 
             let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
             let op_id = op.id.clone();
@@ -1615,15 +1741,15 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
             let mcp_config = mcp_chat_config(state);
 
             tokio::spawn(async move {
-                if let Ok(()) = abort_rx.await {
-                    if let Some(tx) = bridge_tx {
-                        crate::llm_bridge::spawn_tool_call_task(
-                            "cancel".to_string(),
-                            serde_json::json!({ "id": op_id }),
-                            mcp_config,
-                            tx,
-                        );
-                    }
+                if let Ok(()) = abort_rx.await
+                    && let Some(tx) = bridge_tx
+                {
+                    crate::llm_bridge::spawn_tool_call_task(
+                        "cancel".to_string(),
+                        serde_json::json!({ "id": op_id }),
+                        mcp_config,
+                        tx,
+                    );
                 }
             });
 

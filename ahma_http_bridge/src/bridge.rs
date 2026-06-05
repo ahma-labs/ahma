@@ -160,6 +160,12 @@ pub struct BridgeConfig {
     ///
     /// Defaults to `10`. Only effective when `rate_limit_rps > 0`.
     pub rate_limit_burst: u32,
+
+    /// Shared atomic counter tracking active connections.
+    pub active_sessions: Option<Arc<std::sync::atomic::AtomicUsize>>,
+
+    /// Shutdown the server if active_sessions drops to 0 for this duration.
+    pub idle_timeout_secs: Option<u64>,
 }
 
 impl Default for BridgeConfig {
@@ -179,6 +185,8 @@ impl Default for BridgeConfig {
             require_token_path: None,
             rate_limit_rps: 0,
             rate_limit_burst: 10,
+            active_sessions: None,
+            idle_timeout_secs: None,
         }
     }
 }
@@ -203,6 +211,8 @@ pub struct BridgeState {
     /// Uses `ArcSwapOption` so the token can be atomically replaced on SIGHUP
     /// without restarting the bridge or locking out in-flight requests.
     require_token: ArcSwapOption<String>,
+    /// The listener configuration, used for cleanup on restart.
+    listener_kind: ListenerKind,
 }
 
 /// Build a CORS layer appropriate for the bind address.
@@ -361,7 +371,31 @@ async fn bearer_auth_middleware(
 ///    }
 /// }
 /// ```
-pub async fn start_bridge(config: BridgeConfig) -> Result<()> {
+pub async fn start_bridge(mut config: BridgeConfig) -> Result<()> {
+    if config.idle_timeout_secs.is_some() && config.active_sessions.is_none() {
+        config.active_sessions = Some(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+    }
+    if let Some(timeout) = config.idle_timeout_secs
+        && let Some(counter) = config.active_sessions.clone()
+    {
+        tokio::spawn(async move {
+            let mut idle_duration = std::time::Duration::ZERO;
+            let check_interval = std::time::Duration::from_secs(1);
+            loop {
+                tokio::time::sleep(check_interval).await;
+                if counter.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                    idle_duration += check_interval;
+                    if idle_duration.as_secs() >= timeout {
+                        tracing::info!("No active clients for {} seconds. Shutting down.", timeout);
+                        std::process::exit(0);
+                    }
+                } else {
+                    idle_duration = std::time::Duration::ZERO;
+                }
+            }
+        });
+    }
+
     #[cfg(unix)]
     if let ListenerKind::Unix(ref socket_path) = config.listener_kind {
         return start_bridge_unix(config.clone(), socket_path.clone()).await;
@@ -378,10 +412,15 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
         enable_colored_output: config.enable_colored_output,
         handshake_timeout_secs: config.handshake_timeout_secs,
     };
-    let session_manager = Arc::new(SessionManager::new(session_config));
+    let mut session_manager = SessionManager::new(session_config);
+    if let Some(ref counter) = config.active_sessions {
+        session_manager.active_sessions = Some(counter.clone());
+    }
+    let session_manager = Arc::new(session_manager);
     Arc::new(BridgeState {
         session_manager,
         require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),
+        listener_kind: config.listener_kind.clone(),
     })
 }
 
@@ -438,8 +477,11 @@ fn build_mcp_router(
     rate_limit_rps: u64,
     rate_limit_burst: u32,
 ) -> Router {
-    // /health is intentionally outside auth + rate-limit layers.
-    let health_route = Router::new().route("/health", get(health_check));
+    // /health and /restart are intentionally outside auth + rate-limit layers.
+    let exempt_routes = Router::new()
+        .route("/health", get(health_check))
+        .route("/restart", post(handle_restart))
+        .with_state(state.clone());
 
     let mcp_routes = Router::new()
         .route(
@@ -470,7 +512,7 @@ fn build_mcp_router(
         mcp_routes
     };
 
-    let base = health_route.merge(mcp_routes).layer(cors);
+    let base = exempt_routes.merge(mcp_routes).layer(cors);
 
     if let Some(qi) = quic_info {
         let alt_svc = HeaderValue::from_str(&qi.alt_svc_header)
@@ -777,9 +819,44 @@ async fn try_start_quic_endpoint(tcp_addr: SocketAddr) -> Option<QuicInfo> {
     })
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub version: String,
+}
+
 /// Health check endpoint
 async fn health_check() -> impl IntoResponse {
-    (StatusCode::OK, "OK")
+    (
+        StatusCode::OK,
+        Json(HealthResponse {
+            status: "OK".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }),
+    )
+}
+
+/// Handler for POST /restart
+async fn handle_restart(State(state): State<Arc<BridgeState>>) -> impl IntoResponse {
+    info!("Restart requested. Shutting down bridge process...");
+    let listener_kind = state.listener_kind.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        #[cfg(unix)]
+        if let ListenerKind::Unix(ref path) = listener_kind
+            && !path.starts_with('\0')
+        {
+            let _ = std::fs::remove_file(path);
+        }
+        std::process::exit(0);
+    });
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "restarting",
+            "version": env!("CARGO_PKG_VERSION")
+        })),
+    )
 }
 
 /// Fallback handler for unknown routes.
@@ -1138,6 +1215,8 @@ mod tests {
             require_token_path: None,
             rate_limit_rps: 0,
             rate_limit_burst: 10,
+            active_sessions: None,
+            idle_timeout_secs: None,
         };
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
         assert_eq!(config.server_command, "custom_server");
@@ -1179,6 +1258,7 @@ mod tests {
         Arc::new(BridgeState {
             session_manager,
             require_token: ArcSwapOption::new(None),
+            listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
         })
     }
 
@@ -1445,7 +1525,12 @@ for line in sys.stdin:
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
-        assert_eq!(&body[..], b"OK");
+        let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response_json.get("status").unwrap().as_str().unwrap(), "OK");
+        assert_eq!(
+            response_json.get("version").unwrap().as_str().unwrap(),
+            env!("CARGO_PKG_VERSION")
+        );
     }
 
     // ── CORS hardening tests ───────────────────────────────────────────
@@ -1595,6 +1680,7 @@ for line in sys.stdin:
                 handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
             })),
             require_token: ArcSwapOption::new(token.map(|s| Arc::new(s.to_owned()))),
+            listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
         });
         let loopback_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         Router::new()

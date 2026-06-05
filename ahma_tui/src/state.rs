@@ -495,6 +495,8 @@ pub struct Operation {
     pub tool_name: String,
     pub status: OpStatus,
     pub started_at: Option<Instant>,
+    pub started_time: chrono::DateTime<chrono::Local>,
+    pub description: String,
     pub cwd: Option<String>,
     pub args: Vec<String>,
     /// ID of the parent operation this one is waiting for (for DAG rendering).
@@ -520,6 +522,8 @@ impl Operation {
             tool_name: tool_name.into(),
             status,
             started_at: Some(Instant::now()),
+            started_time: chrono::Local::now(),
+            description: String::new(),
             cwd: None,
             args: vec![],
             parent_id: None,
@@ -703,8 +707,8 @@ pub struct AppState {
     pub current_provider_url: Option<String>,
     /// True when ahma-as-MCP is active.
     pub mcp_enabled: bool,
-    /// Discovered + configured providers (name → base_url).
-    pub available_providers: Vec<(String, String)>,
+    /// Discovered + configured providers.
+    pub available_providers: Vec<ahma_llm_monitor::LocalProvider>,
     /// Available models for the current provider.
     pub available_models: Vec<String>,
     /// Chat scroll offset (lines from bottom = 0 is newest).

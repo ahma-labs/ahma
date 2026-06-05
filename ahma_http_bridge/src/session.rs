@@ -490,6 +490,8 @@ pub struct SessionManager {
     sessions: DashMap<String, Arc<Session>>,
     /// Configuration for spawning new sessions
     config: SessionManagerConfig,
+    /// Shared atomic counter tracking active connections.
+    pub active_sessions: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 /// Extract the request ID from a JSON-RPC request value.
@@ -664,6 +666,7 @@ impl SessionManager {
         Self {
             sessions: DashMap::new(),
             config,
+            active_sessions: None,
         }
     }
 
@@ -770,6 +773,10 @@ impl SessionManager {
         });
 
         self.sessions.insert(session_id.clone(), session);
+
+        if let Some(ref count) = self.active_sessions {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
 
         Ok(session_id)
     }
@@ -975,6 +982,9 @@ impl SessionManager {
         reason: SessionTerminationReason,
     ) -> Result<()> {
         if let Some((_, session)) = self.sessions.remove(session_id) {
+            if let Some(ref count) = self.active_sessions {
+                count.fetch_sub(1, Ordering::SeqCst);
+            }
             info!(
                 session_id = %session_id,
                 reason = ?reason,
