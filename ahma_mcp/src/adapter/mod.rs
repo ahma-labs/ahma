@@ -69,9 +69,9 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn generate_id() -> String {
+fn generate_id(tool_name: &str, command: &str) -> String {
     let id = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("op_{}", id)
+    crate::utils::operation::generate_id_with_details(id, tool_name, command)
 }
 
 const MAX_STREAM_COLLECTED_LINES: usize = 5_000;
@@ -437,7 +437,9 @@ impl Adapter {
             .prepare_command_and_args(command, args.as_ref(), subcommand_config, &safe_wd)
             .await?;
 
-        let op_id = id.unwrap_or_else(generate_id);
+        let op_id = id
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| generate_id(tool_name, command));
         let op_id_clone = op_id.clone();
         let wd = safe_wd_str.clone();
 
@@ -1211,8 +1213,8 @@ mod tests {
 
     #[test]
     fn test_generate_id_increments() {
-        let id1 = generate_id();
-        let id2 = generate_id();
+        let id1 = generate_id("test_tool", "echo 'hello'");
+        let id2 = generate_id("test_tool", "echo 'hello'");
         assert!(id1.starts_with("op_"));
         assert!(id2.starts_with("op_"));
         assert_ne!(id1, id2);

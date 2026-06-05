@@ -1,0 +1,4 @@
+provider = "Ollama"
+model = "gemma4-direct:latest"
+provider_url = "http://localhost:11434/v1"
+mcp_enabled = false

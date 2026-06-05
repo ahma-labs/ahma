@@ -188,3 +188,200 @@ async fn test_orchestrator_recovery_backtracking() {
     assert!(node_result.success);
     assert!(node_result.summary.contains("recovered"));
 }
+
+#[tokio::test]
+async fn test_task_tree_extension_handler_integration() {
+    use ahma_mcp::test_utils::in_process::create_in_process_mcp_from_dir;
+    use rmcp::model::CallToolRequestParams;
+
+    let server = MockServer::start().await;
+    let temp = tempdir().unwrap();
+    let tools_dir = temp.path().join(".ahma");
+    std::fs::create_dir_all(&tools_dir).unwrap();
+
+    // Register extension handler globally
+    ahma_mcp::register_global_extension_handler(
+        "task_tree".to_string(),
+        std::sync::Arc::new(ahma_task_tree::TaskTreeExtensionHandler),
+    );
+
+    // 1. Success case setup
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("Expected JSON Schema:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": r#"{"steps": []}"#
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    // Create a tool definition config JSON
+    let tool_def = json!({
+        "name": "task_tree",
+        "description": "Run task tree",
+        "command": "task_tree",
+        "enabled": true,
+        "tool_type": "extension",
+        "task_tree": {
+            "llm_provider": {
+                "base_url": server.uri(),
+                "model": "test-model"
+            }
+        }
+    });
+    std::fs::write(
+        tools_dir.join("task_tree.json"),
+        serde_json::to_string(&tool_def).unwrap(),
+    )
+    .unwrap();
+
+    let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
+
+    // Scenario A: Successful run using 'goal' parameter
+    let params = CallToolRequestParams::new(std::borrow::Cow::Borrowed("task_tree"))
+        .with_arguments(json!({"goal": "Test goal A"}).as_object().unwrap().clone());
+    let result = mcp.client.call_tool(params).await.unwrap();
+    assert!(!result.is_error.unwrap_or(false));
+    let text = result.content[0].as_text().unwrap().text.clone();
+    assert!(text.contains("Goal: Test goal A"));
+    assert!(text.contains("Result: SUCCESS"));
+
+    // Scenario B: Successful run using 'query' parameter
+    let params = CallToolRequestParams::new(std::borrow::Cow::Borrowed("task_tree"))
+        .with_arguments(
+            json!({"query": "Test query B"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+    let result = mcp.client.call_tool(params).await.unwrap();
+    assert!(!result.is_error.unwrap_or(false));
+    let text = result.content[0].as_text().unwrap().text.clone();
+    assert!(text.contains("Goal: Test query B"));
+
+    // Scenario C: Successful run using 'instructions' parameter
+    let params = CallToolRequestParams::new(std::borrow::Cow::Borrowed("task_tree"))
+        .with_arguments(
+            json!({"instructions": "Test instructions C"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+    let result = mcp.client.call_tool(params).await.unwrap();
+    assert!(!result.is_error.unwrap_or(false));
+    let text = result.content[0].as_text().unwrap().text.clone();
+    assert!(text.contains("Goal: Test instructions C"));
+
+    // Scenario D: Missing required parameter (goal/query/instructions)
+    let params = CallToolRequestParams::new(std::borrow::Cow::Borrowed("task_tree"))
+        .with_arguments(json!({"other_arg": "value"}).as_object().unwrap().clone());
+    let result = mcp.client.call_tool(params).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(format!("{:?}", err).contains("Missing required parameter"));
+
+    // Scenario E: Missing arguments payload entirely
+    let params = CallToolRequestParams::new(std::borrow::Cow::Borrowed("task_tree"));
+    let result = mcp.client.call_tool(params).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(format!("{:?}", err).contains("Missing arguments payload"));
+}
+
+#[tokio::test]
+async fn test_task_tree_extension_handler_bad_config() {
+    use ahma_mcp::test_utils::in_process::create_in_process_mcp_from_dir;
+    use rmcp::model::CallToolRequestParams;
+
+    let temp = tempdir().unwrap();
+    let tools_dir = temp.path().join(".ahma");
+    std::fs::create_dir_all(&tools_dir).unwrap();
+
+    // Register extension handler globally for tool
+    ahma_mcp::register_global_extension_handler(
+        "task_tree".to_string(),
+        std::sync::Arc::new(ahma_task_tree::TaskTreeExtensionHandler),
+    );
+
+    // Create a tool def config JSON with invalid task_tree payload (String instead of object)
+    let tool_def = json!({
+        "name": "task_tree_bad_config",
+        "description": "Run task tree with bad config",
+        "command": "task_tree_bad_config",
+        "enabled": true,
+        "tool_type": "extension",
+        "task_tree": "invalid_config_payload"
+    });
+    std::fs::write(
+        tools_dir.join("task_tree_bad_config.json"),
+        serde_json::to_string(&tool_def).unwrap(),
+    )
+    .unwrap();
+
+    let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
+
+    let params = CallToolRequestParams::new(std::borrow::Cow::Borrowed("task_tree_bad_config"))
+        .with_arguments(json!({"goal": "Test goal"}).as_object().unwrap().clone());
+    let result = mcp.client.call_tool(params).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(format!("{:?}", err).contains("Invalid task tree config"));
+}
+
+#[tokio::test]
+async fn test_task_tree_extension_handler_fail() {
+    use ahma_mcp::test_utils::in_process::create_in_process_mcp_from_dir;
+    use rmcp::model::CallToolRequestParams;
+
+    let server = MockServer::start().await;
+    let temp = tempdir().unwrap();
+    let tools_dir = temp.path().join(".ahma");
+    std::fs::create_dir_all(&tools_dir).unwrap();
+
+    // Register extension handler globally for tool
+    ahma_mcp::register_global_extension_handler(
+        "task_tree".to_string(),
+        std::sync::Arc::new(ahma_task_tree::TaskTreeExtensionHandler),
+    );
+
+    // Mock completion endpoint to return 500 Internal Server Error (forcing orchestrator execution failure)
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    // Create a tool definition config JSON
+    let tool_def = json!({
+        "name": "task_tree_fail",
+        "description": "Run task tree fail",
+        "command": "task_tree_fail",
+        "enabled": true,
+        "tool_type": "extension",
+        "task_tree": {
+            "llm_provider": {
+                "base_url": server.uri(),
+                "model": "test-model"
+            }
+        }
+    });
+    std::fs::write(
+        tools_dir.join("task_tree_fail.json"),
+        serde_json::to_string(&tool_def).unwrap(),
+    )
+    .unwrap();
+
+    let mcp = create_in_process_mcp_from_dir(&tools_dir).await.unwrap();
+
+    let params = CallToolRequestParams::new(std::borrow::Cow::Borrowed("task_tree_fail"))
+        .with_arguments(json!({"goal": "Test goal"}).as_object().unwrap().clone());
+    let result = mcp.client.call_tool(params).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(format!("{:?}", err).contains("Task tree execution failed"));
+}

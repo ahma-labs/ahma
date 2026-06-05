@@ -23,6 +23,18 @@ pub enum BridgeEvent {
         base_url: String,
         models: Vec<String>,
     },
+    Decomposed {
+        steps: Vec<ahma_task_tree::parser::ParsedStep>,
+    },
+    WindowOutput {
+        window_id: usize,
+        line: String,
+    },
+    WindowFinished {
+        window_id: usize,
+        success: bool,
+        summary: String,
+    },
 }
 
 #[derive(Clone)]
@@ -256,4 +268,214 @@ async fn call_mcp_tool_http(
     };
 
     Ok((content_str, is_error))
+}
+
+pub fn spawn_decompose_task(client: LlmClient, goal: String, tx: Sender<BridgeEvent>) {
+    tokio::spawn(async move {
+        let prompt = ahma_task_tree::prompt::build_planning_prompt(
+            &goal,
+            &goal,
+            "No prior task context available.",
+            5,
+        );
+        let system_msg = serde_json::json!({
+            "role": "system",
+            "content": "You are a precise task orchestrator. You decompose goals into subtasks and output strictly valid JSON according to the schema provided."
+        });
+        let user_msg = serde_json::json!({
+            "role": "user",
+            "content": prompt
+        });
+
+        let completion_res = client
+            .chat_completion_with_tools(vec![system_msg, user_msg], &[])
+            .await;
+        match completion_res {
+            Ok(completion) => {
+                let steps_res = ahma_task_tree::parser::parse_steps(&completion.content);
+                match steps_res {
+                    Ok(steps) => {
+                        let _ = tx.send(BridgeEvent::Decomposed { steps }).await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(BridgeEvent::Error(format!(
+                                "Failed to parse decomposition JSON: {e}"
+                            )))
+                            .await;
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(BridgeEvent::Error(format!(
+                        "Decomposition call failed: {e}"
+                    )))
+                    .await;
+            }
+        }
+    });
+}
+
+pub fn spawn_window_cli_task(
+    window_id: usize,
+    command_str: String,
+    working_dir: String,
+    mut abort_rx: tokio::sync::oneshot::Receiver<()>,
+    tx: Sender<BridgeEvent>,
+) {
+    tokio::spawn(async move {
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = tokio::process::Command::new("powershell");
+            c.arg("-NoProfile").arg("-Command").arg(&command_str);
+            c
+        } else {
+            let mut c = tokio::process::Command::new("bash");
+            c.arg("-c").arg(&command_str);
+            c
+        };
+        cmd.current_dir(&working_dir);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx
+                    .send(BridgeEvent::WindowFinished {
+                        window_id,
+                        success: false,
+                        summary: format!("Failed to spawn: {e}"),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+
+        use tokio::io::AsyncBufReadExt;
+        let mut stdout_reader = tokio::io::BufReader::new(stdout).lines();
+        let mut stderr_reader = tokio::io::BufReader::new(stderr).lines();
+
+        let tx_clone = tx.clone();
+        let stdout_loop = async {
+            while let Ok(Some(line)) = stdout_reader.next_line().await {
+                let _ = tx_clone
+                    .send(BridgeEvent::WindowOutput { window_id, line })
+                    .await;
+            }
+        };
+
+        let tx_clone2 = tx.clone();
+        let stderr_loop = async {
+            while let Ok(Some(line)) = stderr_reader.next_line().await {
+                let _ = tx_clone2
+                    .send(BridgeEvent::WindowOutput { window_id, line })
+                    .await;
+            }
+        };
+
+        let wait_loop = child.wait();
+
+        tokio::select! {
+            biased;
+            _ = &mut abort_rx => {
+                let _ = child.kill().await;
+                let _ = tx.send(BridgeEvent::WindowFinished {
+                    window_id,
+                    success: false,
+                    summary: "Cancelled".to_string(),
+                }).await;
+            }
+            res = wait_loop => {
+                let _ = tokio::join!(stdout_loop, stderr_loop);
+                match res {
+                    Ok(status) => {
+                        let success = status.success();
+                        let summary = if success {
+                            "Completed".to_string()
+                        } else {
+                            format!("Failed with exit code {:?}", status.code())
+                        };
+                        let _ = tx.send(BridgeEvent::WindowFinished {
+                            window_id,
+                            success,
+                            summary,
+                        }).await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(BridgeEvent::WindowFinished {
+                            window_id,
+                            success: false,
+                            summary: format!("Execution error: {e}"),
+                        }).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
+pub fn spawn_window_llm_task(
+    window_id: usize,
+    base_url: String,
+    model: String,
+    instructions: String,
+    mut abort_rx: tokio::sync::oneshot::Receiver<()>,
+    tx: Sender<BridgeEvent>,
+) {
+    tokio::spawn(async move {
+        let client = LlmClient::new(base_url, model, None);
+        let system_msg = "You are a reasoning agent performing a subtask. Follow the instructions carefully and output the results.";
+        let messages = vec![ChatMessage::user(instructions)];
+
+        let stream = client.chat_stream(messages, Some(system_msg));
+        tokio::pin!(stream);
+
+        use futures::StreamExt;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut abort_rx => {
+                    let _ = tx.send(BridgeEvent::WindowFinished {
+                        window_id,
+                        success: false,
+                        summary: "Cancelled".to_string(),
+                    }).await;
+                    return;
+                }
+                res = stream.next() => {
+                    match res {
+                        Some(Ok(token)) => {
+                            if !token.is_empty() {
+                                let _ = tx.send(BridgeEvent::WindowOutput {
+                                    window_id,
+                                    line: token,
+                                }).await;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            let _ = tx.send(BridgeEvent::WindowFinished {
+                                window_id,
+                                success: false,
+                                summary: format!("LLM error: {e}"),
+                            }).await;
+                            return;
+                        }
+                        None => {
+                            let _ = tx.send(BridgeEvent::WindowFinished {
+                                window_id,
+                                success: true,
+                                summary: "Done".to_string(),
+                            }).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
 }

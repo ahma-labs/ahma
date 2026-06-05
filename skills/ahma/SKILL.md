@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.11.4
+version: 0.11.6
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -18,7 +18,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.11.4 | author: Paul Houghton -->
+<!-- version: 0.11.6 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -300,7 +300,7 @@ Two flavors of log monitoring:
 "args": ["serve", "stdio", "--log-monitor"]
 ```
 
-Tails Ahma's rolling log files (`./log/ahma_mcp.log.*`), analyzes chunks with an LLM, and
+Tails Ahma's rolling log files (`./logs/ahma_mcp.log.*`), analyzes chunks with an LLM, and
 pushes `LogAlert` MCP progress notifications when errors or anomalies are detected.
 
 Configure minimum seconds between alerts: `--monitor-rate-limit 60` (default 60).

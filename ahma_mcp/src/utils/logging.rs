@@ -150,7 +150,7 @@ fn do_setup_logging(
 fn try_create_file_appender() -> Option<tracing_appender::rolling::RollingFileAppender> {
     let log_dir = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join("log");
+        .join("logs");
 
     // Test if we can actually write to the log directory before calling
     // tracing_appender::rolling::daily, which panics on permission errors
@@ -170,7 +170,7 @@ fn try_create_file_appender() -> Option<tracing_appender::rolling::RollingFileAp
     .ok()?;
 
     // Create a stable `ahma_mcp.log` symlink pointing to today's dated rolling file.
-    // This lets `tail -F ./log/ahma_mcp.log` work even though the actual file is dated.
+    // This lets `tail -F ./logs/ahma_mcp.log` work even though the actual file is dated.
     #[cfg(unix)]
     try_update_current_log_symlink(&log_dir);
 

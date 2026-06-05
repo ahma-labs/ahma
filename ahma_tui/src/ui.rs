@@ -46,6 +46,85 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
 // ─── Chat layout ──────────────────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
+struct RenderedWindowLayout {
+    orig_idx: usize,
+    height: u16,
+    collapsed: bool,
+    visible: bool,
+}
+
+#[cfg(feature = "tui")]
+fn compute_window_layouts(
+    windows: &[crate::state::TuiWindow],
+    max_h: u16,
+) -> Vec<RenderedWindowLayout> {
+    let mut layouts: Vec<RenderedWindowLayout> = windows
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.visible)
+        .map(|(i, w)| {
+            let preferred_h = if w.collapsed {
+                1
+            } else {
+                (w.content.len() + 2).clamp(3, 8) as u16
+            };
+            RenderedWindowLayout {
+                orig_idx: i,
+                height: preferred_h,
+                collapsed: w.collapsed,
+                visible: true,
+            }
+        })
+        .collect();
+
+    // 1. Check if total height fits.
+    let mut total_h: u16 = layouts.iter().map(|l| l.height).sum();
+    if total_h <= max_h {
+        return layouts;
+    }
+
+    // 2. Collapse expanded windows starting from the oldest.
+    for l in layouts.iter_mut() {
+        if total_h <= max_h {
+            break;
+        }
+        if !l.collapsed {
+            let old_h = l.height;
+            l.collapsed = true;
+            l.height = 1;
+            total_h = total_h - old_h + 1;
+        }
+    }
+
+    // 3. If it still doesn't fit, hide oldest windows.
+    for l in layouts.iter_mut() {
+        if total_h <= max_h {
+            break;
+        }
+        if l.visible {
+            let old_h = l.height;
+            l.visible = false;
+            l.height = 0;
+            total_h -= old_h;
+        }
+    }
+
+    layouts
+}
+
+#[cfg(feature = "tui")]
+fn window_status_style(status: &str, theme: &Theme) -> Style {
+    match status {
+        "Running" => theme.running(),
+        "Finished" => theme.success(),
+        "Error" => theme.failed(),
+        "Cancelled" => theme.cancelled(),
+        "Pending" => theme.pending(),
+        _ => theme.normal(),
+    }
+}
+
+#[cfg(feature = "tui")]
 fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
     let approval_h: u16 = if state.approval.is_some() { 3 } else { 0 };
@@ -64,7 +143,90 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     .areas(full);
 
     draw_chat_header(frame, state, theme, header_a);
-    draw_chat_history(frame, state, theme, chat_a);
+
+    // Clear window_rects at start of drawing
+    state.window_rects.borrow_mut().clear();
+
+    let visible_count = state.windows.iter().filter(|w| w.visible).count();
+    let (history_area, windows_area, layouts) = if visible_count > 0 {
+        let max_w_h = chat_a.height.saturating_sub(4);
+        let layouts = compute_window_layouts(&state.windows, max_w_h);
+        let total_w_h: u16 = layouts.iter().filter(|l| l.visible).map(|l| l.height).sum();
+        let [h_area, w_area] =
+            Layout::vertical([Constraint::Min(4), Constraint::Length(total_w_h)]).areas(chat_a);
+        (h_area, w_area, layouts)
+    } else {
+        (chat_a, Rect::default(), vec![])
+    };
+
+    draw_chat_history(frame, state, theme, history_area);
+
+    if windows_area.height > 0 && !layouts.is_empty() {
+        let mut constraints = Vec::new();
+        let mut active_layouts = Vec::new();
+        for l in &layouts {
+            if l.visible && l.height > 0 {
+                constraints.push(Constraint::Length(l.height));
+                active_layouts.push(l);
+            }
+        }
+        let window_areas = Layout::vertical(constraints).split(windows_area);
+        for (area, l) in window_areas.iter().zip(active_layouts) {
+            let w = &state.windows[l.orig_idx];
+            state.window_rects.borrow_mut().push((w.id, *area));
+
+            let status_style = window_status_style(&w.status, theme);
+            if l.collapsed {
+                // Draw collapsed window as a single summary line
+                let mut spans = vec![
+                    Span::styled(" [+] ", theme.dim()),
+                    Span::styled(format!("{} ", w.id), theme.normal()),
+                    Span::styled(format!("[{}] ", w.status), status_style),
+                    Span::styled(w.label.clone(), theme.normal()),
+                ];
+                let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
+                let right_str = format!(" X{}", w.id);
+                let pad_width = (area.width as usize).saturating_sub(left_len + right_str.len());
+                if pad_width > 0 {
+                    spans.push(Span::raw(" ".repeat(pad_width)));
+                }
+                spans.push(Span::styled(right_str, theme.dim()));
+
+                let line = Line::from(spans);
+                let para = Paragraph::new(line);
+                frame.render_widget(para, *area);
+            } else {
+                // Draw expanded window as a border block
+                let border_width = 2;
+                let title_space = (area.width as usize).saturating_sub(border_width);
+                let title_left = format!(" [-] {} {}", w.id, w.label);
+                let title_right = format!("X{} ", w.id);
+                let pad_width = title_space.saturating_sub(title_left.len() + title_right.len());
+                let title_combined = if pad_width > 0 {
+                    format!("{}{}{}", title_left, " ".repeat(pad_width), title_right)
+                } else {
+                    title_left
+                };
+
+                let block = Block::default()
+                    .title(Span::styled(title_combined, theme.normal()))
+                    .borders(Borders::ALL)
+                    .border_style(status_style);
+
+                let inner = block.inner(*area);
+                frame.render_widget(block, *area);
+
+                let content_text: Vec<Line> = w
+                    .content
+                    .iter()
+                    .map(|line| Line::from(Span::styled(line.clone(), theme.normal())))
+                    .collect();
+                let para = Paragraph::new(content_text).wrap(Wrap { trim: false });
+                frame.render_widget(para, inner);
+            }
+        }
+    }
+
     if state.approval.is_some() {
         draw_approval(frame, state, theme, approval_a);
     }
@@ -1216,6 +1378,13 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("COMMAND PALETTE (:)", ""),
         ("Tab", "Next completion"),
         ("Enter", "Run command"),
+        ("", ""),
+        ("WINDOW ACTIONS", ""),
+        ("/n", "Restore/expand window with ID n (e.g. /3)"),
+        ("/xn", "Close/cancel window with ID n (e.g. /x3)"),
+        ("/exit", "Quit the application"),
+        ("Mouse Click on Xn", "Close/cancel window"),
+        ("Mouse Click on Window", "Toggle expand/collapse"),
     ];
 
     let lines: Vec<Line> = rows
@@ -1333,7 +1502,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
-fn shorten_path(path: &str, max_chars: usize) -> String {
+pub(crate) fn shorten_path(path: &str, max_chars: usize) -> String {
     if path.len() <= max_chars {
         return path.to_string();
     }

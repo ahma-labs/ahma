@@ -1,6 +1,6 @@
 //! Tests for livelog symlink resolution in Sandbox::new().
 //!
-//! When `livelog = true`, the sandbox looks for `<scope>/log/*.log` symlinks
+//! When `livelog = true`, the sandbox looks for `<scope>/logs/*.log` symlinks
 //! and resolves their targets as read-only scopes to allow live log monitoring
 //! of tracing-appender rotated logs.
 
@@ -16,8 +16,8 @@ mod unix_tests {
         let temp = tempdir().unwrap();
         let scope = temp.path().to_path_buf();
 
-        // Create log/ dir with a symlink to a .log file
-        let log_dir = scope.join("log");
+        // Create logs/ dir with a symlink to a .log file
+        let log_dir = scope.join("logs");
         std::fs::create_dir_all(&log_dir).unwrap();
 
         let actual_log = temp.path().join("real.log");
@@ -43,7 +43,7 @@ mod unix_tests {
     fn test_livelog_ignores_non_log_symlinks() {
         let temp = tempdir().unwrap();
         let scope = temp.path().to_path_buf();
-        let log_dir = scope.join("log");
+        let log_dir = scope.join("logs");
         std::fs::create_dir_all(&log_dir).unwrap();
 
         let actual_file = temp.path().join("data.txt");
@@ -62,7 +62,7 @@ mod unix_tests {
     fn test_livelog_ignores_regular_log_files() {
         let temp = tempdir().unwrap();
         let scope = temp.path().to_path_buf();
-        let log_dir = scope.join("log");
+        let log_dir = scope.join("logs");
         std::fs::create_dir_all(&log_dir).unwrap();
 
         // Regular file (not a symlink) — should be ignored
@@ -79,7 +79,7 @@ mod unix_tests {
     fn test_livelog_ignores_broken_symlinks() {
         let temp = tempdir().unwrap();
         let scope = temp.path().to_path_buf();
-        let log_dir = scope.join("log");
+        let log_dir = scope.join("logs");
         std::fs::create_dir_all(&log_dir).unwrap();
 
         // Symlink to non-existent file
@@ -96,7 +96,7 @@ mod unix_tests {
     fn test_livelog_ignores_symlink_to_directory() {
         let temp = tempdir().unwrap();
         let scope = temp.path().to_path_buf();
-        let log_dir = scope.join("log");
+        let log_dir = scope.join("logs");
         std::fs::create_dir_all(&log_dir).unwrap();
 
         let dir_target = temp.path().join("some_dir");
@@ -116,11 +116,11 @@ mod unix_tests {
         let temp = tempdir().unwrap();
         let scope = temp.path().to_path_buf();
 
-        // No log/ directory at all
+        // No logs/ directory at all
         let sandbox = Sandbox::new(vec![scope], SandboxMode::Strict, false, true, false).unwrap();
         assert!(
             sandbox.read_scopes().is_empty(),
-            "should return empty when no log/ directory exists"
+            "should return empty when no logs/ directory exists"
         );
     }
 
@@ -128,14 +128,14 @@ mod unix_tests {
     fn test_livelog_empty_log_directory() {
         let temp = tempdir().unwrap();
         let scope = temp.path().to_path_buf();
-        let log_dir = scope.join("log");
+        let log_dir = scope.join("logs");
         std::fs::create_dir_all(&log_dir).unwrap();
 
-        // log/ exists but has no symlinks
+        // logs/ exists but has no symlinks
         let sandbox = Sandbox::new(vec![scope], SandboxMode::Strict, false, true, false).unwrap();
         assert!(
             sandbox.read_scopes().is_empty(),
-            "should return empty when log/ has no symlinks"
+            "should return empty when logs/ has no symlinks"
         );
     }
 
@@ -143,7 +143,7 @@ mod unix_tests {
     fn test_livelog_disabled_produces_no_read_scopes() {
         let temp = tempdir().unwrap();
         let scope = temp.path().to_path_buf();
-        let log_dir = scope.join("log");
+        let log_dir = scope.join("logs");
         std::fs::create_dir_all(&log_dir).unwrap();
 
         let actual_log = temp.path().join("real.log");

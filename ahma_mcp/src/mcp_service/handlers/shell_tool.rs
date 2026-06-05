@@ -272,7 +272,16 @@ impl AhmaMcpService {
         subcommand_config: &crate::config::SubcommandConfig,
         context: &RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let id = format!("op_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
+        let cmd_str = adapter_args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let id = crate::utils::operation::generate_id_with_details(
+            counter_val,
+            "run_terminal_command",
+            cmd_str,
+        );
         let started_at = std::time::Instant::now();
         self.emit_vault_tool_call(
             &id,
@@ -362,7 +371,16 @@ impl AhmaMcpService {
         context: &RequestContext<RoleServer>,
         log_monitor_config: Option<crate::log_monitor::LogMonitorConfig>,
     ) -> Result<CallToolResult, McpError> {
-        let id = format!("op_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
+        let cmd_str = adapter_args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let id = crate::utils::operation::generate_id_with_details(
+            counter_val,
+            "run_terminal_command",
+            cmd_str,
+        );
         self.emit_vault_tool_call(
             &id,
             "run_terminal_command",
