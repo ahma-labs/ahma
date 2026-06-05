@@ -7,6 +7,8 @@ use std::{
 
 use crate::session_config::TuiSessionConfig;
 #[cfg(feature = "tui")]
+use ratatui::layout::Rect;
+#[cfg(feature = "tui")]
 use tui_textarea::TextArea;
 
 // ─── Ring-buffer capacities ───────────────────────────────────────────────────
@@ -203,6 +205,10 @@ pub fn builtin_commands() -> Vec<NavCommand> {
         NavCommand {
             command: "/clear".into(),
             description: "clear chat history",
+        },
+        NavCommand {
+            command: "/exit".into(),
+            description: "quit the application",
         },
     ]
 }
@@ -640,8 +646,32 @@ impl PaletteState {
 
 // ─── Application state ────────────────────────────────────────────────────────
 
+/// A window representing a running or finished CLI command or LLM call.
+#[derive(Debug, Clone)]
+pub struct TuiWindow {
+    pub id: usize,
+    pub label: String,
+    pub status: String, // "Pending", "Running", "Finished", "Cancelled", "Error"
+    pub content: Vec<String>,
+    pub collapsed: bool,
+    pub finished_at: Option<std::time::Instant>,
+    pub is_cli: bool,
+    pub command: String,
+    pub working_dir: String,
+    pub llm_model: Option<String>,
+    pub visible: bool,
+    pub abort_tx: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+}
+
 /// Top-level application state — owns all panel data and UI mode.
 pub struct AppState {
+    pub windows: Vec<TuiWindow>,
+    pub next_window_id: usize,
+    #[cfg(feature = "tui")]
+    pub window_rects: std::cell::RefCell<Vec<(usize, Rect)>>,
+    #[cfg(not(feature = "tui"))]
+    pub window_rects: std::cell::RefCell<Vec<(usize, ())>>,
+
     // ── Connection ──
     pub server_url: String,
     pub mcp_http_base_url: String,
@@ -770,6 +800,10 @@ impl AppState {
             log_filter_active: false,
             palette: PaletteState::default(),
             show_help: false,
+
+            windows: vec![],
+            next_window_id: 0,
+            window_rects: std::cell::RefCell::new(vec![]),
 
             unicode,
             should_quit: false,

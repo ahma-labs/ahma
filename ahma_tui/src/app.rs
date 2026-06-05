@@ -127,6 +127,11 @@ async fn run_ratatui(connection: &ResolvedConnection) -> Result<()> {
                         Some(Ok(Event::Resize(..))) => {
                             terminal.autoresize()?;
                         }
+                        Some(Ok(Event::Mouse(mouse_event))) => {
+                            if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse_event.kind {
+                                handle_mouse_click(mouse_event.column, mouse_event.row, &mut state);
+                            }
+                        }
                         Some(Err(e)) => {
                             debug!("terminal event error: {e}");
                         }
@@ -146,6 +151,12 @@ async fn run_ratatui(connection: &ResolvedConnection) -> Result<()> {
                 _ = tick.tick() => {
                     // Periodic redraw keeps elapsed timers and approval
                     // countdown ticking even with no key events.
+                    let now = std::time::Instant::now();
+                    for w in &mut state.windows {
+                        if w.visible && w.finished_at.is_some_and(|t| now.duration_since(t) >= std::time::Duration::from_secs(300)) {
+                            w.visible = false;
+                        }
+                    }
                 }
             }
 
@@ -621,9 +632,9 @@ fn backspace_chat_input(state: &mut crate::state::AppState) {
 
 #[cfg(feature = "tui")]
 fn submit_chat_input(state: &mut crate::state::AppState) {
-    use crate::llm_bridge::spawn_chat_task;
-    use crate::state::ChatEntry;
-    use ahma_llm_monitor::LlmClient;
+    use crate::llm_bridge::{spawn_chat_task, spawn_decompose_task, spawn_window_cli_task};
+    use crate::state::{ChatEntry, LogEntry, LogLevel, TuiWindow};
+    use ahma_llm_monitor::client::LlmClient;
 
     let text = state.chat_input_text().trim().to_string();
     if text.is_empty() {
@@ -632,6 +643,70 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     state.clear_chat_input();
 
     let (base_url, model) = parse_llm_selection(state);
+
+    if let Some(stripped_goal) = text.strip_prefix('!') {
+        let goal = stripped_goal.trim().to_string();
+        if goal.is_empty() {
+            return;
+        }
+        if base_url.is_empty() {
+            push_assistant_message(state, "No LLM configured. Use /provider to select one.");
+            return;
+        }
+        state.push_log(LogEntry {
+            timestamp: chrono::Local::now(),
+            level: LogLevel::Info,
+            message: format!("Decomposing goal: {}", goal),
+        });
+        let client = LlmClient::new(base_url, model, None);
+        if let Some(tx) = &state.bridge_tx {
+            spawn_decompose_task(client, goal, tx.clone());
+        }
+        return;
+    }
+
+    if let Some(stripped_cmd) = text.strip_prefix('%') {
+        let cmd_str = stripped_cmd.trim().to_string();
+        if cmd_str.is_empty() {
+            return;
+        }
+        let win_id = state.next_window_id;
+        state.next_window_id = (state.next_window_id + 1) % 100;
+
+        let working_dir = state.workspace.clone();
+        let label = format!(
+            "Command: {} in {}",
+            cmd_str,
+            crate::ui::shorten_path(&working_dir, 20)
+        );
+
+        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+        let w = TuiWindow {
+            id: win_id,
+            label,
+            status: "Running".to_string(),
+            content: vec![],
+            collapsed: false,
+            finished_at: None,
+            is_cli: true,
+            command: cmd_str.clone(),
+            working_dir: working_dir.clone(),
+            llm_model: None,
+            visible: true,
+            abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(abort_tx))),
+        };
+
+        state.windows.push(w);
+        if state.windows.len() > 100 {
+            state.windows.remove(0);
+        }
+
+        if let Some(tx) = &state.bridge_tx {
+            spawn_window_cli_task(win_id, cmd_str, working_dir, abort_rx, tx.clone());
+        }
+        return;
+    }
+
     if base_url.is_empty() {
         push_assistant_message(state, "No LLM configured. Use /provider to select one.");
         return;
@@ -887,11 +962,35 @@ fn textarea_input_from_key_event(key: crossterm::event::KeyEvent) -> tui_textare
     }
 }
 
+#[cfg(feature = "tui")]
+fn handle_window_nav_commands(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    if cmd == "/exit" {
+        state.should_quit = true;
+        return true;
+    }
+    if let Some(num_str) = cmd.strip_prefix("/x")
+        && let Ok(id) = num_str.parse::<usize>()
+    {
+        close_window_by_id(id, state);
+        return true;
+    }
+    if let Some(num_str) = cmd.strip_prefix('/')
+        && let Ok(id) = num_str.parse::<usize>()
+        && let Some(w) = state.windows.iter_mut().find(|w| w.id == id)
+    {
+        w.visible = true;
+        w.collapsed = false;
+        return true;
+    }
+    false
+}
+
 /// Dispatch a `/command` string from the navigator.
 #[cfg(feature = "tui")]
 fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
     let cmd = cmd.trim();
-    if handle_basic_nav_command(cmd, state)
+    if handle_window_nav_commands(cmd, state)
+        || handle_basic_nav_command(cmd, state)
         || handle_mode_nav_command(cmd, state)
         || handle_mcp_nav_command(cmd, state)
         || handle_tools_nav_command(cmd, state)
@@ -1323,6 +1422,103 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             });
             state.chat_scroll = 0;
         }
+        BridgeEvent::Decomposed { steps } => {
+            for step in steps {
+                let win_id = state.next_window_id;
+                state.next_window_id = (state.next_window_id + 1) % 100;
+
+                let is_cli = step.r#type.as_str() == "shell_command";
+
+                let label = if is_cli {
+                    format!(
+                        "Command: {} in {}",
+                        step.command.as_deref().unwrap_or(&step.task),
+                        crate::ui::shorten_path(&state.workspace, 20)
+                    )
+                } else {
+                    format!("LLM Call (model: {})", state.selected_model())
+                };
+
+                let command = if is_cli {
+                    step.command.clone().unwrap_or(step.task.clone())
+                } else {
+                    step.instructions.clone().unwrap_or(step.task.clone())
+                };
+
+                let w = crate::state::TuiWindow {
+                    id: win_id,
+                    label,
+                    status: "Pending".to_string(),
+                    content: vec![format!("Task: {}", step.task)],
+                    collapsed: false,
+                    finished_at: None,
+                    is_cli,
+                    command,
+                    working_dir: state.workspace.clone(),
+                    llm_model: if is_cli {
+                        None
+                    } else {
+                        Some(state.selected_model())
+                    },
+                    visible: true,
+                    abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+                };
+
+                state.windows.push(w);
+                if state.windows.len() > 100 {
+                    state.windows.remove(0);
+                }
+            }
+
+            run_next_pending_window(state);
+        }
+        BridgeEvent::WindowOutput { window_id, line } => {
+            if let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) {
+                if w.is_cli {
+                    w.content.push(line);
+                } else {
+                    if w.content.is_empty() {
+                        w.content.push(String::new());
+                    }
+                    let parts: Vec<&str> = line.split('\n').collect();
+                    if let Some(last) = w.content.last_mut() {
+                        last.push_str(parts[0]);
+                    }
+                    for part in parts.iter().skip(1) {
+                        w.content.push(part.to_string());
+                    }
+                }
+            }
+        }
+        BridgeEvent::WindowFinished {
+            window_id,
+            success,
+            summary,
+        } => {
+            let mut current_failed = false;
+            if let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) {
+                w.status = if success {
+                    "Finished".to_string()
+                } else {
+                    "Error".to_string()
+                };
+                w.content.push(summary);
+                w.finished_at = Some(std::time::Instant::now());
+                if !success {
+                    current_failed = true;
+                }
+            }
+            if current_failed {
+                for w in &mut state.windows {
+                    if w.status == "Pending" {
+                        w.status = "Cancelled".to_string();
+                        w.finished_at = Some(std::time::Instant::now());
+                    }
+                }
+            } else {
+                run_next_pending_window(state);
+            }
+        }
         BridgeEvent::ToolCallStarted { id, name, args } => {
             state.chat.start_tool_call(id, name, args);
             state.chat_scroll = 0;
@@ -1394,6 +1590,93 @@ fn http_base_url(connection: &ResolvedConnection) -> String {
     }
 }
 
+#[cfg(feature = "tui")]
+fn run_next_pending_window(state: &mut crate::state::AppState) {
+    if let Some(pos) = state.windows.iter().position(|w| w.status == "Pending") {
+        let win_id = state.windows[pos].id;
+        start_window_execution(win_id, state);
+    }
+}
+
+#[cfg(feature = "tui")]
+fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
+    use crate::llm_bridge::{spawn_window_cli_task, spawn_window_llm_task};
+
+    let (base_url, model) = parse_llm_selection(state);
+
+    let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) else {
+        return;
+    };
+    w.status = "Running".to_string();
+
+    let is_cli = w.is_cli;
+    let command = w.command.clone();
+    let working_dir = w.working_dir.clone();
+    let bridge_tx = state.bridge_tx.clone();
+
+    let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+    if let Ok(mut guard) = w.abort_tx.try_lock() {
+        *guard = Some(abort_tx);
+    }
+
+    if is_cli {
+        if let Some(tx) = bridge_tx {
+            spawn_window_cli_task(win_id, command, working_dir, abort_rx, tx);
+        }
+    } else {
+        if let Some(tx) = bridge_tx {
+            spawn_window_llm_task(win_id, base_url, model, command, abort_rx, tx);
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
+fn close_window_by_id(win_id: usize, state: &mut crate::state::AppState) {
+    if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
+        if let Ok(mut guard) = w.abort_tx.try_lock()
+            && let Some(abort_tx) = guard.take()
+        {
+            let _ = abort_tx.send(());
+        }
+        w.visible = false;
+        w.status = "Cancelled".to_string();
+        w.finished_at = Some(std::time::Instant::now());
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
+    let mut clicked_close = None;
+    let mut clicked_toggle = None;
+
+    let rects = state.window_rects.borrow().clone();
+    for &(win_id, rect) in &rects {
+        if col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+        {
+            let is_close_click = if rect.height == 1 {
+                col >= rect.x + rect.width.saturating_sub(5)
+            } else {
+                row == rect.y && col >= rect.x + rect.width.saturating_sub(5)
+            };
+
+            if is_close_click {
+                clicked_close = Some(win_id);
+            } else {
+                clicked_toggle = Some(win_id);
+            }
+            break;
+        }
+    }
+
+    if let Some(win_id) = clicked_close {
+        close_window_by_id(win_id, state);
+    } else if let Some(win_id) = clicked_toggle
+        && let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id)
+    {
+        w.collapsed = !w.collapsed;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_run_command;
@@ -1423,5 +1706,44 @@ mod tests {
     fn parse_run_command_rejects_non_object_json() {
         let error = parse_run_command("status []").unwrap_err();
         assert!(error.contains("expects a JSON object"));
+    }
+
+    #[test]
+    fn test_handle_window_nav_commands() {
+        use crate::state::{AppState, TuiWindow};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        
+        let w = TuiWindow {
+            id: 3,
+            label: "Test Window".to_string(),
+            status: "Running".to_string(),
+            content: vec![],
+            collapsed: true,
+            finished_at: None,
+            is_cli: true,
+            command: "echo test".to_string(),
+            working_dir: state.workspace.clone(),
+            llm_model: None,
+            visible: false,
+            abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        state.windows.push(w);
+
+        // Test /3 to restore and expand
+        let handled = super::handle_window_nav_commands("/3", &mut state);
+        assert!(handled);
+        assert!(state.windows[0].visible);
+        assert!(!state.windows[0].collapsed);
+
+        // Test /x3 to close
+        let handled_close = super::handle_window_nav_commands("/x3", &mut state);
+        assert!(handled_close);
+        assert!(!state.windows[0].visible);
+        assert_eq!(state.windows[0].status, "Cancelled");
+        
+        // Test /exit to quit
+        let handled_exit = super::handle_window_nav_commands("/exit", &mut state);
+        assert!(handled_exit);
+        assert!(state.should_quit);
     }
 }

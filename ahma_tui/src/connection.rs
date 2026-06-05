@@ -14,6 +14,7 @@
 //! When `--connect <URL>` is explicitly supplied the value is used as the sole
 //! candidate; no fallback is attempted.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -102,14 +103,32 @@ async fn resolve_default_candidates() -> Result<ResolvedConnection> {
     let candidates = default_candidates();
     let mut errors: Vec<String> = Vec::new();
 
-    for candidate in candidates {
+    for candidate in &candidates {
         debug!("TUI: probing candidate {:?}", candidate.display_url);
-        if probe_candidate(&candidate).await {
+        if probe_candidate(candidate).await {
             tracing::info!(
                 "TUI: connected via {} ({})",
                 candidate.transport_label(),
                 candidate.display_url
             );
+            // Try to upgrade TCP connections to HTTP/3 when QUIC is available.
+            if let Some(upgraded) = try_upgrade_to_http3(candidate).await {
+                tracing::info!(
+                    "TUI: upgraded to {} ({})",
+                    upgraded.transport_label(),
+                    upgraded.display_url
+                );
+                return Ok(upgraded);
+            }
+            return Ok(candidate.clone());
+        }
+        errors.push(candidate.display_url.clone());
+    }
+
+    // Try starting our own server
+    tracing::info!("TUI: No server found. Starting a background server...");
+    match start_background_server().await {
+        Ok(candidate) => {
             // Try to upgrade TCP connections to HTTP/3 when QUIC is available.
             if let Some(upgraded) = try_upgrade_to_http3(&candidate).await {
                 tracing::info!(
@@ -121,15 +140,73 @@ async fn resolve_default_candidates() -> Result<ResolvedConnection> {
             }
             return Ok(candidate);
         }
-        errors.push(candidate.display_url.clone());
+        Err(e) => {
+            errors.push(format!("start server error: {e}"));
+        }
     }
 
     bail!(
-        "No ahma server found. Tried: {}. \
+        "No ahma server found and failed to start one. Tried: {}. \
          Start a server with `ahma serve http` or `ahma serve unix`, \
          or use --connect <URL> to specify a custom address.",
         errors.join(", ")
     )
+}
+
+#[cfg(unix)]
+fn default_server_candidate() -> ResolvedConnection {
+    let socket_path = unix_socket_default_path();
+    ResolvedConnection {
+        display_url: format!("unix://{socket_path}"),
+        transport: ResolvedTransport::UnixSocket(socket_path),
+    }
+}
+
+#[cfg(not(unix))]
+fn default_server_candidate() -> ResolvedConnection {
+    ResolvedConnection {
+        display_url: "http://localhost:3000".to_string(),
+        transport: ResolvedTransport::Http("http://localhost:3000".to_string()),
+    }
+}
+
+async fn start_background_server() -> Result<ResolvedConnection> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ahma"));
+    let mut cmd = tokio::process::Command::new(&exe);
+
+    #[cfg(unix)]
+    {
+        cmd.arg("serve").arg("unix");
+        // Detach from parent process group
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        cmd.arg("serve").arg("http");
+    }
+
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    match cmd.spawn() {
+        Ok(_) => {
+            tracing::info!("TUI: spawned background server from {:?}", exe);
+        }
+        Err(e) => {
+            bail!("Failed to spawn background server: {e}");
+        }
+    }
+
+    // Poll candidate up to 5 seconds
+    let candidate = default_server_candidate();
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if probe_candidate(&candidate).await {
+            return Ok(candidate);
+        }
+    }
+    bail!("Background server failed to respond to health checks within 5s");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
