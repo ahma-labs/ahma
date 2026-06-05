@@ -121,7 +121,7 @@ impl DaemonState {
         instance_id: &str,
         op_id: String,
         tool_name: String,
-        _description: String,
+        description: String,
         scope: Option<String>,
     ) {
         let label = self
@@ -134,6 +134,7 @@ impl DaemonState {
         op.instance_id = Some(instance_id.to_string());
         op.instance_label = Some(label);
         op.scope = scope;
+        op.description = description;
 
         self.ops
             .entry(instance_id.to_string())

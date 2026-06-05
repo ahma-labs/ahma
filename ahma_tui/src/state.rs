@@ -495,6 +495,8 @@ pub struct Operation {
     pub tool_name: String,
     pub status: OpStatus,
     pub started_at: Option<Instant>,
+    pub started_time: chrono::DateTime<chrono::Local>,
+    pub description: String,
     pub cwd: Option<String>,
     pub args: Vec<String>,
     /// ID of the parent operation this one is waiting for (for DAG rendering).
@@ -520,6 +522,8 @@ impl Operation {
             tool_name: tool_name.into(),
             status,
             started_at: Some(Instant::now()),
+            started_time: chrono::Local::now(),
+            description: String::new(),
             cwd: None,
             args: vec![],
             parent_id: None,

@@ -1562,6 +1562,99 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
 }
 
 #[cfg(feature = "tui")]
+fn clean_up_summary(summary: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(summary) {
+        if let Some(msg) = val.get("message").and_then(|v| v.as_str()) {
+            return msg.to_string();
+        }
+        if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
+            return err.to_string();
+        }
+    }
+    if summary.starts_with('"') && summary.ends_with('"') && summary.len() >= 2 {
+        return summary[1..summary.len() - 1].to_string();
+    }
+    summary.to_string()
+}
+
+#[cfg(feature = "tui")]
+fn format_friendly_start(
+    tool_name: &str,
+    description: &str,
+    start_time: chrono::DateTime<chrono::Local>,
+) -> String {
+    let mut args_summary = String::new();
+    if let Some(start_idx) = description.find('{')
+        && let Some(end_idx) = description.rfind('}')
+        && start_idx < end_idx
+        && let Ok(val) =
+            serde_json::from_str::<serde_json::Value>(&description[start_idx..=end_idx])
+        && let Some(obj) = val.as_object()
+    {
+        if tool_name == "run_terminal_command" {
+            if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+                args_summary = format!("command: {cmd}");
+            }
+        } else {
+            let parts: Vec<String> = obj
+                .iter()
+                .filter(|(k, _)| {
+                    *k != "working_directory" && *k != "working_dir" && *k != "synchronous"
+                })
+                .map(|(k, v)| {
+                    let val_str = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        _ => v.to_string(),
+                    };
+                    format!("{k}={val_str}")
+                })
+                .collect();
+            if !parts.is_empty() {
+                args_summary = parts.join(", ");
+            }
+        }
+    }
+
+    let time_str = start_time.format("%H:%M:%S").to_string();
+    if args_summary.is_empty() {
+        format!("Starting {tool_name} at {time_str}")
+    } else {
+        format!("Starting {tool_name} ({args_summary}) at {time_str}")
+    }
+}
+
+#[cfg(feature = "tui")]
+fn format_friendly_end(op: &crate::state::Operation) -> String {
+    let status_str = match op.status {
+        crate::state::OpStatus::Succeeded => "Finished successfully",
+        crate::state::OpStatus::Failed => "Failed",
+        crate::state::OpStatus::Cancelled => "Cancelled",
+        _ => "Finished",
+    };
+
+    let duration_str = if let Some(ms) = op.duration_ms {
+        if ms < 1000 {
+            format!("{ms}ms")
+        } else {
+            format!("{:.2}s", ms as f64 / 1000.0)
+        }
+    } else {
+        op.elapsed_display()
+    };
+
+    let mut end_text = format!("{status_str} in {duration_str}");
+
+    if let Some(summary) = &op.result_summary {
+        let clean_summary = clean_up_summary(summary);
+        if !clean_summary.is_empty() {
+            end_text.push_str(&format!(": {clean_summary}"));
+        }
+    }
+
+    end_text
+}
+
+#[cfg(feature = "tui")]
 fn sync_operations_to_windows(state: &mut crate::state::AppState) {
     let mut to_add = Vec::new();
 
@@ -1583,23 +1676,28 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
             if op.status != crate::state::OpStatus::Running
                 && op.status != crate::state::OpStatus::Pending
                 && op.status != crate::state::OpStatus::Waiting
+                && w.finished_at.is_none()
             {
-                if w.finished_at.is_none() {
-                    w.finished_at = Some(std::time::Instant::now());
-                }
+                w.finished_at = Some(std::time::Instant::now());
             }
 
             let mut content = vec![];
-            if let Some(cwd) = &op.cwd {
-                content.push(format!("cwd: {cwd}"));
+            let start_text = format_friendly_start(&op.tool_name, &op.description, op.started_time);
+            content.push(start_text);
+
+            if op.status != crate::state::OpStatus::Running
+                && op.status != crate::state::OpStatus::Pending
+                && op.status != crate::state::OpStatus::Waiting
+            {
+                let sep = if state.unicode {
+                    "────────────────────────────────────────".to_string()
+                } else {
+                    "----------------------------------------".to_string()
+                };
+                content.push(sep);
+                content.push(format_friendly_end(op));
             }
-            if !op.args.is_empty() {
-                content.push(format!("args: {}", op.args.join(" ")));
-            }
-            if let Some(summary) = &op.result_summary {
-                content.push(format!("summary: {summary}"));
-            }
-            content.extend(op.stdout_tail.iter().cloned());
+
             w.content = content;
         } else {
             let win_id = state.next_window_id;
@@ -1621,16 +1719,21 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
             };
 
             let mut content = vec![];
-            if let Some(cwd) = &op.cwd {
-                content.push(format!("cwd: {cwd}"));
+            let start_text = format_friendly_start(&op.tool_name, &op.description, op.started_time);
+            content.push(start_text);
+
+            if op.status != crate::state::OpStatus::Running
+                && op.status != crate::state::OpStatus::Pending
+                && op.status != crate::state::OpStatus::Waiting
+            {
+                let sep = if state.unicode {
+                    "────────────────────────────────────────".to_string()
+                } else {
+                    "----------------------------------------".to_string()
+                };
+                content.push(sep);
+                content.push(format_friendly_end(op));
             }
-            if !op.args.is_empty() {
-                content.push(format!("args: {}", op.args.join(" ")));
-            }
-            if let Some(summary) = &op.result_summary {
-                content.push(format!("summary: {summary}"));
-            }
-            content.extend(op.stdout_tail.iter().cloned());
 
             let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
             let op_id = op.id.clone();
@@ -1638,15 +1741,15 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
             let mcp_config = mcp_chat_config(state);
 
             tokio::spawn(async move {
-                if let Ok(()) = abort_rx.await {
-                    if let Some(tx) = bridge_tx {
-                        crate::llm_bridge::spawn_tool_call_task(
-                            "cancel".to_string(),
-                            serde_json::json!({ "id": op_id }),
-                            mcp_config,
-                            tx,
-                        );
-                    }
+                if let Ok(()) = abort_rx.await
+                    && let Some(tx) = bridge_tx
+                {
+                    crate::llm_bridge::spawn_tool_call_task(
+                        "cancel".to_string(),
+                        serde_json::json!({ "id": op_id }),
+                        mcp_config,
+                        tx,
+                    );
                 }
             });
 

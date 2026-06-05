@@ -219,7 +219,22 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
                 let content_text: Vec<Line> = w
                     .content
                     .iter()
-                    .map(|line| Line::from(Span::styled(line.clone(), theme.normal())))
+                    .map(|line| {
+                        let style = if line.starts_with("Starting") {
+                            theme.dim()
+                        } else if line.starts_with("Finished successfully") {
+                            theme.success()
+                        } else if line.starts_with("Failed") {
+                            theme.failed()
+                        } else if line.starts_with("Cancelled") {
+                            theme.cancelled()
+                        } else if line.starts_with("──") || line.starts_with("--") {
+                            theme.dim()
+                        } else {
+                            theme.normal()
+                        };
+                        Line::from(Span::styled(line.clone(), style))
+                    })
                     .collect();
                 let para = Paragraph::new(content_text).wrap(Wrap { trim: false });
                 frame.render_widget(para, inner);

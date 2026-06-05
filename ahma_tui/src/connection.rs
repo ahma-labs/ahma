@@ -429,14 +429,175 @@ fn parse_status_2xx(response: &[u8]) -> bool {
     false
 }
 
+fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+#[cfg(unix)]
+async fn query_uds_health(path: &str) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connect = tokio::net::UnixStream::connect(path);
+    let mut stream = tokio::time::timeout(Duration::from_millis(200), connect)
+        .await
+        .ok()?
+        .ok()?;
+
+    let request = b"GET /health HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if stream.write_all(request).await.is_err() {
+        return None;
+    }
+
+    let mut buf = Vec::with_capacity(512);
+    let _ = tokio::time::timeout(Duration::from_millis(200), stream.read_to_end(&mut buf)).await;
+
+    let response_str = std::str::from_utf8(&buf).ok()?;
+    let body = response_str.split("\r\n\r\n").nth(1)?;
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    parsed.get("version")?.as_str().map(String::from)
+}
+
+async fn query_tcp_health(url: &str) -> Option<String> {
+    let health_url = format!("{}/health", url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap_or_default();
+    let resp = client.get(&health_url).send().await.ok()?;
+    if resp.status().is_success() {
+        let parsed: serde_json::Value = resp.json().await.ok()?;
+        return parsed.get("version")?.as_str().map(String::from);
+    }
+    None
+}
+
+pub async fn get_candidate_version(candidate: &ResolvedConnection) -> Option<String> {
+    match &candidate.transport {
+        ResolvedTransport::Http(url) | ResolvedTransport::Http3(url) => query_tcp_health(url).await,
+        #[cfg(unix)]
+        ResolvedTransport::UnixSocket(path) => query_uds_health(path).await,
+    }
+}
+
+#[cfg(unix)]
+async fn trigger_uds_restart(path: &str) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connect = tokio::net::UnixStream::connect(path);
+    let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_millis(200), connect).await else {
+        return false;
+    };
+
+    let request = b"POST /restart HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    if stream.write_all(request).await.is_err() {
+        return false;
+    }
+
+    let mut buf = Vec::with_capacity(512);
+    let _ = tokio::time::timeout(Duration::from_millis(200), stream.read_to_end(&mut buf)).await;
+
+    let response_str = std::str::from_utf8(&buf).unwrap_or("");
+    response_str.starts_with("HTTP/1.") && response_str.contains(" 200 ")
+}
+
+async fn trigger_tcp_restart(url: &str) -> bool {
+    let restart_url = format!("{}/restart", url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap_or_default();
+    if let Ok(resp) = client.post(&restart_url).send().await {
+        return resp.status().is_success();
+    }
+    false
+}
+
+pub async fn trigger_candidate_restart(candidate: &ResolvedConnection) -> bool {
+    match &candidate.transport {
+        ResolvedTransport::Http(url) | ResolvedTransport::Http3(url) => {
+            trigger_tcp_restart(url).await
+        }
+        #[cfg(unix)]
+        ResolvedTransport::UnixSocket(path) => trigger_uds_restart(path).await,
+    }
+}
+
 /// Ensure a local server is running by probing available local transports.
 /// If none is reachable, spawns a background `ahma serve unix` (on macOS/Linux)
 /// or `ahma serve http` (on Windows) and polls until healthy.
 pub async fn ensure_server_running() -> Result<()> {
+    let client_version = env!("CARGO_PKG_VERSION");
     let candidates = default_candidates();
     for candidate in &candidates {
-        if probe_candidate(candidate).await {
-            return Ok(());
+        if let Some(bridge_version) = get_candidate_version(candidate).await {
+            if bridge_version == client_version {
+                return Ok(());
+            }
+
+            let c_ver = parse_version(client_version);
+            let b_ver = parse_version(&bridge_version);
+            let client_is_newer = match (c_ver, b_ver) {
+                (Some(c), Some(b)) => c > b,
+                _ => true,
+            };
+
+            if client_is_newer {
+                tracing::info!(
+                    "TUI version (v{}) is newer than running bridge version (v{}). Requesting bridge restart...",
+                    client_version,
+                    bridge_version
+                );
+
+                let _ = trigger_candidate_restart(candidate).await;
+
+                let start = std::time::Instant::now();
+                while start.elapsed() < Duration::from_secs(2) {
+                    if get_candidate_version(candidate).await.is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                break;
+            } else {
+                if std::env::var("AHMA_RESTARTED").is_err() {
+                    tracing::info!(
+                        "TUI version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
+                        client_version,
+                        bridge_version
+                    );
+
+                    let exe = std::env::current_exe()?;
+                    let args: Vec<String> = std::env::args().skip(1).collect();
+                    let mut cmd = std::process::Command::new(exe);
+                    cmd.args(&args);
+                    cmd.env("AHMA_RESTARTED", "1");
+
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::CommandExt;
+                        let err = cmd.exec();
+                        return Err(anyhow::anyhow!("Failed to re-exec TUI process: {}", err));
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let mut child = cmd
+                            .stdin(std::process::Stdio::inherit())
+                            .stdout(std::process::Stdio::inherit())
+                            .stderr(std::process::Stdio::inherit())
+                            .spawn()?;
+                        let status = child.wait()?;
+                        std::process::exit(status.code().unwrap_or(0));
+                    }
+                } else {
+                    bail!(
+                        "Version mismatch: TUI version (v{}) is older than running bridge version (v{}). Please update TUI binary.",
+                        client_version,
+                        bridge_version
+                    );
+                }
+            }
         }
     }
 

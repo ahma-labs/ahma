@@ -90,6 +90,7 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         rate_limit_rps: 0,
         rate_limit_burst: 10,
         active_sessions: None,
+        idle_timeout_secs: config.idle_timeout_secs,
     };
 
     start_bridge(bridge_config).await?;

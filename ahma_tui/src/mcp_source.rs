@@ -338,6 +338,14 @@ fn parse_operations(val: &Value) -> Vec<Operation> {
             if let Some(cwd) = op_val.get("cwd").and_then(|v| v.as_str()) {
                 op.cwd = Some(cwd.to_string());
             }
+            if let Some(desc) = op_val.get("description").and_then(|v| v.as_str()) {
+                op.description = desc.to_string();
+            }
+            if let Some(st_str) = op_val.get("start_time").and_then(|v| v.as_str())
+                && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(st_str)
+            {
+                op.started_time = dt.with_timezone(&chrono::Local);
+            }
 
             Some(op)
         })
