@@ -200,7 +200,65 @@ async fn run_shutdown_handler(
 ///
 /// # Errors
 /// Returns an error if the server fails to start or encounters a fatal error.
+async fn check_bridge_running(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
+    #[cfg(unix)]
+    if let Some(path) = socket_path
+        && tokio::net::UnixStream::connect(path).await.is_ok()
+    {
+        return true;
+    }
+    if let Some(url) = http_url {
+        let health_url = format!("{}/health", url.trim_end_matches('/'));
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap_or_default();
+        if let Ok(resp) = client.get(&health_url).send().await
+            && resp.status().is_success()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run in server mode (stdio MCP server).
+///
+/// # Arguments
+/// * `config` - Immutable application configuration.
+/// * `sandbox` - Sandbox configuration.
+///
+/// # Errors
+/// Returns an error if the server fails to start or encounters a fatal error.
 pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
+    let is_test = sandbox.is_test_mode()
+        || std::env::var("NEXTEST").is_ok()
+        || std::env::var("CARGO_MANIFEST_DIR").is_ok();
+
+    let socket_path = if let Ok(path) = std::env::var("AHMA_UNIX_SOCKET") {
+        path
+    } else if config.unix_socket_path.is_empty() {
+        "/tmp/ahma.sock".to_string()
+    } else {
+        config.unix_socket_path.clone()
+    };
+    let http_url = format!("http://{}:{}", config.http_host, config.http_port);
+
+    let socket_path_opt = if cfg!(unix) {
+        Some(socket_path.as_str())
+    } else {
+        None
+    };
+    let http_url_opt = Some(http_url.as_str());
+
+    if !is_test && check_bridge_running(socket_path_opt, http_url_opt).await {
+        tracing::info!(
+            "Local bridge server is already running. Forwarding stdio as a proxy client."
+        );
+        return crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
+            .await;
+    }
+
     // Redirect stdout to stderr to prevent protocol stream corruption by standard prints
     if let Err(e) = crate::utils::stdio_redirect::redirect_stdout_to_stderr() {
         tracing::error!("Failed to redirect stdout to stderr: {}", e);
@@ -274,6 +332,94 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         loaded_tools_count,
     );
 
+    let active_sessions_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    if !is_test {
+        // Start background bridge server
+        let server_command = std::env::current_exe()
+            .context("Failed to get current executable path")?
+            .to_string_lossy()
+            .to_string();
+
+        let mut server_args = vec!["serve".to_string()];
+
+        if config.explicit_tools_dir
+            && let Some(ref tools_dir) = config.tools_dir
+        {
+            server_args.push("--tools-dir".to_string());
+            server_args.push(tools_dir.to_string_lossy().to_string());
+        }
+
+        if let Some(ref task_vault) = config.task_vault {
+            server_args.push("--task-vault".to_string());
+            server_args.push(task_vault.to_string_lossy().to_string());
+        }
+
+        server_args.push("stdio".to_string());
+
+        for bundle in &config.tool_bundles {
+            server_args.push("--tool".to_string());
+            server_args.push(bundle.clone());
+        }
+
+        let explicit_fallback_scope = if !config.sandbox_scopes.is_empty() {
+            Some(
+                dunce::canonicalize(&config.sandbox_scopes[0])
+                    .unwrap_or_else(|_| config.sandbox_scopes[0].clone()),
+            )
+        } else {
+            None
+        };
+
+        let bind_addr = format!("127.0.0.1:{}", config.http_port)
+            .parse()
+            .unwrap_or_else(|_| "127.0.0.1:3000".parse().unwrap());
+
+        #[cfg(unix)]
+        let listener_kind = ahma_http_bridge::ListenerKind::Unix(socket_path.clone());
+        #[cfg(not(unix))]
+        let listener_kind = ahma_http_bridge::ListenerKind::Tcp(bind_addr);
+
+        let bridge_config = ahma_http_bridge::BridgeConfig {
+            bind_addr,
+            server_command,
+            server_args,
+            enable_colored_output: true,
+            default_sandbox_scope: explicit_fallback_scope,
+            handshake_timeout_secs: config.handshake_timeout_secs,
+            enable_quic: if cfg!(unix) { false } else { !config.no_quic },
+            disable_http1_1: config.disable_http1_1,
+            listener_kind,
+            require_token: None,
+            require_token_path: None,
+            rate_limit_rps: 0,
+            rate_limit_burst: 10,
+            active_sessions: Some(active_sessions_counter.clone()),
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = ahma_http_bridge::start_bridge(bridge_config).await {
+                tracing::error!("Failed to start background bridge: {}", e);
+            }
+        });
+
+        // Wait for the background bridge to be healthy/available
+        let start_time = std::time::Instant::now();
+        let mut healthy = false;
+        while start_time.elapsed() < Duration::from_secs(2) {
+            if check_bridge_running(socket_path_opt, http_url_opt).await {
+                healthy = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !healthy {
+            tracing::warn!("Background bridge server failed to become healthy within 2 seconds");
+        } else {
+            tracing::info!("Background bridge server started successfully and is healthy");
+        }
+    }
+
     use crate::transport_patch::PatchedStdioTransport;
     let service = service_handler
         .serve(PatchedStdioTransport::new_stdio())
@@ -286,13 +432,69 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         shutdown_timeout,
     ));
 
-    let result = service.waiting().await;
-    let reason = match &result {
-        Ok(_) => "session_ended".to_string(),
-        Err(e) => format!("session_error: {:#}", e),
-    };
-    emit_sandbox_terminated(&reason);
-    adapter.shutdown().await;
-    result?;
-    Ok(())
+    if is_test {
+        let result = service.waiting().await;
+        let reason = match &result {
+            Ok(_) => "session_ended".to_string(),
+            Err(e) => format!("session_error: {:#}", e),
+        };
+        emit_sandbox_terminated(&reason);
+        adapter.shutdown().await;
+        result?;
+        return Ok(());
+    }
+
+    let stdio_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let stdio_active_clone = stdio_active.clone();
+
+    let stdio_wait_task = tokio::spawn(async move {
+        let res = service.waiting().await;
+        stdio_active_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+        res
+    });
+
+    // Idle supervisor loop
+    let active_sessions_clone = active_sessions_counter.clone();
+    let adapter_clone = adapter.clone();
+    let stdio_active_for_supervisor = stdio_active.clone();
+
+    tokio::spawn(async move {
+        let mut idle_duration = Duration::ZERO;
+        let check_interval = Duration::from_millis(500);
+        loop {
+            tokio::time::sleep(check_interval).await;
+
+            let stdio_on = stdio_active_for_supervisor.load(std::sync::atomic::Ordering::SeqCst);
+            let active_count = active_sessions_clone.load(std::sync::atomic::Ordering::SeqCst);
+
+            if !stdio_on && active_count == 0 {
+                idle_duration += check_interval;
+                if idle_duration >= Duration::from_secs(10) {
+                    tracing::info!(
+                        "No active clients (stdio disconnected and 0 bridge sessions) for 10 seconds. Shutting down."
+                    );
+                    emit_sandbox_terminated("idle_timeout");
+                    adapter_clone.shutdown().await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    std::process::exit(0);
+                }
+            } else {
+                idle_duration = Duration::ZERO;
+            }
+        }
+    });
+
+    let result = stdio_wait_task.await;
+    if let Ok(res) = result {
+        let reason = match &res {
+            Ok(_) => "session_ended".to_string(),
+            Err(e) => format!("session_error: {:#}", e),
+        };
+        emit_sandbox_terminated(&reason);
+        res?;
+    }
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }

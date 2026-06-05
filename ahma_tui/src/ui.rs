@@ -321,14 +321,28 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
         theme.border_unfocused()
     };
 
-    let title = if state.llm_label == "no LLM" {
-        " no LLM — /provider to configure ".to_string()
+    let title_left = if state.llm_label == "no LLM" {
+        Line::from(Span::styled(
+            " model: no LLM — /provider to configure ",
+            theme.title(),
+        ))
+        .left_aligned()
     } else {
-        " message ".to_string()
+        Line::from(Span::styled(
+            format!(" model: {} ", state.llm_label),
+            theme.title(),
+        ))
+        .left_aligned()
     };
+    let title_right = Line::from(Span::styled(
+        format!(" sandbox: {} ", shorten_path(&state.workspace, 45)),
+        theme.dim(),
+    ))
+    .right_aligned();
 
     let block = Block::default()
-        .title(Span::styled(title, theme.dim()))
+        .title(title_left)
+        .title(title_right)
         .borders(Borders::ALL)
         .border_style(border_style);
     let inner = block.inner(area);

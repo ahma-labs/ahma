@@ -89,6 +89,7 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         require_token_path: None,
         rate_limit_rps: 0,
         rate_limit_burst: 10,
+        active_sessions: None,
     };
 
     start_bridge(bridge_config).await?;

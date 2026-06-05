@@ -138,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         require_token_path: args.require_token,
         rate_limit_rps: args.rate_limit_rps,
         rate_limit_burst: args.rate_limit_burst,
+        active_sessions: None,
     };
 
     // Warn when listening on a non-loopback address without a token.

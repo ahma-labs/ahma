@@ -276,13 +276,28 @@ fn submit_provider_picker(picker: crate::state::PickerState, state: &mut crate::
 
 #[cfg(feature = "tui")]
 fn submit_model_picker(picker: crate::state::PickerState, state: &mut crate::state::AppState) {
-    let Some(model) = picker.selected_item() else {
+    let Some(item) = picker.selected_item() else {
         return;
     };
 
-    let provider = provider_label(&state.llm_label);
-    state.llm_label = format!("{provider} / {model}");
-    save_session(state);
+    if let Some((provider_name, model_name)) = item.split_once(" / ") {
+        let provider_name = provider_name.trim();
+        let model_name = model_name.trim();
+        if let Some(provider) = state
+            .available_providers
+            .iter()
+            .find(|p| p.name == provider_name)
+        {
+            state.current_provider_url = Some(provider.base_url.clone());
+            state.available_models = provider.models.clone();
+            state.llm_label = format!("{provider_name} / {model_name}");
+            save_session(state);
+        }
+    } else {
+        let provider = provider_label(&state.llm_label);
+        state.llm_label = format!("{provider} / {item}");
+        save_session(state);
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -1026,7 +1041,7 @@ fn open_provider_picker(state: &mut crate::state::AppState) {
     let items: Vec<String> = state
         .available_providers
         .iter()
-        .map(|(name, url)| format!("{name}  {url}"))
+        .map(|p| format!("{}  {}", p.name, p.base_url))
         .collect();
 
     if items.is_empty() {
@@ -1042,8 +1057,8 @@ fn open_provider_picker(state: &mut crate::state::AppState) {
         let selected = state
             .available_providers
             .iter()
-            .find(|(_, url)| url == current_url)
-            .map(|(name, url)| format!("{name}  {url}"))
+            .find(|p| p.base_url == *current_url)
+            .map(|p| format!("{}  {}", p.name, p.base_url))
             .unwrap_or_default();
         picker.select_exact(&selected);
     }
@@ -1055,7 +1070,14 @@ fn open_model_picker(state: &mut crate::state::AppState) {
     use crate::llm_bridge::spawn_model_refresh;
     use crate::state::PickerState;
 
-    if state.available_models.is_empty() {
+    let mut items = Vec::new();
+    for provider in &state.available_providers {
+        for model in &provider.models {
+            items.push(format!("{} / {}", provider.name, model));
+        }
+    }
+
+    if items.is_empty() {
         let (base_url, _) = parse_llm_selection(state);
         if !base_url.is_empty()
             && let Some(tx) = &state.bridge_tx
@@ -1066,10 +1088,12 @@ fn open_model_picker(state: &mut crate::state::AppState) {
         return;
     }
 
-    let mut picker = PickerState::new("Select model", state.available_models.clone());
+    let mut picker = PickerState::new("Select model", items);
     let selected_model = state.selected_model();
-    if !selected_model.is_empty() {
-        picker.select_exact(&selected_model);
+    let selected_provider = provider_label(&state.llm_label);
+    if !selected_model.is_empty() && !selected_provider.is_empty() {
+        let exact = format!("{selected_provider} / {selected_model}");
+        picker.select_exact(&exact);
     }
     state.model_picker = Some(picker);
 }
@@ -1239,10 +1263,7 @@ fn handle_providers_discovered(
     providers: Vec<ahma_llm_monitor::LocalProvider>,
     state: &mut crate::state::AppState,
 ) {
-    state.available_providers = providers
-        .iter()
-        .map(|p| (p.name.clone(), p.base_url.clone()))
-        .collect();
+    state.available_providers = providers.clone();
 
     if state.llm_label == "no LLM" {
         if let Some(provider) = providers.first() {
@@ -1290,15 +1311,17 @@ fn handle_models_refreshed(
     models: Vec<String>,
     state: &mut crate::state::AppState,
 ) {
+    if let Some(provider) = state
+        .available_providers
+        .iter_mut()
+        .find(|p| p.base_url == base_url)
+    {
+        provider.models = models.clone();
+    }
+
     if state.current_provider_url.as_deref() == Some(base_url.as_str()) && !models.is_empty() {
-        use crate::state::PickerState;
         state.available_models = models.clone();
-        let mut picker = PickerState::new("Select model", models);
-        let selected_model = state.selected_model();
-        if !selected_model.is_empty() {
-            picker.select_exact(&selected_model);
-        }
-        state.model_picker = Some(picker);
+        open_model_picker(state);
     }
 }
 

@@ -352,6 +352,64 @@ fn parse_status_2xx(response: &[u8]) -> bool {
     false
 }
 
+/// Ensure a local server is running by probing available local transports.
+/// If none is reachable, spawns a background `ahma serve unix` (on macOS/Linux)
+/// or `ahma serve http` (on Windows) and polls until healthy.
+pub async fn ensure_server_running() -> Result<()> {
+    let candidates = default_candidates();
+    for candidate in &candidates {
+        if probe_candidate(candidate).await {
+            return Ok(());
+        }
+    }
+
+    let exe = std::env::current_exe()?;
+    #[cfg(unix)]
+    let args = vec!["serve", "unix"];
+    #[cfg(not(unix))]
+    let args = vec!["serve", "http"];
+
+    tracing::info!("Spawning background server: {} {:?}", exe.display(), args);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&args);
+        cmd.process_group(0);
+        cmd.spawn()?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&args);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.spawn()?;
+    }
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        for candidate in &candidates {
+            if probe_candidate(candidate).await {
+                tracing::info!(
+                    "Background server started and healthy at {}",
+                    candidate.display_url
+                );
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!("Failed to start background server within 2 seconds")
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────

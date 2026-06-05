@@ -160,6 +160,9 @@ pub struct BridgeConfig {
     ///
     /// Defaults to `10`. Only effective when `rate_limit_rps > 0`.
     pub rate_limit_burst: u32,
+
+    /// Shared atomic counter tracking active connections.
+    pub active_sessions: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Default for BridgeConfig {
@@ -179,6 +182,7 @@ impl Default for BridgeConfig {
             require_token_path: None,
             rate_limit_rps: 0,
             rate_limit_burst: 10,
+            active_sessions: None,
         }
     }
 }
@@ -378,7 +382,11 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
         enable_colored_output: config.enable_colored_output,
         handshake_timeout_secs: config.handshake_timeout_secs,
     };
-    let session_manager = Arc::new(SessionManager::new(session_config));
+    let mut session_manager = SessionManager::new(session_config);
+    if let Some(ref counter) = config.active_sessions {
+        session_manager.active_sessions = Some(counter.clone());
+    }
+    let session_manager = Arc::new(session_manager);
     Arc::new(BridgeState {
         session_manager,
         require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),
@@ -1138,6 +1146,7 @@ mod tests {
             require_token_path: None,
             rate_limit_rps: 0,
             rate_limit_burst: 10,
+            active_sessions: None,
         };
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
         assert_eq!(config.server_command, "custom_server");

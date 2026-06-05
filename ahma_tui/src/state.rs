@@ -672,8 +672,8 @@ pub struct AppState {
     pub current_provider_url: Option<String>,
     /// True when ahma-as-MCP is active.
     pub mcp_enabled: bool,
-    /// Discovered + configured providers (name → base_url).
-    pub available_providers: Vec<(String, String)>,
+    /// Discovered + configured providers.
+    pub available_providers: Vec<ahma_llm_monitor::LocalProvider>,
     /// Available models for the current provider.
     pub available_models: Vec<String>,
     /// Chat scroll offset (lines from bottom = 0 is newest).

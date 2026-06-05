@@ -32,6 +32,11 @@ use anyhow::Result;
 /// * `connect` — explicit `--connect` URL, or `None` to auto-probe local
 ///   transports (Unix socket first on Unix, then `http://localhost:3000`).
 pub async fn run_tui(connect: Option<&str>) -> Result<()> {
+    if connect.is_none()
+        && let Err(e) = connection::ensure_server_running().await
+    {
+        tracing::warn!("Could not ensure server is running: {}", e);
+    }
     let connection = connection::resolve_connection(connect).await?;
     app::run(&connection).await
 }
