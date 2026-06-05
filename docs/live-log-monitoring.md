@@ -135,7 +135,7 @@ ollama pull llama3.2
 
 ### How It Works
 
-The tool runs `tail -F ./log/ahma_mcp.log` and feeds output to a local LLM, which watches for:
+The tool runs `tail -F ./logs/ahma_mcp.log` and feeds output to a local LLM, which watches for:
 - `ERROR` or `WARN` level tracing entries
 - Thread panics (`thread 'main' panicked at ...`)
 - Unwrap failures on `Option::None` or `Result::Err`

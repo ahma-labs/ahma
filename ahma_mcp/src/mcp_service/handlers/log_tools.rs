@@ -5,7 +5,7 @@
 //!
 //! ## Security model
 //!
-//! All requested paths are resolved relative to the project log directory (`./log/`
+//! All requested paths are resolved relative to the project log directory (`./logs/`
 //! within the sandbox scope). Absolute paths are rejected.  Traversals (`../`) are
 //! normalised away by `canonicalize` and rejected if they escape the log directory.
 //!
@@ -187,11 +187,11 @@ pub fn logs_search_schema() -> Arc<Map<String, Value>> {
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns the canonical project log directory (`<cwd>/log`).
+/// Returns the canonical project log directory (`<cwd>/logs`).
 fn project_log_dir() -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join("log")
+        .join("logs")
 }
 
 /// Validates and resolves a caller-supplied log file name into a safe absolute path.

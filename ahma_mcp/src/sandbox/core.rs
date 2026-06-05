@@ -19,7 +19,7 @@ fn resolve_livelog_scopes(canonicalized: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 fn log_dir_for_scope(scope: &Path) -> PathBuf {
-    scope.join("log")
+    scope.join("logs")
 }
 
 fn resolve_log_dir_symlinks(log_dir: &Path) -> Option<Vec<PathBuf>> {

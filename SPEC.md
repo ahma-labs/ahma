@@ -295,15 +295,15 @@ The planned implementation uses two mechanisms in order of preference:
 
 ## 4.5 File System Contracts and Features
 
-### R8: Project Logging (`/log` directory)
+### R8: Project Logging (`/logs` directory)
 
-- **R8.1**: All ahma and execution logs **must** be placed in the `log/` directory at the root of the (primary) configured sandbox scope, rather than global user cache directories (`~/.cache`).
-- **R8.2**: When the project is built or the server initialized, the `log/` directory is created if it does not exist, and old `.log` files are deleted to wipe previous logs.
+- **R8.1**: All ahma and execution logs **must** be placed in the `logs/` directory at the root of the (primary) configured sandbox scope, rather than global user cache directories (`~/.cache`).
+- **R8.2**: When the project is built or the server initialized, the `logs/` directory is created if it does not exist, and old `.log` files are deleted to wipe previous logs.
 
 ### R9: Safe Live Log Monitoring (`--livelog`)
 
 - **R9.1**: The `--livelog` feature flag enables safe read-only access to specific log files located outside the sandbox scope without compromising the sandbox contract.
-- **R9.2**: **Mechanisms**: During initialization (and ONLY at initialization), the system scans the `log/` directories of all configured sandbox roots for symbolic links. The targets of these symlinks are evaluated.
+- **R9.2**: **Mechanisms**: During initialization (and ONLY at initialization), the system scans the `logs/` directories of all configured sandbox roots for symbolic links. The targets of these symlinks are evaluated.
 - **R9.3**: **Enforcement**: The resolved physical paths of those symlinks are dynamically added to the sandbox profile (across Linux, macOS, and Windows) as **read-only scopes**.
 - **R9.4**: **Abuse Prevention**: Since symlinks are only resolved and granted access at startup, hostile entities or rogue AI cannot abuse this later by creating new symlinks to sensitive files (e.g. `/etc/passwd`). Existing files placed in read-only scopes are tightly controlled by the system operator running `ahma --livelog`.
 - **R9.5**: **LLM-Based Detection** (`tool_type: livelog`): Tools with `tool_type: livelog` spawn their `source_command` inside the kernel-enforced sandbox scope. The LLM endpoint is an outbound connection from the ahma process and is not subject to the inbound sandbox policy. See Section 5.5 for the full pipeline specification.

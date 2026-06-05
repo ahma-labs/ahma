@@ -1053,7 +1053,7 @@ impl ServerHandler for AhmaMcpService {
                 // Hard-wired log inspection tools — always available
                 Tool::new(
                     "logs_list",
-                    "List all log files in the project log directory (`./log/`). Returns file names, sizes, modification times, and symlink targets. Use this to discover which log files are available before calling logs_read or logs_search.",
+                    "List all log files in the project log directory (`./logs/`). Returns file names, sizes, modification times, and symlink targets. Use this to discover which log files are available before calling logs_read or logs_search.",
                     handlers::log_tools::logs_list_schema(),
                 )
                 .with_title("logs_list"),
@@ -1288,7 +1288,11 @@ impl AhmaMcpService {
         let execution_mode = self.determine_execution_mode(subcommand_config, &config, &arguments);
 
         let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let id = crate::utils::operation::generate_id_with_details(counter_val, &tool_name, &base_command);
+        let id = crate::utils::operation::generate_id_with_details(
+            counter_val,
+            &tool_name,
+            &base_command,
+        );
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
 
