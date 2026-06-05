@@ -694,6 +694,7 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
             llm_model: None,
             visible: true,
             abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(abort_tx))),
+            op_id: None,
         };
 
         state.windows.push(w);
@@ -1462,6 +1463,7 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
                     },
                     visible: true,
                     abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+                    op_id: None,
                 };
 
                 state.windows.push(w);
@@ -1536,6 +1538,126 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
     }
 }
 
+#[cfg(feature = "tui")]
+fn sync_operations_to_windows(state: &mut crate::state::AppState) {
+    let mut to_add = Vec::new();
+
+    for op in &state.operations {
+        if let Some(w) = state.windows.iter_mut().find(|w| w.op_id.as_deref() == Some(&op.id)) {
+            w.status = match op.status {
+                crate::state::OpStatus::Running => "Running".to_string(),
+                crate::state::OpStatus::Pending => "Pending".to_string(),
+                crate::state::OpStatus::Succeeded => "Finished".to_string(),
+                crate::state::OpStatus::Failed => "Error".to_string(),
+                crate::state::OpStatus::Cancelled => "Cancelled".to_string(),
+                crate::state::OpStatus::Waiting => "Pending".to_string(),
+            };
+
+            if op.status != crate::state::OpStatus::Running
+                && op.status != crate::state::OpStatus::Pending
+                && op.status != crate::state::OpStatus::Waiting
+            {
+                if w.finished_at.is_none() {
+                    w.finished_at = Some(std::time::Instant::now());
+                }
+            }
+
+            let mut content = vec![];
+            if let Some(cwd) = &op.cwd {
+                content.push(format!("cwd: {cwd}"));
+            }
+            if !op.args.is_empty() {
+                content.push(format!("args: {}", op.args.join(" ")));
+            }
+            if let Some(summary) = &op.result_summary {
+                content.push(format!("summary: {summary}"));
+            }
+            content.extend(op.stdout_tail.iter().cloned());
+            w.content = content;
+        } else {
+            let win_id = state.next_window_id;
+            state.next_window_id = (state.next_window_id + 1) % 100;
+
+            let label = format!(
+                "Operation: {} (instance: {})",
+                op.tool_name,
+                op.instance_label.as_deref().unwrap_or("local")
+            );
+
+            let status = match op.status {
+                crate::state::OpStatus::Running => "Running".to_string(),
+                crate::state::OpStatus::Pending => "Pending".to_string(),
+                crate::state::OpStatus::Succeeded => "Finished".to_string(),
+                crate::state::OpStatus::Failed => "Error".to_string(),
+                crate::state::OpStatus::Cancelled => "Cancelled".to_string(),
+                crate::state::OpStatus::Waiting => "Pending".to_string(),
+            };
+
+            let mut content = vec![];
+            if let Some(cwd) = &op.cwd {
+                content.push(format!("cwd: {cwd}"));
+            }
+            if !op.args.is_empty() {
+                content.push(format!("args: {}", op.args.join(" ")));
+            }
+            if let Some(summary) = &op.result_summary {
+                content.push(format!("summary: {summary}"));
+            }
+            content.extend(op.stdout_tail.iter().cloned());
+
+            let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+            let op_id = op.id.clone();
+            let bridge_tx = state.bridge_tx.clone();
+            let mcp_config = mcp_chat_config(state);
+
+            tokio::spawn(async move {
+                if let Ok(()) = abort_rx.await {
+                    if let Some(tx) = bridge_tx {
+                        crate::llm_bridge::spawn_tool_call_task(
+                            "cancel".to_string(),
+                            serde_json::json!({ "id": op_id }),
+                            mcp_config,
+                            tx,
+                        );
+                    }
+                }
+            });
+
+            let w = crate::state::TuiWindow {
+                id: win_id,
+                label,
+                status,
+                content,
+                collapsed: false,
+                finished_at: if op.status != crate::state::OpStatus::Running
+                    && op.status != crate::state::OpStatus::Pending
+                    && op.status != crate::state::OpStatus::Waiting
+                {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                },
+                is_cli: true,
+                command: op.tool_name.clone(),
+                working_dir: op.cwd.clone().unwrap_or_else(|| state.workspace.clone()),
+                llm_model: None,
+                visible: true,
+                abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(abort_tx))),
+                op_id: Some(op.id.clone()),
+            };
+
+            to_add.push(w);
+        }
+    }
+
+    for w in to_add {
+        state.windows.push(w);
+        if state.windows.len() > 100 {
+            state.windows.remove(0);
+        }
+    }
+}
+
 // ─── Source event handler ────────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
@@ -1547,6 +1669,7 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             for op in ops {
                 state.upsert_operation(op);
             }
+            sync_operations_to_windows(state);
         }
         SourceEvent::AiActivity(entry) => state.push_activity(entry),
         SourceEvent::LogLine(entry) => state.push_log(entry),
@@ -1726,6 +1849,7 @@ mod tests {
             llm_model: None,
             visible: false,
             abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            op_id: None,
         };
         state.windows.push(w);
 

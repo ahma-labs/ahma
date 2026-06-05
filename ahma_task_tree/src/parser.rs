@@ -86,4 +86,76 @@ mod tests {
         assert_eq!(steps[0].sandbox_scopes.as_ref().unwrap()[0], "src");
         assert_eq!(steps[0].allowed_tools.as_ref().unwrap()[0], "cargo");
     }
+
+    #[test]
+    fn test_parse_steps_invalid_json() {
+        let raw = r#"```json
+        {
+          "steps": [
+            {
+              "task": "Test cargo",
+              "type": "shell_command",
+              "command": "cargo test",
+              "sandbox_scopes":
+            }
+          ]
+        }
+        ```"#;
+        let result = parse_steps(raw);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_recovery_decision_re_plan() {
+        let raw = r#"```json
+        {
+          "action": "re_plan",
+          "steps": [
+            {
+              "task": "recovery",
+              "type": "shell_command",
+              "command": "echo"
+            }
+          ]
+        }
+        ```"#;
+        let decision = parse_recovery_decision(raw).unwrap();
+        assert_eq!(decision.action, "re_plan");
+        assert_eq!(decision.steps.unwrap()[0].task, "recovery");
+    }
+
+    #[test]
+    fn test_parse_recovery_decision_fail() {
+        let raw = r#"
+        {
+          "action": "fail",
+          "reason": "unrecoverable error"
+        }
+        "#;
+        let decision = parse_recovery_decision(raw).unwrap();
+        assert_eq!(decision.action, "fail");
+        assert_eq!(decision.reason.as_deref(), Some("unrecoverable error"));
+    }
+
+    #[test]
+    fn test_parse_recovery_decision_invalid() {
+        let raw = "invalid json";
+        let result = parse_recovery_decision(raw);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_clean_json_response_raw_markdown_ticks() {
+        let raw = "```\n{\"steps\": []}\n```";
+        let cleaned = clean_json_response(raw);
+        assert_eq!(cleaned, "{\"steps\": []}");
+    }
+
+    #[test]
+    fn test_clean_json_response_no_markdown() {
+        let raw = " {\"steps\": []}   ";
+        let cleaned = clean_json_response(raw);
+        assert_eq!(cleaned, "{\"steps\": []}");
+    }
 }
+
