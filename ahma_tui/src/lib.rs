@@ -11,12 +11,13 @@
 //!
 //! This crate is licensed under **AGPL-3.0-or-later**.
 
+pub mod agent_config;
 pub mod app;
 pub mod connection;
 pub mod daemon_source;
 pub mod keymap;
 pub mod llm_bridge;
-// pub mod mcp_client;
+pub mod mcp_connections;
 pub mod mcp_source;
 pub mod session_config;
 pub mod state;
@@ -31,12 +32,12 @@ use anyhow::Result;
 ///
 /// * `connect` — explicit `--connect` URL, or `None` to auto-probe local
 ///   transports (Unix socket first on Unix, then `http://localhost:3000`).
-pub async fn run_tui(connect: Option<&str>) -> Result<()> {
+pub async fn run_tui(connect: Option<&str>, profile: Option<String>) -> Result<()> {
     if connect.is_none()
         && let Err(e) = connection::ensure_server_running().await
     {
         tracing::warn!("Could not ensure server is running: {}", e);
     }
     let connection = connection::resolve_connection(connect).await?;
-    app::run(&connection).await
+    app::run(&connection, profile).await
 }

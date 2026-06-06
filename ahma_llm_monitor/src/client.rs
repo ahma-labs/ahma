@@ -86,12 +86,21 @@ pub struct ChatToolCall {
     pub arguments_raw: String,
 }
 
+/// Token usage metrics returned by the LLM.
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
 /// One assistant turn returned from a non-streaming chat completion.
 #[derive(Debug, Clone)]
 pub struct ChatCompletionResponse {
     pub content: String,
     pub tool_calls: Vec<ChatToolCall>,
     pub assistant_message: Value,
+    pub usage: Option<TokenUsage>,
 }
 
 /// A discovered local LLM provider.
@@ -497,10 +506,20 @@ fn parse_chat_completion_response(json: Value) -> Result<ChatCompletionResponse,
         })
         .unwrap_or_default();
 
+    let usage = json.get("usage").map(|u| TokenUsage {
+        prompt_tokens: u.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+        completion_tokens: u
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        total_tokens: u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
+    });
+
     Ok(ChatCompletionResponse {
         content,
         tool_calls,
         assistant_message,
+        usage,
     })
 }
 
@@ -532,5 +551,29 @@ mod tests {
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "status");
         assert_eq!(parsed.tool_calls[0].arguments, json!({"verbose": true}));
+    }
+
+    #[test]
+    fn parse_chat_completion_response_extracts_usage() {
+        let response = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Done."
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150
+            }
+        });
+
+        let parsed = parse_chat_completion_response(response).unwrap();
+        assert_eq!(parsed.content, "Done.");
+        let usage = parsed.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.total_tokens, 150);
     }
 }

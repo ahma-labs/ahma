@@ -371,6 +371,25 @@ async fn bearer_auth_middleware(
 ///    }
 /// }
 /// ```
+fn spawn_idle_timeout_checker(timeout: u64, counter: Arc<std::sync::atomic::AtomicUsize>) {
+    tokio::spawn(async move {
+        let mut idle_duration = std::time::Duration::ZERO;
+        let check_interval = std::time::Duration::from_secs(1);
+        loop {
+            tokio::time::sleep(check_interval).await;
+            if counter.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                idle_duration += check_interval;
+                if idle_duration.as_secs() >= timeout {
+                    tracing::info!("No active clients for {} seconds. Shutting down.", timeout);
+                    std::process::exit(0);
+                }
+            } else {
+                idle_duration = std::time::Duration::ZERO;
+            }
+        }
+    });
+}
+
 pub async fn start_bridge(mut config: BridgeConfig) -> Result<()> {
     if config.idle_timeout_secs.is_some() && config.active_sessions.is_none() {
         config.active_sessions = Some(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
@@ -378,22 +397,7 @@ pub async fn start_bridge(mut config: BridgeConfig) -> Result<()> {
     if let Some(timeout) = config.idle_timeout_secs
         && let Some(counter) = config.active_sessions.clone()
     {
-        tokio::spawn(async move {
-            let mut idle_duration = std::time::Duration::ZERO;
-            let check_interval = std::time::Duration::from_secs(1);
-            loop {
-                tokio::time::sleep(check_interval).await;
-                if counter.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                    idle_duration += check_interval;
-                    if idle_duration.as_secs() >= timeout {
-                        tracing::info!("No active clients for {} seconds. Shutting down.", timeout);
-                        std::process::exit(0);
-                    }
-                } else {
-                    idle_duration = std::time::Duration::ZERO;
-                }
-            }
-        });
+        spawn_idle_timeout_checker(timeout, counter);
     }
 
     #[cfg(unix)]
@@ -567,19 +571,37 @@ async fn serve_tcp_connection(
     }
 }
 
-/// Serve MCP Streamable HTTP over a TCP socket.
-async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
-    info!("Starting HTTP bridge on {}", config.bind_addr);
-
-    // SECURITY: warn when binding to a non-loopback address — the bridge is
-    // designed for localhost use and has no authentication beyond session IDs.
-    if !config.bind_addr.ip().is_loopback() {
+fn warn_if_non_loopback(bind_addr: SocketAddr) {
+    if !bind_addr.ip().is_loopback() {
         warn!(
             "HTTP bridge bound to non-loopback address {}. \
              CORS allows any origin. Restrict access via firewall or reverse proxy.",
-            config.bind_addr
+            bind_addr
         );
     }
+}
+
+fn print_quic_info(quic_info: &Option<QuicInfo>, enable_quic: bool, local_addr: SocketAddr) {
+    if let Some(qi) = quic_info {
+        eprintln!("AHMA_QUIC_PORT={}", qi.quic_port);
+        eprintln!(
+            "AHMA_QUIC_CERT={}",
+            base64::engine::general_purpose::STANDARD.encode(&qi.cert_der)
+        );
+        info!(
+            "QUIC/HTTP/3 listening on udp://{}:{}",
+            local_addr.ip(),
+            qi.quic_port
+        );
+    } else if enable_quic {
+        info!("QUIC/HTTP/3 not started (unavailable or failed to bind)");
+    }
+}
+
+/// Serve MCP Streamable HTTP over a TCP socket.
+async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
+    info!("Starting HTTP bridge on {}", config.bind_addr);
+    warn_if_non_loopback(config.bind_addr);
 
     info!("Session isolation: ENABLED (always-on)");
     let state = build_bridge_state(&config);
@@ -620,20 +642,7 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
     );
 
     // Print QUIC startup markers *before* AHMA_BOUND_PORT so parsers see them in order.
-    if let Some(ref qi) = quic_info {
-        eprintln!("AHMA_QUIC_PORT={}", qi.quic_port);
-        eprintln!(
-            "AHMA_QUIC_CERT={}",
-            base64::engine::general_purpose::STANDARD.encode(&qi.cert_der)
-        );
-        info!(
-            "QUIC/HTTP/3 listening on udp://{}:{}",
-            local_addr.ip(),
-            qi.quic_port
-        );
-    } else if config.enable_quic {
-        info!("QUIC/HTTP/3 not started (unavailable or failed to bind)");
-    }
+    print_quic_info(&quic_info, config.enable_quic, local_addr);
 
     // Print machine-readable bound port for test infrastructure (always print, tests parse it)
     eprintln!("AHMA_BOUND_PORT={}", local_addr.port());

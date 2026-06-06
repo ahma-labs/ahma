@@ -181,8 +181,8 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     // Verify only built-in tools are present
     assert_eq!(
         tools.len(),
-        7,
-        "Should have exactly 7 built-in tools when no .ahma exists. Got: {:?}",
+        14,
+        "Should have exactly 14 built-in tools when no .ahma exists. Got: {:?}",
         tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 
@@ -213,6 +213,34 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     assert!(
         tools.iter().any(|t| t.name == "restart"),
         "Built-in 'restart' tool should be present"
+    );
+    assert!(
+        tools.iter().any(|t| t.name == "read_file"),
+        "Built-in 'read_file' tool should be present"
+    );
+    assert!(
+        tools.iter().any(|t| t.name == "list_dir"),
+        "Built-in 'list_dir' tool should be present"
+    );
+    assert!(
+        tools.iter().any(|t| t.name == "file_search"),
+        "Built-in 'file_search' tool should be present"
+    );
+    assert!(
+        tools.iter().any(|t| t.name == "grep_search"),
+        "Built-in 'grep_search' tool should be present"
+    );
+    assert!(
+        tools.iter().any(|t| t.name == "fetch_webpage"),
+        "Built-in 'fetch_webpage' tool should be present"
+    );
+    assert!(
+        tools.iter().any(|t| t.name == "write_file"),
+        "Built-in 'write_file' tool should be present"
+    );
+    assert!(
+        tools.iter().any(|t| t.name == "replace_in_file"),
+        "Built-in 'replace_in_file' tool should be present"
     );
 
     Ok(())

@@ -17,6 +17,7 @@ path = "src/lib.rs"
 
 [dependencies]
 ahma_common = { path = "../ahma_common" }
+ahma_harness_tools = { path = "../ahma_harness_tools" }
 ahma_http_bridge = { path = "../ahma_http_bridge" }
 ahma_http_mcp_client = { path = "../ahma_http_mcp_client" }
 ahma_llm_monitor = { path = "../ahma_llm_monitor" }
@@ -48,7 +49,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 ring = { version = "0.17", features = ["std"] }
 sha2 = "0.10.9"
-sigstore-verification = { version = "0.2", default-features = false, features = ["rustls"] }
+sigstore-verification = { version = "0.2", default-features = false, features = [
+	"rustls",
+] }
 tar = "0.4"
 tempfile.workspace = true
 zip = "2.4.2"

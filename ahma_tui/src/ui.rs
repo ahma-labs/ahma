@@ -125,9 +125,114 @@ fn window_status_style(status: &str, theme: &Theme) -> Style {
 }
 
 #[cfg(feature = "tui")]
+fn draw_single_window(
+    frame: &mut Frame,
+    w: &crate::state::TuiWindow,
+    l: &RenderedWindowLayout,
+    area: Rect,
+    theme: &Theme,
+) {
+    let status_style = window_status_style(&w.status, theme);
+    if l.collapsed {
+        // Draw collapsed window as a single summary line
+        let mut spans = vec![
+            Span::styled(" [+] ", theme.dim()),
+            Span::styled(format!("{} ", w.id), theme.normal()),
+            Span::styled(format!("[{}] ", w.status), status_style),
+            Span::styled(w.label.clone(), theme.normal()),
+        ];
+        let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
+        let right_str = format!(" X{}", w.id);
+        let pad_width = (area.width as usize).saturating_sub(left_len + right_str.len());
+        if pad_width > 0 {
+            spans.push(Span::raw(" ".repeat(pad_width)));
+        }
+        spans.push(Span::styled(right_str, theme.dim()));
+
+        let line = Line::from(spans);
+        let para = Paragraph::new(line);
+        frame.render_widget(para, area);
+    } else {
+        // Draw expanded window as a border block
+        let border_width = 2;
+        let title_space = (area.width as usize).saturating_sub(border_width);
+        let title_left = format!(" [-] {} {}", w.id, w.label);
+        let title_right = format!("X{} ", w.id);
+        let pad_width = title_space.saturating_sub(title_left.len() + title_right.len());
+        let title_combined = if pad_width > 0 {
+            format!("{}{}{}", title_left, " ".repeat(pad_width), title_right)
+        } else {
+            title_left
+        };
+
+        let block = Block::default()
+            .title(Span::styled(title_combined, theme.normal()))
+            .borders(Borders::ALL)
+            .border_style(status_style);
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let content_text: Vec<Line> = w
+            .content
+            .iter()
+            .map(|line| {
+                let style = if line.starts_with("Starting") {
+                    theme.dim()
+                } else if line.starts_with("Finished successfully") {
+                    theme.success()
+                } else if line.starts_with("Failed") {
+                    theme.failed()
+                } else if line.starts_with("Cancelled") {
+                    theme.cancelled()
+                } else if line.starts_with("──") || line.starts_with("--") {
+                    theme.dim()
+                } else {
+                    theme.normal()
+                };
+                Line::from(Span::styled(line.clone(), style))
+            })
+            .collect();
+        let para = Paragraph::new(content_text).wrap(Wrap { trim: false });
+        frame.render_widget(para, inner);
+    }
+}
+
+#[cfg(feature = "tui")]
+fn draw_windows_layout(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    windows_area: Rect,
+    layouts: &[RenderedWindowLayout],
+) {
+    if windows_area.height == 0 || layouts.is_empty() {
+        return;
+    }
+    let mut constraints = Vec::new();
+    let mut active_layouts = Vec::new();
+    for l in layouts {
+        if l.visible && l.height > 0 {
+            constraints.push(Constraint::Length(l.height));
+            active_layouts.push(l);
+        }
+    }
+    let window_areas = Layout::vertical(constraints).split(windows_area);
+    for (area, l) in window_areas.iter().zip(active_layouts) {
+        let w = &state.windows[l.orig_idx];
+        state.window_rects.borrow_mut().push((w.id, *area));
+        draw_single_window(frame, w, l, *area, theme);
+    }
+}
+
+#[cfg(feature = "tui")]
 fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
-    let approval_h: u16 = if state.approval.is_some() { 3 } else { 0 };
+    let approval_h: u16 = if let Some(gate) = &state.approval {
+        if gate.diff.is_some() { 12 } else { 3 }
+    } else {
+        0
+    };
 
     // Input height: 1–6 lines depending on content, always at least 3 (borders).
     let input_lines = state.chat_input_line_count().clamp(1, 6) as u16;
@@ -161,86 +266,7 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
     draw_chat_history(frame, state, theme, history_area);
 
-    if windows_area.height > 0 && !layouts.is_empty() {
-        let mut constraints = Vec::new();
-        let mut active_layouts = Vec::new();
-        for l in &layouts {
-            if l.visible && l.height > 0 {
-                constraints.push(Constraint::Length(l.height));
-                active_layouts.push(l);
-            }
-        }
-        let window_areas = Layout::vertical(constraints).split(windows_area);
-        for (area, l) in window_areas.iter().zip(active_layouts) {
-            let w = &state.windows[l.orig_idx];
-            state.window_rects.borrow_mut().push((w.id, *area));
-
-            let status_style = window_status_style(&w.status, theme);
-            if l.collapsed {
-                // Draw collapsed window as a single summary line
-                let mut spans = vec![
-                    Span::styled(" [+] ", theme.dim()),
-                    Span::styled(format!("{} ", w.id), theme.normal()),
-                    Span::styled(format!("[{}] ", w.status), status_style),
-                    Span::styled(w.label.clone(), theme.normal()),
-                ];
-                let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
-                let right_str = format!(" X{}", w.id);
-                let pad_width = (area.width as usize).saturating_sub(left_len + right_str.len());
-                if pad_width > 0 {
-                    spans.push(Span::raw(" ".repeat(pad_width)));
-                }
-                spans.push(Span::styled(right_str, theme.dim()));
-
-                let line = Line::from(spans);
-                let para = Paragraph::new(line);
-                frame.render_widget(para, *area);
-            } else {
-                // Draw expanded window as a border block
-                let border_width = 2;
-                let title_space = (area.width as usize).saturating_sub(border_width);
-                let title_left = format!(" [-] {} {}", w.id, w.label);
-                let title_right = format!("X{} ", w.id);
-                let pad_width = title_space.saturating_sub(title_left.len() + title_right.len());
-                let title_combined = if pad_width > 0 {
-                    format!("{}{}{}", title_left, " ".repeat(pad_width), title_right)
-                } else {
-                    title_left
-                };
-
-                let block = Block::default()
-                    .title(Span::styled(title_combined, theme.normal()))
-                    .borders(Borders::ALL)
-                    .border_style(status_style);
-
-                let inner = block.inner(*area);
-                frame.render_widget(block, *area);
-
-                let content_text: Vec<Line> = w
-                    .content
-                    .iter()
-                    .map(|line| {
-                        let style = if line.starts_with("Starting") {
-                            theme.dim()
-                        } else if line.starts_with("Finished successfully") {
-                            theme.success()
-                        } else if line.starts_with("Failed") {
-                            theme.failed()
-                        } else if line.starts_with("Cancelled") {
-                            theme.cancelled()
-                        } else if line.starts_with("──") || line.starts_with("--") {
-                            theme.dim()
-                        } else {
-                            theme.normal()
-                        };
-                        Line::from(Span::styled(line.clone(), style))
-                    })
-                    .collect();
-                let para = Paragraph::new(content_text).wrap(Wrap { trim: false });
-                frame.render_widget(para, inner);
-            }
-        }
-    }
+    draw_windows_layout(frame, state, theme, windows_area, &layouts);
 
     if state.approval.is_some() {
         draw_approval(frame, state, theme, approval_a);
@@ -263,11 +289,28 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         (false, false) => (" - ", theme.unhealthy()),
     };
     let health_span = Span::styled(health_char, health_style);
+    let mut http_count = 0;
+    let mut stdio_count = 0;
+    for s in &state.mcp_connections.servers {
+        if s.enabled {
+            match &s.kind {
+                crate::mcp_connections::McpServerKind::Http { .. } => http_count += 1,
+                crate::mcp_connections::McpServerKind::Stdio { .. } => stdio_count += 1,
+            }
+        }
+    }
+    let external_tools = state.mcp_connections.aggregate_tool_names().len();
+    let external_part = if http_count > 0 || stdio_count > 0 {
+        format!(" · ext (http:{http_count} stdio:{stdio_count}) / {external_tools} tools")
+    } else {
+        String::new()
+    };
 
     let line = Line::from(vec![
         Span::styled(" ahma chat", theme.title()),
         Span::styled(format!("  {}", state.llm_label), theme.normal()),
         Span::styled(mcp_label, theme.dim()),
+        Span::styled(external_part, theme.dim()),
         health_span,
         Span::styled(
             format!("{}  q quit  ? help", state.transport_label),
@@ -823,6 +866,48 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         .unwrap_or_default();
 
     let workspace_short = shorten_path(&state.workspace, 30);
+    let mut http_count = 0;
+    let mut stdio_count = 0;
+    for s in &state.mcp_connections.servers {
+        if s.enabled {
+            match &s.kind {
+                crate::mcp_connections::McpServerKind::Http { .. } => http_count += 1,
+                crate::mcp_connections::McpServerKind::Stdio { .. } => stdio_count += 1,
+            }
+        }
+    }
+    let external_tools = state.mcp_connections.aggregate_tool_names().len();
+    let external_part = if http_count > 0 || stdio_count > 0 {
+        format!(" · ext (http:{http_count} stdio:{stdio_count})/{external_tools}")
+    } else {
+        String::new()
+    };
+
+    let tokens_part = if state.token_usage.total_tokens > 0 {
+        let (p, c, t) = (
+            state.token_usage.prompt_tokens,
+            state.token_usage.completion_tokens,
+            state.token_usage.total_tokens,
+        );
+        let p_fmt = if p > 1000 {
+            format!("{:.1}k", p as f64 / 1000.0)
+        } else {
+            p.to_string()
+        };
+        let c_fmt = if c > 1000 {
+            format!("{:.1}k", c as f64 / 1000.0)
+        } else {
+            c.to_string()
+        };
+        let t_fmt = if t > 1000 {
+            format!("{:.1}k", t as f64 / 1000.0)
+        } else {
+            t.to_string()
+        };
+        format!(" · tkns {p_fmt} in / {c_fmt} out ({t_fmt} ttl)")
+    } else {
+        String::new()
+    };
 
     let line = Line::from(vec![
         Span::styled(" ahma", theme.title()),
@@ -831,6 +916,8 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
             format!(" · sandbox {}", state.sandbox_status),
             sandbox_style,
         ),
+        Span::styled(external_part, theme.dim()),
+        Span::styled(tokens_part, theme.pending()),
         Span::styled(format!(" · {workspace_short}"), theme.dim()),
         Span::styled(format!(" · {}", state.transport_label), theme.dim()),
         health_span,
@@ -1263,24 +1350,43 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
     let desc = truncate(&gate.description, (area.width as usize).saturating_sub(50));
     let warn = if state.unicode { "⚠ " } else { "! " };
 
-    let line1 = Line::from(vec![
-        Span::styled(
-            format!(" {warn}APPROVAL REQUIRED  {}", gate.op_id),
-            theme.approval_banner(),
-        ),
-        Span::styled(format!("  {desc}"), theme.approval_banner()),
-        Span::styled(countdown, theme.approval_banner()),
-    ]);
-    let line2 = Line::from(vec![
-        Span::styled("   [y] approve  ", theme.approval_banner()),
-        Span::styled("[n] reject  ", theme.approval_banner()),
-        Span::styled(
-            "[Tab] focus other panels while deciding",
-            theme.approval_banner(),
-        ),
-    ]);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(" {warn}APPROVAL REQUIRED  {}", gate.op_id),
+                theme.approval_banner(),
+            ),
+            Span::styled(format!("  {desc}"), theme.approval_banner()),
+            Span::styled(countdown, theme.approval_banner()),
+        ]),
+        Line::from(vec![
+            Span::styled("   [y] approve  ", theme.approval_banner()),
+            Span::styled("[n] reject  ", theme.approval_banner()),
+            Span::styled(
+                "[Tab] focus other panels while deciding",
+                theme.approval_banner(),
+            ),
+        ]),
+    ];
 
-    let para = Paragraph::new(Text::from(vec![line1, line2])).style(theme.approval_banner());
+    if let Some(diff) = &gate.diff {
+        lines.push(Line::from(""));
+        for diff_line in diff.lines().take(9) {
+            let style = if diff_line.starts_with('+') {
+                theme.success()
+            } else if diff_line.starts_with('-') {
+                theme.failed()
+            } else {
+                theme.normal()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("    {}", diff_line),
+                style,
+            )));
+        }
+    }
+
+    let para = Paragraph::new(Text::from(lines)).style(theme.approval_banner());
     frame.render_widget(para, area);
 }
 

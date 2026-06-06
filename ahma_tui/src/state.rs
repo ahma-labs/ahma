@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::mcp_connections::McpConnectionManager;
 use crate::session_config::TuiSessionConfig;
 #[cfg(feature = "tui")]
 use ratatui::layout::Rect;
@@ -108,6 +109,31 @@ impl ChatHistory {
         self.entries.is_empty()
     }
 
+    /// Compaction: removes ToolCall entries from old history to save tokens.
+    /// `keep_latest` specifies how many of the most recent entries are preserved intact.
+    pub fn compact(&mut self, keep_latest: usize) {
+        let len = self.entries.len();
+        if len <= keep_latest {
+            return;
+        }
+        let cutoff = len - keep_latest;
+
+        let mut new_entries = VecDeque::with_capacity(len);
+        for (i, entry) in self.entries.drain(..).enumerate() {
+            if i >= cutoff {
+                new_entries.push_back(entry);
+            } else {
+                match entry {
+                    ChatEntry::ToolCall { .. } => {
+                        // Drop old tool calls to save context window space
+                    }
+                    other => new_entries.push_back(other),
+                }
+            }
+        }
+        self.entries = new_entries;
+    }
+
     pub fn start_tool_call(&mut self, id: String, name: String, args: String) {
         self.push(ChatEntry::ToolCall {
             id,
@@ -179,6 +205,22 @@ pub fn builtin_commands() -> Vec<NavCommand> {
             description: "disable ahma MCP tool server",
         },
         NavCommand {
+            command: "/mcp list".into(),
+            description: "list configured MCP client servers",
+        },
+        NavCommand {
+            command: "/mcp refresh".into(),
+            description: "refresh tools from configured MCP servers",
+        },
+        NavCommand {
+            command: "/mcp add http <url> [name]".into(),
+            description: "add an HTTP MCP server",
+        },
+        NavCommand {
+            command: "/mcp remove <name>".into(),
+            description: "remove a configured MCP server",
+        },
+        NavCommand {
             command: "/run <tool> {json}".into(),
             description: "invoke an ahma tool directly with optional JSON args",
         },
@@ -205,6 +247,26 @@ pub fn builtin_commands() -> Vec<NavCommand> {
         NavCommand {
             command: "/clear".into(),
             description: "clear chat history",
+        },
+        NavCommand {
+            command: "/agent list".into(),
+            description: "list saved agent profiles",
+        },
+        NavCommand {
+            command: "/agent save <name>".into(),
+            description: "save current setup as an agent profile",
+        },
+        NavCommand {
+            command: "/agent load <name>".into(),
+            description: "load an agent profile",
+        },
+        NavCommand {
+            command: "/agent delete <name>".into(),
+            description: "delete an agent profile",
+        },
+        NavCommand {
+            command: "/export markdown".into(),
+            description: "export chat transcript to markdown",
         },
         NavCommand {
             command: "/exit".into(),
@@ -594,6 +656,7 @@ pub struct ApprovalGate {
     pub op_id: String,
     pub description: String,
     pub deadline: Option<Instant>,
+    pub diff: Option<String>,
 }
 
 impl ApprovalGate {
@@ -691,7 +754,8 @@ pub struct AppState {
     pub operations: Vec<Operation>,
     pub log: VecDeque<LogEntry>,
     pub approval: Option<ApprovalGate>,
-    pub tools_list: Vec<String>,
+    pub tools_list: Vec<crate::mcp_connections::ToolInfo>,
+    pub mcp_connections: McpConnectionManager,
 
     // ── Chat ──
     pub mode: Mode,
@@ -705,6 +769,7 @@ pub struct AppState {
     pub llm_label: String,
     /// Concrete provider URL used for API calls and persisted in session config.
     pub current_provider_url: Option<String>,
+    pub active_profile: Option<String>,
     /// True when ahma-as-MCP is active.
     pub mcp_enabled: bool,
     /// Discovered + configured providers.
@@ -724,6 +789,10 @@ pub struct AppState {
     pub focus: Focus,
     pub ops_selected: usize,
     pub activity_scroll: usize,
+    /// Tracked token usage for the current session.
+    pub token_usage: ahma_llm_monitor::client::TokenUsage,
+
+    // --- Monitor mode state ---
     pub log_scroll: usize,
     pub log_filter: String,
     pub log_filter_active: bool,
@@ -738,6 +807,10 @@ pub struct AppState {
     pub bridge_tx: Option<tokio::sync::mpsc::Sender<crate::llm_bridge::BridgeEvent>>,
     #[cfg(not(feature = "tui"))]
     pub bridge_tx: Option<()>,
+    #[cfg(feature = "tui")]
+    pub approval_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    #[cfg(not(feature = "tui"))]
+    pub approval_tx: Option<()>,
 }
 
 impl AppState {
@@ -769,6 +842,11 @@ impl AppState {
             })
         });
         let mcp_enabled = session.as_ref().map(|s| s.mcp_enabled).unwrap_or(false);
+        let mcp_connections = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| McpConnectionManager::load(&cwd).ok())
+            .unwrap_or_default();
+        let active_profile = session.as_ref().and_then(|s| s.active_profile.clone());
 
         Self {
             server_url: server_url.into(),
@@ -783,12 +861,14 @@ impl AppState {
             log: VecDeque::with_capacity(LOG_RING_CAP),
             approval: None,
             tools_list: vec![],
+            mcp_connections,
 
             mode: Mode::default(),
             chat: ChatHistory::default(),
             chat_input: TextArea::default(),
             llm_label,
             current_provider_url,
+            active_profile,
             mcp_enabled,
             available_providers: vec![],
             available_models: vec![],
@@ -800,6 +880,7 @@ impl AppState {
             focus: Focus::default(),
             ops_selected: 0,
             activity_scroll: 0,
+            token_usage: ahma_llm_monitor::client::TokenUsage::default(),
             log_scroll: 0,
             log_filter: String::new(),
             log_filter_active: false,
@@ -813,6 +894,10 @@ impl AppState {
             unicode,
             should_quit: false,
             bridge_tx: None,
+            #[cfg(feature = "tui")]
+            approval_tx: None,
+            #[cfg(not(feature = "tui"))]
+            approval_tx: None,
         }
     }
 
@@ -954,5 +1039,24 @@ mod tests {
         s.upsert_operation(Operation::new("op1", "cargo_build", OpStatus::Succeeded));
         assert_eq!(s.operations.len(), 1);
         assert_eq!(s.operations[0].status, OpStatus::Succeeded);
+    }
+
+    #[test]
+    fn test_chat_history_compact() {
+        let mut hist = ChatHistory::default();
+        hist.push(ChatEntry::User("Hello!".into()));
+        hist.start_tool_call("call_1".into(), "test_tool".into(), "{}".into());
+        hist.append_token("I ran the tool.");
+        hist.finish_stream();
+        hist.push(ChatEntry::User("Thanks.".into()));
+
+        assert_eq!(hist.entries.len(), 4);
+        hist.compact(1); // Keep the last 1 item ("Thanks.") intact
+
+        // The tool call (at index 1) should be dropped, but user and assistant messages kept.
+        assert_eq!(hist.entries.len(), 3);
+        assert!(matches!(hist.entries[0], ChatEntry::User(_)));
+        assert!(matches!(hist.entries[1], ChatEntry::Assistant { .. }));
+        assert!(matches!(hist.entries[2], ChatEntry::User(_)));
     }
 }

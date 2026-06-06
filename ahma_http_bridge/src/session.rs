@@ -557,41 +557,52 @@ async fn await_response(
 /// Handle sandbox lifecycle notifications received from the subprocess.
 ///
 /// Drives the `SandboxStateMachine` forward based on `notifications/sandbox/*` methods.
+fn handle_sandbox_configured(session: &Arc<Session>) {
+    if let Err(e) = session.sandbox_state_machine.transition_to_active() {
+        warn!(
+            session_id = %session.id,
+            error = %e,
+            "Failed to transition sandbox state to Active (received notifications/sandbox/configured)"
+        );
+    } else {
+        info!(session_id = %session.id, "Observed notifications/sandbox/configured from subprocess - Sandbox is now ACTIVE");
+    }
+}
+
+fn handle_sandbox_failed(session: &Arc<Session>, value: &Value) {
+    let err_msg = value
+        .get("params")
+        .and_then(|p| p.get("error"))
+        .and_then(|e| e.as_str())
+        .unwrap_or("Unknown error");
+    if let Err(e) = session
+        .sandbox_state_machine
+        .transition_to_failed(err_msg.to_string())
+    {
+        warn!(
+            session_id = %session.id,
+            error = %e,
+            "Failed to transition sandbox state to Failed (received notifications/sandbox/failed)"
+        );
+    } else {
+        warn!(
+            session_id = %session.id,
+            error_msg = %err_msg,
+            "Subprocess reported sandbox configuration failed"
+        );
+    }
+}
+
+/// Handle sandbox lifecycle notifications received from the subprocess.
+///
+/// Drives the `SandboxStateMachine` forward based on `notifications/sandbox/*` methods.
 fn handle_sandbox_notification(session: &Arc<Session>, value: &Value) {
     match value.get("method").and_then(Value::as_str) {
         Some("notifications/sandbox/configured") => {
-            if let Err(e) = session.sandbox_state_machine.transition_to_active() {
-                warn!(
-                    session_id = %session.id,
-                    error = %e,
-                    "Failed to transition sandbox state to Active (received notifications/sandbox/configured)"
-                );
-            } else {
-                info!(session_id = %session.id, "Observed notifications/sandbox/configured from subprocess - Sandbox is now ACTIVE");
-            }
+            handle_sandbox_configured(session);
         }
         Some("notifications/sandbox/failed") => {
-            let err_msg = value
-                .get("params")
-                .and_then(|p| p.get("error"))
-                .and_then(|e| e.as_str())
-                .unwrap_or("Unknown error");
-            if let Err(e) = session
-                .sandbox_state_machine
-                .transition_to_failed(err_msg.to_string())
-            {
-                warn!(
-                    session_id = %session.id,
-                    error = %e,
-                    "Failed to transition sandbox state to Failed (received notifications/sandbox/failed)"
-                );
-            } else {
-                warn!(
-                    session_id = %session.id,
-                    error_msg = %err_msg,
-                    "Subprocess reported sandbox configuration failed"
-                );
-            }
+            handle_sandbox_failed(session, value);
         }
         Some(method_str) => {
             debug!(session_id = %session.id, method = %method_str, "Subprocess sent a different notification");

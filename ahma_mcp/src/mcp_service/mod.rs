@@ -612,6 +612,13 @@ impl AhmaMcpService {
         "logs_read",
         "logs_search",
         "restart",
+        "read_file",
+        "list_dir",
+        "file_search",
+        "grep_search",
+        "fetch_webpage",
+        "write_file",
+        "replace_in_file",
     ];
 
     /// Returns true if a configured tool should be exposed to the client
@@ -1076,6 +1083,48 @@ impl ServerHandler for AhmaMcpService {
                     handlers::restart_tool::restart_schema(),
                 )
                 .with_title("restart"),
+                Tool::new(
+                    "read_file",
+                    "Read UTF-8 text from a scoped file, with optional line slicing.",
+                    handlers::harness_tools::read_file_schema(),
+                )
+                .with_title("read_file"),
+                Tool::new(
+                    "list_dir",
+                    "List entries in a scoped directory with basic metadata.",
+                    handlers::harness_tools::list_dir_schema(),
+                )
+                .with_title("list_dir"),
+                Tool::new(
+                    "file_search",
+                    "Find files by glob pattern inside the sandbox scope.",
+                    handlers::harness_tools::file_search_schema(),
+                )
+                .with_title("file_search"),
+                Tool::new(
+                    "grep_search",
+                    "Search file contents by plain text or regex.",
+                    handlers::harness_tools::grep_search_schema(),
+                )
+                .with_title("grep_search"),
+                Tool::new(
+                    "fetch_webpage",
+                    "Fetch and extract readable text from an HTTP/HTTPS webpage.",
+                    handlers::harness_tools::fetch_webpage_schema(),
+                )
+                .with_title("fetch_webpage"),
+                Tool::new(
+                    "write_file",
+                    "Write UTF-8 content to a scoped file (create or overwrite).",
+                    handlers::harness_tools::write_file_schema(),
+                )
+                .with_title("write_file"),
+                Tool::new(
+                    "replace_in_file",
+                    "Replace exact string occurrences in a scoped UTF-8 file.",
+                    handlers::harness_tools::replace_in_file_schema(),
+                )
+                .with_title("replace_in_file"),
             ];
 
             let configs_lock = self.configs.read().unwrap();
@@ -1130,6 +1179,34 @@ impl ServerHandler for AhmaMcpService {
                     self.handle_restart(params.arguments.unwrap_or_default())
                         .await
                 }
+                "read_file" => {
+                    self.handle_read_file(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "list_dir" => {
+                    self.handle_list_dir(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "file_search" => {
+                    self.handle_file_search(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "grep_search" => {
+                    self.handle_grep_search(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "fetch_webpage" => {
+                    self.handle_fetch_webpage(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "write_file" => {
+                    self.handle_write_file(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "replace_in_file" => {
+                    self.handle_replace_in_file(params.arguments.unwrap_or_default())
+                        .await
+                }
                 _ => self.dispatch_configured_tool(params, context).await,
             }
         }
@@ -1177,15 +1254,9 @@ impl AhmaMcpService {
         Ok((config, flattened_subcommand))
     }
 
-    async fn dispatch_resolved_configured_tool(
-        &self,
-        params: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-        config: ToolConfig,
-        flattened_subcommand: Option<String>,
-    ) -> Result<CallToolResult, McpError> {
+    fn get_extension_key(config: &ToolConfig) -> Option<&'static str> {
         if config.tool_type == Some(crate::config::ToolType::Extension) {
-            let extension_key = if config.task_tree.is_some() {
+            if config.task_tree.is_some() {
                 Some("task_tree")
             } else if config.decompose.is_some() {
                 Some("decompose")
@@ -1193,21 +1264,31 @@ impl AhmaMcpService {
                 Some("worker")
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        }
+    }
 
-            if let Some(key) = extension_key {
-                let handler_opt = self.extension_handlers.read().unwrap().get(key).cloned();
-                if let Some(handler) = handler_opt {
-                    return handler
-                        .call(
-                            params,
-                            context,
-                            config,
-                            self.adapter.clone(),
-                            self.operation_monitor.clone(),
-                        )
-                        .await;
-                }
+    async fn dispatch_resolved_configured_tool(
+        &self,
+        params: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+        config: ToolConfig,
+        flattened_subcommand: Option<String>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(key) = Self::get_extension_key(&config) {
+            let handler_opt = self.extension_handlers.read().unwrap().get(key).cloned();
+            if let Some(handler) = handler_opt {
+                return handler
+                    .call(
+                        params,
+                        context,
+                        config,
+                        self.adapter.clone(),
+                        self.operation_monitor.clone(),
+                    )
+                    .await;
             }
         }
 
@@ -1245,6 +1326,82 @@ impl AhmaMcpService {
             .await
     }
 
+    fn resolve_subcommand<'a>(
+        &self,
+        config: &'a ToolConfig,
+        tool_name: &str,
+        arguments: &mut serde_json::Map<String, serde_json::Value>,
+        flattened_subcommand: Option<String>,
+    ) -> Result<(&'a crate::config::SubcommandConfig, Vec<String>), McpError> {
+        let subcommand_name = flattened_subcommand.or_else(|| {
+            arguments
+                .remove("subcommand")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        });
+
+        match subcommand::find_subcommand_config_from_args(config, subcommand_name.clone()) {
+            Some(result) => Ok(result),
+            None => Err(Self::subcommand_not_found_error(
+                tool_name,
+                config,
+                subcommand_name,
+            )),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_subcommand_command(
+        &self,
+        tool_name: &str,
+        base_command: &str,
+        working_directory: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+        timeout: Option<u64>,
+        subcommand_config: &crate::config::SubcommandConfig,
+        config: &ToolConfig,
+        context: RequestContext<RoleServer>,
+        execution_mode: crate::adapter::ExecutionMode,
+    ) -> Result<CallToolResult, McpError> {
+        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let id =
+            crate::utils::operation::generate_id_with_details(counter_val, tool_name, base_command);
+        let progress_token = context.meta.get_progress_token();
+        let client_type = McpClientType::from_peer(&context.peer);
+
+        match execution_mode {
+            crate::adapter::ExecutionMode::Synchronous => {
+                self.call_sync_tool(
+                    id,
+                    base_command,
+                    working_directory,
+                    arguments,
+                    timeout,
+                    subcommand_config,
+                    progress_token,
+                    client_type,
+                    context.peer.clone(),
+                )
+                .await
+            }
+            crate::adapter::ExecutionMode::AsyncResultPush => {
+                self.call_async_tool(
+                    tool_name,
+                    id,
+                    base_command,
+                    working_directory,
+                    arguments,
+                    timeout,
+                    subcommand_config,
+                    config,
+                    progress_token,
+                    client_type,
+                    context.peer.clone(),
+                )
+                .await
+            }
+        }
+    }
+
     /// Resolves the subcommand from arguments, then dispatches either as a
     /// subcommand sequence or a regular sync/async execution.
     async fn dispatch_subcommand_tool(
@@ -1256,23 +1413,16 @@ impl AhmaMcpService {
     ) -> Result<CallToolResult, McpError> {
         let tool_name = params.name.to_string();
         let mut arguments = params.arguments.clone().unwrap_or_default();
-        let subcommand_name = flattened_subcommand.or_else(|| {
-            arguments
-                .remove("subcommand")
-                .and_then(|v| v.as_str().map(|s| s.to_string()))
-        });
 
-        let (subcommand_config, command_parts) =
-            match subcommand::find_subcommand_config_from_args(&config, subcommand_name.clone()) {
-                Some(result) => result,
-                None => {
-                    return Err(Self::subcommand_not_found_error(
-                        &tool_name,
-                        &config,
-                        subcommand_name,
-                    ));
-                }
-            };
+        let (subcommand_config, command_parts) = match self.resolve_subcommand(
+            &config,
+            &tool_name,
+            &mut arguments,
+            flattened_subcommand,
+        ) {
+            Ok(res) => res,
+            Err(e) => return Err(e),
+        };
 
         if subcommand_config.sequence.is_some() {
             return sequence::handle_subcommand_sequence(
@@ -1298,47 +1448,18 @@ impl AhmaMcpService {
         let timeout = arguments.get("timeout_seconds").and_then(|v| v.as_u64());
         let execution_mode = self.determine_execution_mode(subcommand_config, &config, &arguments);
 
-        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-        let id = crate::utils::operation::generate_id_with_details(
-            counter_val,
+        self.execute_subcommand_command(
             &tool_name,
             &base_command,
-        );
-        let progress_token = context.meta.get_progress_token();
-        let client_type = McpClientType::from_peer(&context.peer);
-
-        match execution_mode {
-            crate::adapter::ExecutionMode::Synchronous => {
-                self.call_sync_tool(
-                    id,
-                    &base_command,
-                    &working_directory,
-                    arguments,
-                    timeout,
-                    subcommand_config,
-                    progress_token,
-                    client_type,
-                    context.peer.clone(),
-                )
-                .await
-            }
-            crate::adapter::ExecutionMode::AsyncResultPush => {
-                self.call_async_tool(
-                    &tool_name,
-                    id,
-                    &base_command,
-                    &working_directory,
-                    arguments,
-                    timeout,
-                    subcommand_config,
-                    &config,
-                    progress_token,
-                    client_type,
-                    context.peer.clone(),
-                )
-                .await
-            }
-        }
+            &working_directory,
+            arguments,
+            timeout,
+            subcommand_config,
+            &config,
+            context,
+            execution_mode,
+        )
+        .await
     }
 
     /// Picks the working directory for a tool call: explicit argument first,

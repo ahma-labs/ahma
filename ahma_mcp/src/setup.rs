@@ -160,6 +160,27 @@ impl Platform {
     }
 }
 
+async fn execute_actions(
+    actions: &[SetupAction],
+    platforms: &[Platform],
+    transport: &str,
+    interactive: bool,
+) -> Result<()> {
+    if actions.contains(&SetupAction::Mcp) {
+        setup_mcp_config(platforms, transport, interactive).await?;
+    }
+    if actions.contains(&SetupAction::Hooks) {
+        setup_terminal_hooks(platforms, interactive).await?;
+    }
+    if actions.contains(&SetupAction::Skills) {
+        setup_agent_skills(interactive).await?;
+    }
+    if actions.contains(&SetupAction::Tls) {
+        setup_tls()?;
+    }
+    Ok(())
+}
+
 /// Runs the setup wizard.
 ///
 /// Interactively this asks just two questions: **what** to set up (actions),
@@ -200,18 +221,7 @@ pub async fn run(args: SetupArgs) -> Result<()> {
         "stdio"
     };
 
-    if actions.contains(&SetupAction::Mcp) {
-        setup_mcp_config(&platforms, transport, interactive).await?;
-    }
-    if actions.contains(&SetupAction::Hooks) {
-        setup_terminal_hooks(&platforms, interactive).await?;
-    }
-    if actions.contains(&SetupAction::Skills) {
-        setup_agent_skills(interactive).await?;
-    }
-    if actions.contains(&SetupAction::Tls) {
-        setup_tls()?;
-    }
+    execute_actions(&actions, &platforms, transport, interactive).await?;
 
     if interactive {
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -621,20 +631,9 @@ fn setup_tls() -> Result<()> {
     Ok(())
 }
 
-async fn setup_agent_skills(interactive: bool) -> Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
-
-    // Generic cross-agent path (~/.agents/skills/ahma/SKILL.md)
-    let skill_dir = home.join(".agents").join("skills").join("ahma");
-    let skill_path = skill_dir.join("SKILL.md");
-    std::fs::create_dir_all(&skill_dir)
-        .with_context(|| format!("Failed to create directory {}", skill_dir.display()))?;
-    std::fs::write(&skill_path, SKILL_CONTENT)
-        .with_context(|| format!("Failed to write skill to {}", skill_path.display()))?;
-
-    // Claude Code plugin installation (only if Claude Code is present)
+fn maybe_install_claude_plugin(home: &Path, interactive: bool) {
     if home.join(".claude").exists() {
-        match install_claude_code_plugin(&home) {
+        match install_claude_code_plugin(home) {
             Ok(plugin_dir) => {
                 if interactive {
                     println!(
@@ -650,6 +649,20 @@ async fn setup_agent_skills(interactive: bool) -> Result<()> {
             }
         }
     }
+}
+
+async fn setup_agent_skills(interactive: bool) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
+
+    // Generic cross-agent path (~/.agents/skills/ahma/SKILL.md)
+    let skill_dir = home.join(".agents").join("skills").join("ahma");
+    let skill_path = skill_dir.join("SKILL.md");
+    std::fs::create_dir_all(&skill_dir)
+        .with_context(|| format!("Failed to create directory {}", skill_dir.display()))?;
+    std::fs::write(&skill_path, SKILL_CONTENT)
+        .with_context(|| format!("Failed to write skill to {}", skill_path.display()))?;
+
+    maybe_install_claude_plugin(&home, interactive);
 
     if interactive {
         println!("✓ Installed ahma skill to {}", skill_path.display());

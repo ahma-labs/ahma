@@ -670,6 +670,93 @@ fn sse_single_event_response(session: &crate::session::Session, value: Value) ->
 /// a single acknowledgment event is returned.
 /// Handles requests in session isolation mode (SSE transport).
 #[tracing::instrument(skip_all, fields(method, session_id))]
+fn build_interleaved_sse_stream(
+    session: Arc<crate::session::Session>,
+    session_id: String,
+    rx: tokio::sync::broadcast::Receiver<(u64, String)>,
+    response: Value,
+) -> impl futures::Stream<Item = Result<Event, Infallible>> {
+    let (response_id, response_json) = session_sse_event(&session, &response);
+
+    let session_clone = session.clone();
+    let sid = session_id;
+    let notification_stream = BroadcastStream::new(rx).filter_map(move |result| {
+        let sid = sid.clone();
+        let session_ref = session_clone.clone();
+        async move {
+            match result {
+                Ok((id, msg)) => {
+                    debug!(session_id = %sid, event_id = id, "POST SSE notification: {}", msg);
+                    Some(Ok::<_, Infallible>(sse_event(id, msg)))
+                }
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    session_ref.record_lagged_events(n);
+                    Some(Ok(
+                        Event::default().comment(format!("lagged: {} events dropped", n))
+                    ))
+                }
+            }
+        }
+    });
+
+    let response_event =
+        stream::once(async move { Ok::<_, Infallible>(sse_event(response_id, response_json)) });
+
+    notification_stream
+        .take_until(tokio::time::sleep(Duration::from_millis(50)))
+        .chain(response_event)
+}
+
+async fn check_sse_request_gating(
+    session_manager: &SessionManager,
+    session_id: &str,
+    method: Option<&str>,
+    payload: &Value,
+    is_initialized_notification: bool,
+) -> Option<Response> {
+    // Validate session exists
+    if let Some(response) = check_session_exists(session_manager, session_id) {
+        return Some(response);
+    }
+
+    // Client responses and notifications that modify state use the same JSON path
+    let is_client_response = is_client_response(method, payload);
+    if is_client_response {
+        return Some(handle_client_response(session_manager, session_id, payload).await);
+    }
+
+    // Roots changed check
+    if method == Some("notifications/roots/list_changed")
+        && let Some(response) = handle_roots_changed_request(session_manager, session_id).await
+    {
+        return Some(response);
+    }
+
+    // Sandbox gating for tools/call
+    if method == Some("tools/call")
+        && let Some(response) = check_sandbox_lock(session_manager, session_id)
+    {
+        return Some(response);
+    }
+
+    // Wait for MCP initialization if needed
+    if let Some(response) = check_initialization_required(
+        session_manager,
+        session_id,
+        method,
+        is_initialized_notification,
+        false,
+    )
+    .await
+    {
+        return Some(response);
+    }
+
+    None
+}
+
+/// Handles requests in session isolation mode (SSE transport).
+#[tracing::instrument(skip_all, fields(method, session_id))]
 pub async fn handle_session_isolated_request_sse(
     session_manager: Arc<SessionManager>,
     headers: HeaderMap,
@@ -695,40 +782,14 @@ pub async fn handle_session_isolated_request_sse(
         return missing_session_id_response();
     };
 
-    // Validate session exists
-    if let Some(response) = check_session_exists(&session_manager, &session_id) {
-        return response;
-    }
-
-    // Client responses and notifications that modify state use the same JSON path
-    let is_client_response = is_client_response(method, &payload);
-    if is_client_response {
-        return handle_client_response(&session_manager, &session_id, &payload).await;
-    }
-
-    // Roots changed check
-    if method == Some("notifications/roots/list_changed")
-        && let Some(response) = handle_roots_changed_request(&session_manager, &session_id).await
-    {
-        return response;
-    }
-
-    // Sandbox gating for tools/call
-    if method == Some("tools/call")
-        && let Some(response) = check_sandbox_lock(&session_manager, &session_id)
-    {
-        return response;
-    }
-
     let is_initialized_notification = method == Some("notifications/initialized");
 
-    // Wait for MCP initialization if needed
-    if let Some(response) = check_initialization_required(
+    if let Some(response) = check_sse_request_gating(
         &session_manager,
         &session_id,
         method,
+        &payload,
         is_initialized_notification,
-        false,
     )
     .await
     {
@@ -860,48 +921,8 @@ async fn forward_request_sse(
                 .await;
 
             // Build SSE stream: broadcast events that arrived during processing + the response
-            let (response_id, response_json) = session_sse_event(&session, &response);
-
-            // Collect any broadcast events that arrived while waiting for the response
-            let session_clone = session.clone();
-            let sid = session_id.to_string();
-            let notification_stream =
-                BroadcastStream::new(rx).filter_map(move |result| {
-                    let sid = sid.clone();
-                    let session_ref = session_clone.clone();
-                    async move {
-                        match result {
-                            Ok((id, msg)) => {
-                                debug!(session_id = %sid, event_id = id, "POST SSE notification: {}", msg);
-                                Some(Ok::<_, Infallible>(sse_event(id, msg)))
-                            }
-                            Err(
-                                tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(
-                                    n,
-                                ),
-                            ) => {
-                                session_ref.record_lagged_events(n);
-                                Some(Ok(Event::default().comment(format!(
-                                    "lagged: {} events dropped",
-                                    n
-                                ))))
-                            }
-                        }
-                    }
-                });
-
-            // The response event is emitted last, then the stream closes
-            let response_event =
-                stream::once(
-                    async move { Ok::<_, Infallible>(sse_event(response_id, response_json)) },
-                );
-
-            // Take only notifications that arrived before the response, then emit response
-            // Since we already awaited the response, any events in the broadcast channel
-            // were emitted during request processing. We take a small window then close.
-            let combined = notification_stream
-                .take_until(tokio::time::sleep(Duration::from_millis(50)))
-                .chain(response_event);
+            let combined =
+                build_interleaved_sse_stream(session, session_id.to_string(), rx, response);
 
             with_session_header(
                 Sse::new(combined)
