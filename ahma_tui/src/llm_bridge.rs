@@ -46,6 +46,7 @@ pub enum BridgeEvent {
         args: String,
         tx: tokio::sync::oneshot::Sender<bool>,
     },
+    Usage(ahma_llm_monitor::client::TokenUsage),
 }
 
 #[derive(Clone)]
@@ -182,6 +183,10 @@ pub fn spawn_agent_task(
                     return;
                 }
             };
+
+            if let Some(usage) = &completion.usage {
+                let _ = tx.send(BridgeEvent::Usage(usage.clone())).await;
+            }
 
             let assistant_content = completion.content.clone();
             msg_json.push(serde_json::json!({

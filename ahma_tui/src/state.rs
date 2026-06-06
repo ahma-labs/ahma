@@ -109,6 +109,31 @@ impl ChatHistory {
         self.entries.is_empty()
     }
 
+    /// Compaction: removes ToolCall entries from old history to save tokens.
+    /// `keep_latest` specifies how many of the most recent entries are preserved intact.
+    pub fn compact(&mut self, keep_latest: usize) {
+        let len = self.entries.len();
+        if len <= keep_latest {
+            return;
+        }
+        let cutoff = len - keep_latest;
+
+        let mut new_entries = VecDeque::with_capacity(len);
+        for (i, entry) in self.entries.drain(..).enumerate() {
+            if i >= cutoff {
+                new_entries.push_back(entry);
+            } else {
+                match entry {
+                    ChatEntry::ToolCall { .. } => {
+                        // Drop old tool calls to save context window space
+                    }
+                    other => new_entries.push_back(other),
+                }
+            }
+        }
+        self.entries = new_entries;
+    }
+
     pub fn start_tool_call(&mut self, id: String, name: String, args: String) {
         self.push(ChatEntry::ToolCall {
             id,
@@ -631,6 +656,7 @@ pub struct ApprovalGate {
     pub op_id: String,
     pub description: String,
     pub deadline: Option<Instant>,
+    pub diff: Option<String>,
 }
 
 impl ApprovalGate {
@@ -763,6 +789,10 @@ pub struct AppState {
     pub focus: Focus,
     pub ops_selected: usize,
     pub activity_scroll: usize,
+    /// Tracked token usage for the current session.
+    pub token_usage: ahma_llm_monitor::client::TokenUsage,
+
+    // --- Monitor mode state ---
     pub log_scroll: usize,
     pub log_filter: String,
     pub log_filter_active: bool,
@@ -850,6 +880,7 @@ impl AppState {
             focus: Focus::default(),
             ops_selected: 0,
             activity_scroll: 0,
+            token_usage: ahma_llm_monitor::client::TokenUsage::default(),
             log_scroll: 0,
             log_filter: String::new(),
             log_filter_active: false,
@@ -1008,5 +1039,24 @@ mod tests {
         s.upsert_operation(Operation::new("op1", "cargo_build", OpStatus::Succeeded));
         assert_eq!(s.operations.len(), 1);
         assert_eq!(s.operations[0].status, OpStatus::Succeeded);
+    }
+
+    #[test]
+    fn test_chat_history_compact() {
+        let mut hist = ChatHistory::default();
+        hist.push(ChatEntry::User("Hello!".into()));
+        hist.start_tool_call("call_1".into(), "test_tool".into(), "{}".into());
+        hist.append_token("I ran the tool.");
+        hist.finish_stream();
+        hist.push(ChatEntry::User("Thanks.".into()));
+
+        assert_eq!(hist.entries.len(), 4);
+        hist.compact(1); // Keep the last 1 item ("Thanks.") intact
+
+        // The tool call (at index 1) should be dropped, but user and assistant messages kept.
+        assert_eq!(hist.entries.len(), 3);
+        assert!(matches!(hist.entries[0], ChatEntry::User(_)));
+        assert!(matches!(hist.entries[1], ChatEntry::Assistant { .. }));
+        assert!(matches!(hist.entries[2], ChatEntry::User(_)));
     }
 }

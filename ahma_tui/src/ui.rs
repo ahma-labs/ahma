@@ -127,7 +127,11 @@ fn window_status_style(status: &str, theme: &Theme) -> Style {
 #[cfg(feature = "tui")]
 fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
-    let approval_h: u16 = if state.approval.is_some() { 3 } else { 0 };
+    let approval_h: u16 = if let Some(gate) = &state.approval {
+        if gate.diff.is_some() { 12 } else { 3 }
+    } else {
+        0
+    };
 
     // Input height: 1–6 lines depending on content, always at least 3 (borders).
     let input_lines = state.chat_input_line_count().clamp(1, 6) as u16;
@@ -857,6 +861,32 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         String::new()
     };
 
+    let tokens_part = if state.token_usage.total_tokens > 0 {
+        let (p, c, t) = (
+            state.token_usage.prompt_tokens,
+            state.token_usage.completion_tokens,
+            state.token_usage.total_tokens,
+        );
+        let p_fmt = if p > 1000 {
+            format!("{:.1}k", p as f64 / 1000.0)
+        } else {
+            p.to_string()
+        };
+        let c_fmt = if c > 1000 {
+            format!("{:.1}k", c as f64 / 1000.0)
+        } else {
+            c.to_string()
+        };
+        let t_fmt = if t > 1000 {
+            format!("{:.1}k", t as f64 / 1000.0)
+        } else {
+            t.to_string()
+        };
+        format!(" · tkns {p_fmt} in / {c_fmt} out ({t_fmt} ttl)")
+    } else {
+        String::new()
+    };
+
     let line = Line::from(vec![
         Span::styled(" ahma", theme.title()),
         Span::styled(session_part, theme.dim()),
@@ -865,6 +895,7 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
             sandbox_style,
         ),
         Span::styled(external_part, theme.dim()),
+        Span::styled(tokens_part, theme.pending()),
         Span::styled(format!(" · {workspace_short}"), theme.dim()),
         Span::styled(format!(" · {}", state.transport_label), theme.dim()),
         health_span,
@@ -1297,24 +1328,43 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
     let desc = truncate(&gate.description, (area.width as usize).saturating_sub(50));
     let warn = if state.unicode { "⚠ " } else { "! " };
 
-    let line1 = Line::from(vec![
-        Span::styled(
-            format!(" {warn}APPROVAL REQUIRED  {}", gate.op_id),
-            theme.approval_banner(),
-        ),
-        Span::styled(format!("  {desc}"), theme.approval_banner()),
-        Span::styled(countdown, theme.approval_banner()),
-    ]);
-    let line2 = Line::from(vec![
-        Span::styled("   [y] approve  ", theme.approval_banner()),
-        Span::styled("[n] reject  ", theme.approval_banner()),
-        Span::styled(
-            "[Tab] focus other panels while deciding",
-            theme.approval_banner(),
-        ),
-    ]);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(" {warn}APPROVAL REQUIRED  {}", gate.op_id),
+                theme.approval_banner(),
+            ),
+            Span::styled(format!("  {desc}"), theme.approval_banner()),
+            Span::styled(countdown, theme.approval_banner()),
+        ]),
+        Line::from(vec![
+            Span::styled("   [y] approve  ", theme.approval_banner()),
+            Span::styled("[n] reject  ", theme.approval_banner()),
+            Span::styled(
+                "[Tab] focus other panels while deciding",
+                theme.approval_banner(),
+            ),
+        ]),
+    ];
 
-    let para = Paragraph::new(Text::from(vec![line1, line2])).style(theme.approval_banner());
+    if let Some(diff) = &gate.diff {
+        lines.push(Line::from(""));
+        for diff_line in diff.lines().take(9) {
+            let style = if diff_line.starts_with('+') {
+                theme.success()
+            } else if diff_line.starts_with('-') {
+                theme.failed()
+            } else {
+                theme.normal()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("    {}", diff_line),
+                style,
+            )));
+        }
+    }
+
+    let para = Paragraph::new(Text::from(lines)).style(theme.approval_banner());
     frame.render_widget(para, area);
 }
 

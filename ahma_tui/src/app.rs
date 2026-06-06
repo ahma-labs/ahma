@@ -993,6 +993,16 @@ fn handle_chat_input_key(
             state.should_quit = true;
             true
         }
+        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+            if state.chat_input_is_empty() {
+                state.chat_input.insert_str("/run ");
+                let tools = state.tools_list.clone();
+                state.navigator.open(&tools);
+                state.navigator.input = "run ".to_string();
+                state.navigator.refresh_completions(&tools);
+            }
+            true
+        }
         (KeyCode::Tab, KeyModifiers::NONE) => {
             handle_action(crate::keymap::Action::Tab, state);
             true
@@ -1101,6 +1111,10 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
     match cmd {
         "/help" => state.show_help = true,
         "/clear" => state.chat.clear(),
+        "/compact" => {
+            state.chat.compact(4);
+            push_assistant_message(state, "Context window compacted (kept 4 latest turns).");
+        }
         "/operations" => set_mode_and_focus(
             state,
             crate::state::Mode::Monitor,
@@ -1778,6 +1792,11 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             state.chat.append_token(&token);
             state.chat_scroll = 0;
         }
+        BridgeEvent::Usage(usage) => {
+            state.token_usage.prompt_tokens += usage.prompt_tokens;
+            state.token_usage.completion_tokens += usage.completion_tokens;
+            state.token_usage.total_tokens += usage.total_tokens;
+        }
         BridgeEvent::Done => {
             state.chat.finish_stream();
             if let Some(profile) = &state.active_profile
@@ -1928,10 +1947,19 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             push_assistant_message(state, "External MCP tools refreshed.");
         }
         BridgeEvent::RequestApproval { id, tool, args, tx } => {
+            let diff = if tool.contains("replace") || tool == "write_file" {
+                serde_json::from_str::<serde_json::Value>(&args)
+                    .ok()
+                    .and_then(|val| serde_json::to_string_pretty(&val).ok())
+            } else {
+                None
+            };
+
             state.approval = Some(crate::state::ApprovalGate {
                 op_id: id,
-                description: format!("Execute tool {tool} with args {args}"),
+                description: format!("Execute tool {tool}"),
                 deadline: None,
+                diff,
             });
             state.approval_tx = Some(tx);
         }
@@ -2411,6 +2439,7 @@ mod tests {
             op_id: "op_test".to_string(),
             description: "test".to_string(),
             deadline: None,
+            diff: None,
         });
         state.approval_tx = Some(tx);
 
