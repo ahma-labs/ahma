@@ -269,6 +269,8 @@ impl ClientBuilder {
                 cmd.env(k, v);
             }
 
+            cmd.env("NEXTEST", "1");
+
             configure_tools_dir_env(cmd, tools_dir, working_dir);
 
             cmd.args(extra_args);
