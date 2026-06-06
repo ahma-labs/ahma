@@ -206,7 +206,7 @@ async fn mcp_source_emits_tools_list() {
     .await
     .expect("timed out waiting for ToolsListUpdated event");
     assert!(
-        tools.contains(&"mock_tool".to_string()),
+        tools.iter().any(|t| t.name == "mock_tool"),
         "expected 'mock_tool' in tools list, got: {tools:?}"
     );
 }

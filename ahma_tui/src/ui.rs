@@ -125,6 +125,107 @@ fn window_status_style(status: &str, theme: &Theme) -> Style {
 }
 
 #[cfg(feature = "tui")]
+fn draw_single_window(
+    frame: &mut Frame,
+    w: &crate::state::TuiWindow,
+    l: &RenderedWindowLayout,
+    area: Rect,
+    theme: &Theme,
+) {
+    let status_style = window_status_style(&w.status, theme);
+    if l.collapsed {
+        // Draw collapsed window as a single summary line
+        let mut spans = vec![
+            Span::styled(" [+] ", theme.dim()),
+            Span::styled(format!("{} ", w.id), theme.normal()),
+            Span::styled(format!("[{}] ", w.status), status_style),
+            Span::styled(w.label.clone(), theme.normal()),
+        ];
+        let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
+        let right_str = format!(" X{}", w.id);
+        let pad_width = (area.width as usize).saturating_sub(left_len + right_str.len());
+        if pad_width > 0 {
+            spans.push(Span::raw(" ".repeat(pad_width)));
+        }
+        spans.push(Span::styled(right_str, theme.dim()));
+
+        let line = Line::from(spans);
+        let para = Paragraph::new(line);
+        frame.render_widget(para, area);
+    } else {
+        // Draw expanded window as a border block
+        let border_width = 2;
+        let title_space = (area.width as usize).saturating_sub(border_width);
+        let title_left = format!(" [-] {} {}", w.id, w.label);
+        let title_right = format!("X{} ", w.id);
+        let pad_width = title_space.saturating_sub(title_left.len() + title_right.len());
+        let title_combined = if pad_width > 0 {
+            format!("{}{}{}", title_left, " ".repeat(pad_width), title_right)
+        } else {
+            title_left
+        };
+
+        let block = Block::default()
+            .title(Span::styled(title_combined, theme.normal()))
+            .borders(Borders::ALL)
+            .border_style(status_style);
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let content_text: Vec<Line> = w
+            .content
+            .iter()
+            .map(|line| {
+                let style = if line.starts_with("Starting") {
+                    theme.dim()
+                } else if line.starts_with("Finished successfully") {
+                    theme.success()
+                } else if line.starts_with("Failed") {
+                    theme.failed()
+                } else if line.starts_with("Cancelled") {
+                    theme.cancelled()
+                } else if line.starts_with("──") || line.starts_with("--") {
+                    theme.dim()
+                } else {
+                    theme.normal()
+                };
+                Line::from(Span::styled(line.clone(), style))
+            })
+            .collect();
+        let para = Paragraph::new(content_text).wrap(Wrap { trim: false });
+        frame.render_widget(para, inner);
+    }
+}
+
+#[cfg(feature = "tui")]
+fn draw_windows_layout(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    windows_area: Rect,
+    layouts: &[RenderedWindowLayout],
+) {
+    if windows_area.height == 0 || layouts.is_empty() {
+        return;
+    }
+    let mut constraints = Vec::new();
+    let mut active_layouts = Vec::new();
+    for l in layouts {
+        if l.visible && l.height > 0 {
+            constraints.push(Constraint::Length(l.height));
+            active_layouts.push(l);
+        }
+    }
+    let window_areas = Layout::vertical(constraints).split(windows_area);
+    for (area, l) in window_areas.iter().zip(active_layouts) {
+        let w = &state.windows[l.orig_idx];
+        state.window_rects.borrow_mut().push((w.id, *area));
+        draw_single_window(frame, w, l, *area, theme);
+    }
+}
+
+#[cfg(feature = "tui")]
 fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
     let approval_h: u16 = if let Some(gate) = &state.approval {
@@ -165,86 +266,7 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
 
     draw_chat_history(frame, state, theme, history_area);
 
-    if windows_area.height > 0 && !layouts.is_empty() {
-        let mut constraints = Vec::new();
-        let mut active_layouts = Vec::new();
-        for l in &layouts {
-            if l.visible && l.height > 0 {
-                constraints.push(Constraint::Length(l.height));
-                active_layouts.push(l);
-            }
-        }
-        let window_areas = Layout::vertical(constraints).split(windows_area);
-        for (area, l) in window_areas.iter().zip(active_layouts) {
-            let w = &state.windows[l.orig_idx];
-            state.window_rects.borrow_mut().push((w.id, *area));
-
-            let status_style = window_status_style(&w.status, theme);
-            if l.collapsed {
-                // Draw collapsed window as a single summary line
-                let mut spans = vec![
-                    Span::styled(" [+] ", theme.dim()),
-                    Span::styled(format!("{} ", w.id), theme.normal()),
-                    Span::styled(format!("[{}] ", w.status), status_style),
-                    Span::styled(w.label.clone(), theme.normal()),
-                ];
-                let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
-                let right_str = format!(" X{}", w.id);
-                let pad_width = (area.width as usize).saturating_sub(left_len + right_str.len());
-                if pad_width > 0 {
-                    spans.push(Span::raw(" ".repeat(pad_width)));
-                }
-                spans.push(Span::styled(right_str, theme.dim()));
-
-                let line = Line::from(spans);
-                let para = Paragraph::new(line);
-                frame.render_widget(para, *area);
-            } else {
-                // Draw expanded window as a border block
-                let border_width = 2;
-                let title_space = (area.width as usize).saturating_sub(border_width);
-                let title_left = format!(" [-] {} {}", w.id, w.label);
-                let title_right = format!("X{} ", w.id);
-                let pad_width = title_space.saturating_sub(title_left.len() + title_right.len());
-                let title_combined = if pad_width > 0 {
-                    format!("{}{}{}", title_left, " ".repeat(pad_width), title_right)
-                } else {
-                    title_left
-                };
-
-                let block = Block::default()
-                    .title(Span::styled(title_combined, theme.normal()))
-                    .borders(Borders::ALL)
-                    .border_style(status_style);
-
-                let inner = block.inner(*area);
-                frame.render_widget(block, *area);
-
-                let content_text: Vec<Line> = w
-                    .content
-                    .iter()
-                    .map(|line| {
-                        let style = if line.starts_with("Starting") {
-                            theme.dim()
-                        } else if line.starts_with("Finished successfully") {
-                            theme.success()
-                        } else if line.starts_with("Failed") {
-                            theme.failed()
-                        } else if line.starts_with("Cancelled") {
-                            theme.cancelled()
-                        } else if line.starts_with("──") || line.starts_with("--") {
-                            theme.dim()
-                        } else {
-                            theme.normal()
-                        };
-                        Line::from(Span::styled(line.clone(), style))
-                    })
-                    .collect();
-                let para = Paragraph::new(content_text).wrap(Wrap { trim: false });
-                frame.render_widget(para, inner);
-            }
-        }
-    }
+    draw_windows_layout(frame, state, theme, windows_area, &layouts);
 
     if state.approval.is_some() {
         draw_approval(frame, state, theme, approval_a);

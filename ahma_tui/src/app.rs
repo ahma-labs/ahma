@@ -540,7 +540,7 @@ fn close_palette(state: &mut crate::state::AppState) {
 
 #[cfg(feature = "tui")]
 fn refresh_palette_completions(state: &mut crate::state::AppState) {
-    let tools = state.tools_list.clone();
+    let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
     state.palette.update_completions(&tools);
 }
 
@@ -889,13 +889,13 @@ fn handle_navigator_action(
 
 #[cfg(feature = "tui")]
 fn open_navigator(state: &mut crate::state::AppState) {
-    let tools = state.tools_list.clone();
+    let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
     state.navigator.open(&tools);
 }
 
 #[cfg(feature = "tui")]
 fn refresh_navigator_completions(state: &mut crate::state::AppState) {
-    let tools = state.tools_list.clone();
+    let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
     state.navigator.refresh_completions(&tools);
 }
 
@@ -996,7 +996,7 @@ fn handle_chat_input_key(
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
             if state.chat_input_is_empty() {
                 state.chat_input.insert_str("/run ");
-                let tools = state.tools_list.clone();
+                let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
                 state.navigator.open(&tools);
                 state.navigator.input = "run ".to_string();
                 state.navigator.refresh_completions(&tools);
@@ -1020,7 +1020,7 @@ fn handle_chat_input_key(
             true
         }
         (KeyCode::Char('/'), KeyModifiers::NONE) if state.chat_input_is_empty() => {
-            let tools = state.tools_list.clone();
+            let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
             state.navigator.open(&tools);
             true
         }
@@ -1411,13 +1411,17 @@ fn handle_export_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
 }
 
 #[cfg(feature = "tui")]
-fn format_tools_list_message(tools: &[String]) -> String {
+fn format_tools_list_message(tools: &[crate::mcp_connections::ToolInfo]) -> String {
     if tools.is_empty() {
         return "No tools discovered yet.".to_string();
     }
     let mut content = format!("{} tool(s) available:\n", tools.len());
     for tool in tools {
-        content.push_str(&format!("- {tool}\n"));
+        if let Some(desc) = &tool.description {
+            content.push_str(&format!("- **{}**: {}\n", tool.name, desc));
+        } else {
+            content.push_str(&format!("- {}\n", tool.name));
+        }
     }
     content.trim_end().to_string()
 }
@@ -1596,7 +1600,7 @@ fn validate_nav_tool_run(tool: &str, state: &crate::state::AppState) -> Result<(
     if state.mcp_http_base_url.is_empty() {
         return Err("Cannot run tools because the ahma MCP bridge URL is unavailable.".to_string());
     }
-    if !state.tools_list.is_empty() && !state.tools_list.iter().any(|known| known == tool) {
+    if !state.tools_list.is_empty() && !state.tools_list.iter().any(|known| known.name == tool) {
         return Err(format!(
             "Unknown tool `{tool}`. Use /tools to inspect the current tool list."
         ));
@@ -1783,6 +1787,114 @@ fn handle_models_refreshed(
 }
 
 #[cfg(feature = "tui")]
+fn handle_decomposed_event(
+    steps: Vec<ahma_task_tree::parser::ParsedStep>,
+    state: &mut crate::state::AppState,
+) {
+    for step in steps {
+        let win_id = state.next_window_id;
+        state.next_window_id = (state.next_window_id + 1) % 100;
+
+        let is_cli = step.r#type.as_str() == "shell_command";
+
+        let label = if is_cli {
+            format!(
+                "Command: {} in {}",
+                step.command.as_deref().unwrap_or(&step.task),
+                crate::ui::shorten_path(&state.workspace, 20)
+            )
+        } else {
+            format!("LLM Call (model: {})", state.selected_model())
+        };
+
+        let command = if is_cli {
+            step.command.clone().unwrap_or(step.task.clone())
+        } else {
+            step.instructions.clone().unwrap_or(step.task.clone())
+        };
+
+        let w = crate::state::TuiWindow {
+            id: win_id,
+            label,
+            status: "Pending".to_string(),
+            content: vec![format!("Task: {}", step.task)],
+            collapsed: false,
+            finished_at: None,
+            is_cli,
+            command,
+            working_dir: state.workspace.clone(),
+            llm_model: if is_cli {
+                None
+            } else {
+                Some(state.selected_model())
+            },
+            visible: true,
+            abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            op_id: None,
+        };
+
+        state.windows.push(w);
+        if state.windows.len() > 100 {
+            state.windows.remove(0);
+        }
+    }
+
+    run_next_pending_window(state);
+}
+
+#[cfg(feature = "tui")]
+fn handle_window_output_event(window_id: usize, line: String, state: &mut crate::state::AppState) {
+    if let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) {
+        if w.is_cli {
+            w.content.push(line);
+        } else {
+            if w.content.is_empty() {
+                w.content.push(String::new());
+            }
+            let parts: Vec<&str> = line.split('\n').collect();
+            if let Some(last) = w.content.last_mut() {
+                last.push_str(parts[0]);
+            }
+            for part in parts.iter().skip(1) {
+                w.content.push(part.to_string());
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_window_finished_event(
+    window_id: usize,
+    success: bool,
+    summary: String,
+    state: &mut crate::state::AppState,
+) {
+    let mut current_failed = false;
+    if let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) {
+        w.status = if success {
+            "Finished".to_string()
+        } else {
+            "Error".to_string()
+        };
+        w.content.push(summary);
+        w.finished_at = Some(std::time::Instant::now());
+        if !success {
+            current_failed = true;
+        }
+    }
+    if current_failed {
+        for w in &mut state.windows {
+            if w.status == "Pending" {
+                w.status = "Cancelled".to_string();
+                w.finished_at = Some(std::time::Instant::now());
+            }
+        }
+    } else {
+        run_next_pending_window(state);
+    }
+}
+
+#[cfg(feature = "tui")]
 fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate::state::AppState) {
     use crate::llm_bridge::BridgeEvent;
     use crate::state::ChatEntry;
@@ -1823,102 +1935,17 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             state.chat_scroll = 0;
         }
         BridgeEvent::Decomposed { steps } => {
-            for step in steps {
-                let win_id = state.next_window_id;
-                state.next_window_id = (state.next_window_id + 1) % 100;
-
-                let is_cli = step.r#type.as_str() == "shell_command";
-
-                let label = if is_cli {
-                    format!(
-                        "Command: {} in {}",
-                        step.command.as_deref().unwrap_or(&step.task),
-                        crate::ui::shorten_path(&state.workspace, 20)
-                    )
-                } else {
-                    format!("LLM Call (model: {})", state.selected_model())
-                };
-
-                let command = if is_cli {
-                    step.command.clone().unwrap_or(step.task.clone())
-                } else {
-                    step.instructions.clone().unwrap_or(step.task.clone())
-                };
-
-                let w = crate::state::TuiWindow {
-                    id: win_id,
-                    label,
-                    status: "Pending".to_string(),
-                    content: vec![format!("Task: {}", step.task)],
-                    collapsed: false,
-                    finished_at: None,
-                    is_cli,
-                    command,
-                    working_dir: state.workspace.clone(),
-                    llm_model: if is_cli {
-                        None
-                    } else {
-                        Some(state.selected_model())
-                    },
-                    visible: true,
-                    abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-                    op_id: None,
-                };
-
-                state.windows.push(w);
-                if state.windows.len() > 100 {
-                    state.windows.remove(0);
-                }
-            }
-
-            run_next_pending_window(state);
+            handle_decomposed_event(steps, state);
         }
         BridgeEvent::WindowOutput { window_id, line } => {
-            if let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) {
-                if w.is_cli {
-                    w.content.push(line);
-                } else {
-                    if w.content.is_empty() {
-                        w.content.push(String::new());
-                    }
-                    let parts: Vec<&str> = line.split('\n').collect();
-                    if let Some(last) = w.content.last_mut() {
-                        last.push_str(parts[0]);
-                    }
-                    for part in parts.iter().skip(1) {
-                        w.content.push(part.to_string());
-                    }
-                }
-            }
+            handle_window_output_event(window_id, line, state);
         }
         BridgeEvent::WindowFinished {
             window_id,
             success,
             summary,
         } => {
-            let mut current_failed = false;
-            if let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) {
-                w.status = if success {
-                    "Finished".to_string()
-                } else {
-                    "Error".to_string()
-                };
-                w.content.push(summary);
-                w.finished_at = Some(std::time::Instant::now());
-                if !success {
-                    current_failed = true;
-                }
-            }
-            if current_failed {
-                for w in &mut state.windows {
-                    if w.status == "Pending" {
-                        w.status = "Cancelled".to_string();
-                        w.finished_at = Some(std::time::Instant::now());
-                    }
-                }
-            } else {
-                run_next_pending_window(state);
-            }
+            handle_window_finished_event(window_id, success, summary, state);
         }
         BridgeEvent::ToolCallStarted { id, name, args } => {
             state.chat.start_tool_call(id, name, args);
@@ -1937,12 +1964,12 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
         BridgeEvent::ExternalToolsRefreshed { manager } => {
             state.mcp_connections = manager;
             let mut merged = state.tools_list.clone();
-            for tool in state.mcp_connections.aggregate_tool_names() {
-                if !merged.contains(&tool) {
+            for tool in state.mcp_connections.aggregate_tools() {
+                if !merged.iter().any(|existing| existing.name == tool.name) {
                     merged.push(tool);
                 }
             }
-            merged.sort();
+            merged.sort_by(|a, b| a.name.cmp(&b.name));
             state.tools_list = merged;
             push_assistant_message(state, "External MCP tools refreshed.");
         }
@@ -2210,9 +2237,12 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         SourceEvent::LogLine(entry) => state.push_log(entry),
         SourceEvent::ToolsListUpdated { tools } => {
             let mut merged = tools;
-            merged.extend(state.mcp_connections.aggregate_tool_names());
-            merged.sort();
-            merged.dedup();
+            for t in state.mcp_connections.aggregate_tools() {
+                if !merged.iter().any(|existing| existing.name == t.name) {
+                    merged.push(t);
+                }
+            }
+            merged.sort_by(|a, b| a.name.cmp(&b.name));
             state.tools_list = merged;
         }
         SourceEvent::SandboxStatus { status } => state.sandbox_status = status,

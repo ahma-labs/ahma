@@ -481,6 +481,44 @@ struct Row {
 }
 
 /// Entry point for the `safe-update` subcommand.
+fn pin_skipped_dependencies(root: &Path, rows: &[Row]) {
+    println!("Pinning skipped/unsafe dependencies to current versions in Cargo.lock…");
+    for row in rows {
+        if row.status.starts_with("skipped:") {
+            println!(
+                "  Pinning {name} to {version}…",
+                name = row.name,
+                version = row.old_ver
+            );
+            let _ = std::process::Command::new("cargo")
+                .args(["update", "-p", &row.name, "--precise", &row.old_ver])
+                .current_dir(root)
+                .status();
+        }
+    }
+}
+
+fn verify_workspace_compiles(root: &Path) {
+    println!();
+    println!("Verifying workspace compiles…");
+    let exit = std::process::Command::new("cargo")
+        .args(["check", "--workspace"])
+        .current_dir(root)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("ERROR: failed to run `cargo check`: {e}");
+            process::exit(1);
+        });
+    if !exit.success() {
+        eprintln!();
+        eprintln!("ERROR: `cargo check --workspace` failed after upgrades.");
+        eprintln!("Review `git diff` and revert if needed:");
+        eprintln!("  git checkout -- Cargo.toml Cargo.lock");
+        process::exit(1);
+    }
+}
+
+/// Entry point for the `safe-update` subcommand.
 fn safe_update(args: &[String]) {
     let opts = SafeUpdateOpts::parse(args);
     check_prereqs();
@@ -533,20 +571,7 @@ fn safe_update(args: &[String]) {
     }
 
     // Pin skipped/unsafe candidates to their old versions in Cargo.lock to prevent transitives/resolver from upgrading them
-    println!("Pinning skipped/unsafe dependencies to current versions in Cargo.lock…");
-    for row in &rows {
-        if row.status.starts_with("skipped:") {
-            println!(
-                "  Pinning {name} to {version}…",
-                name = row.name,
-                version = row.old_ver
-            );
-            let _ = std::process::Command::new("cargo")
-                .args(["update", "-p", &row.name, "--precise", &row.old_ver])
-                .current_dir(&root)
-                .status();
-        }
-    }
+    pin_skipped_dependencies(&root, &rows);
 
     // --- Step 5: apply upgrades ---
     println!("Applying {} upgrade(s)…", to_apply.len());
@@ -556,23 +581,7 @@ fn safe_update(args: &[String]) {
     }
 
     // --- Step 6: verify workspace still compiles ---
-    println!();
-    println!("Verifying workspace compiles…");
-    let exit = std::process::Command::new("cargo")
-        .args(["check", "--workspace"])
-        .current_dir(&root)
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("ERROR: failed to run `cargo check`: {e}");
-            process::exit(1);
-        });
-    if !exit.success() {
-        eprintln!();
-        eprintln!("ERROR: `cargo check --workspace` failed after upgrades.");
-        eprintln!("Review `git diff` and revert if needed:");
-        eprintln!("  git checkout -- Cargo.toml Cargo.lock");
-        process::exit(1);
-    }
+    verify_workspace_compiles(&root);
 
     println!();
     println!(

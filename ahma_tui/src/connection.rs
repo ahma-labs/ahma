@@ -524,104 +524,93 @@ pub async fn trigger_candidate_restart(candidate: &ResolvedConnection) -> bool {
     }
 }
 
-/// Ensure a local server is running by probing available local transports.
-/// If none is reachable, spawns a background `ahma serve unix` (on macOS/Linux)
-/// or `ahma serve http` (on Windows) and polls until healthy.
-pub async fn ensure_server_running() -> Result<()> {
-    let client_version = env!("CARGO_PKG_VERSION");
-    let candidates = default_candidates();
-    for candidate in &candidates {
-        if let Some(bridge_version) = get_candidate_version(candidate).await {
-            if bridge_version == client_version {
-                return Ok(());
-            }
-
-            let c_ver = parse_version(client_version);
-            let b_ver = parse_version(&bridge_version);
-            let client_is_newer = match (c_ver, b_ver) {
-                (Some(c), Some(b)) => c > b,
-                _ => true,
-            };
-
-            if client_is_newer {
-                tracing::info!(
-                    "TUI version (v{}) is newer than running bridge version (v{}). Requesting bridge restart...",
-                    client_version,
-                    bridge_version
-                );
-
-                let _ = trigger_candidate_restart(candidate).await;
-
-                let start = std::time::Instant::now();
-                while start.elapsed() < Duration::from_secs(2) {
-                    if get_candidate_version(candidate).await.is_none() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                break;
-            } else {
-                if std::env::var("AHMA_RESTARTED").is_err() {
-                    tracing::info!(
-                        "TUI version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
-                        client_version,
-                        bridge_version
-                    );
-
-                    let exe = std::env::current_exe()?;
-                    let args: Vec<String> = std::env::args().skip(1).collect();
-                    let mut cmd = std::process::Command::new(exe);
-                    cmd.args(&args);
-                    cmd.env("AHMA_RESTARTED", "1");
-
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::process::CommandExt;
-                        let err = cmd.exec();
-                        return Err(anyhow::anyhow!("Failed to re-exec TUI process: {}", err));
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let mut child = cmd
-                            .stdin(std::process::Stdio::inherit())
-                            .stdout(std::process::Stdio::inherit())
-                            .stderr(std::process::Stdio::inherit())
-                            .spawn()?;
-                        let status = child.wait()?;
-                        std::process::exit(status.code().unwrap_or(0));
-                    }
-                } else {
-                    bail!(
-                        "Version mismatch: TUI version (v{}) is older than running bridge version (v{}). Please update TUI binary.",
-                        client_version,
-                        bridge_version
-                    );
-                }
-            }
-        }
+async fn handle_existing_candidate(
+    candidate: &ResolvedConnection,
+    client_version: &str,
+    bridge_version: String,
+) -> Result<Option<()>> {
+    if bridge_version == client_version {
+        return Ok(Some(()));
     }
 
-    let exe = std::env::current_exe()?;
-    #[cfg(unix)]
-    let args = vec!["serve", "unix"];
-    #[cfg(not(unix))]
-    let args = vec!["serve", "http"];
+    let c_ver = parse_version(client_version);
+    let b_ver = parse_version(&bridge_version);
+    let client_is_newer = match (c_ver, b_ver) {
+        (Some(c), Some(b)) => c > b,
+        _ => true,
+    };
 
-    tracing::info!("Spawning background server: {} {:?}", exe.display(), args);
+    if client_is_newer {
+        tracing::info!(
+            "TUI version (v{}) is newer than running bridge version (v{}). Requesting bridge restart...",
+            client_version,
+            bridge_version
+        );
 
+        let _ = trigger_candidate_restart(candidate).await;
+
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if get_candidate_version(candidate).await.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(None)
+    } else {
+        if std::env::var("AHMA_RESTARTED").is_err() {
+            tracing::info!(
+                "TUI version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
+                client_version,
+                bridge_version
+            );
+
+            let exe = std::env::current_exe()?;
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(&args);
+            cmd.env("AHMA_RESTARTED", "1");
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let err = cmd.exec();
+                return Err(anyhow::anyhow!("Failed to re-exec TUI process: {}", err));
+            }
+            #[cfg(not(unix))]
+            {
+                let mut child = cmd
+                    .stdin(std::process::Stdio::inherit())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()?;
+                let status = child.wait()?;
+                std::process::exit(status.code().unwrap_or(0));
+            }
+        } else {
+            bail!(
+                "Version mismatch: TUI version (v{}) is older than running bridge version (v{}). Please update TUI binary.",
+                client_version,
+                bridge_version
+            );
+        }
+    }
+}
+
+fn spawn_server_process(exe: &std::path::Path, args: &[&str]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(&args);
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(args);
         cmd.process_group(0);
         cmd.spawn()?;
     }
 
     #[cfg(not(unix))]
     {
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.args(&args);
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(args);
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
@@ -630,6 +619,34 @@ pub async fn ensure_server_running() -> Result<()> {
         }
         cmd.spawn()?;
     }
+    Ok(())
+}
+
+/// Ensure a local server is running by probing available local transports.
+/// If none is reachable, spawns a background `ahma serve unix` (on macOS/Linux)
+/// or `ahma serve http` (on Windows) and polls until healthy.
+pub async fn ensure_server_running() -> Result<()> {
+    let client_version = env!("CARGO_PKG_VERSION");
+    let candidates = default_candidates();
+    for candidate in &candidates {
+        if let Some(bridge_version) = get_candidate_version(candidate).await {
+            if let Some(()) =
+                handle_existing_candidate(candidate, client_version, bridge_version).await?
+            {
+                return Ok(());
+            }
+            break;
+        }
+    }
+
+    let exe = std::env::current_exe()?;
+    #[cfg(unix)]
+    let args = ["serve", "unix"];
+    #[cfg(not(unix))]
+    let args = ["serve", "http"];
+
+    tracing::info!("Spawning background server: {} {:?}", exe.display(), args);
+    spawn_server_process(&exe, &args)?;
 
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(2) {

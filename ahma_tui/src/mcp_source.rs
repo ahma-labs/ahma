@@ -19,13 +19,23 @@ use crate::state::{AiActivityEntry, LogEntry, LogLevel, OpStatus, Operation};
 /// Events produced by the MCP source task and consumed by the app event loop.
 #[derive(Debug, Clone)]
 pub enum SourceEvent {
-    HealthChanged { healthy: bool },
-    OperationsUpdated { ops: Vec<Operation> },
+    HealthChanged {
+        healthy: bool,
+    },
+    OperationsUpdated {
+        ops: Vec<Operation>,
+    },
     AiActivity(AiActivityEntry),
     LogLine(LogEntry),
-    ToolsListUpdated { tools: Vec<String> },
-    SandboxStatus { status: String },
-    SessionId { id: String },
+    ToolsListUpdated {
+        tools: Vec<crate::mcp_connections::ToolInfo>,
+    },
+    SandboxStatus {
+        status: String,
+    },
+    SessionId {
+        id: String,
+    },
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -208,7 +218,7 @@ async fn call_tools_list(
     client: &reqwest::Client,
     base_url: &str,
     session: &McpSession,
-) -> Result<Vec<String>> {
+) -> Result<Vec<crate::mcp_connections::ToolInfo>> {
     let url = format!("{base_url}/mcp");
     let req_id = session.next_req_id();
     let body = json!({
@@ -234,7 +244,22 @@ async fn call_tools_list(
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .filter_map(|t| {
+                    let name = t.get("name").and_then(|n| n.as_str())?;
+                    let description = t
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .map(String::from);
+                    let input_schema = t.get("inputSchema").cloned().unwrap_or(serde_json::json!({
+                        "type": "object",
+                        "additionalProperties": true
+                    }));
+                    Some(crate::mcp_connections::ToolInfo {
+                        name: name.to_string(),
+                        description,
+                        input_schema,
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();

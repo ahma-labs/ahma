@@ -322,25 +322,12 @@ async fn check_bridge_running(socket_path: Option<&str>, http_url: Option<&str>)
 ///
 /// # Errors
 /// Returns an error if the server fails to start or encounters a fatal error.
-pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
-    let is_test = std::env::var("NEXTEST").is_ok() || std::env::var("CARGO_MANIFEST_DIR").is_ok();
-
-    let socket_path = if let Ok(path) = std::env::var("AHMA_UNIX_SOCKET") {
-        path
-    } else if config.unix_socket_path.is_empty() {
-        "/tmp/ahma.sock".to_string()
-    } else {
-        config.unix_socket_path.clone()
-    };
-    let http_url = format!("http://{}:{}", config.http_host, config.http_port);
-
-    let socket_path_opt = if cfg!(unix) {
-        Some(socket_path.as_str())
-    } else {
-        None
-    };
-    let http_url_opt = Some(http_url.as_str());
-
+async fn handle_version_checks(
+    _config: &AppConfig,
+    is_test: bool,
+    socket_path_opt: Option<&str>,
+    http_url_opt: Option<&str>,
+) -> Result<Option<()>> {
     let client_version = env!("CARGO_PKG_VERSION");
     let bridge_version_opt = if is_test {
         None
@@ -354,11 +341,9 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
                 "Local bridge server is already running (v{}). Forwarding stdio as a proxy client.",
                 bridge_version
             );
-            return crate::shell::modes::proxy_client::run_proxy_client(
-                socket_path_opt,
-                http_url_opt,
-            )
-            .await;
+            crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
+                .await?;
+            return Ok(Some(()));
         }
 
         let c_ver = parse_version(client_version);
@@ -422,6 +407,114 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
                 ));
             }
         }
+    }
+    Ok(None)
+}
+
+async fn spawn_background_bridge(
+    config: &AppConfig,
+    socket_path_opt: Option<&str>,
+    http_url_opt: Option<&str>,
+) -> Result<()> {
+    let server_command = std::env::current_exe()
+        .context("Failed to get current executable path")?
+        .to_string_lossy()
+        .to_string();
+
+    let mut server_args = vec!["serve".to_string()];
+
+    if config.explicit_tools_dir
+        && let Some(ref tools_dir) = config.tools_dir
+    {
+        server_args.push("--tools-dir".to_string());
+        server_args.push(tools_dir.to_string_lossy().to_string());
+    }
+
+    if let Some(ref task_vault) = config.task_vault {
+        server_args.push("--task-vault".to_string());
+        server_args.push(task_vault.to_string_lossy().to_string());
+    }
+
+    #[cfg(unix)]
+    server_args.push("unix".to_string());
+    #[cfg(not(unix))]
+    server_args.push("http".to_string());
+
+    for bundle in &config.tool_bundles {
+        server_args.push("--tool".to_string());
+        server_args.push(bundle.clone());
+    }
+
+    if let Some(timeout) = config.idle_timeout_secs {
+        server_args.push("--idle-timeout".to_string());
+        server_args.push(timeout.to_string());
+    }
+
+    let mut cmd = tokio::process::Command::new(&server_command);
+    cmd.args(&server_args);
+
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    // Do not inherit standard streams to fully detach
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    match cmd.spawn() {
+        Ok(_) => tracing::info!("Spawned background bridge server successfully"),
+        Err(e) => tracing::error!("Failed to spawn background bridge server: {}", e),
+    }
+
+    // Wait for the background bridge to be healthy/available
+    let start_time = std::time::Instant::now();
+    let mut healthy = false;
+    while start_time.elapsed() < Duration::from_secs(2) {
+        if check_bridge_running(socket_path_opt, http_url_opt).await {
+            healthy = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !healthy {
+        tracing::warn!("Background bridge server failed to become healthy within 2 seconds");
+    } else {
+        tracing::info!("Background bridge server started successfully and is healthy");
+    }
+
+    Ok(())
+}
+
+pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
+    let is_test = std::env::var("NEXTEST").is_ok() || std::env::var("CARGO_MANIFEST_DIR").is_ok();
+
+    let socket_path = if let Ok(path) = std::env::var("AHMA_UNIX_SOCKET") {
+        path
+    } else if config.unix_socket_path.is_empty() {
+        "/tmp/ahma.sock".to_string()
+    } else {
+        config.unix_socket_path.clone()
+    };
+    let http_url = format!("http://{}:{}", config.http_host, config.http_port);
+
+    let socket_path_opt = if cfg!(unix) {
+        Some(socket_path.as_str())
+    } else {
+        None
+    };
+    let http_url_opt = Some(http_url.as_str());
+
+    if let Some(()) = handle_version_checks(&config, is_test, socket_path_opt, http_url_opt).await?
+    {
+        return Ok(());
     }
 
     // Redirect stdout to stderr to prevent protocol stream corruption by standard prints
@@ -498,81 +591,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     );
 
     if !is_test {
-        // Start background bridge server
-        let server_command = std::env::current_exe()
-            .context("Failed to get current executable path")?
-            .to_string_lossy()
-            .to_string();
-
-        let mut server_args = vec!["serve".to_string()];
-
-        if config.explicit_tools_dir
-            && let Some(ref tools_dir) = config.tools_dir
-        {
-            server_args.push("--tools-dir".to_string());
-            server_args.push(tools_dir.to_string_lossy().to_string());
-        }
-
-        if let Some(ref task_vault) = config.task_vault {
-            server_args.push("--task-vault".to_string());
-            server_args.push(task_vault.to_string_lossy().to_string());
-        }
-
-        #[cfg(unix)]
-        server_args.push("unix".to_string());
-        #[cfg(not(unix))]
-        server_args.push("http".to_string());
-
-        for bundle in &config.tool_bundles {
-            server_args.push("--tool".to_string());
-            server_args.push(bundle.clone());
-        }
-
-        if let Some(timeout) = config.idle_timeout_secs {
-            server_args.push("--idle-timeout".to_string());
-            server_args.push(timeout.to_string());
-        }
-
-        let mut cmd = tokio::process::Command::new(&server_command);
-        cmd.args(&server_args);
-
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        // Do not inherit standard streams to fully detach
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-
-        match cmd.spawn() {
-            Ok(_) => tracing::info!("Spawned background bridge server successfully"),
-            Err(e) => tracing::error!("Failed to spawn background bridge server: {}", e),
-        }
-
-        // Wait for the background bridge to be healthy/available
-        let start_time = std::time::Instant::now();
-        let mut healthy = false;
-        while start_time.elapsed() < Duration::from_secs(2) {
-            if check_bridge_running(socket_path_opt, http_url_opt).await {
-                healthy = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        if !healthy {
-            tracing::warn!("Background bridge server failed to become healthy within 2 seconds");
-        } else {
-            tracing::info!("Background bridge server started successfully and is healthy");
-        }
-
+        spawn_background_bridge(&config, socket_path_opt, http_url_opt).await?;
         // Proceed with proxy setup
         return crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
             .await;

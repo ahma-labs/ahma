@@ -1846,43 +1846,10 @@ pub fn load_settings(cli: &Cli) -> ahma_common::config::AhmaSettings {
     }
 }
 
-pub fn build_app_config(cli: &Cli) -> AppConfig {
-    let serve = extract_serve_fields(&cli.command);
-    let tool = extract_tool_fields(&cli.command);
-
-    // Load user settings (priority layer 2: below CLI flags, above env vars)
-    let s = load_settings(cli);
-
-    // ── Tool loading ────────────────────────────────────────────────────────
-    // Priority: CLI > AHMA_TOOLS_DIR (deprecated env) > auto-detect
-    if std::env::var_os("AHMA_TOOLS_DIR").is_some() {
-        deprecated_env!("AHMA_TOOLS_DIR");
-    }
-    let env_tools_dir = std::env::var("AHMA_TOOLS_DIR").ok().map(PathBuf::from);
-    let explicit_tools_dir = serve.tools_dir.is_some();
-    let raw_tools_dir = serve.tools_dir.or(env_tools_dir);
-    let tools_dir = resolution::normalize_tools_dir(raw_tools_dir);
-
-    // Flatten and deduplicate tool bundles
-    let tool_bundles = {
-        let mut seen = std::collections::HashSet::new();
-        serve
-            .tool_bundles
-            .into_iter()
-            .filter(|b| seen.insert(b.clone()))
-            .collect()
-    };
-
-    // ── Sandbox scope ───────────────────────────────────────────────────────
-    // (No settings.toml key for sandbox scope paths; AHMA_SANDBOX_SCOPE still
-    //  the right mechanism for path lists, which aren't well expressed in TOML.)
-    let sandbox_scopes = AppConfig::env_sandbox_scopes();
-    let working_dirs = AppConfig::env_working_dirs();
-
-    // ── Helpers for 3-layer env-var fallback with deprecation warnings ───────
-    // Each macro call: CLI-flag || settings-file || deprecated-env || default
-
-    // timeout_secs: CLI > settings > AHMA_TIMEOUT (deprecated) > 360
+fn parse_execution_settings(
+    serve: &ServeFields,
+    s: &ahma_common::config::AhmaSettings,
+) -> (u64, bool, bool, bool) {
     let timeout_secs = if let Some(t) = serve.timeout {
         t
     } else {
@@ -1897,7 +1864,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         }
     };
 
-    // force_sync: CLI > settings > AHMA_SYNC (deprecated)
     let force_sync = if serve.sync {
         true
     } else if AppConfig::env_flag("AHMA_SYNC") {
@@ -1907,7 +1873,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         s.tools.force_sync
     };
 
-    // hot_reload_tools: settings > AHMA_HOT_RELOAD (deprecated)
     let hot_reload_tools = if AppConfig::env_flag("AHMA_HOT_RELOAD") {
         deprecated_env!("AHMA_HOT_RELOAD");
         true
@@ -1915,7 +1880,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         s.tools.hot_reload
     };
 
-    // skip_availability_probes: settings > AHMA_SKIP_PROBES (deprecated)
     let skip_availability_probes = if AppConfig::env_flag("AHMA_SKIP_PROBES") {
         deprecated_env!("AHMA_SKIP_PROBES");
         true
@@ -1923,7 +1887,18 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         s.tools.skip_probes
     };
 
-    // no_sandbox: CLI > settings > AHMA_DISABLE_SANDBOX (deprecated)
+    (
+        timeout_secs,
+        force_sync,
+        hot_reload_tools,
+        skip_availability_probes,
+    )
+}
+
+fn parse_sandbox_settings(
+    serve: &ServeFields,
+    s: &ahma_common::config::AhmaSettings,
+) -> (bool, bool, bool, bool, bool, u64) {
     let no_sandbox = if serve.no_sandbox {
         true
     } else if AppConfig::env_flag("AHMA_DISABLE_SANDBOX") {
@@ -1933,7 +1908,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         s.sandbox.disable
     };
 
-    // defer_sandbox: settings > AHMA_SANDBOX_DEFER (deprecated)
     let defer_sandbox = if AppConfig::env_flag("AHMA_SANDBOX_DEFER") {
         deprecated_env!("AHMA_SANDBOX_DEFER");
         true
@@ -1941,7 +1915,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         s.sandbox.defer
     };
 
-    // tmp_access: CLI > settings > AHMA_TMP_ACCESS (deprecated)
     let tmp_access = if serve.tmp {
         true
     } else if AppConfig::env_flag("AHMA_TMP_ACCESS") {
@@ -1951,7 +1924,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         s.sandbox.tmp_access
     };
 
-    // no_temp_files: settings > AHMA_DISABLE_TEMP (deprecated)
     let no_temp_files = if AppConfig::env_flag("AHMA_DISABLE_TEMP") {
         deprecated_env!("AHMA_DISABLE_TEMP");
         true
@@ -1959,7 +1931,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         s.sandbox.disable_temp
     };
 
-    // log_monitor: CLI > settings > AHMA_LOG_MONITOR (deprecated)
     let log_monitor = if serve.log_monitor {
         true
     } else if AppConfig::env_flag("AHMA_LOG_MONITOR") {
@@ -1969,7 +1940,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         s.logging.log_monitor
     };
 
-    // monitor_rate_limit_secs: CLI > settings > AHMA_MONITOR_RATE_LIMIT (deprecated)
     let monitor_rate_limit_secs = if let Some(r) = serve.monitor_rate_limit {
         r
     } else {
@@ -1984,9 +1954,20 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         }
     };
 
-    let idle_timeout_secs = serve.idle_timeout.or(Some(10));
+    (
+        no_sandbox,
+        defer_sandbox,
+        tmp_access,
+        no_temp_files,
+        log_monitor,
+        monitor_rate_limit_secs,
+    )
+}
 
-    // HTTP transport flags: CLI > settings > deprecated env
+fn parse_http_settings(
+    serve: &ServeFields,
+    s: &ahma_common::config::AhmaSettings,
+) -> (bool, bool, u64) {
     let no_quic = if serve.no_quic {
         true
     } else if AppConfig::env_flag("AHMA_DISABLE_QUIC") {
@@ -2005,7 +1986,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         s.http.disable_http1_1
     };
 
-    // handshake_timeout_secs: settings > AHMA_HANDSHAKE_TIMEOUT (deprecated)
     let handshake_timeout_secs = {
         let from_env = std::env::var("AHMA_HANDSHAKE_TIMEOUT")
             .ok()
@@ -2018,7 +1998,12 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         }
     };
 
-    // Auth: settings > deprecated env vars
+    (no_quic, disable_http1_1, handshake_timeout_secs)
+}
+
+fn parse_auth_settings(
+    s: &ahma_common::config::AhmaSettings,
+) -> (Option<String>, Option<PathBuf>, u64, u32, String) {
     let require_token = std::env::var("AHMA_REQUIRE_TOKEN")
         .ok()
         .filter(|v| !v.is_empty())
@@ -2058,6 +2043,66 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         .ok()
         .inspect(|_| deprecated_env!("AHMA_INSTANCE_LABEL"))
         .unwrap_or_else(|| s.instance.label.clone());
+
+    (
+        require_token,
+        require_token_path,
+        rate_limit_rps,
+        rate_limit_burst,
+        instance_label,
+    )
+}
+
+pub fn build_app_config(cli: &Cli) -> AppConfig {
+    let serve = extract_serve_fields(&cli.command);
+    let tool = extract_tool_fields(&cli.command);
+
+    // Load user settings (priority layer 2: below CLI flags, above env vars)
+    let s = load_settings(cli);
+
+    // ── Tool loading ────────────────────────────────────────────────────────
+    if std::env::var_os("AHMA_TOOLS_DIR").is_some() {
+        deprecated_env!("AHMA_TOOLS_DIR");
+    }
+    let env_tools_dir = std::env::var("AHMA_TOOLS_DIR").ok().map(PathBuf::from);
+    let explicit_tools_dir = serve.tools_dir.is_some();
+    let raw_tools_dir = serve.tools_dir.clone().or(env_tools_dir);
+    let tools_dir = resolution::normalize_tools_dir(raw_tools_dir);
+
+    // Flatten and deduplicate tool bundles
+    let tool_bundles = {
+        let mut seen = std::collections::HashSet::new();
+        serve
+            .tool_bundles
+            .clone()
+            .into_iter()
+            .filter(|b| seen.insert(b.clone()))
+            .collect()
+    };
+
+    // ── Sandbox scope ───────────────────────────────────────────────────────
+    let sandbox_scopes = AppConfig::env_sandbox_scopes();
+    let working_dirs = AppConfig::env_working_dirs();
+
+    // ── Parse settings sections via modular helper functions ─────────────────
+    let (timeout_secs, force_sync, hot_reload_tools, skip_availability_probes) =
+        parse_execution_settings(&serve, &s);
+
+    let (
+        no_sandbox,
+        defer_sandbox,
+        tmp_access,
+        no_temp_files,
+        log_monitor,
+        monitor_rate_limit_secs,
+    ) = parse_sandbox_settings(&serve, &s);
+
+    let idle_timeout_secs = serve.idle_timeout.or(Some(10));
+
+    let (no_quic, disable_http1_1, handshake_timeout_secs) = parse_http_settings(&serve, &s);
+
+    let (require_token, require_token_path, rate_limit_rps, rate_limit_burst, instance_label) =
+        parse_auth_settings(&s);
 
     AppConfig {
         tools_dir,

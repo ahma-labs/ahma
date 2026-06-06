@@ -754,7 +754,7 @@ pub struct AppState {
     pub operations: Vec<Operation>,
     pub log: VecDeque<LogEntry>,
     pub approval: Option<ApprovalGate>,
-    pub tools_list: Vec<String>,
+    pub tools_list: Vec<crate::mcp_connections::ToolInfo>,
     pub mcp_connections: McpConnectionManager,
 
     // ── Chat ──

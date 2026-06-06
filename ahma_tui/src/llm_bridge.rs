@@ -117,12 +117,122 @@ pub fn spawn_chat_task(
     });
 }
 
+fn prepare_tool_definitions(
+    available_tools: Vec<crate::mcp_connections::ToolInfo>,
+) -> Vec<serde_json::Value> {
+    available_tools
+        .into_iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description.unwrap_or_else(|| "MCP tool callable from ahma".to_string()),
+                    "parameters": tool.input_schema
+                }
+            })
+        })
+        .collect()
+}
+
+async fn execute_single_tool_call(
+    call: ahma_llm_monitor::client::ChatToolCall,
+    cfg: McpChatConfig,
+    tx: Sender<BridgeEvent>,
+) -> (String, String, serde_json::Value, bool) {
+    let args_value = call.arguments;
+    let args_str = serde_json::to_string(&args_value).unwrap_or_default();
+
+    let approved = if needs_approval(&call.name, cfg.tool_approval) {
+        let (approval_tx, approval_rx) = tokio::sync::oneshot::channel();
+        let _ = tx
+            .send(BridgeEvent::RequestApproval {
+                id: call.id.clone(),
+                tool: call.name.clone(),
+                args: args_str.clone(),
+                tx: approval_tx,
+            })
+            .await;
+        approval_rx.await.unwrap_or(false)
+    } else {
+        true
+    };
+
+    if !approved {
+        let err_text = "Error: Tool execution rejected by user".to_string();
+        let _ = tx
+            .send(BridgeEvent::ToolCallFinished {
+                id: call.id.clone(),
+                result: err_text.clone(),
+                failed: true,
+            })
+            .await;
+        return (
+            call.id,
+            call.name,
+            serde_json::json!({"error": err_text}),
+            true,
+        );
+    }
+
+    let _ = tx
+        .send(BridgeEvent::ToolCallStarted {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            args: args_str,
+        })
+        .await;
+
+    let result = if let Some((server, tool)) = call.name.split_once("::") {
+        if let Some(base_url) = cfg.external_http_servers.get(server) {
+            spawn_external_tool_call_http(base_url, tool, args_value).await
+        } else {
+            Err(format!("Unknown external MCP server `{server}`"))
+        }
+    } else {
+        spawn_local_tool_call(cfg, &call.name, args_value).await
+    };
+    match result {
+        Ok((text, failed)) => {
+            let _ = tx
+                .send(BridgeEvent::ToolCallFinished {
+                    id: call.id.clone(),
+                    result: text.clone(),
+                    failed,
+                })
+                .await;
+            (
+                call.id,
+                call.name,
+                serde_json::json!({"output": text}),
+                failed,
+            )
+        }
+        Err(e) => {
+            let err_text = format!("Error: {e}");
+            let _ = tx
+                .send(BridgeEvent::ToolCallFinished {
+                    id: call.id.clone(),
+                    result: err_text.clone(),
+                    failed: true,
+                })
+                .await;
+            (
+                call.id,
+                call.name,
+                serde_json::json!({"error": err_text}),
+                true,
+            )
+        }
+    }
+}
+
 pub fn spawn_agent_task(
     client: LlmClient,
     messages: Vec<ChatMessage>,
     system_prompt: Option<String>,
     mcp: Option<McpChatConfig>,
-    available_tools: Vec<String>,
+    available_tools: Vec<crate::mcp_connections::ToolInfo>,
     tx: Sender<BridgeEvent>,
 ) {
     tokio::spawn(async move {
@@ -134,22 +244,7 @@ pub fn spawn_agent_task(
             msg_json.push(serde_json::json!({"role": msg.role, "content": msg.content}));
         }
 
-        let tool_defs: Vec<serde_json::Value> = available_tools
-            .into_iter()
-            .map(|name| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": "MCP tool callable from ahma",
-                        "parameters": {
-                            "type": "object",
-                            "additionalProperties": true
-                        }
-                    }
-                })
-            })
-            .collect();
+        let tool_defs = prepare_tool_definitions(available_tools);
 
         let max_turns = mcp.as_ref().map(|c| c.max_turns).unwrap_or(8);
         for _ in 0..max_turns {
@@ -213,97 +308,9 @@ pub fn spawn_agent_task(
             };
 
             let calls = completion.tool_calls;
-            let call_futures = calls.into_iter().map(|call| {
-                let tx_clone = tx.clone();
-                let cfg = mcp_cfg.clone();
-                async move {
-                    let args_value = call.arguments;
-                    let args_str = serde_json::to_string(&args_value).unwrap_or_default();
-
-                    let approved = if needs_approval(&call.name, cfg.tool_approval) {
-                        let (approval_tx, approval_rx) = tokio::sync::oneshot::channel();
-                        let _ = tx_clone
-                            .send(BridgeEvent::RequestApproval {
-                                id: call.id.clone(),
-                                tool: call.name.clone(),
-                                args: args_str.clone(),
-                                tx: approval_tx,
-                            })
-                            .await;
-                        approval_rx.await.unwrap_or(false)
-                    } else {
-                        true
-                    };
-
-                    if !approved {
-                        let err_text = "Error: Tool execution rejected by user".to_string();
-                        let _ = tx_clone
-                            .send(BridgeEvent::ToolCallFinished {
-                                id: call.id.clone(),
-                                result: err_text.clone(),
-                                failed: true,
-                            })
-                            .await;
-                        return (
-                            call.id,
-                            call.name,
-                            serde_json::json!({"error": err_text}),
-                            true,
-                        );
-                    }
-
-                    let _ = tx_clone
-                        .send(BridgeEvent::ToolCallStarted {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            args: args_str,
-                        })
-                        .await;
-
-                    let result = if let Some((server, tool)) = call.name.split_once("::") {
-                        if let Some(base_url) = cfg.external_http_servers.get(server) {
-                            spawn_external_tool_call_http(base_url, tool, args_value).await
-                        } else {
-                            Err(format!("Unknown external MCP server `{server}`"))
-                        }
-                    } else {
-                        spawn_local_tool_call(cfg, &call.name, args_value).await
-                    };
-                    match result {
-                        Ok((text, failed)) => {
-                            let _ = tx_clone
-                                .send(BridgeEvent::ToolCallFinished {
-                                    id: call.id.clone(),
-                                    result: text.clone(),
-                                    failed,
-                                })
-                                .await;
-                            (
-                                call.id,
-                                call.name,
-                                serde_json::json!({"output": text}),
-                                failed,
-                            )
-                        }
-                        Err(e) => {
-                            let err_text = format!("Error: {e}");
-                            let _ = tx_clone
-                                .send(BridgeEvent::ToolCallFinished {
-                                    id: call.id.clone(),
-                                    result: err_text.clone(),
-                                    failed: true,
-                                })
-                                .await;
-                            (
-                                call.id,
-                                call.name,
-                                serde_json::json!({"error": err_text}),
-                                true,
-                            )
-                        }
-                    }
-                }
-            });
+            let call_futures = calls
+                .into_iter()
+                .map(|call| execute_single_tool_call(call, mcp_cfg.clone(), tx.clone()));
 
             let tool_results = join_all(call_futures).await;
             for (tool_call_id, _tool_name, payload, _failed) in tool_results {
@@ -910,7 +917,14 @@ mod tests {
             messages,
             None,
             Some(mcp),
-            vec!["test_tool".to_string()],
+            vec![crate::mcp_connections::ToolInfo {
+                name: "test_tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": true
+                }),
+            }],
             tx,
         );
 

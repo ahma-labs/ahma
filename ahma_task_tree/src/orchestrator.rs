@@ -173,81 +173,21 @@ impl TaskTreeOrchestrator {
         let parent_domains = self.get_effective_parent_allowed_domains(tree, node_id);
 
         for step in parsed_steps {
-            let child_scopes = if let Some(ref step_scopes) = step.sandbox_scopes {
-                let resolved = self.validate_child_scopes(step_scopes, &parent_scopes)?;
-                let resolved_strs = resolved
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>();
-                Some(resolved_strs)
-            } else {
-                let parent_strs = parent_scopes
-                    .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect::<Vec<_>>();
-                Some(parent_strs)
-            };
-
-            let child_tools = if let Some(ref step_tools) = step.allowed_tools {
-                if let Some(ref p_tools) = parent_tools {
-                    for tool in step_tools {
-                        if !p_tools.iter().any(|pt| tool == pt || tool.starts_with(pt)) {
-                            return Err(anyhow!(
-                                "Security violation: Child task specifies allowed tool {:?} which is not permitted by parent allowed tools {:?}",
-                                tool,
-                                p_tools
-                            ));
-                        }
-                    }
-                }
-                Some(step_tools.clone())
-            } else {
-                parent_tools.clone()
-            };
-
-            let child_domains = if let Some(ref step_domains) = step.allowed_domains {
-                if let Some(ref p_domains) = parent_domains {
-                    for domain in step_domains {
-                        if !p_domains.contains(domain) {
-                            return Err(anyhow!(
-                                "Security violation: Child task specifies allowed domain {:?} which is not permitted by parent allowed domains {:?}",
-                                domain,
-                                p_domains
-                            ));
-                        }
-                    }
-                }
-                Some(step_domains.clone())
-            } else {
-                parent_domains.clone()
-            };
-
-            let task_type = match step.r#type.as_str() {
-                "shell_command" => TaskType::ShellCommand {
-                    command: step.command.clone().unwrap_or_default(),
-                },
-                "llm_call" => TaskType::LlmCall {
-                    instructions: step.instructions.clone().unwrap_or_default(),
-                },
-                "planning" => TaskType::Planning,
-                other => return Err(anyhow!("Unsupported task type returned by LLM: {}", other)),
-            };
-
-            let child_id = tree.add_node(
-                Some(node_id),
-                step.task.clone(),
-                task_type,
-                child_scopes,
-                child_tools,
-                child_domains,
-            );
+            let child_id = self.create_child_node(
+                tree,
+                node_id,
+                &step,
+                &parent_scopes,
+                &parent_tools,
+                &parent_domains,
+                false,
+            )?;
             child_ids.push(child_id);
         }
 
         let mut overall_success = true;
         let mut child_summaries = Vec::new();
         let max_retries = self.config.max_retries.unwrap_or(2);
-        let max_subtasks = self.config.max_depth.unwrap_or(4);
 
         let mut queue = std::collections::VecDeque::from(child_ids);
         while let Some(child_id) = queue.pop_front() {
@@ -285,187 +225,22 @@ impl TaskTreeOrchestrator {
             }
 
             if !success {
-                info!(
-                    "Child node {} failed after maximum retries. Initiating recovery/backtracking...",
-                    child_id.0
-                );
+                let recovery_success = self
+                    .handle_recovery_backtracking(
+                        tree,
+                        node_id,
+                        &node,
+                        child_id,
+                        &mut queue,
+                        max_subtasks,
+                        &goal,
+                        &parent_scopes,
+                        &parent_tools,
+                        &parent_domains,
+                    )
+                    .await?;
 
-                // Collect descriptions of remaining unexecuted steps
-                let mut remaining_descs = Vec::new();
-                for &rem_id in &queue {
-                    if let Some(n) = tree.get_node(rem_id) {
-                        remaining_descs.push(n.task_description.clone());
-                    }
-                }
-
-                // Format the failed node outcome and extract description
-                let (failed_node_desc, outcome_str) = {
-                    let failed_node = tree.get_node(child_id).unwrap();
-                    let outcome = failed_node
-                        .result
-                        .as_ref()
-                        .map(|r| {
-                            format!(
-                                "Exit code: {:?}\nSummary: {}\nStdout: {}\nStderr: {}",
-                                r.exit_code, r.summary, r.stdout, r.stderr
-                            )
-                        })
-                        .unwrap_or_else(|| "No outcome recorded".to_string());
-                    (failed_node.task_description.clone(), outcome)
-                };
-
-                // Mark parent planning node state as Backtracking
-                if let Some(n) = tree.get_node_mut(node_id) {
-                    n.state = NodeState::Backtracking;
-                }
-
-                let branch_context = self.build_branch_context(tree, node_id);
-                let recovery_prompt = crate::prompt::build_recovery_prompt(
-                    &goal,
-                    &node.task_description,
-                    &branch_context,
-                    &failed_node_desc,
-                    &outcome_str,
-                    &remaining_descs,
-                    max_subtasks,
-                );
-
-                let system_msg = json!({
-                    "role": "system",
-                    "content": "You are a precise task orchestrator. You handle subtask failures and decide how to recover."
-                });
-                let user_msg = json!({
-                    "role": "user",
-                    "content": recovery_prompt
-                });
-
-                let recovery_timeout =
-                    Duration::from_secs(self.config.llm_timeout_seconds.unwrap_or(30));
-                let recovery_completion_res = tokio::time::timeout(
-                    recovery_timeout,
-                    self.llm
-                        .chat_completion_with_tools(vec![system_msg, user_msg], &[]),
-                )
-                .await;
-
-                let recovery_completion = match recovery_completion_res {
-                    Ok(Ok(res)) => res,
-                    Ok(Err(e)) => return Err(anyhow!("LLM call failed during recovery: {}", e)),
-                    Err(_) => return Err(anyhow!("LLM call timed out during recovery")),
-                };
-
-                let decision = crate::parser::parse_recovery_decision(&recovery_completion.content)
-                    .context("Failed to parse LLM recovery decision")?;
-
-                info!(
-                    "Recovery decision for node {}: action={}",
-                    node_id.0, decision.action
-                );
-
-                if decision.action == "re_plan" {
-                    let Some(new_steps) = decision.steps else {
-                        overall_success = false;
-                        break;
-                    };
-                    info!(
-                        "Re-planning node {} with {} new steps",
-                        node_id.0,
-                        new_steps.len()
-                    );
-                    // Clear unexecuted remaining steps from queue
-                    queue.clear();
-
-                    let parent_scopes = self.get_effective_parent_scopes(tree, node_id);
-                    let parent_tools = self.get_effective_parent_allowed_tools(tree, node_id);
-                    let parent_domains = self.get_effective_parent_allowed_domains(tree, node_id);
-
-                    let mut new_child_ids = Vec::new();
-                    for step in new_steps {
-                        let child_scopes = if let Some(ref step_scopes) = step.sandbox_scopes {
-                            let resolved =
-                                self.validate_child_scopes(step_scopes, &parent_scopes)?;
-                            let resolved_strs = resolved
-                                .iter()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .collect::<Vec<_>>();
-                            Some(resolved_strs)
-                        } else {
-                            let parent_strs = parent_scopes
-                                .iter()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .collect::<Vec<_>>();
-                            Some(parent_strs)
-                        };
-
-                        let child_tools = if let Some(ref step_tools) = step.allowed_tools {
-                            if let Some(ref p_tools) = parent_tools {
-                                for tool in step_tools {
-                                    if !p_tools.iter().any(|pt| tool == pt || tool.starts_with(pt))
-                                    {
-                                        return Err(anyhow!(
-                                            "Security violation during re-plan: Child task specifies allowed tool {:?} which is not permitted by parent allowed tools {:?}",
-                                            tool,
-                                            p_tools
-                                        ));
-                                    }
-                                }
-                            }
-                            Some(step_tools.clone())
-                        } else {
-                            parent_tools.clone()
-                        };
-
-                        let child_domains = if let Some(ref step_domains) = step.allowed_domains {
-                            if let Some(ref p_domains) = parent_domains {
-                                for domain in step_domains {
-                                    if !p_domains.contains(domain) {
-                                        return Err(anyhow!(
-                                            "Security violation during re-plan: Child task specifies allowed domain {:?} which is not permitted by parent allowed domains {:?}",
-                                            domain,
-                                            p_domains
-                                        ));
-                                    }
-                                }
-                            }
-                            Some(step_domains.clone())
-                        } else {
-                            parent_domains.clone()
-                        };
-
-                        let task_type = match step.r#type.as_str() {
-                            "shell_command" => TaskType::ShellCommand {
-                                command: step.command.clone().unwrap_or_default(),
-                            },
-                            "llm_call" => TaskType::LlmCall {
-                                instructions: step.instructions.clone().unwrap_or_default(),
-                            },
-                            "planning" => TaskType::Planning,
-                            other => {
-                                return Err(anyhow!(
-                                    "Unsupported task type returned by LLM recovery: {}",
-                                    other
-                                ));
-                            }
-                        };
-
-                        let child_id = tree.add_node(
-                            Some(node_id),
-                            step.task.clone(),
-                            task_type,
-                            child_scopes,
-                            child_tools,
-                            child_domains,
-                        );
-                        new_child_ids.push(child_id);
-                    }
-
-                    queue.extend(new_child_ids);
-
-                    // Reset parent node state to Running
-                    if let Some(n) = tree.get_node_mut(node_id) {
-                        n.state = NodeState::Running;
-                    }
-
+                if recovery_success {
                     continue;
                 }
 
@@ -492,6 +267,236 @@ impl TaskTreeOrchestrator {
             summary,
             success: overall_success,
         })
+    }
+
+    fn create_child_node(
+        &self,
+        tree: &mut TaskTree,
+        parent_id: NodeId,
+        step: &crate::parser::ParsedStep,
+        parent_scopes: &[PathBuf],
+        parent_tools: &Option<Vec<String>>,
+        parent_domains: &Option<Vec<String>>,
+        is_replan: bool,
+    ) -> Result<NodeId> {
+        let child_scopes = if let Some(ref step_scopes) = step.sandbox_scopes {
+            let resolved = self.validate_child_scopes(step_scopes, parent_scopes)?;
+            let resolved_strs = resolved
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            Some(resolved_strs)
+        } else {
+            let parent_strs = parent_scopes
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            Some(parent_strs)
+        };
+
+        let child_tools = if let Some(step_tools) = &step.allowed_tools {
+            if let Some(p_tools) = parent_tools {
+                for tool in step_tools {
+                    if !p_tools.iter().any(|pt| tool == pt || tool.starts_with(pt)) {
+                        let msg = if is_replan {
+                            format!(
+                                "Security violation during re-plan: Child task specifies allowed tool {:?} which is not permitted by parent allowed tools {:?}",
+                                tool, p_tools
+                            )
+                        } else {
+                            format!(
+                                "Security violation: Child task specifies allowed tool {:?} which is not permitted by parent allowed tools {:?}",
+                                tool, p_tools
+                            )
+                        };
+                        return Err(anyhow!(msg));
+                    }
+                }
+            }
+            Some(step_tools.clone())
+        } else {
+            parent_tools.clone()
+        };
+
+        let child_domains = if let Some(step_domains) = &step.allowed_domains {
+            if let Some(p_domains) = parent_domains {
+                for domain in step_domains {
+                    if !p_domains.contains(domain) {
+                        let msg = if is_replan {
+                            format!(
+                                "Security violation during re-plan: Child task specifies allowed domain {:?} which is not permitted by parent allowed domains {:?}",
+                                domain, p_domains
+                            )
+                        } else {
+                            format!(
+                                "Security violation: Child task specifies allowed domain {:?} which is not permitted by parent allowed domains {:?}",
+                                domain, p_domains
+                            )
+                        };
+                        return Err(anyhow!(msg));
+                    }
+                }
+            }
+            Some(step_domains.clone())
+        } else {
+            parent_domains.clone()
+        };
+
+        let task_type = match step.r#type.as_str() {
+            "shell_command" => TaskType::ShellCommand {
+                command: step.command.clone().unwrap_or_default(),
+            },
+            "llm_call" => TaskType::LlmCall {
+                instructions: step.instructions.clone().unwrap_or_default(),
+            },
+            "planning" => TaskType::Planning,
+            other => {
+                let msg = if is_replan {
+                    format!("Unsupported task type returned by LLM recovery: {}", other)
+                } else {
+                    format!("Unsupported task type returned by LLM: {}", other)
+                };
+                return Err(anyhow!(msg));
+            }
+        };
+
+        let child_id = tree.add_node(
+            Some(parent_id),
+            step.task.clone(),
+            task_type,
+            child_scopes,
+            child_tools,
+            child_domains,
+        );
+        Ok(child_id)
+    }
+
+    async fn handle_recovery_backtracking(
+        &self,
+        tree: &mut TaskTree,
+        node_id: NodeId,
+        node: &crate::tree::TaskNode,
+        child_id: NodeId,
+        queue: &mut std::collections::VecDeque<NodeId>,
+        max_subtasks: usize,
+        goal: &str,
+        parent_scopes: &[PathBuf],
+        parent_tools: &Option<Vec<String>>,
+        parent_domains: &Option<Vec<String>>,
+    ) -> Result<bool> {
+        info!(
+            "Child node {} failed after maximum retries. Initiating recovery/backtracking...",
+            child_id.0
+        );
+
+        // Collect descriptions of remaining unexecuted steps
+        let mut remaining_descs = Vec::new();
+        for &rem_id in queue.iter() {
+            if let Some(n) = tree.get_node(rem_id) {
+                remaining_descs.push(n.task_description.clone());
+            }
+        }
+
+        // Format the failed node outcome and extract description
+        let (failed_node_desc, outcome_str) = {
+            let failed_node = tree.get_node(child_id).unwrap();
+            let outcome = failed_node
+                .result
+                .as_ref()
+                .map(|r| {
+                    format!(
+                        "Exit code: {:?}\nSummary: {}\nStdout: {}\nStderr: {}",
+                        r.exit_code, r.summary, r.stdout, r.stderr
+                    )
+                })
+                .unwrap_or_else(|| "No outcome recorded".to_string());
+            (failed_node.task_description.clone(), outcome)
+        };
+
+        // Mark parent planning node state as Backtracking
+        if let Some(n) = tree.get_node_mut(node_id) {
+            n.state = NodeState::Backtracking;
+        }
+
+        let branch_context = self.build_branch_context(tree, node_id);
+        let recovery_prompt = crate::prompt::build_recovery_prompt(
+            goal,
+            &node.task_description,
+            &branch_context,
+            &failed_node_desc,
+            &outcome_str,
+            &remaining_descs,
+            max_subtasks,
+        );
+
+        let system_msg = json!({
+            "role": "system",
+            "content": "You are a precise task orchestrator. You handle subtask failures and decide how to recover."
+        });
+        let user_msg = json!({
+            "role": "user",
+            "content": recovery_prompt
+        });
+
+        let recovery_timeout = Duration::from_secs(self.config.llm_timeout_seconds.unwrap_or(30));
+        let recovery_completion_res = tokio::time::timeout(
+            recovery_timeout,
+            self.llm
+                .chat_completion_with_tools(vec![system_msg, user_msg], &[]),
+        )
+        .await;
+
+        let recovery_completion = match recovery_completion_res {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => return Err(anyhow!("LLM call failed during recovery: {}", e)),
+            Err(_) => return Err(anyhow!("LLM call timed out during recovery")),
+        };
+
+        let decision = crate::parser::parse_recovery_decision(&recovery_completion.content)
+            .context("Failed to parse LLM recovery decision")?;
+
+        info!(
+            "Recovery decision for node {}: action={}",
+            node_id.0, decision.action
+        );
+
+        if decision.action == "re_plan" {
+            let Some(new_steps) = decision.steps else {
+                return Ok(false);
+            };
+            info!(
+                "Re-planning node {} with {} new steps",
+                node_id.0,
+                new_steps.len()
+            );
+            // Clear unexecuted remaining steps from queue
+            queue.clear();
+
+            let mut new_child_ids = Vec::new();
+            for step in new_steps {
+                let child_id = self.create_child_node(
+                    tree,
+                    node_id,
+                    &step,
+                    parent_scopes,
+                    parent_tools,
+                    parent_domains,
+                    true,
+                )?;
+                new_child_ids.push(child_id);
+            }
+
+            queue.extend(new_child_ids);
+
+            // Reset parent node state to Running
+            if let Some(n) = tree.get_node_mut(node_id) {
+                n.state = NodeState::Running;
+            }
+
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     async fn execute_shell_command_node(

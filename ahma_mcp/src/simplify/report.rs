@@ -407,34 +407,42 @@ fn identify_culprit(f: &FileSimplicity) -> &'static str {
 
 /// Builds the hotspot/findings section of the AI fix prompt for `file`.
 /// Shows per-function hotspots when available, or falls back to raw Detekt findings.
-fn build_hotspot_section(file: &FileSimplicity) -> String {
-    if !file.hotspots.is_empty() {
-        let mut s = String::from("\nHOTSPOT FUNCTIONS (worst first — focus here):\n");
-        for h in &file.hotspots {
-            if h.cognitive > 0.0 || h.cyclomatic > 0.0 {
-                s.push_str(&format!(
-                    "  - `{}()` line {}: Cog={:.0}, Cyc={:.0}\n",
-                    h.name, h.start_line, h.cognitive, h.cyclomatic
-                ));
-            }
-        }
-        s
-    } else if !file.external_issues.is_empty() {
-        // Fallback for external-only analysis (e.g. Kotlin via Detekt) where
-        // hotspots were not populated — show raw tool findings instead.
-        let mut s = String::from("\nDETEKT FINDINGS (for context — fix the listed functions):\n");
-        for issue in file.external_issues.iter().take(10) {
-            let fn_ctx = issue
-                .function_name
-                .as_deref()
-                .map(|n| format!(" in `{n}()`"))
-                .unwrap_or_default();
+fn format_hotspots(hotspots: &[super::models::FunctionHotspot]) -> String {
+    let mut s = String::from("\nHOTSPOT FUNCTIONS (worst first — focus here):\n");
+    for h in hotspots {
+        if h.cognitive > 0.0 || h.cyclomatic > 0.0 {
             s.push_str(&format!(
-                "  - [{}{}] line {}: {}\n",
-                issue.rule, fn_ctx, issue.start_line, issue.message
+                "  - `{}()` line {}: Cog={:.0}, Cyc={:.0}\n",
+                h.name, h.start_line, h.cognitive, h.cyclomatic
             ));
         }
-        s
+    }
+    s
+}
+
+fn format_detekt_findings(issues: &[super::analysis::ExternalIssue]) -> String {
+    let mut s = String::from("\nDETEKT FINDINGS (for context — fix the listed functions):\n");
+    for issue in issues.iter().take(10) {
+        let fn_ctx = issue
+            .function_name
+            .as_deref()
+            .map(|n| format!(" in `{n}()`"))
+            .unwrap_or_default();
+        s.push_str(&format!(
+            "  - [{}{}] line {}: {}\n",
+            issue.rule, fn_ctx, issue.start_line, issue.message
+        ));
+    }
+    s
+}
+
+/// Builds the hotspot/findings section of the AI fix prompt for `file`.
+/// Shows per-function hotspots when available, or falls back to raw Detekt findings.
+fn build_hotspot_section(file: &FileSimplicity) -> String {
+    if !file.hotspots.is_empty() {
+        format_hotspots(&file.hotspots)
+    } else if !file.external_issues.is_empty() {
+        format_detekt_findings(&file.external_issues)
     } else {
         String::new()
     }

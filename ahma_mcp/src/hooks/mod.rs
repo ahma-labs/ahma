@@ -870,30 +870,12 @@ fn install_copilot_hook(
 }
 
 fn uninstall_copilot_hook(document: &mut Value) -> Result<bool> {
-    let Some(root) = document.as_object_mut() else {
-        bail!("GitHub Copilot hook config must be a JSON object");
-    };
-    let Some(hooks) = root.get_mut("hooks") else {
-        return Ok(false);
-    };
-    let Some(hooks_object) = hooks.as_object_mut() else {
-        bail!("GitHub Copilot hook config field 'hooks' must be an object");
-    };
-    let Some(entries) = hooks_object.get_mut(HookPlatform::Copilot.event_key()) else {
-        return Ok(false);
-    };
-    let Some(entries_array) = entries.as_array_mut() else {
-        bail!("GitHub Copilot preToolUse hook list must be an array");
-    };
-
-    let changed = {
-        let before_len = entries_array.len();
-        entries_array.retain(|entry| !is_managed_copilot_entry(entry));
-        entries_array.len() != before_len
-    };
-    cleanup_empty_hook_tree(root, HookPlatform::Copilot.event_key());
-
-    Ok(changed)
+    remove_managed_hook_entries(
+        document,
+        "GitHub Copilot",
+        HookPlatform::Copilot.event_key(),
+        is_managed_copilot_entry,
+    )
 }
 
 fn copilot_hook_installed(document: &Value) -> bool {

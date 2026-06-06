@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -23,10 +25,40 @@ pub struct McpClientConfigFile {
     pub servers: Vec<McpServerConfig>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolInfo {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+}
+
+pub type StdioClient = Arc<rmcp::service::RunningService<rmcp::RoleClient, ()>>;
+
+#[derive(Clone)]
 pub struct McpConnectionManager {
     pub servers: Vec<McpServerConfig>,
-    pub tools_by_server: BTreeMap<String, Vec<String>>,
+    pub tools_by_server: BTreeMap<String, Vec<ToolInfo>>,
+    pub stdio_clients: Arc<Mutex<BTreeMap<String, StdioClient>>>,
+}
+
+impl Default for McpConnectionManager {
+    fn default() -> Self {
+        Self {
+            servers: Vec::new(),
+            tools_by_server: BTreeMap::new(),
+            stdio_clients: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+}
+
+impl std::fmt::Debug for McpConnectionManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpConnectionManager")
+            .field("servers", &self.servers)
+            .field("tools_by_server", &self.tools_by_server)
+            .field("stdio_clients", &"<stdio clients>")
+            .finish()
+    }
 }
 
 impl McpConnectionManager {
@@ -43,6 +75,7 @@ impl McpConnectionManager {
         Ok(Self {
             servers: cfg.servers,
             tools_by_server: BTreeMap::new(),
+            stdio_clients: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -79,17 +112,30 @@ impl McpConnectionManager {
         let mut out = Vec::new();
         for (server, tools) in &self.tools_by_server {
             for tool in tools {
-                out.push(format!("{server}::{tool}"));
+                out.push(format!("{server}::{}", tool.name));
             }
         }
         out.sort();
         out
     }
 
+    pub fn aggregate_tools(&self) -> Vec<ToolInfo> {
+        let mut out = Vec::new();
+        for (server, tools) in &self.tools_by_server {
+            for tool in tools {
+                let mut t = tool.clone();
+                t.name = format!("{server}::{}", tool.name);
+                out.push(t);
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
     pub async fn refresh_tools(&mut self) {
         self.tools_by_server.clear();
         for server in self.servers.iter().filter(|s| s.enabled).cloned() {
-            if let Ok(tools) = fetch_server_tools(&server).await {
+            if let Ok(tools) = self.fetch_server_tools(&server).await {
                 self.tools_by_server.insert(server.name.clone(), tools);
             }
         }
@@ -115,9 +161,133 @@ impl McpConnectionManager {
         match &server.kind {
             McpServerKind::Http { url } => call_mcp_tool_http(url, tool_name, arguments).await,
             McpServerKind::Stdio { command, args } => {
-                call_mcp_tool_stdio(command, args, tool_name, arguments).await
+                let client = self
+                    .get_or_spawn_stdio_client(server_name, command, args)
+                    .await?;
+                call_mcp_tool_stdio(client, tool_name, arguments).await
             }
         }
+    }
+
+    pub async fn get_or_spawn_stdio_client(
+        &self,
+        name: &str,
+        command: &str,
+        args: &[String],
+    ) -> Result<StdioClient> {
+        let mut clients = self.stdio_clients.lock().await;
+        if let Some(client) = clients.get(name) {
+            return Ok(client.clone());
+        }
+
+        use rmcp::{
+            ServiceExt,
+            transport::{ConfigureCommandExt, TokioChildProcess},
+        };
+        use tokio::process::Command;
+
+        let mut cmd = Command::new(command);
+        cmd.args(args);
+        cmd.kill_on_drop(true);
+
+        let client =
+            ().serve(TokioChildProcess::new(cmd.configure(|_c| {}))?)
+                .await
+                .context("Failed to start stdio MCP server process")?;
+
+        let client_arc = Arc::new(client);
+        clients.insert(name.to_string(), client_arc.clone());
+        Ok(client_arc)
+    }
+
+    async fn fetch_server_tools(&self, server: &McpServerConfig) -> Result<Vec<ToolInfo>> {
+        match &server.kind {
+            McpServerKind::Http { url } => {
+                let client = reqwest::Client::new();
+                let sid = initialize_mcp_session(&client, url).await?;
+                let resp = client
+                    .post(format!("{}/mcp", url.trim_end_matches('/')))
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .header("mcp-session-id", sid)
+                    .json(&json!({
+                        "jsonrpc":"2.0",
+                        "id": 2,
+                        "method": "tools/list",
+                        "params": {}
+                    }))
+                    .send()
+                    .await
+                    .with_context(|| format!("Failed tools/list for {}", server.name))?;
+
+                if !resp.status().is_success() {
+                    return Err(anyhow!("tools/list failed for {}", server.name));
+                }
+
+                let val = resp
+                    .json::<Value>()
+                    .await
+                    .context("Failed to parse tools/list response")?;
+
+                let mut tools = Vec::new();
+                if let Some(arr) = val
+                    .get("result")
+                    .and_then(|r| r.get("tools"))
+                    .and_then(|t| t.as_array())
+                {
+                    for t in arr {
+                        if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
+                            let description = t
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .map(String::from);
+                            let input_schema =
+                                t.get("inputSchema").cloned().unwrap_or(serde_json::json!({
+                                    "type": "object",
+                                    "additionalProperties": true
+                                }));
+                            tools.push(ToolInfo {
+                                name: name.to_string(),
+                                description,
+                                input_schema,
+                            });
+                        }
+                    }
+                }
+                Ok(tools)
+            }
+            McpServerKind::Stdio { command, args } => {
+                self.fetch_server_tools_stdio(&server.name, command, args)
+                    .await
+            }
+        }
+    }
+
+    async fn fetch_server_tools_stdio(
+        &self,
+        name: &str,
+        command: &str,
+        args: &[String],
+    ) -> Result<Vec<ToolInfo>> {
+        let client = self.get_or_spawn_stdio_client(name, command, args).await?;
+        let tools_res = client
+            .list_tools(None)
+            .await
+            .context("Failed tools/list via stdio")?;
+        let mut infos = Vec::new();
+        for tool in tools_res.tools {
+            let input_schema =
+                serde_json::to_value(&tool.input_schema).unwrap_or(serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": true
+                }));
+            infos.push(ToolInfo {
+                name: tool.name.into_owned(),
+                description: tool.description.map(|d| d.into_owned()),
+                input_schema,
+            });
+        }
+        Ok(infos)
     }
 }
 
@@ -125,101 +295,12 @@ fn config_path(cwd: &Path) -> PathBuf {
     cwd.join(".ahma").join("mcp-clients.toml")
 }
 
-async fn fetch_server_tools(server: &McpServerConfig) -> Result<Vec<String>> {
-    match &server.kind {
-        McpServerKind::Http { url } => {
-            let client = reqwest::Client::new();
-            let sid = initialize_mcp_session(&client, url).await?;
-            let resp = client
-                .post(format!("{}/mcp", url.trim_end_matches('/')))
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header("mcp-session-id", sid)
-                .json(&json!({
-                    "jsonrpc":"2.0",
-                    "id": 2,
-                    "method": "tools/list",
-                    "params": {}
-                }))
-                .send()
-                .await
-                .with_context(|| format!("Failed tools/list for {}", server.name))?;
-
-            if !resp.status().is_success() {
-                return Err(anyhow!("tools/list failed for {}", server.name));
-            }
-
-            let val = resp
-                .json::<Value>()
-                .await
-                .context("Failed to parse tools/list response")?;
-
-            let mut tools = Vec::new();
-            if let Some(arr) = val
-                .get("result")
-                .and_then(|r| r.get("tools"))
-                .and_then(|t| t.as_array())
-            {
-                for t in arr {
-                    if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
-                        tools.push(name.to_string());
-                    }
-                }
-            }
-            Ok(tools)
-        }
-        McpServerKind::Stdio { command, args } => fetch_server_tools_stdio(command, args).await,
-    }
-}
-
-async fn fetch_server_tools_stdio(command: &str, args: &[String]) -> Result<Vec<String>> {
-    use rmcp::{
-        ServiceExt,
-        transport::{ConfigureCommandExt, TokioChildProcess},
-    };
-    use tokio::process::Command;
-
-    let mut cmd = Command::new(command);
-    cmd.args(args);
-    cmd.kill_on_drop(true);
-
-    let client =
-        ().serve(TokioChildProcess::new(cmd.configure(|_c| {}))?)
-            .await
-            .context("Failed to start stdio MCP server process")?;
-
-    let tools_res = client
-        .list_tools(None)
-        .await
-        .context("Failed tools/list via stdio")?;
-    let mut names = Vec::new();
-    for tool in tools_res.tools {
-        names.push(tool.name.into_owned());
-    }
-    Ok(names)
-}
-
 async fn call_mcp_tool_stdio(
-    command: &str,
-    args: &[String],
+    client: StdioClient,
     tool: &str,
     arguments: Value,
 ) -> Result<(String, bool)> {
-    use rmcp::{
-        ServiceExt,
-        model::CallToolRequestParams,
-        transport::{ConfigureCommandExt, TokioChildProcess},
-    };
-    use tokio::process::Command;
-
-    let mut cmd = Command::new(command);
-    cmd.args(args);
-    cmd.kill_on_drop(true);
-
-    let client =
-        ().serve(TokioChildProcess::new(cmd.configure(|_c| {}))?)
-            .await
-            .context("Failed to start stdio MCP server process")?;
+    use rmcp::model::CallToolRequestParams;
 
     let map = if let Value::Object(m) = arguments {
         m
@@ -402,11 +483,27 @@ mod tests {
         let mut manager = McpConnectionManager::default();
         manager.tools_by_server.insert(
             "srv1".to_string(),
-            vec!["tool_a".to_string(), "tool_b".to_string()],
+            vec![
+                ToolInfo {
+                    name: "tool_a".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                },
+                ToolInfo {
+                    name: "tool_b".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                },
+            ],
         );
-        manager
-            .tools_by_server
-            .insert("srv2".to_string(), vec!["tool_c".to_string()]);
+        manager.tools_by_server.insert(
+            "srv2".to_string(),
+            vec![ToolInfo {
+                name: "tool_c".to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+            }],
+        );
 
         let tools = manager.aggregate_tool_names();
         assert_eq!(

@@ -29,6 +29,7 @@ fn build_binary(package: &str, binary: &str) -> PathBuf {
 fn test_command(binary: &PathBuf) -> Command {
     let mut cmd = Command::new(binary);
     cmd.env("AHMA_DISABLE_SANDBOX", "1");
+    cmd.env("AHMA_SKIP_PROBES", "1");
     cmd.env_remove("AHMA_SANDBOX_SCOPE");
     cmd.env_remove("AHMA_WORKING_DIRS");
     cmd

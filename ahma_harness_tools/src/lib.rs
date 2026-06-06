@@ -25,7 +25,7 @@ pub struct WebFetchResult {
     pub text: String,
 }
 
-fn validate_path_in_scopes(path: &Path, scopes: &[PathBuf]) -> Result<PathBuf> {
+fn validate_path_in_scopes_sync(path: &Path, scopes: &[PathBuf]) -> Result<PathBuf> {
     let canonical = if path.exists() {
         std::fs::canonicalize(path)
             .with_context(|| format!("Failed to canonicalize path: {}", path.display()))?
@@ -58,13 +58,52 @@ fn validate_path_in_scopes(path: &Path, scopes: &[PathBuf]) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+async fn validate_path_in_scopes_async(path: &Path, scopes: &[PathBuf]) -> Result<PathBuf> {
+    let canonical = if path.exists() {
+        tokio::fs::canonicalize(path)
+            .await
+            .with_context(|| format!("Failed to canonicalize path: {}", path.display()))?
+    } else {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("Path has no parent: {}", path.display()))?;
+        let canonical_parent = tokio::fs::canonicalize(parent)
+            .await
+            .with_context(|| format!("Failed to canonicalize parent path: {}", parent.display()))?;
+        canonical_parent.join(path.file_name().unwrap_or_default())
+    };
+
+    if scopes.is_empty() {
+        return Ok(canonical);
+    }
+
+    let mut allowed = false;
+    for s in scopes {
+        if let Ok(scope) = tokio::fs::canonicalize(s).await {
+            if canonical.starts_with(scope) {
+                allowed = true;
+                break;
+            }
+        }
+    }
+
+    if !allowed {
+        return Err(anyhow!(
+            "Path '{}' is outside allowed scopes",
+            canonical.display()
+        ));
+    }
+
+    Ok(canonical)
+}
+
 pub async fn read_file(
     scopes: &[PathBuf],
     path: &Path,
     start_line: Option<usize>,
     end_line: Option<usize>,
 ) -> Result<String> {
-    let safe_path = validate_path_in_scopes(path, scopes)?;
+    let safe_path = validate_path_in_scopes_async(path, scopes).await?;
     let content = tokio::fs::read_to_string(&safe_path)
         .await
         .with_context(|| format!("Failed to read file: {}", safe_path.display()))?;
@@ -84,7 +123,7 @@ pub async fn read_file(
 }
 
 pub async fn list_dir(scopes: &[PathBuf], path: &Path) -> Result<Vec<DirEntryInfo>> {
-    let safe_path = validate_path_in_scopes(path, scopes)?;
+    let safe_path = validate_path_in_scopes_async(path, scopes).await?;
     let mut entries = tokio::fs::read_dir(&safe_path)
         .await
         .with_context(|| format!("Failed to read directory: {}", safe_path.display()))?;
@@ -104,7 +143,7 @@ pub async fn list_dir(scopes: &[PathBuf], path: &Path) -> Result<Vec<DirEntryInf
 }
 
 pub async fn write_file(scopes: &[PathBuf], path: &Path, content: &str) -> Result<()> {
-    let safe_path = validate_path_in_scopes(path, scopes)?;
+    let safe_path = validate_path_in_scopes_async(path, scopes).await?;
     if let Some(parent) = safe_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -126,7 +165,7 @@ pub async fn replace_in_file(
         return Err(anyhow!("old_str must not be empty"));
     }
 
-    let safe_path = validate_path_in_scopes(path, scopes)?;
+    let safe_path = validate_path_in_scopes_async(path, scopes).await?;
     let content = tokio::fs::read_to_string(&safe_path)
         .await
         .with_context(|| format!("Failed to read file: {}", safe_path.display()))?;
@@ -147,7 +186,7 @@ pub async fn replace_in_file(
 }
 
 pub fn file_search(scopes: &[PathBuf], base_dir: &Path, pattern: &str) -> Result<Vec<String>> {
-    let safe_base = validate_path_in_scopes(base_dir, scopes)?;
+    let safe_base = validate_path_in_scopes_sync(base_dir, scopes)?;
     let glob_pattern = safe_base.join(pattern).to_string_lossy().to_string();
 
     let mut out = Vec::new();
@@ -155,7 +194,7 @@ pub fn file_search(scopes: &[PathBuf], base_dir: &Path, pattern: &str) -> Result
         .with_context(|| format!("Invalid glob pattern: {}", pattern))?)
     .flatten()
     {
-        if path.is_file() && validate_path_in_scopes(&path, scopes).is_ok() {
+        if path.is_file() && validate_path_in_scopes_sync(&path, scopes).is_ok() {
             out.push(path.to_string_lossy().to_string());
         }
     }
@@ -171,7 +210,7 @@ pub fn grep_search(
     include_pattern: Option<&str>,
     max_results: Option<usize>,
 ) -> Result<Vec<GrepMatch>> {
-    let safe_base = validate_path_in_scopes(base_dir, scopes)?;
+    let safe_base = validate_path_in_scopes_sync(base_dir, scopes)?;
     let max = max_results.unwrap_or(200);
 
     let regex = if is_regex {
