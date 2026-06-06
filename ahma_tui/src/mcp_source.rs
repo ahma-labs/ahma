@@ -22,6 +22,9 @@ pub enum SourceEvent {
     HealthChanged {
         healthy: bool,
     },
+    DaemonHealthChanged {
+        healthy: bool,
+    },
     OperationsUpdated {
         ops: Vec<Operation>,
     },
@@ -370,6 +373,18 @@ fn parse_operations(val: &Value) -> Vec<Operation> {
                 && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(st_str)
             {
                 op.started_time = dt.with_timezone(&chrono::Local);
+            }
+            if let Some(arr) = op_val.get("stdout_tail").and_then(|v| v.as_array()) {
+                op.stdout_tail = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+            }
+            if let Some(arr) = op_val.get("alerts").and_then(|v| v.as_array()) {
+                op.alerts = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
             }
 
             Some(op)

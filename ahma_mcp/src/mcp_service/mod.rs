@@ -70,9 +70,14 @@ use tracing;
 use tracing::Instrument as _;
 
 use crate::{
-    adapter::Adapter, callback_system::CallbackSender, client_type::McpClientType,
-    config::ToolConfig, mcp_callback::McpCallbackSender,
+    adapter::Adapter,
+    callback_system::CallbackSender,
+    client_type::McpClientType,
+    config::ToolConfig,
+    mcp_callback::McpCallbackSender,
+    operation_monitor::{Operation, OperationStatus},
 };
+use serde_json::Value;
 
 pub(crate) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1125,6 +1130,23 @@ impl ServerHandler for AhmaMcpService {
                     handlers::harness_tools::replace_in_file_schema(),
                 )
                 .with_title("replace_in_file"),
+                Tool::new(
+                    "log_monitor",
+                    "Start a real-time log monitoring session on a file inside the sandbox. Reads new lines as they are written, runs them through the AI for issue detection, and sends alerts.",
+                    schema::object_input_schema(
+                        {
+                            let mut props = serde_json::Map::new();
+                            props.insert("file_path".to_string(), schema::string_property("Path of the log file to monitor (within sandbox scope)"));
+                            props.insert("detection_prompt".to_string(), schema::string_property("Optional prompt guiding AI issue detection"));
+                            props.insert("llm_base_url".to_string(), schema::string_property("Optional custom LLM base URL"));
+                            props.insert("llm_model".to_string(), schema::string_property("Optional custom LLM model"));
+                            props.insert("llm_api_key".to_string(), schema::string_property("Optional custom LLM API key"));
+                            props
+                        },
+                        &["file_path"],
+                    ),
+                )
+                .with_title("log_monitor"),
             ];
 
             let configs_lock = self.configs.read().unwrap();
@@ -1207,6 +1229,10 @@ impl ServerHandler for AhmaMcpService {
                     self.handle_replace_in_file(params.arguments.unwrap_or_default())
                         .await
                 }
+                "log_monitor" => {
+                    self.handle_log_monitor(params.arguments.unwrap_or_default(), context)
+                        .await
+                }
                 _ => self.dispatch_configured_tool(params, context).await,
             }
         }
@@ -1224,6 +1250,134 @@ impl AhmaMcpService {
                 .to_string();
         tracing::warn!("{}", error_message);
         Err(handlers::common::mcp_internal(error_message))
+    }
+
+    pub async fn handle_log_monitor(
+        &self,
+        arguments: serde_json::Map<String, Value>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        use std::sync::atomic::Ordering;
+
+        let file_path_str = arguments
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                McpError::invalid_params("file_path parameter is required".to_string(), None)
+            })?;
+
+        let detection_prompt = arguments
+            .get("detection_prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Identify errors or warnings")
+            .to_string();
+
+        let path = std::path::Path::new(file_path_str);
+        let safe_path = self
+            .adapter
+            .sandbox()
+            .validate_path(path)
+            .map_err(|e| McpError::invalid_params(format!("Invalid file path: {}", e), None))?;
+
+        let llm_base_url = arguments
+            .get("llm_base_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let llm_model = arguments
+            .get("llm_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let llm_api_key = arguments
+            .get("llm_api_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let llm_provider = if let Some(base_url) = llm_base_url
+            && let Some(model) = llm_model
+        {
+            crate::config::LlmProviderConfig {
+                base_url,
+                model,
+                api_key: llm_api_key,
+            }
+        } else {
+            let configs_lock = self.configs.read().unwrap();
+            let mut found_provider = None;
+            for config in configs_lock.values() {
+                if let Some(livelog) = &config.livelog {
+                    found_provider = Some(livelog.llm_provider.clone());
+                    break;
+                }
+            }
+            drop(configs_lock);
+
+            found_provider.unwrap_or_else(|| crate::config::LlmProviderConfig {
+                base_url: "http://localhost:11434/v1".to_string(),
+                model: "llama3.2".to_string(),
+                api_key: None,
+            })
+        };
+
+        static NEXT_LOG_MON_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let op_id = format!("logmon_{}", NEXT_LOG_MON_ID.fetch_add(1, Ordering::SeqCst));
+        let operation = Operation::new_with_timeout(
+            op_id.clone(),
+            "log_monitor".to_string(),
+            format!("Monitoring log: {}", file_path_str),
+            None,
+            None,
+        );
+        self.operation_monitor.add_operation(operation).await;
+
+        let monitor = self.operation_monitor.clone();
+        let cancellation_token = monitor
+            .get_operation(&op_id)
+            .await
+            .unwrap()
+            .cancellation_token;
+
+        let progress_token = context.meta.get_progress_token();
+        let client_type = McpClientType::from_peer(&context.peer);
+        let callback: Option<Box<dyn CallbackSender>> = progress_token.map(|token| {
+            Box::new(McpCallbackSender::new(
+                context.peer.clone(),
+                op_id.clone(),
+                Some(token),
+                client_type,
+            )) as Box<dyn CallbackSender>
+        });
+
+        let op_id_clone = op_id.clone();
+        let monitor_clone = monitor.clone();
+        tokio::spawn(async move {
+            monitor_clone
+                .update_status(&op_id_clone, OperationStatus::InProgress, None)
+                .await;
+
+            let cb_ref: Option<&(dyn CallbackSender + Send + Sync)> = callback
+                .as_ref()
+                .map(|b| b.as_ref() as &(dyn CallbackSender + Send + Sync));
+
+            crate::livelog::run_file_monitor_pipeline(
+                &op_id_clone,
+                safe_path,
+                detection_prompt,
+                llm_provider,
+                cancellation_token,
+                cb_ref,
+                monitor_clone.clone(),
+            )
+            .await;
+
+            monitor_clone
+                .update_status(&op_id_clone, OperationStatus::Completed, None)
+                .await;
+        });
+
+        Ok(handlers::common::text_result(format!(
+            "Log monitor started on '{}'. Operation ID: {}",
+            file_path_str, op_id
+        )))
     }
 
     fn resolve_configured_tool(

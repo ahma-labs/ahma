@@ -20,6 +20,7 @@ use wiremock::{
 use ahma_mcp::callback_system::{CallbackError, CallbackSender, ProgressUpdate};
 use ahma_mcp::config::{LivelogConfig, LlmProviderConfig};
 use ahma_mcp::livelog::run_livelog_pipeline;
+use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
 use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 
 // ---------------------------------------------------------------------------
@@ -123,6 +124,9 @@ async fn test_livelog_pipeline_clean_response_no_alert() {
 
     let callback = MockCallback::new();
     let token = CancellationToken::new();
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(30),
+    )));
 
     run_livelog_pipeline(
         "test-op-clean",
@@ -131,6 +135,7 @@ async fn test_livelog_pipeline_clean_response_no_alert() {
         temp_dir.path(),
         token,
         Some(&callback),
+        monitor,
     )
     .await;
 
@@ -175,6 +180,9 @@ async fn test_livelog_pipeline_issue_detected_sends_alert() {
 
     let callback = MockCallback::new();
     let token = CancellationToken::new();
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(30),
+    )));
 
     run_livelog_pipeline(
         "test-op-issue",
@@ -183,6 +191,7 @@ async fn test_livelog_pipeline_issue_detected_sends_alert() {
         temp_dir.path(),
         token,
         Some(&callback),
+        monitor,
     )
     .await;
 
@@ -245,6 +254,9 @@ async fn test_livelog_pipeline_cooldown_suppresses_second_alert() {
 
     let callback = MockCallback::new();
     let token = CancellationToken::new();
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(30),
+    )));
 
     run_livelog_pipeline(
         "test-op-cooldown",
@@ -253,6 +265,7 @@ async fn test_livelog_pipeline_cooldown_suppresses_second_alert() {
         temp_dir.path(),
         token,
         Some(&callback),
+        monitor,
     )
     .await;
 
@@ -295,6 +308,9 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
 
     let callback = MockCallback::new();
     let token = CancellationToken::new();
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(30),
+    )));
 
     // Cancel after a short delay so the pipeline can actually start.
     let token_clone = token.clone();
@@ -311,6 +327,7 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
         temp_dir.path(),
         token,
         Some(&callback),
+        monitor,
     )
     .await;
     let elapsed = start.elapsed();
@@ -359,6 +376,9 @@ async fn test_livelog_pipeline_llm_http_500_graceful() {
 
     let callback = MockCallback::new();
     let token = CancellationToken::new();
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(30),
+    )));
 
     // Pipeline should complete without panic/hang despite LLM 500.
     run_livelog_pipeline(
@@ -368,6 +388,7 @@ async fn test_livelog_pipeline_llm_http_500_graceful() {
         temp_dir.path(),
         token,
         Some(&callback),
+        monitor,
     )
     .await;
 
@@ -409,6 +430,9 @@ async fn test_livelog_pipeline_llm_malformed_json_graceful() {
 
     let callback = MockCallback::new();
     let token = CancellationToken::new();
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(30),
+    )));
 
     run_livelog_pipeline(
         "test-op-bad-json",
@@ -417,6 +441,7 @@ async fn test_livelog_pipeline_llm_malformed_json_graceful() {
         temp_dir.path(),
         token,
         Some(&callback),
+        monitor,
     )
     .await;
 
@@ -460,6 +485,9 @@ async fn test_livelog_pipeline_zero_cooldown_fires_all_alerts() {
 
     let callback = MockCallback::new();
     let token = CancellationToken::new();
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(30),
+    )));
 
     run_livelog_pipeline(
         "test-op-zero-cd",
@@ -468,6 +496,7 @@ async fn test_livelog_pipeline_zero_cooldown_fires_all_alerts() {
         temp_dir.path(),
         token,
         Some(&callback),
+        monitor,
     )
     .await;
 
@@ -507,6 +536,9 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
 
     let callback = MockCallback::new();
     let token = CancellationToken::new();
+    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        Duration::from_secs(30),
+    )));
 
     // Should complete without panicking.
     run_livelog_pipeline(
@@ -516,6 +548,7 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
         temp_dir.path(),
         token,
         Some(&callback),
+        monitor,
     )
     .await;
 

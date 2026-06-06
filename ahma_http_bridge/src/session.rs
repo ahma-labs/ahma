@@ -718,6 +718,7 @@ impl SessionManager {
         let mut child = Command::new(&self.config.server_command)
             .args(&args)
             .env("AHMA_SANDBOX_DEFER", "1")
+            .env("AHMA_SERVER_CHILD", "1")
             // Propagate W3C trace context so subprocess spans are linked to the
             // current session span (W3C Trace Context 1.0 §3.2).
             .env(

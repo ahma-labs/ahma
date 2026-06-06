@@ -70,6 +70,12 @@ pub struct Operation {
     /// Not serialised — only meaningful for live operations held in OperationMonitor.
     #[serde(skip, default = "default_completion_watch")]
     pub completion_watch: Arc<watch::Sender<bool>>,
+    /// Tail of stdout/stderr lines for this operation (max 100)
+    #[serde(default)]
+    pub stdout_tail: Vec<String>,
+    /// Any warnings/errors detected for this operation
+    #[serde(default)]
+    pub alerts: Vec<String>,
 }
 
 /// Default factory for `completion_watch` used during serde deserialisation.
@@ -92,6 +98,8 @@ impl Operation {
             timeout_duration: None,
             cancellation_token: CancellationToken::new(),
             completion_watch: Arc::new(watch::channel(false).0),
+            stdout_tail: Vec::new(),
+            alerts: Vec::new(),
         }
     }
 
@@ -115,6 +123,8 @@ impl Operation {
             timeout_duration: timeout,
             cancellation_token: CancellationToken::new(),
             completion_watch: Arc::new(watch::channel(false).0),
+            stdout_tail: Vec::new(),
+            alerts: Vec::new(),
         }
     }
 
@@ -234,6 +244,23 @@ impl OperationMonitor {
         );
         ops.insert(operation.id.clone(), operation);
         tracing::debug!("Total operations in monitor after add: {}", ops.len());
+    }
+
+    pub async fn append_stdout_line(&self, id: &str, line: String) {
+        let mut ops = self.operations.write().await;
+        if let Some(op) = ops.get_mut(id) {
+            if op.stdout_tail.len() >= 100 {
+                op.stdout_tail.remove(0);
+            }
+            op.stdout_tail.push(line);
+        }
+    }
+
+    pub async fn append_alert(&self, id: &str, alert: String) {
+        let mut ops = self.operations.write().await;
+        if let Some(op) = ops.get_mut(id) {
+            op.alerts.push(alert);
+        }
     }
 
     pub async fn get_operation(&self, id: &str) -> Option<Operation> {

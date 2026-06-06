@@ -73,7 +73,7 @@ pub enum Action {
 #[cfg(feature = "tui")]
 pub fn map_key(
     key: KeyEvent,
-    mode: Mode,
+    _mode: Mode,
     focus: Focus,
     palette: &PaletteState,
     nav_visible: bool,
@@ -92,8 +92,8 @@ pub fn map_key(
         return map_filter_key(key);
     }
 
-    // In Chat mode the input box handles most keys.
-    if mode == Mode::Chat && focus == Focus::Chat {
+    // If the input box is focused, let it handle key inputs.
+    if focus == Focus::Chat {
         return map_chat_input_key(key);
     }
 

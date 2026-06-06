@@ -121,6 +121,7 @@ pub async fn handle_livelog_start(
             &safe_wd,
             cancellation_token,
             cb_ref,
+            monitor_task.clone(),
         )
         .await;
 
