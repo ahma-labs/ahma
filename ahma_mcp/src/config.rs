@@ -50,6 +50,16 @@ const RESERVED_TOOL_NAMES: &[&str] = &[
     "run_terminal_command",
     "cancel",
     "restart",
+    "logs_list",
+    "logs_read",
+    "logs_search",
+    "read_file",
+    "list_dir",
+    "file_search",
+    "grep_search",
+    "fetch_webpage",
+    "write_file",
+    "replace_in_file",
 ];
 const TOOL_CONFIG_READ_MAX_ATTEMPTS: usize = 8;
 const TOOL_CONFIG_READ_BACKOFF_MS: u64 = 40;

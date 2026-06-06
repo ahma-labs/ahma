@@ -263,11 +263,28 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         (false, false) => (" - ", theme.unhealthy()),
     };
     let health_span = Span::styled(health_char, health_style);
+    let mut http_count = 0;
+    let mut stdio_count = 0;
+    for s in &state.mcp_connections.servers {
+        if s.enabled {
+            match &s.kind {
+                crate::mcp_connections::McpServerKind::Http { .. } => http_count += 1,
+                crate::mcp_connections::McpServerKind::Stdio { .. } => stdio_count += 1,
+            }
+        }
+    }
+    let external_tools = state.mcp_connections.aggregate_tool_names().len();
+    let external_part = if http_count > 0 || stdio_count > 0 {
+        format!(" · ext (http:{http_count} stdio:{stdio_count}) / {external_tools} tools")
+    } else {
+        String::new()
+    };
 
     let line = Line::from(vec![
         Span::styled(" ahma chat", theme.title()),
         Span::styled(format!("  {}", state.llm_label), theme.normal()),
         Span::styled(mcp_label, theme.dim()),
+        Span::styled(external_part, theme.dim()),
         health_span,
         Span::styled(
             format!("{}  q quit  ? help", state.transport_label),
@@ -823,6 +840,22 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         .unwrap_or_default();
 
     let workspace_short = shorten_path(&state.workspace, 30);
+    let mut http_count = 0;
+    let mut stdio_count = 0;
+    for s in &state.mcp_connections.servers {
+        if s.enabled {
+            match &s.kind {
+                crate::mcp_connections::McpServerKind::Http { .. } => http_count += 1,
+                crate::mcp_connections::McpServerKind::Stdio { .. } => stdio_count += 1,
+            }
+        }
+    }
+    let external_tools = state.mcp_connections.aggregate_tool_names().len();
+    let external_part = if http_count > 0 || stdio_count > 0 {
+        format!(" · ext (http:{http_count} stdio:{stdio_count})/{external_tools}")
+    } else {
+        String::new()
+    };
 
     let line = Line::from(vec![
         Span::styled(" ahma", theme.title()),
@@ -831,6 +864,7 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
             format!(" · sandbox {}", state.sandbox_status),
             sandbox_style,
         ),
+        Span::styled(external_part, theme.dim()),
         Span::styled(format!(" · {workspace_short}"), theme.dim()),
         Span::styled(format!(" · {}", state.transport_label), theme.dim()),
         health_span,

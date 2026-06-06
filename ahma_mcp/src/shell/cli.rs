@@ -1421,6 +1421,10 @@ pub struct TuiArgs {
     ///   unix:///path/to.sock    — Unix domain socket (Unix only)
     #[arg(long = "connect")]
     pub connect: Option<String>,
+
+    /// Launch directly with a specific agent profile.
+    #[arg(long = "profile")]
+    pub profile: Option<String>,
 }
 
 // ── tls ───────────────────────────────────────────────────────────────────────

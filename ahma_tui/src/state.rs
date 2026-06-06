@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::mcp_connections::McpConnectionManager;
 use crate::session_config::TuiSessionConfig;
 #[cfg(feature = "tui")]
 use ratatui::layout::Rect;
@@ -179,6 +180,22 @@ pub fn builtin_commands() -> Vec<NavCommand> {
             description: "disable ahma MCP tool server",
         },
         NavCommand {
+            command: "/mcp list".into(),
+            description: "list configured MCP client servers",
+        },
+        NavCommand {
+            command: "/mcp refresh".into(),
+            description: "refresh tools from configured MCP servers",
+        },
+        NavCommand {
+            command: "/mcp add http <url> [name]".into(),
+            description: "add an HTTP MCP server",
+        },
+        NavCommand {
+            command: "/mcp remove <name>".into(),
+            description: "remove a configured MCP server",
+        },
+        NavCommand {
             command: "/run <tool> {json}".into(),
             description: "invoke an ahma tool directly with optional JSON args",
         },
@@ -205,6 +222,26 @@ pub fn builtin_commands() -> Vec<NavCommand> {
         NavCommand {
             command: "/clear".into(),
             description: "clear chat history",
+        },
+        NavCommand {
+            command: "/agent list".into(),
+            description: "list saved agent profiles",
+        },
+        NavCommand {
+            command: "/agent save <name>".into(),
+            description: "save current setup as an agent profile",
+        },
+        NavCommand {
+            command: "/agent load <name>".into(),
+            description: "load an agent profile",
+        },
+        NavCommand {
+            command: "/agent delete <name>".into(),
+            description: "delete an agent profile",
+        },
+        NavCommand {
+            command: "/export markdown".into(),
+            description: "export chat transcript to markdown",
         },
         NavCommand {
             command: "/exit".into(),
@@ -692,6 +729,7 @@ pub struct AppState {
     pub log: VecDeque<LogEntry>,
     pub approval: Option<ApprovalGate>,
     pub tools_list: Vec<String>,
+    pub mcp_connections: McpConnectionManager,
 
     // ── Chat ──
     pub mode: Mode,
@@ -705,6 +743,7 @@ pub struct AppState {
     pub llm_label: String,
     /// Concrete provider URL used for API calls and persisted in session config.
     pub current_provider_url: Option<String>,
+    pub active_profile: Option<String>,
     /// True when ahma-as-MCP is active.
     pub mcp_enabled: bool,
     /// Discovered + configured providers.
@@ -738,6 +777,10 @@ pub struct AppState {
     pub bridge_tx: Option<tokio::sync::mpsc::Sender<crate::llm_bridge::BridgeEvent>>,
     #[cfg(not(feature = "tui"))]
     pub bridge_tx: Option<()>,
+    #[cfg(feature = "tui")]
+    pub approval_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    #[cfg(not(feature = "tui"))]
+    pub approval_tx: Option<()>,
 }
 
 impl AppState {
@@ -769,6 +812,11 @@ impl AppState {
             })
         });
         let mcp_enabled = session.as_ref().map(|s| s.mcp_enabled).unwrap_or(false);
+        let mcp_connections = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| McpConnectionManager::load(&cwd).ok())
+            .unwrap_or_default();
+        let active_profile = session.as_ref().and_then(|s| s.active_profile.clone());
 
         Self {
             server_url: server_url.into(),
@@ -783,12 +831,14 @@ impl AppState {
             log: VecDeque::with_capacity(LOG_RING_CAP),
             approval: None,
             tools_list: vec![],
+            mcp_connections,
 
             mode: Mode::default(),
             chat: ChatHistory::default(),
             chat_input: TextArea::default(),
             llm_label,
             current_provider_url,
+            active_profile,
             mcp_enabled,
             available_providers: vec![],
             available_models: vec![],
@@ -813,6 +863,10 @@ impl AppState {
             unicode,
             should_quit: false,
             bridge_tx: None,
+            #[cfg(feature = "tui")]
+            approval_tx: None,
+            #[cfg(not(feature = "tui"))]
+            approval_tx: None,
         }
     }
 

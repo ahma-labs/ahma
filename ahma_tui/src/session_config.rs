@@ -8,6 +8,8 @@ pub struct TuiSessionConfig {
     pub model: String,
     pub provider_url: Option<String>,
     pub mcp_enabled: bool,
+    #[serde(default)]
+    pub active_profile: Option<String>,
 }
 
 impl TuiSessionConfig {

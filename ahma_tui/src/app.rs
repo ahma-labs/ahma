@@ -13,9 +13,9 @@ use crate::connection::ResolvedConnection;
 
 /// Launch the TUI.  Restores the terminal on exit (even on error) when the
 /// full ratatui UI is compiled in.
-pub async fn run(connection: &ResolvedConnection) -> Result<()> {
+pub async fn run(connection: &ResolvedConnection, profile: Option<String>) -> Result<()> {
     #[cfg(feature = "tui")]
-    return run_ratatui(connection).await;
+    return run_ratatui(connection, profile).await;
 
     #[cfg(not(feature = "tui"))]
     return run_text_stub(connection).await;
@@ -24,7 +24,10 @@ pub async fn run(connection: &ResolvedConnection) -> Result<()> {
 // ─── Ratatui implementation (feature = "tui") ─────────────────────────────────
 
 #[cfg(feature = "tui")]
-async fn run_ratatui(connection: &ResolvedConnection) -> Result<()> {
+async fn run_ratatui(
+    connection: &ResolvedConnection,
+    profile_override: Option<String>,
+) -> Result<()> {
     use std::io;
     use std::time::Duration;
 
@@ -54,6 +57,18 @@ async fn run_ratatui(connection: &ResolvedConnection) -> Result<()> {
         unicode,
     );
     state.mcp_http_base_url = http_base_url(connection);
+
+    if let Some(profile_name) = profile_override
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        if let Ok(profile) = crate::agent_config::get_profile(&cwd, &profile_name) {
+            state.active_profile = Some(profile.name.clone());
+            state.current_provider_url = Some(profile.provider_url);
+            state.llm_label = format!("profile:{} / {}", profile.name, profile.model);
+        } else {
+            tracing::warn!("Failed to load profile override: {profile_name}");
+        }
+    }
 
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<SourceEvent>(256);
     spawn_mcp_source(connection.clone(), mcp_tx.clone());
@@ -426,6 +441,10 @@ fn resolve_approval(state: &mut crate::state::AppState, approved: bool) {
         return;
     };
 
+    if let Some(tx) = state.approval_tx.take() {
+        let _ = tx.send(approved);
+    }
+
     let (level, verb) = if approved {
         (LogLevel::Info, "Approved")
     } else {
@@ -647,7 +666,9 @@ fn backspace_chat_input(state: &mut crate::state::AppState) {
 
 #[cfg(feature = "tui")]
 fn submit_chat_input(state: &mut crate::state::AppState) {
-    use crate::llm_bridge::{spawn_chat_task, spawn_decompose_task, spawn_window_cli_task};
+    use crate::llm_bridge::{
+        spawn_agent_task, spawn_chat_task, spawn_decompose_task, spawn_window_cli_task,
+    };
     use crate::state::{ChatEntry, LogEntry, LogLevel, TuiWindow};
     use ahma_llm_monitor::client::LlmClient;
 
@@ -743,13 +764,24 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     let system = state.mcp_enabled.then(|| {
         "Use ahma tools when they would materially improve the answer. Prefer direct answers when no tool is needed.".to_string()
     });
-    spawn_chat_task(
-        client,
-        collect_chat_history(state),
-        system,
-        optional_mcp_chat_config(state),
-        tx.clone(),
-    );
+    if state.mcp_enabled {
+        spawn_agent_task(
+            client,
+            collect_chat_history(state),
+            system,
+            optional_mcp_chat_config(state),
+            state.tools_list.clone(),
+            tx.clone(),
+        );
+    } else {
+        spawn_chat_task(
+            client,
+            collect_chat_history(state),
+            system,
+            optional_mcp_chat_config(state),
+            tx.clone(),
+        );
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -781,10 +813,49 @@ fn optional_mcp_chat_config(
 
 #[cfg(feature = "tui")]
 fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChatConfig {
+    let external_http_servers = state
+        .mcp_connections
+        .servers
+        .iter()
+        .filter_map(|s| match &s.kind {
+            crate::mcp_connections::McpServerKind::Http { url } if s.enabled => {
+                Some((s.name.clone(), url.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let max_turns = if let Some(profile_name) = &state.active_profile {
+        if let Ok(cwd) = std::env::current_dir() {
+            crate::agent_config::get_profile(&cwd, profile_name)
+                .map(|p| p.max_turns)
+                .unwrap_or(8)
+        } else {
+            8
+        }
+    } else {
+        8
+    };
+
+    let tool_approval = if let Some(profile_name) = &state.active_profile {
+        if let Ok(cwd) = std::env::current_dir() {
+            crate::agent_config::get_profile(&cwd, profile_name)
+                .map(|p| p.tool_approval)
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     crate::llm_bridge::McpChatConfig {
         base_url: state.mcp_http_base_url.clone(),
         workspace_root: std::path::PathBuf::from(&state.workspace),
         session_id: state.session_id.clone(),
+        external_http_servers,
+        max_turns,
+        tool_approval,
     }
 }
 
@@ -1009,6 +1080,8 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
         || handle_basic_nav_command(cmd, state)
         || handle_mode_nav_command(cmd, state)
         || handle_mcp_nav_command(cmd, state)
+        || handle_agent_nav_command(cmd, state)
+        || handle_export_nav_command(cmd, state)
         || handle_tools_nav_command(cmd, state)
         || handle_approval_nav_command(cmd, state)
         || handle_picker_nav_command(cmd, state)
@@ -1069,13 +1142,96 @@ fn set_mode_and_focus(
 
 #[cfg(feature = "tui")]
 fn handle_mcp_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
-    match cmd {
-        "/mcp on" => set_mcp_enabled(state, true),
-        "/mcp off" => set_mcp_enabled(state, false),
-        _ => return false,
+    if cmd == "/mcp on" {
+        set_mcp_enabled(state, true);
+        return true;
+    }
+    if cmd == "/mcp off" {
+        set_mcp_enabled(state, false);
+        return true;
     }
 
-    true
+    if cmd == "/mcp list" {
+        let servers = state.mcp_connections.list_servers();
+        if servers.is_empty() {
+            push_assistant_message(state, "No MCP client servers configured.");
+        } else {
+            let mut msg = String::from("Configured MCP servers:\n");
+            for s in servers {
+                let kind = match &s.kind {
+                    crate::mcp_connections::McpServerKind::Http { url } => {
+                        format!("http {url}")
+                    }
+                    crate::mcp_connections::McpServerKind::Stdio { command, args } => {
+                        format!("stdio {} {}", command, args.join(" "))
+                    }
+                };
+                msg.push_str(&format!(
+                    "- {} [{}] {}\n",
+                    s.name,
+                    if s.enabled { "on" } else { "off" },
+                    kind
+                ));
+            }
+            push_assistant_message(state, msg.trim_end());
+        }
+        return true;
+    }
+
+    if cmd == "/mcp refresh" {
+        if let Some(tx) = &state.bridge_tx {
+            crate::llm_bridge::spawn_external_tools_refresh(
+                state.mcp_connections.clone(),
+                tx.clone(),
+            );
+            push_assistant_message(state, "Refreshing external MCP tools in the background...");
+        } else {
+            push_assistant_message(
+                state,
+                "Bridge is not available; cannot refresh external tools.",
+            );
+        }
+        return true;
+    }
+
+    if let Some(rest) = cmd.strip_prefix("/mcp remove ") {
+        let name = rest.trim();
+        if name.is_empty() {
+            push_assistant_message(state, "Usage: /mcp remove <name>");
+            return true;
+        }
+        state.mcp_connections.remove_server(name);
+        if let Ok(cwd) = std::env::current_dir() {
+            let _ = state.mcp_connections.save(&cwd);
+        }
+        push_assistant_message(state, format!("Removed MCP server `{name}`."));
+        return true;
+    }
+
+    if let Some(rest) = cmd.strip_prefix("/mcp add http ") {
+        let mut parts = rest.split_whitespace();
+        let Some(url) = parts.next() else {
+            push_assistant_message(state, "Usage: /mcp add http <url> [name]");
+            return true;
+        };
+        let name = parts.next().unwrap_or("external-http").to_string();
+        state
+            .mcp_connections
+            .add_server(crate::mcp_connections::McpServerConfig {
+                name: name.clone(),
+                enabled: true,
+                kind: crate::mcp_connections::McpServerKind::Http {
+                    url: url.to_string(),
+                },
+            });
+        if let Ok(cwd) = std::env::current_dir() {
+            let _ = state.mcp_connections.save(&cwd);
+        }
+        push_assistant_message(state, format!("Added HTTP MCP server `{name}` -> {url}"));
+        return true;
+    }
+
+    false
 }
 
 #[cfg(feature = "tui")]
@@ -1097,6 +1253,146 @@ fn handle_tools_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
     }
 
     push_assistant_message(state, format_tools_list_message(&state.tools_list));
+    true
+}
+
+#[cfg(feature = "tui")]
+fn handle_agent_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    let Ok(cwd) = std::env::current_dir() else {
+        push_assistant_message(state, "Cannot resolve current working directory.");
+        return true;
+    };
+
+    if cmd == "/agent list" {
+        match crate::agent_config::load_profiles(&cwd) {
+            Ok(file) => {
+                if file.profiles.is_empty() {
+                    push_assistant_message(state, "No saved agent profiles.");
+                } else {
+                    let mut msg = String::from("Saved agent profiles:\n");
+                    for name in file.profiles.keys() {
+                        msg.push_str(&format!("- {name}\n"));
+                    }
+                    push_assistant_message(state, msg.trim_end());
+                }
+            }
+            Err(e) => push_assistant_message(state, format!("Failed to load profiles: {e}")),
+        }
+        return true;
+    }
+
+    if let Some(name) = cmd.strip_prefix("/agent save ") {
+        let name = name.trim();
+        if name.is_empty() {
+            push_assistant_message(state, "Usage: /agent save <name>");
+            return true;
+        }
+        let profile = crate::agent_config::AgentProfile {
+            name: name.to_string(),
+            model: state.selected_model(),
+            provider_url: state.current_provider_url.clone().unwrap_or_default(),
+            system_prompt: "Use tools when needed, prefer concise reasoning.".to_string(),
+            tool_approval: false,
+            max_turns: 8,
+            mcp_servers: state
+                .mcp_connections
+                .servers
+                .iter()
+                .map(|s| s.name.clone())
+                .collect(),
+        };
+        match crate::agent_config::upsert_profile(&cwd, profile) {
+            Ok(()) => {
+                state.active_profile = Some(name.to_string());
+                push_assistant_message(state, format!("Saved profile `{name}`."));
+            }
+            Err(e) => push_assistant_message(state, format!("Failed to save profile: {e}")),
+        }
+        return true;
+    }
+
+    if let Some(name) = cmd.strip_prefix("/agent load ") {
+        let name = name.trim();
+        if name.is_empty() {
+            push_assistant_message(state, "Usage: /agent load <name>");
+            return true;
+        }
+        match crate::agent_config::get_profile(&cwd, name) {
+            Ok(profile) => {
+                state.active_profile = Some(profile.name.clone());
+                state.current_provider_url = Some(profile.provider_url);
+                state.llm_label = format!("profile:{name} / {}", profile.model);
+                push_assistant_message(state, format!("Loaded profile `{name}`."));
+            }
+            Err(e) => push_assistant_message(state, format!("Failed to load profile: {e}")),
+        }
+        return true;
+    }
+
+    if let Some(name) = cmd.strip_prefix("/agent delete ") {
+        let name = name.trim();
+        if name.is_empty() {
+            push_assistant_message(state, "Usage: /agent delete <name>");
+            return true;
+        }
+        match crate::agent_config::delete_profile(&cwd, name) {
+            Ok(true) => push_assistant_message(state, format!("Deleted profile `{name}`.")),
+            Ok(false) => push_assistant_message(state, format!("Profile `{name}` not found.")),
+            Err(e) => push_assistant_message(state, format!("Failed to delete profile: {e}")),
+        }
+        return true;
+    }
+
+    false
+}
+
+#[cfg(feature = "tui")]
+fn handle_export_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    if cmd != "/export markdown" {
+        return false;
+    }
+
+    let Ok(cwd) = std::env::current_dir() else {
+        push_assistant_message(state, "Cannot resolve current working directory.");
+        return true;
+    };
+
+    let out_dir = cwd.join(".ahma").join("exports");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let file = out_dir.join(format!(
+        "chat-{}.md",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+
+    let mut md = String::from("# ahma chat export\n\n");
+    for entry in state.chat.entries() {
+        match entry {
+            crate::state::ChatEntry::User(content) => {
+                md.push_str("## User\n\n");
+                md.push_str(content);
+                md.push_str("\n\n");
+            }
+            crate::state::ChatEntry::Assistant { content, .. } => {
+                md.push_str("## Assistant\n\n");
+                md.push_str(content);
+                md.push_str("\n\n");
+            }
+            crate::state::ChatEntry::ToolCall {
+                name, args, result, ..
+            } => {
+                md.push_str(&format!("## Tool `{name}`\n\n"));
+                md.push_str(&format!("Args: `{args}`\n\n"));
+                if let Some(result) = result {
+                    md.push_str(&format!("Result:\n\n```\n{}\n```\n\n", result));
+                }
+            }
+        }
+    }
+
+    match std::fs::write(&file, md) {
+        Ok(_) => push_assistant_message(state, format!("Exported chat to `{}`", file.display())),
+        Err(e) => push_assistant_message(state, format!("Export failed: {e}")),
+    }
     true
 }
 
@@ -1227,6 +1523,52 @@ fn run_nav_tool(rest: &str, state: &mut crate::state::AppState) {
         return;
     };
 
+    if tool.contains("::") {
+        let tool_name = tool.to_string();
+        let args_clone = arguments.clone();
+        let tx_clone = tx.clone();
+        let manager = state.mcp_connections.clone();
+        tokio::spawn(async move {
+            let id = format!(
+                "call_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+            );
+            let _ = tx_clone
+                .send(crate::llm_bridge::BridgeEvent::ToolCallStarted {
+                    id: id.clone(),
+                    name: tool_name.clone(),
+                    args: serde_json::to_string(&args_clone).unwrap_or_default(),
+                })
+                .await;
+
+            let outcome = manager.call_tool(&tool_name, args_clone).await;
+            match outcome {
+                Ok((result, failed)) => {
+                    let _ = tx_clone
+                        .send(crate::llm_bridge::BridgeEvent::ToolCallFinished {
+                            id,
+                            result,
+                            failed,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx_clone
+                        .send(crate::llm_bridge::BridgeEvent::ToolCallFinished {
+                            id,
+                            result: format!("Error: {e}"),
+                            failed: true,
+                        })
+                        .await;
+                }
+            }
+        });
+        return;
+    }
+
     crate::llm_bridge::spawn_tool_call_task(
         tool.to_string(),
         arguments,
@@ -1347,6 +1689,7 @@ fn save_session(state: &crate::state::AppState) {
         model,
         provider_url: state.current_provider_url.clone(),
         mcp_enabled: state.mcp_enabled,
+        active_profile: state.active_profile.clone(),
     };
 
     if let Ok(cwd) = std::env::current_dir()
@@ -1437,6 +1780,20 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
         }
         BridgeEvent::Done => {
             state.chat.finish_stream();
+            if let Some(profile) = &state.active_profile
+                && let Ok(cwd) = std::env::current_dir()
+            {
+                let payload = serde_json::json!({
+                    "timestamp": chrono::Local::now().to_rfc3339(),
+                    "chat_entries": state.chat.entries().len(),
+                    "model": state.selected_model(),
+                });
+                let _ = crate::agent_config::append_transcript_entry(
+                    &cwd,
+                    profile,
+                    &payload.to_string(),
+                );
+            }
         }
         BridgeEvent::Error(msg) => {
             state.chat.finish_stream();
@@ -1557,6 +1914,26 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
         }
         BridgeEvent::ModelsRefreshed { base_url, models } => {
             handle_models_refreshed(base_url, models, state);
+        }
+        BridgeEvent::ExternalToolsRefreshed { manager } => {
+            state.mcp_connections = manager;
+            let mut merged = state.tools_list.clone();
+            for tool in state.mcp_connections.aggregate_tool_names() {
+                if !merged.contains(&tool) {
+                    merged.push(tool);
+                }
+            }
+            merged.sort();
+            state.tools_list = merged;
+            push_assistant_message(state, "External MCP tools refreshed.");
+        }
+        BridgeEvent::RequestApproval { id, tool, args, tx } => {
+            state.approval = Some(crate::state::ApprovalGate {
+                op_id: id,
+                description: format!("Execute tool {tool} with args {args}"),
+                deadline: None,
+            });
+            state.approval_tx = Some(tx);
         }
     }
 }
@@ -1803,7 +2180,13 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         }
         SourceEvent::AiActivity(entry) => state.push_activity(entry),
         SourceEvent::LogLine(entry) => state.push_log(entry),
-        SourceEvent::ToolsListUpdated { tools } => state.tools_list = tools,
+        SourceEvent::ToolsListUpdated { tools } => {
+            let mut merged = tools;
+            merged.extend(state.mcp_connections.aggregate_tool_names());
+            merged.sort();
+            merged.dedup();
+            state.tools_list = merged;
+        }
         SourceEvent::SandboxStatus { status } => state.sandbox_status = status,
         SourceEvent::SessionId { id } => state.session_id = Some(id),
     }
@@ -1999,5 +2382,43 @@ mod tests {
         let handled_exit = super::handle_window_nav_commands("/exit", &mut state);
         assert!(handled_exit);
         assert!(state.should_quit);
+    }
+
+    #[test]
+    fn test_needs_approval_filtering() {
+        use crate::llm_bridge::needs_approval;
+        // Gating write_file and replace_in_file by default
+        assert!(needs_approval("write_file", false));
+        assert!(needs_approval("replace_in_file", false));
+        assert!(needs_approval("srv::write_file", false));
+        assert!(needs_approval("srv::replace_in_file", false));
+        // Not gating read_file by default
+        assert!(!needs_approval("read_file", false));
+        assert!(!needs_approval("srv::read_file", false));
+
+        // When tool_approval is enabled, all tools need approval
+        assert!(needs_approval("read_file", true));
+        assert!(needs_approval("srv::list_dir", true));
+    }
+
+    #[test]
+    fn test_resolve_approval_signaling() {
+        use crate::state::AppState;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.approval = Some(crate::state::ApprovalGate {
+            op_id: "op_test".to_string(),
+            description: "test".to_string(),
+            deadline: None,
+        });
+        state.approval_tx = Some(tx);
+
+        super::resolve_approval(&mut state, true);
+        assert!(state.approval.is_none());
+        assert!(state.approval_tx.is_none());
+
+        let approved = rx.blocking_recv().unwrap();
+        assert!(approved);
     }
 }

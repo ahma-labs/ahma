@@ -1,6 +1,7 @@
 pub mod await_tool;
 pub mod cancel_tool;
 pub mod common;
+pub mod harness_tools;
 pub mod livelog_tool;
 pub mod log_tools;
 pub mod restart_tool;

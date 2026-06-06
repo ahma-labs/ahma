@@ -612,6 +612,13 @@ impl AhmaMcpService {
         "logs_read",
         "logs_search",
         "restart",
+        "read_file",
+        "list_dir",
+        "file_search",
+        "grep_search",
+        "fetch_webpage",
+        "write_file",
+        "replace_in_file",
     ];
 
     /// Returns true if a configured tool should be exposed to the client
@@ -1076,6 +1083,48 @@ impl ServerHandler for AhmaMcpService {
                     handlers::restart_tool::restart_schema(),
                 )
                 .with_title("restart"),
+                Tool::new(
+                    "read_file",
+                    "Read UTF-8 text from a scoped file, with optional line slicing.",
+                    handlers::harness_tools::read_file_schema(),
+                )
+                .with_title("read_file"),
+                Tool::new(
+                    "list_dir",
+                    "List entries in a scoped directory with basic metadata.",
+                    handlers::harness_tools::list_dir_schema(),
+                )
+                .with_title("list_dir"),
+                Tool::new(
+                    "file_search",
+                    "Find files by glob pattern inside the sandbox scope.",
+                    handlers::harness_tools::file_search_schema(),
+                )
+                .with_title("file_search"),
+                Tool::new(
+                    "grep_search",
+                    "Search file contents by plain text or regex.",
+                    handlers::harness_tools::grep_search_schema(),
+                )
+                .with_title("grep_search"),
+                Tool::new(
+                    "fetch_webpage",
+                    "Fetch and extract readable text from an HTTP/HTTPS webpage.",
+                    handlers::harness_tools::fetch_webpage_schema(),
+                )
+                .with_title("fetch_webpage"),
+                Tool::new(
+                    "write_file",
+                    "Write UTF-8 content to a scoped file (create or overwrite).",
+                    handlers::harness_tools::write_file_schema(),
+                )
+                .with_title("write_file"),
+                Tool::new(
+                    "replace_in_file",
+                    "Replace exact string occurrences in a scoped UTF-8 file.",
+                    handlers::harness_tools::replace_in_file_schema(),
+                )
+                .with_title("replace_in_file"),
             ];
 
             let configs_lock = self.configs.read().unwrap();
@@ -1128,6 +1177,34 @@ impl ServerHandler for AhmaMcpService {
                 }
                 "restart" => {
                     self.handle_restart(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "read_file" => {
+                    self.handle_read_file(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "list_dir" => {
+                    self.handle_list_dir(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "file_search" => {
+                    self.handle_file_search(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "grep_search" => {
+                    self.handle_grep_search(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "fetch_webpage" => {
+                    self.handle_fetch_webpage(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "write_file" => {
+                    self.handle_write_file(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "replace_in_file" => {
+                    self.handle_replace_in_file(params.arguments.unwrap_or_default())
                         .await
                 }
                 _ => self.dispatch_configured_tool(params, context).await,

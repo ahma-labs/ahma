@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
         }
         Subcommands::Tui(tui_args) => {
             tracing::info!("Starting TUI control plane");
-            ahma_tui::run_tui(tui_args.connect.as_deref()).await
+            ahma_tui::run_tui(tui_args.connect.as_deref(), tui_args.profile.clone()).await
         }
         Subcommands::Tls(tls_args) => {
             tracing::info!("TLS subcommand");
