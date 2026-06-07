@@ -49,6 +49,7 @@ mod types;
 mod windows;
 
 pub use core::Sandbox;
+pub use core::{is_target_allowed, load_exceptions};
 pub use error::SandboxError;
 #[cfg(target_os = "linux")]
 pub use landlock::enforce_landlock_sandbox;

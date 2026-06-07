@@ -71,7 +71,7 @@ async fn run_ratatui(
     }
 
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<SourceEvent>(256);
-    spawn_mcp_source(connection.clone(), mcp_tx.clone());
+    state.mcp_source_tx = Some(spawn_mcp_source(connection.clone(), mcp_tx.clone()));
     // Start the hub server inside this TUI process so its lifecycle matches the
     // TUI — no dangling socket if the TUI crashes. ahma instances connect via
     // Unix socket (macOS/Linux) or TCP loopback (Windows) using push messaging.
@@ -111,8 +111,6 @@ async fn run_ratatui(
 
     // ── Event loop ───────────────────────────────────────────────────────────
     let mut event_stream = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let loop_result: Result<()> = async {
         loop {
@@ -122,7 +120,12 @@ async fn run_ratatui(
                 maybe = event_stream.next() => {
                     match maybe {
                         Some(Ok(Event::Key(key))) => {
-                            if handle_help_key(key, &mut state)
+                            if (key.code == crossterm::event::KeyCode::PageUp || key.code == crossterm::event::KeyCode::PageDown)
+                                && !state.show_help
+                                && !state.log_files_modal_open
+                            {
+                                handle_page_up_down(key.code == crossterm::event::KeyCode::PageUp, &mut state);
+                            } else if handle_help_key(key, &mut state)
                                 || handle_picker_key(key, &mut state)
                                 || handle_chat_input_key(key, &mut state)
                             {
@@ -135,6 +138,7 @@ async fn run_ratatui(
                                     &state.palette,
                                     state.navigator.visible,
                                     state.log_filter_active,
+                                    state.log_files_modal_open,
                                 );
                                 handle_action(action, &mut state);
                             }
@@ -143,8 +147,18 @@ async fn run_ratatui(
                             terminal.autoresize()?;
                         }
                         Some(Ok(Event::Mouse(mouse_event))) => {
-                            if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = mouse_event.kind {
-                                handle_mouse_click(mouse_event.column, mouse_event.row, &mut state);
+                            state.last_mouse_pos.set(Some((mouse_event.column, mouse_event.row)));
+                            match mouse_event.kind {
+                                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                                    handle_mouse_click(mouse_event.column, mouse_event.row, &mut state);
+                                }
+                                crossterm::event::MouseEventKind::ScrollUp => {
+                                    handle_mouse_scroll(mouse_event.column, mouse_event.row, true, &mut state);
+                                }
+                                crossterm::event::MouseEventKind::ScrollDown => {
+                                    handle_mouse_scroll(mouse_event.column, mouse_event.row, false, &mut state);
+                                }
+                                _ => {}
                             }
                         }
                         Some(Err(e)) => {
@@ -163,15 +177,21 @@ async fn run_ratatui(
                     handle_bridge_event(bridge_event, &mut state);
                 }
 
-                _ = tick.tick() => {
-                    // Periodic redraw keeps elapsed timers and approval
-                    // countdown ticking even with no key events.
+                _ = tokio::time::sleep(if (state.chat_scroll_current.get() - state.chat_scroll_target.get()).abs() > 0.01
+                    || (state.log_scroll_current.get() - state.log_scroll_target.get()).abs() > 0.01
+                {
+                    Duration::from_millis(15)
+                } else {
+                    Duration::from_millis(250)
+                }) => {
+                    // Periodic redraw / animation update
                     let now = std::time::Instant::now();
                     for w in &mut state.windows {
                         if w.visible && w.finished_at.is_some_and(|t| now.duration_since(t) >= std::time::Duration::from_secs(300)) {
                             w.visible = false;
                         }
                     }
+                    update_scroll_animations(&mut state);
                 }
             }
 
@@ -202,7 +222,8 @@ async fn run_ratatui(
 #[cfg(feature = "tui")]
 fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppState) {
     use crate::keymap::Action;
-    if handle_picker_action(&action, state)
+    if handle_log_monitor_action(&action, state)
+        || handle_picker_action(&action, state)
         || handle_navigation_action(&action, state)
         || handle_approval_action(&action, state)
         || handle_operation_action(&action, state)
@@ -219,8 +240,119 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         Action::Tab => state.focus = state.focus.cycle_next(),
         Action::BackTab => state.focus = state.focus.cycle_prev(),
         Action::ToggleHelp => state.show_help = !state.show_help,
+        Action::FocusChat => {
+            state.focus = crate::state::Focus::Chat;
+        }
         Action::ToggleDetail | Action::AwaitOp | Action::Unknown | Action::Enter => {}
         _ => {}
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_log_monitor_action(
+    action: &crate::keymap::Action,
+    state: &mut crate::state::AppState,
+) -> bool {
+    use crate::keymap::Action;
+    match action {
+        Action::ToggleWrap => {
+            state.log_wrap_enabled = !state.log_wrap_enabled;
+            true
+        }
+        Action::ToggleZoom => {
+            state.log_zoom_enabled = !state.log_zoom_enabled;
+            true
+        }
+        Action::OpenLogSwitcher => {
+            state.log_files_modal_open = true;
+            state.log_files_modal_selected = 0;
+            // Proactively request logs list refresh when modal is opened
+            if let Some(ref tx) = state.mcp_source_tx {
+                let _ = tx.try_send(crate::mcp_source::McpSourceCommand::RefreshLogs);
+            }
+            true
+        }
+        Action::CloseLogSwitcher => {
+            state.log_files_modal_open = false;
+            true
+        }
+        Action::SubmitLogSwitcher => {
+            if state.log_files_modal_open {
+                let idx = state.log_files_modal_selected;
+                if idx == 0 {
+                    state.active_log_file = None;
+                    state.active_log_lines.clear();
+                    if let Some(ref tx) = state.mcp_source_tx {
+                        let _ =
+                            tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(None));
+                    }
+                } else {
+                    let file_idx = idx - 1;
+                    if file_idx < state.log_files.len() {
+                        let file_name = state.log_files[file_idx].name.clone();
+                        state.active_log_file = Some(file_name.clone());
+                        state.active_log_lines.clear();
+                        if let Some(ref tx) = state.mcp_source_tx {
+                            let _ = tx.try_send(
+                                crate::mcp_source::McpSourceCommand::SetActiveFile(Some(file_name)),
+                            );
+                        }
+                    }
+                }
+                state.log_files_modal_open = false;
+            }
+            true
+        }
+        Action::Up if state.log_files_modal_open => {
+            if state.log_files_modal_selected > 0 {
+                state.log_files_modal_selected -= 1;
+            }
+            true
+        }
+        Action::Down if state.log_files_modal_open => {
+            if state.log_files_modal_selected < state.log_files.len() {
+                state.log_files_modal_selected += 1;
+            }
+            true
+        }
+        Action::ApproveSymlink => {
+            if let Some(ref active_file) = state.active_log_file
+                && let Some(info) = state.log_files.iter().find(|f| f.name == *active_file)
+                && !info.is_approved
+                && let Some(tx) = &state.bridge_tx
+            {
+                let tx = tx.clone();
+                let file_to_approve = active_file.clone();
+                let mcp = crate::llm_bridge::McpChatConfig {
+                    base_url: state.server_url.clone(),
+                    workspace_root: std::path::PathBuf::from(&state.workspace),
+                    session_id: state.session_id.clone(),
+                    external_http_servers: std::collections::BTreeMap::new(),
+                    max_turns: 8,
+                    tool_approval: false,
+                };
+                tokio::spawn(async move {
+                    crate::llm_bridge::spawn_tool_call_task(
+                        "logs_approve".to_string(),
+                        serde_json::json!({ "file": file_to_approve }),
+                        mcp,
+                        tx,
+                    );
+                });
+                // Optimistically set approved
+                if let Some(pos) = state.log_files.iter().position(|f| f.name == *active_file) {
+                    state.log_files[pos].is_approved = true;
+                    if let Some(ref src_tx) = state.mcp_source_tx {
+                        let _ =
+                            src_tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(
+                                Some(active_file.clone()),
+                            ));
+                    }
+                }
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -357,10 +489,14 @@ fn scroll_focus_up(state: &mut crate::state::AppState) {
     match state.focus {
         Focus::OpsDag => state.ops_selected = state.ops_selected.saturating_sub(1),
         Focus::AiActivity => state.activity_scroll = state.activity_scroll.saturating_sub(1),
-        Focus::Log => state.log_scroll = state.log_scroll.saturating_sub(1),
+        Focus::Log => {
+            state.log_scroll = state.log_scroll.saturating_sub(1);
+            state.sync_log_scroll_to_animation();
+        }
         Focus::Chat => {
-            let max = state.chat.len().saturating_sub(1);
+            let max = state.chat_max_scroll.get();
             state.chat_scroll = (state.chat_scroll + 1).min(max);
+            state.sync_chat_scroll_to_animation();
         }
         _ => {}
     }
@@ -380,10 +516,14 @@ fn scroll_focus_down(state: &mut crate::state::AppState) {
             state.activity_scroll = (state.activity_scroll + 1).min(max);
         }
         Focus::Log => {
-            let visible = state.filtered_log().len();
-            state.log_scroll = (state.log_scroll + 1).min(visible.saturating_sub(1));
+            let max = state.log_max_scroll.get();
+            state.log_scroll = (state.log_scroll + 1).min(max);
+            state.sync_log_scroll_to_animation();
         }
-        Focus::Chat => state.chat_scroll = state.chat_scroll.saturating_sub(1),
+        Focus::Chat => {
+            state.chat_scroll = state.chat_scroll.saturating_sub(1);
+            state.sync_chat_scroll_to_animation();
+        }
         _ => {}
     }
 }
@@ -395,8 +535,14 @@ fn move_focus_to_top(state: &mut crate::state::AppState) {
     match state.focus {
         Focus::OpsDag => state.ops_selected = 0,
         Focus::AiActivity => state.activity_scroll = 0,
-        Focus::Log => state.log_scroll = 0,
-        Focus::Chat => state.chat_scroll = state.chat.len().saturating_sub(1),
+        Focus::Log => {
+            state.log_scroll = 0;
+            state.sync_log_scroll_to_animation();
+        }
+        Focus::Chat => {
+            state.chat_scroll = state.chat_max_scroll.get();
+            state.sync_chat_scroll_to_animation();
+        }
         _ => {}
     }
 }
@@ -409,10 +555,13 @@ fn move_focus_to_bottom(state: &mut crate::state::AppState) {
         Focus::OpsDag => state.ops_selected = state.operations.len().saturating_sub(1),
         Focus::AiActivity => state.activity_scroll = state.ai_activity.len().saturating_sub(1),
         Focus::Log => {
-            let visible = state.filtered_log().len();
-            state.log_scroll = visible.saturating_sub(1);
+            state.log_scroll = state.log_max_scroll.get();
+            state.sync_log_scroll_to_animation();
         }
-        Focus::Chat => state.chat_scroll = 0,
+        Focus::Chat => {
+            state.chat_scroll = 0;
+            state.sync_chat_scroll_to_animation();
+        }
         _ => {}
     }
 }
@@ -617,19 +766,23 @@ fn handle_log_filter_action(
             state.log_filter_active = true;
             state.log_filter.clear();
             state.log_scroll = 0;
+            state.sync_log_scroll_to_animation();
         }
         Action::FilterChar(c) => {
             state.log_filter.push(*c);
             state.log_scroll = 0;
+            state.sync_log_scroll_to_animation();
         }
         Action::FilterBackspace => {
             state.log_filter.pop();
             state.log_scroll = 0;
+            state.sync_log_scroll_to_animation();
         }
         Action::FilterEsc => {
             state.log_filter_active = false;
             state.log_filter.clear();
             state.log_scroll = 0;
+            state.sync_log_scroll_to_animation();
         }
         _ => return false,
     }
@@ -1079,7 +1232,7 @@ fn textarea_input_from_key_event(key: crossterm::event::KeyEvent) -> tui_textare
 
 #[cfg(feature = "tui")]
 fn handle_window_nav_commands(cmd: &str, state: &mut crate::state::AppState) -> bool {
-    if cmd == "/exit" {
+    if cmd == "/exit" || cmd == "/q" || cmd == "/quit" {
         state.should_quit = true;
         return true;
     }
@@ -1129,7 +1282,7 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
 #[cfg(feature = "tui")]
 fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     match cmd {
-        "/help" => state.show_help = true,
+        "/help" | "/?" => state.show_help = true,
         "/clear" => state.chat.clear(),
         "/compact" => {
             state.chat.compact(4);
@@ -2272,6 +2425,38 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         }
         SourceEvent::SandboxStatus { status } => state.sandbox_status = status,
         SourceEvent::SessionId { id } => state.session_id = Some(id),
+        SourceEvent::LogFilesUpdated { files } => {
+            state.log_files = files;
+            if state.active_log_file.is_none() && !state.log_files.is_empty() {
+                // Default to first file
+                let first = state.log_files[0].name.clone();
+                state.active_log_file = Some(first.clone());
+                if let Some(ref tx) = state.mcp_source_tx {
+                    let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(Some(
+                        first,
+                    )));
+                }
+            }
+        }
+        SourceEvent::LogLinesUpdated {
+            file,
+            content,
+            append,
+        } => {
+            if Some(&file) == state.active_log_file.as_ref() {
+                if append {
+                    for line in content.lines() {
+                        state.active_log_lines.push(line.to_string());
+                    }
+                    if state.active_log_lines.len() > 2000 {
+                        let drain_len = state.active_log_lines.len() - 2000;
+                        state.active_log_lines.drain(0..drain_len);
+                    }
+                } else {
+                    state.active_log_lines = content.lines().map(String::from).collect();
+                }
+            }
+        }
     }
 }
 
@@ -2303,8 +2488,8 @@ fn http_base_url(connection: &ResolvedConnection) -> String {
         crate::connection::ResolvedTransport::Http(url)
         | crate::connection::ResolvedTransport::Http3(url) => url.clone(),
         #[cfg(unix)]
-        crate::connection::ResolvedTransport::UnixSocket(_) => {
-            std::env::var("AHMA_HTTP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string())
+        crate::connection::ResolvedTransport::UnixSocket(path) => {
+            std::env::var("AHMA_HTTP_URL").unwrap_or_else(|_| format!("unix://{}", path))
         }
     }
 }
@@ -2571,17 +2756,21 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
                             tx.clone(),
                         );
                     }
+                    state.focus = crate::state::Focus::OpsDag;
                 }
                 ClickTarget::PinOperation(op_id) => {
                     if let Some(op) = state.operations.iter_mut().find(|o| o.id == op_id) {
                         op.pinned = !op.pinned;
                     }
+                    state.focus = crate::state::Focus::OpsDag;
                 }
                 ClickTarget::AnalyzeOperation(op_id) => {
                     analyze_operation(state, &op_id);
+                    state.focus = crate::state::Focus::OpsDag;
                 }
                 ClickTarget::SelectOperation(op_idx) => {
                     state.ops_selected = op_idx;
+                    state.focus = crate::state::Focus::OpsDag;
                 }
                 ClickTarget::CloseWindow(win_id) => {
                     close_window_by_id(win_id, state);
@@ -2620,10 +2809,164 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
 
     if let Some(win_id) = clicked_close {
         close_window_by_id(win_id, state);
+        return;
     } else if let Some(win_id) = clicked_toggle
         && let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id)
     {
         w.collapsed = !w.collapsed;
+        return;
+    }
+
+    let chat_input = state.chat_input_area.get();
+    if col >= chat_input.x
+        && col < chat_input.x + chat_input.width
+        && row >= chat_input.y
+        && row < chat_input.y + chat_input.height
+    {
+        state.focus = crate::state::Focus::Chat;
+        return;
+    }
+    let chat_hist = state.chat_area.get();
+    if col >= chat_hist.x
+        && col < chat_hist.x + chat_hist.width
+        && row >= chat_hist.y
+        && row < chat_hist.y + chat_hist.height
+    {
+        state.focus = crate::state::Focus::Chat;
+        return;
+    }
+    let log = state.log_area.get();
+    if col >= log.x && col < log.x + log.width && row >= log.y && row < log.y + log.height {
+        state.focus = crate::state::Focus::Log;
+        return;
+    }
+    let ops = state.ops_area.get();
+    if col >= ops.x && col < ops.x + ops.width && row >= ops.y && row < ops.y + ops.height {
+        state.focus = crate::state::Focus::OpsDag;
+        return;
+    }
+    let detail = state.detail_area.get();
+    if col >= detail.x
+        && col < detail.x + detail.width
+        && row >= detail.y
+        && row < detail.y + detail.height
+    {
+        state.focus = crate::state::Focus::OpsDag;
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
+    let chat_area = state.chat_area.get();
+    if col >= chat_area.x
+        && col < chat_area.x + chat_area.width
+        && row >= chat_area.y
+        && row < chat_area.y + chat_area.height
+    {
+        if up {
+            let max = state.chat_max_scroll.get();
+            state.chat_scroll = (state.chat_scroll + 1).min(max);
+        } else {
+            state.chat_scroll = state.chat_scroll.saturating_sub(1);
+        }
+        state.sync_chat_scroll_to_animation();
+        return;
+    }
+
+    let log_area = state.log_area.get();
+    if col >= log_area.x
+        && col < log_area.x + log_area.width
+        && row >= log_area.y
+        && row < log_area.y + log_area.height
+    {
+        if up {
+            state.log_scroll = state.log_scroll.saturating_sub(1);
+        } else {
+            let max = state.log_max_scroll.get();
+            state.log_scroll = (state.log_scroll + 1).min(max);
+        }
+        state.sync_log_scroll_to_animation();
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
+    let mut scrolled_panel = None;
+
+    if let Some((col, row)) = state.last_mouse_pos.get() {
+        let chat_area = state.chat_area.get();
+        let log_area = state.log_area.get();
+
+        if col >= chat_area.x
+            && col < chat_area.x + chat_area.width
+            && row >= chat_area.y
+            && row < chat_area.y + chat_area.height
+        {
+            scrolled_panel = Some("chat");
+        } else if col >= log_area.x
+            && col < log_area.x + log_area.width
+            && row >= log_area.y
+            && row < log_area.y + log_area.height
+        {
+            scrolled_panel = Some("log");
+        }
+    }
+
+    let panel = scrolled_panel.unwrap_or_else(|| {
+        if state.mode == crate::state::Mode::Monitor && state.focus == crate::state::Focus::Log {
+            "log"
+        } else {
+            "chat"
+        }
+    });
+
+    if panel == "chat" {
+        let height = state.chat_area.get().height;
+        let page_size = if height > 2 { height - 2 } else { 10 } as f64;
+        let max_scroll = state.chat_max_scroll.get() as f64;
+        let current_target = state.chat_scroll_target.get();
+        let new_target = if up {
+            (current_target + page_size).min(max_scroll)
+        } else {
+            (current_target - page_size).max(0.0)
+        };
+        state.chat_scroll_target.set(new_target);
+    } else {
+        let height = state.log_area.get().height;
+        let page_size = if height > 2 { height - 2 } else { 10 } as f64;
+        let max_scroll = state.log_max_scroll.get() as f64;
+        let current_target = state.log_scroll_target.get();
+        let new_target = if up {
+            (current_target - page_size).max(0.0)
+        } else {
+            (current_target + page_size).min(max_scroll)
+        };
+        state.log_scroll_target.set(new_target);
+    }
+}
+
+#[cfg(feature = "tui")]
+fn update_scroll_animations(state: &mut crate::state::AppState) {
+    let chat_curr = state.chat_scroll_current.get();
+    let chat_tgt = state.chat_scroll_target.get();
+    if (chat_curr - chat_tgt).abs() > 0.01 {
+        let next = chat_curr + (chat_tgt - chat_curr) * 0.25;
+        state.chat_scroll_current.set(next);
+        state.chat_scroll = next.round() as usize;
+    } else {
+        state.chat_scroll_current.set(chat_tgt);
+        state.chat_scroll = chat_tgt.round() as usize;
+    }
+
+    let log_curr = state.log_scroll_current.get();
+    let log_tgt = state.log_scroll_target.get();
+    if (log_curr - log_tgt).abs() > 0.01 {
+        let next = log_curr + (log_tgt - log_curr) * 0.25;
+        state.log_scroll_current.set(next);
+        state.log_scroll = next.round() as usize;
+    } else {
+        state.log_scroll_current.set(log_tgt);
+        state.log_scroll = log_tgt.round() as usize;
     }
 }
 
@@ -2696,6 +3039,17 @@ mod tests {
         let handled_exit = super::handle_window_nav_commands("/exit", &mut state);
         assert!(handled_exit);
         assert!(state.should_quit);
+
+        // Test /q and /quit to quit
+        let mut state_q = AppState::new("http://localhost:3000", "HTTP", true);
+        let handled_q = super::handle_window_nav_commands("/q", &mut state_q);
+        assert!(handled_q);
+        assert!(state_q.should_quit);
+
+        let mut state_quit = AppState::new("http://localhost:3000", "HTTP", true);
+        let handled_quit = super::handle_window_nav_commands("/quit", &mut state_quit);
+        assert!(handled_quit);
+        assert!(state_quit.should_quit);
     }
 
     #[test]
@@ -2735,5 +3089,62 @@ mod tests {
 
         let approved = rx.blocking_recv().unwrap();
         assert!(approved);
+    }
+
+    #[test]
+    fn test_handle_mouse_click_focus_change() {
+        use crate::state::{AppState, Focus};
+        use ratatui::layout::Rect;
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.chat_input_area.set(Rect::new(10, 10, 20, 5));
+        state.chat_area.set(Rect::new(10, 0, 20, 10));
+        state.log_area.set(Rect::new(30, 0, 20, 15));
+
+        // Start with Focus::OpsDag
+        state.focus = Focus::OpsDag;
+
+        // Click on Chat Input Area -> should change focus to Chat
+        super::handle_mouse_click(15, 12, &mut state);
+        assert_eq!(state.focus, Focus::Chat);
+
+        // Click on Log Area -> should change focus to Log
+        super::handle_mouse_click(35, 5, &mut state);
+        assert_eq!(state.focus, Focus::Log);
+
+        // Click on Chat Area -> should change focus to Chat
+        super::handle_mouse_click(15, 5, &mut state);
+        assert_eq!(state.focus, Focus::Chat);
+    }
+
+    #[test]
+    fn test_handle_page_up_down_scrolling() {
+        use crate::state::{AppState, Focus};
+        use ratatui::layout::Rect;
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.chat_area.set(Rect::new(0, 0, 80, 20)); // height = 20, page_size = 18
+        state.log_area.set(Rect::new(0, 20, 80, 10)); // height = 10, page_size = 8
+
+        state.chat_max_scroll.set(100);
+        state.log_max_scroll.set(50);
+
+        // Case 1: Mouse not over TUI, focus is Chat -> PageUp should scroll Chat
+        state.focus = Focus::Chat;
+        state.last_mouse_pos.set(None);
+        super::handle_page_up_down(true, &mut state);
+        assert_eq!(state.chat_scroll_target.get(), 18.0);
+
+        // PageDown Chat
+        super::handle_page_up_down(false, &mut state);
+        assert_eq!(state.chat_scroll_target.get(), 0.0);
+
+        // Case 2: Mouse over Log Area -> PageUp/PageDown should scroll Log, even if focused on Chat
+        state.last_mouse_pos.set(Some((10, 25))); // over log area
+        super::handle_page_up_down(false, &mut state); // PageDown log -> target increases (shows newer logs)
+        assert_eq!(state.log_scroll_target.get(), 8.0);
+
+        super::handle_page_up_down(true, &mut state); // PageUp log -> target decreases
+        assert_eq!(state.log_scroll_target.get(), 0.0);
     }
 }

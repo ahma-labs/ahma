@@ -157,4 +157,62 @@ mod unix_tests {
             "livelog=false should not resolve any read scopes"
         );
     }
+
+    #[test]
+    fn test_livelog_blocks_out_of_scope_symlink() {
+        let temp1 = tempdir().unwrap();
+        let temp2 = tempdir().unwrap();
+        let scope = temp1.path().to_path_buf();
+
+        let log_dir = scope.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let actual_log = temp2.path().join("real.log");
+        std::fs::write(&actual_log, "log content").unwrap();
+
+        symlink(&actual_log, log_dir.join("current.log")).unwrap();
+
+        let sandbox = Sandbox::new(vec![scope], SandboxMode::Strict, false, true, false).unwrap();
+        assert!(
+            sandbox.read_scopes().is_empty(),
+            "should block out-of-scope symlink"
+        );
+    }
+
+    #[test]
+    fn test_livelog_allows_approved_out_of_scope_symlink() {
+        let temp1 = tempdir().unwrap();
+        let temp2 = tempdir().unwrap();
+        let scope = temp1.path().to_path_buf();
+
+        let log_dir = scope.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let actual_log = temp2.path().join("real.log");
+        std::fs::write(&actual_log, "log content").unwrap();
+        let resolved_target = dunce::canonicalize(&actual_log).unwrap();
+
+        symlink(&actual_log, log_dir.join("current.log")).unwrap();
+
+        let ahma_dir = scope.join(".ahma");
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+
+        let exceptions = serde_json::json!({
+            "approved_log_symlinks": [
+                { "target_path": resolved_target.to_string_lossy().to_string() }
+            ]
+        });
+        std::fs::write(
+            ahma_dir.join("exceptions.json"),
+            serde_json::to_string(&exceptions).unwrap(),
+        )
+        .unwrap();
+
+        let sandbox = Sandbox::new(vec![scope], SandboxMode::Strict, false, true, false).unwrap();
+        let read_scopes = sandbox.read_scopes();
+        assert!(
+            read_scopes.contains(&resolved_target),
+            "should allow approved out-of-scope symlink"
+        );
+    }
 }

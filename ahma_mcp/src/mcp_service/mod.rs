@@ -244,7 +244,14 @@ impl AhmaMcpService {
     fn is_sync_meta_tool_for_protocol_cancel(tool_name: &str) -> bool {
         matches!(
             tool_name,
-            "await" | "status" | "cancel" | "logs_list" | "logs_read" | "logs_search" | "restart"
+            "await"
+                | "status"
+                | "cancel"
+                | "logs_list"
+                | "logs_approve"
+                | "logs_read"
+                | "logs_search"
+                | "restart"
         )
     }
 
@@ -614,6 +621,7 @@ impl AhmaMcpService {
         "run_terminal_command",
         "cancel",
         "logs_list",
+        "logs_approve",
         "logs_read",
         "logs_search",
         "restart",
@@ -1071,6 +1079,12 @@ impl ServerHandler for AhmaMcpService {
                 )
                 .with_title("logs_list"),
                 Tool::new(
+                    "logs_approve",
+                    "Approve a blocked out-of-scope log symlink target to allow AI read access.",
+                    handlers::log_tools::logs_approve_schema(),
+                )
+                .with_title("logs_approve"),
+                Tool::new(
                     "logs_read",
                     "Read lines from a project log file with optional pagination. Sensitive values (tokens, passwords, API keys) are redacted by default. Use `raw: true` only when debugging credential issues.",
                     handlers::log_tools::logs_read_schema(),
@@ -1187,6 +1201,10 @@ impl ServerHandler for AhmaMcpService {
 
                 "logs_list" => {
                     self.handle_logs_list(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "logs_approve" => {
+                    self.handle_logs_approve(params.arguments.unwrap_or_default())
                         .await
                 }
                 "logs_read" => {

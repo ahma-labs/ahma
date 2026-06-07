@@ -48,6 +48,12 @@ impl Theme {
     pub fn header_bar(&self) -> Style {
         Style::default().bg(Color::DarkGray).fg(Color::White)
     }
+    pub fn input_bg(&self) -> Style {
+        Style::default().bg(Color::Rgb(24, 28, 36))
+    }
+    pub fn input_placeholder(&self) -> Style {
+        Style::default().fg(Color::Rgb(100, 110, 120))
+    }
     pub fn title(&self) -> Style {
         Style::default()
             .fg(Color::Cyan)

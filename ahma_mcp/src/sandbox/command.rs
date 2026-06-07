@@ -85,7 +85,7 @@ impl Sandbox {
                     args,
                     working_dir,
                     &scope,
-                    &self.read_scopes,
+                    &self.read_scopes(),
                 );
             }
             // Other non-Linux/macOS platforms (e.g., FreeBSD): run unsandboxed.

@@ -435,11 +435,6 @@ async fn spawn_background_bridge(
         server_args.push(task_vault.to_string_lossy().to_string());
     }
 
-    #[cfg(unix)]
-    server_args.push("unix".to_string());
-    #[cfg(not(unix))]
-    server_args.push("http".to_string());
-
     for bundle in &config.tool_bundles {
         server_args.push("--tool".to_string());
         server_args.push(bundle.clone());

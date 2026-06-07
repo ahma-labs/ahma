@@ -10,10 +10,50 @@ use super::types::{SandboxMode, ScopesGuard};
 // Livelog symlink resolution helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub fn load_exceptions(primary_root: &Path) -> Vec<PathBuf> {
+    let path = primary_root.join(".ahma").join("exceptions.json");
+    if !path.exists() {
+        return vec![];
+    }
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return vec![];
+    };
+    let Some(arr) = val.get("approved_log_symlinks").and_then(|v| v.as_array()) else {
+        return vec![];
+    };
+    arr.iter()
+        .filter_map(|item| {
+            let target = item.get("target_path").and_then(|v| v.as_str())?;
+            Some(PathBuf::from(target))
+        })
+        .collect()
+}
+
+pub fn is_target_allowed(target: &Path, scopes: &[PathBuf], exceptions: &[PathBuf]) -> bool {
+    if scopes.iter().any(|scope| target.starts_with(scope)) {
+        return true;
+    }
+    if exceptions.iter().any(|exc| target == exc) {
+        return true;
+    }
+    false
+}
+
 fn resolve_livelog_scopes(canonicalized: &[PathBuf]) -> Vec<PathBuf> {
+    let exceptions = if let Some(primary) = canonicalized.first() {
+        load_exceptions(primary)
+    } else {
+        vec![]
+    };
+
     canonicalized
         .iter()
-        .filter_map(|scope| resolve_log_dir_symlinks(&log_dir_for_scope(scope)))
+        .filter_map(|scope| {
+            resolve_log_dir_symlinks(&log_dir_for_scope(scope), canonicalized, &exceptions)
+        })
         .flatten()
         .collect()
 }
@@ -22,13 +62,17 @@ fn log_dir_for_scope(scope: &Path) -> PathBuf {
     scope.join("logs")
 }
 
-fn resolve_log_dir_symlinks(log_dir: &Path) -> Option<Vec<PathBuf>> {
+fn resolve_log_dir_symlinks(
+    log_dir: &Path,
+    scopes: &[PathBuf],
+    exceptions: &[PathBuf],
+) -> Option<Vec<PathBuf>> {
     let entries = std::fs::read_dir(log_dir).ok()?;
     Some(
         entries
             .flatten()
             .filter_map(|entry| {
-                let target = resolve_log_symlink(&entry.path(), log_dir)?;
+                let target = resolve_log_symlink(&entry.path(), log_dir, scopes, exceptions)?;
                 tracing::info!(
                     "Adding --livelog read-only scope for symlink target: {}",
                     target.display()
@@ -39,12 +83,27 @@ fn resolve_log_dir_symlinks(log_dir: &Path) -> Option<Vec<PathBuf>> {
     )
 }
 
-fn resolve_log_symlink(path: &Path, log_dir: &Path) -> Option<PathBuf> {
+fn resolve_log_symlink(
+    path: &Path,
+    log_dir: &Path,
+    scopes: &[PathBuf],
+    exceptions: &[PathBuf],
+) -> Option<PathBuf> {
     if !is_log_symlink(path) {
         return None;
     }
 
-    resolve_log_symlink_target(path, log_dir)
+    let target = resolve_log_symlink_target(path, log_dir)?;
+    if is_target_allowed(&target, scopes, exceptions) {
+        Some(target)
+    } else {
+        tracing::warn!(
+            "Blocked out-of-scope log symlink target: {} (link: {}). Use logs_approve to authorize.",
+            target.display(),
+            path.display()
+        );
+        None
+    }
 }
 
 fn is_log_symlink(path: &Path) -> bool {
@@ -98,21 +157,23 @@ fn canonicalize_with_fallback(full_path: &Path) -> PathBuf {
 /// The security context for the Ahma session.
 pub struct Sandbox {
     pub(super) scopes: std::sync::RwLock<Vec<PathBuf>>,
-    pub(super) read_scopes: Vec<PathBuf>,
+    pub(super) read_scopes: std::sync::RwLock<Vec<PathBuf>>,
     pub(super) mode: SandboxMode,
     pub(super) no_temp_files: bool,
     /// When true, the canonical temp directory is preserved across scope updates.
     pub(super) tmp_access: bool,
+    pub(super) livelog: bool,
 }
 
 impl Clone for Sandbox {
     fn clone(&self) -> Self {
         Self {
             scopes: std::sync::RwLock::new(self.scopes.read().unwrap().clone()),
-            read_scopes: self.read_scopes.clone(),
+            read_scopes: std::sync::RwLock::new(self.read_scopes.read().unwrap().clone()),
             mode: self.mode,
             no_temp_files: self.no_temp_files,
             tmp_access: self.tmp_access,
+            livelog: self.livelog,
         }
     }
 }
@@ -121,10 +182,11 @@ impl std::fmt::Debug for Sandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Sandbox")
             .field("scopes", &self.scopes.read().unwrap())
-            .field("read_scopes", &self.read_scopes)
+            .field("read_scopes", &self.read_scopes.read().unwrap())
             .field("mode", &self.mode)
             .field("no_temp_files", &self.no_temp_files)
             .field("tmp_access", &self.tmp_access)
+            .field("livelog", &self.livelog)
             .finish()
     }
 }
@@ -153,10 +215,11 @@ impl Sandbox {
 
         Ok(Self {
             scopes: std::sync::RwLock::new(canonicalized),
-            read_scopes,
+            read_scopes: std::sync::RwLock::new(read_scopes),
             mode,
             no_temp_files,
             tmp_access,
+            livelog,
         })
     }
 
@@ -174,6 +237,12 @@ impl Sandbox {
                 canonical_temp
             );
             canonicalized.push(canonical_temp);
+        }
+
+        if self.livelog && self.mode != SandboxMode::Test {
+            let new_read_scopes = resolve_livelog_scopes(&canonicalized);
+            let mut current_read_scopes = self.read_scopes.write().unwrap();
+            *current_read_scopes = new_read_scopes;
         }
 
         let mut current_scopes = self.scopes.write().unwrap();
@@ -215,8 +284,8 @@ impl Sandbox {
     }
 
     /// Get the read-only scopes (for --livelog symlink targets).
-    pub fn read_scopes(&self) -> &[PathBuf] {
-        &self.read_scopes
+    pub fn read_scopes(&self) -> Vec<PathBuf> {
+        self.read_scopes.read().unwrap().clone()
     }
 
     /// Check if a path is within any of the sandbox scopes.

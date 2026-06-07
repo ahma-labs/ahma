@@ -29,9 +29,106 @@ impl AhmaMcpService {
         _args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
         let log_dir = project_log_dir();
-        let sources = collect_log_sources(&log_dir).map_err(|e| mcp_internal(e.to_string()))?;
+        let scopes = self.adapter.sandbox().scopes();
+        let exceptions = if let Some(primary) = scopes.first() {
+            crate::sandbox::load_exceptions(primary)
+        } else {
+            vec![]
+        };
+        let sources = collect_log_sources(&log_dir, &scopes, &exceptions)
+            .map_err(|e| mcp_internal(e.to_string()))?;
         let json = serde_json::to_string_pretty(&sources).unwrap_or_else(|_| "[]".to_string());
         Ok(text_result(json))
+    }
+
+    /// `logs_approve` — approve a blocked out-of-scope log symlink target.
+    pub async fn handle_logs_approve(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let file_name = args
+            .get("file")
+            .and_then(Value::as_str)
+            .ok_or_else(|| mcp_invalid_params("'file' parameter is required"))?;
+
+        if file_name.contains('/') || file_name.contains('\\') || file_name.starts_with('.') {
+            return Err(mcp_invalid_params(format!(
+                "Invalid log file name '{file_name}': must be a plain filename, not a path"
+            )));
+        }
+
+        let log_dir = project_log_dir();
+        let symlink_path = log_dir.join(file_name);
+
+        if !symlink_path.exists() {
+            return Err(mcp_invalid_params(format!(
+                "Log file '{file_name}' does not exist"
+            )));
+        }
+
+        let meta = std::fs::symlink_metadata(&symlink_path)
+            .map_err(|e| mcp_internal(format!("Failed to read symlink metadata: {e}")))?;
+
+        if !meta.file_type().is_symlink() {
+            return Err(mcp_invalid_params(format!(
+                "Log file '{file_name}' is not a symbolic link"
+            )));
+        }
+
+        let target = std::fs::read_link(&symlink_path)
+            .map_err(|e| mcp_internal(format!("Failed to read symlink target: {e}")))?;
+
+        let canonical_target = dunce::canonicalize(log_dir.join(&target))
+            .map_err(|e| mcp_internal(format!("Failed to canonicalize target path: {e}")))?;
+
+        let primary_root = self
+            .adapter
+            .sandbox()
+            .scopes()
+            .first()
+            .cloned()
+            .ok_or_else(|| mcp_internal("No sandbox scopes configured"))?;
+
+        let exceptions_dir = primary_root.join(".ahma");
+        if !exceptions_dir.exists() {
+            std::fs::create_dir_all(&exceptions_dir)
+                .map_err(|e| mcp_internal(format!("Failed to create .ahma directory: {e}")))?;
+        }
+
+        let exceptions_file = exceptions_dir.join("exceptions.json");
+        let mut approved = vec![];
+
+        if exceptions_file.exists()
+            && let Ok(content) = std::fs::read_to_string(&exceptions_file)
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Some(arr) = val.get("approved_log_symlinks").and_then(|v| v.as_array())
+        {
+            for item in arr {
+                if let Some(t) = item.get("target_path").and_then(|v| v.as_str()) {
+                    approved.push(t.to_string());
+                }
+            }
+        }
+
+        let target_str = canonical_target.to_string_lossy().to_string();
+        if !approved.contains(&target_str) {
+            approved.push(target_str);
+        }
+
+        let new_val = serde_json::json!({
+            "approved_log_symlinks": approved.into_iter().map(|t| serde_json::json!({ "target_path": t })).collect::<Vec<_>>()
+        });
+
+        let new_content = serde_json::to_string_pretty(&new_val)
+            .map_err(|e| mcp_internal(format!("Failed to serialize exceptions: {e}")))?;
+
+        std::fs::write(&exceptions_file, new_content)
+            .map_err(|e| mcp_internal(format!("Failed to write exceptions.json: {e}")))?;
+
+        Ok(text_result(format!(
+            "Successfully approved symlink target: {}. Please restart the TUI/session to apply changes.",
+            canonical_target.display()
+        )))
     }
 
     /// `logs_read` — return lines from a log file with optional offset and limit.
@@ -183,6 +280,19 @@ pub fn logs_search_schema() -> Arc<Map<String, Value>> {
     schema::object_input_schema(props, &["file", "pattern"])
 }
 
+/// Input schema for `logs_approve`.
+pub fn logs_approve_schema() -> Arc<Map<String, Value>> {
+    let mut props = Map::new();
+    props.insert(
+        "file".to_string(),
+        json!({
+            "type": "string",
+            "description": "Name of the log file symlink to approve (e.g. 'sys.log')."
+        }),
+    );
+    schema::object_input_schema(props, &["file"])
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -251,18 +361,23 @@ fn require_safe_log_path(args: &Map<String, Value>, log_dir: &Path) -> Result<Pa
 }
 
 /// A serializable summary of a single log file in the log directory.
-#[derive(serde::Serialize)]
-struct LogFileInfo {
-    name: String,
-    path: String,
-    size_bytes: u64,
-    modified: Option<String>,
-    is_symlink: bool,
-    symlink_target: Option<String>,
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct LogFileInfo {
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub modified: Option<String>,
+    pub is_symlink: bool,
+    pub symlink_target: Option<String>,
+    pub is_approved: bool,
 }
 
 /// Scans the log directory and returns metadata for each log file.
-fn collect_log_sources(log_dir: &Path) -> anyhow::Result<Vec<LogFileInfo>> {
+fn collect_log_sources(
+    log_dir: &Path,
+    scopes: &[PathBuf],
+    exceptions: &[PathBuf],
+) -> anyhow::Result<Vec<LogFileInfo>> {
     if !log_dir.exists() {
         return Ok(vec![]);
     }
@@ -274,13 +389,25 @@ fn collect_log_sources(log_dir: &Path) -> anyhow::Result<Vec<LogFileInfo>> {
             let meta = std::fs::symlink_metadata(&path).ok()?;
 
             let is_symlink = meta.file_type().is_symlink();
-            let symlink_target = if is_symlink {
-                std::fs::read_link(&path)
-                    .ok()
-                    .map(|t| t.display().to_string())
-            } else {
-                None
-            };
+            let mut symlink_target = None;
+            let mut is_approved = true;
+
+            if is_symlink {
+                if let Ok(target) = std::fs::read_link(&path) {
+                    symlink_target = Some(target.display().to_string());
+                    if let Ok(canonical_target) = dunce::canonicalize(log_dir.join(&target)) {
+                        is_approved = crate::sandbox::is_target_allowed(
+                            &canonical_target,
+                            scopes,
+                            exceptions,
+                        );
+                    } else {
+                        is_approved = false;
+                    }
+                } else {
+                    is_approved = false;
+                }
+            }
 
             // For size/modified use the real file metadata (follows symlink).
             let real_meta = std::fs::metadata(&path).ok()?;
@@ -302,6 +429,7 @@ fn collect_log_sources(log_dir: &Path) -> anyhow::Result<Vec<LogFileInfo>> {
                 modified,
                 is_symlink,
                 symlink_target,
+                is_approved,
             })
         })
         .collect();
@@ -405,7 +533,7 @@ mod tests {
     fn test_collect_log_sources() {
         let dir = tempdir().unwrap();
         // empty dir
-        let sources = collect_log_sources(dir.path()).unwrap();
+        let sources = collect_log_sources(dir.path(), &[], &[]).unwrap();
         assert!(sources.is_empty());
 
         // write some files
@@ -416,7 +544,7 @@ mod tests {
         std::fs::write(&f1, "hello").unwrap();
         std::fs::write(&f2, "world").unwrap();
 
-        let sources = collect_log_sources(dir.path()).unwrap();
+        let sources = collect_log_sources(dir.path(), &[], &[]).unwrap();
         assert_eq!(sources.len(), 2);
         // Assert we have both filenames
         let names: Vec<String> = sources.iter().map(|s| s.name.clone()).collect();

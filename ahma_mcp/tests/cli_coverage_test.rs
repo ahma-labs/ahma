@@ -96,6 +96,7 @@ fn test_resolve_cli_subcommand_errors() {
     assert!(res.is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn test_cli_argument_parsing() {
     use ahma_mcp::shell::cli::{ServeTransport, Subcommands};
@@ -107,7 +108,7 @@ fn test_cli_argument_parsing() {
     let Subcommands::Serve(serve_args) = cli.command else {
         panic!("Expected serve subcommand");
     };
-    let ServeTransport::Http(http_args) = serve_args.transport else {
+    let Some(ServeTransport::Http(http_args)) = serve_args.transport else {
         panic!("Expected http transport");
     };
     assert_eq!(http_args.port, 8080);

@@ -513,7 +513,7 @@ fn check_powershell_available() {
 
 async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
     match serve_args.transport {
-        ServeTransport::Stdio => {
+        Some(ServeTransport::Stdio) => {
             let sandbox = initialize_sandbox(&cfg)?;
             let sandbox =
                 sandbox.ok_or_else(|| anyhow!("Sandbox failed to initialize for stdio mode"))?;
@@ -521,15 +521,28 @@ async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
             tracing::info!("Running in STDIO server mode");
             modes::run_server_mode(cfg, sandbox).await
         }
-        ServeTransport::Http(_) => {
+        #[cfg(unix)]
+        Some(ServeTransport::Http(_)) => {
             tracing::info!("Running in HTTP bridge mode");
             modes::run_http_bridge_mode(cfg).await
         }
         #[cfg(unix)]
-        ServeTransport::Unix(u) => {
+        Some(ServeTransport::Unix(u)) => {
             let path = u.socket_path.as_deref().unwrap_or("/tmp/ahma.sock");
             tracing::info!("Running in Unix socket bridge mode on {}", path);
             modes::run_unix_bridge_mode(cfg).await
+        }
+        None => {
+            #[cfg(unix)]
+            {
+                tracing::info!("Running in Unix socket bridge mode on /tmp/ahma.sock");
+                modes::run_unix_bridge_mode(cfg).await
+            }
+            #[cfg(not(unix))]
+            {
+                tracing::info!("Running in HTTP bridge mode");
+                modes::run_http_bridge_mode(cfg).await
+            }
         }
     }
 }
@@ -1029,7 +1042,7 @@ pub enum SettingsCommand {
   ahma serve http --port 8080 --disable-quic")]
 pub struct ServeArgs {
     #[command(subcommand)]
-    pub transport: ServeTransport,
+    pub transport: Option<ServeTransport>,
 
     /// Tool bundles to enable (e.g. --tools rust --tools python,git).
     /// Repeat or comma-separate. Available: rust, python, git, kotlin, fileutils, github, simplify.
@@ -1148,6 +1161,7 @@ pub enum ServeTransport {
     /// (optionally) HTTP/3/QUIC.  Multiple MCP clients can connect
     /// concurrently.  Suitable for CI runners, shared machines, or
     /// remote integrations.
+    #[cfg(unix)]
     Http(HttpArgs),
     /// Serve over a Unix domain socket (UDS) — for local IPC and Kubernetes sidecar proxies.
     ///
@@ -1211,6 +1225,7 @@ pub enum ServeTransport {
 
   # Extended timeout, temp access, and log monitoring
   ahma serve http --timeout 600 --tmp --log-monitor")]
+#[cfg(unix)]
 pub struct HttpArgs {
     /// Host to bind the HTTP server on.
     #[arg(long, default_value = "127.0.0.1")]
@@ -1680,10 +1695,13 @@ pub struct ClusterPingArgs {
 fn unix_socket_path_from_cli(cli: &Cli) -> String {
     match &cli.command {
         Subcommands::Serve(s) => match &s.transport {
-            ServeTransport::Unix(u) => u
+            Some(ServeTransport::Unix(u)) => u
                 .socket_path
                 .clone()
                 .or_else(|| std::env::var("AHMA_UNIX_SOCKET").ok())
+                .unwrap_or_else(|| "/tmp/ahma.sock".to_string()),
+            None => std::env::var("AHMA_UNIX_SOCKET")
+                .ok()
                 .unwrap_or_else(|| "/tmp/ahma.sock".to_string()),
             _ => String::new(),
         },
@@ -1717,10 +1735,21 @@ struct ServeFields {
 fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
     if let Subcommands::Serve(s) = cmd {
         let (host, port, no_quic, disable_http1_1) = match &s.transport {
-            ServeTransport::Http(h) => (h.host.clone(), h.port, h.no_quic, h.disable_http1_1),
-            ServeTransport::Stdio => ("127.0.0.1".to_string(), 3000u16, false, false),
             #[cfg(unix)]
-            ServeTransport::Unix(_) => ("127.0.0.1".to_string(), 3000u16, true, false),
+            Some(ServeTransport::Http(h)) => (h.host.clone(), h.port, h.no_quic, h.disable_http1_1),
+            Some(ServeTransport::Stdio) => ("127.0.0.1".to_string(), 3000u16, false, false),
+            #[cfg(unix)]
+            Some(ServeTransport::Unix(_)) => ("127.0.0.1".to_string(), 3000u16, true, false),
+            None => {
+                #[cfg(unix)]
+                {
+                    ("127.0.0.1".to_string(), 3000u16, true, false)
+                }
+                #[cfg(not(unix))]
+                {
+                    ("127.0.0.1".to_string(), 3000u16, false, false)
+                }
+            }
         };
         ServeFields {
             tool_bundles: s.tool_bundles.clone(),
@@ -2957,17 +2986,30 @@ mod tests {
         assert!(matches!(
             cli.command,
             Subcommands::Serve(ServeArgs {
-                transport: ServeTransport::Stdio,
+                transport: Some(ServeTransport::Stdio),
                 ..
             })
         ));
     }
 
     #[test]
+    fn test_cli_parse_serve_default_none() {
+        let cli = Cli::try_parse_from(["ahma", "serve"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Subcommands::Serve(ServeArgs {
+                transport: None,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_cli_parse_serve_http_defaults() {
         let cli = Cli::try_parse_from(["ahma", "serve", "http"]).unwrap();
         if let Subcommands::Serve(ServeArgs {
-            transport: ServeTransport::Http(h),
+            transport: Some(ServeTransport::Http(h)),
             ..
         }) = cli.command
         {
@@ -2979,11 +3021,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_cli_parse_serve_http_custom_port() {
         let cli = Cli::try_parse_from(["ahma", "serve", "http", "--port", "8080"]).unwrap();
         if let Subcommands::Serve(ServeArgs {
-            transport: ServeTransport::Http(h),
+            transport: Some(ServeTransport::Http(h)),
             ..
         }) = cli.command
         {

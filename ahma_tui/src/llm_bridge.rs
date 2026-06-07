@@ -335,8 +335,22 @@ async fn spawn_local_tool_call(
     tool: &str,
     arguments: serde_json::Value,
 ) -> Result<(String, bool), String> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/mcp", mcp.base_url);
+    let builder = reqwest::Client::builder();
+    let (request_base_url, builder) = if let Some(path) = mcp.base_url.strip_prefix("unix://") {
+        #[cfg(unix)]
+        {
+            ("http://localhost".to_string(), builder.unix_socket(path))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            (mcp.base_url.clone(), builder)
+        }
+    } else {
+        (mcp.base_url.clone(), builder)
+    };
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let url = format!("{}/mcp", request_base_url);
     let session_id = get_or_create_session(&client, &url, &mcp).await?;
     call_mcp_tool_http(&client, &url, &session_id, tool, arguments).await
 }
@@ -419,8 +433,34 @@ pub fn spawn_tool_call_task(
             })
             .await;
 
-        let client = reqwest::Client::new();
-        let url = format!("{}/mcp", mcp.base_url);
+        let builder = reqwest::Client::builder();
+        let (request_base_url, builder) = if let Some(path) = mcp.base_url.strip_prefix("unix://") {
+            #[cfg(unix)]
+            {
+                ("http://localhost".to_string(), builder.unix_socket(path))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                (mcp.base_url.clone(), builder)
+            }
+        } else {
+            (mcp.base_url.clone(), builder)
+        };
+        let client = match builder.build() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx
+                    .send(BridgeEvent::ToolCallFinished {
+                        id: id.clone(),
+                        result: format!("Error: {e}"),
+                        failed: true,
+                    })
+                    .await;
+                return;
+            }
+        };
+        let url = format!("{}/mcp", request_base_url);
 
         let session_id = match get_or_create_session(&client, &url, &mcp).await {
             Ok(sid) => sid,

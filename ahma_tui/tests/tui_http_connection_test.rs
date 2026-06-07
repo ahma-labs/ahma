@@ -168,7 +168,7 @@ async fn mcp_source_emits_health_changed() {
         display_url: base_url.clone(),
         transport: ResolvedTransport::Http(base_url),
     };
-    spawn_mcp_source(connection, tx);
+    let _cmd_tx = spawn_mcp_source(connection, tx);
     let healthy = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(ev) = rx.recv().await {
             if let SourceEvent::HealthChanged { healthy } = ev {
@@ -194,7 +194,7 @@ async fn mcp_source_emits_tools_list() {
         display_url: base_url.clone(),
         transport: ResolvedTransport::Http(base_url),
     };
-    spawn_mcp_source(connection, tx);
+    let _cmd_tx = spawn_mcp_source(connection, tx);
     let tools = tokio::time::timeout(Duration::from_secs(15), async {
         while let Some(ev) = rx.recv().await {
             if let SourceEvent::ToolsListUpdated { tools } = ev {
