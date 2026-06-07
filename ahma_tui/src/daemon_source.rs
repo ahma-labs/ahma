@@ -58,6 +58,9 @@ pub fn spawn_embedded_hub_source(
     tx: mpsc::Sender<SourceEvent>,
 ) {
     tokio::spawn(async move {
+        let _ = tx
+            .send(SourceEvent::DaemonHealthChanged { healthy: true })
+            .await;
         let mut state = DaemonState::new();
         loop {
             match rx.recv().await {
@@ -124,15 +127,16 @@ impl DaemonState {
         description: String,
         scope: Option<String>,
     ) {
-        let label = self
+        let (label, pid) = self
             .instances
             .get(instance_id)
-            .map(|i| i.label.clone())
-            .unwrap_or_else(|| instance_id.to_string());
+            .map(|i| (i.label.clone(), Some(i.pid)))
+            .unwrap_or_else(|| (instance_id.to_string(), None));
 
         let mut op = Operation::new(&op_id, &tool_name, OpStatus::Running);
         op.instance_id = Some(instance_id.to_string());
         op.instance_label = Some(label);
+        op.pid = pid;
         op.scope = scope;
         op.description = description;
 
@@ -207,6 +211,9 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
                 "daemon_source: daemon unavailable ({e}); retry in {:?}",
                 backoff
             );
+            let _ = tx
+                .send(SourceEvent::DaemonHealthChanged { healthy: false })
+                .await;
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(Duration::from_secs(30));
             continue;
@@ -219,6 +226,9 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
                     "daemon_source: connect failed ({e}); retry in {:?}",
                     backoff
                 );
+                let _ = tx
+                    .send(SourceEvent::DaemonHealthChanged { healthy: false })
+                    .await;
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
                 continue;
@@ -227,6 +237,9 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
 
         backoff = Duration::from_secs(5);
         debug!("daemon_source: connected");
+        let _ = tx
+            .send(SourceEvent::DaemonHealthChanged { healthy: true })
+            .await;
 
         let (read_half, write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
@@ -235,6 +248,9 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
         // Subscribe to the event stream.
         if let Err(e) = send_msg(&mut writer, &ClientMsg::Subscribe).await {
             warn!("daemon_source: subscribe failed: {e}");
+            let _ = tx
+                .send(SourceEvent::DaemonHealthChanged { healthy: false })
+                .await;
             continue;
         }
 
@@ -263,6 +279,9 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
                 }
                 Err(e) => {
                     debug!("daemon_source: connection lost ({e})");
+                    let _ = tx
+                        .send(SourceEvent::DaemonHealthChanged { healthy: false })
+                        .await;
                     break;
                 }
             }

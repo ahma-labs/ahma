@@ -15,7 +15,7 @@ use ratatui::{
     },
 };
 
-use crate::state::{AppState, ChatEntry, Focus, Mode, NavCommand};
+use crate::state::{AppState, ChatEntry, ClickTarget, Focus, Mode, NavCommand};
 use crate::theme::Theme;
 
 // ─── Top-level draw ───────────────────────────────────────────────────────────
@@ -283,12 +283,24 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         (false, _) => "",
     };
     let (health_char, health_style) = match (state.server_healthy, state.unicode) {
-        (true, true) => (" ● ", theme.healthy()),
-        (true, false) => (" * ", theme.healthy()),
-        (false, true) => (" ○ ", theme.unhealthy()),
-        (false, false) => (" - ", theme.unhealthy()),
+        (true, true) => (" ●", theme.healthy()),
+        (true, false) => (" *", theme.healthy()),
+        (false, true) => (" ○", theme.unhealthy()),
+        (false, false) => (" -", theme.unhealthy()),
     };
     let health_span = Span::styled(health_char, health_style);
+    let daemon_char = match (state.daemon_healthy, state.unicode) {
+        (true, true) => " ● DMON",
+        (true, false) => " * DMON",
+        (false, true) => " ○ DMON",
+        (false, false) => " - DMON",
+    };
+    let daemon_style = if state.daemon_healthy {
+        theme.healthy()
+    } else {
+        theme.unhealthy()
+    };
+    let daemon_span = Span::styled(daemon_char, daemon_style);
     let mut http_count = 0;
     let mut stdio_count = 0;
     for s in &state.mcp_connections.servers {
@@ -312,8 +324,10 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         Span::styled(mcp_label, theme.dim()),
         Span::styled(external_part, theme.dim()),
         health_span,
+        Span::styled(" · ", theme.dim()),
+        daemon_span,
         Span::styled(
-            format!("{}  q quit  ? help", state.transport_label),
+            format!("  {}  q quit  ? help", state.transport_label),
             theme.dim(),
         ),
     ]);
@@ -570,13 +584,26 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
 
     let (cursor_row, cursor_col) = state.chat_input.cursor();
     let mut rendered_lines: Vec<String> = state.chat_input.lines().to_vec();
-    if focused {
-        insert_input_cursor(&mut rendered_lines, cursor_row, cursor_col, state.unicode);
-    }
+    let is_empty = rendered_lines.len() == 1 && rendered_lines[0].is_empty();
 
-    let text = rendered_lines.join("\n");
-    let para = Paragraph::new(Span::styled(text, theme.normal())).wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
+    if is_empty {
+        let placeholder = "Type a message... (Prefix $ or % to run terminal command, ! to decompose, / for commands)";
+        let text = if focused {
+            let cursor = if state.unicode { "│" } else { "|" };
+            format!("{}{}", cursor, placeholder)
+        } else {
+            placeholder.to_string()
+        };
+        let para = Paragraph::new(Span::styled(text, theme.dim())).wrap(Wrap { trim: false });
+        frame.render_widget(para, inner);
+    } else {
+        if focused {
+            insert_input_cursor(&mut rendered_lines, cursor_row, cursor_col, state.unicode);
+        }
+        let text = rendered_lines.join("\n");
+        let para = Paragraph::new(Span::styled(text, theme.normal())).wrap(Wrap { trim: false });
+        frame.render_widget(para, inner);
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -606,24 +633,44 @@ fn draw_chat_footer(frame: &mut Frame, _state: &AppState, theme: &Theme, area: R
 #[cfg(feature = "tui")]
 fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
-    let approval_h: u16 = if state.approval.is_some() { 3 } else { 0 };
+    let approval_h: u16 = if let Some(gate) = &state.approval {
+        if gate.diff.is_some() { 12 } else { 3 }
+    } else {
+        0
+    };
 
-    let [header_a, activity_a, middle_a, log_a, approval_a, footer_a] = Layout::vertical([
+    // Input height: 1–6 lines depending on content, always at least 3 (borders).
+    let input_lines = state.chat_input_line_count().clamp(1, 6) as u16;
+    let input_h = input_lines + 2; // borders
+
+    let [
+        header_a,
+        monitor_a,
+        approval_a,
+        chat_history_a,
+        input_a,
+        footer_a,
+    ] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(8),
-        Constraint::Length(10),
-        Constraint::Min(4),
+        Constraint::Percentage(50),
         Constraint::Length(approval_h),
+        Constraint::Min(4),
+        Constraint::Length(input_h),
         Constraint::Length(1),
     ])
     .areas(full);
 
-    let [ops_a, detail_a] =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .areas(middle_a);
+    draw_chat_header(frame, state, theme, header_a);
 
-    draw_header(frame, state, theme, header_a);
-    draw_ai_activity(frame, state, theme, activity_a);
+    // Left panel is Operations (40% width), Right panel is vertical split of Detail (50% height) and Logs (50% height)
+    let [ops_a, right_panel_a] =
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .areas(monitor_a);
+
+    let [detail_a, log_a] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .areas(right_panel_a);
+
     draw_ops_dag(frame, state, theme, ops_a);
     draw_detail(frame, state, theme, detail_a);
     draw_log(frame, state, theme, log_a);
@@ -632,7 +679,10 @@ fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         draw_approval(frame, state, theme, approval_a);
     }
 
-    draw_footer(frame, state, theme, footer_a);
+    draw_chat_history(frame, state, theme, chat_history_a);
+    draw_input_box(frame, state, theme, input_a);
+    draw_chat_footer(frame, state, theme, footer_a);
+
     if state.palette.visible {
         draw_palette(frame, state, theme, full);
     }
@@ -909,6 +959,19 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         String::new()
     };
 
+    let daemon_char = match (state.daemon_healthy, state.unicode) {
+        (true, true) => " · ● DMON",
+        (true, false) => " · * DMON",
+        (false, true) => " · ○ DMON",
+        (false, false) => " · - DMON",
+    };
+    let daemon_style = if state.daemon_healthy {
+        theme.healthy()
+    } else {
+        theme.unhealthy()
+    };
+    let daemon_span = Span::styled(daemon_char, daemon_style);
+
     let line = Line::from(vec![
         Span::styled(" ahma", theme.title()),
         Span::styled(session_part, theme.dim()),
@@ -921,6 +984,7 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         Span::styled(format!(" · {workspace_short}"), theme.dim()),
         Span::styled(format!(" · {}", state.transport_label), theme.dim()),
         health_span,
+        daemon_span,
         Span::styled("  q quit  ? help", theme.dim()),
     ]);
 
@@ -1038,24 +1102,75 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
         return;
     }
 
-    let items = build_ops_dag_items(state, theme, inner.width as usize);
+    let display_rows = inner.height as usize;
+    let visible_ops = state.operations.len();
 
-    let mut list_state = ListState::default().with_selected(Some(state.ops_selected));
-    let list = List::new(items)
-        .highlight_style(theme.selected_item())
-        .highlight_symbol(if state.unicode { "▶ " } else { "> " });
+    // Auto-adjust scroll offset to keep selected in view
+    let mut scroll = state.ops_scroll.get();
+    if state.ops_selected < scroll {
+        scroll = state.ops_selected;
+    } else if state.ops_selected >= scroll + display_rows {
+        scroll = state.ops_selected - display_rows + 1;
+    }
+    scroll = scroll.min(visible_ops.saturating_sub(display_rows));
+    state.ops_scroll.set(scroll);
 
-    frame.render_stateful_widget(list, inner, &mut list_state);
-}
+    let rows_to_draw = display_rows.min(visible_ops - scroll);
 
-#[cfg(feature = "tui")]
-fn build_ops_dag_items(state: &AppState, theme: &Theme, width: usize) -> Vec<ListItem<'static>> {
-    state
-        .operations
-        .iter()
-        .enumerate()
-        .map(|(index, op)| build_ops_dag_item(index, op, state, theme, width))
-        .collect()
+    for i in 0..rows_to_draw {
+        let op_idx = scroll + i;
+        let op = &state.operations[op_idx];
+        let row_area = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+
+        // We split row horizontally:
+        // Details: Constraint::Min(5)
+        // Pin button: Constraint::Length(5)
+        // Cancel button: Constraint::Length(5)
+        let [details_a, pin_a, cancel_a] = Layout::horizontal([
+            Constraint::Min(5),
+            Constraint::Length(5),
+            Constraint::Length(5),
+        ])
+        .areas(row_area);
+
+        // Render details
+        let item = build_ops_dag_item(op_idx, op, state, theme, details_a.width as usize);
+        frame.render_widget(Paragraph::new(item), details_a);
+
+        // Register select click target
+        state
+            .click_targets
+            .borrow_mut()
+            .push((ClickTarget::SelectOperation(op_idx), details_a));
+
+        // Render Pin button: "[P]"
+        let pin_text = if op.pinned { " [P] " } else { " [P] " };
+        let pin_style = if op.pinned {
+            theme.running()
+        } else {
+            theme.dim()
+        };
+        frame.render_widget(Paragraph::new(Span::styled(pin_text, pin_style)), pin_a);
+
+        // Register pin click target
+        state
+            .click_targets
+            .borrow_mut()
+            .push((ClickTarget::PinOperation(op.id.clone()), pin_a));
+
+        // Render Cancel button: "[X]"
+        if !op.status.is_terminal() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(" [X] ", theme.failed())),
+                cancel_a,
+            );
+            // Register cancel click target
+            state
+                .click_targets
+                .borrow_mut()
+                .push((ClickTarget::CancelOperation(op.id.clone()), cancel_a));
+        }
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -1065,36 +1180,58 @@ fn build_ops_dag_item(
     state: &AppState,
     theme: &Theme,
     width: usize,
-) -> ListItem<'static> {
-    let prefix = match (op.parent_id.is_some(), state.unicode) {
-        (true, true) => "  └ ",
-        (true, false) => "  L ",
-        (false, _) => " ",
+) -> Line<'static> {
+    let is_selected = index == state.ops_selected;
+    let sel_symbol = if is_selected {
+        if state.unicode { "▶ " } else { "> " }
+    } else {
+        "  "
     };
-    let pinned = match (op.pinned, state.unicode) {
-        (true, true) => "📌",
-        (true, false) => "P",
+
+    let prefix = match (op.parent_id.is_some(), state.unicode) {
+        (true, true) => "└ ",
+        (true, false) => "L ",
         (false, _) => "",
     };
+
     let id_short = &op.id[..op.id.len().min(6)];
-    let name_short = truncate(&op.tool_name, width.saturating_sub(22));
+    let instance_part = if let Some(label) = &op.instance_label {
+        let pid_part = op.pid.map(|p| format!(":{}", p)).unwrap_or_default();
+        format!(" [{}{}]", label, pid_part)
+    } else {
+        String::new()
+    };
+
+    // Subtract some characters for prefix, status, id, etc. to find name_short width
+    let prefix_len = prefix.len() + sel_symbol.len();
+    let reserved_len = prefix_len + 15 + instance_part.len(); // status + id + spaces + instance_part
+    let name_short = truncate(&op.tool_name, width.saturating_sub(reserved_len));
+
     let row_style = if index == state.ops_selected {
         theme.selected_item()
     } else {
         theme.normal()
     };
 
-    let line = Line::from(vec![
+    Line::from(vec![
+        Span::styled(
+            sel_symbol,
+            if is_selected {
+                theme.selected_item()
+            } else {
+                theme.normal()
+            },
+        ),
         Span::styled(prefix, theme.dim()),
         Span::styled(
             format!("{} ", op.status.glyph(state.unicode)),
             theme.op_status_style(&op.status),
         ),
         Span::styled(format!("{id_short} "), theme.dim()),
-        Span::styled(format!("{pinned}{name_short}"), row_style),
+        Span::styled(instance_part, theme.dim()),
+        Span::styled(name_short, row_style),
         Span::styled(format!("  {}", op.elapsed_display()), theme.dim()),
-    ]);
-    ListItem::new(line)
+    ])
 }
 
 // ─── Detail pane ──────────────────────────────────────────────────────────────
@@ -1137,7 +1274,12 @@ fn render_selected_detail(
     border_style: Style,
     op: &crate::state::Operation,
 ) {
-    let title = format!(" {}  {} ", op.id, op.tool_name);
+    let title = if let Some(label) = &op.instance_label {
+        let pid_part = op.pid.map(|p| format!(":{}", p)).unwrap_or_default();
+        format!(" {} [{}{}]  {} ", op.id, label, pid_part, op.tool_name)
+    } else {
+        format!(" {}  {} ", op.id, op.tool_name)
+    };
     let block = Block::default()
         .title(Span::styled(title, theme.title()))
         .borders(Borders::ALL)
@@ -1145,15 +1287,47 @@ fn render_selected_detail(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    if inner.height == 0 {
+        return;
+    }
+
+    let [header_row_a, rest_a] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+
+    let [status_a, analyze_a] = Layout::horizontal([
+        Constraint::Min(10),
+        Constraint::Length(11), // " [Analyze] "
+    ])
+    .areas(header_row_a);
+
+    let status_line = Line::from(vec![
+        Span::styled("status  ", theme.dim()),
+        Span::styled(
+            format!("{} {:?}", op.status.glyph(state.unicode), op.status),
+            theme.op_status_style(&op.status),
+        ),
+        Span::styled(format!("  ({})", op.elapsed_display()), theme.dim()),
+    ]);
+    frame.render_widget(Paragraph::new(status_line), status_a);
+
+    let analyze_btn = Span::styled(" [Analyze] ", theme.running());
+    frame.render_widget(Paragraph::new(analyze_btn), analyze_a);
+
+    // Register Analyze ClickTarget
+    state
+        .click_targets
+        .borrow_mut()
+        .push((ClickTarget::AnalyzeOperation(op.id.clone()), analyze_a));
+
     let lines = build_detail_lines(
         op,
         state,
         theme,
-        inner.width as usize,
-        inner.height as usize,
+        rest_a.width as usize,
+        rest_a.height as usize,
     );
     let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
+    frame.render_widget(para, rest_a);
 }
 
 #[cfg(feature = "tui")]
@@ -1166,6 +1340,18 @@ fn build_detail_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     push_detail_summary_lines(&mut lines, op, state, theme, width);
+
+    if !op.alerts.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Alerts:", theme.failed())));
+        for alert in &op.alerts {
+            lines.push(Line::from(Span::styled(
+                format!("  ⚠ {alert}"),
+                theme.failed(),
+            )));
+        }
+    }
+
     push_stdout_tail_lines(&mut lines, op, state, theme, width, height);
     lines
 }
@@ -1174,46 +1360,34 @@ fn build_detail_lines(
 fn push_detail_summary_lines(
     lines: &mut Vec<Line<'static>>,
     op: &crate::state::Operation,
-    state: &AppState,
+    _state: &AppState,
     theme: &Theme,
     width: usize,
 ) {
-    lines.push(Line::from(vec![
-        Span::styled("  status  ", theme.dim()),
-        Span::styled(
-            format!("{} {:?}", op.status.glyph(state.unicode), op.status),
-            theme.op_status_style(&op.status),
-        ),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  elapsed ", theme.dim()),
-        Span::styled(op.elapsed_display(), theme.normal()),
-    ]));
-
     if let Some(cwd) = &op.cwd {
         lines.push(Line::from(vec![
-            Span::styled("  cwd     ", theme.dim()),
+            Span::styled("cwd     ", theme.dim()),
             Span::styled(shorten_path(cwd, 40), theme.normal()),
         ]));
     }
     if let Some(pid) = op.pid {
         lines.push(Line::from(vec![
-            Span::styled("  pid     ", theme.dim()),
+            Span::styled("pid     ", theme.dim()),
             Span::styled(pid.to_string(), theme.normal()),
         ]));
     }
     if !op.args.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("  args    ", theme.dim()),
+            Span::styled("args    ", theme.dim()),
             Span::styled(
-                truncate(&op.args.join(" "), width.saturating_sub(12)),
+                truncate(&op.args.join(" "), width.saturating_sub(10)),
                 theme.normal(),
             ),
         ]));
     }
     if let Some(parent) = &op.parent_id {
         lines.push(Line::from(vec![
-            Span::styled("  waits   ", theme.dim()),
+            Span::styled("waits   ", theme.dim()),
             Span::styled(parent.clone(), theme.pending()),
         ]));
     }
@@ -1438,8 +1612,18 @@ fn draw_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
 #[cfg(feature = "tui")]
 fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
-    let w = 62u16.min(area.width);
-    let h = 38u16.min(area.height);
+    let use_two_columns = area.width >= 100;
+
+    let w = if use_two_columns {
+        100u16.min(area.width)
+    } else {
+        62u16.min(area.width)
+    };
+    let h = if use_two_columns {
+        35u16.min(area.height)
+    } else {
+        45u16.min(area.height)
+    };
     let popup = centered_rect(w, h, area);
 
     frame.render_widget(Clear, popup);
@@ -1451,7 +1635,72 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let rows: &[(&str, &str)] = &[
+    let left_rows: &[(&str, &str)] = &[
+        ("GLOBAL", ""),
+        ("q / Ctrl-C", "Quit"),
+        ("Tab / Shift-Tab", "Cycle focus"),
+        ("?", "Toggle this help"),
+        ("Esc / ?", "Close help overlay"),
+        (":", "Open command palette"),
+        ("", ""),
+        ("CHAT", ""),
+        ("Enter", "Send message"),
+        ("Shift+Enter", "Insert newline"),
+        ("Esc", "Clear current input"),
+        ("Arrows / Home / End", "Move within editor"),
+        ("", ""),
+        ("CHAT INPUT PREFIXES", ""),
+        ("$ / % / # <command>", "Run terminal command (e.g. $ pwd)"),
+        ("! <goal>", "Decompose goal using LLM"),
+        ("/", "Open navigator (from empty input)"),
+        ("", ""),
+        ("PICKERS", ""),
+        ("Type", "Filter providers/models"),
+        ("Up / Down", "Move selection"),
+        ("Enter / Esc", "Choose / cancel"),
+        ("", ""),
+        ("APPROVAL BANNER", ""),
+        ("y", "Approve gate"),
+        ("n", "Reject gate"),
+    ];
+
+    let right_rows: &[(&str, &str)] = &[
+        ("COMMAND NAVIGATOR (/)", ""),
+        ("Type", "Narrow commands/tools"),
+        ("Tab", "Complete selected command"),
+        ("Enter", "Run selected command"),
+        ("/run <tool> {json}", "Run tool with JSON args"),
+        ("", ""),
+        ("COMMAND PALETTE (:)", ""),
+        ("Tab", "Next completion"),
+        ("Enter", "Run command"),
+        ("", ""),
+        ("WINDOW ACTIONS", ""),
+        ("/n", "Restore/expand window n"),
+        ("/xn", "Close/cancel window n"),
+        ("/exit", "Quit the application"),
+        ("Mouse Click on Xn", "Close/cancel window"),
+        ("Mouse Click on Window", "Toggle expand/collapse"),
+        ("", ""),
+        ("AI ACTIVITY", ""),
+        ("j / k", "Scroll entries"),
+        ("g / G", "Top / bottom"),
+        ("", ""),
+        ("OPERATIONS", ""),
+        ("j / k", "Select operation"),
+        ("c", "Cancel selected"),
+        ("p", "Pin to top"),
+        ("a", "Await selected"),
+        ("/analyze [op_id]", "Ask AI to analyze operation"),
+        ("/monitor file <path>", "Start log monitoring"),
+        ("", ""),
+        ("LOG", ""),
+        ("/", "Start filter (Esc to clear)"),
+        ("j / k", "Scroll"),
+        ("g / G", "Top / bottom"),
+    ];
+
+    let single_rows: &[(&str, &str)] = &[
         ("GLOBAL", ""),
         ("q / Ctrl-C", "Quit"),
         ("Tab / Shift-Tab", "Cycle focus"),
@@ -1462,9 +1711,13 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("CHAT", ""),
         ("Enter", "Send message"),
         ("Shift+Enter", "Insert newline"),
-        ("/", "Open command navigator from empty input"),
         ("Esc", "Clear current input"),
         ("Arrow keys / Home / End", "Move within the editor"),
+        ("", ""),
+        ("CHAT INPUT PREFIXES", ""),
+        ("$ or % or # <command>", "Run terminal command (e.g. $ pwd)"),
+        ("! <goal>", "Decompose goal using LLM (e.g. ! run tests)"),
+        ("/", "Open command navigator (from empty input)"),
         ("", ""),
         ("PICKERS", ""),
         ("Type", "Filter providers or models"),
@@ -1480,6 +1733,8 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("c", "Cancel selected"),
         ("p", "Pin to top"),
         ("a", "Await selected"),
+        ("/analyze [op_id]", "Ask AI to analyze operation"),
+        ("/monitor file <path>", "Start log monitoring"),
         ("", ""),
         ("LOG", ""),
         ("/", "Start filter (Esc to clear)"),
@@ -1501,31 +1756,71 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Enter", "Run command"),
         ("", ""),
         ("WINDOW ACTIONS", ""),
-        ("/n", "Restore/expand window with ID n (e.g. /3)"),
-        ("/xn", "Close/cancel window with ID n (e.g. /x3)"),
+        ("/n", "Restore/expand window n (e.g. /3)"),
+        ("/xn", "Close/cancel window n (e.g. /x3)"),
         ("/exit", "Quit the application"),
         ("Mouse Click on Xn", "Close/cancel window"),
         ("Mouse Click on Window", "Toggle expand/collapse"),
     ];
 
-    let lines: Vec<Line> = rows
-        .iter()
-        .map(|(key, desc)| {
-            if key.is_empty() {
-                Line::default()
-            } else if desc.is_empty() {
-                Line::from(Span::styled(format!(" {key}"), theme.title()))
-            } else {
-                Line::from(vec![
-                    Span::styled(format!("  {:<24}", key), theme.footer_key()),
-                    Span::styled(desc.to_string(), theme.normal()),
-                ])
-            }
-        })
-        .collect();
+    if use_two_columns {
+        let chunks = Layout::horizontal([
+            Constraint::Percentage(49),
+            Constraint::Length(2),
+            Constraint::Percentage(49),
+        ])
+        .split(inner);
 
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
+        let format_rows = |rows: &[(&str, &str)]| -> Vec<Line> {
+            rows.iter()
+                .map(|(key, desc)| {
+                    if key.is_empty() {
+                        Line::default()
+                    } else if desc.is_empty() {
+                        Line::from(Span::styled(format!(" {key}"), theme.title()))
+                    } else {
+                        Line::from(vec![
+                            Span::styled(format!("  {:<21}", key), theme.footer_key()),
+                            Span::styled(desc.to_string(), theme.normal()),
+                        ])
+                    }
+                })
+                .collect()
+        };
+
+        let left_lines = format_rows(left_rows);
+        let right_lines = format_rows(right_rows);
+
+        let left_para = Paragraph::new(Text::from(left_lines)).wrap(Wrap { trim: false });
+        let right_para = Paragraph::new(Text::from(right_lines)).wrap(Wrap { trim: false });
+
+        let sep = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(theme.border_unfocused());
+
+        frame.render_widget(left_para, chunks[0]);
+        frame.render_widget(sep, chunks[1]);
+        frame.render_widget(right_para, chunks[2]);
+    } else {
+        let lines: Vec<Line> = single_rows
+            .iter()
+            .map(|(key, desc)| {
+                if key.is_empty() {
+                    Line::default()
+                } else if desc.is_empty() {
+                    Line::from(Span::styled(format!(" {key}"), theme.title()))
+                } else {
+                    Line::from(vec![
+                        Span::styled(format!("  {:<24}", key), theme.footer_key()),
+                        Span::styled(desc.to_string(), theme.normal()),
+                    ])
+                }
+            })
+            .collect();
+
+        let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        frame.render_widget(para, inner);
+    }
 }
 
 // ─── Command palette overlay ──────────────────────────────────────────────────

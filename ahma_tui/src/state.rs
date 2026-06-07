@@ -449,7 +449,7 @@ impl Focus {
     /// Cycle through monitor panels (skips Chat — return there with Esc).
     pub fn cycle_next(self) -> Self {
         match self {
-            Self::Chat => Self::AiActivity,
+            Self::Chat => Self::OpsDag,
             Self::AiActivity => Self::OpsDag,
             Self::OpsDag => Self::Log,
             Self::Log => Self::Chat,
@@ -461,7 +461,7 @@ impl Focus {
         match self {
             Self::Chat => Self::Log,
             Self::AiActivity => Self::Chat,
-            Self::OpsDag => Self::AiActivity,
+            Self::OpsDag => Self::Chat,
             Self::Log => Self::OpsDag,
             Self::Palette => Self::Chat,
         }
@@ -527,6 +527,10 @@ pub enum OpStatus {
 }
 
 impl OpStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+
     pub fn glyph(&self, unicode: bool) -> &'static str {
         if unicode {
             match self {
@@ -565,6 +569,7 @@ pub struct Operation {
     pub parent_id: Option<String>,
     /// Tail of stdout for the detail pane.
     pub stdout_tail: VecDeque<String>,
+    pub alerts: Vec<String>,
     pub pid: Option<u32>,
     pub pinned: bool,
     /// UUID of the ahma instance this operation belongs to (set for daemon-sourced ops).
@@ -590,6 +595,7 @@ impl Operation {
             args: vec![],
             parent_id: None,
             stdout_tail: VecDeque::with_capacity(STDOUT_TAIL_CAP),
+            alerts: vec![],
             pid: None,
             pinned: false,
             instance_id: None,
@@ -666,6 +672,18 @@ impl ApprovalGate {
             if d > now { (d - now).as_secs() } else { 0 }
         })
     }
+}
+
+// ─── Click target ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClickTarget {
+    CancelOperation(String),
+    PinOperation(String),
+    AnalyzeOperation(String),
+    SelectOperation(usize),
+    CloseWindow(usize),
+    ToggleWindow(usize),
 }
 
 // ─── Command palette ──────────────────────────────────────────────────────────
@@ -745,6 +763,7 @@ pub struct AppState {
     pub mcp_http_base_url: String,
     pub transport_label: String,
     pub server_healthy: bool,
+    pub daemon_healthy: bool,
     pub session_id: Option<String>,
     pub sandbox_status: String,
     pub workspace: String,
@@ -788,6 +807,7 @@ pub struct AppState {
     // ── UI state ──
     pub focus: Focus,
     pub ops_selected: usize,
+    pub ops_scroll: std::cell::Cell<usize>,
     pub activity_scroll: usize,
     /// Tracked token usage for the current session.
     pub token_usage: ahma_llm_monitor::client::TokenUsage,
@@ -797,6 +817,14 @@ pub struct AppState {
     pub log_filter: String,
     pub log_filter_active: bool,
     pub palette: PaletteState,
+    #[cfg(feature = "tui")]
+    pub click_targets: std::cell::RefCell<Vec<(ClickTarget, Rect)>>,
+    #[cfg(not(feature = "tui"))]
+    pub click_targets: std::cell::RefCell<Vec<(ClickTarget, ())>>,
+    #[cfg(feature = "tui")]
+    pub ops_list_state: std::cell::RefCell<ratatui::widgets::ListState>,
+    #[cfg(not(feature = "tui"))]
+    pub ops_list_state: std::cell::RefCell<()>,
     pub show_help: bool,
 
     // ── Config ──
@@ -853,6 +881,7 @@ impl AppState {
             mcp_http_base_url: String::new(),
             transport_label: transport_label.into(),
             server_healthy: false,
+            daemon_healthy: false,
             session_id: None,
             sandbox_status: "UNKNOWN".to_string(),
             workspace,
@@ -879,12 +908,21 @@ impl AppState {
 
             focus: Focus::default(),
             ops_selected: 0,
+            ops_scroll: std::cell::Cell::new(0),
             activity_scroll: 0,
             token_usage: ahma_llm_monitor::client::TokenUsage::default(),
             log_scroll: 0,
             log_filter: String::new(),
             log_filter_active: false,
             palette: PaletteState::default(),
+            #[cfg(feature = "tui")]
+            click_targets: std::cell::RefCell::new(vec![]),
+            #[cfg(not(feature = "tui"))]
+            click_targets: std::cell::RefCell::new(vec![]),
+            #[cfg(feature = "tui")]
+            ops_list_state: std::cell::RefCell::new(ratatui::widgets::ListState::default()),
+            #[cfg(not(feature = "tui"))]
+            ops_list_state: std::cell::RefCell::new(()),
             show_help: false,
 
             windows: vec![],
@@ -984,7 +1022,11 @@ impl AppState {
     }
 
     pub fn upsert_operation(&mut self, op: Operation) {
-        if let Some(existing) = self.operations.iter_mut().find(|o| o.id == op.id) {
+        if let Some(existing) = self
+            .operations
+            .iter_mut()
+            .find(|o| o.id == op.id && o.instance_id == op.instance_id)
+        {
             *existing = op;
         } else {
             self.operations.push(op);
@@ -1024,8 +1066,7 @@ mod tests {
 
     #[test]
     fn focus_cycles_correctly() {
-        assert_eq!(Focus::Chat.cycle_next(), Focus::AiActivity);
-        assert_eq!(Focus::AiActivity.cycle_next(), Focus::OpsDag);
+        assert_eq!(Focus::Chat.cycle_next(), Focus::OpsDag);
         assert_eq!(Focus::OpsDag.cycle_next(), Focus::Log);
         assert_eq!(Focus::Log.cycle_next(), Focus::Chat);
         assert_eq!(Focus::Log.cycle_prev(), Focus::OpsDag);
@@ -1039,6 +1080,20 @@ mod tests {
         s.upsert_operation(Operation::new("op1", "cargo_build", OpStatus::Succeeded));
         assert_eq!(s.operations.len(), 1);
         assert_eq!(s.operations[0].status, OpStatus::Succeeded);
+    }
+
+    #[test]
+    fn upsert_operation_multi_instance() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        let mut op1 = Operation::new("op1", "cargo_build", OpStatus::Running);
+        op1.instance_id = Some("inst1".to_string());
+        let mut op2 = Operation::new("op1", "cargo_build", OpStatus::Running);
+        op2.instance_id = Some("inst2".to_string());
+
+        s.upsert_operation(op1);
+        s.upsert_operation(op2);
+
+        assert_eq!(s.operations.len(), 2);
     }
 
     #[test]

@@ -488,6 +488,16 @@ fn request_cancel_selected_op(state: &mut crate::state::AppState) {
         level: LogLevel::Info,
         message: format!("Cancel requested: {id}"),
     });
+
+    if let Some(tx) = &state.bridge_tx {
+        let mcp_config = mcp_chat_config(state);
+        crate::llm_bridge::spawn_tool_call_task(
+            "cancel".to_string(),
+            serde_json::json!({ "id": id }),
+            mcp_config,
+            tx.clone(),
+        );
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -678,6 +688,11 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     }
     state.clear_chat_input();
 
+    if text.starts_with('/') {
+        dispatch_nav_command(&text, state);
+        return;
+    }
+
     let (base_url, model) = parse_llm_selection(state);
 
     if let Some(stripped_goal) = text.strip_prefix('!') {
@@ -701,7 +716,11 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
         return;
     }
 
-    if let Some(stripped_cmd) = text.strip_prefix('%') {
+    if let Some(stripped_cmd) = text
+        .strip_prefix('%')
+        .or_else(|| text.strip_prefix('$'))
+        .or_else(|| text.strip_prefix('#'))
+    {
         let cmd_str = stripped_cmd.trim().to_string();
         if cmd_str.is_empty() {
             return;
@@ -974,11 +993,10 @@ fn handle_chat_input_key(
     key: crossterm::event::KeyEvent,
     state: &mut crate::state::AppState,
 ) -> bool {
-    use crate::state::{Focus, Mode};
+    use crate::state::Focus;
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    if state.mode != Mode::Chat
-        || state.focus != Focus::Chat
+    if state.focus != Focus::Chat
         || state.navigator.visible
         || state.provider_picker.is_some()
         || state.model_picker.is_some()
@@ -1096,6 +1114,8 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
         || handle_approval_nav_command(cmd, state)
         || handle_picker_nav_command(cmd, state)
         || handle_run_nav_command(cmd, state)
+        || handle_monitor_nav_command(cmd, state)
+        || handle_analyze_nav_command(cmd, state)
     {
         return;
     }
@@ -2128,6 +2148,8 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
                 };
                 content.push(sep);
                 content.push(format_friendly_end(op));
+            } else {
+                content.push("____".to_string());
             }
 
             w.content = content;
@@ -2165,6 +2187,8 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
                 };
                 content.push(sep);
                 content.push(format_friendly_end(op));
+            } else {
+                content.push("____".to_string());
             }
 
             let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
@@ -2227,6 +2251,7 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
     use crate::mcp_source::SourceEvent;
     match event {
         SourceEvent::HealthChanged { healthy } => state.server_healthy = healthy,
+        SourceEvent::DaemonHealthChanged { healthy } => state.daemon_healthy = healthy,
         SourceEvent::OperationsUpdated { ops } => {
             for op in ops {
                 state.upsert_operation(op);
@@ -2339,7 +2364,238 @@ fn close_window_by_id(win_id: usize, state: &mut crate::state::AppState) {
 }
 
 #[cfg(feature = "tui")]
+fn handle_monitor_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    if !cmd.starts_with("/monitor file ") {
+        return false;
+    }
+
+    let rest = cmd.strip_prefix("/monitor file ").unwrap().trim();
+    let (path, prompt) = if rest.starts_with('"') {
+        let mut chars = rest.chars().skip(1);
+        let mut path_str = String::new();
+        let mut closed = false;
+        for c in chars.by_ref() {
+            if c == '"' {
+                closed = true;
+                break;
+            }
+            path_str.push(c);
+        }
+        if closed {
+            (path_str, chars.collect::<String>().trim().to_string())
+        } else {
+            (rest.to_string(), String::new())
+        }
+    } else {
+        let parts: Vec<&str> = rest.splitn(2, |c: char| c.is_whitespace()).collect();
+        let path = parts[0].to_string();
+        let prompt = parts.get(1).map(|&s| s.to_string()).unwrap_or_default();
+        (path, prompt)
+    };
+
+    if path.is_empty() {
+        push_assistant_message(state, "Usage: /monitor file <path> [prompt]");
+        return true;
+    }
+
+    let Some(tx) = &state.bridge_tx else {
+        push_assistant_message(state, "Bridge not available.");
+        return true;
+    };
+
+    let (base_url, model) = parse_llm_selection(state);
+    let mut args = serde_json::json!({
+        "file_path": path,
+    });
+    if !prompt.is_empty() {
+        args["detection_prompt"] = serde_json::Value::String(prompt);
+    }
+    if !base_url.is_empty() {
+        args["llm_base_url"] = serde_json::Value::String(base_url);
+        args["llm_model"] = serde_json::Value::String(model);
+    }
+
+    crate::llm_bridge::spawn_tool_call_task(
+        "log_monitor".to_string(),
+        args,
+        mcp_chat_config(state),
+        tx.clone(),
+    );
+    push_assistant_message(
+        state,
+        format!("Started log monitor on `{}` in the background.", path),
+    );
+    true
+}
+
+#[cfg(feature = "tui")]
+fn handle_analyze_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    if cmd == "/analyze" {
+        let op_id = state.selected_op().map(|op| op.id.clone());
+        if let Some(id) = op_id {
+            analyze_operation(state, &id);
+        } else {
+            push_assistant_message(
+                state,
+                "No operation selected for analysis. Usage: /analyze [op_id]",
+            );
+        }
+        return true;
+    }
+
+    if let Some(op_id) = cmd.strip_prefix("/analyze ") {
+        let op_id = op_id.trim();
+        if op_id.is_empty() {
+            push_assistant_message(state, "Usage: /analyze [op_id]");
+            return true;
+        }
+        analyze_operation(state, op_id);
+        return true;
+    }
+
+    false
+}
+
+#[cfg(feature = "tui")]
+fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
+    let extracted = {
+        let Some(op) = state.operations.iter().find(|o| o.id == op_id) else {
+            push_assistant_message(state, format!("Operation `{op_id}` not found."));
+            return;
+        };
+        let stdout_str = op
+            .stdout_tail
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let alerts_str = op.alerts.join("\n");
+        Some((
+            op.id.clone(),
+            op.tool_name.clone(),
+            op.status.clone(),
+            op.args.clone(),
+            alerts_str,
+            stdout_str,
+        ))
+    };
+
+    let Some((id, tool_name, status, args, alerts_str, stdout_str)) = extracted else {
+        return;
+    };
+
+    let prompt = format!(
+        "Analyze the following operation:\n\
+         - ID: {}\n\
+         - Tool: {}\n\
+         - Status: {:?}\n\
+         - Command/Args: {:?}\n\
+         - Alerts:\n{}\n\
+         - Stdout tail:\n{}",
+        id, tool_name, status, args, alerts_str, stdout_str
+    );
+
+    state.chat.push(crate::state::ChatEntry::User(format!(
+        "Analyze operation {}",
+        id
+    )));
+    state.chat.push(crate::state::ChatEntry::Assistant {
+        content: String::new(),
+        streaming: true,
+    });
+    state.chat_scroll = 0;
+
+    let Some(tx) = &state.bridge_tx else {
+        return;
+    };
+
+    let (base_url, model) = parse_llm_selection(state);
+    if base_url.is_empty() {
+        push_assistant_message(state, "No LLM configured. Use /provider to select one.");
+        return;
+    }
+
+    use ahma_llm_monitor::client::LlmClient;
+    let client = LlmClient::new(base_url, model, None);
+    let system = state.mcp_enabled.then(|| {
+        "Use ahma tools when they would materially improve the answer. Prefer direct answers when no tool is needed.".to_string()
+    });
+
+    let mut history = collect_chat_history(state);
+    if let Some(last_msg) = history.last_mut() {
+        last_msg.content = prompt;
+    }
+
+    if state.mcp_enabled {
+        crate::llm_bridge::spawn_agent_task(
+            client,
+            history,
+            system,
+            optional_mcp_chat_config(state),
+            state.tools_list.clone(),
+            tx.clone(),
+        );
+    } else {
+        crate::llm_bridge::spawn_chat_task(
+            client,
+            history,
+            system,
+            optional_mcp_chat_config(state),
+            tx.clone(),
+        );
+    }
+}
+
+#[cfg(feature = "tui")]
 fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
+    use crate::state::ClickTarget;
+
+    let click_targets = state.click_targets.borrow().clone();
+    for (target, rect) in click_targets {
+        if col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+        {
+            match target {
+                ClickTarget::CancelOperation(op_id) => {
+                    let id = op_id.clone();
+                    state.push_log(crate::state::LogEntry {
+                        timestamp: chrono::Local::now(),
+                        level: crate::state::LogLevel::Info,
+                        message: format!("Cancel requested: {id}"),
+                    });
+                    if let Some(tx) = &state.bridge_tx {
+                        let mcp_config = mcp_chat_config(state);
+                        crate::llm_bridge::spawn_tool_call_task(
+                            "cancel".to_string(),
+                            serde_json::json!({ "id": id }),
+                            mcp_config,
+                            tx.clone(),
+                        );
+                    }
+                }
+                ClickTarget::PinOperation(op_id) => {
+                    if let Some(op) = state.operations.iter_mut().find(|o| o.id == op_id) {
+                        op.pinned = !op.pinned;
+                    }
+                }
+                ClickTarget::AnalyzeOperation(op_id) => {
+                    analyze_operation(state, &op_id);
+                }
+                ClickTarget::SelectOperation(op_idx) => {
+                    state.ops_selected = op_idx;
+                }
+                ClickTarget::CloseWindow(win_id) => {
+                    close_window_by_id(win_id, state);
+                }
+                ClickTarget::ToggleWindow(win_id) => {
+                    if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
+                        w.collapsed = !w.collapsed;
+                    }
+                }
+            }
+            return;
+        }
+    }
+
     let mut clicked_close = None;
     let mut clicked_toggle = None;
 

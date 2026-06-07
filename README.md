@@ -204,6 +204,10 @@ ahma tui --connect http://localhost:8080
 
 A terminal dashboard for monitoring active operations and handling approval gates (renewal checkpoints, elevation requests, deletion confirmations).
 
+- **Redesigned Monitor Mode (`/mode monitor`)**: Features a unified operations list with clickable/touchable `[Pin]` and `[Cancel]` buttons, a detailed operation inspector with a clickable `[Analyze]` button for AI analysis of outputs/logs, and inline log viewing.
+- **Log Monitor Integration**: Type `/monitor file <path> [prompt]` in the chat input area to start a background log-monitoring operation using the built-in process-free tailing engine.
+- **AI Analysis**: Type `/analyze [op_id]` or click `[Analyze]` on any operation to ask the AI for analysis of the operation's stdout and alerts.
+
 See [docs/tui.md](docs/tui.md).
 
 ### Egress Sandbox — per-task outbound network control

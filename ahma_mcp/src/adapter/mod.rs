@@ -864,6 +864,23 @@ async fn complete_operation_with_output(
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = output.status.code().unwrap_or(-1);
     let success = output.status.success();
+
+    let tail_source = if stdout.is_empty() { &stderr } else { &stdout };
+    let tail_lines: Vec<String> = tail_source
+        .lines()
+        .rev()
+        .take(100)
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    if let Some(mut op) = monitor.get_operation(op_id).await {
+        op.stdout_tail = tail_lines;
+        monitor.add_operation(op).await;
+    }
+
     let final_output = json!({
         "stdout": stdout,
         "stderr": stderr,
@@ -997,12 +1014,12 @@ async fn execute_with_streaming(
 
             // Read stderr line
             result = stderr_reader.next_line() => {
-                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, callback, op_id).await;
+                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, callback, op_id, op_monitor).await;
             }
 
             // Read stdout line
             result = stdout_reader.next_line() => {
-                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, callback, op_id).await;
+                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, callback, op_id, op_monitor).await;
             }
         }
 
@@ -1019,6 +1036,7 @@ async fn execute_with_streaming(
                     &mut log_monitor,
                     callback,
                     op_id,
+                    op_monitor,
                 )
                 .await;
                 break;
@@ -1057,12 +1075,31 @@ async fn drain_remaining_stream_lines(
     log_monitor: &mut crate::log_monitor::LogMonitor,
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
     op_id: &str,
+    op_monitor: &Arc<OperationMonitor>,
 ) {
     while let Ok(Some(line)) = stderr_reader.next_line().await {
-        process_streaming_line(&line, true, collected_stderr, log_monitor, callback, op_id).await;
+        process_streaming_line(
+            &line,
+            true,
+            collected_stderr,
+            log_monitor,
+            callback,
+            op_id,
+            op_monitor,
+        )
+        .await;
     }
     while let Ok(Some(line)) = stdout_reader.next_line().await {
-        process_streaming_line(&line, false, collected_stdout, log_monitor, callback, op_id).await;
+        process_streaming_line(
+            &line,
+            false,
+            collected_stdout,
+            log_monitor,
+            callback,
+            op_id,
+            op_monitor,
+        )
+        .await;
     }
 }
 
@@ -1167,10 +1204,20 @@ async fn handle_stream_line(
     log_monitor: &mut crate::log_monitor::LogMonitor,
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
     op_id: &str,
+    op_monitor: &Arc<OperationMonitor>,
 ) {
     match result {
         Ok(Some(line)) => {
-            process_streaming_line(&line, is_stderr, collector, log_monitor, callback, op_id).await;
+            process_streaming_line(
+                &line,
+                is_stderr,
+                collector,
+                log_monitor,
+                callback,
+                op_id,
+                op_monitor,
+            )
+            .await;
         }
         Ok(None) => {}
         Err(e) => {
@@ -1188,20 +1235,26 @@ async fn process_streaming_line(
     log_monitor: &mut crate::log_monitor::LogMonitor,
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
     op_id: &str,
+    op_monitor: &Arc<OperationMonitor>,
 ) {
     let safe_line = crate::log_monitor::redact_sensitive_line(line);
-    collector.push(safe_line);
-    if let Some(snapshot) = log_monitor.process_line(line, is_stderr)
-        && let Some(callback) = callback
-    {
-        let alert = crate::callback_system::ProgressUpdate::LogAlert {
-            id: op_id.to_string(),
-            trigger_level: snapshot.trigger_level.to_string(),
-            context_snapshot: snapshot.format_for_notification(),
-            llm_summary: None,
-            trigger_lines: None,
-        };
-        let _ = callback.send_progress(alert).await;
+    collector.push(safe_line.clone());
+    op_monitor.append_stdout_line(op_id, safe_line).await;
+
+    if let Some(snapshot) = log_monitor.process_line(line, is_stderr) {
+        let alert_summary = format!("[{}] {}", snapshot.trigger_level, snapshot.trigger_line);
+        op_monitor.append_alert(op_id, alert_summary).await;
+
+        if let Some(callback) = callback {
+            let alert = crate::callback_system::ProgressUpdate::LogAlert {
+                id: op_id.to_string(),
+                trigger_level: snapshot.trigger_level.to_string(),
+                context_snapshot: snapshot.format_for_notification(),
+                llm_summary: None,
+                trigger_lines: None,
+            };
+            let _ = callback.send_progress(alert).await;
+        }
     }
 }
 

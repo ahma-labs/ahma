@@ -494,7 +494,9 @@ async fn spawn_background_bridge(
 }
 
 pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
-    let is_test = std::env::var("NEXTEST").is_ok() || std::env::var("CARGO_MANIFEST_DIR").is_ok();
+    let is_test = std::env::var("NEXTEST").is_ok()
+        || std::env::var("CARGO_MANIFEST_DIR").is_ok()
+        || std::env::var("AHMA_SERVER_CHILD").is_ok();
 
     let socket_path = if let Ok(path) = std::env::var("AHMA_UNIX_SOCKET") {
         path
