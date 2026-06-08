@@ -2,7 +2,7 @@
 
 `ahma` supports:
 1. **STDIO Mode** (default): IDE spawns `ahma` as a subprocess and communicates via standard I/O. Recommended for development.
-2. **HTTP Mode**: Start `ahma --mode http` for HTTP/3 (QUIC) support.
+2. **HTTP Mode**: Start `ahma serve http` for HTTP/3 (QUIC) support.
 
 ## 1. STDIO Mode (Default)
 
@@ -13,7 +13,7 @@ The IDE spawns `ahma` as a subprocess and communicates via standard I/O. This is
 - No network exposure.
 
 ```bash
-ahma --mode stdio
+ahma serve stdio
 ```
 
 ### mcp.json examples
@@ -38,7 +38,7 @@ ahma --mode stdio
 }
 ```
 
-Alternatively, in a terminal run `ahma --mode http` for visibility of all actions, and use:
+Alternatively, in a terminal run `ahma serve http` for visibility of all actions, and use:
 
 ```json
 {
@@ -112,7 +112,7 @@ Alternatively, in a terminal run `ahma --mode http` for visibility of all action
 First start the server in a terminal with your preferred flags, defaulting to port 3000:
 
 ```bash
-ahma --mode http --tmp --livelog --simplify
+ahma serve http --tmp --livelog --simplify
 ```
 
 The HTTP server requires **HTTP/2 or HTTP/3**. HTTP/1.1 connections are explicitly rejected.
@@ -147,17 +147,17 @@ HTTP server that proxies MCP protocol to a stdio subprocess. Used for web client
 
 ```bash
 # Start on default port 3000 (sandbox scope from roots/list)
-ahma --mode http
+ahma serve http
 
 # Explicit sandbox scope (for clients that don't send roots/list)
-ahma --mode http --sandbox-scope /path/to/your/project
+ahma serve http --sandbox-scope /path/to/your/project
 
 # Via environment variable
 export AHMA_SANDBOX_SCOPE=/path/to/your/project
-ahma --mode http
+ahma serve http
 
 # Custom port and host
-ahma --mode http --http-port 8080 --http-host 127.0.0.1
+ahma serve http --http-port 8080 --http-host 127.0.0.1
 ```
 
 | Feature | STDIO Mode | HTTP Mode |

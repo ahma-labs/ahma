@@ -98,7 +98,7 @@ SANDBOX_SCOPE="$PROJECT_ROOT"
 if $VERBOSE; then
     # Verbose: show all server output
     "$PROJECT_ROOT/target/release/ahma" \
-        --mode http \
+        serve http \
         --http-port 0 \
         --sync \
         --tools-dir "$TOOLS_DIR" \
@@ -108,7 +108,7 @@ if $VERBOSE; then
 else
     # Normal: only capture, don't show
     "$PROJECT_ROOT/target/release/ahma" \
-        --mode http \
+        serve http \
         --http-port 0 \
         --sync \
         --tools-dir "$TOOLS_DIR" \

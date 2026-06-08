@@ -411,16 +411,7 @@ async fn handle_version_checks(
     Ok(None)
 }
 
-async fn spawn_background_bridge(
-    config: &AppConfig,
-    socket_path_opt: Option<&str>,
-    http_url_opt: Option<&str>,
-) -> Result<()> {
-    let server_command = std::env::current_exe()
-        .context("Failed to get current executable path")?
-        .to_string_lossy()
-        .to_string();
-
+fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
     let mut server_args = vec!["serve".to_string()];
 
     if config.explicit_tools_dir
@@ -494,6 +485,21 @@ async fn spawn_background_bridge(
         server_args.push("--instance-label".to_string());
         server_args.push(config.instance_label.clone());
     }
+
+    server_args
+}
+
+async fn spawn_background_bridge(
+    config: &AppConfig,
+    socket_path_opt: Option<&str>,
+    http_url_opt: Option<&str>,
+) -> Result<()> {
+    let server_command = std::env::current_exe()
+        .context("Failed to get current executable path")?
+        .to_string_lossy()
+        .to_string();
+
+    let server_args = build_background_bridge_args(config);
 
     let mut cmd = tokio::process::Command::new(&server_command);
     cmd.args(&server_args);

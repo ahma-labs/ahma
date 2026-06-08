@@ -39,7 +39,7 @@ cat /sys/kernel/security/lsm        # verify landlock is active
 
 ```bash
 export AHMA_DISABLE_SANDBOX=1
-ahma --mode stdio
+ahma serve stdio
 ```
 
 or add `"--disable-sandbox"` to `mcp.json` args.
@@ -60,7 +60,7 @@ When running inside Cursor, VS Code, or Docker, the outer environment may preven
 
 ## HTTP Transport Authentication
 
-When running in `--mode http`, all `/mcp` endpoints are protected by **bearer token authentication**:
+When running in HTTP mode (`ahma serve http`), all `/mcp` endpoints are protected by **bearer token authentication**:
 
 ```jsonc
 // mcp.json
@@ -74,7 +74,7 @@ When running in `--mode http`, all `/mcp` endpoints are protected by **bearer to
 }
 ```
 
-- Start the server with `--bearer-token <token>` or set `AHMA_BEARER_TOKEN`.
+- Start the server with `--require-token <token>` or set `AHMA_REQUIRE_TOKEN`.
 - The `Authorization: Bearer` scheme is **case-insensitive** (RFC 7235 §2.1).
 - The `/health` endpoint is explicitly **exempt** from authentication so orchestrators can probe liveness without credentials.
 - Bearer tokens are compared in **constant time** to prevent timing attacks.

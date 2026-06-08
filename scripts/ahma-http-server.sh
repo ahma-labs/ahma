@@ -68,8 +68,9 @@ echo "-----------------------------------------------"
 echo
 
 (cd "$PROJECT_ROOT" && cargo run $RELEASE_FLAG -p ahma_mcp --bin ahma -- \
-    --mode http \
+    serve http \
     --http-port 3000 \
     --tools-dir "$TOOLS_DIR" \
     --sandbox-scope "$SANDBOX_SCOPE" \
 )
+

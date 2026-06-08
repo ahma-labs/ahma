@@ -1299,6 +1299,50 @@ impl AhmaMcpService {
         Err(handlers::common::mcp_internal(error_message))
     }
 
+    fn parse_llm_provider(
+        &self,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> crate::config::LlmProviderConfig {
+        let llm_base_url = arguments
+            .get("llm_base_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let llm_model = arguments
+            .get("llm_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let llm_api_key = arguments
+            .get("llm_api_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        if let Some(base_url) = llm_base_url
+            && let Some(model) = llm_model
+        {
+            crate::config::LlmProviderConfig {
+                base_url,
+                model,
+                api_key: llm_api_key,
+            }
+        } else {
+            let configs_lock = self.configs.read().unwrap();
+            let mut found_provider = None;
+            for config in configs_lock.values() {
+                if let Some(livelog) = &config.livelog {
+                    found_provider = Some(livelog.llm_provider.clone());
+                    break;
+                }
+            }
+            drop(configs_lock);
+
+            found_provider.unwrap_or_else(|| crate::config::LlmProviderConfig {
+                base_url: "http://localhost:11434/v1".to_string(),
+                model: "llama3.2".to_string(),
+                api_key: None,
+            })
+        }
+    }
+
     pub async fn handle_log_monitor(
         &self,
         arguments: serde_json::Map<String, Value>,
@@ -1326,44 +1370,7 @@ impl AhmaMcpService {
             .validate_path(path)
             .map_err(|e| McpError::invalid_params(format!("Invalid file path: {}", e), None))?;
 
-        let llm_base_url = arguments
-            .get("llm_base_url")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let llm_model = arguments
-            .get("llm_model")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let llm_api_key = arguments
-            .get("llm_api_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let llm_provider = if let Some(base_url) = llm_base_url
-            && let Some(model) = llm_model
-        {
-            crate::config::LlmProviderConfig {
-                base_url,
-                model,
-                api_key: llm_api_key,
-            }
-        } else {
-            let configs_lock = self.configs.read().unwrap();
-            let mut found_provider = None;
-            for config in configs_lock.values() {
-                if let Some(livelog) = &config.livelog {
-                    found_provider = Some(livelog.llm_provider.clone());
-                    break;
-                }
-            }
-            drop(configs_lock);
-
-            found_provider.unwrap_or_else(|| crate::config::LlmProviderConfig {
-                base_url: "http://localhost:11434/v1".to_string(),
-                model: "llama3.2".to_string(),
-                api_key: None,
-            })
-        };
+        let llm_provider = self.parse_llm_provider(&arguments);
 
         static NEXT_LOG_MON_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let op_id = format!("logmon_{}", NEXT_LOG_MON_ID.fetch_add(1, Ordering::SeqCst));

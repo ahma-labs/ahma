@@ -545,17 +545,17 @@ See [docs/security-sandbox.md](docs/security-sandbox.md) for full documentation.
 Direct MCP server over stdio for IDE integration:
 
 ```bash
-ahma --mode stdio
+ahma serve stdio
 ```
 
-Alternatively, standard tool configurations are bundled directly inside the binary. Enable them using CLI flags to activate built-in fallback definitions:
+Alternatively, standard tool configurations are bundled directly inside the binary. Enable them using the `--tools` flag to activate built-in fallback definitions:
 ```bash
-ahma --mode stdio --rust --python --git --github --fileutils --simplify --kotlin
+ahma serve stdio --tools rust,python,git,github,fileutils,simplify,kotlin
 ```
 
 Note: Core tools (`run_terminal_command`, `await`, `status`, `cancel`) are always available without any flags.
 
-**Tool loading priority**: When an `.ahma/` directory exists (auto-detected or via explicit `--tools-dir`), **all** tool definitions in it are always loaded regardless of bundle flags. Bundle flags (`--rust`, `--simplify`, etc.) additionally activate built-in tool definitions compiled into the binary, serving as **fallbacks** for tools not defined locally. Local `.ahma/` definitions override bundled defaults with the same name. If *no* `.ahma/` directory exists and no `--tools-dir` is given, only bundle-flag tools plus core built-ins are available.
+**Tool loading priority**: When an `.ahma/` directory exists (auto-detected or via explicit `--tools-dir`), **all** tool definitions in it are always loaded regardless of bundle flags. Bundle flags (`--tools rust`, `--tools simplify`, etc.) additionally activate built-in tool definitions compiled into the binary, serving as **fallbacks** for tools not defined locally. Local `.ahma/` definitions override bundled defaults with the same name. If *no* `.ahma/` directory exists and no `--tools-dir` is given, only bundle-flag tools plus core built-ins are available.
 
 ### 6.2 HTTP Bridge Mode
 
@@ -564,13 +564,13 @@ HTTP server proxying to stdio MCP server:
 ```bash
 # Start on default port (3000)
 cd /path/to/project
-ahma --mode http
+ahma serve http
 
 # Explicit sandbox scope
-ahma --mode http --sandbox-scope /path/to/project
+ahma serve http --sandbox-scope /path/to/project
 
 # Custom port
-ahma --mode http --http-port 8080
+ahma serve http --port 8080
 ```
 
 **Endpoints:**
@@ -603,7 +603,7 @@ ahma --list-tools --http http://localhost:3000
 
 ### R8: HTTP Bridge & Streamable HTTP
 
-- **R8.1**: HTTP bridge mode via `ahma --mode http`.
+- **R8.1**: HTTP bridge mode via `ahma serve http`.
 - **R8.2**: SSE at `/mcp` (GET) for server-to-client notifications.
 - **R8.3**: JSON-RPC via POST at `/mcp`.
 - **R8.4**: Auto-restart stdio subprocess if it crashes.

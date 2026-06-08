@@ -280,6 +280,30 @@ async fn maybe_analyze(
     }
 }
 
+async fn process_new_bytes(
+    buffer: &[u8],
+    n: usize,
+    remainder: &mut String,
+    op_id: &str,
+    monitor: &OperationMonitor,
+) -> Vec<String> {
+    let text = format!("{}{}", remainder, String::from_utf8_lossy(&buffer[..n]));
+    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
+    if let Some(last) = lines.pop() {
+        *remainder = last;
+    } else {
+        remainder.clear();
+    }
+
+    let mut cleaned = Vec::new();
+    for line in lines {
+        let line_clean = line.trim_end_matches('\r').to_string();
+        monitor.append_stdout_line(op_id, line_clean.clone()).await;
+        cleaned.push(line_clean);
+    }
+    cleaned
+}
+
 /// Run the file-log tailing pipeline, reading from the file as it grows.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_file_monitor_pipeline(
@@ -397,17 +421,10 @@ pub async fn run_file_monitor_pipeline(
                 Ok(0) => {}
                 Ok(n) => {
                     pos += n as u64;
-                    let text = format!("{}{}", remainder, String::from_utf8_lossy(&buffer[..n]));
-                    let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
-                    if let Some(last) = lines.pop() {
-                        remainder = last;
-                    } else {
-                        remainder.clear();
-                    }
-
-                    for line in lines {
-                        let line_clean = line.trim_end_matches('\r').to_string();
-                        monitor.append_stdout_line(op_id, line_clean.clone()).await;
+                    let new_lines =
+                        process_new_bytes(&buffer, n, &mut remainder, op_id, monitor.as_ref())
+                            .await;
+                    for line_clean in new_lines {
                         chunk.push(line_clean);
 
                         if chunk.len() >= chunk_max_lines {

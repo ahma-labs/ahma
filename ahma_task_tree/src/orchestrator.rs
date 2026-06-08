@@ -269,6 +269,83 @@ impl TaskTreeOrchestrator {
         })
     }
 
+    fn validate_child_tools(
+        child_tools: &[String],
+        parent_tools: &Option<Vec<String>>,
+        is_replan: bool,
+    ) -> Result<()> {
+        if let Some(p_tools) = parent_tools {
+            for tool in child_tools {
+                if !p_tools.iter().any(|pt| tool == pt || tool.starts_with(pt)) {
+                    let msg = if is_replan {
+                        format!(
+                            "Security violation during re-plan: Child task specifies allowed tool {:?} which is not permitted by parent allowed tools {:?}",
+                            tool, p_tools
+                        )
+                    } else {
+                        format!(
+                            "Security violation: Child task specifies allowed tool {:?} which is not permitted by parent allowed tools {:?}",
+                            tool, p_tools
+                        )
+                    };
+                    return Err(anyhow!(msg));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_child_domains(
+        child_domains: &[String],
+        parent_domains: &Option<Vec<String>>,
+        is_replan: bool,
+    ) -> Result<()> {
+        if let Some(p_domains) = parent_domains {
+            for domain in child_domains {
+                if !p_domains.contains(domain) {
+                    let msg = if is_replan {
+                        format!(
+                            "Security violation during re-plan: Child task specifies allowed domain {:?} which is not permitted by parent allowed domains {:?}",
+                            domain, p_domains
+                        )
+                    } else {
+                        format!(
+                            "Security violation: Child task specifies allowed domain {:?} which is not permitted by parent allowed domains {:?}",
+                            domain, p_domains
+                        )
+                    };
+                    return Err(anyhow!(msg));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn map_step_task_type(
+        step_type: &str,
+        command: Option<String>,
+        instructions: Option<String>,
+        is_replan: bool,
+    ) -> Result<TaskType> {
+        match step_type {
+            "shell_command" => Ok(TaskType::ShellCommand {
+                command: command.unwrap_or_default(),
+            }),
+            "llm_call" => Ok(TaskType::LlmCall {
+                instructions: instructions.unwrap_or_default(),
+            }),
+            "planning" => Ok(TaskType::Planning),
+            other => {
+                let msg = if is_replan {
+                    format!("Unsupported task type returned by LLM recovery: {}", other)
+                } else {
+                    format!("Unsupported task type returned by LLM: {}", other)
+                };
+                Err(anyhow!(msg))
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn create_child_node(
         &self,
@@ -296,70 +373,25 @@ impl TaskTreeOrchestrator {
         };
 
         let child_tools = if let Some(step_tools) = &step.allowed_tools {
-            if let Some(p_tools) = parent_tools {
-                for tool in step_tools {
-                    if !p_tools.iter().any(|pt| tool == pt || tool.starts_with(pt)) {
-                        let msg = if is_replan {
-                            format!(
-                                "Security violation during re-plan: Child task specifies allowed tool {:?} which is not permitted by parent allowed tools {:?}",
-                                tool, p_tools
-                            )
-                        } else {
-                            format!(
-                                "Security violation: Child task specifies allowed tool {:?} which is not permitted by parent allowed tools {:?}",
-                                tool, p_tools
-                            )
-                        };
-                        return Err(anyhow!(msg));
-                    }
-                }
-            }
+            Self::validate_child_tools(step_tools, parent_tools, is_replan)?;
             Some(step_tools.clone())
         } else {
             parent_tools.clone()
         };
 
         let child_domains = if let Some(step_domains) = &step.allowed_domains {
-            if let Some(p_domains) = parent_domains {
-                for domain in step_domains {
-                    if !p_domains.contains(domain) {
-                        let msg = if is_replan {
-                            format!(
-                                "Security violation during re-plan: Child task specifies allowed domain {:?} which is not permitted by parent allowed domains {:?}",
-                                domain, p_domains
-                            )
-                        } else {
-                            format!(
-                                "Security violation: Child task specifies allowed domain {:?} which is not permitted by parent allowed domains {:?}",
-                                domain, p_domains
-                            )
-                        };
-                        return Err(anyhow!(msg));
-                    }
-                }
-            }
+            Self::validate_child_domains(step_domains, parent_domains, is_replan)?;
             Some(step_domains.clone())
         } else {
             parent_domains.clone()
         };
 
-        let task_type = match step.r#type.as_str() {
-            "shell_command" => TaskType::ShellCommand {
-                command: step.command.clone().unwrap_or_default(),
-            },
-            "llm_call" => TaskType::LlmCall {
-                instructions: step.instructions.clone().unwrap_or_default(),
-            },
-            "planning" => TaskType::Planning,
-            other => {
-                let msg = if is_replan {
-                    format!("Unsupported task type returned by LLM recovery: {}", other)
-                } else {
-                    format!("Unsupported task type returned by LLM: {}", other)
-                };
-                return Err(anyhow!(msg));
-            }
-        };
+        let task_type = Self::map_step_task_type(
+            step.r#type.as_str(),
+            step.command.clone(),
+            step.instructions.clone(),
+            is_replan,
+        )?;
 
         let child_id = tree.add_node(
             Some(parent_id),

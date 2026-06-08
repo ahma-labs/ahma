@@ -741,7 +741,7 @@ mod http_mode {
         let binary = build_binary();
 
         let output = test_command(&binary)
-            .args(["--http-port", "not_a_port"])
+            .args(["serve", "http", "--port", "not_a_port"])
             .output()
             .expect("Failed to execute with invalid port");
 

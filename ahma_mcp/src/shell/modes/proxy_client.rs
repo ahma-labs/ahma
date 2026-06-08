@@ -208,5 +208,12 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
         }
     }
 
+    // Terminate session on exit
+    let _ = client
+        .delete(&mcp_url)
+        .header("mcp-session-id", &session_id)
+        .send()
+        .await;
+
     Ok(())
 }

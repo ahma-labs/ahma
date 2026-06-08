@@ -250,6 +250,71 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
 }
 
 #[cfg(feature = "tui")]
+#[cfg(feature = "tui")]
+fn submit_log_switcher(state: &mut crate::state::AppState) {
+    if state.log_files_modal_open {
+        let idx = state.log_files_modal_selected;
+        if idx == 0 {
+            state.active_log_file = None;
+            state.active_log_lines.clear();
+            if let Some(ref tx) = state.mcp_source_tx {
+                let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(None));
+            }
+        } else {
+            let file_idx = idx - 1;
+            if file_idx < state.log_files.len() {
+                let file_name = state.log_files[file_idx].name.clone();
+                state.active_log_file = Some(file_name.clone());
+                state.active_log_lines.clear();
+                if let Some(ref tx) = state.mcp_source_tx {
+                    let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(Some(
+                        file_name,
+                    )));
+                }
+            }
+        }
+        state.log_files_modal_open = false;
+    }
+}
+
+#[cfg(feature = "tui")]
+fn approve_symlink(state: &mut crate::state::AppState) {
+    if let Some(ref active_file) = state.active_log_file
+        && let Some(info) = state.log_files.iter().find(|f| f.name == *active_file)
+        && !info.is_approved
+        && let Some(tx) = &state.bridge_tx
+    {
+        let tx = tx.clone();
+        let file_to_approve = active_file.clone();
+        let mcp = crate::llm_bridge::McpChatConfig {
+            base_url: state.server_url.clone(),
+            workspace_root: std::path::PathBuf::from(&state.workspace),
+            session_id: state.session_id.clone(),
+            external_http_servers: std::collections::BTreeMap::new(),
+            max_turns: 8,
+            tool_approval: false,
+        };
+        tokio::spawn(async move {
+            crate::llm_bridge::spawn_tool_call_task(
+                "logs_approve".to_string(),
+                serde_json::json!({ "file": file_to_approve }),
+                mcp,
+                tx,
+            );
+        });
+        // Optimistically set approved
+        if let Some(pos) = state.log_files.iter().position(|f| f.name == *active_file) {
+            state.log_files[pos].is_approved = true;
+            if let Some(ref src_tx) = state.mcp_source_tx {
+                let _ = src_tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(Some(
+                    active_file.clone(),
+                )));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
 fn handle_log_monitor_action(
     action: &crate::keymap::Action,
     state: &mut crate::state::AppState,
@@ -278,30 +343,7 @@ fn handle_log_monitor_action(
             true
         }
         Action::SubmitLogSwitcher => {
-            if state.log_files_modal_open {
-                let idx = state.log_files_modal_selected;
-                if idx == 0 {
-                    state.active_log_file = None;
-                    state.active_log_lines.clear();
-                    if let Some(ref tx) = state.mcp_source_tx {
-                        let _ =
-                            tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(None));
-                    }
-                } else {
-                    let file_idx = idx - 1;
-                    if file_idx < state.log_files.len() {
-                        let file_name = state.log_files[file_idx].name.clone();
-                        state.active_log_file = Some(file_name.clone());
-                        state.active_log_lines.clear();
-                        if let Some(ref tx) = state.mcp_source_tx {
-                            let _ = tx.try_send(
-                                crate::mcp_source::McpSourceCommand::SetActiveFile(Some(file_name)),
-                            );
-                        }
-                    }
-                }
-                state.log_files_modal_open = false;
-            }
+            submit_log_switcher(state);
             true
         }
         Action::Up if state.log_files_modal_open => {
@@ -317,40 +359,7 @@ fn handle_log_monitor_action(
             true
         }
         Action::ApproveSymlink => {
-            if let Some(ref active_file) = state.active_log_file
-                && let Some(info) = state.log_files.iter().find(|f| f.name == *active_file)
-                && !info.is_approved
-                && let Some(tx) = &state.bridge_tx
-            {
-                let tx = tx.clone();
-                let file_to_approve = active_file.clone();
-                let mcp = crate::llm_bridge::McpChatConfig {
-                    base_url: state.server_url.clone(),
-                    workspace_root: std::path::PathBuf::from(&state.workspace),
-                    session_id: state.session_id.clone(),
-                    external_http_servers: std::collections::BTreeMap::new(),
-                    max_turns: 8,
-                    tool_approval: false,
-                };
-                tokio::spawn(async move {
-                    crate::llm_bridge::spawn_tool_call_task(
-                        "logs_approve".to_string(),
-                        serde_json::json!({ "file": file_to_approve }),
-                        mcp,
-                        tx,
-                    );
-                });
-                // Optimistically set approved
-                if let Some(pos) = state.log_files.iter().position(|f| f.name == *active_file) {
-                    state.log_files[pos].is_approved = true;
-                    if let Some(ref src_tx) = state.mcp_source_tx {
-                        let _ =
-                            src_tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(
-                                Some(active_file.clone()),
-                            ));
-                    }
-                }
-            }
+            approve_symlink(state);
             true
         }
         _ => false,
@@ -2261,131 +2270,148 @@ fn format_friendly_end(op: &crate::state::Operation) -> String {
 }
 
 #[cfg(feature = "tui")]
+fn update_existing_window(
+    w: &mut crate::state::TuiWindow,
+    op: &crate::state::Operation,
+    unicode: bool,
+) {
+    w.status = match op.status {
+        crate::state::OpStatus::Running => "Running".to_string(),
+        crate::state::OpStatus::Pending => "Pending".to_string(),
+        crate::state::OpStatus::Succeeded => "Finished".to_string(),
+        crate::state::OpStatus::Failed => "Error".to_string(),
+        crate::state::OpStatus::Cancelled => "Cancelled".to_string(),
+        crate::state::OpStatus::Waiting => "Pending".to_string(),
+    };
+
+    if op.status != crate::state::OpStatus::Running
+        && op.status != crate::state::OpStatus::Pending
+        && op.status != crate::state::OpStatus::Waiting
+        && w.finished_at.is_none()
+    {
+        w.finished_at = Some(std::time::Instant::now());
+    }
+
+    let mut content = vec![];
+    let start_text = format_friendly_start(&op.tool_name, &op.description, op.started_time);
+    content.push(start_text);
+
+    if op.status != crate::state::OpStatus::Running
+        && op.status != crate::state::OpStatus::Pending
+        && op.status != crate::state::OpStatus::Waiting
+    {
+        let sep = if unicode {
+            "────────────────────────────────────────".to_string()
+        } else {
+            "----------------------------------------".to_string()
+        };
+        content.push(sep);
+        content.push(format_friendly_end(op));
+    } else {
+        content.push("____".to_string());
+    }
+
+    w.content = content;
+}
+
+#[cfg(feature = "tui")]
+fn build_new_window(
+    op: &crate::state::Operation,
+    state: &mut crate::state::AppState,
+) -> crate::state::TuiWindow {
+    let win_id = state.next_window_id;
+    state.next_window_id = (state.next_window_id + 1) % 100;
+
+    let label = format!(
+        "Operation: {} (instance: {})",
+        op.tool_name,
+        op.instance_label.as_deref().unwrap_or("local")
+    );
+
+    let status = match op.status {
+        crate::state::OpStatus::Running => "Running".to_string(),
+        crate::state::OpStatus::Pending => "Pending".to_string(),
+        crate::state::OpStatus::Succeeded => "Finished".to_string(),
+        crate::state::OpStatus::Failed => "Error".to_string(),
+        crate::state::OpStatus::Cancelled => "Cancelled".to_string(),
+        crate::state::OpStatus::Waiting => "Pending".to_string(),
+    };
+
+    let mut content = vec![];
+    let start_text = format_friendly_start(&op.tool_name, &op.description, op.started_time);
+    content.push(start_text);
+
+    if op.status != crate::state::OpStatus::Running
+        && op.status != crate::state::OpStatus::Pending
+        && op.status != crate::state::OpStatus::Waiting
+    {
+        let sep = if state.unicode {
+            "────────────────────────────────────────".to_string()
+        } else {
+            "----------------------------------------".to_string()
+        };
+        content.push(sep);
+        content.push(format_friendly_end(op));
+    } else {
+        content.push("____".to_string());
+    }
+
+    let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+    let op_id = op.id.clone();
+    let bridge_tx = state.bridge_tx.clone();
+    let mcp_config = mcp_chat_config(state);
+
+    tokio::spawn(async move {
+        if let Ok(()) = abort_rx.await
+            && let Some(tx) = bridge_tx
+        {
+            crate::llm_bridge::spawn_tool_call_task(
+                "cancel".to_string(),
+                serde_json::json!({ "id": op_id }),
+                mcp_config,
+                tx,
+            );
+        }
+    });
+
+    crate::state::TuiWindow {
+        id: win_id,
+        label,
+        status,
+        content,
+        collapsed: false,
+        finished_at: if op.status != crate::state::OpStatus::Running
+            && op.status != crate::state::OpStatus::Pending
+            && op.status != crate::state::OpStatus::Waiting
+        {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        },
+        is_cli: true,
+        command: op.tool_name.clone(),
+        working_dir: op.cwd.clone().unwrap_or_else(|| state.workspace.clone()),
+        llm_model: None,
+        visible: true,
+        abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(abort_tx))),
+        op_id: Some(op.id.clone()),
+    }
+}
+
+#[cfg(feature = "tui")]
 fn sync_operations_to_windows(state: &mut crate::state::AppState) {
     let mut to_add = Vec::new();
+    let ops = state.operations.clone();
 
-    for op in &state.operations {
+    for op in &ops {
         if let Some(w) = state
             .windows
             .iter_mut()
             .find(|w| w.op_id.as_deref() == Some(&op.id))
         {
-            w.status = match op.status {
-                crate::state::OpStatus::Running => "Running".to_string(),
-                crate::state::OpStatus::Pending => "Pending".to_string(),
-                crate::state::OpStatus::Succeeded => "Finished".to_string(),
-                crate::state::OpStatus::Failed => "Error".to_string(),
-                crate::state::OpStatus::Cancelled => "Cancelled".to_string(),
-                crate::state::OpStatus::Waiting => "Pending".to_string(),
-            };
-
-            if op.status != crate::state::OpStatus::Running
-                && op.status != crate::state::OpStatus::Pending
-                && op.status != crate::state::OpStatus::Waiting
-                && w.finished_at.is_none()
-            {
-                w.finished_at = Some(std::time::Instant::now());
-            }
-
-            let mut content = vec![];
-            let start_text = format_friendly_start(&op.tool_name, &op.description, op.started_time);
-            content.push(start_text);
-
-            if op.status != crate::state::OpStatus::Running
-                && op.status != crate::state::OpStatus::Pending
-                && op.status != crate::state::OpStatus::Waiting
-            {
-                let sep = if state.unicode {
-                    "────────────────────────────────────────".to_string()
-                } else {
-                    "----------------------------------------".to_string()
-                };
-                content.push(sep);
-                content.push(format_friendly_end(op));
-            } else {
-                content.push("____".to_string());
-            }
-
-            w.content = content;
+            update_existing_window(w, op, state.unicode);
         } else {
-            let win_id = state.next_window_id;
-            state.next_window_id = (state.next_window_id + 1) % 100;
-
-            let label = format!(
-                "Operation: {} (instance: {})",
-                op.tool_name,
-                op.instance_label.as_deref().unwrap_or("local")
-            );
-
-            let status = match op.status {
-                crate::state::OpStatus::Running => "Running".to_string(),
-                crate::state::OpStatus::Pending => "Pending".to_string(),
-                crate::state::OpStatus::Succeeded => "Finished".to_string(),
-                crate::state::OpStatus::Failed => "Error".to_string(),
-                crate::state::OpStatus::Cancelled => "Cancelled".to_string(),
-                crate::state::OpStatus::Waiting => "Pending".to_string(),
-            };
-
-            let mut content = vec![];
-            let start_text = format_friendly_start(&op.tool_name, &op.description, op.started_time);
-            content.push(start_text);
-
-            if op.status != crate::state::OpStatus::Running
-                && op.status != crate::state::OpStatus::Pending
-                && op.status != crate::state::OpStatus::Waiting
-            {
-                let sep = if state.unicode {
-                    "────────────────────────────────────────".to_string()
-                } else {
-                    "----------------------------------------".to_string()
-                };
-                content.push(sep);
-                content.push(format_friendly_end(op));
-            } else {
-                content.push("____".to_string());
-            }
-
-            let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
-            let op_id = op.id.clone();
-            let bridge_tx = state.bridge_tx.clone();
-            let mcp_config = mcp_chat_config(state);
-
-            tokio::spawn(async move {
-                if let Ok(()) = abort_rx.await
-                    && let Some(tx) = bridge_tx
-                {
-                    crate::llm_bridge::spawn_tool_call_task(
-                        "cancel".to_string(),
-                        serde_json::json!({ "id": op_id }),
-                        mcp_config,
-                        tx,
-                    );
-                }
-            });
-
-            let w = crate::state::TuiWindow {
-                id: win_id,
-                label,
-                status,
-                content,
-                collapsed: false,
-                finished_at: if op.status != crate::state::OpStatus::Running
-                    && op.status != crate::state::OpStatus::Pending
-                    && op.status != crate::state::OpStatus::Waiting
-                {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                },
-                is_cli: true,
-                command: op.tool_name.clone(),
-                working_dir: op.cwd.clone().unwrap_or_else(|| state.workspace.clone()),
-                llm_model: None,
-                visible: true,
-                abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(abort_tx))),
-                op_id: Some(op.id.clone()),
-            };
-
+            let w = build_new_window(op, state);
             to_add.push(w);
         }
     }
@@ -2733,13 +2759,19 @@ fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
 }
 
 #[cfg(feature = "tui")]
+#[cfg(feature = "tui")]
+#[inline]
+fn inside_rect(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+#[cfg(feature = "tui")]
 fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
     use crate::state::ClickTarget;
 
     let click_targets = state.click_targets.borrow().clone();
     for (target, rect) in click_targets {
-        if col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
-        {
+        if inside_rect(col, row, rect) {
             match target {
                 ClickTarget::CancelOperation(op_id) => {
                     let id = op_id.clone();
@@ -2791,8 +2823,7 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
 
     let rects = state.window_rects.borrow().clone();
     for &(win_id, rect) in &rects {
-        if col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
-        {
+        if inside_rect(col, row, rect) {
             let is_close_click = if rect.height == 1 {
                 col >= rect.x + rect.width.saturating_sub(5)
             } else {
@@ -2818,40 +2849,23 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
         return;
     }
 
-    let chat_input = state.chat_input_area.get();
-    if col >= chat_input.x
-        && col < chat_input.x + chat_input.width
-        && row >= chat_input.y
-        && row < chat_input.y + chat_input.height
-    {
+    if inside_rect(col, row, state.chat_input_area.get()) {
         state.focus = crate::state::Focus::Chat;
         return;
     }
-    let chat_hist = state.chat_area.get();
-    if col >= chat_hist.x
-        && col < chat_hist.x + chat_hist.width
-        && row >= chat_hist.y
-        && row < chat_hist.y + chat_hist.height
-    {
+    if inside_rect(col, row, state.chat_area.get()) {
         state.focus = crate::state::Focus::Chat;
         return;
     }
-    let log = state.log_area.get();
-    if col >= log.x && col < log.x + log.width && row >= log.y && row < log.y + log.height {
+    if inside_rect(col, row, state.log_area.get()) {
         state.focus = crate::state::Focus::Log;
         return;
     }
-    let ops = state.ops_area.get();
-    if col >= ops.x && col < ops.x + ops.width && row >= ops.y && row < ops.y + ops.height {
+    if inside_rect(col, row, state.ops_area.get()) {
         state.focus = crate::state::Focus::OpsDag;
         return;
     }
-    let detail = state.detail_area.get();
-    if col >= detail.x
-        && col < detail.x + detail.width
-        && row >= detail.y
-        && row < detail.y + detail.height
-    {
+    if inside_rect(col, row, state.detail_area.get()) {
         state.focus = crate::state::Focus::OpsDag;
     }
 }

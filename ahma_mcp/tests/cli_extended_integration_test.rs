@@ -355,7 +355,7 @@ mod error_handling_tests {
 mod mode_tests {
     use super::*;
 
-    /// Test --mode stdio requires proper environment
+    /// Test `serve stdio` requires proper environment
     #[test]
     fn test_ahma_mcp_stdio_mode_without_client() {
         let binary = build_binary("ahma_bin", "ahma");
@@ -364,12 +364,7 @@ mod mode_tests {
 
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .args([
-                "--mode",
-                "stdio",
-                "--tools-dir",
-                tools_dir.to_str().unwrap(),
-            ])
+            .args(["serve", "stdio", "--tools-dir", tools_dir.to_str().unwrap()])
             .output()
             .expect("Failed to execute ahma_mcp in stdio mode");
 
@@ -378,24 +373,24 @@ mod mode_tests {
         let _exit_code = output.status.code();
     }
 
-    /// Test --mode http requires port specification
+    /// Test `serve http` help is available
     #[test]
     fn test_ahma_mcp_http_mode_default_port() {
         let binary = build_binary("ahma_bin", "ahma");
 
         let output = test_command(&binary)
-            .args(["--help"])
+            .args(["serve", "http", "--help"])
             .output()
-            .expect("Failed to execute ahma_mcp --help");
+            .expect("Failed to execute ahma serve http --help");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let combined = format!("{}{}", stdout, stderr);
 
-        // Help should mention http mode
+        // Help should mention HTTP bridge mode details
         assert!(
-            combined.contains("http") || combined.contains("HTTP"),
-            "Help should mention http mode. Got: {}",
+            combined.contains("HTTP") || combined.contains("bridge"),
+            "Help should mention HTTP bridge mode. Got: {}",
             combined
         );
     }
@@ -408,7 +403,7 @@ mod mode_tests {
 
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .args(["--mode", "invalid_mode_xyz"])
+            .args(["serve", "invalid_mode_xyz"])
             .output()
             .expect("Failed to execute ahma_mcp with invalid mode");
 
@@ -417,7 +412,10 @@ mod mode_tests {
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("invalid") || stderr.contains("Invalid") || stderr.contains("error"),
+            stderr.contains("invalid")
+                || stderr.contains("Invalid")
+                || stderr.contains("error")
+                || stderr.contains("unrecognized"),
             "Should indicate invalid mode. Got: {}",
             stderr
         );

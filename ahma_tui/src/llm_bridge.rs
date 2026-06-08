@@ -227,6 +227,90 @@ async fn execute_single_tool_call(
     }
 }
 
+async fn execute_agent_turn(
+    client: &LlmClient,
+    msg_json: &mut Vec<serde_json::Value>,
+    tool_defs: &[serde_json::Value],
+    mcp: &Option<McpChatConfig>,
+    tx: &Sender<BridgeEvent>,
+    messages: &[ChatMessage],
+    system_prompt: &Option<String>,
+) -> bool {
+    let completion = match client
+        .chat_completion_with_tools(msg_json.clone(), tool_defs)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let err_msg = e.to_string().to_lowercase();
+            if err_msg.contains("400")
+                || err_msg.contains("tool")
+                || err_msg.contains("not supported")
+            {
+                let _ = tx
+                    .send(BridgeEvent::Error(
+                        "Model does not support tools. Falling back to standard chat.".to_string(),
+                    ))
+                    .await;
+                spawn_chat_task(
+                    client.clone(),
+                    messages.to_vec(),
+                    system_prompt.clone(),
+                    mcp.clone(),
+                    tx.clone(),
+                );
+                return false;
+            }
+            let _ = tx.send(BridgeEvent::Error(e.to_string())).await;
+            return false;
+        }
+    };
+
+    if let Some(usage) = &completion.usage {
+        let _ = tx.send(BridgeEvent::Usage(usage.clone())).await;
+    }
+
+    let assistant_content = completion.content.clone();
+    msg_json.push(serde_json::json!({
+        "role": "assistant",
+        "content": assistant_content,
+        "tool_calls": completion.assistant_message.get("tool_calls").cloned().unwrap_or(serde_json::Value::Null)
+    }));
+
+    if completion.tool_calls.is_empty() {
+        if !completion.content.is_empty() {
+            let _ = tx.send(BridgeEvent::Token(completion.content)).await;
+        }
+        let _ = tx.send(BridgeEvent::Done).await;
+        return false;
+    }
+
+    let Some(mcp_cfg) = mcp.clone() else {
+        let _ = tx
+            .send(BridgeEvent::Error(
+                "Model requested tools but MCP is not configured".to_string(),
+            ))
+            .await;
+        return false;
+    };
+
+    let calls = completion.tool_calls;
+    let call_futures = calls
+        .into_iter()
+        .map(|call| execute_single_tool_call(call, mcp_cfg.clone(), tx.clone()));
+
+    let tool_results = join_all(call_futures).await;
+    for (tool_call_id, _tool_name, payload, _failed) in tool_results {
+        msg_json.push(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": payload.to_string()
+        }));
+    }
+
+    true
+}
+
 pub fn spawn_agent_task(
     client: LlmClient,
     messages: Vec<ChatMessage>,
@@ -247,86 +331,31 @@ pub fn spawn_agent_task(
         let tool_defs = prepare_tool_definitions(available_tools);
 
         let max_turns = mcp.as_ref().map(|c| c.max_turns).unwrap_or(8);
+        let mut completed = false;
         for _ in 0..max_turns {
-            let completion = match client
-                .chat_completion_with_tools(msg_json.clone(), &tool_defs)
-                .await
+            if !execute_agent_turn(
+                &client,
+                &mut msg_json,
+                &tool_defs,
+                &mcp,
+                &tx,
+                &messages,
+                &system_prompt,
+            )
+            .await
             {
-                Ok(c) => c,
-                Err(e) => {
-                    let err_msg = e.to_string().to_lowercase();
-                    if err_msg.contains("400")
-                        || err_msg.contains("tool")
-                        || err_msg.contains("not supported")
-                    {
-                        let _ = tx
-                            .send(BridgeEvent::Error(
-                                "Model does not support tools. Falling back to standard chat."
-                                    .to_string(),
-                            ))
-                            .await;
-                        spawn_chat_task(
-                            client.clone(),
-                            messages.clone(),
-                            system_prompt.clone(),
-                            mcp.clone(),
-                            tx.clone(),
-                        );
-                        return;
-                    }
-                    let _ = tx.send(BridgeEvent::Error(e.to_string())).await;
-                    return;
-                }
-            };
-
-            if let Some(usage) = &completion.usage {
-                let _ = tx.send(BridgeEvent::Usage(usage.clone())).await;
-            }
-
-            let assistant_content = completion.content.clone();
-            msg_json.push(serde_json::json!({
-                "role": "assistant",
-                "content": assistant_content,
-                "tool_calls": completion.assistant_message.get("tool_calls").cloned().unwrap_or(serde_json::Value::Null)
-            }));
-
-            if completion.tool_calls.is_empty() {
-                if !completion.content.is_empty() {
-                    let _ = tx.send(BridgeEvent::Token(completion.content)).await;
-                }
-                let _ = tx.send(BridgeEvent::Done).await;
-                return;
-            }
-
-            let Some(mcp_cfg) = mcp.clone() else {
-                let _ = tx
-                    .send(BridgeEvent::Error(
-                        "Model requested tools but MCP is not configured".to_string(),
-                    ))
-                    .await;
-                return;
-            };
-
-            let calls = completion.tool_calls;
-            let call_futures = calls
-                .into_iter()
-                .map(|call| execute_single_tool_call(call, mcp_cfg.clone(), tx.clone()));
-
-            let tool_results = join_all(call_futures).await;
-            for (tool_call_id, _tool_name, payload, _failed) in tool_results {
-                msg_json.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": payload.to_string()
-                }));
+                completed = true;
+                break;
             }
         }
 
-        let _ = tx
-            .send(BridgeEvent::Error(
-                "Agent loop reached max turns without completion".to_string(),
-            ))
-            .await;
+        if !completed {
+            let _ = tx
+                .send(BridgeEvent::Error(
+                    "Agent loop reached max turns without completion".to_string(),
+                ))
+                .await;
+        }
     });
 }
 
@@ -545,6 +574,40 @@ async fn get_or_create_session(
     Ok(sid)
 }
 
+fn parse_mcp_response(json_resp: &serde_json::Value) -> (String, bool) {
+    let result_val = json_resp.get("result");
+    let is_error = json_resp.get("error").is_some()
+        || (result_val
+            .and_then(|r| r.get("isError"))
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false));
+
+    let content_str = if let Some(err) = json_resp.get("error") {
+        format!(
+            "Error: {}",
+            err.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error")
+        )
+    } else if let Some(res) = result_val {
+        if let Some(content_array) = res.get("content").and_then(|c| c.as_array()) {
+            let mut texts = Vec::new();
+            for item in content_array {
+                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                    texts.push(t.to_string());
+                }
+            }
+            texts.join("\n")
+        } else {
+            serde_json::to_string_pretty(res).unwrap_or_default()
+        }
+    } else {
+        "Empty result".to_string()
+    };
+
+    (content_str, is_error)
+}
+
 async fn call_mcp_tool_http(
     client: &reqwest::Client,
     url: &str,
@@ -583,37 +646,7 @@ async fn call_mcp_tool_http(
         .await
         .map_err(|e| format!("Failed to parse tool response JSON: {e}"))?;
 
-    let result_val = json_resp.get("result");
-    let is_error = json_resp.get("error").is_some()
-        || (result_val
-            .and_then(|r| r.get("isError"))
-            .and_then(|e| e.as_bool())
-            .unwrap_or(false));
-
-    let content_str = if let Some(err) = json_resp.get("error") {
-        format!(
-            "Error: {}",
-            err.get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error")
-        )
-    } else if let Some(res) = result_val {
-        if let Some(content_array) = res.get("content").and_then(|c| c.as_array()) {
-            let mut texts = Vec::new();
-            for item in content_array {
-                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                    texts.push(t.to_string());
-                }
-            }
-            texts.join("\n")
-        } else {
-            serde_json::to_string_pretty(res).unwrap_or_default()
-        }
-    } else {
-        "Empty result".to_string()
-    };
-
-    Ok((content_str, is_error))
+    Ok(parse_mcp_response(&json_resp))
 }
 
 pub fn spawn_decompose_task(client: LlmClient, goal: String, tx: Sender<BridgeEvent>) {

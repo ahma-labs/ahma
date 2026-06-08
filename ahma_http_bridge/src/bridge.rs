@@ -1046,8 +1046,9 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
     // We log this prominently and bump a per-session counter so the loss is
     // observable in tests, metrics, and debug logs.
     let session_arc = session.clone();
+    let session_id_clone = session_id.clone();
     let live_stream = BroadcastStream::new(rx).filter_map(move |result| {
-        let session_id = session_id.clone();
+        let session_id = session_id_clone.clone();
         let session_ref = session_arc.clone();
         async move {
             match result {
@@ -1081,6 +1082,53 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
 
     // Chain replay events before live stream for seamless reconnection
     let combined = replay_stream.chain(live_stream);
+
+    struct CleanupStream<S> {
+        inner: S,
+        session_id: String,
+        session_manager: Arc<SessionManager>,
+    }
+
+    impl<S: futures::Stream> futures::Stream for CleanupStream<S> {
+        type Item = S::Item;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            unsafe {
+                let this = self.get_unchecked_mut();
+                std::pin::Pin::new_unchecked(&mut this.inner).poll_next(cx)
+            }
+        }
+    }
+
+    impl<S> Drop for CleanupStream<S> {
+        fn drop(&mut self) {
+            let session_id = self.session_id.clone();
+            let session_manager = self.session_manager.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if let Some(session) = session_manager.get_session(&session_id)
+                    && session.sse_receivers() == 0
+                {
+                    tracing::info!(session_id = %session_id, "No active SSE subscribers after disconnect - terminating session");
+                    let _ = session_manager
+                        .terminate_session(
+                            &session_id,
+                            crate::session::SessionTerminationReason::Timeout,
+                        )
+                        .await;
+                }
+            });
+        }
+    }
+
+    let combined = CleanupStream {
+        inner: combined,
+        session_id: session_id.clone(),
+        session_manager: state.session_manager.clone(),
+    };
 
     // Return SSE response with keep-alive
     Sse::new(combined)
