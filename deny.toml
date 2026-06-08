@@ -25,6 +25,12 @@ ignore = [
     # locspan-derive → proc-macro-error.  This is a build-time procedural macro
     # crate; it has no runtime attack surface.
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error is a build-time-only proc-macro dep via sigstore transitive chain; unmaintained but no runtime exposure; no fix available upstream" },
+
+    # proc-macro-error2 is unmaintained. No fix available.
+    # Pulled transitively: sigstore-verification → sigstore → oci-client →
+    # oci-spec → getset → proc-macro-error2. This is a build-time procedural
+    # macro crate; it has no runtime attack surface.
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is a build-time-only proc-macro dep via sigstore transitive chain; unmaintained but no runtime exposure; no fix available upstream" },
 ]
 
 # ---------------------------------------------------------------------------

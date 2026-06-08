@@ -542,7 +542,6 @@ async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
             tracing::info!("Running in STDIO server mode");
             modes::run_server_mode(cfg, sandbox).await
         }
-        #[cfg(unix)]
         Some(ServeTransport::Http(_)) => {
             tracing::info!("Running in HTTP bridge mode");
             modes::run_http_bridge_mode(cfg).await
@@ -1458,7 +1457,6 @@ pub enum ServeTransport {
     /// (optionally) HTTP/3/QUIC.  Multiple MCP clients can connect
     /// concurrently.  Suitable for CI runners, shared machines, or
     /// remote integrations.
-    #[cfg(unix)]
     Http(HttpArgs),
     /// Serve over a Unix domain socket (UDS) — for local IPC and Kubernetes sidecar proxies.
     ///
@@ -1522,7 +1520,6 @@ pub enum ServeTransport {
 
   # Extended timeout, temp access, and log monitoring
   ahma serve http --timeout 600 --tmp --log-monitor")]
-#[cfg(unix)]
 pub struct HttpArgs {
     /// Host to bind the HTTP server on.
     #[arg(long, default_value = "127.0.0.1")]
@@ -2029,7 +2026,6 @@ fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
 
     if let Subcommands::Serve(s) = cmd {
         let (host, port) = match &s.transport {
-            #[cfg(unix)]
             Some(ServeTransport::Http(h)) => (h.host.clone(), env_port.unwrap_or(h.port)),
             Some(ServeTransport::Stdio) => ("127.0.0.1".to_string(), env_port.unwrap_or(3000u16)),
             #[cfg(unix)]
@@ -3309,7 +3305,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_cli_parse_serve_http_defaults() {
         let cli = Cli::try_parse_from(["ahma", "serve", "http"]).unwrap();
@@ -3326,7 +3321,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn test_cli_parse_serve_http_custom_port() {
         let cli = Cli::try_parse_from(["ahma", "serve", "http", "--port", "8080"]).unwrap();
