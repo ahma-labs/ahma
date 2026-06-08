@@ -965,7 +965,7 @@ impl AppState {
                 }
             })
         });
-        let mcp_enabled = session.as_ref().map(|s| s.mcp_enabled).unwrap_or(false);
+        let mcp_enabled = session.as_ref().map(|s| s.mcp_enabled).unwrap_or(true);
         let mcp_connections = std::env::current_dir()
             .ok()
             .and_then(|cwd| McpConnectionManager::load(&cwd).ok())

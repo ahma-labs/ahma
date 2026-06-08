@@ -214,7 +214,13 @@ fn cleanup_old_logs(log_dir: &Path) {
             };
             // Match both plain `ahma_mcp.log` and dated rolling files `ahma_mcp.log.YYYY-MM-DD`.
             if name == "ahma_mcp.log" || name.starts_with("ahma_mcp.log.") {
-                let _ = std::fs::remove_file(&path);
+                // Keep only logs from the last 7 days.
+                if let Ok(modified) = meta.modified()
+                    && let Ok(elapsed) = modified.elapsed()
+                    && elapsed.as_secs() > 7 * 24 * 60 * 60
+                {
+                    let _ = std::fs::remove_file(&path);
+                }
             }
         }
     }

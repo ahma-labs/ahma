@@ -48,3 +48,6 @@ temp/
 release_key.pem
 ahma-release-new.pem
 *.private.pem
+
+# Local session files
+.ahma/session.toml

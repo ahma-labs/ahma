@@ -686,3 +686,53 @@ async fn test_session_subscribe() {
     // Getting a second receiver should also work
     let _receiver2 = session.subscribe();
 }
+
+/// Test that the session sweeper cleans up terminated sessions and timed out handshakes.
+#[tokio::test]
+async fn test_session_sweeper_cleanup() {
+    let temp = tempdir().expect("Failed to create temp dir");
+    // Create a SessionManager with a very short handshake timeout (1s) to test timeout sweep
+    let config = SessionManagerConfig {
+        server_command: "echo".to_string(),
+        server_args: vec!["test".to_string()],
+        default_scope: Some(temp.path().to_path_buf()),
+        enable_colored_output: false,
+        handshake_timeout_secs: 1, // 1 second timeout
+        max_sessions: 10,
+    };
+    let session_manager = Arc::new(SessionManager::new(config));
+
+    // Start the sweeper
+    session_manager.start_sweeper();
+
+    // Create session 1: this will be marked terminated to simulate subprocess exit/crashes
+    let session_id_terminated = session_manager
+        .create_session()
+        .await
+        .expect("Should create session");
+    let session_terminated = session_manager
+        .get_session(&session_id_terminated)
+        .expect("Session should exist");
+
+    // Create session 2: this will just time out
+    let _session_id_timeout = session_manager
+        .create_session()
+        .await
+        .expect("Should create session");
+
+    assert_eq!(session_manager.session_count(), 2);
+
+    // Simulate subprocess exit for session 1 by marking it terminated
+    // (In reality, this is set to true by the handle_session_io loop)
+    session_terminated.set_terminated(true);
+
+    // Wait for the sweeper to run (sweeper sleep is 5 seconds, let's sleep 6 seconds to be sure)
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    // Both sessions should be cleaned up by the sweeper
+    assert_eq!(
+        session_manager.session_count(),
+        0,
+        "Sweeper should have removed both sessions"
+    );
+}

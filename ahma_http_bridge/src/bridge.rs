@@ -426,6 +426,7 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
         session_manager.active_sessions = Some(counter.clone());
     }
     let session_manager = Arc::new(session_manager);
+    session_manager.start_sweeper();
     Arc::new(BridgeState {
         session_manager,
         require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),

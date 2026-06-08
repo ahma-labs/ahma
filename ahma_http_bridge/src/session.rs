@@ -190,6 +190,11 @@ impl Session {
         self.terminated.load(Ordering::SeqCst)
     }
 
+    /// Set the terminated status of the session. Primarily for testing.
+    pub fn set_terminated(&self, terminated: bool) {
+        self.terminated.store(terminated, Ordering::SeqCst);
+    }
+
     /// Check if the sandbox is fully configured and active.
     ///
     /// Returns `true` only in `Active` state (subprocess confirmed sandbox configuration).
@@ -686,6 +691,42 @@ impl SessionManager {
             config,
             active_sessions: None,
         }
+    }
+
+    /// Spawns a background task that periodically sweeps the sessions map,
+    /// terminating any sessions that have timed out during handshake or
+    /// whose subprocesses have exited (terminated).
+    pub fn start_sweeper(self: &Arc<Self>) {
+        let manager = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+
+                let mut to_terminate = Vec::new();
+                for entry in manager.sessions.iter() {
+                    let session_id = entry.key().clone();
+                    let session = entry.value();
+
+                    if session.is_terminated() {
+                        to_terminate.push((session_id, SessionTerminationReason::ProcessCrashed));
+                    } else if session.is_handshake_timed_out().is_some() {
+                        to_terminate.push((session_id, SessionTerminationReason::Timeout));
+                    }
+                }
+
+                for (session_id, reason) in to_terminate {
+                    tracing::info!(
+                        session_id = %session_id,
+                        reason = ?reason,
+                        "Sweeper cleaning up inactive/terminated session"
+                    );
+                    let _ = manager.terminate_session(&session_id, reason).await;
+                }
+            }
+        });
     }
 
     /// Returns true when this server requires client roots to complete sandbox lock.
