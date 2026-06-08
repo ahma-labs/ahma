@@ -245,14 +245,14 @@ if [ -n "$SUMS_URL" ]; then
     fi
 fi
 
-# If SUMS_URL not found, we'll skip the hash pre-check (Sigstore attestation is the real anchor)
-if [ -z "$EXPECTED_HASH" ]; then
+# If SUMS_URL not found or download failed, we'll skip the hash pre-check (Sigstore attestation is the real anchor)
+if [ ! -f "$TEMP_DIR/SHA256SUMS" ]; then
     echo "Note: SHA256SUMS manifest not available; skipping hash pre-check."
     echo "      Sigstore attestation verification after install remains the cryptographic anchor."
 fi
 
 EXPECTED_HASH_PLACEHOLDER="$EXPECTED_HASH"  # may be empty — handled after download
-if [ -z "$EXPECTED_HASH" ]; then
+if [ -f "$TEMP_DIR/SHA256SUMS" ] && [ -z "$EXPECTED_HASH" ]; then
     echo "Error: Checksum entry for '$ASSET_NAME' not found in release manifest."
     exit 1
 fi
