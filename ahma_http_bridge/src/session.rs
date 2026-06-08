@@ -271,8 +271,12 @@ impl Session {
 
     /// Check if the handshake has timed out
     pub fn is_handshake_timed_out(&self) -> Option<u64> {
-        if self.is_sandbox_locked() {
-            return None;
+        // If the sandbox is Active or Configuring, the handshake is done or in
+        // progress — don't sweep the session.
+        match self.sandbox_state_machine.current() {
+            ahma_common::sandbox_state::SandboxState::Active { .. }
+            | ahma_common::sandbox_state::SandboxState::Configuring { .. } => return None,
+            _ => {}
         }
         let elapsed = self.created_at.elapsed();
         if elapsed >= self.handshake_timeout {
@@ -732,6 +736,28 @@ impl SessionManager {
     /// Returns true when this server requires client roots to complete sandbox lock.
     pub fn requires_client_roots(&self) -> bool {
         self.config.default_scope.is_none()
+    }
+
+    /// Auto-lock the sandbox using the configured `default_scope` when no client roots
+    /// are expected (or before they arrive). This is a no-op when `default_scope` is
+    /// `None` or the sandbox is already locked. The subprocess still controls the
+    /// final `Active` transition via `notifications/sandbox/configured`.
+    pub async fn auto_lock_if_default_scope(&self, session_id: &str) {
+        if self.config.default_scope.is_none() {
+            return;
+        }
+        match self.lock_sandbox(session_id, &[]).await {
+            Ok(true) => info!(
+                session_id = %session_id,
+                "Bridge: auto-locked sandbox from default_scope (no client roots needed)"
+            ),
+            Ok(false) => {} // already locked
+            Err(e) => tracing::warn!(
+                session_id = %session_id,
+                "Bridge: auto-lock from default_scope failed: {}",
+                e
+            ),
+        }
     }
 
     /// Initializes a new session and spawns a specific `ahma_mcp` subprocess for it.

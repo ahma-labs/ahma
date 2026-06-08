@@ -57,6 +57,8 @@ pub struct McpChatConfig {
     pub external_http_servers: BTreeMap<String, String>,
     pub max_turns: u32,
     pub tool_approval: bool,
+    /// All external MCP servers (HTTP and stdio) for agent tool routing.
+    pub mcp_connections: crate::mcp_connections::McpConnectionManager,
 }
 
 pub fn spawn_external_tools_refresh(
@@ -183,9 +185,20 @@ async fn execute_single_tool_call(
         })
         .await;
 
-    let result = if let Some((server, tool)) = call.name.split_once("::") {
-        if let Some(base_url) = cfg.external_http_servers.get(server) {
-            spawn_external_tool_call_http(base_url, tool, args_value).await
+    let result = if let Some((server, _tool)) = call.name.split_once("::") {
+        // Route namespaced tools through the connection manager (handles both HTTP and stdio).
+        // Fall back to the legacy HTTP-only map for backwards compatibility.
+        let full_name = call.name.clone();
+        let mut conn = cfg.mcp_connections.clone();
+        let conn_has_server = conn.servers.iter().any(|s| s.name == server);
+        if conn_has_server {
+            match conn.call_tool(&full_name, args_value.clone()).await {
+                Ok(pair) => Ok(pair),
+                Err(e) => Err(format!("MCP tool error ({full_name}): {e}")),
+            }
+        } else if let Some(base_url) = cfg.external_http_servers.get(server) {
+            let base = base_url.clone();
+            spawn_external_tool_call_http(&base, _tool, args_value).await
         } else {
             Err(format!("Unknown external MCP server `{server}`"))
         }
@@ -963,6 +976,7 @@ mod tests {
             external_http_servers: BTreeMap::new(),
             max_turns: 2,
             tool_approval: false,
+            mcp_connections: crate::mcp_connections::McpConnectionManager::default(),
         };
 
         let (tx, mut rx) = mpsc::channel(100);

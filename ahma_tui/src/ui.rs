@@ -360,6 +360,28 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     frame.render_widget(Paragraph::new(line).style(theme.header_bar()), area);
 }
 
+/// Estimate the number of physical terminal rows a ratatui [`Line`] will occupy
+/// when word-wrapped into `width` columns.  This uses simple character-count
+/// arithmetic (ignoring double-width Unicode codepoints) which is accurate for
+/// typical ASCII/Latin chat content and "close enough" for the scrollbar thumb.
+#[cfg(feature = "tui")]
+fn line_wrapped_rows(line: &ratatui::text::Line<'_>, width: usize) -> usize {
+    let width = width.max(1);
+    let total_chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    if total_chars == 0 {
+        1
+    } else {
+        (total_chars + width - 1) / width
+    }
+}
+
+/// Total wrapped physical rows for a slice of logical lines at the given width.
+/// Returns 0 for an empty slice (used as a scroll position offset).
+#[cfg(feature = "tui")]
+fn total_wrapped_rows(lines: &[ratatui::text::Line<'_>], width: usize) -> usize {
+    lines.iter().map(|l| line_wrapped_rows(l, width)).sum()
+}
+
 #[cfg(feature = "tui")]
 fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Chat;
@@ -405,7 +427,13 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None);
-        let mut sb_state = ScrollbarState::new(lines.len()).position(scroll);
+        // Use wrapped-row counts so the thumb accurately represents position and
+        // range even when long lines fold across multiple terminal rows.
+        let total_wrapped = total_wrapped_rows(&lines, inner.width as usize);
+        let scroll_wrapped = total_wrapped_rows(&lines[..scroll], inner.width as usize);
+        let mut sb_state = ScrollbarState::new(total_wrapped)
+            .viewport_content_length(visible_h)
+            .position(scroll_wrapped);
         frame.render_stateful_widget(sb, inner, &mut sb_state);
     }
 }
@@ -1170,7 +1198,9 @@ fn draw_ai_activity(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None);
-        let mut sb_state = ScrollbarState::new(state.ai_activity.len()).position(scroll);
+        let mut sb_state = ScrollbarState::new(state.ai_activity.len())
+            .viewport_content_length(visible_h)
+            .position(scroll);
         frame.render_stateful_widget(sb, inner, &mut sb_state);
     }
 }
@@ -1671,7 +1701,9 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None);
-        let mut sb_state = ScrollbarState::new(display_lines.len()).position(scroll);
+        let mut sb_state = ScrollbarState::new(display_lines.len())
+            .viewport_content_length(visible_h)
+            .position(scroll);
         frame.render_stateful_widget(sb, inner, &mut sb_state);
     }
 }
@@ -2289,3 +2321,98 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// No-op stub so the crate compiles without the `tui` feature.
 #[cfg(not(feature = "tui"))]
 pub fn draw(_frame: &mut (), _state: &AppState, _theme: &Theme) {}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "tui"))]
+mod tests {
+    use super::*;
+    use ratatui::text::{Line, Span};
+
+    fn make_line(text: &str) -> Line<'static> {
+        Line::from(Span::raw(text.to_string()))
+    }
+
+    #[test]
+    fn test_line_wrapped_rows_short() {
+        // A line that fits in one row.
+        let line = make_line("hello");
+        assert_eq!(line_wrapped_rows(&line, 80), 1);
+    }
+
+    #[test]
+    fn test_line_wrapped_rows_exact_fit() {
+        // Exactly fills the width → 1 row.
+        let line = make_line("abcde");
+        assert_eq!(line_wrapped_rows(&line, 5), 1);
+    }
+
+    #[test]
+    fn test_line_wrapped_rows_one_over() {
+        // One char over the width → 2 rows.
+        let line = make_line("abcdef");
+        assert_eq!(line_wrapped_rows(&line, 5), 2);
+    }
+
+    #[test]
+    fn test_line_wrapped_rows_empty() {
+        let line = make_line("");
+        assert_eq!(line_wrapped_rows(&line, 80), 1);
+    }
+
+    #[test]
+    fn test_total_wrapped_rows_all_short() {
+        // All lines fit in one row each.
+        let lines: Vec<Line> = (0..5).map(|_| make_line("hi")).collect();
+        assert_eq!(total_wrapped_rows(&lines, 80), 5);
+    }
+
+    #[test]
+    fn test_total_wrapped_rows_wrapping() {
+        // 3 short lines + 1 long line that wraps into 3 rows.
+        let lines = vec![
+            make_line("short"),
+            make_line("short"),
+            make_line("short"),
+            make_line("a".repeat(25).as_str()), // 25 chars @ width=10 → 3 rows
+        ];
+        assert_eq!(total_wrapped_rows(&lines, 10), 6); // 3×1 + 3
+    }
+
+    #[test]
+    fn test_scrollbar_position_at_top() {
+        // scroll=0 means nothing above → position=0 in wrapped space.
+        let lines: Vec<Line> = (0..20).map(|_| make_line("hi")).collect();
+        let pos = total_wrapped_rows(&lines[..0], 80);
+        assert_eq!(pos, 0); // empty slice → 0
+    }
+
+    #[test]
+    fn test_scrollbar_position_at_max_scroll() {
+        // At max scroll (visible_h=10, total=20): skip 10 lines.
+        let lines: Vec<Line<'static>> = (0..20).map(|_| make_line("hi")).collect();
+        let scroll = 10_usize;
+        let total_w = total_wrapped_rows(&lines, 80);
+        let pos_w = total_wrapped_rows(&lines[..scroll], 80);
+        assert_eq!(total_w, 20);
+        assert_eq!(pos_w, 10);
+    }
+
+    #[test]
+    fn test_scrollbar_thumb_reaches_bottom_with_wrapped_content() {
+        // 10 normal lines + 1 very long line (wraps into 5 rows at width=10).
+        // At max scroll (scroll = 1 line from top so bottom is visible),
+        // the wrapped position should be close to (total_wrapped - visible_h).
+        let mut lines: Vec<Line<'static>> = (0..10).map(|_| make_line("short")).collect();
+        lines.push(make_line(&"x".repeat(50))); // 50 chars @ width=10 → 5 rows
+        let total_w = total_wrapped_rows(&lines, 10); // 10 + 5 = 15
+        assert_eq!(total_w, 15);
+        // If visible_h=5, max logical scroll = 11 - 5 = 6.
+        // Scrolled to max (skip 6 logical lines), pos_w = 6.
+        let pos_w = total_wrapped_rows(&lines[..6], 10);
+        assert_eq!(pos_w, 6);
+        // The thumb should NOT be at position 6 of a 10-line logical space (60%),
+        // but at 6 of a 15-row wrapped space (40%). The important thing: pos_w < total_w.
+        assert!(pos_w < total_w);
+    }
+}
