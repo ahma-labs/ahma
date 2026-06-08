@@ -190,6 +190,10 @@ pub struct AhmaMcpService {
     pub web_page_fetcher: Arc<dyn WebPageFetcher>,
     /// Custom LLM completion service.
     pub llm_service: Arc<dyn LlmCompletionService>,
+    /// Last received timestamp for keep-alive optimization.
+    pub last_received_signal: Arc<std::sync::atomic::AtomicU64>,
+    /// True if the connected peer is an Ahma node.
+    pub is_ahma_peer: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AhmaMcpService {
@@ -478,6 +482,10 @@ impl AhmaMcpService {
             file_ops_provider: Arc::new(DefaultFileOpsProvider),
             web_page_fetcher: Arc::new(DefaultWebPageFetcher),
             llm_service: Arc::new(DefaultLlmCompletionService),
+            last_received_signal: Arc::new(std::sync::atomic::AtomicU64::new(
+                ahma_common::keepalive::current_timestamp_ms(),
+            )),
+            is_ahma_peer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -972,6 +980,19 @@ impl ServerHandler for AhmaMcpService {
             let peer = &context.peer;
             self.store_peer_handle_if_unset(peer);
 
+            // Configure keepalive behavior based on peer type
+            if matches!(client_type, McpClientType::Ahma) {
+                self.is_ahma_peer.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            // Start keepalive heartbeat task
+            ahma_common::keepalive::spawn_keepalive_task(
+                Arc::new(self.clone()),
+                self.last_received_signal.clone(),
+                env!("CARGO_PKG_VERSION").to_string(),
+                "todo-hash".to_string(), // TODO: inject build hash
+            );
+
             if self.defer_sandbox {
                 tracing::info!("Sandbox deferred - waiting for roots/list_changed notification");
                 return;
@@ -1214,6 +1235,10 @@ impl ServerHandler for AhmaMcpService {
         params: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+        self.last_received_signal.store(
+            ahma_common::keepalive::current_timestamp_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let span = tracing::info_span!("call_tool", tool = &*params.name);
         async move {
             match params.name.as_ref() as &str {
@@ -1284,6 +1309,31 @@ impl ServerHandler for AhmaMcpService {
             }
         }
         .instrument(span)
+    }
+
+    fn ping(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        self.last_received_signal.store(
+            ahma_common::keepalive::current_timestamp_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        std::future::ready(Ok(()))
+    }
+
+    fn on_custom_notification(
+        &self,
+        notification: rmcp::model::CustomNotification,
+        _context: NotificationContext<RoleServer>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        if notification.method == "notifications/ahma/heartbeat" {
+            self.last_received_signal.store(
+                ahma_common::keepalive::current_timestamp_ms(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        std::future::ready(())
     }
 }
 
@@ -2515,3 +2565,63 @@ mod tests {
         assert_eq!(info.server_info.name, env!("CARGO_PKG_NAME"));
     }
 }
+
+impl ahma_common::keepalive::KeepAlive for AhmaMcpService {
+    fn send_standard_ping(
+        &self,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+        let peer_opt = self.peer.read().unwrap().clone();
+        async move {
+            if let Some(peer) = peer_opt {
+                peer.send_request(rmcp::model::ServerRequest::PingRequest(
+                    Default::default(),
+                ))
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
+    fn send_enhanced_heartbeat(
+        &self,
+        payload: ahma_common::keepalive::HeartbeatPayload,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
+        let peer_opt = self.peer.read().unwrap().clone();
+        async move {
+            if let Some(peer) = peer_opt {
+                let params = serde_json::to_value(payload)?;
+                
+                peer.send_notification(rmcp::model::ServerNotification::CustomNotification(
+                    rmcp::model::CustomNotification::new(
+                        "notifications/ahma/heartbeat",
+                        Some(params),
+                    ),
+                ))
+                .await?;
+            }
+            Ok(())
+        }
+    }
+
+    fn time_since_last_received(&self) -> std::time::Duration {
+        let last = self.last_received_signal.load(std::sync::atomic::Ordering::Relaxed);
+        let now = ahma_common::keepalive::current_timestamp_ms();
+        std::time::Duration::from_millis(now.saturating_sub(last))
+    }
+
+    fn heartbeat_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+
+    fn is_ahma_peer(&self) -> bool {
+        self.is_ahma_peer.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn on_timeout(&self) -> impl std::future::Future<Output = ()> + Send {
+        async move {
+            tracing::warn!("AhmaMcpService keepalive timeout! Exiting process to allow bridge to cleanup.");
+            std::process::exit(1);
+        }
+    }
+}
+

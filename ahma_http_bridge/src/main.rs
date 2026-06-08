@@ -75,7 +75,7 @@ struct Args {
     /// rate that are permitted before limiting kicks in).
     ///
     /// Defaults to `10`.  Only effective when `--rate-limit-rps > 0`.
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value = "50")]
     rate_limit_burst: u32,
 
     /// Idle timeout in seconds before the background bridge shuts down.
@@ -83,7 +83,7 @@ struct Args {
     idle_timeout_secs: Option<u64>,
 
     /// Maximum concurrent HTTP server sessions.
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value = "50")]
     max_sessions: usize,
 }
 

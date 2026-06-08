@@ -19,6 +19,8 @@ use rmcp::service::{Peer, RoleServer};
 /// Represents known MCP client types with their behavioral quirks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum McpClientType {
+    /// Ahma CLI or Ahma IDE integration - supports enhanced heartbeat and payloads.
+    Ahma,
     /// Cursor IDE - has issues with progress notification token handling.
     /// We skip progress notifications for this client.
     Cursor,
@@ -40,7 +42,9 @@ impl McpClientType {
     pub fn from_client_name(name: &str) -> Self {
         let name_lower = name.to_lowercase();
 
-        if name_lower.contains("cursor") {
+        if name_lower.contains("ahma") {
+            McpClientType::Ahma
+        } else if name_lower.contains("cursor") {
             McpClientType::Cursor
         } else if name_lower.contains("claude") {
             McpClientType::ClaudeDesktop
@@ -73,6 +77,7 @@ impl McpClientType {
     /// Human-readable name for logging.
     pub fn display_name(&self) -> &'static str {
         match self {
+            McpClientType::Ahma => "Ahma",
             McpClientType::Cursor => "Cursor",
             McpClientType::VSCode => "VSCode/Copilot",
             McpClientType::ClaudeDesktop => "Claude Desktop",
@@ -85,6 +90,18 @@ impl McpClientType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ahma_detection() {
+        assert_eq!(
+            McpClientType::from_client_name("ahma"),
+            McpClientType::Ahma
+        );
+        assert_eq!(
+            McpClientType::from_client_name("ahma-cli"),
+            McpClientType::Ahma
+        );
+    }
 
     #[test]
     fn test_cursor_detection() {

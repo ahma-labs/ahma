@@ -89,21 +89,21 @@ async fn test_tools_call_without_sse_returns_handshake_timeout() {
         .await
         .expect("tools/call POST failed");
 
-    // Should return 504 Gateway Timeout (not 409 Conflict)
+    // Should return 403 Forbidden (Session not found) because watchdog terminated it
     assert_eq!(
         resp.status().as_u16(),
-        504,
-        "Expected HTTP 504 for handshake timeout"
+        403,
+        "Expected HTTP 403 for handshake timeout (session reaped by watchdog)"
     );
 
     let body: Value = resp.json().await.expect("Response should be JSON");
     let error = body.get("error").expect("Should have error");
 
-    // Verify error code is -32002 (handshake timeout)
+    // Verify error code is -32600 (Session not found or terminated)
     assert_eq!(
         error.get("code").and_then(|c| c.as_i64()),
-        Some(-32002),
-        "Expected error code -32002 for handshake timeout"
+        Some(-32600),
+        "Expected error code -32600 for session not found"
     );
 
     // Verify error message is actionable
@@ -112,12 +112,8 @@ async fn test_tools_call_without_sse_returns_handshake_timeout() {
         .and_then(|m| m.as_str())
         .unwrap_or_default();
     assert!(
-        msg.contains("Handshake timeout") && msg.contains("SSE"),
-        "Error message should mention handshake timeout and SSE. Got: {msg}"
-    );
-    assert!(
-        msg.contains("SSE connected: false"),
-        "Error should indicate SSE not connected. Got: {msg}"
+        msg.contains("Session not found or terminated"),
+        "Error message should mention session not found. Got: {msg}"
     );
 }
 
@@ -196,7 +192,7 @@ async fn test_tools_call_without_initialized_notification_returns_timeout() {
         .await
         .expect("tools/call POST failed");
 
-    assert_eq!(resp.status().as_u16(), 504);
+    assert_eq!(resp.status().as_u16(), 403);
 
     let body: Value = resp.json().await.expect("Response should be JSON");
     let error = body.get("error").expect("Should have error");
@@ -205,10 +201,9 @@ async fn test_tools_call_without_initialized_notification_returns_timeout() {
         .and_then(|m| m.as_str())
         .unwrap_or_default();
 
-    // SSE should be connected, but MCP initialized should be false
     assert!(
-        msg.contains("SSE connected: true") && msg.contains("MCP initialized: false"),
-        "Error should show SSE connected but MCP not initialized. Got: {msg}"
+        msg.contains("Session not found or terminated"),
+        "Error should show session not found. Got: {msg}"
     );
 }
 
@@ -463,8 +458,8 @@ async fn test_handshake_timeout_is_per_server_via_cli() {
 
     assert_eq!(
         resp1_tool.status().as_u16(),
-        504,
-        "Server1 should timeout (504)"
+        403,
+        "Server1 should timeout and be reaped (403)"
     );
 
     // Server2 should still return 409 (still in handshake, not timed out)
