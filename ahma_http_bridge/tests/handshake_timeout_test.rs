@@ -64,8 +64,8 @@ async fn test_tools_call_without_sse_returns_handshake_timeout() {
 
     // Intentionally skip: SSE connection, initialized notification, roots/list response
 
-    // Wait for handshake timeout (2s timeout + 1.5s margin for CI)
-    tokio::time::sleep(TestTimeouts::scale_millis(3500)).await;
+    // Wait for handshake timeout (2s timeout + 1.5s margin)
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
 
     // Try to call a tool - should get handshake timeout error
     let tool_call = json!({
@@ -171,8 +171,8 @@ async fn test_tools_call_without_initialized_notification_returns_timeout() {
 
     // Intentionally skip: initialized notification, roots/list response
 
-    // Wait for handshake timeout (2s timeout + 1.5s margin for CI)
-    tokio::time::sleep(TestTimeouts::scale_millis(3500)).await;
+    // Wait for handshake timeout (2s timeout + 1.5s margin)
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
 
     // Try to call a tool
     let tool_call = json!({
@@ -438,7 +438,7 @@ async fn test_handshake_timeout_is_per_server_via_cli() {
         .to_string();
 
     // Wait for server1's timeout to expire (2s + margin)
-    tokio::time::sleep(TestTimeouts::scale_millis(3500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
 
     // Server1 should return 504 (timeout)
     let tool_call = json!({
