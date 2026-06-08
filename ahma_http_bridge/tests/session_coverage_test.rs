@@ -8,12 +8,12 @@
 //!
 //! These tests improve session.rs coverage from ~47% to higher.
 
-use std::sync::Arc;
 use ahma_http_bridge::DEFAULT_HANDSHAKE_TIMEOUT_SECS;
 use ahma_http_bridge::session::{
     HandshakeState, McpRoot, SessionManager, SessionManagerConfig, SessionTerminationReason,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 /// Helper to create a test session manager with echo as subprocess

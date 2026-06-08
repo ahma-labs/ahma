@@ -93,10 +93,7 @@ mod tests {
 
     #[test]
     fn test_ahma_detection() {
-        assert_eq!(
-            McpClientType::from_client_name("ahma"),
-            McpClientType::Ahma
-        );
+        assert_eq!(McpClientType::from_client_name("ahma"), McpClientType::Ahma);
         assert_eq!(
             McpClientType::from_client_name("ahma-cli"),
             McpClientType::Ahma

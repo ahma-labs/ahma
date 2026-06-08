@@ -8,12 +8,12 @@
 //! These tests improve coverage in `ahma_http_bridge/src/session.rs` (46.84% → higher)
 
 use ahma_http_bridge::DEFAULT_HANDSHAKE_TIMEOUT_SECS;
-use std::sync::Arc;
 use ahma_http_bridge::session::{
     McpRoot, SessionManager, SessionManagerConfig, SessionTerminationReason,
 };
 use ahma_mcp::test_utils::path_helpers::test_temp_path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 

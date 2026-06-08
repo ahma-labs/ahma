@@ -8,10 +8,10 @@
 //! connecting from VS Code with workspace `/Users/paul/github/nb_lifeline3/android_lifeline`
 //! results in: "Path is outside the sandbox root"
 
-use std::sync::Arc;
 use ahma_http_bridge::DEFAULT_HANDSHAKE_TIMEOUT_SECS;
 use ahma_http_bridge::session::{McpRoot, SessionManager, SessionManagerConfig};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Helper to create a SessionManager with test configuration
 fn create_test_session_manager(default_scope: Option<PathBuf>) -> Arc<SessionManager> {

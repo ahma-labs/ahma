@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Payload sent with enhanced Ahma keep-alive / heartbeat notifications.
@@ -15,15 +15,17 @@ pub struct HeartbeatPayload {
 }
 
 /// Abstract trait for sending a keep-alive signal over a specific transport.
-
 pub trait KeepAlive {
     /// Send a standard MCP `ping` method request (for 3rd-party compatibility)
     fn send_standard_ping(&self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
     /// Send an enhanced Ahma heartbeat notification (`notifications/ahma/heartbeat`)
-    fn send_enhanced_heartbeat(&self, payload: HeartbeatPayload) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    fn send_enhanced_heartbeat(
+        &self,
+        payload: HeartbeatPayload,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
 
-    /// Check if the connection has received any data recently. 
+    /// Check if the connection has received any data recently.
     /// Should return the duration since the last received byte or JSON-RPC message.
     fn time_since_last_received(&self) -> Duration;
 
@@ -32,7 +34,7 @@ pub trait KeepAlive {
 
     /// True if the peer has been identified as an Ahma node (so we can send enhanced heartbeats).
     fn is_ahma_peer(&self) -> bool;
-    
+
     /// True if the transport supports Server-to-Client `ping` requests properly.
     /// Some HTTP transports might only support passive timeouts for 3rd-party clients.
     fn supports_active_pings(&self) -> bool {
@@ -66,7 +68,7 @@ pub fn spawn_keepalive_task<T: KeepAlive + Send + Sync + 'static>(
             tokio::time::sleep(tickle_interval).await;
 
             let idle_duration = connection.time_since_last_received();
-            
+
             if idle_duration > timeout {
                 tracing::warn!(
                     "KeepAlive timeout exceeded (idle for {}s). Terminating connection.",
@@ -100,7 +102,7 @@ pub fn spawn_keepalive_task<T: KeepAlive + Send + Sync + 'static>(
                     tracing::debug!("Failed to send keep-alive signal. Connection likely closed.");
                     break;
                 }
-                
+
                 last_sent_signal.store(current_timestamp_ms(), Ordering::Relaxed);
             }
         }

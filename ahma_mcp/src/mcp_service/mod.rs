@@ -982,7 +982,8 @@ impl ServerHandler for AhmaMcpService {
 
             // Configure keepalive behavior based on peer type
             if matches!(client_type, McpClientType::Ahma) {
-                self.is_ahma_peer.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.is_ahma_peer
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
 
             // Start keepalive heartbeat task
@@ -1872,6 +1873,59 @@ impl AhmaMcpService {
     }
 }
 
+impl ahma_common::keepalive::KeepAlive for AhmaMcpService {
+    async fn send_standard_ping(&self) -> anyhow::Result<()> {
+        let peer_opt = self.peer.read().unwrap().clone();
+        if let Some(peer) = peer_opt {
+            peer.send_request(rmcp::model::ServerRequest::PingRequest(Default::default()))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn send_enhanced_heartbeat(
+        &self,
+        payload: ahma_common::keepalive::HeartbeatPayload,
+    ) -> anyhow::Result<()> {
+        let peer_opt = self.peer.read().unwrap().clone();
+        if let Some(peer) = peer_opt {
+            let params = serde_json::to_value(payload)?;
+
+            peer.send_notification(rmcp::model::ServerNotification::CustomNotification(
+                rmcp::model::CustomNotification::new(
+                    "notifications/ahma/heartbeat",
+                    Some(params),
+                ),
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn time_since_last_received(&self) -> std::time::Duration {
+        let last = self
+            .last_received_signal
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let now = ahma_common::keepalive::current_timestamp_ms();
+        std::time::Duration::from_millis(now.saturating_sub(last))
+    }
+
+    fn heartbeat_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
+
+    fn is_ahma_peer(&self) -> bool {
+        self.is_ahma_peer.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn on_timeout(&self) {
+        tracing::warn!(
+            "AhmaMcpService keepalive timeout! Exiting process to allow bridge to cleanup."
+        );
+        std::process::exit(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // ==================== force_synchronous inheritance tests ====================
@@ -2565,63 +2619,3 @@ mod tests {
         assert_eq!(info.server_info.name, env!("CARGO_PKG_NAME"));
     }
 }
-
-impl ahma_common::keepalive::KeepAlive for AhmaMcpService {
-    fn send_standard_ping(
-        &self,
-    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
-        let peer_opt = self.peer.read().unwrap().clone();
-        async move {
-            if let Some(peer) = peer_opt {
-                peer.send_request(rmcp::model::ServerRequest::PingRequest(
-                    Default::default(),
-                ))
-                .await?;
-            }
-            Ok(())
-        }
-    }
-
-    fn send_enhanced_heartbeat(
-        &self,
-        payload: ahma_common::keepalive::HeartbeatPayload,
-    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
-        let peer_opt = self.peer.read().unwrap().clone();
-        async move {
-            if let Some(peer) = peer_opt {
-                let params = serde_json::to_value(payload)?;
-                
-                peer.send_notification(rmcp::model::ServerNotification::CustomNotification(
-                    rmcp::model::CustomNotification::new(
-                        "notifications/ahma/heartbeat",
-                        Some(params),
-                    ),
-                ))
-                .await?;
-            }
-            Ok(())
-        }
-    }
-
-    fn time_since_last_received(&self) -> std::time::Duration {
-        let last = self.last_received_signal.load(std::sync::atomic::Ordering::Relaxed);
-        let now = ahma_common::keepalive::current_timestamp_ms();
-        std::time::Duration::from_millis(now.saturating_sub(last))
-    }
-
-    fn heartbeat_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(60)
-    }
-
-    fn is_ahma_peer(&self) -> bool {
-        self.is_ahma_peer.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn on_timeout(&self) -> impl std::future::Future<Output = ()> + Send {
-        async move {
-            tracing::warn!("AhmaMcpService keepalive timeout! Exiting process to allow bridge to cleanup.");
-            std::process::exit(1);
-        }
-    }
-}
-
