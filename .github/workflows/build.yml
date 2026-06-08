@@ -336,7 +336,8 @@ jobs:
           tool: nextest,sccache
 
       - name: Install cargo-ndk
-        run: [ -x "$HOME/.cargo/bin/cargo-ndk" ] || cargo install cargo-ndk
+        run: |
+          [ -x "$HOME/.cargo/bin/cargo-ndk" ] || cargo install cargo-ndk
 
       - name: Add Cargo Bin to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -417,7 +418,8 @@ jobs:
           tool: nextest,cargo-llvm-cov,sccache
 
       - name: Install cargo-ndk
-        run: [ -x "$HOME/.cargo/bin/cargo-ndk" ] || cargo install cargo-ndk
+        run: |
+          [ -x "$HOME/.cargo/bin/cargo-ndk" ] || cargo install cargo-ndk
 
       - name: Build ahma binary (required by integration tests)
         run: cargo build --locked --no-default-features -p ahma_bin
