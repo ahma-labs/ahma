@@ -726,8 +726,13 @@ async fn test_session_sweeper_cleanup() {
     // (In reality, this is set to true by the handle_session_io loop)
     session_terminated.set_terminated(true);
 
-    // Wait for the sweeper to run (sweeper sleep is 5 seconds, let's sleep 6 seconds to be sure)
-    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    // Poll the session count until it reaches 0, up to a reasonable platform-aware timeout.
+    // The sweeper runs every 5 seconds, so we wait up to 10 seconds (scaled) for it to run.
+    let start = std::time::Instant::now();
+    let max_wait = ahma_common::timeouts::TestTimeouts::scale_secs(10);
+    while session_manager.session_count() > 0 && start.elapsed() < max_wait {
+        tokio::time::sleep(ahma_common::timeouts::TestTimeouts::poll_interval()).await;
+    }
 
     // Both sessions should be cleaned up by the sweeper
     assert_eq!(
