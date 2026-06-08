@@ -31,13 +31,14 @@ use wiremock::{
     matchers::{method, path},
 };
 
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::callback_system::{CallbackError, CallbackSender, ProgressUpdate};
 use ahma_mcp::config::{LivelogConfig, LlmProviderConfig, ToolConfig, ToolType};
 use ahma_mcp::mcp_service::handlers::livelog_tool::handle_livelog_start;
 use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor, OperationStatus};
 use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 use ahma_mcp::test_utils::concurrency::{
-    CI_DEFAULT_TIMEOUT, CI_QUICK_TIMEOUT, wait_for_operation_terminal,
+    ci_default_timeout, ci_quick_timeout, wait_for_operation_terminal,
 };
 use ahma_mcp::test_utils::in_process::create_in_process_mcp_from_dir;
 use ahma_mcp::utils::logging::init_test_logging;
@@ -136,14 +137,16 @@ fn test_sandbox(scope: &std::path::Path) -> Arc<Sandbox> {
     )
 }
 
-/// Create an `OperationMonitor` suitable for tests (30 s default timeout).
+/// Create an `OperationMonitor` suitable for tests.
 fn test_monitor() -> Arc<OperationMonitor> {
     Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(30),
+        TestTimeouts::get(TimeoutCategory::ToolCall),
     )))
 }
 
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+fn poll_interval() -> Duration {
+    TestTimeouts::poll_interval()
+}
 
 // ---------------------------------------------------------------------------
 // Layer 1 — Handler integration tests
@@ -193,7 +196,7 @@ async fn test_livelog_handler_issue_detected_sends_alert() {
 
     // Wait for the background pipeline to complete.
     let completed =
-        wait_for_operation_terminal(&monitor, &op_id, CI_DEFAULT_TIMEOUT, POLL_INTERVAL).await;
+        wait_for_operation_terminal(&monitor, &op_id, ci_default_timeout(), poll_interval()).await;
     assert!(
         completed,
         "operation '{op_id}' should reach a terminal state within the timeout"
@@ -276,7 +279,7 @@ async fn test_livelog_handler_clean_response_no_alert() {
     .expect("handle_livelog_start should succeed");
 
     let completed =
-        wait_for_operation_terminal(&monitor, &op_id, CI_DEFAULT_TIMEOUT, POLL_INTERVAL).await;
+        wait_for_operation_terminal(&monitor, &op_id, ci_default_timeout(), poll_interval()).await;
     assert!(completed, "operation should complete");
 
     let alerts = callback.captured_alerts();
@@ -334,7 +337,7 @@ async fn test_livelog_handler_multiple_alerts_pipeline_continues() {
     .expect("handle_livelog_start should succeed");
 
     let completed =
-        wait_for_operation_terminal(&monitor, &op_id, CI_DEFAULT_TIMEOUT, POLL_INTERVAL).await;
+        wait_for_operation_terminal(&monitor, &op_id, ci_default_timeout(), poll_interval()).await;
     assert!(completed, "operation should complete");
 
     let alerts = callback.captured_alerts();
@@ -391,7 +394,7 @@ async fn test_livelog_handler_cooldown_suppresses_second_alert() {
     .expect("handle_livelog_start should succeed");
 
     let completed =
-        wait_for_operation_terminal(&monitor, &op_id, CI_DEFAULT_TIMEOUT, POLL_INTERVAL).await;
+        wait_for_operation_terminal(&monitor, &op_id, ci_default_timeout(), poll_interval()).await;
     assert!(completed, "operation should complete");
 
     let alerts = callback.captured_alerts();
@@ -438,14 +441,14 @@ async fn test_livelog_handler_cancel_via_monitor_stops_pipeline() {
     .expect("handle_livelog_start should succeed");
 
     // Give the background task a moment to start, then cancel through the monitor.
-    sleep(Duration::from_millis(50)).await;
+    sleep(poll_interval()).await;
     if let Some(op) = monitor.get_operation(&op_id).await {
         op.cancellation_token.cancel();
     }
 
     let start = std::time::Instant::now();
     let completed =
-        wait_for_operation_terminal(&monitor, &op_id, CI_QUICK_TIMEOUT, POLL_INTERVAL).await;
+        wait_for_operation_terminal(&monitor, &op_id, ci_quick_timeout(), poll_interval()).await;
     let elapsed = start.elapsed();
 
     assert!(
@@ -498,7 +501,7 @@ async fn test_livelog_handler_llm_http_error_graceful() {
 
     // Pipeline should still complete (LLM error is non-fatal).
     let completed =
-        wait_for_operation_terminal(&monitor, &op_id, CI_DEFAULT_TIMEOUT, POLL_INTERVAL).await;
+        wait_for_operation_terminal(&monitor, &op_id, ci_default_timeout(), poll_interval()).await;
     assert!(
         completed,
         "pipeline should complete even when LLM returns HTTP 500"

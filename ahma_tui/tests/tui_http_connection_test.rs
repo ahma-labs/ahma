@@ -16,6 +16,7 @@ mod common;
 
 use std::time::Duration;
 
+use ahma_common::timeouts::TestTimeouts;
 use ahma_tui::connection::{ResolvedConnection, ResolvedTransport, probe_candidate};
 use ahma_tui::mcp_source::{SourceEvent, spawn_mcp_source};
 use axum::Json;
@@ -104,7 +105,7 @@ async fn start_mock_mcp_server() -> (String, tokio::task::JoinHandle<()>) {
             .expect("mock MCP server error");
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(TestTimeouts::short_delay()).await;
     (base_url, handle)
 }
 

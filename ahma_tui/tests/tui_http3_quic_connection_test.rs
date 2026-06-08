@@ -12,6 +12,7 @@
 
 mod common;
 
+use ahma_common::timeouts::TestTimeouts;
 use ahma_tui::connection::{ResolvedTransport, parse_h3_from_alt_svc};
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -25,7 +26,7 @@ async fn bridge_advertises_alt_svc_h3() {
     let bridge = common::start_bridge_tcp(true).await;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(TestTimeouts::scale_secs(5))
         .build()
         .expect("reqwest client");
 
@@ -75,7 +76,7 @@ async fn resolve_connection_upgrades_to_http3() {
 
     // Check whether QUIC actually started — skip gracefully if not.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(TestTimeouts::scale_secs(5))
         .build()
         .expect("reqwest client");
 

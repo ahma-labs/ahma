@@ -6,13 +6,19 @@ use std::time::Duration;
 use tokio::sync::Barrier;
 
 /// Default CI-friendly timeout for concurrent operations.
-pub const CI_DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+pub fn ci_default_timeout() -> Duration {
+    ahma_common::timeouts::TestTimeouts::scale(Duration::from_secs(30))
+}
 
 /// Generous timeout for heavy operations (compilation, network, etc.)
-pub const CI_HEAVY_TIMEOUT: Duration = Duration::from_secs(120);
+pub fn ci_heavy_timeout() -> Duration {
+    ahma_common::timeouts::TestTimeouts::scale(Duration::from_secs(120))
+}
 
 /// Short timeout for quick sanity checks
-pub const CI_QUICK_TIMEOUT: Duration = Duration::from_secs(5);
+pub fn ci_quick_timeout() -> Duration {
+    ahma_common::timeouts::TestTimeouts::scale(Duration::from_secs(5))
+}
 
 /// Wait for an async condition to become true, polling at a fixed interval.
 /// Returns true if the condition succeeds within the timeout.

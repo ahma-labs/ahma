@@ -1,5 +1,6 @@
 //! Shared test helpers for ahma_tui integration tests.
 #![allow(dead_code)] // helpers are selectively used by cfg-gated test binaries
+use ahma_common::timeouts::TestTimeouts;
 use ahma_http_bridge::{BridgeConfig, ListenerKind, start_bridge};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -85,14 +86,17 @@ pub async fn start_bridge_unix(socket_path: std::path::PathBuf) -> UnixBridgeHan
         let _ = start_bridge(config).await;
     });
 
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let poll_interval = TestTimeouts::poll_interval();
+    let max_attempts =
+        (TestTimeouts::scale_secs(5).as_millis() / poll_interval.as_millis()).max(1) as usize;
+    for _ in 0..max_attempts {
+        tokio::time::sleep(poll_interval).await;
         if socket_path.exists() {
             return UnixBridgeHandle { socket_path, task };
         }
     }
     panic!(
-        "Unix socket {} did not appear within 5 seconds",
+        "Unix socket {} did not appear within scaled 5 seconds",
         socket_path.display()
     );
 }
@@ -104,8 +108,11 @@ pub async fn wait_for_health(base_url: &str) {
         .build()
         .unwrap_or_default();
     let url = format!("{base_url}/health");
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let poll_interval = TestTimeouts::poll_interval();
+    let max_attempts =
+        (TestTimeouts::scale_secs(5).as_millis() / poll_interval.as_millis()).max(1) as usize;
+    for _ in 0..max_attempts {
+        tokio::time::sleep(poll_interval).await;
         if client
             .get(&url)
             .send()
@@ -116,5 +123,5 @@ pub async fn wait_for_health(base_url: &str) {
             return;
         }
     }
-    panic!("Server at {base_url} did not become healthy within 5 seconds");
+    panic!("Server at {base_url} did not become healthy within scaled 5 seconds");
 }
