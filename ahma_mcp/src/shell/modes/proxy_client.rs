@@ -183,18 +183,23 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
 
                 let val = serde_json::to_value(&msg)?;
                 let has_id = val.get("id").is_some();
+                // A message is a JSON-RPC *request* when it has both "id" and "method".
+                // A message with "id" but no "method" is a *response* (e.g. the client
+                // answering the server's roots/list request). For responses the bridge
+                // returns HTTP 202 with an empty body — don't try to parse it.
+                let is_request = val.get("method").is_some();
 
                 let mut req = client.post(&mcp_url)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .header("mcp-session-id", &session_id)
                     .json(&val);
 
-                if has_id {
+                if has_id && is_request {
                     req = req.header(reqwest::header::ACCEPT, "application/json");
                 }
 
                 let resp = req.send().await?;
-                if has_id {
+                if has_id && is_request {
                     let bytes = resp.bytes().await?;
                     if !bytes.is_empty() {
                         let resp_msg: TxJsonRpcMessage<RoleServer> = serde_json::from_slice(&bytes)?;

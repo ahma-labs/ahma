@@ -64,16 +64,28 @@ impl std::fmt::Debug for McpConnectionManager {
 impl McpConnectionManager {
     pub fn load(cwd: &Path) -> Result<Self> {
         let path = config_path(cwd);
-        if !path.exists() {
-            return Ok(Self::default());
+        let mut servers = if path.exists() {
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            let cfg: McpClientConfigFile = toml::from_str(&content)
+                .with_context(|| format!("Failed to parse {}", path.display()))?;
+            cfg.servers
+        } else {
+            Vec::new()
+        };
+
+        // Merge in servers discovered from IDE mcp.json configs (Cursor, VS Code, etc.).
+        // Entries from the local `.ahma/mcp-clients.toml` take precedence (same name wins).
+        let local_names: std::collections::BTreeSet<_> =
+            servers.iter().map(|s| s.name.clone()).collect();
+        for ide_server in discover_ide_servers() {
+            if !local_names.contains(&ide_server.name) {
+                servers.push(ide_server);
+            }
         }
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let cfg: McpClientConfigFile = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse {}", path.display()))?;
 
         Ok(Self {
-            servers: cfg.servers,
+            servers,
             tools_by_server: BTreeMap::new(),
             stdio_clients: Arc::new(Mutex::new(BTreeMap::new())),
         })
@@ -293,6 +305,116 @@ impl McpConnectionManager {
 
 fn config_path(cwd: &Path) -> PathBuf {
     cwd.join(".ahma").join("mcp-clients.toml")
+}
+
+/// Discover servers defined in IDE mcp.json config files (Cursor, VS Code).
+///
+/// Reads from well-known IDE paths and converts `mcpServers` / `servers` entries
+/// into `McpServerConfig` values that the TUI can connect to.
+pub fn discover_ide_servers() -> Vec<McpServerConfig> {
+    let mut results = Vec::new();
+
+    let home = match home_dir() {
+        Some(h) => h,
+        None => return results,
+    };
+
+    // Cursor: ~/.cursor/mcp.json  with "mcpServers" key
+    let cursor_path = home.join(".cursor").join("mcp.json");
+    parse_ide_mcp_json(&cursor_path, &mut results);
+
+    // VS Code (macOS): ~/Library/Application Support/Code/User/mcp.json  with "servers" key
+    #[cfg(target_os = "macos")]
+    {
+        let vscode_path = home
+            .join("Library")
+            .join("Application Support")
+            .join("Code")
+            .join("User")
+            .join("mcp.json");
+        parse_ide_mcp_json(&vscode_path, &mut results);
+    }
+
+    // VS Code (Linux): ~/.config/Code/User/mcp.json
+    #[cfg(target_os = "linux")]
+    {
+        let vscode_path = home.join(".config").join("Code").join("User").join("mcp.json");
+        parse_ide_mcp_json(&vscode_path, &mut results);
+    }
+
+    // VS Code (Windows): %APPDATA%\Code\User\mcp.json
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let vscode_path =
+                std::path::PathBuf::from(appdata).join("Code").join("User").join("mcp.json");
+            parse_ide_mcp_json(&vscode_path, &mut results);
+        }
+    }
+
+    results
+}
+
+fn home_dir() -> Option<PathBuf> {
+    // std::env::home_dir is deprecated but works fine on all platforms.
+    #[allow(deprecated)]
+    std::env::home_dir()
+}
+
+/// Parse one IDE mcp.json file (Cursor or VS Code format) and push discovered
+/// servers into `out`.  Both formats are tried; the function is silent on errors.
+fn parse_ide_mcp_json(path: &Path, out: &mut Vec<McpServerConfig>) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let val: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // Try both "mcpServers" (Cursor) and "servers" (VS Code) top-level keys.
+    for key in &["mcpServers", "servers"] {
+        if let Some(Value::Object(map)) = val.get(*key) {
+            for (name, entry) in map {
+                if let Some(server) = ide_entry_to_server(name, entry) {
+                    // Skip duplicates from the same file.
+                    if !out.iter().any(|s| &s.name == name) {
+                        out.push(server);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn ide_entry_to_server(name: &str, entry: &Value) -> Option<McpServerConfig> {
+    // HTTP server entry: { "url": "..." }
+    if let Some(url) = entry.get("url").and_then(|u| u.as_str()) {
+        return Some(McpServerConfig {
+            name: name.to_string(),
+            enabled: true,
+            kind: McpServerKind::Http { url: url.to_string() },
+        });
+    }
+
+    // Stdio server entry: { "command": "...", "args": [...] }
+    let command = entry.get("command").and_then(|c| c.as_str())?;
+    let args: Vec<String> = entry
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(McpServerConfig {
+        name: name.to_string(),
+        enabled: true,
+        kind: McpServerKind::Stdio { command: command.to_string(), args },
+    })
 }
 
 async fn call_mcp_tool_stdio(

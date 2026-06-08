@@ -339,35 +339,53 @@ impl AhmaMcpService {
         let timeout_duration = TestTimeouts::get(TimeoutCategory::SseStream);
         tracing::info!(timeout = ?timeout_duration, "Requesting roots/list from client...");
 
-        let list_result = match tokio::time::timeout(timeout_duration, peer.list_roots()).await {
-            Ok(result) => result,
+        // Attempt roots/list; fall back to pre-configured scopes on timeout or error
+        // so that clients that don't support roots/list (e.g. Antigravity) still work
+        // when --sandbox-scope was provided at startup.
+        let roots = match tokio::time::timeout(timeout_duration, peer.list_roots()).await {
+            Ok(Ok(result)) => result.roots,
+            Ok(Err(e)) => {
+                if !self.adapter.sandbox().scopes().is_empty() {
+                    tracing::info!(
+                        "roots/list returned error ({}); using pre-configured scopes",
+                        e
+                    );
+                    vec![]
+                } else {
+                    tracing::error!("Failed to request roots/list: {}", e);
+                    emit_sandbox_notification(
+                        "notifications/sandbox/failed",
+                        Some(&e.to_string()),
+                    );
+                    return;
+                }
+            }
             Err(_) => {
-                tracing::error!(
-                    "Timeout waiting for roots/list response after {:?}. \
-                     This may indicate a stdio communication issue.",
-                    timeout_duration
-                );
-                emit_sandbox_notification(
-                    "notifications/sandbox/failed",
-                    Some(&format!(
-                        "Timeout waiting for roots/list response after {:?}",
+                if !self.adapter.sandbox().scopes().is_empty() {
+                    tracing::info!(
+                        "Timeout waiting for roots/list response after {:?}; \
+                         using pre-configured scopes",
                         timeout_duration
-                    )),
-                );
-                return;
+                    );
+                    vec![]
+                } else {
+                    tracing::error!(
+                        "Timeout waiting for roots/list response after {:?}. \
+                         This may indicate a stdio communication issue.",
+                        timeout_duration
+                    );
+                    emit_sandbox_notification(
+                        "notifications/sandbox/failed",
+                        Some(&format!(
+                            "Timeout waiting for roots/list response after {:?}",
+                            timeout_duration
+                        )),
+                    );
+                    return;
+                }
             }
         };
-        tracing::debug!("peer.list_roots() returned: ok={}", list_result.is_ok());
-
-        let roots = match list_result {
-            Ok(result) => result.roots,
-            Err(e) => {
-                tracing::error!("Failed to request roots/list: {}", e);
-                emit_sandbox_notification("notifications/sandbox/failed", Some(&e.to_string()));
-                return;
-            }
-        };
-        tracing::info!("Received {} roots from client: {:?}", roots.len(), roots);
+        tracing::debug!("roots/list returned {} roots", roots.len());
 
         let new_scopes: Vec<PathBuf> = roots
             .iter()

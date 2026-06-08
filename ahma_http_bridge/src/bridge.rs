@@ -1017,8 +1017,15 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
         .and_then(|s| s.parse().ok());
 
     // Mark SSE as connected - if MCP is already initialized, this will trigger roots/list_changed
-    if let Err(e) = session.mark_sse_connected().await {
-        warn!(session_id = %session_id, "Failed to mark SSE connected: {}", e);
+    match session.mark_sse_connected().await {
+        Ok(true) => {
+            // Handshake just reached RootsRequested; auto-lock from default_scope if configured.
+            state.session_manager.auto_lock_if_default_scope(&session_id).await;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            warn!(session_id = %session_id, "Failed to mark SSE connected: {}", e);
+        }
     }
 
     // Build replay stream from history (if Last-Event-Id was provided)

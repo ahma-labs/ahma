@@ -221,6 +221,10 @@ pub fn builtin_commands() -> Vec<NavCommand> {
             description: "add an HTTP MCP server",
         },
         NavCommand {
+            command: "/mcp add stdio <cmd> [args] [--name <n>]".into(),
+            description: "add a stdio MCP server",
+        },
+        NavCommand {
             command: "/mcp remove <name>".into(),
             description: "remove a configured MCP server",
         },

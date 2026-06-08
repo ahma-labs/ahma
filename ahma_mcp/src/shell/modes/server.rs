@@ -13,6 +13,7 @@ use ahma_http_mcp_client::client::HttpMcpTransport;
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
 use std::{
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -415,8 +416,16 @@ async fn handle_version_checks(
     Ok(None)
 }
 
-fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
+fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf]) -> Vec<String> {
     let mut server_args = vec!["serve".to_string()];
+
+    // Forward the resolved sandbox scope(s) so the bridge can use them as a fallback
+    // for clients that don't send roots/list (e.g. Antigravity) and so the bridge
+    // can pass them on to per-session subprocesses.
+    for scope in resolved_scopes {
+        server_args.push("--sandbox-scope".to_string());
+        server_args.push(scope.to_string_lossy().to_string());
+    }
 
     if config.explicit_tools_dir
         && let Some(ref tools_dir) = config.tools_dir
@@ -495,6 +504,7 @@ fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
 
 async fn spawn_background_bridge(
     config: &AppConfig,
+    resolved_scopes: &[PathBuf],
     socket_path_opt: Option<&str>,
     http_url_opt: Option<&str>,
 ) -> Result<()> {
@@ -503,7 +513,7 @@ async fn spawn_background_bridge(
         .to_string_lossy()
         .to_string();
 
-    let server_args = build_background_bridge_args(config);
+    let server_args = build_background_bridge_args(config, resolved_scopes);
 
     let mut cmd = tokio::process::Command::new(&server_command);
     cmd.args(&server_args);
@@ -576,10 +586,12 @@ async fn spawn_background_bridge(
         tokio::time::sleep(ahma_common::timeouts::TestTimeouts::poll_interval()).await;
     }
     if !healthy {
-        tracing::warn!(
-            "Background bridge server failed to become healthy within {:?}",
-            timeout
-        );
+        return Err(anyhow::anyhow!(
+            "Background bridge server failed to become healthy within {:?}. \
+             Check logs at {:?} for details.",
+            timeout,
+            std::env::temp_dir().join("ahma_grandchild.stderr")
+        ));
     } else {
         tracing::info!("Background bridge server started successfully and is healthy");
     }
@@ -688,7 +700,14 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     );
 
     if !is_test {
-        spawn_background_bridge(&config, socket_path_opt, http_url_opt).await?;
+        let resolved_scopes: Vec<PathBuf> = sandbox.scopes().to_vec();
+        spawn_background_bridge(
+            &config,
+            &resolved_scopes,
+            socket_path_opt,
+            http_url_opt,
+        )
+        .await?;
         // Proceed with proxy setup
         return crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
             .await;

@@ -583,13 +583,21 @@ async fn mark_session_initialized(
     if !is_initialized_notification {
         return;
     }
-    if let Some(session) = session_manager.get_session(session_id)
-        && let Err(e) = session.mark_mcp_initialized().await
-    {
-        warn!(
-            session_id = %session_id,
-            "Failed to mark MCP initialized: {}", e
-        );
+    if let Some(session) = session_manager.get_session(session_id) {
+        match session.mark_mcp_initialized().await {
+            Ok(true) => {
+                // Handshake just reached RootsRequested; auto-lock from default_scope
+                // if configured so that clients that don't send roots/list still work.
+                session_manager.auto_lock_if_default_scope(session_id).await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    "Failed to mark MCP initialized: {}", e
+                );
+            }
+        }
     }
 }
 

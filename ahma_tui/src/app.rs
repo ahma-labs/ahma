@@ -293,6 +293,7 @@ fn approve_symlink(state: &mut crate::state::AppState) {
             external_http_servers: std::collections::BTreeMap::new(),
             max_turns: 8,
             tool_approval: false,
+            mcp_connections: state.mcp_connections.clone(),
         };
         tokio::spawn(async move {
             crate::llm_bridge::spawn_tool_call_task(
@@ -1038,6 +1039,7 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
         external_http_servers,
         max_turns,
         tool_approval,
+        mcp_connections: state.mcp_connections.clone(),
     }
 }
 
@@ -1425,6 +1427,49 @@ fn handle_mcp_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool
             let _ = state.mcp_connections.save(&cwd);
         }
         push_assistant_message(state, format!("Added HTTP MCP server `{name}` -> {url}"));
+        return true;
+    }
+
+    if let Some(rest) = cmd.strip_prefix("/mcp add stdio ") {
+        // Syntax: /mcp add stdio <command> [arg1 arg2 ...] [--name <name>]
+        let mut parts = rest.split_whitespace().peekable();
+        let Some(command) = parts.next() else {
+            push_assistant_message(
+                state,
+                "Usage: /mcp add stdio <command> [args...] [--name <name>]",
+            );
+            return true;
+        };
+        let mut args: Vec<String> = Vec::new();
+        let mut name_override: Option<String> = None;
+        while let Some(part) = parts.next() {
+            if part == "--name" {
+                name_override = parts.next().map(String::from);
+            } else {
+                args.push(part.to_string());
+            }
+        }
+        let name = name_override.unwrap_or_else(|| {
+            std::path::Path::new(command)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(command)
+                .to_string()
+        });
+        state
+            .mcp_connections
+            .add_server(crate::mcp_connections::McpServerConfig {
+                name: name.clone(),
+                enabled: true,
+                kind: crate::mcp_connections::McpServerKind::Stdio {
+                    command: command.to_string(),
+                    args,
+                },
+            });
+        if let Ok(cwd) = std::env::current_dir() {
+            let _ = state.mcp_connections.save(&cwd);
+        }
+        push_assistant_message(state, format!("Added stdio MCP server `{name}` ({})", command));
         return true;
     }
 
