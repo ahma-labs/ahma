@@ -330,10 +330,13 @@ jobs:
           rustflags: ""
           cache: false
 
-      - name: Install cargo-nextest, cargo-ndk and sccache
+      - name: Install cargo-nextest and sccache
         uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
         with:
-          tool: nextest,cargo-ndk,sccache
+          tool: nextest,sccache
+
+      - name: Install cargo-ndk
+        run: [ -x "$HOME/.cargo/bin/cargo-ndk" ] || cargo install cargo-ndk
 
       - name: Add Cargo Bin to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -408,10 +411,13 @@ jobs:
             echo "LANG=C"
           } >> "$GITHUB_ENV"
 
-      - name: Install cargo-nextest, cargo-ndk, cargo-llvm-cov and sccache
+      - name: Install cargo-nextest, cargo-llvm-cov and sccache
         uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
         with:
-          tool: nextest,cargo-ndk,cargo-llvm-cov,sccache
+          tool: nextest,cargo-llvm-cov,sccache
+
+      - name: Install cargo-ndk
+        run: [ -x "$HOME/.cargo/bin/cargo-ndk" ] || cargo install cargo-ndk
 
       - name: Build ahma binary (required by integration tests)
         run: cargo build --locked --no-default-features -p ahma_bin
