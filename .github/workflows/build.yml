@@ -630,6 +630,10 @@ jobs:
         run: |
           [ -x "$HOME/.cargo/bin/sccache" ] || cargo install sccache
 
+      - name: Add Cargo Bin to PATH (macOS)
+        if: "!matrix.use_cross && runner.os == 'macOS'"
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Install cross (for cross-compilation)
         if: matrix.use_cross
         uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
