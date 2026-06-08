@@ -1892,10 +1892,7 @@ impl ahma_common::keepalive::KeepAlive for AhmaMcpService {
             let params = serde_json::to_value(payload)?;
 
             peer.send_notification(rmcp::model::ServerNotification::CustomNotification(
-                rmcp::model::CustomNotification::new(
-                    "notifications/ahma/heartbeat",
-                    Some(params),
-                ),
+                rmcp::model::CustomNotification::new("notifications/ahma/heartbeat", Some(params)),
             ))
             .await?;
         }
