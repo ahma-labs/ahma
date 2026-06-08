@@ -169,7 +169,7 @@ jobs:
       - name: Install sccache (macOS)
         if: runner.os == 'macOS'
         run: |
-          [ -x "$HOME/.cargo/bin/sccache" ] || cargo install sccache
+          [ -x "$HOME/.cargo/bin/sccache" ] || RUSTC_WRAPPER="" cargo install sccache
 
       - name: Add Cargo Bin to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -348,7 +348,7 @@ jobs:
 
       - name: Install sccache (macOS)
         run: |
-          [ -x "$HOME/.cargo/bin/sccache" ] || cargo install sccache
+          [ -x "$HOME/.cargo/bin/sccache" ] || RUSTC_WRAPPER="" cargo install sccache
 
       - name: Install cargo-ndk
         run: |
@@ -628,7 +628,7 @@ jobs:
       - name: Install sccache (macOS)
         if: "!matrix.use_cross && runner.os == 'macOS'"
         run: |
-          [ -x "$HOME/.cargo/bin/sccache" ] || cargo install sccache
+          [ -x "$HOME/.cargo/bin/sccache" ] || RUSTC_WRAPPER="" cargo install sccache
 
       - name: Add Cargo Bin to PATH (macOS)
         if: "!matrix.use_cross && runner.os == 'macOS'"

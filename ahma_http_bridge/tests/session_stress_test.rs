@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 /// Helper to create a SessionManager with test configuration
-fn create_test_session_manager(default_scope: Option<PathBuf>) -> SessionManager {
+fn create_test_session_manager(default_scope: Option<PathBuf>) -> Arc<SessionManager> {
     let config = SessionManagerConfig {
         server_command: "echo".to_string(),
         server_args: vec!["test".to_string()],
@@ -27,7 +27,7 @@ fn create_test_session_manager(default_scope: Option<PathBuf>) -> SessionManager
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         max_sessions: 100,
     };
-    SessionManager::new(config)
+    Arc::new(SessionManager::new(config))
 }
 
 /// Returns a valid `(file_uri, expected_pathbuf)` pair for the current platform.
@@ -58,7 +58,7 @@ fn test_file_uri(relative_path: &str) -> (String, PathBuf) {
 #[tokio::test]
 async fn test_concurrent_session_creation() {
     let default_scope = test_temp_path("stress_test");
-    let session_manager = Arc::new(create_test_session_manager(Some(default_scope)));
+    let session_manager = create_test_session_manager(Some(default_scope));
 
     let num_sessions = 50;
     let mut handles = Vec::new();
@@ -127,7 +127,7 @@ async fn test_concurrent_session_creation() {
 #[tokio::test]
 async fn test_concurrent_creation_and_termination() {
     let default_scope = test_temp_path("race_test");
-    let session_manager = Arc::new(create_test_session_manager(Some(default_scope)));
+    let session_manager = create_test_session_manager(Some(default_scope));
 
     let num_iterations = 20;
 
@@ -167,7 +167,7 @@ async fn test_concurrent_creation_and_termination() {
 #[tokio::test]
 async fn test_concurrent_sandbox_lock_attempts() {
     let default_scope = test_temp_path("lock_race_test");
-    let session_manager = Arc::new(create_test_session_manager(Some(default_scope)));
+    let session_manager = create_test_session_manager(Some(default_scope));
 
     // Create a single session
     let session_id = session_manager.create_session().await.unwrap();
@@ -221,7 +221,7 @@ async fn test_concurrent_sandbox_lock_attempts() {
 #[tokio::test]
 async fn test_many_independent_sandbox_scopes() {
     let default_scope = test_temp_path("multi_scope_test");
-    let session_manager = Arc::new(create_test_session_manager(Some(default_scope.clone())));
+    let session_manager = create_test_session_manager(Some(default_scope.clone()));
 
     let num_sessions = 20;
     // (session_id, expected_scope_path)
@@ -501,7 +501,7 @@ async fn test_uri_parsing_edge_cases() {
 #[tokio::test]
 async fn test_session_operations_with_timeout() {
     let default_scope = test_temp_path("timeout_test");
-    let session_manager = Arc::new(create_test_session_manager(Some(default_scope)));
+    let session_manager = create_test_session_manager(Some(default_scope));
 
     let session_id = session_manager.create_session().await.unwrap();
 

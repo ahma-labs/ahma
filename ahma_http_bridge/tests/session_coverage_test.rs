@@ -13,10 +13,11 @@ use ahma_http_bridge::session::{
     HandshakeState, McpRoot, SessionManager, SessionManagerConfig, SessionTerminationReason,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 /// Helper to create a test session manager with echo as subprocess
-fn create_test_session_manager(default_scope: Option<PathBuf>) -> SessionManager {
+fn create_test_session_manager(default_scope: Option<PathBuf>) -> Arc<SessionManager> {
     let config = SessionManagerConfig {
         server_command: "echo".to_string(),
         server_args: vec!["test".to_string()],
@@ -25,7 +26,7 @@ fn create_test_session_manager(default_scope: Option<PathBuf>) -> SessionManager
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         max_sessions: 10,
     };
-    SessionManager::new(config)
+    Arc::new(SessionManager::new(config))
 }
 
 // =============================================================================

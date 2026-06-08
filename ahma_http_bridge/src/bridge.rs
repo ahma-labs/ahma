@@ -1279,7 +1279,7 @@ mod tests {
             rate_limit_burst: 10,
             active_sessions: None,
             idle_timeout_secs: None,
-            max_sessions: 10,
+            max_sessions: 50,
         };
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
         assert_eq!(config.server_command, "custom_server");
@@ -1400,7 +1400,7 @@ for line in sys.stdin:
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            max_sessions: 10,
+            max_sessions: 50,
         }));
 
         let state = create_state_with_session_manager(Arc::clone(&session_manager));
@@ -1571,7 +1571,7 @@ for line in sys.stdin:
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            max_sessions: 10,
+            max_sessions: 50,
         }));
         let state = create_state_with_session_manager(session_manager);
         let app = create_app(state);
@@ -1661,7 +1661,7 @@ for line in sys.stdin:
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            max_sessions: 10,
+            max_sessions: 50,
         }));
 
         let session_id = session_manager
@@ -1704,7 +1704,7 @@ for line in sys.stdin:
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            max_sessions: 10,
+            max_sessions: 50,
         }));
 
         let state = create_state_with_session_manager(session_manager);
@@ -1745,7 +1745,7 @@ for line in sys.stdin:
                 default_scope: Some(temp_dir.path().to_path_buf()),
                 enable_colored_output: false,
                 handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-                max_sessions: 10,
+                max_sessions: 50,
             })),
             require_token: ArcSwapOption::new(token.map(|s| Arc::new(s.to_owned()))),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
