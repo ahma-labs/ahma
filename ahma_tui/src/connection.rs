@@ -600,6 +600,9 @@ fn spawn_server_process(exe: &std::path::Path, args: &[&str]) -> Result<()> {
         let mut cmd = std::process::Command::new(exe);
         cmd.args(args);
         cmd.process_group(0);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
         cmd.spawn()?;
     }
 
@@ -607,6 +610,9 @@ fn spawn_server_process(exe: &std::path::Path, args: &[&str]) -> Result<()> {
     {
         let mut cmd = std::process::Command::new(exe);
         cmd.args(args);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;

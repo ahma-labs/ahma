@@ -296,6 +296,11 @@ impl Session {
         self.broadcast_tx.subscribe()
     }
 
+    /// Get the number of active SSE subscribers.
+    pub fn sse_receivers(&self) -> usize {
+        self.broadcast_tx.receiver_count()
+    }
+
     /// Record `n` events lost due to broadcast receiver lag.
     pub fn record_lagged_events(&self, n: u64) {
         self.lagged_events.fetch_add(n, Ordering::Relaxed);

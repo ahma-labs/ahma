@@ -347,32 +347,32 @@ cargo nextest run test_name --no-capture
 ### Adding a New Tool
 1. Create a JSON configuration in `.ahma/yourtool.json`
 2. Follow the MTDF schema (see [SPEC.md Section 3](SPEC.md#3-tool-definition-mtdf-schema))
-3. Test the tool: `ahma yourtool_subcommand --help`
-4. Restart the server to pick up tool changes by default; use `--hot-reload-tools` only while developing tool definitions
+3. Test the tool: `ahma tool run yourtool_subcommand --help`
+4. Restart the server to pick up tool changes by default; use `--hot-reload` only while developing tool definitions
 
 ### Debugging
 ```bash
 # Run with debug logging
-ahma --debug --log-to-stderr
+RUST_LOG=debug ahma --log-to-stderr
 
 # Inspect MCP protocol communication
 ./scripts/ahma-inspector.sh
 
 # Test single tool in CLI mode
-ahma cargo_build --working-directory . -- --release
+ahma tool run cargo_build --working-directory . -- --release
 ```
 
 ### MCP Server Testing
 ```bash
 # Start stdio server (used by Cursor/VS Code)
-ahma --mode stdio
+ahma serve stdio
 
 # Start HTTP bridge server
-ahma --mode http --http-port 3000
+ahma serve http --http-port 3000
 
 # List all tools from a server
-ahma --list-tools -- ./target/debug/ahma --tools-dir .ahma
-ahma --list-tools --http http://localhost:3000 --format json
+ahma tool list -- ./target/debug/ahma --tools-dir .ahma
+ahma tool list --http http://localhost:3000 --format json
 ```
 
 ---
@@ -570,10 +570,10 @@ For development and debugging, bypass the MCP protocol:
 
 ```bash
 # Execute a single tool command
-ahma cargo_build --working-directory . -- --release
+ahma tool run cargo_build --working-directory . -- --release
 
 # With debug logging
-ahma --debug --log-to-stderr cargo_test --working-directory .
+RUST_LOG=debug ahma --log-to-stderr tool run cargo_test --working-directory .
 ```
 
 ---

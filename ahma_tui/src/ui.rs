@@ -982,41 +982,9 @@ fn header_health_span(state: &AppState, theme: &Theme) -> Span<'static> {
 }
 
 #[cfg(feature = "tui")]
-fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let health_span = header_health_span(state, theme);
-
-    let sandbox_style = match state.sandbox_status.as_str() {
-        "LOCKED" => theme.success(),
-        "INITIALIZING" => theme.pending(),
-        "FAILED" => theme.failed(),
-        _ => theme.unknown_health(),
-    };
-
-    let session_part = state
-        .session_id
-        .as_deref()
-        .map(|id| format!(" · session {}", &id[..id.len().min(8)]))
-        .unwrap_or_default();
-
-    let workspace_short = shorten_path(&state.workspace, 30);
-    let mut http_count = 0;
-    let mut stdio_count = 0;
-    for s in &state.mcp_connections.servers {
-        if s.enabled {
-            match &s.kind {
-                crate::mcp_connections::McpServerKind::Http { .. } => http_count += 1,
-                crate::mcp_connections::McpServerKind::Stdio { .. } => stdio_count += 1,
-            }
-        }
-    }
-    let external_tools = state.mcp_connections.aggregate_tool_names().len();
-    let external_part = if http_count > 0 || stdio_count > 0 {
-        format!(" · ext (http:{http_count} stdio:{stdio_count})/{external_tools}")
-    } else {
-        String::new()
-    };
-
-    let tokens_part = if state.token_usage.total_tokens > 0 {
+#[cfg(feature = "tui")]
+fn format_tokens_part(state: &AppState) -> String {
+    if state.token_usage.total_tokens > 0 {
         let (p, c, t) = (
             state.token_usage.prompt_tokens,
             state.token_usage.completion_tokens,
@@ -1040,7 +1008,49 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         format!(" · tkns {p_fmt} in / {c_fmt} out ({t_fmt} ttl)")
     } else {
         String::new()
+    }
+}
+
+#[cfg(feature = "tui")]
+fn format_external_part(state: &AppState) -> String {
+    let mut http_count = 0;
+    let mut stdio_count = 0;
+    for s in &state.mcp_connections.servers {
+        if s.enabled {
+            match &s.kind {
+                crate::mcp_connections::McpServerKind::Http { .. } => http_count += 1,
+                crate::mcp_connections::McpServerKind::Stdio { .. } => stdio_count += 1,
+            }
+        }
+    }
+    let external_tools = state.mcp_connections.aggregate_tool_names().len();
+    if http_count > 0 || stdio_count > 0 {
+        format!(" · ext (http:{http_count} stdio:{stdio_count})/{external_tools}")
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(feature = "tui")]
+fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let health_span = header_health_span(state, theme);
+
+    let sandbox_style = match state.sandbox_status.as_str() {
+        "LOCKED" => theme.success(),
+        "INITIALIZING" => theme.pending(),
+        "FAILED" => theme.failed(),
+        _ => theme.unknown_health(),
     };
+
+    let session_part = state
+        .session_id
+        .as_deref()
+        .map(|id| format!(" · session {}", &id[..id.len().min(8)]))
+        .unwrap_or_default();
+
+    let workspace_short = shorten_path(&state.workspace, 30);
+    let external_part = format_external_part(state);
+    let tokens_part = format_tokens_part(state);
 
     let daemon_char = match (state.daemon_healthy, state.unicode) {
         (true, true) => " · ● DMON",
@@ -1534,6 +1544,49 @@ fn log_filter_indicator(state: &AppState) -> String {
 }
 
 #[cfg(feature = "tui")]
+#[cfg(feature = "tui")]
+fn get_file_display_lines(state: &AppState, theme: &Theme, inner_width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![];
+    let max_width = inner_width.saturating_sub(1) as usize; // leave 1 col margin
+    for raw_line in &state.active_log_lines {
+        let clean_line = raw_line.replace('\t', "    ");
+        if state.log_wrap_enabled && max_width > 0 {
+            for sub_line in wrap_line(&clean_line, max_width) {
+                lines.push(style_raw_log_line(&sub_line, theme));
+            }
+        } else {
+            lines.push(style_raw_log_line(&clean_line, theme));
+        }
+    }
+    lines
+}
+
+#[cfg(feature = "tui")]
+fn get_system_display_lines(
+    state: &AppState,
+    theme: &Theme,
+    inner_width: u16,
+) -> Vec<Line<'static>> {
+    let filtered = state.filtered_log();
+    let mut lines = vec![];
+    let max_width = inner_width.saturating_sub(1) as usize;
+    for e in filtered {
+        let ts = e.timestamp.format("%H:%M:%S").to_string();
+        let level_label = e.level.label();
+        let msg = &e.message;
+        let full_line = format!("{} {} {}", ts, level_label, msg);
+        if state.log_wrap_enabled && max_width > 0 {
+            for sub_line in wrap_line(&full_line, max_width) {
+                lines.push(style_system_log_line(&sub_line, &ts, level_label, theme));
+            }
+        } else {
+            lines.push(style_system_log_line(&full_line, &ts, level_label, theme));
+        }
+    }
+    lines
+}
+
+#[cfg(feature = "tui")]
 fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Log;
     let border_style = if focused {
@@ -1579,39 +1632,9 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
     // Get lines to display
     let display_lines = if let Some(ref _file) = state.active_log_file {
-        // Render file lines
-        let mut lines = vec![];
-        let max_width = inner.width.saturating_sub(1) as usize; // leave 1 col margin
-        for raw_line in &state.active_log_lines {
-            let clean_line = raw_line.replace('\t', "    ");
-            if state.log_wrap_enabled && max_width > 0 {
-                for sub_line in wrap_line(&clean_line, max_width) {
-                    lines.push(style_raw_log_line(&sub_line, theme));
-                }
-            } else {
-                lines.push(style_raw_log_line(&clean_line, theme));
-            }
-        }
-        lines
+        get_file_display_lines(state, theme, inner.width)
     } else {
-        // Render system logs (from state.filtered_log())
-        let filtered = state.filtered_log();
-        let mut lines = vec![];
-        let max_width = inner.width.saturating_sub(1) as usize;
-        for e in filtered {
-            let ts = e.timestamp.format("%H:%M:%S").to_string();
-            let level_label = e.level.label();
-            let msg = &e.message;
-            let full_line = format!("{} {} {}", ts, level_label, msg);
-            if state.log_wrap_enabled && max_width > 0 {
-                for sub_line in wrap_line(&full_line, max_width) {
-                    lines.push(style_system_log_line(&sub_line, &ts, level_label, theme));
-                }
-            } else {
-                lines.push(style_system_log_line(&full_line, &ts, level_label, theme));
-            }
-        }
-        lines
+        get_system_display_lines(state, theme, inner.width)
     };
 
     if display_lines.is_empty() {

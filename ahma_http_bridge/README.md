@@ -100,23 +100,23 @@ The bridge is integrated into the `ahma_shell` binary:
 ```bash
 # Start HTTP bridge on default port (3000)
 # Clients must provide roots/list unless explicit fallback scope is configured
-ahma --mode http
+ahma serve http
 
 # Explicit fallback scope for clients without roots/list support
-ahma --mode http --sandbox-scope /path/to/project
+ahma serve http --sandbox-scope /path/to/project
 
 # Start on custom port
-ahma --mode http --http-port 8080
+ahma serve http --port 8080
 
 # Start with specific tools directory
-ahma --mode http --tools-dir ./my-tools
+ahma serve http --tools-dir ./my-tools
 ```
 
 ## Port Configuration
 
 | Environment | Port | Notes |
 | ----------- | ---- | ----- |
-| **Production** | 3000 (default) | Configurable via `--http-port` |
+| **Production** | 3000 (default) | Configurable via `--port` |
 | **Integration Tests** | 5721 (reserved) | Hardcoded constant, do not change |
 
 ### Why Port 5721 for Tests?

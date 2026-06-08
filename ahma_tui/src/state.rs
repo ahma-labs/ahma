@@ -1117,6 +1117,23 @@ impl AppState {
 }
 
 #[cfg(feature = "tui")]
+fn parse_word_len<I: Iterator<Item = char>>(
+    _first_char: char,
+    chars: &mut std::iter::Peekable<I>,
+) -> usize {
+    let mut word_len = 1;
+    while let Some(&next_c) = chars.peek() {
+        if next_c != ' ' {
+            word_len += 1;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    word_len
+}
+
+#[cfg(feature = "tui")]
 fn count_wrapped_lines(line: &str, width: usize) -> usize {
     let width = width.max(1);
     if line.is_empty() {
@@ -1134,15 +1151,7 @@ fn count_wrapped_lines(line: &str, width: usize) -> usize {
                 current_line_len = 0;
             }
         } else {
-            let mut word_len = 1;
-            while let Some(&next_c) = chars.peek() {
-                if next_c != ' ' {
-                    word_len += 1;
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
+            let word_len = parse_word_len(c, &mut chars);
             if current_line_len + word_len <= width {
                 current_line_len += word_len;
             } else {

@@ -781,160 +781,175 @@ fn run_settings_command(args: SettingsArgs) -> Result<()> {
     }
 }
 
-fn run_prompts_command(args: PromptsArgs) -> Result<()> {
+fn handle_prompts_init(force: bool, project: bool, path: Option<PathBuf>) -> Result<()> {
     use ahma_common::prompts::{AhmaPrompts, global_prompts_path};
     use std::fs;
 
+    let target = if let Some(p) = path {
+        p
+    } else if project {
+        PathBuf::from(".ahma").join("prompts.toml")
+    } else {
+        global_prompts_path()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory for prompts.toml"))?
+    };
+
+    if target.exists() && !force {
+        anyhow::bail!(
+            "Prompts file already exists at {}. Use --force to overwrite.",
+            target.display()
+        );
+    }
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let template = AhmaPrompts::generate_template();
+    fs::write(&target, template)?;
+    println!("Prompts file written to: {}", target.display());
+    println!();
+    println!("Edit the file to override LLM prompt templates.");
+    Ok(())
+}
+
+fn handle_prompts_show() -> Result<()> {
+    use ahma_common::prompts::{AhmaPrompts, global_prompts_path};
+    use std::fs;
+
+    let s = AhmaPrompts::load();
+
+    let mut global_p = AhmaPrompts::default();
+    if let Some(parsed) = global_prompts_path()
+        .filter(|p| p.exists())
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|c| toml::from_str::<AhmaPrompts>(&c).ok())
+    {
+        global_p = parsed;
+    }
+
+    let mut local_p = AhmaPrompts::default();
+    let local_path = PathBuf::from(".ahma").join("prompts.toml");
+    if let Some(parsed) = Some(&local_path)
+        .filter(|p| p.exists())
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|c| toml::from_str::<AhmaPrompts>(&c).ok())
+    {
+        local_p = parsed;
+    }
+
+    println!("# Effective Ahma LLM Prompts");
+    println!(
+        "# Sources: [project-local] = .ahma/prompts.toml  [global] = ~/.ahma/prompts.toml  [default] = compiled-in"
+    );
+    println!();
+
+    let show_prompt_info = |name: &str, is_local_some: bool, is_global_some: bool| {
+        let source = if is_local_some {
+            "[project-local override]"
+        } else if is_global_some {
+            "[global override]"
+        } else {
+            "[compiled-in default]"
+        };
+        println!("## {} -- {}", name, source);
+    };
+
+    let local_tt = local_p.task_tree.as_ref();
+    let global_tt = global_p.task_tree.as_ref();
+    let local_dec = local_p.decompose.as_ref();
+    let global_dec = global_p.decompose.as_ref();
+
+    show_prompt_info(
+        "task_tree.planning",
+        local_tt.and_then(|t| t.planning.as_ref()).is_some(),
+        global_tt.and_then(|t| t.planning.as_ref()).is_some(),
+    );
+    println!("{}", s.planning_prompt());
+    println!();
+
+    show_prompt_info(
+        "task_tree.summarisation",
+        local_tt.and_then(|t| t.summarisation.as_ref()).is_some(),
+        global_tt.and_then(|t| t.summarisation.as_ref()).is_some(),
+    );
+    println!("{}", s.summarisation_prompt());
+    println!();
+
+    show_prompt_info(
+        "task_tree.recovery",
+        local_tt.and_then(|t| t.recovery.as_ref()).is_some(),
+        global_tt.and_then(|t| t.recovery.as_ref()).is_some(),
+    );
+    println!("{}", s.recovery_prompt());
+    println!();
+
+    show_prompt_info(
+        "decompose.split",
+        local_dec.and_then(|d| d.split.as_ref()).is_some(),
+        global_dec.and_then(|d| d.split.as_ref()).is_some(),
+    );
+    println!("{}", s.split_prompt());
+    println!();
+
+    Ok(())
+}
+
+fn handle_prompts_validate() -> Result<()> {
+    use ahma_common::prompts::AhmaPrompts;
+
+    let s = AhmaPrompts::load();
+    let warnings = s.validate();
+    if warnings.is_empty() {
+        println!("✓ Prompts configuration is valid.");
+    } else {
+        println!("Warnings found in prompts configuration:");
+        for w in warnings {
+            println!("  - {}", w);
+        }
+    }
+    Ok(())
+}
+
+fn handle_prompts_update() -> Result<()> {
+    use ahma_common::prompts::{AhmaPrompts, global_prompts_path};
+    use std::fs;
+
+    let Some(path) = global_prompts_path() else {
+        anyhow::bail!("Could not determine home directory for ~/.ahma/prompts.toml");
+    };
+
+    let template = AhmaPrompts::generate_template();
+    if path.exists() {
+        let backup_path = path.with_extension("toml.bak");
+        if backup_path.exists() {
+            let _ = fs::remove_file(&backup_path);
+        }
+        fs::rename(&path, &backup_path)?;
+        println!(
+            "✓ Backed up existing prompts file to {}",
+            backup_path.display()
+        );
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, template)?;
+    println!("✓ Wrote latest prompt defaults to {}", path.display());
+    Ok(())
+}
+
+fn run_prompts_command(args: PromptsArgs) -> Result<()> {
     match args.command {
         PromptsCommand::Init {
             force,
             project,
             path,
-        } => {
-            let target = if let Some(p) = path {
-                p
-            } else if project {
-                PathBuf::from(".ahma").join("prompts.toml")
-            } else {
-                global_prompts_path().ok_or_else(|| {
-                    anyhow::anyhow!("Could not determine home directory for prompts.toml")
-                })?
-            };
-
-            if target.exists() && !force {
-                anyhow::bail!(
-                    "Prompts file already exists at {}. Use --force to overwrite.",
-                    target.display()
-                );
-            }
-
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let template = AhmaPrompts::generate_template();
-            fs::write(&target, template)?;
-            println!("Prompts file written to: {}", target.display());
-            println!();
-            println!("Edit the file to override LLM prompt templates.");
-            Ok(())
-        }
-        PromptsCommand::Show => {
-            let s = AhmaPrompts::load();
-
-            let mut global_p = AhmaPrompts::default();
-            if let Some(parsed) = global_prompts_path()
-                .filter(|p| p.exists())
-                .and_then(|p| fs::read_to_string(p).ok())
-                .and_then(|c| toml::from_str::<AhmaPrompts>(&c).ok())
-            {
-                global_p = parsed;
-            }
-
-            let mut local_p = AhmaPrompts::default();
-            let local_path = PathBuf::from(".ahma").join("prompts.toml");
-            if let Some(parsed) = Some(&local_path)
-                .filter(|p| p.exists())
-                .and_then(|p| fs::read_to_string(p).ok())
-                .and_then(|c| toml::from_str::<AhmaPrompts>(&c).ok())
-            {
-                local_p = parsed;
-            }
-
-            println!("# Effective Ahma LLM Prompts");
-            println!(
-                "# Sources: [project-local] = .ahma/prompts.toml  [global] = ~/.ahma/prompts.toml  [default] = compiled-in"
-            );
-            println!();
-
-            let show_prompt_info = |name: &str, is_local_some: bool, is_global_some: bool| {
-                let source = if is_local_some {
-                    "[project-local override]"
-                } else if is_global_some {
-                    "[global override]"
-                } else {
-                    "[compiled-in default]"
-                };
-                println!("## {} -- {}", name, source);
-            };
-
-            let local_tt = local_p.task_tree.as_ref();
-            let global_tt = global_p.task_tree.as_ref();
-            let local_dec = local_p.decompose.as_ref();
-            let global_dec = global_p.decompose.as_ref();
-
-            show_prompt_info(
-                "task_tree.planning",
-                local_tt.and_then(|t| t.planning.as_ref()).is_some(),
-                global_tt.and_then(|t| t.planning.as_ref()).is_some(),
-            );
-            println!("{}", s.planning_prompt());
-            println!();
-
-            show_prompt_info(
-                "task_tree.summarisation",
-                local_tt.and_then(|t| t.summarisation.as_ref()).is_some(),
-                global_tt.and_then(|t| t.summarisation.as_ref()).is_some(),
-            );
-            println!("{}", s.summarisation_prompt());
-            println!();
-
-            show_prompt_info(
-                "task_tree.recovery",
-                local_tt.and_then(|t| t.recovery.as_ref()).is_some(),
-                global_tt.and_then(|t| t.recovery.as_ref()).is_some(),
-            );
-            println!("{}", s.recovery_prompt());
-            println!();
-
-            show_prompt_info(
-                "decompose.split",
-                local_dec.and_then(|d| d.split.as_ref()).is_some(),
-                global_dec.and_then(|d| d.split.as_ref()).is_some(),
-            );
-            println!("{}", s.split_prompt());
-            println!();
-
-            Ok(())
-        }
-        PromptsCommand::Validate => {
-            let s = AhmaPrompts::load();
-            let warnings = s.validate();
-            if warnings.is_empty() {
-                println!("✓ Prompts configuration is valid.");
-            } else {
-                println!("Warnings found in prompts configuration:");
-                for w in warnings {
-                    println!("  - {}", w);
-                }
-            }
-            Ok(())
-        }
-        PromptsCommand::Update => {
-            let Some(path) = global_prompts_path() else {
-                anyhow::bail!("Could not determine home directory for ~/.ahma/prompts.toml");
-            };
-
-            let template = AhmaPrompts::generate_template();
-            if path.exists() {
-                let backup_path = path.with_extension("toml.bak");
-                if backup_path.exists() {
-                    let _ = fs::remove_file(&backup_path);
-                }
-                fs::rename(&path, &backup_path)?;
-                println!(
-                    "✓ Backed up existing prompts file to {}",
-                    backup_path.display()
-                );
-            }
-
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&path, template)?;
-            println!("✓ Wrote latest prompt defaults to {}", path.display());
-            Ok(())
-        }
+        } => handle_prompts_init(force, project, path),
+        PromptsCommand::Show => handle_prompts_show(),
+        PromptsCommand::Validate => handle_prompts_validate(),
+        PromptsCommand::Update => handle_prompts_update(),
     }
 }
 

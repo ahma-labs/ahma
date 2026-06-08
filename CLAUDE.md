@@ -279,26 +279,26 @@ cargo nextest run test_name --no-capture
 ### Debugging
 ```bash
 # Run with debug logging
-ahma --debug --log-to-stderr
+RUST_LOG=debug ahma --log-to-stderr
 
 # Inspect MCP protocol communication
 ./scripts/ahma-inspector.sh
 
 # Test single tool in CLI mode
-ahma cargo_build --working-directory . -- --release
+ahma tool run cargo_build --working-directory . -- --release
 ```
 
 ### MCP Server Testing
 ```bash
 # Start stdio server (used by Cursor/VS Code)
-ahma --mode stdio
+ahma serve stdio
 
 # Start HTTP bridge server
-ahma --mode http --http-port 3000
+ahma serve http --port 3000
 
 # List all tools from a server
-ahma --list-tools -- ./target/debug/ahma --tools-dir .ahma
-ahma --list-tools --http http://localhost:3000 --format json
+ahma tool list -- ./target/debug/ahma --tools-dir .ahma
+ahma tool list --http http://localhost:3000 --format json
 ```
 
 ---
