@@ -25,8 +25,9 @@ const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 /// This simulates a broken client that sends initialize but never opens SSE.
 #[tokio::test]
 async fn test_tools_call_without_sse_returns_handshake_timeout() {
-    // Use 2 second timeout via CLI argument (not env var) for test isolation
-    let server = spawn_test_server_with_timeout(Some(2))
+    // Use 0 second timeout via CLI argument (not env var) for test isolation
+    // This makes it timeout immediately, avoiding race conditions with the 5s sweeper.
+    let server = spawn_test_server_with_timeout(Some(0))
         .await
         .expect("Failed to spawn test server");
     let client = common::make_h2_client();
@@ -64,8 +65,7 @@ async fn test_tools_call_without_sse_returns_handshake_timeout() {
 
     // Intentionally skip: SSE connection, initialized notification, roots/list response
 
-    // Wait for handshake timeout (2s timeout + 1.5s margin for CI)
-    tokio::time::sleep(TestTimeouts::scale_millis(3500)).await;
+    // Timeout is 0s, so it should timeout immediately on the next request.
 
     // Try to call a tool - should get handshake timeout error
     let tool_call = json!({
@@ -125,8 +125,9 @@ async fn test_tools_call_without_sse_returns_handshake_timeout() {
 /// This simulates a client that opens SSE but forgets to send initialized.
 #[tokio::test]
 async fn test_tools_call_without_initialized_notification_returns_timeout() {
-    // Use 2 second timeout via CLI argument (not env var) for test isolation
-    let server = spawn_test_server_with_timeout(Some(2))
+    // Use 0 second timeout via CLI argument (not env var) for test isolation
+    // This makes it timeout immediately, avoiding race conditions with the 5s sweeper.
+    let server = spawn_test_server_with_timeout(Some(0))
         .await
         .expect("Failed to spawn test server");
     let client = common::make_h2_client();
@@ -171,8 +172,7 @@ async fn test_tools_call_without_initialized_notification_returns_timeout() {
 
     // Intentionally skip: initialized notification, roots/list response
 
-    // Wait for handshake timeout (2s timeout + 1.5s margin for CI)
-    tokio::time::sleep(TestTimeouts::scale_millis(3500)).await;
+    // Timeout is 0s, so it should timeout immediately on the next request.
 
     // Try to call a tool
     let tool_call = json!({
@@ -363,8 +363,8 @@ async fn test_tools_call_during_handshake_returns_conflict() {
 #[tokio::test]
 async fn test_handshake_timeout_is_per_server_via_cli() {
     // Spawn two servers with different timeouts
-    // Server 1: 2 second timeout
-    let server1 = spawn_test_server_with_timeout(Some(2))
+    // Server 1: 0 second timeout (times out immediately, avoiding sweeper race)
+    let server1 = spawn_test_server_with_timeout(Some(0))
         .await
         .expect("Failed to spawn server 1");
 
@@ -437,8 +437,7 @@ async fn test_handshake_timeout_is_per_server_via_cli() {
         .expect("Should have session ID")
         .to_string();
 
-    // Wait for server1's timeout to expire (2s + margin)
-    tokio::time::sleep(TestTimeouts::scale_millis(3500)).await;
+    // Server1 timeout is 0s, so it should timeout immediately on the next request.
 
     // Server1 should return 504 (timeout)
     let tool_call = json!({

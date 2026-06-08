@@ -5,6 +5,7 @@
 //! - A wiremock server standing in for the LLM endpoint.
 //! - A `MockCallbackSender` that captures `ProgressUpdate::LogAlert` notifications.
 
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -125,7 +126,7 @@ async fn test_livelog_pipeline_clean_response_no_alert() {
     let callback = MockCallback::new();
     let token = CancellationToken::new();
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(30),
+        TestTimeouts::get(TimeoutCategory::ToolCall),
     )));
 
     run_livelog_pipeline(
@@ -182,7 +183,7 @@ async fn test_livelog_pipeline_issue_detected_sends_alert() {
     let callback = MockCallback::new();
     let token = CancellationToken::new();
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(30),
+        TestTimeouts::get(TimeoutCategory::ToolCall),
     )));
 
     run_livelog_pipeline(
@@ -257,7 +258,7 @@ async fn test_livelog_pipeline_cooldown_suppresses_second_alert() {
     let callback = MockCallback::new();
     let token = CancellationToken::new();
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(30),
+        TestTimeouts::get(TimeoutCategory::ToolCall),
     )));
 
     run_livelog_pipeline(
@@ -312,13 +313,13 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
     let callback = MockCallback::new();
     let token = CancellationToken::new();
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(30),
+        TestTimeouts::get(TimeoutCategory::ToolCall),
     )));
 
     // Cancel after a short delay so the pipeline can actually start.
     let token_clone = token.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(TestTimeouts::poll_interval()).await;
         token_clone.cancel();
     });
 
@@ -381,7 +382,7 @@ async fn test_livelog_pipeline_llm_http_500_graceful() {
     let callback = MockCallback::new();
     let token = CancellationToken::new();
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(30),
+        TestTimeouts::get(TimeoutCategory::ToolCall),
     )));
 
     // Pipeline should complete without panic/hang despite LLM 500.
@@ -436,7 +437,7 @@ async fn test_livelog_pipeline_llm_malformed_json_graceful() {
     let callback = MockCallback::new();
     let token = CancellationToken::new();
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(30),
+        TestTimeouts::get(TimeoutCategory::ToolCall),
     )));
 
     run_livelog_pipeline(
@@ -492,7 +493,7 @@ async fn test_livelog_pipeline_zero_cooldown_fires_all_alerts() {
     let callback = MockCallback::new();
     let token = CancellationToken::new();
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(30),
+        TestTimeouts::get(TimeoutCategory::ToolCall),
     )));
 
     run_livelog_pipeline(
@@ -544,7 +545,7 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
     let callback = MockCallback::new();
     let token = CancellationToken::new();
     let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        Duration::from_secs(30),
+        TestTimeouts::get(TimeoutCategory::ToolCall),
     )));
 
     // Should complete without panicking.

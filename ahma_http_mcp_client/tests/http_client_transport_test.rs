@@ -7,6 +7,7 @@
 // and test isolation is handled via unique temp files per test.
 #![allow(clippy::await_holding_lock)]
 
+use ahma_common::timeouts::TestTimeouts;
 use std::env;
 use std::sync::{Mutex as StdMutex, OnceLock};
 use tempfile::tempdir;
@@ -866,11 +867,10 @@ mod transport_lifecycle {
         transport.send(request).await.unwrap();
 
         // Now receive should get the message
-        let message =
-            tokio::time::timeout(std::time::Duration::from_millis(100), transport.receive())
-                .await
-                .expect("Should not timeout")
-                .expect("Should receive message");
+        let message = tokio::time::timeout(TestTimeouts::scale_millis(100), transport.receive())
+            .await
+            .expect("Should not timeout")
+            .expect("Should receive message");
 
         // Verify the message content
         let msg_str = serde_json::to_string(&message).unwrap();

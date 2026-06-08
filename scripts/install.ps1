@@ -9,8 +9,8 @@
 #   - Internet access to GitHub releases
 #
 # Version indicator for build script check:
-# -Version '0.11.9'
-# Install-OneSkill -Version '0.11.9'
+# -Version '0.11.10'
+# Install-OneSkill -Version '0.11.10'
 #
 # Environment variables:
 #   AHMA_INSTALL_DIR     - Override install directory (default: $HOME\.local\bin)

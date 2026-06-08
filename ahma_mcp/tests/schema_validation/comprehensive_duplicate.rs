@@ -6,9 +6,9 @@
 //! inserted by `load_tool_configs()` must be filtered out by the
 //! `HARDCODED_TOOLS` guard in `list_tools()`.
 
+use ahma_common::timeouts::TestTimeouts;
 use ahma_mcp::test_utils::client::ClientBuilder;
 use std::collections::HashSet;
-use std::time::Duration;
 use tempfile::TempDir;
 
 /// Verify that `tools/list` response contains no duplicate tool names,
@@ -41,7 +41,7 @@ async fn test_tools_list_no_duplicate_names() -> anyhow::Result<()> {
     }
 
     let service = ClientBuilder::new().working_dir(cwd).build().await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(TestTimeouts::short_delay()).await;
 
     let tools_result = service.list_tools(None).await?;
     let tools = tools_result.tools;

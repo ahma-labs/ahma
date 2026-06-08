@@ -73,6 +73,7 @@ async fn test_proxy_client_autostart_and_shutdown() {
             healthy = true;
             break;
         }
+        #[cfg(unix)]
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 

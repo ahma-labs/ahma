@@ -16,6 +16,7 @@
 
 mod common;
 
+use ahma_common::timeouts::TestTimeouts;
 use common::{McpTestClient, TransportMode, spawn_server_guard_with_config};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -105,7 +106,10 @@ async fn run_per_client_tools_dir_discovery(transport: TransportMode) {
     // client doesn't subscribe — a short poll loop is the simplest robust path.
     let mut found = false;
     let mut last_names: Vec<String> = Vec::new();
-    for _ in 0..40 {
+    let poll_interval = TestTimeouts::poll_interval();
+    let max_attempts =
+        (TestTimeouts::scale_secs(4).as_millis() / poll_interval.as_millis()).max(1) as usize;
+    for _ in 0..max_attempts {
         match mcp.list_tools().await {
             Ok(tools) => {
                 last_names = tool_names(&tools);
@@ -118,7 +122,7 @@ async fn run_per_client_tools_dir_discovery(transport: TransportMode) {
                 eprintln!("list_tools error (will retry): {e}");
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(poll_interval).await;
     }
 
     assert!(

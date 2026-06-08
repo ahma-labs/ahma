@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_bin"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_cluster",
  "ahma_common",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_cluster"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_common",
  "ahma_decompose",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_common"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "anyhow",
  "dirs",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_core"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_common",
  "ahma_llm_monitor",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_decompose"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_common",
  "ahma_llm_monitor",
@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_harness_tools"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "anyhow",
  "glob",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_http_bridge"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_common",
  "ahma_mcp",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_http_mcp_client"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_common",
  "anyhow",
@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_llm_monitor"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_common",
  "bytes",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_mcp"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_common",
  "ahma_harness_tools",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_renewal"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_vault",
  "anyhow",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_task_tree"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_common",
  "ahma_llm_monitor",
@@ -346,11 +346,11 @@ dependencies = [
 
 [[package]]
 name = "ahma_test_support"
-version = "0.11.9"
+version = "0.11.10"
 
 [[package]]
 name = "ahma_tui"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_common",
  "ahma_http_bridge",
@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_vault"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "anyhow",
  "chrono",
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "ahma_worker"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_vault",
  "anyhow",
@@ -754,7 +754,7 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "generate_tool_schema"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "ahma_mcp",
  "schemars 1.2.1",
@@ -2812,15 +2812,6 @@ name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]
@@ -7747,7 +7738,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.11.9"
+version = "0.11.10"
 dependencies = [
  "chrono",
  "regex",

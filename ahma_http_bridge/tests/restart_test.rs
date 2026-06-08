@@ -2,6 +2,7 @@
 
 mod common;
 
+use ahma_common::timeouts::TestTimeouts;
 use common::spawn_test_server;
 use serde_json::Value;
 
@@ -47,8 +48,9 @@ async fn test_health_check_version_and_restart() {
     // 3. Wait/poll to verify server process exited
     let start = std::time::Instant::now();
     let mut exited = false;
-    while start.elapsed() < std::time::Duration::from_secs(5) {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let poll_interval = TestTimeouts::poll_interval();
+    while start.elapsed() < TestTimeouts::scale_secs(5) {
+        tokio::time::sleep(poll_interval).await;
         if client
             .get(format!("{}/health", server.base_url()))
             .send()

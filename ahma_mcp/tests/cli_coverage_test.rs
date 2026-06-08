@@ -1,7 +1,9 @@
 use ahma_mcp::config::{SubcommandConfig, ToolConfig};
+#[cfg(unix)]
 use ahma_mcp::shell::cli::Cli;
 use ahma_mcp::shell::resolution::{normalize_tools_dir, resolve_cli_subcommand};
 
+#[cfg(unix)]
 use clap::Parser;
 
 use std::fs;

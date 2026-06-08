@@ -9,8 +9,8 @@
 //! - R1.2.2: Explicit --tools-dir takes precedence over auto-detection
 //! - Built-in tools (await, status, run_terminal_command) always available
 
+use ahma_common::timeouts::TestTimeouts;
 use ahma_mcp::test_utils::client::ClientBuilder;
-use std::time::Duration;
 use tempfile::TempDir;
 
 /// Helper to create a tool config JSON
@@ -62,7 +62,7 @@ async fn test_auto_detect_ahma_in_cwd() -> anyhow::Result<()> {
     let service = ClientBuilder::new().working_dir(cwd).build().await?;
 
     // Give server a moment to initialize
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(TestTimeouts::short_delay()).await;
 
     // List tools
     let tools_result = service.list_tools(None).await?;
@@ -125,7 +125,7 @@ async fn test_explicit_tools_dir_takes_precedence() -> anyhow::Result<()> {
         .build()
         .await?;
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(TestTimeouts::short_delay()).await;
 
     // List tools
     let tools_result = service.list_tools(None).await?;
@@ -172,7 +172,7 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     // Start server with CWD set and no --tools-dir
     let service = ClientBuilder::new().working_dir(cwd).build().await?;
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(TestTimeouts::short_delay()).await;
 
     // List tools
     let tools_result = service.list_tools(None).await?;
@@ -263,7 +263,7 @@ async fn test_run_terminal_command_builtin_without_json_file() -> anyhow::Result
 
     // Start server
     let service = ClientBuilder::new().working_dir(cwd).build().await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(TestTimeouts::short_delay()).await;
 
     // List tools
     let tools_result = service.list_tools(None).await?;

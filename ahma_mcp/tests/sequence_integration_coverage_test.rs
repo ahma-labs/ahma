@@ -8,6 +8,7 @@
 //!
 //! These tests spawn the actual ahma_mcp binary and use real tool configs.
 
+use ahma_common::timeouts::TestTimeouts;
 use ahma_mcp::test_utils::concurrency::wait_for_condition;
 use ahma_mcp::test_utils::in_process::create_in_process_mcp_from_dir;
 use ahma_mcp::utils::logging::init_test_logging;
@@ -267,8 +268,8 @@ async fn test_async_sequence_tool_execution() -> Result<()> {
 
     // Wait for operations to complete
     let _ = wait_for_condition(
-        std::time::Duration::from_secs(5),
-        std::time::Duration::from_millis(50),
+        TestTimeouts::scale_secs(5),
+        TestTimeouts::poll_interval(),
         || {
             let client = mcp.client.clone();
             async move {
