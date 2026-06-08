@@ -143,7 +143,7 @@ async fn handle_initialize_error(
 
 /// Handles initialization requests by creating a new session.
 #[tracing::instrument(skip_all, fields(session_id))]
-async fn handle_initialize(session_manager: &SessionManager, payload: &Value) -> Response {
+async fn handle_initialize(session_manager: &Arc<SessionManager>, payload: &Value) -> Response {
     debug!("Processing initialize request (no session ID)");
 
     if let Some(err_response) = validate_initialize_payload(payload) {
@@ -828,7 +828,7 @@ pub async fn handle_session_isolated_request_sse(
 }
 
 /// Handle initialize with SSE response.
-async fn handle_initialize_sse(session_manager: &SessionManager, payload: &Value) -> Response {
+async fn handle_initialize_sse(session_manager: &Arc<SessionManager>, payload: &Value) -> Response {
     if let Some(err_response) = validate_initialize_payload(payload) {
         return err_response;
     }

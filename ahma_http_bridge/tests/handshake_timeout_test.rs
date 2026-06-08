@@ -464,7 +464,7 @@ async fn test_handshake_timeout_is_per_server_via_cli() {
     assert_eq!(
         resp1_tool.status().as_u16(),
         504,
-        "Server1 should timeout (504)"
+        "Server1 should timeout and be reaped (504)"
     );
 
     // Server2 should still return 409 (still in handshake, not timed out)

@@ -11,9 +11,10 @@
 use ahma_http_bridge::DEFAULT_HANDSHAKE_TIMEOUT_SECS;
 use ahma_http_bridge::session::{McpRoot, SessionManager, SessionManagerConfig};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Helper to create a SessionManager with test configuration
-fn create_test_session_manager(default_scope: Option<PathBuf>) -> SessionManager {
+fn create_test_session_manager(default_scope: Option<PathBuf>) -> Arc<SessionManager> {
     let config = SessionManagerConfig {
         server_command: "echo".to_string(), // Use echo as a safe subprocess
         server_args: vec!["test".to_string()],
@@ -22,7 +23,7 @@ fn create_test_session_manager(default_scope: Option<PathBuf>) -> SessionManager
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         max_sessions: 100,
     };
-    SessionManager::new(config)
+    Arc::new(SessionManager::new(config))
 }
 
 /// Convert a `Path` to a `file://` URI that is valid on both Unix and Windows.
