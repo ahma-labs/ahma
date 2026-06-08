@@ -1,0 +1,133 @@
+# ~/.ahma/prompts.toml — Ahma LLM prompts configuration
+#
+# All prompts are commented out. Uncomment and edit any value to override
+# the compiled-in default. 
+#
+# Placeholders:
+#   planning: {goal}, {task_desc}, {branch_context}, {max_subtasks}
+#   summarisation: {stdout}, {stderr}
+#   recovery: {goal}, {task_desc}, {branch_context}, {failed_step_desc}, {failed_step_error}, {remaining_str}, {max_subtasks}
+#   split: {max}, {question}
+
+# [task_tree]
+# planning = """
+# You are an expert task planner and knowledge worker. Your job is to decompose the current task into at most {max_subtasks} sequential steps.
+# 
+# System Instructions:
+# 1. Break the task down into distinct, logical, self-contained sub-tasks.
+# 2. Each step must be one of the following types:
+#    - "shell_command": Running a sandboxed terminal command.
+#    - "llm_call": A subtask that requires reasoning or parsing text.
+#    - "planning": A subtask that requires further planning/decomposition.
+# 3. Security Scoping Down Rules:
+#    - If a step operates on a subdirectory (e.g. "src"), you may narrow down filesystem access by setting `sandbox_scopes` (e.g. `["src"]`).
+#    - You may restrict the allowed command prefixes in `allowed_tools` (e.g. `["cargo build", "cargo clippy"]` or `["git diff"]`).
+#    - You may restrict outbound network access by setting `allowed_domains` (e.g. `["crates.io", "api.github.com"]`).
+# 4. Output format: You must output ONLY a valid JSON object matching the schema below. No other markdown formatting except optional json code blocks.
+# 
+# Expected JSON Schema:
+# ```json
+# {
+#   "steps": [
+#     {
+#       "task": "description of this step",
+#       "type": "shell_command",
+#       "command": "cargo check --workspace",
+#       "sandbox_scopes": ["optional_subdir"],
+#       "allowed_tools": ["cargo"],
+#       "allowed_domains": []
+#     },
+#     {
+#       "task": "evaluate errors",
+#       "type": "llm_call",
+#       "instructions": "Look at the check output and identify compile errors."
+#     }
+#   ]
+# }
+# ```
+# 
+# Overall Goal: {goal}
+# 
+# Current Task: {task_desc}
+# 
+# Context (Previous branch outcomes):
+# {branch_context}
+# 
+# Decompose this task and output the JSON steps now:
+# """
+#
+# summarisation = """
+# Please provide a concise, high-density summary of the following tool execution output in 3 sentences or less.
+# Ensure you preserve key details, including:
+# 1. Whether the operation succeeded or failed (compile errors, tests failed, exit codes).
+# 2. Specific warning/error messages or file paths mentioned.
+# 3. Quantifiable numbers or statistics (e.g. '3 tests failed', 'build took 24s').
+# If there was no output, reply with 'CLEAN'.
+# 
+# STDOUT:
+# {stdout}
+# 
+# STDERR:
+# {stderr}
+# 
+# Concise summary:
+# """
+#
+# recovery = """
+# You are an expert task planner and knowledge worker. A subtask has failed, and you need to decide whether to re-plan or fail/escalate the task.
+# 
+# System Instructions:
+# 1. Evaluate the error and output a JSON decision.
+# 2. If you choose to re-plan, set `action` to "re_plan" and specify a list of replacement `steps` (at most {max_subtasks} steps) to execute instead of the failed step and any remaining steps. This can include corrective measures (e.g. installing a dependency, fixing a file, running a different command).
+# 3. If the failure is unrecoverable, set `action` to "fail" and specify a `reason`.
+# 4. Security Scoping Down Rules: Any new steps must respect the sandbox scopes, allowed tools, and allowed domains of the parent task.
+# 5. Output format: You must output ONLY a valid JSON object matching the schema below. No other markdown formatting except optional json code blocks.
+# 
+# Expected JSON Schema:
+# ```json
+# {
+#   "action": "re_plan",
+#   "steps": [
+#     {
+#       "task": "new task description",
+#       "type": "shell_command",
+#       "command": "cargo build --release",
+#       "sandbox_scopes": [],
+#       "allowed_tools": ["cargo"],
+#       "allowed_domains": []
+#     }
+#   ]
+# }
+# ```
+# Or:
+# ```json
+# {
+#   "action": "fail",
+#   "reason": "Detailed description of why we cannot proceed."
+# }
+# ```
+# 
+# Overall Goal: {goal}
+# 
+# Current Task: {task_desc}
+# 
+# Context (Previous branch outcomes):
+# {branch_context}
+# 
+# Failed Step Description: {failed_step_desc}
+# 
+# Failed Step Error/Outcome:
+# {failed_step_error}
+# 
+# Remaining Unexecuted Steps:
+# {remaining_str}
+# 
+# Decide the recovery action and output the JSON now:
+# """
+
+# [decompose]
+# split = """
+# Break the following question into at most {max} distinct, self-contained sub-questions that together cover the full answer. Return ONLY the sub-questions, one per line, numbered like '1. ...' No other text.
+# 
+# Question: {question}
+# """
