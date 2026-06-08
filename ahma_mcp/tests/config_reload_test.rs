@@ -1,4 +1,4 @@
-use ahma_common::timeouts::TestTimeouts;
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::test_utils::client::ClientBuilder;
 use ahma_mcp::test_utils::concurrency::wait_for_condition;
 use anyhow::Result;
@@ -18,7 +18,11 @@ async fn test_config_reload_stays_off_by_default() -> Result<()> {
 
     let client = ClientBuilder::new().tools_dir(&tools_dir).build().await?;
 
-    let tools = client.list_tools(None).await?;
+    let tools = tokio::time::timeout(
+        TestTimeouts::get(TimeoutCategory::ToolCall),
+        client.list_tools(None),
+    )
+    .await??;
     assert!(tools.tools.iter().any(|t| t.name == "initial_tool"));
     assert!(!tools.tools.iter().any(|t| t.name == "new_tool"));
 
@@ -33,7 +37,11 @@ async fn test_config_reload_stays_off_by_default() -> Result<()> {
 
     tokio::time::sleep(TestTimeouts::scale_millis(750)).await;
 
-    let tools = client.list_tools(None).await?;
+    let tools = tokio::time::timeout(
+        TestTimeouts::get(TimeoutCategory::ToolCall),
+        client.list_tools(None),
+    )
+    .await??;
     assert!(
         !tools.tools.iter().any(|t| t.name == "new_tool"),
         "New tool should not appear without --hot-reload-tools"
@@ -68,7 +76,11 @@ async fn test_config_reload_when_hot_reload_enabled() -> Result<()> {
         .build()
         .await?;
 
-    let tools = client.list_tools(None).await?;
+    let tools = tokio::time::timeout(
+        TestTimeouts::get(TimeoutCategory::ToolCall),
+        client.list_tools(None),
+    )
+    .await??;
     assert!(tools.tools.iter().any(|t| t.name == "initial_tool"));
     assert!(!tools.tools.iter().any(|t| t.name == "new_tool"));
 
@@ -79,12 +91,15 @@ async fn test_config_reload_when_hot_reload_enabled() -> Result<()> {
     let new_tool_seen = wait_for_condition(reload_timeout(), TestTimeouts::poll_interval(), || {
         let client = &client;
         async move {
-            client
-                .list_tools(None)
-                .await
-                .ok()
-                .map(|tools| tools.tools.iter().any(|t| t.name == "new_tool"))
-                .unwrap_or(false)
+            let tools_res = tokio::time::timeout(
+                TestTimeouts::get(TimeoutCategory::ToolCall),
+                client.list_tools(None),
+            )
+            .await;
+            match tools_res {
+                Ok(Ok(tools)) => tools.tools.iter().any(|t| t.name == "new_tool"),
+                _ => false,
+            }
         }
     })
     .await;
@@ -98,18 +113,20 @@ async fn test_config_reload_when_hot_reload_enabled() -> Result<()> {
     let modified_seen = wait_for_condition(reload_timeout(), TestTimeouts::poll_interval(), || {
         let client = &client;
         async move {
-            client
-                .list_tools(None)
-                .await
-                .ok()
-                .and_then(|tools| {
-                    tools
-                        .tools
-                        .iter()
-                        .find(|t| t.name == "initial_tool")
-                        .map(|t| t.description == Some("Modified initial tool".into()))
-                })
-                .unwrap_or(false)
+            let tools_res = tokio::time::timeout(
+                TestTimeouts::get(TimeoutCategory::ToolCall),
+                client.list_tools(None),
+            )
+            .await;
+            match tools_res {
+                Ok(Ok(tools)) => tools
+                    .tools
+                    .iter()
+                    .find(|t| t.name == "initial_tool")
+                    .map(|t| t.description == Some("Modified initial tool".into()))
+                    .unwrap_or(false),
+                _ => false,
+            }
         }
     })
     .await;
@@ -123,12 +140,15 @@ async fn test_config_reload_when_hot_reload_enabled() -> Result<()> {
     let removed_seen = wait_for_condition(reload_timeout(), TestTimeouts::poll_interval(), || {
         let client = &client;
         async move {
-            client
-                .list_tools(None)
-                .await
-                .ok()
-                .map(|tools| !tools.tools.iter().any(|t| t.name == "new_tool"))
-                .unwrap_or(false)
+            let tools_res = tokio::time::timeout(
+                TestTimeouts::get(TimeoutCategory::ToolCall),
+                client.list_tools(None),
+            )
+            .await;
+            match tools_res {
+                Ok(Ok(tools)) => !tools.tools.iter().any(|t| t.name == "new_tool"),
+                _ => false,
+            }
         }
     })
     .await;
