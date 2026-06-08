@@ -427,7 +427,7 @@ fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
     }
 
     for bundle in &config.tool_bundles {
-        server_args.push("--tool".to_string());
+        server_args.push("--tools".to_string());
         server_args.push(bundle.clone());
     }
 
@@ -450,7 +450,7 @@ fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
         server_args.push("--sync".to_string());
     }
     if config.hot_reload_tools {
-        server_args.push("--hot-reload-tools".to_string());
+        server_args.push("--hot-reload".to_string());
     }
     if config.defer_sandbox {
         server_args.push("--defer-sandbox".to_string());
@@ -587,7 +587,8 @@ async fn spawn_background_bridge(
 pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
     let is_test = std::env::var("NEXTEST").is_ok()
         || std::env::var("CARGO_MANIFEST_DIR").is_ok()
-        || std::env::var("AHMA_SERVER_CHILD").is_ok();
+        || std::env::var("AHMA_SERVER_CHILD").is_ok()
+        || config.is_server_child;
 
     let socket_path = if let Ok(path) = std::env::var("AHMA_UNIX_SOCKET") {
         path
