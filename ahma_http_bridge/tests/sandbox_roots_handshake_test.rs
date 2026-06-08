@@ -54,7 +54,7 @@ fn parse_bound_port_line(line: &str) -> Option<u16> {
 
 /// Build and get the ahma_mcp binary path
 fn get_ahma_mcp_binary() -> PathBuf {
-    ahma_mcp::test_utils::cli::build_binary_cached("ahma_mcp", "ahma")
+    ahma_mcp::test_utils::cli::build_binary_cached("ahma_bin", "ahma")
 }
 
 /// Build the server Command with all required env vars for deferred-sandbox mode.
@@ -64,20 +64,22 @@ fn build_deferred_sandbox_command(
     tools_dir: &std::path::Path,
 ) -> Command {
     let mut cmd = Command::new(binary);
-    cmd.args(["serve", "http", "--port", "0"])
-        .current_dir(workspace)
-        .env("AHMA_SYNC", "1")
-        .env("AHMA_TOOLS_DIR", &*tools_dir.to_string_lossy())
-        .env("AHMA_SANDBOX_DEFER", "1") // Key: sandbox is deferred until roots/list
-        .env("AHMA_LOG_TARGET", "stderr")
-        // Match the server-side handshake timeout to the client-side TestTimeouts::Handshake
-        // so both sides give up at the same time (60s on Linux/macOS, 240s on Windows).
-        .env(
-            "AHMA_HANDSHAKE_TIMEOUT",
-            TestTimeouts::get(TimeoutCategory::Handshake)
-                .as_secs()
-                .to_string(),
-        );
+    cmd.args([
+        "--sync",
+        "--tools-dir",
+        &*tools_dir.to_string_lossy(),
+        "--defer-sandbox",
+        "--log-to-stderr",
+        "--handshake-timeout",
+        &TestTimeouts::get(TimeoutCategory::Handshake)
+            .as_secs()
+            .to_string(),
+        "serve",
+        "http",
+        "--port",
+        "0",
+    ])
+    .current_dir(workspace);
     // CRITICAL: Remove bypass env vars for real sandbox testing
     SandboxTestEnv::configure(&mut cmd);
     // Allow start inside nested sandboxes (app-level path security still active)

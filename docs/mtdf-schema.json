@@ -140,7 +140,7 @@
       "description": "Worker synthesis configuration (opaque — parsed by `ahma_worker` crate).\nRequired when `tool_type` is `worker`; stored as raw JSON for GPL-crate consumption."
     }
   },
-  "additionalProperties": false,
+  "additionalProperties": true,
   "required": [
     "name",
     "description",
@@ -519,7 +519,7 @@
           "minimum": 0
         }
       },
-      "additionalProperties": false,
+      "additionalProperties": true,
       "required": [
         "name",
         "description"

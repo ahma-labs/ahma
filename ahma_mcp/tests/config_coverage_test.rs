@@ -753,29 +753,35 @@ async fn test_load_mcp_config_invalid_json() {
 // ============================================================================
 
 #[test]
-fn test_tool_config_unknown_field_fails() {
+fn test_tool_config_unknown_field_captured_in_extra() {
     let json = json!({
         "name": "test",
         "description": "Test",
         "command": "test",
-        "unknown_field": "should fail"
+        "unknown_field": "should be captured"
     });
 
-    let result: Result<ToolConfig, _> = serde_json::from_value(json);
-    assert!(result.is_err());
+    let result: ToolConfig = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        result.extra.get("unknown_field").and_then(|v| v.as_str()),
+        Some("should be captured")
+    );
 }
 
 #[test]
-fn test_subcommand_config_unknown_field_fails() {
+fn test_subcommand_config_unknown_field_captured_in_extra() {
     let json = json!({
         "name": "test",
         "description": "Test",
         "enabled": true,
-        "extra_field": "should fail"
+        "extra_field": "should be captured"
     });
 
-    let result: Result<SubcommandConfig, _> = serde_json::from_value(json);
-    assert!(result.is_err());
+    let result: SubcommandConfig = serde_json::from_value(json).unwrap();
+    assert_eq!(
+        result.extra.get("extra_field").and_then(|v| v.as_str()),
+        Some("should be captured")
+    );
 }
 
 #[test]

@@ -426,6 +426,12 @@ pub struct ToolSettings {
     /// are guaranteed to be available.
     /// Default: `false`
     pub skip_probes: bool,
+    /// Path to the tools directory containing JSON tool definitions.
+    /// Default: `None`
+    pub tools_dir: Option<PathBuf>,
+    /// Tool bundles to enable.
+    /// Default: empty list
+    pub tool_bundles: Vec<String>,
 }
 
 impl Default for ToolSettings {
@@ -435,6 +441,8 @@ impl Default for ToolSettings {
             force_sync: false,
             hot_reload: false,
             skip_probes: false,
+            tools_dir: None,
+            tool_bundles: Vec::new(),
         }
     }
 }
@@ -460,6 +468,15 @@ pub struct SandboxSettings {
     /// Use when the client supplies workspace roots at connection time.
     /// Default: `false`
     pub defer: bool,
+    /// Run this server session inside an existing task vault.
+    /// Default: `None`
+    pub task_vault: Option<PathBuf>,
+    /// Paths allowed for read/write access under the sandbox.
+    /// Default: empty list
+    pub scopes: Vec<PathBuf>,
+    /// Directories containing allowed working directories.
+    /// Default: empty list
+    pub working_dirs: Vec<PathBuf>,
 }
 
 /// Logging and log-monitoring settings.
@@ -508,6 +525,9 @@ pub struct HttpSettings {
     /// Require HTTP/2 or better; reject HTTP/1.1 connections.
     /// Default: `false`
     pub disable_http1_1: bool,
+    /// Path to the Unix domain socket.
+    /// Default: `None`
+    pub unix_socket_path: Option<String>,
 }
 
 impl Default for HttpSettings {
@@ -516,6 +536,7 @@ impl Default for HttpSettings {
             handshake_timeout_secs: 45,
             disable_quic: false,
             disable_http1_1: false,
+            unix_socket_path: None,
         }
     }
 }
@@ -535,6 +556,9 @@ pub struct AuthSettings {
     /// Burst allowance for the rate limiter.
     /// Default: `10`
     pub rate_limit_burst: u32,
+    /// Required bearer token specified directly in config.
+    /// Default: `None`
+    pub require_token: Option<String>,
 }
 
 impl Default for AuthSettings {
@@ -543,6 +567,7 @@ impl Default for AuthSettings {
             require_token_path: String::new(),
             rate_limit_rps: 0,
             rate_limit_burst: 10,
+            require_token: None,
         }
     }
 }
@@ -699,6 +724,8 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # force_sync   = false    # run all tools synchronously instead of async-first
 # hot_reload   = false    # reload tools from disk on change — INSECURE in production
 # skip_probes  = false    # skip availability probes at startup
+# tools_dir    = ".ahma"  # path to tools directory containing JSON tool definitions
+# tool_bundles = []       # tool bundles to enable (e.g. ["rust", "git"])
 
 # ── Sandbox & filesystem security ────────────────────────────────────────────
 # [sandbox]
@@ -706,6 +733,9 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # tmp_access   = false    # add system temp dir to sandbox scope
 # disable_temp = false    # block all access to system temp dir (overrides tmp_access)
 # defer        = false    # defer sandbox lock until client provides roots/list
+# task_vault   = ""       # run this server session inside an existing task vault
+# scopes       = []       # paths allowed for read/write access under the sandbox
+# working_dirs = []       # directories containing allowed working directories
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # [logging]
@@ -719,9 +749,11 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # handshake_timeout_secs = 45      # MCP handshake timeout
 # disable_quic           = false   # disable HTTP/3 QUIC; fall back to HTTP/2 TCP
 # disable_http1_1        = false   # reject HTTP/1.1; require HTTP/2+
+# unix_socket_path      = ""      # path to the unix domain socket
 
 # ── HTTP authentication & rate limiting ──────────────────────────────────────
 # [auth]
+# require_token      = ""   # required bearer token specified directly in config
 # require_token_path = ""   # path to file containing required bearer token
 # rate_limit_rps     = 0    # max requests/second (0 = no limit)
 # rate_limit_burst   = 10   # burst allowance

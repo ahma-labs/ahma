@@ -845,98 +845,81 @@ mod tests {
 
     #[tokio::test]
     async fn test_agent_task_tool_call_loop() {
-        let llm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let llm_addr = llm_listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            if let Ok((mut socket, _)) = llm_listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
-                let response = serde_json::json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [{
-                                "id": "call_123",
-                                "type": "function",
-                                "function": {
-                                    "name": "test_tool",
-                                    "arguments": "{\"arg\":\"value\"}"
+        let llm_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let llm_router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move || {
+                let counter = llm_counter.clone();
+                async move {
+                    let count = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if count == 0 {
+                        axum::Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "",
+                                    "tool_calls": [{
+                                        "id": "call_123",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "test_tool",
+                                            "arguments": "{\"arg\":\"value\"}"
+                                        }
+                                    }]
                                 }
                             }]
-                        }
-                    }]
-                });
-                let resp_str = serde_json::to_string(&response).unwrap();
-                let http_resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-                    resp_str.len(),
-                    resp_str
-                );
-                let _ =
-                    tokio::io::AsyncWriteExt::write_all(&mut socket, http_resp.as_bytes()).await;
-            }
+                        }))
+                    } else {
+                        axum::Json(serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Tool call was successful.",
+                                }
+                            }]
+                        }))
+                    }
+                }
+            }),
+        );
 
-            if let Ok((mut socket, _)) = llm_listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
-                let response = serde_json::json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "Tool call was successful.",
-                        }
-                    }]
-                });
-                let resp_str = serde_json::to_string(&response).unwrap();
-                let http_resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-                    resp_str.len(),
-                    resp_str
-                );
-                let _ =
-                    tokio::io::AsyncWriteExt::write_all(&mut socket, http_resp.as_bytes()).await;
-            }
+        let llm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llm_addr = llm_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(llm_listener, llm_router).await.unwrap();
         });
+
+        let mcp_router = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(
+                |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    use axum::response::IntoResponse;
+                    let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    match method {
+                        "initialize" => {
+                            let mut headers = axum::http::HeaderMap::new();
+                            headers.insert(
+                                "mcp-session-id",
+                                axum::http::HeaderValue::from_static("test-session-123"),
+                            );
+                            (headers, axum::Json(serde_json::json!({}))).into_response()
+                        }
+                        "tools/call" => axum::Json(serde_json::json!({
+                            "result": {
+                                "content": [{"type": "text", "text": "Tool executed"}]
+                            }
+                        }))
+                        .into_response(),
+                        _ => axum::http::StatusCode::OK.into_response(),
+                    }
+                },
+            ),
+        );
 
         let mcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mcp_addr = mcp_listener.local_addr().unwrap();
-
         tokio::spawn(async move {
-            if let Ok((mut socket, _)) = mcp_listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
-                let http_resp = "HTTP/1.1 200 OK\r\nmcp-session-id: test-session-123\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{}";
-                let _ =
-                    tokio::io::AsyncWriteExt::write_all(&mut socket, http_resp.as_bytes()).await;
-            }
-
-            if let Ok((mut socket, _)) = mcp_listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
-                let http_resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-                let _ =
-                    tokio::io::AsyncWriteExt::write_all(&mut socket, http_resp.as_bytes()).await;
-            }
-
-            if let Ok((mut socket, _)) = mcp_listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
-                let response = serde_json::json!({
-                    "result": {
-                        "content": [{"type": "text", "text": "Tool executed"}]
-                    }
-                });
-                let resp_str = serde_json::to_string(&response).unwrap();
-                let http_resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
-                    resp_str.len(),
-                    resp_str
-                );
-                let _ =
-                    tokio::io::AsyncWriteExt::write_all(&mut socket, http_resp.as_bytes()).await;
-            }
+            axum::serve(mcp_listener, mcp_router).await.unwrap();
         });
 
         let client = LlmClient::new(format!("http://{}", llm_addr), "test-model", None);

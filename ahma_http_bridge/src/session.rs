@@ -471,6 +471,8 @@ pub struct SessionManagerConfig {
     /// within this time, tool calls will return a timeout error.
     /// Defaults to 45 seconds if not specified.
     pub handshake_timeout_secs: u64,
+    /// Maximum concurrent sessions allowed.
+    pub max_sessions: usize,
 }
 
 /// Manages the lifecycle of concurrent MCP sessions.
@@ -698,6 +700,14 @@ impl SessionManager {
     /// * `Ok(String)`: The new session ID (UUID v4). This ID must be included in the `Mcp-Session-Id` header for all subsequent requests.
     /// * `Err(BridgeError)`: If the subprocess could not be spawned.
     pub async fn create_session(&self) -> Result<String> {
+        let current_count = self.sessions.len();
+        if current_count >= self.config.max_sessions {
+            return Err(BridgeError::ServerProcess(format!(
+                "Session limit exceeded (max: {})",
+                self.config.max_sessions
+            )));
+        }
+
         let session_id = Uuid::new_v4().to_string();
 
         info!(session_id = %session_id, "Creating new session");
@@ -710,15 +720,12 @@ impl SessionManager {
             Stdio::inherit()
         };
 
-        // Set AHMA_SANDBOX_DEFER so the subprocess waits for roots/list to set sandbox scope.
-        // Previously this was passed as --defer-sandbox CLI flag; now it uses an env var so
-        // we don't need to care where on the command line it would go.
-        let args = self.config.server_args.clone();
+        let mut args = self.config.server_args.clone();
+        args.push("--defer-sandbox".to_string());
+        args.push("--server-child".to_string());
 
         let mut child = Command::new(&self.config.server_command)
             .args(&args)
-            .env("AHMA_SANDBOX_DEFER", "1")
-            .env("AHMA_SERVER_CHILD", "1")
             // Propagate W3C trace context so subprocess spans are linked to the
             // current session span (W3C Trace Context 1.0 §3.2).
             .env(

@@ -90,32 +90,32 @@ fn use_prebuilt_binary() -> bool {
     !path.as_os_str().is_empty() && path.exists()
 }
 
-fn configure_sandbox_env(
+fn configure_sandbox_args(
     cmd: &mut Command,
     force_no_sandbox: bool,
     working_dir: &Path,
     livelog: bool,
 ) {
     if force_no_sandbox {
-        cmd.env("AHMA_DISABLE_SANDBOX", "1");
+        cmd.arg("--no-sandbox");
     } else {
         if let Some(scope) = working_dir.to_str() {
-            cmd.env("AHMA_SANDBOX_SCOPE", scope);
+            cmd.arg("--sandbox-scope").arg(scope);
         }
         if livelog {
-            cmd.env("AHMA_LOG_MONITOR", "1");
+            cmd.arg("--log-monitor");
         }
     }
 }
 
-fn configure_tools_dir_env(cmd: &mut Command, tools_dir: Option<PathBuf>, working_dir: &Path) {
+fn configure_tools_dir_args(cmd: &mut Command, tools_dir: Option<PathBuf>, working_dir: &Path) {
     let Some(dir) = tools_dir else { return };
     let tools_path = if dir.is_absolute() {
         dir
     } else {
         working_dir.join(dir)
     };
-    cmd.env("AHMA_TOOLS_DIR", tools_path);
+    cmd.arg("--tools-dir").arg(tools_path);
 }
 
 /// Builder for creating MCP clients in tests.
@@ -257,10 +257,10 @@ impl ClientBuilder {
             cmd.env_remove("AHMA_SANDBOX_SCOPE");
             cmd.env_remove("AHMA_WORKING_DIRS");
 
-            configure_sandbox_env(cmd, force_no_sandbox, working_dir, livelog);
+            configure_sandbox_args(cmd, force_no_sandbox, working_dir, livelog);
 
             if skip_availability_probes {
-                cmd.env("AHMA_SKIP_PROBES", "1");
+                cmd.arg("--skip-probes");
             }
 
             cmd.current_dir(working_dir).kill_on_drop(true);
@@ -271,7 +271,7 @@ impl ClientBuilder {
 
             cmd.env("NEXTEST", "1");
 
-            configure_tools_dir_env(cmd, tools_dir, working_dir);
+            configure_tools_dir_args(cmd, tools_dir, working_dir);
 
             cmd.args(extra_args);
         }))?)

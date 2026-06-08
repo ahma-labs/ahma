@@ -216,6 +216,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "clap",
+ "dirs",
  "futures",
  "oauth2",
  "reqwest 0.13.4",

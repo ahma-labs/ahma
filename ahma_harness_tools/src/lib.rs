@@ -79,11 +79,13 @@ async fn validate_path_in_scopes_async(path: &Path, scopes: &[PathBuf]) -> Resul
 
     let mut allowed = false;
     for s in scopes {
-        if let Ok(scope) = tokio::fs::canonicalize(s).await {
-            if canonical.starts_with(scope) {
-                allowed = true;
-                break;
-            }
+        if tokio::fs::canonicalize(s)
+            .await
+            .map(|scope| canonical.starts_with(scope))
+            .unwrap_or(false)
+        {
+            allowed = true;
+            break;
         }
     }
 

@@ -269,6 +269,7 @@ impl TaskTreeOrchestrator {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_child_node(
         &self,
         tree: &mut TaskTree,
@@ -371,6 +372,7 @@ impl TaskTreeOrchestrator {
         Ok(child_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_recovery_backtracking(
         &self,
         tree: &mut TaskTree,

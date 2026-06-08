@@ -66,8 +66,9 @@ const TOOL_CONFIG_READ_BACKOFF_MS: u64 = 40;
 
 /// Represents the complete configuration for a command-line tool.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(deny_unknown_fields)]
 pub struct ToolConfig {
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     pub name: String,
     pub description: String,
     pub command: String,
@@ -266,8 +267,9 @@ fn default_llm_timeout_seconds() -> u64 {
 
 /// Configuration for a subcommand, allowing for nested commands.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(deny_unknown_fields)]
 pub struct SubcommandConfig {
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     pub name: String,
     pub description: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

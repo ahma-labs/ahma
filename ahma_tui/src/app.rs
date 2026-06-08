@@ -179,6 +179,7 @@ async fn run_ratatui(
 
                 _ = tokio::time::sleep(if (state.chat_scroll_current.get() - state.chat_scroll_target.get()).abs() > 0.01
                     || (state.log_scroll_current.get() - state.log_scroll_target.get()).abs() > 0.01
+                    || (state.chat_input_height_current.get() - state.chat_input_height_target.get()).abs() > 0.01
                 {
                     Duration::from_millis(15)
                 } else {
@@ -2967,6 +2968,15 @@ fn update_scroll_animations(state: &mut crate::state::AppState) {
     } else {
         state.log_scroll_current.set(log_tgt);
         state.log_scroll = log_tgt.round() as usize;
+    }
+
+    let input_curr = state.chat_input_height_current.get();
+    let input_tgt = state.chat_input_height_target.get();
+    if (input_curr - input_tgt).abs() > 0.01 {
+        let next = input_curr + (input_tgt - input_curr) * 0.25;
+        state.chat_input_height_current.set(next);
+    } else {
+        state.chat_input_height_current.set(input_tgt);
     }
 }
 

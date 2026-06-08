@@ -24,7 +24,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn build_binary() -> std::path::PathBuf {
-    build_binary_cached("ahma_mcp", "ahma")
+    build_binary_cached("ahma_bin", "ahma")
 }
 
 // ============================================================================

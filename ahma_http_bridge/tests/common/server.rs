@@ -160,36 +160,28 @@ fn build_server_spec(
     sandbox_scope: &Path,
     handshake_timeout_secs: Option<u64>,
 ) -> ServerSpec {
-    let mut env = vec![
-        ("AHMA_SYNC".to_string(), "1".to_string()),
-        ("AHMA_LOG_TARGET".to_string(), "stderr".to_string()),
-        (
-            "AHMA_TOOLS_DIR".to_string(),
-            tools_dir.to_string_lossy().to_string(),
-        ),
-        (
-            "AHMA_SANDBOX_SCOPE".to_string(),
-            sandbox_scope.to_string_lossy().to_string(),
-        ),
+    let mut args = vec![
+        "--sync".to_string(),
+        "--log-to-stderr".to_string(),
+        "--tools-dir".to_string(),
+        tools_dir.to_string_lossy().to_string(),
+        "--sandbox-scope".to_string(),
+        sandbox_scope.to_string_lossy().to_string(),
     ];
 
     if let Some(timeout) = handshake_timeout_secs {
-        env.push(("AHMA_HANDSHAKE_TIMEOUT".to_string(), timeout.to_string()));
-        // Keep bridge→subprocess request timeout independent from handshake timeout.
-        // Handshake timeout governs sandbox-lock gating, while request timeout also
-        // affects initialize forwarding. Coupling them (e.g. 2s) can make initialize
-        // flaky on slower Windows CI runners.
+        args.push("--handshake-timeout".to_string());
+        args.push(timeout.to_string());
     }
 
-    ServerSpec {
-        args: vec![
-            "serve".to_string(),
-            "http".to_string(),
-            "--port".to_string(),
-            "0".to_string(),
-        ],
-        env,
-    }
+    args.extend([
+        "serve".to_string(),
+        "http".to_string(),
+        "--port".to_string(),
+        "0".to_string(),
+    ]);
+
+    ServerSpec { args, env: vec![] }
 }
 
 #[cfg(target_os = "linux")]
@@ -322,7 +314,7 @@ fn configure_server_command(
 
     if should_force_no_sandbox_for_test_server() {
         eprintln!("{no_sandbox_message}");
-        cmd.env("AHMA_DISABLE_SANDBOX", "1");
+        cmd.arg("--no-sandbox");
     }
 
     SandboxTestEnv::configure(cmd);
@@ -479,6 +471,13 @@ pub async fn spawn_test_server_with_timeout(
     )
     .await?;
 
+    // Spawn background log forwarder to keep pipes clear and capture logs on failure
+    std::thread::spawn(move || {
+        while let Ok(line) = line_rx.recv() {
+            eprintln!("[Server] {}", line);
+        }
+    });
+
     Ok(TestServerInstance {
         child,
         port: bound_port,
@@ -542,6 +541,13 @@ pub async fn spawn_server_guard_with_config_extra_env(
         "Custom test server failed to respond to health check within timeout",
     )
     .await?;
+
+    // Spawn background log forwarder to keep pipes clear and capture logs on failure
+    std::thread::spawn(move || {
+        while let Ok(line) = line_rx.recv() {
+            eprintln!("[Server] {}", line);
+        }
+    });
 
     Ok(ServerGuard::new(child, startup_info.bound_port))
 }

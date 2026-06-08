@@ -49,14 +49,7 @@ fn make_find_subcommand() -> SubcommandConfig {
             make_option("-name", "string"),
             make_option("-maxdepth", "integer"),
         ]),
-        subcommand: None,
-        timeout_seconds: None,
-        synchronous: None,
-        guidance_key: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     }
 }
 
@@ -247,20 +240,12 @@ async fn find_command_args_with_dash_prefix() {
 async fn boolean_option_uses_alias_when_true() {
     let temp_manager = test_temp_manager();
     let subcommand_config = SubcommandConfig {
+        extra: Default::default(),
         name: "demo".to_string(),
         description: "demo".to_string(),
         enabled: true,
-        positional_args_first: None,
-        positional_args: None,
         options: Some(vec![make_bool_option("verbose", "v")]),
-        subcommand: None,
-        timeout_seconds: None,
-        synchronous: None,
-        guidance_key: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     };
 
     let mut args_map = Map::new();
@@ -313,20 +298,12 @@ async fn reserved_runtime_keys_are_not_emitted_as_cli_args() {
 async fn file_arg_uses_configured_flag_and_writes_content() {
     let temp_manager = test_temp_manager();
     let subcommand_config = SubcommandConfig {
+        extra: Default::default(),
         name: "demo".to_string(),
         description: "demo".to_string(),
         enabled: true,
-        positional_args_first: None,
-        positional_args: None,
         options: Some(vec![make_file_option("input", Some("-f"))]),
-        subcommand: None,
-        timeout_seconds: None,
-        synchronous: None,
-        guidance_key: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     };
 
     let mut args_map = Map::new();
@@ -359,10 +336,10 @@ async fn file_arg_uses_configured_flag_and_writes_content() {
 /// Creates a SubcommandConfig mimicking the grep subcommand from file-tools.json.
 fn make_grep_subcommand() -> SubcommandConfig {
     SubcommandConfig {
+        extra: Default::default(),
         name: "grep".to_string(),
         description: "Search text patterns in files".to_string(),
         enabled: true,
-        positional_args_first: None,
         positional_args: Some(vec![
             make_option("pattern", "string"),
             CommandOption {
@@ -388,24 +365,17 @@ fn make_grep_subcommand() -> SubcommandConfig {
             make_bool_option("word-regexp", "w"),
             make_bool_option("extended-regexp", "E"),
         ]),
-        subcommand: None,
-        timeout_seconds: None,
-        synchronous: None,
-        guidance_key: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     }
 }
 
 /// Creates a SubcommandConfig mimicking the cat subcommand with BSD-compatible aliases.
 fn make_cat_subcommand() -> SubcommandConfig {
     SubcommandConfig {
+        extra: Default::default(),
         name: "cat".to_string(),
         description: "Display file contents".to_string(),
         enabled: true,
-        positional_args_first: None,
         positional_args: Some(vec![CommandOption {
             name: "files".to_string(),
             option_type: "array".to_string(),
@@ -423,14 +393,7 @@ fn make_cat_subcommand() -> SubcommandConfig {
             make_bool_option("show-ends", "e"),
             make_bool_option("show-tabs", "t"),
         ]),
-        subcommand: None,
-        timeout_seconds: None,
-        synchronous: None,
-        guidance_key: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     }
 }
 

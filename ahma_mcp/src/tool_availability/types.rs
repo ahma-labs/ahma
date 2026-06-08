@@ -77,11 +77,12 @@ impl ProbeTarget {
 }
 
 impl ProbePlan {
-    pub(super) async fn execute(self, shell_pool: Arc<ShellPoolManager>) -> ProbeOutcome {
-        let result = match self.try_shell(shell_pool.as_ref()).await {
-            Some(response) => response,
-            None => self.execute_direct().await,
-        };
+    pub(super) async fn execute(
+        self,
+        _shell_pool: Arc<ShellPoolManager>,
+        sandbox: &crate::sandbox::Sandbox,
+    ) -> ProbeOutcome {
+        let result = self.execute_direct(sandbox).await;
         let success = self.success_codes.contains(&result.exit_code);
 
         ProbeOutcome {
@@ -93,40 +94,25 @@ impl ProbePlan {
         }
     }
 
-    /// Attempt to execute a probe via the shell pool; returns `None` if no shell
-    /// was available or execution failed.
-    async fn try_shell(
+    async fn execute_direct(
         &self,
-        shell_pool: &ShellPoolManager,
-    ) -> Option<crate::shell_pool::ShellResponse> {
-        let mut shell = shell_pool.get_shell(&self.working_dir).await?;
-        let shell_command = crate::shell_pool::ShellCommand {
-            id: format!("availability-{:?}", self.target),
-            command: self.command.clone(),
-            working_dir: self.working_dir.to_string_lossy().to_string(),
-            timeout_ms: self.timeout_ms,
-        };
-
-        let response = shell.execute_command(shell_command).await;
-        shell_pool.return_shell(shell).await;
-
-        match response {
-            Ok(resp) => Some(resp),
-            Err(err) => {
-                warn!("Shell execution failed for {:?}: {err}", self.target);
-                None
-            }
-        }
-    }
-
-    async fn execute_direct(&self) -> crate::shell_pool::ShellResponse {
+        sandbox: &crate::sandbox::Sandbox,
+    ) -> crate::shell_pool::ShellResponse {
         let (program, args) = self.prepare_direct_command();
 
-        let mut command = tokio::process::Command::new(&program);
-        command
-            .args(&args)
-            .current_dir(&self.working_dir)
-            .kill_on_drop(true);
+        let mut command = match sandbox.create_command(&program, &args, &self.working_dir) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                return crate::shell_pool::ShellResponse {
+                    id: format!("direct-availability-{:?}", self.target),
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: format!("Failed to create sandboxed command: {e}"),
+                    duration_ms: 0,
+                };
+            }
+        };
+        command.kill_on_drop(true);
 
         let timeout_duration = Duration::from_millis(self.timeout_ms);
         let result = timeout(timeout_duration, command.output()).await;

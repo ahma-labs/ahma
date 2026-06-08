@@ -136,6 +136,7 @@ async fn test_livelog_pipeline_clean_response_no_alert() {
         token,
         Some(&callback),
         monitor,
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
@@ -192,6 +193,7 @@ async fn test_livelog_pipeline_issue_detected_sends_alert() {
         token,
         Some(&callback),
         monitor,
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
@@ -266,6 +268,7 @@ async fn test_livelog_pipeline_cooldown_suppresses_second_alert() {
         token,
         Some(&callback),
         monitor,
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
@@ -328,6 +331,7 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
         token,
         Some(&callback),
         monitor,
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
     let elapsed = start.elapsed();
@@ -389,6 +393,7 @@ async fn test_livelog_pipeline_llm_http_500_graceful() {
         token,
         Some(&callback),
         monitor,
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
@@ -442,6 +447,7 @@ async fn test_livelog_pipeline_llm_malformed_json_graceful() {
         token,
         Some(&callback),
         monitor,
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
@@ -497,6 +503,7 @@ async fn test_livelog_pipeline_zero_cooldown_fires_all_alerts() {
         token,
         Some(&callback),
         monitor,
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
@@ -549,6 +556,7 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
         token,
         Some(&callback),
         monitor,
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 

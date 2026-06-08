@@ -445,6 +445,56 @@ async fn spawn_background_bridge(
         server_args.push(timeout.to_string());
     }
 
+    if !config.unix_socket_path.is_empty() {
+        server_args.push("--unix-socket-path".to_string());
+        server_args.push(config.unix_socket_path.clone());
+    }
+    if config.no_sandbox {
+        server_args.push("--no-sandbox".to_string());
+    }
+    if config.skip_availability_probes {
+        server_args.push("--skip-probes".to_string());
+    }
+    if config.force_sync {
+        server_args.push("--sync".to_string());
+    }
+    if config.hot_reload_tools {
+        server_args.push("--hot-reload-tools".to_string());
+    }
+    if config.defer_sandbox {
+        server_args.push("--defer-sandbox".to_string());
+    }
+    if config.tmp_access {
+        server_args.push("--tmp".to_string());
+    }
+    if config.no_temp_files {
+        server_args.push("--disable-temp-files".to_string());
+    }
+    if config.rate_limit_rps > 0 {
+        server_args.push("--rate-limit-rps".to_string());
+        server_args.push(config.rate_limit_rps.to_string());
+    }
+    if config.rate_limit_burst > 0 {
+        server_args.push("--rate-limit-burst".to_string());
+        server_args.push(config.rate_limit_burst.to_string());
+    }
+    if config.handshake_timeout_secs > 0 {
+        server_args.push("--handshake-timeout".to_string());
+        server_args.push(config.handshake_timeout_secs.to_string());
+    }
+    if let Some(ref token) = config.require_token {
+        server_args.push("--require-token".to_string());
+        server_args.push(token.clone());
+    }
+    if let Some(ref path) = config.require_token_path {
+        server_args.push("--require-token-path".to_string());
+        server_args.push(path.to_string_lossy().to_string());
+    }
+    if !config.instance_label.is_empty() {
+        server_args.push("--instance-label".to_string());
+        server_args.push(config.instance_label.clone());
+    }
+
     let mut cmd = tokio::process::Command::new(&server_command);
     cmd.args(&server_args);
 
@@ -459,10 +509,45 @@ async fn spawn_background_bridge(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    // Do not inherit standard streams to fully detach
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    let temp = std::env::temp_dir();
+    let stdout_path = temp.join("ahma_grandchild.stdout");
+    let stderr_path = temp.join("ahma_grandchild.stderr");
+
+    let stdout_file = match std::fs::File::create(&stdout_path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create grandchild stdout at {:?}: {}",
+                stdout_path,
+                e
+            );
+            None
+        }
+    };
+
+    let stderr_file = match std::fs::File::create(&stderr_path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!(
+                "Failed to create grandchild stderr at {:?}: {}",
+                stderr_path,
+                e
+            );
+            None
+        }
+    };
+
+    if let Some(out) = stdout_file {
+        cmd.stdout(out);
+    } else {
+        cmd.stdout(std::process::Stdio::null());
+    }
+    if let Some(err) = stderr_file {
+        cmd.stderr(err);
+    } else {
+        cmd.stderr(std::process::Stdio::null());
+    }
+    cmd.stdin(std::process::Stdio::null());
 
     match cmd.spawn() {
         Ok(_) => tracing::info!("Spawned background bridge server successfully"),
@@ -472,15 +557,20 @@ async fn spawn_background_bridge(
     // Wait for the background bridge to be healthy/available
     let start_time = std::time::Instant::now();
     let mut healthy = false;
-    while start_time.elapsed() < Duration::from_secs(2) {
+    let timeout =
+        ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick);
+    while start_time.elapsed() < timeout {
         if check_bridge_running(socket_path_opt, http_url_opt).await {
             healthy = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(ahma_common::timeouts::TestTimeouts::poll_interval()).await;
     }
     if !healthy {
-        tracing::warn!("Background bridge server failed to become healthy within 2 seconds");
+        tracing::warn!(
+            "Background bridge server failed to become healthy within {:?}",
+            timeout
+        );
     } else {
         tracing::info!("Background bridge server started successfully and is healthy");
     }

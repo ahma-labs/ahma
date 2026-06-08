@@ -231,18 +231,15 @@ async fn cleanup(src: &Path, bin: &Path, keep: bool) {
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    // Simple djb2-inspired hash for a lightweight non-cryptographic digest.
-    // For audit purposes — not used as a security primitive.
-    let mut h: u64 = 5381;
-    for &b in data {
-        h = h.wrapping_mul(33).wrapping_add(u64(b));
-    }
-    format!("{h:016x}")
-}
-
-#[inline]
-fn u64(b: u8) -> u64 {
-    b as u64
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let hash = hasher.finalize();
+    hash.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

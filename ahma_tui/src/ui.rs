@@ -3,6 +3,8 @@
 //! The top-level [`draw`] function dispatches to either the chat or monitor
 //! layout based on `state.mode`.
 
+#![allow(dead_code)]
+
 #[cfg(feature = "tui")]
 use ratatui::{
     Frame,
@@ -237,8 +239,20 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         0
     };
 
-    // Input height: 1–6 lines depending on content, always at least 3 (borders).
-    let input_lines = state.chat_input_line_count().clamp(1, 6) as u16;
+    // Input height target: 1-6 lines based on wrapped content
+    let inner_width = full.width.saturating_sub(2);
+    let wrapped_line_count = state
+        .chat_input_line_count(inner_width as usize)
+        .clamp(1, 6);
+    state
+        .chat_input_height_target
+        .set(wrapped_line_count as f64);
+
+    let input_lines = state
+        .chat_input_height_current
+        .get()
+        .round()
+        .clamp(1.0, 6.0) as u16;
     let input_h = input_lines + 2; // borders
 
     let [header_a, chat_a, approval_a, input_a, footer_a] = Layout::vertical([
@@ -693,8 +707,20 @@ fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         0
     };
 
-    // Input height: 1–6 lines depending on content, always at least 3 (borders).
-    let input_lines = state.chat_input_line_count().clamp(1, 6) as u16;
+    // Input height target: 1-6 lines based on wrapped content
+    let inner_width = full.width.saturating_sub(2);
+    let wrapped_line_count = state
+        .chat_input_line_count(inner_width as usize)
+        .clamp(1, 6);
+    state
+        .chat_input_height_target
+        .set(wrapped_line_count as f64);
+
+    let input_lines = state
+        .chat_input_height_current
+        .get()
+        .round()
+        .clamp(1.0, 6.0) as u16;
     let input_h = input_lines + 2; // borders
 
     let [
@@ -1210,7 +1236,7 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
             .push((ClickTarget::SelectOperation(op_idx), details_a));
 
         // Render Pin button: "[P]"
-        let pin_text = if op.pinned { " [P] " } else { " [P] " };
+        let pin_text = " [P] ";
         let pin_style = if op.pinned {
             theme.running()
         } else {

@@ -26,8 +26,6 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
     tracing::info!("Session isolation: ENABLED (always-on)");
 
     // Build the command to run the stdio MCP server subprocess.
-    // Env vars (AHMA_SYNC, AHMA_TIMEOUT, AHMA_LOG_MONITOR, AHMA_DISABLE_TEMP, etc.)
-    // are automatically inherited by child processes — no need to pass them as flags.
     let server_command = env::current_exe()
         .context("Failed to get current executable path")?
         .to_string_lossy()
@@ -41,14 +39,50 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
                 .unwrap_or_else(|_| config.sandbox_scopes[0].clone()),
         )
     } else {
-        // AHMA_SANDBOX_SCOPE is already baked into config.sandbox_scopes — no need to recheck env
         None
     };
 
     // Subprocess gets the `serve stdio` subcommand.
-    // --tools-dir must come before the subcommand (it's on `serve`, not `serve stdio`).
-    // --tool flags propagate tool bundle choices; env vars propagate everything else.
     let mut server_args = vec!["serve".to_string()];
+
+    // Pass global options to child process
+    if config.no_sandbox {
+        server_args.push("--no-sandbox".to_string());
+    }
+    if config.tmp_access {
+        server_args.push("--tmp".to_string());
+    }
+    if config.log_monitor {
+        server_args.push("--log-monitor".to_string());
+    }
+    server_args.push("--monitor-rate-limit".to_string());
+    server_args.push(config.monitor_rate_limit_secs.to_string());
+    server_args.push("--timeout".to_string());
+    server_args.push(config.timeout_secs.to_string());
+    if config.force_sync {
+        server_args.push("--sync".to_string());
+    }
+    if config.no_temp_files {
+        server_args.push("--disable-temp-files".to_string());
+    }
+    if config.hot_reload_tools {
+        server_args.push("--hot-reload".to_string());
+    }
+    if config.skip_availability_probes {
+        server_args.push("--skip-probes".to_string());
+    }
+    if let Some(ref otel_ep) = config.observability.endpoint {
+        server_args.push("--opentelemetry".to_string());
+        server_args.push(otel_ep.clone());
+    }
+    for scope in &config.sandbox_scopes {
+        server_args.push("--sandbox-scope".to_string());
+        server_args.push(scope.to_string_lossy().to_string());
+    }
+    for dir in &config.working_dirs {
+        server_args.push("--working-dir".to_string());
+        server_args.push(dir.to_string_lossy().to_string());
+    }
 
     // Pass --tools-dir only if explicitly provided (otherwise subprocess auto-detects)
     if config.explicit_tools_dir
@@ -69,12 +103,6 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
     for bundle in &config.tool_bundles {
         server_args.push("--tool".to_string());
         server_args.push(bundle.clone());
-    }
-
-    if let Some(ref scope) = explicit_fallback_scope {
-        // Pass scope as env AHMA_WORKING_DIRS for subprocess deferred-sandbox resolution
-        // (already set in env by parent process if user configured it)
-        let _ = scope; // scope used below in BridgeConfig only
     }
 
     let enable_colored_output = true;
@@ -109,6 +137,7 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
         rate_limit_burst: config.rate_limit_burst,
         active_sessions: None,
         idle_timeout_secs: config.idle_timeout_secs,
+        max_sessions: config.max_sessions,
     };
 
     start_bridge(bridge_config).await?;

@@ -312,6 +312,17 @@ impl MtdfValidator {
         self.validate_required_tool_fields(config, errors);
         self.validate_timeout_constraints(config, errors);
         self.validate_subcommand_list(config, errors);
+
+        if !self.allow_unknown_fields && self.strict_mode {
+            for key in config.extra.keys() {
+                push_error(
+                    errors,
+                    ValidationErrorType::UnknownField,
+                    key.clone(),
+                    format!("unknown field '{}' in tool configuration", key),
+                );
+            }
+        }
     }
 
     fn validate_required_tool_fields(
@@ -427,6 +438,17 @@ impl MtdfValidator {
         self.validate_sync_description_consistency(subcommand, path, effective_sync, errors);
         self.validate_nested_subcommands(subcommand, path, effective_sync, errors);
         self.validate_subcommand_options(subcommand, path, errors);
+
+        if !self.allow_unknown_fields && self.strict_mode {
+            for key in subcommand.extra.keys() {
+                push_error(
+                    errors,
+                    ValidationErrorType::UnknownField,
+                    format!("{}.{}", path, key),
+                    format!("unknown field '{}' in subcommand configuration", key),
+                );
+            }
+        }
     }
 
     fn validate_sync_description_consistency(

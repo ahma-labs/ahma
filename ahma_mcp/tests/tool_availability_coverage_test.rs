@@ -33,18 +33,10 @@ fn build_subcommand(
     SubcommandConfig {
         name: name.to_string(),
         description: format!("{} subcommand", name),
-        options: None,
-        positional_args: None,
-        positional_args_first: None,
-        synchronous: None,
-        timeout_seconds: None,
         enabled,
-        guidance_key: None,
-        subcommand: None,
-        sequence: None,
-        step_delay_ms: None,
         availability_check: check,
         install_instructions: install.map(|s| s.to_string()),
+        ..Default::default()
     }
 }
 
@@ -56,18 +48,9 @@ fn build_nested_subcommand(
     SubcommandConfig {
         name: name.to_string(),
         description: format!("{} nested subcommand", name),
-        options: None,
-        positional_args: None,
-        positional_args_first: None,
-        synchronous: None,
-        timeout_seconds: None,
         enabled,
-        guidance_key: None,
         subcommand: Some(nested),
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     }
 }
 

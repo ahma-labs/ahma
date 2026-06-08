@@ -87,6 +87,7 @@ fn test_tool_config_creation() {
         description: "Cargo build tool".to_string(),
         command: "cargo".to_string(),
         subcommand: Some(vec![SubcommandConfig {
+            extra: Default::default(),
             name: "build".to_string(),
             description: "Build project".to_string(),
             enabled: true,
@@ -139,6 +140,7 @@ fn test_tool_config_creation() {
 fn test_subcommand_config_creation() {
     init_test_logging();
     let subcommand = SubcommandConfig {
+        extra: Default::default(),
         name: "build".to_string(),
         description: "Build project".to_string(),
         enabled: true,
@@ -271,6 +273,7 @@ async fn test_service_with_configs() {
         synchronous: Some(true),
         timeout_seconds: Some(60),
         subcommand: Some(vec![SubcommandConfig {
+            extra: Default::default(),
             name: "test_sub".to_string(),
             description: "Test subcommand".to_string(),
             enabled: true,
@@ -374,6 +377,7 @@ fn test_tool_config_with_nested_subcommands() {
         command: "cargo".to_string(),
         description: "Cargo tool".to_string(),
         subcommand: Some(vec![SubcommandConfig {
+            extra: Default::default(),
             name: "build".to_string(),
             description: "Build command".to_string(),
             enabled: true,
@@ -384,6 +388,7 @@ fn test_tool_config_with_nested_subcommands() {
             timeout_seconds: None,
             guidance_key: None,
             subcommand: Some(vec![SubcommandConfig {
+                extra: Default::default(),
                 name: "release".to_string(),
                 description: "Release build".to_string(),
                 enabled: true,
@@ -441,6 +446,7 @@ async fn test_service_with_tool_configs() {
         command: "cargo".to_string(),
         description: "Cargo tool".to_string(),
         subcommand: Some(vec![SubcommandConfig {
+            extra: Default::default(),
             name: "build".to_string(),
             description: "Build project".to_string(),
             enabled: true,

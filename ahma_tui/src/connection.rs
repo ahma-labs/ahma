@@ -571,7 +571,7 @@ async fn handle_existing_candidate(
             {
                 use std::os::unix::process::CommandExt;
                 let err = cmd.exec();
-                return Err(anyhow::anyhow!("Failed to re-exec TUI process: {}", err));
+                Err(anyhow::anyhow!("Failed to re-exec TUI process: {}", err))
             }
             #[cfg(not(unix))]
             {

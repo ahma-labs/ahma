@@ -43,7 +43,47 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         None
     };
 
+    // Subprocess gets the `serve stdio` subcommand.
     let mut server_args = vec!["serve".to_string()];
+
+    // Pass global options to child process
+    if config.no_sandbox {
+        server_args.push("--no-sandbox".to_string());
+    }
+    if config.tmp_access {
+        server_args.push("--tmp".to_string());
+    }
+    if config.log_monitor {
+        server_args.push("--log-monitor".to_string());
+    }
+    server_args.push("--monitor-rate-limit".to_string());
+    server_args.push(config.monitor_rate_limit_secs.to_string());
+    server_args.push("--timeout".to_string());
+    server_args.push(config.timeout_secs.to_string());
+    if config.force_sync {
+        server_args.push("--sync".to_string());
+    }
+    if config.no_temp_files {
+        server_args.push("--disable-temp-files".to_string());
+    }
+    if config.hot_reload_tools {
+        server_args.push("--hot-reload".to_string());
+    }
+    if config.skip_availability_probes {
+        server_args.push("--skip-probes".to_string());
+    }
+    if let Some(ref otel_ep) = config.observability.endpoint {
+        server_args.push("--opentelemetry".to_string());
+        server_args.push(otel_ep.clone());
+    }
+    for scope in &config.sandbox_scopes {
+        server_args.push("--sandbox-scope".to_string());
+        server_args.push(scope.to_string_lossy().to_string());
+    }
+    for dir in &config.working_dirs {
+        server_args.push("--working-dir".to_string());
+        server_args.push(dir.to_string_lossy().to_string());
+    }
 
     if config.explicit_tools_dir
         && let Some(ref tools_dir) = config.tools_dir
@@ -91,6 +131,7 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         rate_limit_burst: 10,
         active_sessions: None,
         idle_timeout_secs: config.idle_timeout_secs,
+        max_sessions: config.max_sessions,
     };
 
     start_bridge(bridge_config).await?;

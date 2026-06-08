@@ -127,6 +127,7 @@ mod mcp_service_tests {
             tool_type: None,
             livelog: None,
             subcommand: Some(vec![SubcommandConfig {
+                extra: Default::default(),
                 name: "build".to_string(),
                 description: "Build the project".to_string(),
                 enabled: true,

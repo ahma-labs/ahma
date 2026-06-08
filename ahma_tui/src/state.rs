@@ -637,18 +637,20 @@ impl Operation {
 
     pub fn display_name(&self) -> String {
         if self.tool_name == "run_terminal_command" {
-            if let Some(start_idx) = self.description.find('{') {
-                if let Some(end_idx) = self.description.rfind('}') {
-                    if start_idx < end_idx {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(
-                            &self.description[start_idx..=end_idx],
-                        ) {
-                            if let Some(cmd) = val.get("command").and_then(|v| v.as_str()) {
-                                return cmd.to_string();
-                            }
-                        }
-                    }
+            let get_cmd = || -> Option<String> {
+                let start_idx = self.description.find('{')?;
+                let end_idx = self.description.rfind('}')?;
+                if start_idx >= end_idx {
+                    return None;
                 }
+                let val: serde_json::Value =
+                    serde_json::from_str(&self.description[start_idx..=end_idx]).ok()?;
+                val.get("command")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            };
+            if let Some(cmd) = get_cmd() {
+                return cmd;
             }
         }
         self.tool_name.clone()
@@ -887,6 +889,8 @@ pub struct AppState {
     pub chat_scroll_current: std::cell::Cell<f64>,
     pub log_scroll_target: std::cell::Cell<f64>,
     pub log_scroll_current: std::cell::Cell<f64>,
+    pub chat_input_height_target: std::cell::Cell<f64>,
+    pub chat_input_height_current: std::cell::Cell<f64>,
     pub chat_max_scroll: std::cell::Cell<usize>,
     pub log_max_scroll: std::cell::Cell<usize>,
     pub activity_scroll: usize,
@@ -1029,6 +1033,8 @@ impl AppState {
             chat_scroll_current: std::cell::Cell::new(0.0),
             log_scroll_target: std::cell::Cell::new(0.0),
             log_scroll_current: std::cell::Cell::new(0.0),
+            chat_input_height_target: std::cell::Cell::new(1.0),
+            chat_input_height_current: std::cell::Cell::new(1.0),
             chat_max_scroll: std::cell::Cell::new(0),
             log_max_scroll: std::cell::Cell::new(0),
             activity_scroll: 0,
@@ -1093,17 +1099,72 @@ impl AppState {
         }
     }
 
-    pub fn chat_input_line_count(&self) -> usize {
+    pub fn chat_input_line_count(&self, width: usize) -> usize {
         #[cfg(feature = "tui")]
         {
-            self.chat_input.lines().len().max(1)
+            let mut total = 0;
+            for line in self.chat_input.lines() {
+                total += count_wrapped_lines(line, width);
+            }
+            total.max(1)
         }
         #[cfg(not(feature = "tui"))]
         {
+            let _ = width;
             1
         }
     }
+}
 
+#[cfg(feature = "tui")]
+fn count_wrapped_lines(line: &str, width: usize) -> usize {
+    let width = width.max(1);
+    if line.is_empty() {
+        return 1;
+    }
+    let mut lines = 0;
+    let mut current_line_len = 0;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ' ' {
+            if current_line_len < width {
+                current_line_len += 1;
+            } else {
+                lines += 1;
+                current_line_len = 0;
+            }
+        } else {
+            let mut word_len = 1;
+            while let Some(&next_c) = chars.peek() {
+                if next_c != ' ' {
+                    word_len += 1;
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if current_line_len + word_len <= width {
+                current_line_len += word_len;
+            } else {
+                if current_line_len > 0 {
+                    lines += 1;
+                }
+                let mut rem = word_len;
+                while rem > width {
+                    lines += 1;
+                    rem -= width;
+                }
+                current_line_len = rem;
+            }
+        }
+    }
+    if current_line_len > 0 {
+        lines += 1;
+    }
+    lines.max(1)
+}
+
+impl AppState {
     pub fn chat_input_is_empty(&self) -> bool {
         self.chat_input_text().is_empty()
     }
@@ -1187,6 +1248,16 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "tui")]
+    fn test_count_wrapped_lines() {
+        assert_eq!(count_wrapped_lines("hello world", 10), 2);
+        assert_eq!(count_wrapped_lines("a verylongword", 10), 3);
+        assert_eq!(count_wrapped_lines(" ", 10), 1);
+        assert_eq!(count_wrapped_lines("", 10), 1);
+        assert_eq!(count_wrapped_lines("one two three four five", 100), 1);
+    }
 
     #[test]
     fn push_activity_caps_at_ring_capacity() {

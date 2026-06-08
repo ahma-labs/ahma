@@ -83,13 +83,9 @@ impl Client {
 
         let client = ()
             .serve(TokioChildProcess::new(command.configure(|cmd| {
-                // New CLI: ahma serve stdio [--tools-dir PATH]
-                // Behaviour flags (--disable-sandbox, etc.) are now env vars.
-                cmd.args(["serve", "stdio"]);
-                cmd.env("AHMA_DISABLE_SANDBOX", "1");
-                cmd.env("AHMA_SKIP_PROBES", "1");
+                cmd.args(["serve", "stdio", "--no-sandbox", "--skip-probes"]);
                 if let Some(dir) = tools_dir {
-                    cmd.env("AHMA_TOOLS_DIR", dir);
+                    cmd.arg("--tools-dir").arg(dir);
                 }
                 for arg in extra_args {
                     cmd.arg(arg);

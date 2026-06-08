@@ -155,6 +155,13 @@ async fn handle_initialize(session_manager: &SessionManager, payload: &Value) ->
         Ok(id) => id,
         Err(e) => {
             error!("Failed to create session: {}", e);
+            if e.to_string().contains("Session limit exceeded") {
+                return error_response_with_status(
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    -32002,
+                    &format!("Failed to create session: {}", e),
+                );
+            }
             return error_response(-32603, &format!("Failed to create session: {}", e));
         }
     };
@@ -830,6 +837,13 @@ async fn handle_initialize_sse(session_manager: &SessionManager, payload: &Value
         Ok(id) => id,
         Err(e) => {
             error!("Failed to create session: {}", e);
+            if e.to_string().contains("Session limit exceeded") {
+                return error_response_with_status(
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    -32002,
+                    &format!("Failed to create session: {}", e),
+                );
+            }
             return error_response(-32603, &format!("Failed to create session: {}", e));
         }
     };

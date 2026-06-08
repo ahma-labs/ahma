@@ -95,25 +95,22 @@ pub async fn spawn_http_bridge() -> anyhow::Result<HttpBridgeTestInstance> {
     // Find available port
     let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
 
-    let binary = cli::build_binary_cached("ahma_mcp", "ahma");
+    let binary = cli::build_binary_cached("ahma_bin", "ahma");
 
     let temp_dir = TempDir::new()?;
     let tools_dir = temp_dir.path().join("tools");
     std::fs::create_dir_all(&tools_dir)?;
 
     let mut cmd = Command::new(&binary);
-    cmd.args(["serve", "http", "--port", &port.to_string()])
-        .env("AHMA_TOOLS_DIR", &*tools_dir.to_string_lossy())
-        .env("AHMA_SANDBOX_SCOPE", &*temp_dir.path().to_string_lossy())
-        .env("AHMA_LOG_TARGET", "stderr")
-        // Give the bridge server a generous handshake window so slow CI runners
-        // (especially Linux with Landlock sandbox setup) have enough time to complete
-        // the roots/list exchange before the server declares a timeout (-32002).
-        .env(
-            "AHMA_HANDSHAKE_TIMEOUT",
-            TestTimeouts::scale_secs(120).as_secs().to_string(),
-        )
-        .env_remove("NEXTEST")
+    cmd.arg("--tools-dir").arg(&tools_dir);
+    cmd.arg("--sandbox-scope").arg(temp_dir.path());
+    cmd.arg("--log-to-stderr");
+    cmd.arg("--handshake-timeout")
+        .arg(TestTimeouts::scale_secs(120).as_secs().to_string());
+    cmd.args(["serve", "http", "--port", &port.to_string()]);
+
+    // Clear unwanted env vars
+    cmd.env_remove("NEXTEST")
         .env_remove("NEXTEST_EXECUTION_MODE")
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("RUST_TEST_THREADS")
@@ -121,14 +118,34 @@ pub async fn spawn_http_bridge() -> anyhow::Result<HttpBridgeTestInstance> {
         .stderr(Stdio::piped());
 
     // Detect nested sandbox (mcp_ahma_run_terminal_command / VS Code / Docker) and use
-    // AHMA_DISABLE_SANDBOX so the child can start; app-level path security still applies.
+    // --no-sandbox so the child can start; app-level path security still applies.
+    let mut force_no_sandbox = false;
     #[cfg(target_os = "macos")]
     if crate::sandbox::test_sandbox_exec_available().is_err() {
-        cmd.env("AHMA_DISABLE_SANDBOX", "1");
+        force_no_sandbox = true;
     }
     #[cfg(target_os = "windows")]
     if crate::sandbox::check_windows_sandbox_available().is_err() {
-        cmd.env("AHMA_DISABLE_SANDBOX", "1");
+        force_no_sandbox = true;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        #[cfg(target_os = "linux")]
+        if matches!(
+            crate::sandbox::check_sandbox_prerequisites(),
+            Err(crate::sandbox::SandboxError::LandlockNotAvailable)
+                | Err(crate::sandbox::SandboxError::PrerequisiteFailed(_))
+        ) {
+            force_no_sandbox = true;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            force_no_sandbox = true;
+        }
+    }
+
+    if force_no_sandbox {
+        cmd.arg("--no-sandbox");
     }
 
     let mut child = cmd.spawn()?;
@@ -159,9 +176,18 @@ pub async fn spawn_http_bridge() -> anyhow::Result<HttpBridgeTestInstance> {
         sleep(Duration::from_millis(100)).await;
     }
 
+    let stderr = child.stderr.take();
     let _ = child.kill();
     let _ = child.wait();
-    anyhow::bail!("Timed out waiting for HTTP bridge health");
+    let mut stderr_content = String::new();
+    if let Some(mut err_stream) = stderr {
+        use std::io::Read;
+        let _ = err_stream.read_to_string(&mut stderr_content);
+    }
+    anyhow::bail!(
+        "Timed out waiting for HTTP bridge health. Stderr:\n{}",
+        stderr_content
+    );
 }
 
 /// A client for testing the MCP protocol over HTTP and SSE.

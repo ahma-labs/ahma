@@ -149,6 +149,36 @@ impl WorkerRunner {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn is_sandbox_exec_working() -> bool {
+    let output = std::process::Command::new("sandbox-exec")
+        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .output();
+    matches!(output, Ok(out) if out.status.success())
+}
+
+#[cfg(target_os = "macos")]
+fn generate_worker_profile(cwd: &Path) -> String {
+    let cwd_str = cwd.to_string_lossy();
+    format!(
+        r#"(version 1)
+(deny default)
+(allow process*)
+(allow signal)
+(allow sysctl-read)
+(allow file-read*)
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (subpath "/private/var/folders"))
+(allow file-write* (subpath "{cwd}"))
+(allow file-write* (literal "/dev/null"))
+(allow file-write* (literal "/dev/zero"))
+(allow mach-lookup)
+(allow ipc-posix-shm*)
+"#,
+        cwd = cwd_str
+    )
+}
+
 async fn run_with_timeout(
     program: &str,
     args: &[&str],
@@ -156,16 +186,41 @@ async fn run_with_timeout(
     extra_args: &Option<Vec<String>>,
     timeout: Duration,
 ) -> Result<std::process::Output> {
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args)
+    #[cfg(target_os = "macos")]
+    let use_sandbox = is_sandbox_exec_working();
+
+    #[cfg(target_os = "macos")]
+    let (real_program, real_args) = if use_sandbox {
+        let profile = generate_worker_profile(cwd);
+        let mut final_args = vec!["-p".to_string(), profile, program.to_string()];
+        final_args.extend(args.iter().map(|s| s.to_string()));
+        if let Some(extras) = extra_args {
+            final_args.extend(extras.iter().cloned());
+        }
+        ("sandbox-exec".to_string(), final_args)
+    } else {
+        let mut final_args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        if let Some(extras) = extra_args {
+            final_args.extend(extras.iter().cloned());
+        }
+        (program.to_string(), final_args)
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let (real_program, real_args) = {
+        let mut final_args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        if let Some(extras) = extra_args {
+            final_args.extend(extras.iter().cloned());
+        }
+        (program.to_string(), final_args)
+    };
+
+    let mut cmd = tokio::process::Command::new(real_program);
+    cmd.args(&real_args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-
-    if let Some(extras) = extra_args {
-        cmd.args(extras);
-    }
 
     tokio::time::timeout(timeout, cmd.output())
         .await
