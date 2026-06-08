@@ -81,11 +81,13 @@ async fn mcp_source_task(
     debug!("mcp_source: base_url={base_url}");
 
     let socket_path = base_url.strip_prefix("unix://");
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
+    let builder = reqwest::Client::builder().timeout(Duration::from_secs(5));
     #[cfg(unix)]
-    if let Some(path) = socket_path {
-        builder = builder.unix_socket(path);
-    }
+    let builder = if let Some(path) = socket_path {
+        builder.unix_socket(path)
+    } else {
+        builder
+    };
     let client = builder.build().expect("reqwest client build failed");
 
     let request_base_url = if socket_path.is_some() {

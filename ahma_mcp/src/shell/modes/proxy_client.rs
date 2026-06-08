@@ -7,7 +7,9 @@
 use crate::transport_patch::PatchedStdioTransport;
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
-use rmcp::service::{RoleClient, RoleServer, TxJsonRpcMessage};
+#[cfg(unix)]
+use rmcp::service::RoleClient;
+use rmcp::service::{RoleServer, TxJsonRpcMessage};
 use rmcp::transport::Transport;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -24,6 +26,9 @@ pub async fn run_proxy_client(uds_path: Option<&str>, http_url: Option<&str>) ->
         tracing::info!("Proxying stdio to HTTP server: {}", url);
         return run_proxy_client_http(url).await;
     }
+
+    #[cfg(not(unix))]
+    let _ = uds_path;
 
     Err(anyhow!("No socket or HTTP URL provided for proxy client"))
 }

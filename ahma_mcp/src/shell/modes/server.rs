@@ -260,6 +260,8 @@ pub async fn get_bridge_version(
     {
         return Some(ver);
     }
+    #[cfg(not(unix))]
+    let _ = socket_path;
     None
 }
 
@@ -307,6 +309,8 @@ pub async fn trigger_bridge_restart(socket_path: Option<&str>, http_url: Option<
     {
         return true;
     }
+    #[cfg(not(unix))]
+    let _ = socket_path;
     false
 }
 
@@ -510,7 +514,6 @@ async fn spawn_background_bridge(
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
