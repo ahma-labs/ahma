@@ -157,6 +157,9 @@ pub struct AppConfig {
     pub idle_timeout_secs: Option<u64>,
     /// Maximum concurrent HTTP server sessions.
     pub max_sessions: usize,
+    /// True when this process was launched as a child server subprocess (--server-child flag or AHMA_SERVER_CHILD env var).
+    /// Prevents the child from itself trying to spawn a background bridge and become a proxy client.
+    pub is_server_child: bool,
 }
 
 impl Default for AppConfig {
@@ -199,6 +202,7 @@ impl Default for AppConfig {
             instance_label: "ahma".to_string(),
             idle_timeout_secs: Some(10),
             max_sessions: 10,
+            is_server_child: false,
         }
     }
 }
@@ -2488,6 +2492,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         instance_label,
         idle_timeout_secs,
         max_sessions: cli.max_sessions.unwrap_or(10),
+        is_server_child: cli.server_child || std::env::var("AHMA_SERVER_CHILD").is_ok(),
     }
 }
 
@@ -2929,6 +2934,7 @@ mod tests {
             instance_label: "ahma".to_string(),
             idle_timeout_secs: Some(10),
             max_sessions: 10,
+            is_server_child: false,
         }
     }
 

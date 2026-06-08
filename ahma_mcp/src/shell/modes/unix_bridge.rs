@@ -95,7 +95,7 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
     server_args.push("stdio".to_string());
 
     for bundle in &config.tool_bundles {
-        server_args.push("--tool".to_string());
+        server_args.push("--tools".to_string());
         server_args.push(bundle.clone());
     }
 
