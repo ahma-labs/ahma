@@ -155,10 +155,21 @@ jobs:
             exit 1
           fi
 
-      - name: Install cargo-nextest and sccache
+      - name: Install cargo-nextest
         uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
         with:
-          tool: nextest,sccache
+          tool: nextest
+
+      - name: Install sccache (non-macOS)
+        if: runner.os != 'macOS'
+        uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
+        with:
+          tool: sccache
+
+      - name: Install sccache (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          [ -x "$HOME/.cargo/bin/sccache" ] || cargo install sccache
 
       - name: Add Cargo Bin to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -330,10 +341,14 @@ jobs:
           rustflags: ""
           cache: false
 
-      - name: Install cargo-nextest and sccache
+      - name: Install cargo-nextest
         uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
         with:
-          tool: nextest,sccache
+          tool: nextest
+
+      - name: Install sccache (macOS)
+        run: |
+          [ -x "$HOME/.cargo/bin/sccache" ] || cargo install sccache
 
       - name: Install cargo-ndk
         run: |
@@ -604,11 +619,16 @@ jobs:
             exit 1
           fi
 
-      - name: Install sccache
-        if: "!matrix.use_cross"
+      - name: Install sccache (non-macOS)
+        if: "!matrix.use_cross && runner.os != 'macOS'"
         uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
         with:
           tool: sccache
+
+      - name: Install sccache (macOS)
+        if: "!matrix.use_cross && runner.os == 'macOS'"
+        run: |
+          [ -x "$HOME/.cargo/bin/sccache" ] || cargo install sccache
 
       - name: Install cross (for cross-compilation)
         if: matrix.use_cross
