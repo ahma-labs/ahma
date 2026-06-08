@@ -23,6 +23,7 @@ fn create_test_session_manager(default_scope: Option<PathBuf>) -> SessionManager
         default_scope,
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        max_sessions: 10,
     };
     SessionManager::new(config)
 }

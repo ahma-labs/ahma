@@ -174,15 +174,11 @@ async fn start_background_server() -> Result<ResolvedConnection> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ahma"));
     let mut cmd = tokio::process::Command::new(&exe);
 
+    cmd.arg("serve");
     #[cfg(unix)]
     {
-        cmd.arg("serve").arg("unix");
         // Detach from parent process group
         cmd.process_group(0);
-    }
-    #[cfg(not(unix))]
-    {
-        cmd.arg("serve").arg("http");
     }
 
     cmd.stdin(std::process::Stdio::null())
@@ -575,7 +571,7 @@ async fn handle_existing_candidate(
             {
                 use std::os::unix::process::CommandExt;
                 let err = cmd.exec();
-                return Err(anyhow::anyhow!("Failed to re-exec TUI process: {}", err));
+                Err(anyhow::anyhow!("Failed to re-exec TUI process: {}", err))
             }
             #[cfg(not(unix))]
             {

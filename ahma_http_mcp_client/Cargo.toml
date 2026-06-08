@@ -12,6 +12,7 @@ ahma_common = { path = "../ahma_common" }
 anyhow.workspace = true
 async-stream = "0.3"
 async-trait.workspace = true
+dirs.workspace = true
 futures.workspace = true
 oauth2 = { version = "5.0", features = ["reqwest"] }
 reqwest = { workspace = true, features = ["json", "stream", "http3"] }

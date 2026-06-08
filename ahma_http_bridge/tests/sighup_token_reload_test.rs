@@ -19,6 +19,7 @@
 mod common;
 
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+use common::SandboxTestEnv;
 use common::server::resolve_binary_path;
 use reqwest::Client;
 use std::process::{Command, Stdio};
@@ -36,14 +37,28 @@ fn spawn_auth_server(token_file: &NamedTempFile) -> Result<(std::process::Child,
     let sandbox_dir = tempdir().map_err(|e| e.to_string())?;
     let binary_path = resolve_binary_path()?;
 
-    let mut child = Command::new(&binary_path)
-        .args(["serve", "http", "--port", "0"])
-        .env("AHMA_SYNC", "1")
-        .env("AHMA_LOG_TARGET", "stderr")
-        .env("AHMA_TOOLS_DIR", tools_dir.path())
-        .env("AHMA_SANDBOX_SCOPE", sandbox_dir.path())
-        .env("AHMA_REQUIRE_TOKEN", INITIAL_TOKEN)
-        .env("AHMA_REQUIRE_TOKEN_PATH", token_file.path())
+    let mut cmd = Command::new(&binary_path);
+    cmd.args([
+        "--sync",
+        "--log-to-stderr",
+        "--tools-dir",
+        &tools_dir.path().to_string_lossy(),
+        "--sandbox-scope",
+        &sandbox_dir.path().to_string_lossy(),
+        "--require-token",
+        INITIAL_TOKEN,
+        "--require-token-path",
+        &token_file.path().to_string_lossy(),
+        "serve",
+        "http",
+        "--port",
+        "0",
+    ]);
+
+    SandboxTestEnv::configure(&mut cmd);
+    SandboxTestEnv::apply_nested_sandbox_override(&mut cmd);
+
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

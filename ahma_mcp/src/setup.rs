@@ -668,7 +668,72 @@ async fn setup_agent_skills(interactive: bool) -> Result<()> {
         println!("✓ Installed ahma skill to {}", skill_path.display());
         println!();
     }
+
+    setup_llm_prompts(interactive).await?;
+
     Ok(())
+}
+
+async fn setup_llm_prompts(interactive: bool) -> Result<()> {
+    use ahma_common::prompts::AhmaPrompts;
+    use std::fs;
+
+    let Some(path) = ahma_common::prompts::global_prompts_path() else {
+        return Ok(());
+    };
+
+    let new_template = AhmaPrompts::generate_template();
+
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, &new_template)?;
+        if interactive {
+            println!("✓ Created global LLM prompts file at {}", path.display());
+            println!();
+        }
+    } else {
+        let current_content = fs::read_to_string(&path)?;
+        if current_content != new_template {
+            if interactive {
+                println!(
+                    "\nNotice: A new version of default prompts is available, or your global prompts file has been modified."
+                );
+                if prompt_yes_no_setup("Would you like to replace ~/.ahma/prompts.toml with the latest default template? (A backup will be created) [y/N]: ").await? {
+                    let backup_path = path.with_extension("toml.bak");
+                    if backup_path.exists() {
+                        let _ = fs::remove_file(&backup_path);
+                    }
+                    fs::rename(&path, &backup_path)?;
+                    fs::write(&path, &new_template)?;
+                    println!("✓ Updated ~/.ahma/prompts.toml. Old version backed up to {}", backup_path.display());
+                    println!();
+                } else {
+                    println!("Keeping existing ~/.ahma/prompts.toml intact.");
+                    println!();
+                }
+            } else {
+                println!(
+                    "Notice: Your global prompts file (~/.ahma/prompts.toml) differs from compiled-in defaults. Run 'ahma prompts update' to overwrite with defaults."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn prompt_yes_no_setup(prompt: &str) -> Result<bool> {
+    let prompt = prompt.to_string();
+    tokio::task::spawn_blocking(move || {
+        print!("{prompt}");
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim().to_lowercase();
+        Ok(trimmed == "y" || trimmed == "yes")
+    })
+    .await?
 }
 
 /// Installs the ahma skill as a Claude Code plugin by writing files into

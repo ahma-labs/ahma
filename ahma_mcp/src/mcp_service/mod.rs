@@ -74,6 +74,8 @@ use crate::{
     callback_system::CallbackSender,
     client_type::McpClientType,
     config::ToolConfig,
+    file_ops::{DefaultFileOpsProvider, DefaultWebPageFetcher, FileOpsProvider, WebPageFetcher},
+    llm_service::{DefaultLlmCompletionService, LlmCompletionService},
     mcp_callback::McpCallbackSender,
     operation_monitor::{Operation, OperationStatus},
 };
@@ -182,6 +184,12 @@ pub struct AhmaMcpService {
     pub current_tools_dir: Arc<RwLock<Option<std::path::PathBuf>>>,
     /// Registered handlers for extension tool types (e.g. task_tree, decompose)
     pub extension_handlers: Arc<std::sync::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>>>,
+    /// Custom file operations backend.
+    pub file_ops_provider: Arc<dyn FileOpsProvider>,
+    /// Custom web page fetcher.
+    pub web_page_fetcher: Arc<dyn WebPageFetcher>,
+    /// Custom LLM completion service.
+    pub llm_service: Arc<dyn LlmCompletionService>,
 }
 
 impl AhmaMcpService {
@@ -244,7 +252,14 @@ impl AhmaMcpService {
     fn is_sync_meta_tool_for_protocol_cancel(tool_name: &str) -> bool {
         matches!(
             tool_name,
-            "await" | "status" | "cancel" | "logs_list" | "logs_read" | "logs_search" | "restart"
+            "await"
+                | "status"
+                | "cancel"
+                | "logs_list"
+                | "logs_approve"
+                | "logs_read"
+                | "logs_search"
+                | "restart"
         )
     }
 
@@ -460,7 +475,28 @@ impl AhmaMcpService {
                     .unwrap()
                     .clone(),
             )),
+            file_ops_provider: Arc::new(DefaultFileOpsProvider),
+            web_page_fetcher: Arc::new(DefaultWebPageFetcher),
+            llm_service: Arc::new(DefaultLlmCompletionService),
         })
+    }
+
+    /// Sets a custom file operations provider.
+    pub fn with_file_ops_provider(mut self, provider: Arc<dyn FileOpsProvider>) -> Self {
+        self.file_ops_provider = provider;
+        self
+    }
+
+    /// Sets a custom web page fetcher.
+    pub fn with_web_page_fetcher(mut self, fetcher: Arc<dyn WebPageFetcher>) -> Self {
+        self.web_page_fetcher = fetcher;
+        self
+    }
+
+    /// Sets a custom LLM completion service.
+    pub fn with_llm_service(mut self, service: Arc<dyn LlmCompletionService>) -> Self {
+        self.llm_service = service;
+        self
     }
 
     /// Store the AppConfig that constructed this service so runtime events
@@ -614,6 +650,7 @@ impl AhmaMcpService {
         "run_terminal_command",
         "cancel",
         "logs_list",
+        "logs_approve",
         "logs_read",
         "logs_search",
         "restart",
@@ -1071,6 +1108,12 @@ impl ServerHandler for AhmaMcpService {
                 )
                 .with_title("logs_list"),
                 Tool::new(
+                    "logs_approve",
+                    "Approve a blocked out-of-scope log symlink target to allow AI read access.",
+                    handlers::log_tools::logs_approve_schema(),
+                )
+                .with_title("logs_approve"),
+                Tool::new(
                     "logs_read",
                     "Read lines from a project log file with optional pagination. Sensitive values (tokens, passwords, API keys) are redacted by default. Use `raw: true` only when debugging credential issues.",
                     handlers::log_tools::logs_read_schema(),
@@ -1187,6 +1230,10 @@ impl ServerHandler for AhmaMcpService {
 
                 "logs_list" => {
                     self.handle_logs_list(params.arguments.unwrap_or_default())
+                        .await
+                }
+                "logs_approve" => {
+                    self.handle_logs_approve(params.arguments.unwrap_or_default())
                         .await
                 }
                 "logs_read" => {
@@ -1349,6 +1396,7 @@ impl AhmaMcpService {
 
         let op_id_clone = op_id.clone();
         let monitor_clone = monitor.clone();
+        let llm_service_clone = self.llm_service.clone();
         tokio::spawn(async move {
             monitor_clone
                 .update_status(&op_id_clone, OperationStatus::InProgress, None)
@@ -1366,6 +1414,7 @@ impl AhmaMcpService {
                 cancellation_token,
                 cb_ref,
                 monitor_clone.clone(),
+                llm_service_clone,
             )
             .await;
 
@@ -1408,20 +1457,25 @@ impl AhmaMcpService {
         Ok((config, flattened_subcommand))
     }
 
-    fn get_extension_key(config: &ToolConfig) -> Option<&'static str> {
+    fn get_extension_key(&self, config: &ToolConfig) -> Option<String> {
         if config.tool_type == Some(crate::config::ToolType::Extension) {
             if config.task_tree.is_some() {
-                Some("task_tree")
-            } else if config.decompose.is_some() {
-                Some("decompose")
-            } else if config.worker.is_some() {
-                Some("worker")
-            } else {
-                None
+                return Some("task_tree".to_string());
             }
-        } else {
-            None
+            if config.decompose.is_some() {
+                return Some("decompose".to_string());
+            }
+            if config.worker.is_some() {
+                return Some("worker".to_string());
+            }
+            let handlers = self.extension_handlers.read().unwrap();
+            for key in config.extra.keys() {
+                if handlers.contains_key(key) {
+                    return Some(key.clone());
+                }
+            }
         }
+        None
     }
 
     async fn dispatch_resolved_configured_tool(
@@ -1431,8 +1485,8 @@ impl AhmaMcpService {
         config: ToolConfig,
         flattened_subcommand: Option<String>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(key) = Self::get_extension_key(&config) {
-            let handler_opt = self.extension_handlers.read().unwrap().get(key).cloned();
+        if let Some(key) = self.get_extension_key(&config) {
+            let handler_opt = self.extension_handlers.read().unwrap().get(&key).cloned();
             if let Some(handler) = handler_opt {
                 return handler
                     .call(
@@ -1661,6 +1715,7 @@ impl AhmaMcpService {
             self.operation_monitor.clone(),
             self.adapter.sandbox_arc(),
             callback,
+            self.llm_service.clone(),
         )
         .await
         {
@@ -2292,20 +2347,11 @@ mod tests {
             description: "DESC".to_string(),
             command: "echo".to_string(),
             subcommand: Some(vec![SubcommandConfig {
+                extra: Default::default(),
                 name: "default".to_string(),
                 description: "d".to_string(),
-                subcommand: None,
-                options: None,
-                positional_args: None,
-                positional_args_first: None,
-                timeout_seconds: None,
-                synchronous: None,
                 enabled: true,
-                guidance_key: None,
-                sequence: None,
-                step_delay_ms: None,
-                availability_check: None,
-                install_instructions: None,
+                ..Default::default()
             }]),
             input_schema: None,
             timeout_seconds: None,

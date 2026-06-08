@@ -109,8 +109,8 @@ fn do_setup_logging(
     log_to_file: bool,
     observability: Option<ObservabilityConfig>,
 ) {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("{log_level},ahma_mcp=debug")));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
     // Build the OTEL layer (no-op when no endpoint is configured).
     let (otel_layer, guard) = {

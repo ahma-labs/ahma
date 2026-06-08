@@ -434,9 +434,21 @@ fn save_token(token: &StoredToken) -> Result<()> {
     let path = token_file_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
     }
 
-    let file = fs::File::create(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path)?;
     let mut writer = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut writer, token)?;
     writer.flush()?;
@@ -447,7 +459,9 @@ fn token_file_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os(TOKEN_PATH_ENV) {
         return Ok(PathBuf::from(path));
     }
-    Ok(env::temp_dir().join(TOKEN_FILE_NAME))
+    let home = dirs::home_dir()
+        .ok_or_else(|| McpHttpError::Custom("Could not determine home directory".to_string()))?;
+    Ok(home.join(".ahma").join(TOKEN_FILE_NAME))
 }
 
 #[cfg(test)]
@@ -523,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn token_file_path_uses_temp_dir_default() {
+    fn token_file_path_uses_home_dir_default() {
         let _guard = token_env_guard().lock().unwrap();
         unsafe {
             env::remove_var(TOKEN_PATH_ENV);
@@ -531,7 +545,7 @@ mod tests {
 
         let path = token_file_path().unwrap();
         assert!(path.ends_with(TOKEN_FILE_NAME));
-        assert!(path.starts_with(env::temp_dir()));
+        assert!(path.starts_with(dirs::home_dir().unwrap().join(".ahma")));
     }
 
     #[test]

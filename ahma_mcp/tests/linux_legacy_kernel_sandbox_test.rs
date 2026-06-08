@@ -13,7 +13,7 @@ fn landlock_unavailable() -> bool {
 }
 
 fn build_binary() -> std::path::PathBuf {
-    build_binary_cached("ahma_mcp", "ahma")
+    build_binary_cached("ahma_bin", "ahma")
 }
 
 #[test]
@@ -26,15 +26,15 @@ fn test_no_sandbox_warns_and_runs_on_legacy_kernel() {
     let binary = build_binary();
     let output = Command::new(&binary)
         .current_dir(workspace_dir())
-        .env("AHMA_DISABLE_SANDBOX", "1")
         .args([
+            "--no-sandbox",
             "--log-to-stderr",
             "run_terminal_command",
             "--",
             "echo legacy-kernel-fallback",
         ])
         .output()
-        .expect("Failed to run ahma_mcp with AHMA_DISABLE_SANDBOX");
+        .expect("Failed to run ahma_mcp with --no-sandbox");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);

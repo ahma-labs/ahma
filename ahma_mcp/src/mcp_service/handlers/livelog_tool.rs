@@ -40,6 +40,7 @@ pub async fn handle_livelog_start(
     monitor: Arc<OperationMonitor>,
     sandbox: Arc<Sandbox>,
     callback: Option<Box<dyn CallbackSender>>,
+    llm_service: Arc<dyn crate::llm_service::LlmCompletionService>,
 ) -> Result<String> {
     let livelog = config.livelog.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -89,6 +90,7 @@ pub async fn handle_livelog_start(
     let livelog_config = livelog.clone();
     let monitor_task = monitor.clone();
     let sandbox_task = sandbox.clone();
+    let llm_service_task = llm_service.clone();
 
     tokio::spawn(async move {
         // Retrieve the cancellation token from the monitor (set when the operation
@@ -122,6 +124,7 @@ pub async fn handle_livelog_start(
             cancellation_token,
             cb_ref,
             monitor_task.clone(),
+            llm_service_task,
         )
         .await;
 

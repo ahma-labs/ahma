@@ -54,7 +54,7 @@ fn get_workspace_dir() -> PathBuf {
 /// Resolve ahma_mcp binary path once per test process.
 fn get_ahma_mcp_binary() -> PathBuf {
     AHMA_MCP_BINARY
-        .get_or_init(|| build_binary_cached("ahma_mcp", "ahma"))
+        .get_or_init(|| build_binary_cached("ahma_bin", "ahma"))
         .clone()
 }
 

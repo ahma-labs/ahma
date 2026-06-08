@@ -49,7 +49,7 @@ fn find_available_port() -> u16 {
 }
 
 fn get_ahma_mcp_binary() -> PathBuf {
-    ahma_mcp::test_utils::cli::build_binary_cached("ahma_mcp", "ahma")
+    ahma_mcp::test_utils::cli::build_binary_cached("ahma_bin", "ahma")
 }
 
 async fn start_deferred_sandbox_server(
@@ -63,12 +63,18 @@ async fn start_deferred_sandbox_server(
         .to_path_buf();
 
     let mut cmd = Command::new(&binary);
-    cmd.args(["serve", "http", "--port", &port.to_string()])
-        .current_dir(&workspace)
-        .env("AHMA_SYNC", "1")
-        .env("AHMA_TOOLS_DIR", &*tools_dir.to_string_lossy())
-        .env("AHMA_SANDBOX_DEFER", "1")
-        .env("AHMA_LOG_TARGET", "stderr");
+    cmd.args([
+        "--sync",
+        "--tools-dir",
+        &*tools_dir.to_string_lossy(),
+        "--defer-sandbox",
+        "--log-to-stderr",
+        "serve",
+        "http",
+        "--port",
+        &port.to_string(),
+    ])
+    .current_dir(&workspace);
 
     SandboxTestEnv::configure(&mut cmd);
     SandboxTestEnv::apply_nested_sandbox_override(&mut cmd);

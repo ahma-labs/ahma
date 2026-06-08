@@ -46,7 +46,8 @@ pub(super) async fn evaluate_tool_availability_impl(
         });
     }
 
-    let outcomes = execute_probes(shell_pool, plans).await;
+    let sandbox_arc = Arc::new(sandbox.clone());
+    let outcomes = execute_probes(shell_pool, plans, sandbox_arc).await;
     let (disabled_tools, disabled_subcommands) =
         process_probe_outcomes(outcomes, &mut filtered_configs);
 
@@ -100,12 +101,14 @@ fn process_probe_outcomes(
 async fn execute_probes(
     shell_pool: Arc<ShellPoolManager>,
     plans: Vec<ProbePlan>,
+    sandbox: Arc<crate::sandbox::Sandbox>,
 ) -> Vec<ProbeOutcome> {
     let probe_tasks: Vec<_> = plans
         .into_iter()
         .map(|plan| {
             let shell_pool = shell_pool.clone();
-            tokio::spawn(async move { plan.execute(shell_pool).await })
+            let sandbox = sandbox.clone();
+            tokio::spawn(async move { plan.execute(shell_pool, &sandbox).await })
         })
         .collect();
 

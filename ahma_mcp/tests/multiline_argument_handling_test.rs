@@ -130,8 +130,6 @@ async fn test_multiline_argument_with_echo() {
     let echo_config = SubcommandConfig {
         name: "default".to_string(),
         description: "Echo command".to_string(),
-        options: None,
-        positional_args_first: None,
         positional_args: Some(vec![CommandOption {
             name: "text".to_string(),
             alias: None,
@@ -143,17 +141,8 @@ async fn test_multiline_argument_with_echo() {
             file_arg: None, // Echo doesn't support files, should use escaping
             file_flag: None,
         }]),
-        synchronous: None,
-        timeout_seconds: None,
         enabled: true,
-        guidance_key: None,
-        subcommand: None,
-
-        sequence: None,
-
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     };
 
     // Test with a multi-line string that should trigger escaping
@@ -458,19 +447,9 @@ async fn test_multiline_git_commit_message() {
             file_arg: Some(true),
             file_flag: Some("-F".to_string()),
         }]),
-        positional_args_first: None,
-        positional_args: None,
         synchronous: Some(true), // Changed to async for proper operation tracking
-        timeout_seconds: None,
         enabled: true,
-        guidance_key: None,
-        subcommand: None,
-
-        sequence: None,
-
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     };
 
     // Test with a multi-line commit message that should trigger file-based handling
@@ -599,8 +578,6 @@ async fn test_special_characters_in_arguments() {
     let echo_config = SubcommandConfig {
         name: "echo".to_string(),
         description: "Display a line of text".to_string(),
-        options: None,
-        positional_args_first: None,
         positional_args: Some(vec![CommandOption {
             name: "text".to_string(),
             alias: None,
@@ -612,17 +589,8 @@ async fn test_special_characters_in_arguments() {
             file_arg: None, // No file support, should use escaping
             file_flag: None,
         }]),
-        synchronous: None,
-        timeout_seconds: None,
         enabled: true,
-        guidance_key: None,
-        subcommand: None,
-
-        sequence: None,
-
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     };
 
     // Test with text containing special characters

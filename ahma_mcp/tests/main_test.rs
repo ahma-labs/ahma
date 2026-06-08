@@ -343,34 +343,18 @@ mod main_tests {
             SubcommandConfig {
                 name: "build".to_string(),
                 description: "Build the project".to_string(),
-                guidance_key: None,
-                subcommand: None,
-                sequence: None,
-                step_delay_ms: None,
                 timeout_seconds: Some(300),
-                options: None,
-                positional_args_first: None,
-                positional_args: None,
                 synchronous: Some(true),
                 enabled: true,
-                availability_check: None,
-                install_instructions: None,
+                ..Default::default()
             },
             SubcommandConfig {
                 name: "check".to_string(),
                 description: "Check the project".to_string(),
-                guidance_key: None,
-                subcommand: None,
-                sequence: None,
-                step_delay_ms: None,
                 timeout_seconds: Some(60),
-                options: None,
-                positional_args_first: None,
-                positional_args: None,
                 synchronous: Some(true),
                 enabled: true,
-                availability_check: None,
-                install_instructions: None,
+                ..Default::default()
             },
         ];
 

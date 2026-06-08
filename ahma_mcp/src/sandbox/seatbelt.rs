@@ -69,7 +69,7 @@ impl Sandbox {
 
     fn get_macos_read_scopes_rules(&self) -> String {
         let mut rules = String::new();
-        for scope in &self.read_scopes {
+        for scope in &self.read_scopes() {
             rules.push_str(&format!(
                 "(allow file-read* (subpath \"{}\"))\n",
                 scope.display()

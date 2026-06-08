@@ -91,7 +91,6 @@ pub fn build_binary_cached(package: &str, binary: &str) -> PathBuf {
 /// The caller must add the appropriate subcommand (e.g., `serve stdio`, `run`, `tool list`).
 pub fn test_command(binary: &Path) -> Command {
     let mut cmd = Command::new(binary);
-    cmd.env("AHMA_DISABLE_SANDBOX", "1");
-    cmd.env("AHMA_SKIP_PROBES", "1");
+    cmd.args(["--no-sandbox", "--skip-probes"]);
     cmd
 }

@@ -67,11 +67,11 @@ impl DecomposeOrchestrator {
         let max = self.cfg.max_subtasks.unwrap_or(5);
         let timeout = Duration::from_secs(self.cfg.llm_timeout_seconds.unwrap_or(30));
 
-        let split_prompt = format!(
-            "Break the following question into at most {max} distinct, self-contained sub-questions \
-             that together cover the full answer. Return ONLY the sub-questions, one per line, \
-             numbered like '1. ...' No other text.\n\nQuestion: {question}"
-        );
+        let prompts = ahma_common::prompts::AhmaPrompts::load();
+        let split_prompt = prompts
+            .split_prompt()
+            .replace("{max}", &max.to_string())
+            .replace("{question}", question);
 
         let raw = self
             .client

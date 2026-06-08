@@ -28,8 +28,14 @@ fn build_binary(package: &str, binary: &str) -> PathBuf {
 /// Create a command for a binary with test mode enabled (bypasses sandbox checks)
 fn test_command(binary: &PathBuf) -> Command {
     let mut cmd = Command::new(binary);
-    cmd.env("AHMA_DISABLE_SANDBOX", "1");
-    cmd.env("AHMA_SKIP_PROBES", "1");
+    let workspace = workspace_dir();
+    let tools_dir = workspace.join(".ahma");
+    cmd.args([
+        "--no-sandbox",
+        "--skip-probes",
+        "--tools-dir",
+        tools_dir.to_str().unwrap(),
+    ]);
     cmd.env_remove("AHMA_SANDBOX_SCOPE");
     cmd.env_remove("AHMA_WORKING_DIRS");
     cmd
@@ -43,13 +49,10 @@ mod file_tools_tests {
         skip_if_disabled!("run_terminal_command");
 
         let binary = build_binary("ahma_mcp", "ahma");
-        let workspace = workspace_dir();
-        let tools_dir = workspace.join(".ahma");
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
         let output = test_command(&binary)
             .current_dir(temp_dir.path())
-            .env("AHMA_TOOLS_DIR", &tools_dir)
             .args(["tool", "run", "run_terminal_command", "pwd"])
             .output()
             .expect("Failed to execute pwd via run_terminal_command");
@@ -79,15 +82,12 @@ mod file_tools_tests {
         skip_if_disabled!("run_terminal_command");
 
         let binary = build_binary("ahma_mcp", "ahma");
-        let workspace = workspace_dir();
-        let tools_dir = workspace.join(".ahma");
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let test_file = "test_file.txt";
 
         // 1. Touch a file
         let output_touch = test_command(&binary)
             .current_dir(temp_dir.path())
-            .env("AHMA_TOOLS_DIR", &tools_dir)
             .args([
                 "tool",
                 "run",
@@ -112,7 +112,6 @@ mod file_tools_tests {
         // 2. List the file
         let output_ls = test_command(&binary)
             .current_dir(temp_dir.path())
-            .env("AHMA_TOOLS_DIR", &tools_dir)
             .args([
                 "tool",
                 "run",
@@ -141,8 +140,6 @@ mod file_tools_tests {
         skip_if_disabled!("run_terminal_command");
 
         let binary = build_binary("ahma_mcp", "ahma");
-        let workspace = workspace_dir();
-        let tools_dir = workspace.join(".ahma");
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
         let source_file = "source.txt";
@@ -156,7 +153,6 @@ mod file_tools_tests {
         // 1. Copy file
         let output_cp = test_command(&binary)
             .current_dir(temp_dir.path())
-            .env("AHMA_TOOLS_DIR", &tools_dir)
             .args([
                 "tool",
                 "run",
@@ -180,7 +176,6 @@ mod file_tools_tests {
         // 2. Move file
         let output_mv = test_command(&binary)
             .current_dir(temp_dir.path())
-            .env("AHMA_TOOLS_DIR", &tools_dir)
             .args([
                 "tool",
                 "run",
@@ -211,8 +206,6 @@ mod file_tools_tests {
         skip_if_disabled!("run_terminal_command");
 
         let binary = build_binary("ahma_mcp", "ahma");
-        let workspace = workspace_dir();
-        let tools_dir = workspace.join(".ahma");
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let test_file = "to_delete.txt";
 
@@ -222,7 +215,6 @@ mod file_tools_tests {
         // Remove file
         let output_rm = test_command(&binary)
             .current_dir(temp_dir.path())
-            .env("AHMA_TOOLS_DIR", &tools_dir)
             .args([
                 "tool",
                 "run",
@@ -249,8 +241,6 @@ mod file_tools_tests {
         skip_if_disabled!("run_terminal_command");
 
         let binary = build_binary("ahma_mcp", "ahma");
-        let workspace = workspace_dir();
-        let tools_dir = workspace.join(".ahma");
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let test_file = "content.txt";
         let content = "Hello World\nAnother Line\nTarget String";
@@ -261,7 +251,6 @@ mod file_tools_tests {
         // 1. Cat file
         let output_cat = test_command(&binary)
             .current_dir(temp_dir.path())
-            .env("AHMA_TOOLS_DIR", &tools_dir)
             .args([
                 "tool",
                 "run",
@@ -285,7 +274,6 @@ mod file_tools_tests {
         // 2. Grep file
         let output_grep = test_command(&binary)
             .current_dir(temp_dir.path())
-            .env("AHMA_TOOLS_DIR", &tools_dir)
             .args([
                 "tool",
                 "run",
@@ -319,13 +307,10 @@ mod run_terminal_command_tests {
     fn test_run_terminal_command_echo() {
         skip_if_disabled!("run_terminal_command");
         let binary = build_binary("ahma_mcp", "ahma");
-        let workspace = workspace_dir();
-        let tools_dir = workspace.join(".ahma");
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
         let output = test_command(&binary)
             .current_dir(temp_dir.path())
-            .env("AHMA_TOOLS_DIR", &tools_dir)
             .args([
                 "tool",
                 "run",
@@ -351,8 +336,6 @@ mod run_terminal_command_tests {
     fn test_run_terminal_command_write_file() {
         skip_if_disabled!("run_terminal_command");
         let binary = build_binary("ahma_mcp", "ahma");
-        let workspace = workspace_dir();
-        let tools_dir = workspace.join(".ahma");
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
         let test_file = "shell_created.txt";
 
@@ -367,7 +350,6 @@ mod run_terminal_command_tests {
 
         let output = test_command(&binary)
             .current_dir(temp_dir.path())
-            .env("AHMA_TOOLS_DIR", &tools_dir)
             .args(["tool", "run", "run_terminal_command", &script])
             .output()
             .expect("Failed to execute run_terminal_command");

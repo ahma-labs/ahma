@@ -24,7 +24,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn build_binary() -> std::path::PathBuf {
-    build_binary_cached("ahma_mcp", "ahma")
+    build_binary_cached("ahma_bin", "ahma")
 }
 
 // ============================================================================
@@ -76,6 +76,7 @@ mod mode_flags {
     /// which is written via `eprintln!` immediately after binding (independent of
     /// `RUST_LOG` level).  No timing luck required: we block until we see the
     /// sentinel or a 30-second deadline expires.
+    #[cfg(unix)]
     #[test]
     fn test_mode_http_explicit() {
         use std::io::BufRead as _;
@@ -699,6 +700,7 @@ mod tools_dir_flag {
 // HTTP Mode Specific Tests
 // ============================================================================
 
+#[cfg(unix)]
 mod http_mode {
     use super::*;
 

@@ -334,6 +334,7 @@ for line in sys.stdin:
         default_scope: Some(temp_dir.path().to_path_buf()),
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        max_sessions: 100,
     }));
 
     let session_id = sm.create_session().await.expect("create session");

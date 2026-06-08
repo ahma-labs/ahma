@@ -446,7 +446,7 @@ async fn test_create_temp_tools_dir() {
 
 #[test]
 fn test_get_binary_path_default_target_dir() {
-    let path = test_utils::cli::get_binary_path("ahma_mcp", "ahma");
+    let path = test_utils::cli::get_binary_path("ahma_bin", "ahma");
     let workspace = test_utils::fs::get_workspace_dir();
     assert!(
         path.starts_with(&workspace),
@@ -507,7 +507,7 @@ fn test_get_binary_path_with_relative_cargo_target_dir() {
         std::env::set_var("CARGO_TARGET_DIR", "target");
     }
 
-    let path = test_utils::cli::get_binary_path("ahma_mcp", "ahma");
+    let path = test_utils::cli::get_binary_path("ahma_bin", "ahma");
 
     if let Some(s) = saved {
         unsafe {
@@ -533,20 +533,20 @@ fn test_get_binary_path_with_relative_cargo_target_dir() {
 
 #[test]
 fn test_build_binary_cached_returns_existing_binary() {
-    let path = test_utils::cli::build_binary_cached("ahma_mcp", "ahma");
+    let path = test_utils::cli::build_binary_cached("ahma_bin", "ahma");
     assert!(path.exists(), "ahma binary should exist at {:?}", path);
 }
 
 #[test]
 fn test_build_binary_cached_cache_hit() {
-    let path1 = test_utils::cli::build_binary_cached("ahma_mcp", "ahma");
-    let path2 = test_utils::cli::build_binary_cached("ahma_mcp", "ahma");
+    let path1 = test_utils::cli::build_binary_cached("ahma_bin", "ahma");
+    let path2 = test_utils::cli::build_binary_cached("ahma_bin", "ahma");
     assert_eq!(path1, path2, "Cached paths should be identical");
 }
 
 #[test]
 fn test_test_command_includes_no_sandbox() {
-    let binary = test_utils::cli::build_binary_cached("ahma_mcp", "ahma");
+    let binary = test_utils::cli::build_binary_cached("ahma_bin", "ahma");
     let mut cmd = test_utils::cli::test_command(&binary);
     let output = cmd.arg("--help").output().unwrap();
     assert!(output.status.success());

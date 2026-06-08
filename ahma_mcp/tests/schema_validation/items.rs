@@ -16,7 +16,7 @@ async fn test_array_parameters_must_have_items_property() -> anyhow::Result<()> 
     // Ensure the binary exists (skips build if already present, e.g. on CI).
     // Using build_binary_cached avoids feature-mismatch rebuilds when the CI
     // test runner uses --no-default-features but isn't aware of that here.
-    let binary_path = build_binary_cached("ahma_mcp", "ahma");
+    let binary_path = build_binary_cached("ahma_bin", "ahma");
     eprintln!("Using binary: {}", binary_path.display());
 
     // Create a test client with the real tool configurations (assume new_client is now async)

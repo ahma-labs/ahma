@@ -15,6 +15,7 @@ async fn test_handshake_state_machine_transitions() {
         default_scope: Some(std::path::PathBuf::from(".")),
         enable_colored_output: false,
         handshake_timeout_secs: 5,
+        max_sessions: 100,
     };
     let session_manager = SessionManager::new(config);
     let session_id = session_manager
@@ -59,6 +60,7 @@ async fn test_handshake_state_machine_race_condition_stress() {
         default_scope: Some(std::path::PathBuf::from(".")),
         enable_colored_output: false,
         handshake_timeout_secs: 5,
+        max_sessions: 100,
     };
     let session_manager = Arc::new(SessionManager::new(config));
 

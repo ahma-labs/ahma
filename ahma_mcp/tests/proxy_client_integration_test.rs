@@ -3,7 +3,7 @@ use ahma_mcp::test_utils::fs::get_workspace_dir as workspace_dir;
 use std::time::{Duration, Instant};
 
 fn build_binary() -> std::path::PathBuf {
-    build_binary_cached("ahma_mcp", "ahma")
+    build_binary_cached("ahma_bin", "ahma")
 }
 
 #[tokio::test]
@@ -25,13 +25,19 @@ async fn test_proxy_client_autostart_and_shutdown() {
     // Since it's the first instance, it should start the background bridge Unix socket at socket_str.
     let mut child = tokio::process::Command::new(&binary)
         .current_dir(&workspace)
-        .env("AHMA_DISABLE_SANDBOX", "1")
-        .env("AHMA_UNIX_SOCKET", &socket_str)
-        .env("AHMA_LOG_TARGET", "stderr")
         .env("RUST_LOG", "debug")
+        .env("AHMA_HTTP_PORT", "0")
+        .env("AHMA_UNIX_SOCKET", &socket_str)
         .env_remove("NEXTEST")
         .env_remove("CARGO_MANIFEST_DIR")
-        .args(["serve", "stdio"])
+        .args([
+            "--no-sandbox",
+            "--unix-socket-path",
+            &socket_str,
+            "--log-to-stderr",
+            "serve",
+            "stdio",
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::piped())
@@ -102,12 +108,18 @@ async fn test_proxy_client_autostart_and_shutdown() {
     // Since the Unix socket is already running, it should run as a proxy client.
     let mut child_proxy = tokio::process::Command::new(&binary)
         .current_dir(&workspace)
-        .env("AHMA_DISABLE_SANDBOX", "1")
+        .env("AHMA_HTTP_PORT", "0")
         .env("AHMA_UNIX_SOCKET", &socket_str)
-        .env("AHMA_LOG_TARGET", "stderr")
         .env_remove("NEXTEST")
         .env_remove("CARGO_MANIFEST_DIR")
-        .args(["serve", "stdio"])
+        .args([
+            "--no-sandbox",
+            "--unix-socket-path",
+            &socket_str,
+            "--log-to-stderr",
+            "serve",
+            "stdio",
+        ])
         .stdout(std::process::Stdio::piped())
         .stdin(std::process::Stdio::piped())
         .spawn()

@@ -3,11 +3,13 @@
 //! The top-level [`draw`] function dispatches to either the chat or monitor
 //! layout based on `state.mode`.
 
+#![allow(dead_code)]
+
 #[cfg(feature = "tui")]
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
@@ -40,6 +42,9 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
         draw_picker(frame, picker, theme, full);
     } else if let Some(picker) = &state.model_picker {
         draw_picker(frame, picker, theme, full);
+    }
+    if state.log_files_modal_open {
+        draw_log_files_modal(frame, state, theme, full);
     }
 }
 
@@ -234,8 +239,20 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         0
     };
 
-    // Input height: 1–6 lines depending on content, always at least 3 (borders).
-    let input_lines = state.chat_input_line_count().clamp(1, 6) as u16;
+    // Input height target: 1-6 lines based on wrapped content
+    let inner_width = full.width.saturating_sub(2);
+    let wrapped_line_count = state
+        .chat_input_line_count(inner_width as usize)
+        .clamp(1, 6);
+    state
+        .chat_input_height_target
+        .set(wrapped_line_count as f64);
+
+    let input_lines = state
+        .chat_input_height_current
+        .get()
+        .round()
+        .clamp(1.0, 6.0) as u16;
     let input_h = input_lines + 2; // borders
 
     let [header_a, chat_a, approval_a, input_a, footer_a] = Layout::vertical([
@@ -327,7 +344,15 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         Span::styled(" · ", theme.dim()),
         daemon_span,
         Span::styled(
-            format!("  {}  q quit  ? help", state.transport_label),
+            format!(
+                "  {}  {}",
+                state.transport_label,
+                if state.focus == Focus::Chat {
+                    "/q quit  /? help"
+                } else {
+                    "q quit  ? help"
+                }
+            ),
             theme.dim(),
         ),
     ]);
@@ -350,21 +375,39 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    state.chat_area.set(inner);
+
     if state.chat.is_empty() {
+        state.chat_max_scroll.set(0);
         let hint = chat_history_hint(state);
-        frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, theme.input_placeholder())),
+            inner,
+        );
         return;
     }
 
     let visible_h = inner.height as usize;
     let lines = build_chat_history_lines(state, theme, inner.width as usize);
+    let max_scroll = lines.len().saturating_sub(visible_h);
+    state.chat_max_scroll.set(max_scroll);
+
     let scroll = chat_history_scroll_offset(lines.len(), visible_h, state.chat_scroll);
     let visible_lines: Vec<Line<'static>> =
-        lines.into_iter().skip(scroll).take(visible_h).collect();
+        lines.iter().skip(scroll).take(visible_h).cloned().collect();
     frame.render_widget(
         Paragraph::new(Text::from(visible_lines)).wrap(Wrap { trim: false }),
         inner,
     );
+
+    if lines.len() > visible_h {
+        let sb = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        let mut sb_state = ScrollbarState::new(lines.len()).position(scroll);
+        frame.render_stateful_widget(sb, inner, &mut sb_state);
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -578,9 +621,12 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
         .title(title_left)
         .title(title_right)
         .borders(Borders::ALL)
-        .border_style(border_style);
+        .border_style(border_style)
+        .style(theme.input_bg());
     let inner = block.inner(area);
     frame.render_widget(block, area);
+
+    state.chat_input_area.set(area);
 
     let (cursor_row, cursor_col) = state.chat_input.cursor();
     let mut rendered_lines: Vec<String> = state.chat_input.lines().to_vec();
@@ -594,26 +640,34 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
         } else {
             placeholder.to_string()
         };
-        let para = Paragraph::new(Span::styled(text, theme.dim())).wrap(Wrap { trim: false });
+        let style = theme.input_placeholder().patch(theme.input_bg());
+        let para = Paragraph::new(Span::styled(text, style)).wrap(Wrap { trim: false });
         frame.render_widget(para, inner);
     } else {
         if focused {
             insert_input_cursor(&mut rendered_lines, cursor_row, cursor_col, state.unicode);
         }
         let text = rendered_lines.join("\n");
-        let para = Paragraph::new(Span::styled(text, theme.normal())).wrap(Wrap { trim: false });
+        let style = theme.normal().patch(theme.input_bg());
+        let para = Paragraph::new(Span::styled(text, style)).wrap(Wrap { trim: false });
         frame.render_widget(para, inner);
     }
 }
 
 #[cfg(feature = "tui")]
-fn draw_chat_footer(frame: &mut Frame, _state: &AppState, theme: &Theme, area: Rect) {
+fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let quit_key = if state.focus == Focus::Chat {
+        "/q"
+    } else {
+        "q"
+    };
+
     let keys: &[(&str, &str)] = &[
         ("Enter", "send"),
         ("Shift+Enter", "newline"),
         ("/", "commands"),
         ("Tab", "monitor panels"),
-        ("q", "quit"),
+        (quit_key, "quit"),
     ];
 
     let mut spans: Vec<Span> = vec![];
@@ -633,14 +687,40 @@ fn draw_chat_footer(frame: &mut Frame, _state: &AppState, theme: &Theme, area: R
 #[cfg(feature = "tui")]
 fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
+    if state.log_zoom_enabled {
+        let [header_a, log_a, footer_a] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .areas(full);
+
+        draw_chat_header(frame, state, theme, header_a);
+        draw_log(frame, state, theme, log_a);
+        draw_chat_footer(frame, state, theme, footer_a);
+        return;
+    }
+
     let approval_h: u16 = if let Some(gate) = &state.approval {
         if gate.diff.is_some() { 12 } else { 3 }
     } else {
         0
     };
 
-    // Input height: 1–6 lines depending on content, always at least 3 (borders).
-    let input_lines = state.chat_input_line_count().clamp(1, 6) as u16;
+    // Input height target: 1-6 lines based on wrapped content
+    let inner_width = full.width.saturating_sub(2);
+    let wrapped_line_count = state
+        .chat_input_line_count(inner_width as usize)
+        .clamp(1, 6);
+    state
+        .chat_input_height_target
+        .set(wrapped_line_count as f64);
+
+    let input_lines = state
+        .chat_input_height_current
+        .get()
+        .round()
+        .clamp(1.0, 6.0) as u16;
     let input_h = input_lines + 2; // borders
 
     let [
@@ -829,13 +909,16 @@ fn draw_picker(frame: &mut Frame, picker: &crate::state::PickerState, theme: &Th
     ])
     .areas(inner);
 
-    let filter_text = if picker.filter.is_empty() {
-        " filter: type to narrow".to_string()
+    let (filter_text, filter_style) = if picker.filter.is_empty() {
+        (
+            " filter: type to narrow".to_string(),
+            theme.input_placeholder(),
+        )
     } else {
-        format!(" filter: {}", picker.filter)
+        (format!(" filter: {}", picker.filter), theme.normal())
     };
     frame.render_widget(
-        Paragraph::new(Span::styled(filter_text, theme.dim())),
+        Paragraph::new(Span::styled(filter_text, filter_style)),
         filter_area,
     );
 
@@ -985,7 +1068,14 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         Span::styled(format!(" · {}", state.transport_label), theme.dim()),
         health_span,
         daemon_span,
-        Span::styled("  q quit  ? help", theme.dim()),
+        Span::styled(
+            if state.focus == Focus::Chat {
+                "  /q quit  /? help"
+            } else {
+                "  q quit  ? help"
+            },
+            theme.dim(),
+        ),
     ]);
 
     let para = Paragraph::new(line).style(theme.header_bar());
@@ -1094,6 +1184,8 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    state.ops_area.set(area);
+
     if state.operations.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled("  No active operations", theme.dim())),
@@ -1144,7 +1236,7 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
             .push((ClickTarget::SelectOperation(op_idx), details_a));
 
         // Render Pin button: "[P]"
-        let pin_text = if op.pinned { " [P] " } else { " [P] " };
+        let pin_text = " [P] ";
         let pin_style = if op.pinned {
             theme.running()
         } else {
@@ -1205,7 +1297,7 @@ fn build_ops_dag_item(
     // Subtract some characters for prefix, status, id, etc. to find name_short width
     let prefix_len = prefix.len() + sel_symbol.len();
     let reserved_len = prefix_len + 15 + instance_part.len(); // status + id + spaces + instance_part
-    let name_short = truncate(&op.tool_name, width.saturating_sub(reserved_len));
+    let name_short = truncate(&op.display_name(), width.saturating_sub(reserved_len));
 
     let row_style = if index == state.ops_selected {
         theme.selected_item()
@@ -1244,6 +1336,8 @@ fn draw_detail(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     } else {
         theme.border_unfocused()
     };
+
+    state.detail_area.set(area);
 
     match state.selected_op() {
         None => render_empty_detail(frame, theme, area, border_style),
@@ -1448,62 +1542,283 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         theme.border_unfocused()
     };
 
+    let log_title = if let Some(ref file) = state.active_log_file {
+        format!(" Log: {} ", file)
+    } else {
+        " Log: system ".to_string()
+    };
+    let wrap_str = if state.log_wrap_enabled { "On" } else { "Off" };
+    let zoom_str = if state.log_zoom_enabled { "On" } else { "Off" };
     let filter_indicator = log_filter_indicator(state);
 
     let block = Block::default()
         .title(Span::styled(
-            format!(" Log{filter_indicator} "),
+            format!(
+                "{}{}[Wrap: {} | Zoom: {} | Press 'l' to switch] ",
+                log_title, filter_indicator, wrap_str, zoom_str
+            ),
             theme.title(),
         ))
         .borders(Borders::ALL)
         .border_style(border_style);
 
     let inner = block.inner(area);
+    state.log_area.set(inner);
+
+    // If active log file is selected and not approved, render warning banner
+    if let Some(ref file) = state.active_log_file
+        && let Some(info) = state.log_files.iter().find(|f| &f.name == file)
+        && !info.is_approved
+    {
+        frame.render_widget(block, area);
+        draw_blocked_symlink_banner(frame, file, info, theme, inner);
+        return;
+    }
+
     frame.render_widget(block, area);
 
-    let filtered = state.filtered_log();
-    if filtered.is_empty() {
-        let hint = if state.log.is_empty() {
-            "  Awaiting log events…"
+    // Get lines to display
+    let display_lines = if let Some(ref _file) = state.active_log_file {
+        // Render file lines
+        let mut lines = vec![];
+        let max_width = inner.width.saturating_sub(1) as usize; // leave 1 col margin
+        for raw_line in &state.active_log_lines {
+            let clean_line = raw_line.replace('\t', "    ");
+            if state.log_wrap_enabled && max_width > 0 {
+                for sub_line in wrap_line(&clean_line, max_width) {
+                    lines.push(style_raw_log_line(&sub_line, theme));
+                }
+            } else {
+                lines.push(style_raw_log_line(&clean_line, theme));
+            }
+        }
+        lines
+    } else {
+        // Render system logs (from state.filtered_log())
+        let filtered = state.filtered_log();
+        let mut lines = vec![];
+        let max_width = inner.width.saturating_sub(1) as usize;
+        for e in filtered {
+            let ts = e.timestamp.format("%H:%M:%S").to_string();
+            let level_label = e.level.label();
+            let msg = &e.message;
+            let full_line = format!("{} {} {}", ts, level_label, msg);
+            if state.log_wrap_enabled && max_width > 0 {
+                for sub_line in wrap_line(&full_line, max_width) {
+                    lines.push(style_system_log_line(&sub_line, &ts, level_label, theme));
+                }
+            } else {
+                lines.push(style_system_log_line(&full_line, &ts, level_label, theme));
+            }
+        }
+        lines
+    };
+
+    if display_lines.is_empty() {
+        state.log_max_scroll.set(0);
+        let hint = if state.active_log_file.is_none() {
+            if state.log.is_empty() {
+                "  Awaiting log events…"
+            } else {
+                "  No entries match filter"
+            }
         } else {
-            "  No entries match filter"
+            "  Log file is empty / awaiting data…"
         };
         frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
         return;
     }
 
     let visible_h = inner.height as usize;
-    let scroll = state.log_scroll.min(filtered.len().saturating_sub(1));
+    let max_scroll = display_lines.len().saturating_sub(visible_h);
+    state.log_max_scroll.set(max_scroll);
+    let scroll = state.log_scroll.min(max_scroll);
 
-    let items: Vec<ListItem> = filtered
+    let visible_lines: Vec<Line> = display_lines
         .iter()
         .skip(scroll)
         .take(visible_h)
-        .map(|e| {
-            let ts = e.timestamp.format("%H:%M:%S").to_string();
-            let level_style = theme.log_style(&e.level);
-            let msg = truncate(
-                &e.message,
-                (inner.width as usize).saturating_sub(ts.len() + 8),
-            );
-            let line = Line::from(vec![
-                Span::styled(format!(" {ts} "), theme.dim()),
-                Span::styled(e.level.label(), level_style),
-                Span::styled(format!(" {msg}"), theme.normal()),
-            ]);
-            ListItem::new(line)
-        })
+        .cloned()
         .collect();
 
-    frame.render_widget(List::new(items), inner);
+    frame.render_widget(Paragraph::new(visible_lines), inner);
 
-    if filtered.len() > visible_h {
+    if display_lines.len() > visible_h {
         let sb = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None);
-        let mut sb_state = ScrollbarState::new(filtered.len()).position(scroll);
+        let mut sb_state = ScrollbarState::new(display_lines.len()).position(scroll);
         frame.render_stateful_widget(sb, inner, &mut sb_state);
+    }
+}
+
+#[cfg(feature = "tui")]
+fn draw_blocked_symlink_banner(
+    frame: &mut Frame,
+    file: &str,
+    info: &crate::state::LogFileInfo,
+    theme: &Theme,
+    area: Rect,
+) {
+    let target_str = info.symlink_target.as_deref().unwrap_or("unknown");
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  ⚠️ SECURITY WARNING: OUT-OF-SCOPE SYMLINK ⚠️",
+            theme.failed().bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  Log file "),
+            Span::styled(file, theme.normal().bold()),
+            Span::raw(" is a symbolic link pointing to:"),
+        ]),
+        Line::from(Span::styled(format!("    {}", target_str), theme.failed())),
+        Line::from(""),
+        Line::from("  This destination lies outside your configured workspace sandbox scopes."),
+        Line::from("  For security, reading out-of-scope files is blocked by default."),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Press [a] to approve this symlink exception and start tailing.",
+            theme.success().bold(),
+        )),
+        Line::from(""),
+    ];
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), area);
+}
+
+#[cfg(feature = "tui")]
+fn draw_log_files_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let popup = centered_rect(70, 15, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled(" Log Switcher ", theme.title().bold()))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut items = vec![];
+
+    // Item 0: System Logs
+    let is_active = state.active_log_file.is_none();
+    let is_selected = state.log_files_modal_selected == 0;
+    let style = if is_selected {
+        theme.normal().bg(Color::Cyan).fg(Color::Black)
+    } else {
+        theme.normal()
+    };
+    let active_marker = if is_active { "● " } else { "  " };
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(active_marker, theme.success()),
+        Span::styled("System Logs", style.bold()),
+        Span::styled(" (internal warnings & info)", style),
+    ])));
+
+    // Item 1..N: Log Files
+    for (i, f) in state.log_files.iter().enumerate() {
+        let is_active = state.active_log_file.as_ref() == Some(&f.name);
+        let is_selected = state.log_files_modal_selected == i + 1;
+        let item_style = if is_selected {
+            theme.normal().bg(Color::Cyan).fg(Color::Black)
+        } else {
+            theme.normal()
+        };
+        let active_marker = if is_active { "● " } else { "  " };
+
+        let size_str = format_size(f.size_bytes);
+
+        let (status_str, status_style) = if f.is_symlink {
+            if f.is_approved {
+                (" [Approved Symlink]", theme.success())
+            } else {
+                (" [Blocked Out-of-Scope]", theme.failed().bold())
+            }
+        } else {
+            ("", theme.dim())
+        };
+
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(active_marker, theme.success()),
+            Span::styled(format!("{:<25}", f.name), item_style.bold()),
+            Span::styled(format!(" {:>8}", size_str), item_style),
+            Span::styled(
+                status_str,
+                if is_selected {
+                    item_style
+                } else {
+                    status_style
+                },
+            ),
+        ])));
+    }
+
+    let list = List::new(items);
+    frame.render_widget(list, inner);
+}
+
+#[cfg(feature = "tui")]
+fn style_raw_log_line<'a>(line: &str, theme: &Theme) -> Line<'a> {
+    let line_upper = line.to_uppercase();
+    let style = if line_upper.contains("ERROR") || line_upper.contains("ERR") {
+        theme.failed()
+    } else if line_upper.contains("WARN") || line_upper.contains("WARNING") {
+        theme.pending()
+    } else if line_upper.contains("INFO") {
+        theme.success()
+    } else if line_upper.contains("DEBUG") || line_upper.contains("TRACE") {
+        theme.dim()
+    } else {
+        theme.normal()
+    };
+    Line::from(Span::styled(line.to_string(), style))
+}
+
+#[cfg(feature = "tui")]
+fn style_system_log_line<'a>(line: &str, _ts: &str, level_label: &str, theme: &Theme) -> Line<'a> {
+    let style = if level_label.contains("ERR") {
+        theme.failed()
+    } else if level_label.contains("WARN") {
+        theme.pending()
+    } else if level_label.contains("INFO") {
+        theme.success()
+    } else {
+        theme.dim()
+    };
+    Line::from(Span::styled(line.to_string(), style))
+}
+
+#[cfg(feature = "tui")]
+fn wrap_line(line: &str, max_width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let mut wrapped = vec![];
+    let mut current = String::new();
+    for c in line.chars() {
+        current.push(c);
+        if current.len() >= max_width {
+            wrapped.push(current);
+            current = String::new();
+        }
+    }
+    if !current.is_empty() {
+        wrapped.push(current);
+    }
+    wrapped
+}
+
+#[cfg(feature = "tui")]
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -1669,6 +1984,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Type", "Narrow commands/tools"),
         ("Tab", "Complete selected command"),
         ("Enter", "Run selected command"),
+        ("/help, /?", "Show keyboard reference"),
         ("/run <tool> {json}", "Run tool with JSON args"),
         ("", ""),
         ("COMMAND PALETTE (:)", ""),
@@ -1678,7 +1994,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("WINDOW ACTIONS", ""),
         ("/n", "Restore/expand window n"),
         ("/xn", "Close/cancel window n"),
-        ("/exit", "Quit the application"),
+        ("/exit, /q, /quit", "Quit the application"),
         ("Mouse Click on Xn", "Close/cancel window"),
         ("Mouse Click on Window", "Toggle expand/collapse"),
         ("", ""),
@@ -1749,6 +2065,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Type", "Narrow commands and tools"),
         ("Tab", "Complete selected command"),
         ("Enter", "Run selected command"),
+        ("/help, /?", "Show keyboard reference"),
         ("/run <tool> {json}", "Run a tool manually with JSON args"),
         ("", ""),
         ("COMMAND PALETTE (:)", ""),
@@ -1758,7 +2075,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("WINDOW ACTIONS", ""),
         ("/n", "Restore/expand window n (e.g. /3)"),
         ("/xn", "Close/cancel window n (e.g. /x3)"),
-        ("/exit", "Quit the application"),
+        ("/exit, /q, /quit", "Quit the application"),
         ("Mouse Click on Xn", "Close/cancel window"),
         ("Mouse Click on Window", "Toggle expand/collapse"),
     ];

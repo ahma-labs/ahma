@@ -34,7 +34,7 @@ impl SandboxTestEnv {
     /// Call this **after** `configure()` on every direct binary spawn.
     pub fn apply_nested_sandbox_override(cmd: &mut Command) -> &mut Command {
         if Self::is_nested_sandbox() {
-            cmd.env("AHMA_DISABLE_SANDBOX", "1");
+            cmd.arg("--no-sandbox");
         }
         cmd
     }
@@ -44,7 +44,7 @@ impl SandboxTestEnv {
         cmd: &mut tokio::process::Command,
     ) -> &mut tokio::process::Command {
         if Self::is_nested_sandbox() {
-            cmd.env("AHMA_DISABLE_SANDBOX", "1");
+            cmd.arg("--no-sandbox");
         }
         cmd
     }

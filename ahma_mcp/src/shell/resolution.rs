@@ -338,20 +338,11 @@ mod tests {
 
     fn make_subcommand(name: &str, enabled: bool) -> SubcommandConfig {
         SubcommandConfig {
+            extra: Default::default(),
             name: name.to_string(),
             description: format!("{} subcommand", name),
-            subcommand: None,
-            options: None,
-            positional_args: None,
-            positional_args_first: None,
-            timeout_seconds: None,
-            synchronous: None,
             enabled,
-            guidance_key: None,
-            sequence: None,
-            step_delay_ms: None,
-            availability_check: None,
-            install_instructions: None,
+            ..Default::default()
         }
     }
 
@@ -361,20 +352,12 @@ mod tests {
         nested: Vec<SubcommandConfig>,
     ) -> SubcommandConfig {
         SubcommandConfig {
+            extra: Default::default(),
             name: name.to_string(),
             description: format!("{} subcommand", name),
             subcommand: Some(nested),
-            options: None,
-            positional_args: None,
-            positional_args_first: None,
-            timeout_seconds: None,
-            synchronous: None,
             enabled,
-            guidance_key: None,
-            sequence: None,
-            step_delay_ms: None,
-            availability_check: None,
-            install_instructions: None,
+            ..Default::default()
         }
     }
 

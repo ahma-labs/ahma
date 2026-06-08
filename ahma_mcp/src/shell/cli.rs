@@ -34,6 +34,24 @@ use std::{
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Deprecation warning macro
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Emit a deprecation warning when an `AHMA_*` environment variable is set
+/// and used as a fallback.  This guides users toward `~/.ahma/settings.toml`.
+macro_rules! deprecated_env {
+    ($name:expr) => {
+        tracing::warn!(concat!(
+            "Deprecated: the ",
+            $name,
+            " environment variable is set. ",
+            "Move this setting to ~/.ahma/settings.toml and run `ahma settings init` ",
+            "to create the file with all options documented."
+        ))
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // AppConfig — single immutable application configuration
 //
 // Built once from CLI args + env vars, then passed as a shared reference.
@@ -137,6 +155,8 @@ pub struct AppConfig {
     pub instance_label: String,
     /// Idle timeout in seconds before the background bridge shuts down (default 10).
     pub idle_timeout_secs: Option<u64>,
+    /// Maximum concurrent HTTP server sessions.
+    pub max_sessions: usize,
 }
 
 impl Default for AppConfig {
@@ -178,6 +198,7 @@ impl Default for AppConfig {
             rate_limit_burst: 10,
             instance_label: "ahma".to_string(),
             idle_timeout_secs: Some(10),
+            max_sessions: 10,
         }
     }
 }
@@ -442,7 +463,7 @@ fn apply_platform_sandbox_enforcement(
             && !cfg.defer_sandbox
             && let Err(e) = sandbox::enforce_landlock_sandbox(
                 &sandbox.scopes(),
-                sandbox.read_scopes(),
+                &sandbox.read_scopes(),
                 sandbox.is_no_temp_files(),
             )
         {
@@ -513,7 +534,7 @@ fn check_powershell_available() {
 
 async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
     match serve_args.transport {
-        ServeTransport::Stdio => {
+        Some(ServeTransport::Stdio) => {
             let sandbox = initialize_sandbox(&cfg)?;
             let sandbox =
                 sandbox.ok_or_else(|| anyhow!("Sandbox failed to initialize for stdio mode"))?;
@@ -521,15 +542,27 @@ async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
             tracing::info!("Running in STDIO server mode");
             modes::run_server_mode(cfg, sandbox).await
         }
-        ServeTransport::Http(_) => {
+        Some(ServeTransport::Http(_)) => {
             tracing::info!("Running in HTTP bridge mode");
             modes::run_http_bridge_mode(cfg).await
         }
         #[cfg(unix)]
-        ServeTransport::Unix(u) => {
+        Some(ServeTransport::Unix(u)) => {
             let path = u.socket_path.as_deref().unwrap_or("/tmp/ahma.sock");
             tracing::info!("Running in Unix socket bridge mode on {}", path);
             modes::run_unix_bridge_mode(cfg).await
+        }
+        None => {
+            #[cfg(unix)]
+            {
+                tracing::info!("Running in Unix socket bridge mode on /tmp/ahma.sock");
+                modes::run_unix_bridge_mode(cfg).await
+            }
+            #[cfg(not(unix))]
+            {
+                tracing::info!("Running in HTTP bridge mode");
+                modes::run_http_bridge_mode(cfg).await
+            }
         }
     }
 }
@@ -629,6 +662,10 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
         Subcommands::Settings(args) => {
             tracing::info!("Running in settings mode");
             run_settings_command(args)
+        }
+        Subcommands::Prompts(args) => {
+            tracing::info!("Running in prompts mode");
+            run_prompts_command(args)
         }
     }
 }
@@ -739,6 +776,163 @@ fn run_settings_command(args: SettingsArgs) -> Result<()> {
                 }
             }
 
+            Ok(())
+        }
+    }
+}
+
+fn run_prompts_command(args: PromptsArgs) -> Result<()> {
+    use ahma_common::prompts::{AhmaPrompts, global_prompts_path};
+    use std::fs;
+
+    match args.command {
+        PromptsCommand::Init {
+            force,
+            project,
+            path,
+        } => {
+            let target = if let Some(p) = path {
+                p
+            } else if project {
+                PathBuf::from(".ahma").join("prompts.toml")
+            } else {
+                global_prompts_path().ok_or_else(|| {
+                    anyhow::anyhow!("Could not determine home directory for prompts.toml")
+                })?
+            };
+
+            if target.exists() && !force {
+                anyhow::bail!(
+                    "Prompts file already exists at {}. Use --force to overwrite.",
+                    target.display()
+                );
+            }
+
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let template = AhmaPrompts::generate_template();
+            fs::write(&target, template)?;
+            println!("Prompts file written to: {}", target.display());
+            println!();
+            println!("Edit the file to override LLM prompt templates.");
+            Ok(())
+        }
+        PromptsCommand::Show => {
+            let s = AhmaPrompts::load();
+
+            let mut global_p = AhmaPrompts::default();
+            if let Some(parsed) = global_prompts_path()
+                .filter(|p| p.exists())
+                .and_then(|p| fs::read_to_string(p).ok())
+                .and_then(|c| toml::from_str::<AhmaPrompts>(&c).ok())
+            {
+                global_p = parsed;
+            }
+
+            let mut local_p = AhmaPrompts::default();
+            let local_path = PathBuf::from(".ahma").join("prompts.toml");
+            if let Some(parsed) = Some(&local_path)
+                .filter(|p| p.exists())
+                .and_then(|p| fs::read_to_string(p).ok())
+                .and_then(|c| toml::from_str::<AhmaPrompts>(&c).ok())
+            {
+                local_p = parsed;
+            }
+
+            println!("# Effective Ahma LLM Prompts");
+            println!(
+                "# Sources: [project-local] = .ahma/prompts.toml  [global] = ~/.ahma/prompts.toml  [default] = compiled-in"
+            );
+            println!();
+
+            let show_prompt_info = |name: &str, is_local_some: bool, is_global_some: bool| {
+                let source = if is_local_some {
+                    "[project-local override]"
+                } else if is_global_some {
+                    "[global override]"
+                } else {
+                    "[compiled-in default]"
+                };
+                println!("## {} -- {}", name, source);
+            };
+
+            let local_tt = local_p.task_tree.as_ref();
+            let global_tt = global_p.task_tree.as_ref();
+            let local_dec = local_p.decompose.as_ref();
+            let global_dec = global_p.decompose.as_ref();
+
+            show_prompt_info(
+                "task_tree.planning",
+                local_tt.and_then(|t| t.planning.as_ref()).is_some(),
+                global_tt.and_then(|t| t.planning.as_ref()).is_some(),
+            );
+            println!("{}", s.planning_prompt());
+            println!();
+
+            show_prompt_info(
+                "task_tree.summarisation",
+                local_tt.and_then(|t| t.summarisation.as_ref()).is_some(),
+                global_tt.and_then(|t| t.summarisation.as_ref()).is_some(),
+            );
+            println!("{}", s.summarisation_prompt());
+            println!();
+
+            show_prompt_info(
+                "task_tree.recovery",
+                local_tt.and_then(|t| t.recovery.as_ref()).is_some(),
+                global_tt.and_then(|t| t.recovery.as_ref()).is_some(),
+            );
+            println!("{}", s.recovery_prompt());
+            println!();
+
+            show_prompt_info(
+                "decompose.split",
+                local_dec.and_then(|d| d.split.as_ref()).is_some(),
+                global_dec.and_then(|d| d.split.as_ref()).is_some(),
+            );
+            println!("{}", s.split_prompt());
+            println!();
+
+            Ok(())
+        }
+        PromptsCommand::Validate => {
+            let s = AhmaPrompts::load();
+            let warnings = s.validate();
+            if warnings.is_empty() {
+                println!("✓ Prompts configuration is valid.");
+            } else {
+                println!("Warnings found in prompts configuration:");
+                for w in warnings {
+                    println!("  - {}", w);
+                }
+            }
+            Ok(())
+        }
+        PromptsCommand::Update => {
+            let Some(path) = global_prompts_path() else {
+                anyhow::bail!("Could not determine home directory for ~/.ahma/prompts.toml");
+            };
+
+            let template = AhmaPrompts::generate_template();
+            if path.exists() {
+                let backup_path = path.with_extension("toml.bak");
+                if backup_path.exists() {
+                    let _ = fs::remove_file(&backup_path);
+                }
+                fs::rename(&path, &backup_path)?;
+                println!(
+                    "✓ Backed up existing prompts file to {}",
+                    backup_path.display()
+                );
+            }
+
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, template)?;
+            println!("✓ Wrote latest prompt defaults to {}", path.display());
             Ok(())
         }
     }
@@ -868,6 +1062,157 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub settings_path: Option<PathBuf>,
 
+    /// Tool bundles to enable (e.g. --tools rust --tools python,git).
+    /// Repeat or comma-separate. Available: rust, python, git, kotlin, fileutils, github, simplify.
+    #[arg(
+        long = "tools",
+        value_name = "NAME",
+        value_delimiter = ',',
+        global = true
+    )]
+    pub tool_bundles: Vec<String>,
+
+    /// Path to the tools directory containing JSON tool definitions.
+    /// Defaults to the auto-detected .ahma/ in the current directory.
+    #[arg(long = "tools-dir", global = true)]
+    pub tools_dir: Option<PathBuf>,
+
+    /// Add the system temp directory to the sandbox scope.
+    /// Useful for workflows that need scratch space (compilers, build systems).
+    #[arg(long = "tmp", global = true)]
+    pub tmp: bool,
+
+    /// Enable live log monitoring. Ahma tails the configured log stream through
+    /// an LLM to detect issues in real time and push alerts as MCP progress
+    /// notifications.
+    #[arg(long = "log-monitor", global = true)]
+    pub log_monitor: bool,
+
+    /// Minimum seconds between successive log-monitor alerts.
+    /// Prevents alert storms when a persistent issue triggers repeated matches.
+    #[arg(long = "monitor-rate-limit", value_name = "SECS", global = true)]
+    pub monitor_rate_limit: Option<u64>,
+
+    /// Idle timeout in seconds for background servers.
+    /// If there are no active clients for this duration, the server exits.
+    #[arg(long = "idle-timeout", value_name = "SECS", global = true)]
+    pub idle_timeout: Option<u64>,
+
+    /// Disable the kernel sandbox entirely.
+    /// UNSAFE: the AI can read and write anywhere on the filesystem.
+    /// Use only in environments that provide their own containment (Docker, CI containers).
+    #[arg(long = "no-sandbox", global = true)]
+    pub no_sandbox: bool,
+
+    /// Default tool execution timeout in seconds.
+    /// Individual tools can override this via the timeout_seconds field in their JSON definition.
+    #[arg(long = "timeout", value_name = "SECS", global = true)]
+    pub timeout: Option<u64>,
+
+    /// Force all tools to run synchronously.
+    /// By default, tools are async-first: if a result arrives within 5 seconds it is
+    /// returned inline; otherwise an operation ID is returned and the result is pushed
+    /// as a notification.
+    #[arg(long = "sync", global = true)]
+    pub sync: bool,
+
+    /// OTLP endpoint for distributed tracing export.
+    /// Providing this flag enables tracing.
+    #[arg(long = "opentelemetry", value_name = "URL", global = true)]
+    pub opentelemetry: Option<String>,
+
+    /// Run this server session inside an existing task vault.
+    ///
+    /// Sets the sandbox scope to <vault>/workdir/, initializes an audit log at
+    /// <vault>/audit.jsonl, and wires two-phase delete through <vault>/trash/.
+    /// The vault must exist (create with `ahma vault create <slug>` first).
+    #[arg(long = "task-vault", value_name = "PATH", global = true)]
+    pub task_vault: Option<PathBuf>,
+
+    /// Paths allowed for read/write access under the sandbox (e.g. --sandbox-scope /path1 --sandbox-scope /path2).
+    /// Repeat or comma-separate.
+    #[arg(
+        long = "sandbox-scope",
+        value_name = "PATH",
+        value_delimiter = ',',
+        global = true
+    )]
+    pub sandbox_scopes: Vec<PathBuf>,
+
+    /// Directories containing allowed working directories.
+    /// Repeat or comma-separate.
+    #[arg(
+        long = "working-dir",
+        value_name = "PATH",
+        value_delimiter = ',',
+        global = true
+    )]
+    pub working_dirs: Vec<PathBuf>,
+
+    /// Defer sandbox lock until the MCP client provides `roots/list`.
+    #[arg(long = "defer-sandbox", global = true)]
+    pub defer_sandbox: bool,
+
+    /// Block all access to the system temp directory.
+    #[arg(long = "disable-temp-files", global = true)]
+    pub no_temp_files: bool,
+
+    /// Watch the tools directory for JSON changes and reload tool definitions at runtime.
+    #[arg(long = "hot-reload", global = true)]
+    pub hot_reload: bool,
+
+    /// Skip tool availability probes at startup.
+    #[arg(long = "skip-probes", global = true)]
+    pub skip_probes: bool,
+
+    /// MCP handshake timeout in seconds.
+    #[arg(long = "handshake-timeout", value_name = "SECS", global = true)]
+    pub handshake_timeout: Option<u64>,
+
+    /// Required bearer token for HTTP access.
+    #[arg(long = "require-token", value_name = "TOKEN", global = true)]
+    pub require_token: Option<String>,
+
+    /// Path to a file containing the required bearer token for HTTP access.
+    #[arg(long = "require-token-path", value_name = "PATH", global = true)]
+    pub require_token_path: Option<PathBuf>,
+
+    /// Maximum requests per second for HTTP rate limiting.
+    #[arg(long = "rate-limit-rps", value_name = "RPS", global = true)]
+    pub rate_limit_rps: Option<u64>,
+
+    /// Burst allowance for the rate limiter.
+    #[arg(long = "rate-limit-burst", value_name = "BURST", global = true)]
+    pub rate_limit_burst: Option<u32>,
+
+    /// Human-readable instance name shown in TUI.
+    #[arg(long = "instance-label", value_name = "LABEL", global = true)]
+    pub instance_label: Option<String>,
+
+    /// Log to stderr instead of rolling log files.
+    #[arg(long = "log-to-stderr", global = true)]
+    pub log_to_stderr: bool,
+
+    /// Indicate that this process is spawned as a child server subprocess.
+    #[arg(long = "server-child", global = true)]
+    pub server_child: bool,
+
+    /// Maximum concurrent HTTP server sessions.
+    #[arg(long = "max-sessions", value_name = "LIMIT", global = true)]
+    pub max_sessions: Option<usize>,
+
+    /// Path to the Unix domain socket.
+    #[arg(long = "unix-socket-path", value_name = "PATH", global = true)]
+    pub unix_socket_path: Option<String>,
+
+    /// Disable HTTP/3 (QUIC). Serve HTTP/2 over TCP only.
+    #[arg(long = "disable-quic", global = true)]
+    pub disable_quic: bool,
+
+    /// Require HTTP/2+; reject HTTP/1.1 connections.
+    #[arg(long = "disable-http1-1", global = true)]
+    pub disable_http1_1: bool,
+
     #[command(subcommand)]
     pub command: Subcommands,
 }
@@ -914,6 +1259,8 @@ pub enum Subcommands {
     /// It supersedes most `AHMA_*` environment variables and provides a
     /// single, auditable, self-documented source of truth for all options.
     Settings(SettingsArgs),
+    /// Manage LLM prompt templates (~/.ahma/prompts.toml).
+    Prompts(PromptsArgs),
 }
 
 /// Arguments for `ahma setup`.
@@ -981,6 +1328,41 @@ pub enum SettingsCommand {
     Show,
 }
 
+// ── prompts ──────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma prompts`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct PromptsArgs {
+    #[command(subcommand)]
+    pub command: PromptsCommand,
+}
+
+/// Subcommands for `ahma prompts`.
+#[derive(Subcommand, Debug, Clone)]
+pub enum PromptsCommand {
+    /// Write the prompts file with all defaults commented out.
+    ///
+    /// Creates `~/.ahma/prompts.toml` (or `./.ahma/prompts.toml` if `--project` is passed)
+    /// with every prompt template shown as a comment.
+    Init {
+        /// Overwrite the file if it already exists.
+        #[arg(long)]
+        force: bool,
+        /// Create a project-local prompts file in `./.ahma/prompts.toml` instead of global.
+        #[arg(long)]
+        project: bool,
+        /// Write to this path instead of the default location.
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+    /// Print the effective prompts resolved from all sources.
+    Show,
+    /// Validate prompt templates, verifying required placeholders exist.
+    Validate,
+    /// Force update the global defaults file (~/.ahma/prompts.toml) with the latest defaults, backing up first.
+    Update,
+}
+
 // ── serve ────────────────────────────────────────────────────────────────────
 
 /// Start the ahma MCP server.
@@ -1029,80 +1411,7 @@ pub enum SettingsCommand {
   ahma serve http --port 8080 --disable-quic")]
 pub struct ServeArgs {
     #[command(subcommand)]
-    pub transport: ServeTransport,
-
-    /// Tool bundles to enable (e.g. --tools rust --tools python,git).
-    /// Repeat or comma-separate. Available: rust, python, git, kotlin, fileutils, github, simplify.
-    #[arg(
-        long = "tools",
-        value_name = "NAME",
-        value_delimiter = ',',
-        global = true
-    )]
-    pub tool_bundles: Vec<String>,
-
-    /// Path to the tools directory containing JSON tool definitions.
-    /// Defaults to the auto-detected .ahma/ in the current directory.
-    /// Override with AHMA_TOOLS_DIR env var.
-    #[arg(long)]
-    pub tools_dir: Option<PathBuf>,
-
-    /// Add the system temp directory to the sandbox scope.
-    /// Useful for workflows that need scratch space (compilers, build systems).
-    /// Equivalent to AHMA_TMP_ACCESS=1.
-    #[arg(long = "tmp", global = true)]
-    pub tmp: bool,
-
-    /// Enable live log monitoring. Ahma tails the configured log stream through
-    /// an LLM to detect issues in real time and push alerts as MCP progress
-    /// notifications. Equivalent to AHMA_LOG_MONITOR=1.
-    #[arg(long = "log-monitor", global = true)]
-    pub log_monitor: bool,
-
-    /// Minimum seconds between successive log-monitor alerts.
-    /// Prevents alert storms when a persistent issue triggers repeated matches.
-    /// Equivalent to AHMA_MONITOR_RATE_LIMIT. Default: 60.
-    #[arg(long = "monitor-rate-limit", value_name = "SECS", global = true)]
-    pub monitor_rate_limit: Option<u64>,
-
-    /// Idle timeout in seconds for background servers.
-    /// If there are no active clients for this duration, the server exits.
-    /// Defaults to 10.
-    #[arg(long = "idle-timeout", value_name = "SECS", global = true)]
-    pub idle_timeout: Option<u64>,
-
-    /// Disable the kernel sandbox entirely.
-    /// UNSAFE: the AI can read and write anywhere on the filesystem.
-    /// Use only in environments that provide their own containment (Docker, CI containers).
-    /// Equivalent to AHMA_DISABLE_SANDBOX=1.
-    #[arg(long = "no-sandbox", global = true)]
-    pub no_sandbox: bool,
-
-    /// Default tool execution timeout in seconds.
-    /// Individual tools can override this via the timeout_seconds field in their JSON definition.
-    /// Equivalent to AHMA_TIMEOUT. Default: 360.
-    #[arg(long = "timeout", value_name = "SECS", global = true)]
-    pub timeout: Option<u64>,
-
-    /// Force all tools to run synchronously.
-    /// By default, tools are async-first: if a result arrives within 5 seconds it is
-    /// returned inline; otherwise an operation ID is returned and the result is pushed
-    /// as a notification. Equivalent to AHMA_SYNC=1.
-    #[arg(long = "sync", global = true)]
-    pub sync: bool,
-
-    /// OTLP endpoint for distributed tracing export.
-    /// Providing this flag enables tracing. Equivalent to OTEL_EXPORTER_OTLP_ENDPOINT.
-    #[arg(long = "opentelemetry", value_name = "URL", global = true)]
-    pub opentelemetry: Option<String>,
-
-    /// Run this server session inside an existing task vault.
-    ///
-    /// Sets the sandbox scope to <vault>/workdir/, initializes an audit log at
-    /// <vault>/audit.jsonl, and wires two-phase delete through <vault>/trash/.
-    /// The vault must exist (create with `ahma vault create <slug>` first).
-    #[arg(long = "task-vault", value_name = "PATH", global = true)]
-    pub task_vault: Option<PathBuf>,
+    pub transport: Option<ServeTransport>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1219,14 +1528,6 @@ pub struct HttpArgs {
     /// Port to bind the HTTP server on.
     #[arg(long, default_value_t = 3000)]
     pub port: u16,
-
-    /// Disable HTTP/3 (QUIC). Serve HTTP/2 over TCP only.
-    #[arg(long = "disable-quic")]
-    pub no_quic: bool,
-
-    /// Require HTTP/2+; reject HTTP/1.1 connections.
-    #[arg(long = "disable-http1-1")]
-    pub disable_http1_1: bool,
 }
 
 /// Arguments for `ahma serve unix`.
@@ -1677,85 +1978,68 @@ pub struct ClusterPingArgs {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(unix)]
-fn unix_socket_path_from_cli(cli: &Cli) -> String {
+fn unix_socket_path_from_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> String {
+    if std::env::var_os("AHMA_UNIX_SOCKET").is_some() {
+        deprecated_env!("AHMA_UNIX_SOCKET");
+    }
+    if let Some(path) = &cli.unix_socket_path {
+        return path.clone();
+    }
+    if let Ok(path) = std::env::var("AHMA_UNIX_SOCKET") {
+        return path;
+    }
     match &cli.command {
-        Subcommands::Serve(s) => match &s.transport {
-            ServeTransport::Unix(u) => u
+        Subcommands::Serve(serve_args) => match &serve_args.transport {
+            Some(ServeTransport::Unix(u)) => u
                 .socket_path
                 .clone()
-                .or_else(|| std::env::var("AHMA_UNIX_SOCKET").ok())
+                .or_else(|| s.http.unix_socket_path.clone())
                 .unwrap_or_else(|| "/tmp/ahma.sock".to_string()),
-            _ => String::new(),
+            _ => s
+                .http
+                .unix_socket_path
+                .clone()
+                .unwrap_or_else(|| "/tmp/ahma.sock".to_string()),
         },
-        _ => String::new(),
+        _ => s
+            .http
+            .unix_socket_path
+            .clone()
+            .unwrap_or_else(|| "/tmp/ahma.sock".to_string()),
     }
 }
 
 #[cfg(not(unix))]
-fn unix_socket_path_from_cli(_cli: &Cli) -> String {
+fn unix_socket_path_from_cli(_cli: &Cli, _s: &ahma_common::config::AhmaSettings) -> String {
     String::new()
 }
 
 struct ServeFields {
-    tool_bundles: Vec<String>,
-    tools_dir: Option<PathBuf>,
     http_host: String,
     http_port: u16,
-    no_quic: bool,
-    disable_http1_1: bool,
-    tmp: bool,
-    log_monitor: bool,
-    monitor_rate_limit: Option<u64>,
-    no_sandbox: bool,
-    timeout: Option<u64>,
-    sync: bool,
-    opentelemetry: Option<String>,
-    task_vault: Option<PathBuf>,
-    idle_timeout: Option<u64>,
 }
 
 fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
+    let env_port = std::env::var("AHMA_HTTP_PORT")
+        .ok()
+        .and_then(|val| val.parse::<u16>().ok());
+
     if let Subcommands::Serve(s) = cmd {
-        let (host, port, no_quic, disable_http1_1) = match &s.transport {
-            ServeTransport::Http(h) => (h.host.clone(), h.port, h.no_quic, h.disable_http1_1),
-            ServeTransport::Stdio => ("127.0.0.1".to_string(), 3000u16, false, false),
+        let (host, port) = match &s.transport {
+            Some(ServeTransport::Http(h)) => (h.host.clone(), env_port.unwrap_or(h.port)),
+            Some(ServeTransport::Stdio) => ("127.0.0.1".to_string(), env_port.unwrap_or(3000u16)),
             #[cfg(unix)]
-            ServeTransport::Unix(_) => ("127.0.0.1".to_string(), 3000u16, true, false),
+            Some(ServeTransport::Unix(_)) => ("127.0.0.1".to_string(), env_port.unwrap_or(3000u16)),
+            None => ("127.0.0.1".to_string(), env_port.unwrap_or(3000u16)),
         };
         ServeFields {
-            tool_bundles: s.tool_bundles.clone(),
-            tools_dir: s.tools_dir.clone(),
             http_host: host,
             http_port: port,
-            no_quic,
-            disable_http1_1,
-            tmp: s.tmp,
-            log_monitor: s.log_monitor,
-            monitor_rate_limit: s.monitor_rate_limit,
-            no_sandbox: s.no_sandbox,
-            timeout: s.timeout,
-            sync: s.sync,
-            opentelemetry: s.opentelemetry.clone(),
-            task_vault: s.task_vault.clone(),
-            idle_timeout: s.idle_timeout,
         }
     } else {
         ServeFields {
-            tool_bundles: vec![],
-            tools_dir: None,
             http_host: "127.0.0.1".to_string(),
-            http_port: 3000u16,
-            no_quic: false,
-            disable_http1_1: false,
-            tmp: false,
-            log_monitor: false,
-            monitor_rate_limit: None,
-            no_sandbox: false,
-            timeout: None,
-            sync: false,
-            opentelemetry: None,
-            task_vault: None,
-            idle_timeout: None,
+            http_port: env_port.unwrap_or(3000u16),
         }
     }
 }
@@ -1817,20 +2101,6 @@ fn extract_tool_fields(cmd: &Subcommands) -> ToolFields {
     }
 }
 
-/// Emit a deprecation warning when an `AHMA_*` environment variable is set
-/// and used as a fallback.  This guides users toward `~/.ahma/settings.toml`.
-macro_rules! deprecated_env {
-    ($name:expr) => {
-        tracing::warn!(concat!(
-            "Deprecated: the ",
-            $name,
-            " environment variable is set. ",
-            "Move this setting to ~/.ahma/settings.toml and run `ahma settings init` ",
-            "to create the file with all options documented."
-        ))
-    };
-}
-
 /// Load `AhmaSettings` from the path determined by the CLI flags.
 ///
 /// Respects `--no-settings` (skip loading entirely) and `--settings-path`
@@ -1847,45 +2117,39 @@ pub fn load_settings(cli: &Cli) -> ahma_common::config::AhmaSettings {
 }
 
 fn parse_execution_settings(
-    serve: &ServeFields,
+    cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
 ) -> (u64, bool, bool, bool) {
-    let timeout_secs = if let Some(t) = serve.timeout {
+    if std::env::var_os("AHMA_TIMEOUT").is_some() {
+        deprecated_env!("AHMA_TIMEOUT");
+    }
+    let timeout_secs = if let Some(t) = cli.timeout {
         t
+    } else if let Some(val) = std::env::var("AHMA_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        val
     } else {
-        let from_env = std::env::var("AHMA_TIMEOUT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        if let Some(t) = from_env {
-            deprecated_env!("AHMA_TIMEOUT");
-            t
-        } else {
-            s.tools.timeout_secs
-        }
+        s.tools.timeout_secs
     };
 
-    let force_sync = if serve.sync {
-        true
-    } else if AppConfig::env_flag("AHMA_SYNC") {
+    if std::env::var_os("AHMA_SYNC").is_some() {
         deprecated_env!("AHMA_SYNC");
-        true
-    } else {
-        s.tools.force_sync
-    };
+    }
+    let force_sync = cli.sync || AppConfig::env_flag("AHMA_SYNC") || s.tools.force_sync;
 
-    let hot_reload_tools = if AppConfig::env_flag("AHMA_HOT_RELOAD") {
+    if std::env::var_os("AHMA_HOT_RELOAD").is_some() {
         deprecated_env!("AHMA_HOT_RELOAD");
-        true
-    } else {
-        s.tools.hot_reload
-    };
+    }
+    let hot_reload_tools =
+        cli.hot_reload || AppConfig::env_flag("AHMA_HOT_RELOAD") || s.tools.hot_reload;
 
-    let skip_availability_probes = if AppConfig::env_flag("AHMA_SKIP_PROBES") {
+    if std::env::var_os("AHMA_SKIP_PROBES").is_some() {
         deprecated_env!("AHMA_SKIP_PROBES");
-        true
-    } else {
-        s.tools.skip_probes
-    };
+    }
+    let skip_availability_probes =
+        cli.skip_probes || AppConfig::env_flag("AHMA_SKIP_PROBES") || s.tools.skip_probes;
 
     (
         timeout_secs,
@@ -1896,62 +2160,50 @@ fn parse_execution_settings(
 }
 
 fn parse_sandbox_settings(
-    serve: &ServeFields,
+    cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
 ) -> (bool, bool, bool, bool, bool, u64) {
-    let no_sandbox = if serve.no_sandbox {
-        true
-    } else if AppConfig::env_flag("AHMA_DISABLE_SANDBOX") {
+    if std::env::var_os("AHMA_DISABLE_SANDBOX").is_some() {
         deprecated_env!("AHMA_DISABLE_SANDBOX");
-        true
-    } else {
-        s.sandbox.disable
-    };
+    }
+    let no_sandbox =
+        cli.no_sandbox || AppConfig::env_flag("AHMA_DISABLE_SANDBOX") || s.sandbox.disable;
 
-    let defer_sandbox = if AppConfig::env_flag("AHMA_SANDBOX_DEFER") {
+    if std::env::var_os("AHMA_SANDBOX_DEFER").is_some() {
         deprecated_env!("AHMA_SANDBOX_DEFER");
-        true
-    } else {
-        s.sandbox.defer
-    };
+    }
+    let defer_sandbox =
+        cli.defer_sandbox || AppConfig::env_flag("AHMA_SANDBOX_DEFER") || s.sandbox.defer;
 
-    let tmp_access = if serve.tmp {
-        true
-    } else if AppConfig::env_flag("AHMA_TMP_ACCESS") {
+    if std::env::var_os("AHMA_TMP_ACCESS").is_some() {
         deprecated_env!("AHMA_TMP_ACCESS");
-        true
-    } else {
-        s.sandbox.tmp_access
-    };
+    }
+    let tmp_access = cli.tmp || AppConfig::env_flag("AHMA_TMP_ACCESS") || s.sandbox.tmp_access;
 
-    let no_temp_files = if AppConfig::env_flag("AHMA_DISABLE_TEMP") {
+    if std::env::var_os("AHMA_DISABLE_TEMP").is_some() {
         deprecated_env!("AHMA_DISABLE_TEMP");
-        true
-    } else {
-        s.sandbox.disable_temp
-    };
+    }
+    let no_temp_files =
+        cli.no_temp_files || AppConfig::env_flag("AHMA_DISABLE_TEMP") || s.sandbox.disable_temp;
 
-    let log_monitor = if serve.log_monitor {
-        true
-    } else if AppConfig::env_flag("AHMA_LOG_MONITOR") {
+    if std::env::var_os("AHMA_LOG_MONITOR").is_some() {
         deprecated_env!("AHMA_LOG_MONITOR");
-        true
-    } else {
-        s.logging.log_monitor
-    };
+    }
+    let log_monitor =
+        cli.log_monitor || AppConfig::env_flag("AHMA_LOG_MONITOR") || s.logging.log_monitor;
 
-    let monitor_rate_limit_secs = if let Some(r) = serve.monitor_rate_limit {
+    if std::env::var_os("AHMA_MONITOR_RATE_LIMIT").is_some() {
+        deprecated_env!("AHMA_MONITOR_RATE_LIMIT");
+    }
+    let monitor_rate_limit_secs = if let Some(r) = cli.monitor_rate_limit {
         r
+    } else if let Some(val) = std::env::var("AHMA_MONITOR_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        val
     } else {
-        let from_env = std::env::var("AHMA_MONITOR_RATE_LIMIT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        if let Some(r) = from_env {
-            deprecated_env!("AHMA_MONITOR_RATE_LIMIT");
-            r
-        } else {
-            s.logging.monitor_rate_limit_secs
-        }
+        s.logging.monitor_rate_limit_secs
     };
 
     (
@@ -1964,84 +2216,108 @@ fn parse_sandbox_settings(
     )
 }
 
-fn parse_http_settings(
-    serve: &ServeFields,
-    s: &ahma_common::config::AhmaSettings,
-) -> (bool, bool, u64) {
-    let no_quic = if serve.no_quic {
-        true
-    } else if AppConfig::env_flag("AHMA_DISABLE_QUIC") {
+fn parse_http_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> (bool, bool, u64) {
+    if std::env::var_os("AHMA_DISABLE_QUIC").is_some() {
         deprecated_env!("AHMA_DISABLE_QUIC");
-        true
-    } else {
-        s.http.disable_quic
-    };
+    }
+    let no_quic =
+        cli.disable_quic || AppConfig::env_flag("AHMA_DISABLE_QUIC") || s.http.disable_quic;
 
-    let disable_http1_1 = if serve.disable_http1_1 {
-        true
-    } else if AppConfig::env_flag("AHMA_DISABLE_HTTP1_1") {
+    if std::env::var_os("AHMA_DISABLE_HTTP1_1").is_some() {
         deprecated_env!("AHMA_DISABLE_HTTP1_1");
-        true
-    } else {
-        s.http.disable_http1_1
-    };
+    }
+    let disable_http1_1 = cli.disable_http1_1
+        || AppConfig::env_flag("AHMA_DISABLE_HTTP1_1")
+        || s.http.disable_http1_1;
 
-    let handshake_timeout_secs = {
-        let from_env = std::env::var("AHMA_HANDSHAKE_TIMEOUT")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        if let Some(t) = from_env {
-            deprecated_env!("AHMA_HANDSHAKE_TIMEOUT");
-            t
-        } else {
-            s.http.handshake_timeout_secs
-        }
+    if std::env::var_os("AHMA_HANDSHAKE_TIMEOUT").is_some() {
+        deprecated_env!("AHMA_HANDSHAKE_TIMEOUT");
+    }
+    let handshake_timeout_secs = if let Some(t) = cli.handshake_timeout {
+        t
+    } else if let Some(val) = std::env::var("AHMA_HANDSHAKE_TIMEOUT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        val
+    } else {
+        s.http.handshake_timeout_secs
     };
 
     (no_quic, disable_http1_1, handshake_timeout_secs)
 }
 
 fn parse_auth_settings(
+    cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
 ) -> (Option<String>, Option<PathBuf>, u64, u32, String) {
-    let require_token = std::env::var("AHMA_REQUIRE_TOKEN")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .inspect(|_| deprecated_env!("AHMA_REQUIRE_TOKEN"));
+    if std::env::var_os("AHMA_REQUIRE_TOKEN").is_some() {
+        deprecated_env!("AHMA_REQUIRE_TOKEN");
+    }
+    let require_token = cli
+        .require_token
+        .clone()
+        .or_else(|| {
+            std::env::var("AHMA_REQUIRE_TOKEN")
+                .ok()
+                .map(|v| v.trim().to_owned())
+        })
+        .or_else(|| s.auth.require_token.clone());
 
-    let require_token_path_env = std::env::var("AHMA_REQUIRE_TOKEN_PATH")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .inspect(|_| deprecated_env!("AHMA_REQUIRE_TOKEN_PATH"))
-        .map(PathBuf::from);
+    if std::env::var_os("AHMA_REQUIRE_TOKEN_PATH").is_some() {
+        deprecated_env!("AHMA_REQUIRE_TOKEN_PATH");
+    }
+    let require_token_path = cli
+        .require_token_path
+        .clone()
+        .or_else(|| {
+            std::env::var("AHMA_REQUIRE_TOKEN_PATH")
+                .ok()
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            if s.auth.require_token_path.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(&s.auth.require_token_path))
+            }
+        });
 
-    let require_token_path = require_token_path_env.or_else(|| {
-        if s.auth.require_token_path.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(&s.auth.require_token_path))
-        }
-    });
-
-    let rate_limit_rps = std::env::var("AHMA_RATE_LIMIT_RPS")
-        .ok()
-        .and_then(|v| {
-            deprecated_env!("AHMA_RATE_LIMIT_RPS");
-            v.parse().ok()
+    if std::env::var_os("AHMA_RATE_LIMIT_RPS").is_some() {
+        deprecated_env!("AHMA_RATE_LIMIT_RPS");
+    }
+    let rate_limit_rps = cli
+        .rate_limit_rps
+        .or_else(|| {
+            std::env::var("AHMA_RATE_LIMIT_RPS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
         })
         .unwrap_or(s.auth.rate_limit_rps);
 
-    let rate_limit_burst = std::env::var("AHMA_RATE_LIMIT_BURST")
-        .ok()
-        .and_then(|v| {
-            deprecated_env!("AHMA_RATE_LIMIT_BURST");
-            v.parse().ok()
+    if std::env::var_os("AHMA_RATE_LIMIT_BURST").is_some() {
+        deprecated_env!("AHMA_RATE_LIMIT_BURST");
+    }
+    let rate_limit_burst = cli
+        .rate_limit_burst
+        .or_else(|| {
+            std::env::var("AHMA_RATE_LIMIT_BURST")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
         })
         .unwrap_or(s.auth.rate_limit_burst);
 
-    let instance_label = std::env::var("AHMA_INSTANCE_LABEL")
-        .ok()
-        .inspect(|_| deprecated_env!("AHMA_INSTANCE_LABEL"))
+    if std::env::var_os("AHMA_INSTANCE_LABEL").is_some() {
+        deprecated_env!("AHMA_INSTANCE_LABEL");
+    }
+    let instance_label = cli
+        .instance_label
+        .clone()
+        .or_else(|| {
+            std::env::var("AHMA_INSTANCE_LABEL")
+                .ok()
+                .map(|v| v.trim().to_owned())
+        })
         .unwrap_or_else(|| s.instance.label.clone());
 
     (
@@ -2064,29 +2340,74 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     if std::env::var_os("AHMA_TOOLS_DIR").is_some() {
         deprecated_env!("AHMA_TOOLS_DIR");
     }
-    let env_tools_dir = std::env::var("AHMA_TOOLS_DIR").ok().map(PathBuf::from);
-    let explicit_tools_dir = serve.tools_dir.is_some();
-    let raw_tools_dir = serve.tools_dir.clone().or(env_tools_dir);
+    let explicit_tools_dir =
+        cli.tools_dir.is_some() || std::env::var_os("AHMA_TOOLS_DIR").is_some();
+    let raw_tools_dir = cli
+        .tools_dir
+        .clone()
+        .or_else(|| std::env::var("AHMA_TOOLS_DIR").ok().map(PathBuf::from))
+        .or_else(|| s.tools.tools_dir.clone());
     let tools_dir = resolution::normalize_tools_dir(raw_tools_dir);
 
     // Flatten and deduplicate tool bundles
     let tool_bundles = {
         let mut seen = std::collections::HashSet::new();
-        serve
-            .tool_bundles
-            .clone()
+        let mut bundles = cli.tool_bundles.clone();
+        if bundles.is_empty() {
+            bundles = s.tools.tool_bundles.clone();
+        }
+        bundles
             .into_iter()
             .filter(|b| seen.insert(b.clone()))
             .collect()
     };
 
     // ── Sandbox scope ───────────────────────────────────────────────────────
-    let sandbox_scopes = AppConfig::env_sandbox_scopes();
-    let working_dirs = AppConfig::env_working_dirs();
+    if std::env::var_os("AHMA_SANDBOX_SCOPE").is_some() {
+        deprecated_env!("AHMA_SANDBOX_SCOPE");
+    }
+    let sandbox_scopes = if !cli.sandbox_scopes.is_empty() {
+        cli.sandbox_scopes
+            .iter()
+            .map(|p| expand_tilde(p.clone()))
+            .collect()
+    } else {
+        let env_scopes = AppConfig::env_sandbox_scopes();
+        if !env_scopes.is_empty() {
+            env_scopes
+        } else {
+            s.sandbox
+                .scopes
+                .iter()
+                .map(|p| expand_tilde(p.clone()))
+                .collect()
+        }
+    };
+
+    if std::env::var_os("AHMA_WORKING_DIRS").is_some() {
+        deprecated_env!("AHMA_WORKING_DIRS");
+    }
+    let working_dirs = if !cli.working_dirs.is_empty() {
+        cli.working_dirs
+            .iter()
+            .map(|p| expand_tilde(p.clone()))
+            .collect()
+    } else {
+        let env_dirs = AppConfig::env_working_dirs();
+        if !env_dirs.is_empty() {
+            env_dirs
+        } else {
+            s.sandbox
+                .working_dirs
+                .iter()
+                .map(|p| expand_tilde(p.clone()))
+                .collect()
+        }
+    };
 
     // ── Parse settings sections via modular helper functions ─────────────────
     let (timeout_secs, force_sync, hot_reload_tools, skip_availability_probes) =
-        parse_execution_settings(&serve, &s);
+        parse_execution_settings(cli, &s);
 
     let (
         no_sandbox,
@@ -2095,14 +2416,14 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         no_temp_files,
         log_monitor,
         monitor_rate_limit_secs,
-    ) = parse_sandbox_settings(&serve, &s);
+    ) = parse_sandbox_settings(cli, &s);
 
-    let idle_timeout_secs = serve.idle_timeout.or(Some(10));
+    let idle_timeout_secs = cli.idle_timeout.or(Some(10));
 
-    let (no_quic, disable_http1_1, handshake_timeout_secs) = parse_http_settings(&serve, &s);
+    let (no_quic, disable_http1_1, handshake_timeout_secs) = parse_http_settings(cli, &s);
 
     let (require_token, require_token_path, rate_limit_rps, rate_limit_burst, instance_label) =
-        parse_auth_settings(&s);
+        parse_auth_settings(cli, &s);
 
     AppConfig {
         tools_dir,
@@ -2126,24 +2447,32 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         no_quic,
         disable_http1_1,
         handshake_timeout_secs,
-        unix_socket_path: unix_socket_path_from_cli(cli),
+        unix_socket_path: unix_socket_path_from_cli(cli, &s),
         observability: ahma_common::observability::ObservabilityConfig::from_env("ahma_mcp")
-            .with_endpoint(serve.opentelemetry.as_deref()),
+            .with_endpoint(cli.opentelemetry.as_deref()),
         list_server: tool.list_server,
         mcp_config: tool.mcp_config,
         list_http: tool.list_http,
         list_format: tool.list_format,
         run_tool: tool.run_tool,
         run_tool_args: tool.run_tool_args,
-        task_vault: serve
-            .task_vault
-            .or_else(|| std::env::var("AHMA_TASK_VAULT").ok().map(PathBuf::from)),
+        task_vault: {
+            if std::env::var_os("AHMA_TASK_VAULT").is_some() {
+                deprecated_env!("AHMA_TASK_VAULT");
+            }
+            cli.task_vault
+                .clone()
+                .or_else(|| std::env::var("AHMA_TASK_VAULT").ok().map(PathBuf::from))
+                .map(expand_tilde)
+                .or_else(|| s.sandbox.task_vault.clone().map(expand_tilde))
+        },
         require_token,
         require_token_path,
         rate_limit_rps,
         rate_limit_burst,
         instance_label,
         idle_timeout_secs,
+        max_sessions: cli.max_sessions.unwrap_or(10),
     }
 }
 
@@ -2584,6 +2913,7 @@ mod tests {
             rate_limit_burst: 10,
             instance_label: "ahma".to_string(),
             idle_timeout_secs: Some(10),
+            max_sessions: 10,
         }
     }
 
@@ -2957,7 +3287,19 @@ mod tests {
         assert!(matches!(
             cli.command,
             Subcommands::Serve(ServeArgs {
-                transport: ServeTransport::Stdio,
+                transport: Some(ServeTransport::Stdio),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_cli_parse_serve_default_none() {
+        let cli = Cli::try_parse_from(["ahma", "serve"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Subcommands::Serve(ServeArgs {
+                transport: None,
                 ..
             })
         ));
@@ -2966,14 +3308,14 @@ mod tests {
     #[test]
     fn test_cli_parse_serve_http_defaults() {
         let cli = Cli::try_parse_from(["ahma", "serve", "http"]).unwrap();
+        assert!(!cli.disable_quic);
         if let Subcommands::Serve(ServeArgs {
-            transport: ServeTransport::Http(h),
+            transport: Some(ServeTransport::Http(h)),
             ..
         }) = cli.command
         {
             assert_eq!(h.host, "127.0.0.1");
             assert_eq!(h.port, 3000);
-            assert!(!h.no_quic);
         } else {
             panic!("expected serve http");
         }
@@ -2983,7 +3325,7 @@ mod tests {
     fn test_cli_parse_serve_http_custom_port() {
         let cli = Cli::try_parse_from(["ahma", "serve", "http", "--port", "8080"]).unwrap();
         if let Subcommands::Serve(ServeArgs {
-            transport: ServeTransport::Http(h),
+            transport: Some(ServeTransport::Http(h)),
             ..
         }) = cli.command
         {
@@ -3067,12 +3409,8 @@ mod tests {
     fn test_cli_parse_serve_with_tool_bundle() {
         let cli =
             Cli::try_parse_from(["ahma", "serve", "stdio", "--tools", "rust,python"]).unwrap();
-        if let Subcommands::Serve(s) = cli.command {
-            assert!(s.tool_bundles.contains(&"rust".to_string()));
-            assert!(s.tool_bundles.contains(&"python".to_string()));
-        } else {
-            panic!("expected serve stdio");
-        }
+        assert!(cli.tool_bundles.contains(&"rust".to_string()));
+        assert!(cli.tool_bundles.contains(&"python".to_string()));
     }
 
     #[test]

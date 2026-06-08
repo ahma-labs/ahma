@@ -21,7 +21,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ahma_llm_monitor::LlmClient;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -45,6 +44,7 @@ use crate::operation_monitor::OperationMonitor;
 /// * `cancellation_token` — Token to stop the pipeline on demand.
 /// * `callback`           — Optional MCP progress callback for pushing alerts.
 /// * `monitor`            — Operation monitor to update logs and alerts.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_livelog_pipeline(
     op_id: &str,
     config: &LivelogConfig,
@@ -53,6 +53,7 @@ pub async fn run_livelog_pipeline(
     cancellation_token: CancellationToken,
     callback: Option<&(dyn CallbackSender + Send + Sync)>,
     monitor: Arc<OperationMonitor>,
+    llm_service: Arc<dyn crate::llm_service::LlmCompletionService>,
 ) {
     let provider = match config.llm_provider.resolve() {
         Ok(p) => p,
@@ -64,7 +65,6 @@ pub async fn run_livelog_pipeline(
             return;
         }
     };
-    let llm = LlmClient::new(&provider.base_url, &provider.model, provider.api_key);
 
     let cmd_result =
         sandbox.create_command(&config.source_command, &config.source_args, working_dir);
@@ -101,7 +101,10 @@ pub async fn run_livelog_pipeline(
     let chunk_max_lines = config.chunk_max_lines;
     let chunk_max_duration = Duration::from_secs(config.chunk_max_seconds);
     let ctx = AnalysisCtx {
-        llm: &llm,
+        llm_service: llm_service.as_ref(),
+        base_url: provider.base_url,
+        model: provider.model,
+        api_key: provider.api_key,
         detection_prompt: &config.detection_prompt,
         llm_timeout: Duration::from_secs(config.llm_timeout_seconds),
         cooldown: Duration::from_secs(config.cooldown_seconds),
@@ -198,7 +201,10 @@ pub async fn run_livelog_pipeline(
 
 /// Immutable per-pipeline configuration threaded into [`maybe_analyze`].
 struct AnalysisCtx<'a> {
-    llm: &'a LlmClient,
+    llm_service: &'a dyn crate::llm_service::LlmCompletionService,
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
     detection_prompt: &'a str,
     llm_timeout: Duration,
     cooldown: Duration,
@@ -216,8 +222,8 @@ async fn maybe_analyze(
     last_alert: &mut Option<Instant>,
     callback: Option<&(dyn CallbackSender + Send + Sync)>,
 ) {
-    let (llm, detection_prompt, llm_timeout, cooldown) =
-        (ctx.llm, ctx.detection_prompt, ctx.llm_timeout, ctx.cooldown);
+    let (detection_prompt, llm_timeout, cooldown) =
+        (ctx.detection_prompt, ctx.llm_timeout, ctx.cooldown);
     // Enforce cooldown before hitting the LLM.
     if let Some(last) = last_alert
         && last.elapsed() < cooldown
@@ -234,8 +240,16 @@ async fn maybe_analyze(
     let chunk_text = chunk.join("\n");
     let trigger_lines: Vec<String> = std::mem::take(chunk); // ownership + clears in one step
 
-    match llm
-        .detect_issues(detection_prompt, &chunk_text, llm_timeout)
+    match ctx
+        .llm_service
+        .detect_issues(
+            &ctx.base_url,
+            &ctx.model,
+            ctx.api_key.clone(),
+            detection_prompt,
+            &chunk_text,
+            llm_timeout,
+        )
         .await
     {
         Ok(Some(summary)) => {
@@ -267,6 +281,7 @@ async fn maybe_analyze(
 }
 
 /// Run the file-log tailing pipeline, reading from the file as it grows.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_file_monitor_pipeline(
     op_id: &str,
     file_path: std::path::PathBuf,
@@ -275,6 +290,7 @@ pub async fn run_file_monitor_pipeline(
     cancellation_token: CancellationToken,
     callback: Option<&(dyn CallbackSender + Send + Sync)>,
     monitor: Arc<OperationMonitor>,
+    llm_service: Arc<dyn crate::llm_service::LlmCompletionService>,
 ) {
     let provider = match llm_provider.resolve() {
         Ok(p) => p,
@@ -286,7 +302,6 @@ pub async fn run_file_monitor_pipeline(
             return;
         }
     };
-    let llm = LlmClient::new(&provider.base_url, &provider.model, provider.api_key);
 
     info!(
         "file_monitor[{}]: starting file monitor on {:?}",
@@ -327,7 +342,10 @@ pub async fn run_file_monitor_pipeline(
     let chunk_max_lines = 50;
     let chunk_max_duration = Duration::from_secs(30);
     let ctx = AnalysisCtx {
-        llm: &llm,
+        llm_service: llm_service.as_ref(),
+        base_url: provider.base_url,
+        model: provider.model,
+        api_key: provider.api_key,
         detection_prompt: &detection_prompt,
         llm_timeout: Duration::from_secs(30),
         cooldown: Duration::from_secs(60),

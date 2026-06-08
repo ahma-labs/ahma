@@ -185,14 +185,30 @@ async fn handle_plain_http(
 ) -> Result<()> {
     // Extract Host header.
     let raw_str = String::from_utf8_lossy(raw);
-    let host = raw_str
+    let host_header = raw_str
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("host:"))
-        .and_then(|l| l.split_once(':').map(|x| x.1))
-        .map(|h| h.trim().split(':').next().unwrap_or("").to_string())
+        .and_then(|l| l.split_once(':').map(|x| x.1.trim()))
         .unwrap_or_default();
 
-    if host.is_empty() || !allowlist.allows(&host) {
+    if host_header.is_empty() {
+        warn!("Egress proxy blocked HTTP {first_line} (missing Host header)");
+        client
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+
+    // Split host_header into domain and optional port
+    let (host, port) = match host_header.split_once(':') {
+        Some((h, p)) => {
+            let port_parsed = p.parse::<u16>().unwrap_or(80);
+            (h.to_string(), port_parsed)
+        }
+        None => (host_header.to_string(), 80),
+    };
+
+    if !allowlist.allows(&host) {
         warn!("Egress proxy blocked HTTP {first_line} (host={host})");
         client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
@@ -200,10 +216,10 @@ async fn handle_plain_http(
         return Ok(());
     }
 
-    debug!("Egress proxy: HTTP {first_line} allowed (host={host})");
+    debug!("Egress proxy: HTTP {first_line} allowed (host={host}, port={port})");
 
-    // Connect to the host on port 80.
-    let upstream_addr = format!("{host}:80");
+    // Connect to the host on the specified port.
+    let upstream_addr = format!("{host}:{port}");
     let mut upstream = TcpStream::connect(&upstream_addr)
         .await
         .with_context(|| format!("Failed to connect to upstream {upstream_addr}"))?;
@@ -249,5 +265,43 @@ mod tests {
         let has_https = vars.iter().any(|(k, _)| k == "HTTPS_PROXY");
         assert!(has_http);
         assert!(has_https);
+    }
+
+    #[tokio::test]
+    async fn test_proxy_handles_custom_port() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_port = upstream_addr.port();
+
+        let allowlist = EgressAllowlist::from_str("127.0.0.1");
+        let proxy = EgressProxy::start(EgressProxyConfig { allowlist })
+            .await
+            .unwrap();
+
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.contains("GET http://"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nHello World!")
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        let req = format!(
+            "GET http://127.0.0.1:{upstream_port}/ HTTP/1.1\r\nHost: 127.0.0.1:{upstream_port}\r\n\r\n"
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        let mut resp = vec![0u8; 1024];
+        let n = client.read(&mut resp).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp[..n]);
+        assert!(resp_str.contains("HTTP/1.1 200 OK"));
+        assert!(resp_str.contains("Hello World!"));
+
+        upstream_task.await.unwrap();
     }
 }

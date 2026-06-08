@@ -181,6 +181,10 @@ pub fn builtin_commands() -> Vec<NavCommand> {
             description: "show keyboard reference",
         },
         NavCommand {
+            command: "/?".into(),
+            description: "show keyboard reference (alias)",
+        },
+        NavCommand {
             command: "/mode chat".into(),
             description: "switch to chat interface",
         },
@@ -271,6 +275,14 @@ pub fn builtin_commands() -> Vec<NavCommand> {
         NavCommand {
             command: "/exit".into(),
             description: "quit the application",
+        },
+        NavCommand {
+            command: "/q".into(),
+            description: "quit the application (alias)",
+        },
+        NavCommand {
+            command: "/quit".into(),
+            description: "quit the application (alias)",
         },
     ]
 }
@@ -608,12 +620,40 @@ impl Operation {
     }
 
     pub fn elapsed_display(&self) -> String {
-        let secs = self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-        if secs < 60 {
-            format!("{secs}s")
-        } else {
-            format!("{}m{:02}s", secs / 60, secs % 60)
+        if let Some(ms) = self.duration_ms {
+            return format!("{}s", ms / 1000);
         }
+        let secs = if let (Some(start), Some(end)) = (self.started_at, self.completed_at) {
+            if end >= start {
+                end.duration_since(start).as_secs()
+            } else {
+                0
+            }
+        } else {
+            self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+        };
+        format!("{secs}s")
+    }
+
+    pub fn display_name(&self) -> String {
+        if self.tool_name == "run_terminal_command" {
+            let get_cmd = || -> Option<String> {
+                let start_idx = self.description.find('{')?;
+                let end_idx = self.description.rfind('}')?;
+                if start_idx >= end_idx {
+                    return None;
+                }
+                let val: serde_json::Value =
+                    serde_json::from_str(&self.description[start_idx..=end_idx]).ok()?;
+                val.get("command")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            };
+            if let Some(cmd) = get_cmd() {
+                return cmd;
+            }
+        }
+        self.tool_name.clone()
     }
 }
 
@@ -652,6 +692,17 @@ pub struct LogEntry {
     pub timestamp: chrono::DateTime<chrono::Local>,
     pub level: LogLevel,
     pub message: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+pub struct LogFileInfo {
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub modified: Option<String>,
+    pub is_symlink: bool,
+    pub symlink_target: Option<String>,
+    pub is_approved: bool,
 }
 
 // ─── Approval gate ────────────────────────────────────────────────────────────
@@ -808,6 +859,40 @@ pub struct AppState {
     pub focus: Focus,
     pub ops_selected: usize,
     pub ops_scroll: std::cell::Cell<usize>,
+    #[cfg(feature = "tui")]
+    pub chat_area: std::cell::Cell<Rect>,
+    #[cfg(not(feature = "tui"))]
+    pub chat_area: std::cell::Cell<()>,
+    #[cfg(feature = "tui")]
+    pub log_area: std::cell::Cell<Rect>,
+    #[cfg(not(feature = "tui"))]
+    pub log_area: std::cell::Cell<()>,
+    #[cfg(feature = "tui")]
+    pub ops_area: std::cell::Cell<Rect>,
+    #[cfg(not(feature = "tui"))]
+    pub ops_area: std::cell::Cell<()>,
+    #[cfg(feature = "tui")]
+    pub detail_area: std::cell::Cell<Rect>,
+    #[cfg(not(feature = "tui"))]
+    pub detail_area: std::cell::Cell<()>,
+    #[cfg(feature = "tui")]
+    pub chat_input_area: std::cell::Cell<Rect>,
+    #[cfg(not(feature = "tui"))]
+    pub chat_input_area: std::cell::Cell<()>,
+    #[cfg(feature = "tui")]
+    pub last_mouse_pos: std::cell::Cell<Option<(u16, u16)>>,
+    #[cfg(not(feature = "tui"))]
+    pub last_mouse_pos: std::cell::Cell<()>,
+
+    // --- Animation states ---
+    pub chat_scroll_target: std::cell::Cell<f64>,
+    pub chat_scroll_current: std::cell::Cell<f64>,
+    pub log_scroll_target: std::cell::Cell<f64>,
+    pub log_scroll_current: std::cell::Cell<f64>,
+    pub chat_input_height_target: std::cell::Cell<f64>,
+    pub chat_input_height_current: std::cell::Cell<f64>,
+    pub chat_max_scroll: std::cell::Cell<usize>,
+    pub log_max_scroll: std::cell::Cell<usize>,
     pub activity_scroll: usize,
     /// Tracked token usage for the current session.
     pub token_usage: ahma_llm_monitor::client::TokenUsage,
@@ -817,6 +902,13 @@ pub struct AppState {
     pub log_filter: String,
     pub log_filter_active: bool,
     pub palette: PaletteState,
+    pub log_files: Vec<LogFileInfo>,
+    pub active_log_file: Option<String>,
+    pub active_log_lines: Vec<String>,
+    pub log_files_modal_open: bool,
+    pub log_files_modal_selected: usize,
+    pub log_wrap_enabled: bool,
+    pub log_zoom_enabled: bool,
     #[cfg(feature = "tui")]
     pub click_targets: std::cell::RefCell<Vec<(ClickTarget, Rect)>>,
     #[cfg(not(feature = "tui"))]
@@ -835,6 +927,10 @@ pub struct AppState {
     pub bridge_tx: Option<tokio::sync::mpsc::Sender<crate::llm_bridge::BridgeEvent>>,
     #[cfg(not(feature = "tui"))]
     pub bridge_tx: Option<()>,
+    #[cfg(feature = "tui")]
+    pub mcp_source_tx: Option<tokio::sync::mpsc::Sender<crate::mcp_source::McpSourceCommand>>,
+    #[cfg(not(feature = "tui"))]
+    pub mcp_source_tx: Option<()>,
     #[cfg(feature = "tui")]
     pub approval_tx: Option<tokio::sync::oneshot::Sender<bool>>,
     #[cfg(not(feature = "tui"))]
@@ -909,12 +1005,51 @@ impl AppState {
             focus: Focus::default(),
             ops_selected: 0,
             ops_scroll: std::cell::Cell::new(0),
+            #[cfg(feature = "tui")]
+            chat_area: std::cell::Cell::new(Rect::default()),
+            #[cfg(not(feature = "tui"))]
+            chat_area: std::cell::Cell::new(()),
+            #[cfg(feature = "tui")]
+            log_area: std::cell::Cell::new(Rect::default()),
+            #[cfg(not(feature = "tui"))]
+            log_area: std::cell::Cell::new(()),
+            #[cfg(feature = "tui")]
+            ops_area: std::cell::Cell::new(Rect::default()),
+            #[cfg(not(feature = "tui"))]
+            ops_area: std::cell::Cell::new(()),
+            #[cfg(feature = "tui")]
+            detail_area: std::cell::Cell::new(Rect::default()),
+            #[cfg(not(feature = "tui"))]
+            detail_area: std::cell::Cell::new(()),
+            #[cfg(feature = "tui")]
+            chat_input_area: std::cell::Cell::new(Rect::default()),
+            #[cfg(not(feature = "tui"))]
+            chat_input_area: std::cell::Cell::new(()),
+            #[cfg(feature = "tui")]
+            last_mouse_pos: std::cell::Cell::new(None),
+            #[cfg(not(feature = "tui"))]
+            last_mouse_pos: std::cell::Cell::new(()),
+            chat_scroll_target: std::cell::Cell::new(0.0),
+            chat_scroll_current: std::cell::Cell::new(0.0),
+            log_scroll_target: std::cell::Cell::new(0.0),
+            log_scroll_current: std::cell::Cell::new(0.0),
+            chat_input_height_target: std::cell::Cell::new(1.0),
+            chat_input_height_current: std::cell::Cell::new(1.0),
+            chat_max_scroll: std::cell::Cell::new(0),
+            log_max_scroll: std::cell::Cell::new(0),
             activity_scroll: 0,
             token_usage: ahma_llm_monitor::client::TokenUsage::default(),
             log_scroll: 0,
             log_filter: String::new(),
             log_filter_active: false,
             palette: PaletteState::default(),
+            log_files: vec![],
+            active_log_file: None,
+            active_log_lines: vec![],
+            log_files_modal_open: false,
+            log_files_modal_selected: 0,
+            log_wrap_enabled: false,
+            log_zoom_enabled: false,
             #[cfg(feature = "tui")]
             click_targets: std::cell::RefCell::new(vec![]),
             #[cfg(not(feature = "tui"))]
@@ -933,10 +1068,24 @@ impl AppState {
             should_quit: false,
             bridge_tx: None,
             #[cfg(feature = "tui")]
+            mcp_source_tx: None,
+            #[cfg(not(feature = "tui"))]
+            mcp_source_tx: None,
+            #[cfg(feature = "tui")]
             approval_tx: None,
             #[cfg(not(feature = "tui"))]
             approval_tx: None,
         }
+    }
+
+    pub fn sync_chat_scroll_to_animation(&self) {
+        self.chat_scroll_target.set(self.chat_scroll as f64);
+        self.chat_scroll_current.set(self.chat_scroll as f64);
+    }
+
+    pub fn sync_log_scroll_to_animation(&self) {
+        self.log_scroll_target.set(self.log_scroll as f64);
+        self.log_scroll_current.set(self.log_scroll as f64);
     }
 
     pub fn chat_input_text(&self) -> String {
@@ -950,17 +1099,72 @@ impl AppState {
         }
     }
 
-    pub fn chat_input_line_count(&self) -> usize {
+    pub fn chat_input_line_count(&self, width: usize) -> usize {
         #[cfg(feature = "tui")]
         {
-            self.chat_input.lines().len().max(1)
+            let mut total = 0;
+            for line in self.chat_input.lines() {
+                total += count_wrapped_lines(line, width);
+            }
+            total.max(1)
         }
         #[cfg(not(feature = "tui"))]
         {
+            let _ = width;
             1
         }
     }
+}
 
+#[cfg(feature = "tui")]
+fn count_wrapped_lines(line: &str, width: usize) -> usize {
+    let width = width.max(1);
+    if line.is_empty() {
+        return 1;
+    }
+    let mut lines = 0;
+    let mut current_line_len = 0;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ' ' {
+            if current_line_len < width {
+                current_line_len += 1;
+            } else {
+                lines += 1;
+                current_line_len = 0;
+            }
+        } else {
+            let mut word_len = 1;
+            while let Some(&next_c) = chars.peek() {
+                if next_c != ' ' {
+                    word_len += 1;
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if current_line_len + word_len <= width {
+                current_line_len += word_len;
+            } else {
+                if current_line_len > 0 {
+                    lines += 1;
+                }
+                let mut rem = word_len;
+                while rem > width {
+                    lines += 1;
+                    rem -= width;
+                }
+                current_line_len = rem;
+            }
+        }
+    }
+    if current_line_len > 0 {
+        lines += 1;
+    }
+    lines.max(1)
+}
+
+impl AppState {
     pub fn chat_input_is_empty(&self) -> bool {
         self.chat_input_text().is_empty()
     }
@@ -1046,6 +1250,16 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "tui")]
+    fn test_count_wrapped_lines() {
+        assert_eq!(count_wrapped_lines("hello world", 10), 2);
+        assert_eq!(count_wrapped_lines("a verylongword", 10), 3);
+        assert_eq!(count_wrapped_lines(" ", 10), 1);
+        assert_eq!(count_wrapped_lines("", 10), 1);
+        assert_eq!(count_wrapped_lines("one two three four five", 100), 1);
+    }
+
+    #[test]
     fn push_activity_caps_at_ring_capacity() {
         let mut s = AppState::new("http://localhost:3000", "HTTP", true);
         for i in 0..ACTIVITY_RING_CAP + 10 {
@@ -1113,5 +1327,40 @@ mod tests {
         assert!(matches!(hist.entries[0], ChatEntry::User(_)));
         assert!(matches!(hist.entries[1], ChatEntry::Assistant { .. }));
         assert!(matches!(hist.entries[2], ChatEntry::User(_)));
+    }
+
+    #[test]
+    fn test_operation_elapsed_display() {
+        let mut op = Operation::new("op1", "run_terminal_command", OpStatus::Running);
+        // Test in-progress elapsed formatting (always in seconds)
+        let display = op.elapsed_display();
+        assert!(display.ends_with('s'));
+
+        // Test completed elapsed formatting (stops counting using completed_at)
+        let now = Instant::now();
+        op.started_at = Some(now);
+        op.completed_at = Some(now + Duration::from_secs(67));
+        assert_eq!(op.elapsed_display(), "67s");
+
+        // Test completed elapsed formatting (stops counting using duration_ms)
+        op.duration_ms = Some(42000);
+        assert_eq!(op.elapsed_display(), "42s");
+    }
+
+    #[test]
+    fn test_operation_display_name() {
+        // Test non-run_terminal_command fallback
+        let op_cargo = Operation::new("op1", "cargo_build", OpStatus::Running);
+        assert_eq!(op_cargo.display_name(), "cargo_build");
+
+        // Test run_terminal_command with structured description
+        let mut op_term = Operation::new("op2", "run_terminal_command", OpStatus::Running);
+        op_term.description = "/bin/sh {\"c_flag\": true, \"command\": \"sleep 10\"}".to_string();
+        assert_eq!(op_term.display_name(), "sleep 10");
+
+        // Test run_terminal_command with fallback description
+        let mut op_term_fallback = Operation::new("op3", "run_terminal_command", OpStatus::Running);
+        op_term_fallback.description = "invalid description".to_string();
+        assert_eq!(op_term_fallback.display_name(), "run_terminal_command");
     }
 }

@@ -186,6 +186,7 @@ async fn test_livelog_handler_issue_detected_sends_alert() {
         monitor.clone(),
         sandbox,
         Some(Box::new(callback.clone())),
+        Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
     .expect("handle_livelog_start should succeed");
@@ -269,6 +270,7 @@ async fn test_livelog_handler_clean_response_no_alert() {
         monitor.clone(),
         sandbox,
         Some(Box::new(callback.clone())),
+        Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
     .expect("handle_livelog_start should succeed");
@@ -326,6 +328,7 @@ async fn test_livelog_handler_multiple_alerts_pipeline_continues() {
         monitor.clone(),
         sandbox,
         Some(Box::new(callback.clone())),
+        Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
     .expect("handle_livelog_start should succeed");
@@ -382,6 +385,7 @@ async fn test_livelog_handler_cooldown_suppresses_second_alert() {
         monitor.clone(),
         sandbox,
         Some(Box::new(callback.clone())),
+        Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
     .expect("handle_livelog_start should succeed");
@@ -428,6 +432,7 @@ async fn test_livelog_handler_cancel_via_monitor_stops_pipeline() {
         monitor.clone(),
         sandbox,
         Some(Box::new(callback.clone())),
+        Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
     .expect("handle_livelog_start should succeed");
@@ -486,6 +491,7 @@ async fn test_livelog_handler_llm_http_error_graceful() {
         monitor.clone(),
         sandbox,
         Some(Box::new(callback.clone())),
+        Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
     .expect("handle_livelog_start should succeed");
@@ -529,6 +535,7 @@ async fn test_livelog_handler_missing_livelog_block_returns_error() {
         monitor.clone(),
         sandbox,
         None,
+        Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await;
 

@@ -81,6 +81,10 @@ struct Args {
     /// Idle timeout in seconds before the background bridge shuts down.
     #[arg(long)]
     idle_timeout_secs: Option<u64>,
+
+    /// Maximum concurrent HTTP server sessions.
+    #[arg(long, default_value = "10")]
+    max_sessions: usize,
 }
 
 #[tokio::main]
@@ -144,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limit_burst: args.rate_limit_burst,
         active_sessions: None,
         idle_timeout_secs: args.idle_timeout_secs,
+        max_sessions: args.max_sessions,
     };
 
     // Warn when listening on a non-loopback address without a token.

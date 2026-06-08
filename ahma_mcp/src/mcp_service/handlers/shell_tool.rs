@@ -224,6 +224,7 @@ impl AhmaMcpService {
         execution_mode: &crate::adapter::ExecutionMode,
     ) -> crate::config::SubcommandConfig {
         crate::config::SubcommandConfig {
+            extra: Default::default(),
             name: "run_terminal_command".to_string(),
             description: "Execute shell commands".to_string(),
             subcommand: None,

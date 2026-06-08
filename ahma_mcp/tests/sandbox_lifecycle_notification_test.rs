@@ -99,7 +99,7 @@ fn perform_mcp_handshake(
 
 #[test]
 fn test_sandbox_lifecycle_notifications() {
-    let binary = test_utils::cli::build_binary_cached("ahma_mcp", "ahma");
+    let binary = test_utils::cli::build_binary_cached("ahma_bin", "ahma");
     let temp_dir = tempfile::tempdir().unwrap();
     let tools_dir = temp_dir.path().join("tools");
     std::fs::create_dir(&tools_dir).unwrap();

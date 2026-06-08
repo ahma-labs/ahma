@@ -109,10 +109,14 @@ pub mod config;
 pub mod constants;
 /// Background reporter that registers this instance with the hub daemon.
 pub mod daemon_reporter;
+/// File operations provider.
+pub mod file_ops;
 /// External terminal hook management for supported AI tools.
 pub mod hooks;
 /// Live log monitoring pipeline (LLM-powered issue detection).
 pub mod livelog;
+/// LLM Completion Service provider.
+pub mod llm_service;
 /// Live log monitoring for streaming processes.
 pub mod log_monitor;
 /// Logging helpers for the core crate.
@@ -192,5 +196,10 @@ pub mod vault;
 // Re-export main types for easier use
 pub use adapter::Adapter;
 
+pub use adapter::executor::{CommandExecutor, DefaultCommandExecutor};
+pub use file_ops::{
+    DefaultFileOpsProvider, DefaultWebPageFetcher, FileOpsProvider, WebPageFetcher,
+};
+pub use llm_service::{DefaultLlmCompletionService, LlmCompletionService};
 pub use mcp_service::AhmaMcpService;
 pub use mcp_service::{ExtensionToolHandler, register_global_extension_handler};

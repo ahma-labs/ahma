@@ -22,15 +22,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Settings-first log target: settings.toml [logging.target] > AHMA_LOG_TARGET (deprecated) > "file"
+    // Settings-first log target: cli --log-to-stderr > settings.toml [logging.target] > AHMA_LOG_TARGET (deprecated) > "file"
     let settings_for_log = load_settings(&cli);
-    let log_to_stderr = if settings_for_log.log_to_stderr() {
-        true
-    } else {
-        std::env::var("AHMA_LOG_TARGET")
-            .map(|v| v.trim().eq_ignore_ascii_case("stderr"))
-            .unwrap_or(false)
-    };
+    if std::env::var_os("AHMA_LOG_TARGET").is_some() {
+        tracing::warn!(
+            "Deprecated: the AHMA_LOG_TARGET environment variable is set. Use --log-to-stderr CLI flag or [logging.target] in settings.toml instead."
+        );
+    }
+    let log_to_stderr = cli.log_to_stderr || settings_for_log.log_to_stderr();
 
     let cfg = build_app_config(&cli);
     let subcommand = cli.command;

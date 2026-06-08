@@ -11,6 +11,7 @@
 mod common;
 
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+use common::SandboxTestEnv;
 use common::server::{ServerGuard, resolve_binary_path};
 use reqwest::Client;
 use std::process::{Command, Stdio};
@@ -26,15 +27,28 @@ fn spawn_rate_limited_server() -> Result<ServerGuard, String> {
     let sandbox_dir = tempdir().map_err(|e| e.to_string())?;
     let binary_path = resolve_binary_path()?;
 
-    let mut child = Command::new(&binary_path)
-        .args(["serve", "http", "--port", "0"])
-        .env("AHMA_SYNC", "1")
-        .env("AHMA_LOG_TARGET", "stderr")
-        .env("AHMA_TOOLS_DIR", tools_dir.path())
-        .env("AHMA_SANDBOX_SCOPE", sandbox_dir.path())
-        // 1 req/s with burst of 1 → 2nd request triggers 429 immediately.
-        .env("AHMA_RATE_LIMIT_RPS", "1")
-        .env("AHMA_RATE_LIMIT_BURST", "1")
+    let mut cmd = Command::new(&binary_path);
+    cmd.args([
+        "--sync",
+        "--log-to-stderr",
+        "--tools-dir",
+        &tools_dir.path().to_string_lossy(),
+        "--sandbox-scope",
+        &sandbox_dir.path().to_string_lossy(),
+        "--rate-limit-rps",
+        "1",
+        "--rate-limit-burst",
+        "1",
+        "serve",
+        "http",
+        "--port",
+        "0",
+    ]);
+
+    SandboxTestEnv::configure(&mut cmd);
+    SandboxTestEnv::apply_nested_sandbox_override(&mut cmd);
+
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

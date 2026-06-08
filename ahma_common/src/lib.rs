@@ -21,6 +21,7 @@ pub mod daemon_hub;
 pub mod file_uri;
 pub mod local_tls;
 pub mod observability;
+pub mod prompts;
 pub mod sandbox_state;
 pub mod state_machine;
 pub mod timeouts;

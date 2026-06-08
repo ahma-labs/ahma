@@ -23,7 +23,9 @@ impl AhmaMcpService {
             .map(|v| v as usize);
 
         let scopes = self.adapter.sandbox().scopes().to_vec();
-        let result = ahma_harness_tools::read_file(&scopes, Path::new(path), start_line, end_line)
+        let result = self
+            .file_ops_provider
+            .read_file(&scopes, Path::new(path), start_line, end_line)
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
 
@@ -37,7 +39,9 @@ impl AhmaMcpService {
         let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
         let scopes = self.adapter.sandbox().scopes().to_vec();
 
-        let entries = ahma_harness_tools::list_dir(&scopes, Path::new(path))
+        let entries = self
+            .file_ops_provider
+            .list_dir(&scopes, Path::new(path))
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
         let body = serde_json::to_string_pretty(&entries)
@@ -62,7 +66,10 @@ impl AhmaMcpService {
             .unwrap_or_else(|| PathBuf::from("."));
 
         let scopes = self.adapter.sandbox().scopes().to_vec();
-        let matches = ahma_harness_tools::file_search(&scopes, &base_dir, pattern)
+        let matches = self
+            .file_ops_provider
+            .file_search(&scopes, &base_dir, pattern)
+            .await
             .map_err(|e| mcp_internal(e.to_string()))?;
 
         let body = serde_json::to_string_pretty(&matches)
@@ -96,15 +103,18 @@ impl AhmaMcpService {
             .unwrap_or_else(|| PathBuf::from("."));
 
         let scopes = self.adapter.sandbox().scopes().to_vec();
-        let matches = ahma_harness_tools::grep_search(
-            &scopes,
-            &base_dir,
-            query,
-            is_regex,
-            include_pattern,
-            max_results,
-        )
-        .map_err(|e| mcp_internal(e.to_string()))?;
+        let matches = self
+            .file_ops_provider
+            .grep_search(
+                &scopes,
+                &base_dir,
+                query,
+                is_regex,
+                include_pattern,
+                max_results,
+            )
+            .await
+            .map_err(|e| mcp_internal(e.to_string()))?;
 
         let body = serde_json::to_string_pretty(&matches)
             .map_err(|e| mcp_internal(format!("Failed to serialize grep_search result: {e}")))?;
@@ -121,7 +131,9 @@ impl AhmaMcpService {
             .ok_or_else(|| mcp_invalid_params("'url' is required"))?;
         let query = args.get("query").and_then(Value::as_str);
 
-        let result = ahma_harness_tools::fetch_webpage(url, query)
+        let result = self
+            .web_page_fetcher
+            .fetch(url, query)
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
 
@@ -144,7 +156,8 @@ impl AhmaMcpService {
             .ok_or_else(|| mcp_invalid_params("'content' is required"))?;
 
         let scopes = self.adapter.sandbox().scopes().to_vec();
-        ahma_harness_tools::write_file(&scopes, Path::new(path), content)
+        self.file_ops_provider
+            .write_file(&scopes, Path::new(path), content)
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
 
@@ -169,10 +182,11 @@ impl AhmaMcpService {
             .ok_or_else(|| mcp_invalid_params("'new_str' is required"))?;
 
         let scopes = self.adapter.sandbox().scopes().to_vec();
-        let replaced =
-            ahma_harness_tools::replace_in_file(&scopes, Path::new(path), old_str, new_str)
-                .await
-                .map_err(|e| mcp_internal(e.to_string()))?;
+        let replaced = self
+            .file_ops_provider
+            .replace_in_file(&scopes, Path::new(path), old_str, new_str)
+            .await
+            .map_err(|e| mcp_internal(e.to_string()))?;
 
         Ok(text_result(format!("Replaced {replaced} occurrence(s)")))
     }

@@ -60,7 +60,7 @@ fn find_available_port() -> u16 {
 
 /// Build the ahma_mcp binary if needed and return the path
 fn get_ahma_mcp_binary() -> PathBuf {
-    ahma_mcp::test_utils::cli::build_binary_cached("ahma_mcp", "ahma")
+    ahma_mcp::test_utils::cli::build_binary_cached("ahma_bin", "ahma")
 }
 
 /// Start the HTTP bridge server and return the process
@@ -83,19 +83,30 @@ async fn start_http_bridge(
     let no_sandbox = cfg!(windows);
 
     let mut cmd = Command::new(&binary);
-    cmd.args(["serve", "http", "--port", &port.to_string()])
+    let mut args = vec![
+        "--sync".to_string(),
+        "--log-to-stderr".to_string(),
+        "--tools-dir".to_string(),
+        tools_dir.to_string_lossy().to_string(),
+        "--sandbox-scope".to_string(),
+        sandbox_scope.to_string_lossy().to_string(),
+    ];
+    if no_sandbox {
+        args.push("--no-sandbox".to_string());
+    }
+    args.extend([
+        "serve".to_string(),
+        "http".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+    ]);
+
+    cmd.args(&args)
         .current_dir(&workspace)
-        .env("AHMA_SYNC", "1")
-        .env("AHMA_TOOLS_DIR", &*tools_dir.to_string_lossy())
-        .env("AHMA_SANDBOX_SCOPE", &*sandbox_scope.to_string_lossy())
-        .env("AHMA_LOG_TARGET", "stderr")
         .env_remove("NEXTEST")
         .env_remove("NEXTEST_EXECUTION_MODE")
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("RUST_TEST_THREADS");
-    if no_sandbox {
-        cmd.env("AHMA_DISABLE_SANDBOX", "1");
-    }
     let child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

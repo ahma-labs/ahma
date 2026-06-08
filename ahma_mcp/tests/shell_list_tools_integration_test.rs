@@ -76,7 +76,7 @@ fn test_list_tools_from_stdio_server() {
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let mcp_config_path = temp_dir.path().join("mcp.json");
     let mcp_config = format!(
-        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["serve","stdio"],"env":{{"AHMA_TOOLS_DIR":"{tools}","AHMA_DISABLE_SANDBOX":"1","AHMA_SKIP_PROBES":"1"}}}}}}}}"#,
+        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
         cmd = ahma_binary.to_str().unwrap().replace('\\', "/"),
         tools = tools_dir.to_str().unwrap().replace('\\', "/")
     );
@@ -85,6 +85,7 @@ fn test_list_tools_from_stdio_server() {
     // Run ahma_mcp tool list with the mcp.json config
     let output = Command::new(&ahma_binary)
         .args([
+            "--no-sandbox",
             "tool",
             "list",
             "--server",
@@ -92,7 +93,6 @@ fn test_list_tools_from_stdio_server() {
             "--mcp-config",
             mcp_config_path.to_str().unwrap(),
         ])
-        .env("AHMA_DISABLE_SANDBOX", "1")
         .current_dir(&project_root)
         .output()
         .expect("Failed to execute ahma_mcp tool list");
@@ -137,7 +137,7 @@ fn test_list_tools_json_format() {
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let mcp_config_path = temp_dir.path().join("mcp.json");
     let mcp_config = format!(
-        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["serve","stdio"],"env":{{"AHMA_TOOLS_DIR":"{tools}","AHMA_DISABLE_SANDBOX":"1","AHMA_SKIP_PROBES":"1"}}}}}}}}"#,
+        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
         cmd = ahma_binary.to_str().unwrap().replace('\\', "/"),
         tools = tools_dir.to_str().unwrap().replace('\\', "/")
     );
@@ -146,6 +146,7 @@ fn test_list_tools_json_format() {
     // Run ahma_mcp tool list --format json
     let output = Command::new(&ahma_binary)
         .args([
+            "--no-sandbox",
             "tool",
             "list",
             "--format",
@@ -155,7 +156,6 @@ fn test_list_tools_json_format() {
             "--mcp-config",
             mcp_config_path.to_str().unwrap(),
         ])
-        .env("AHMA_DISABLE_SANDBOX", "1")
         .current_dir(&project_root)
         .output()
         .expect("Failed to execute ahma_mcp tool list");
@@ -200,7 +200,7 @@ fn test_list_tools_output_format() {
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let mcp_config_path = temp_dir.path().join("mcp.json");
     let mcp_config = format!(
-        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["serve","stdio"],"env":{{"AHMA_TOOLS_DIR":"{tools}","AHMA_DISABLE_SANDBOX":"1","AHMA_SKIP_PROBES":"1"}}}}}}}}"#,
+        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
         cmd = ahma_binary.to_str().unwrap().replace('\\', "/"),
         tools = tools_dir.to_str().unwrap().replace('\\', "/")
     );
@@ -208,6 +208,7 @@ fn test_list_tools_output_format() {
 
     let output = Command::new(&ahma_binary)
         .args([
+            "--no-sandbox",
             "tool",
             "list",
             "--server",
@@ -215,7 +216,6 @@ fn test_list_tools_output_format() {
             "--mcp-config",
             mcp_config_path.to_str().unwrap(),
         ])
-        .env("AHMA_DISABLE_SANDBOX", "1")
         .current_dir(&project_root)
         .output()
         .expect("Failed to execute ahma_mcp tool list");
@@ -254,16 +254,21 @@ fn test_list_tools_trailing_args() {
     // Run ahma tool list -- <command>
     let output = Command::new(&ahma_binary)
         .args([
+            "--no-sandbox",
+            "--skip-probes",
+            "--tools-dir",
+            tools_dir.to_str().unwrap(),
             "tool",
             "list",
             "--",
             ahma_binary.to_str().unwrap(),
+            "--no-sandbox",
+            "--skip-probes",
+            "--tools-dir",
+            tools_dir.to_str().unwrap(),
             "serve",
             "stdio",
         ])
-        .env("AHMA_DISABLE_SANDBOX", "1")
-        .env("AHMA_SKIP_PROBES", "1")
-        .env("AHMA_TOOLS_DIR", tools_dir.to_str().unwrap())
         .current_dir(&project_root)
         .output()
         .expect("Failed to execute ahma tool list with trailing args");
@@ -305,12 +310,12 @@ fn test_list_tools_no_connection_suggestions() {
 
     let output = Command::new(&ahma_binary)
         .args([
+            "--no-sandbox",
             "tool",
             "list",
             "--mcp-config",
             "nonexistent-mcp.json", // Ensure it doesn't fall back to an existing mcp.json
         ])
-        .env("AHMA_DISABLE_SANDBOX", "1")
         .current_dir(temp_dir.path())
         .output()
         .expect("Failed to execute ahma tool list");

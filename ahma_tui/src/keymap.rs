@@ -41,6 +41,7 @@ pub enum Action {
     FilterBackspace,
     FilterEsc,
     // Chat mode input
+    FocusChat,
     /// A printable character typed into the chat input box.
     InputChar(char),
     /// Backspace in the chat input box.
@@ -60,6 +61,13 @@ pub enum Action {
     NavSubmit,
     NavUp,
     NavDown,
+    // Log monitor actions
+    ToggleWrap,
+    ToggleZoom,
+    OpenLogSwitcher,
+    CloseLogSwitcher,
+    SubmitLogSwitcher,
+    ApproveSymlink,
     Unknown,
 }
 
@@ -67,9 +75,10 @@ pub enum Action {
 ///
 /// Checked in priority order:
 /// 1. Command navigator (if visible)
-/// 2. Log filter (if active)
-/// 3. Chat input (if in Chat mode and input is focused)
-/// 4. Global / Monitor shortcuts
+/// 2. Log switcher modal (if open)
+/// 3. Log filter (if active)
+/// 4. Chat input (if in Chat mode and input is focused)
+/// 5. Global / Monitor shortcuts
 #[cfg(feature = "tui")]
 pub fn map_key(
     key: KeyEvent,
@@ -78,10 +87,15 @@ pub fn map_key(
     palette: &PaletteState,
     nav_visible: bool,
     log_filter_active: bool,
+    log_files_modal_open: bool,
 ) -> Action {
     // Navigator has highest priority when open.
     if nav_visible {
         return map_navigator_key(key);
+    }
+
+    if log_files_modal_open {
+        return map_log_modal_key(key);
     }
 
     if palette.visible {
@@ -148,6 +162,22 @@ fn map_navigator_key(key: KeyEvent) -> Action {
     }
 }
 
+// ─── Log Switcher Modal ───────────────────────────────────────────────────────
+
+#[cfg(feature = "tui")]
+fn map_log_modal_key(key: KeyEvent) -> Action {
+    use KeyCode::*;
+    use KeyModifiers as KM;
+
+    match (key.code, key.modifiers) {
+        (Esc, _) => Action::CloseLogSwitcher,
+        (Enter, _) => Action::SubmitLogSwitcher,
+        (Up, _) | (Char('k'), KM::NONE) => Action::Up,
+        (Down, _) | (Char('j'), KM::NONE) => Action::Down,
+        _ => Action::Unknown,
+    }
+}
+
 // ─── Global (monitor) keys ───────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
@@ -167,7 +197,15 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
         (Char('G'), KM::SHIFT) | (Char('G'), KM::NONE) => Action::Bottom,
         (Tab, KM::NONE) => Action::Tab,
         (BackTab, _) => Action::BackTab,
+
+        // Log focus Enter triggers ToggleZoom; other panels trigger Enter
+        (Enter, _) if focus == Focus::Log => Action::ToggleZoom,
         (Enter, _) => Action::Enter,
+
+        // Log monitor specific hotkeys
+        (Char('w'), KM::NONE) if focus == Focus::Log => Action::ToggleWrap,
+        (Char('l'), KM::NONE) if focus == Focus::Log => Action::OpenLogSwitcher,
+        (Char('a'), KM::NONE) if focus == Focus::Log => Action::ApproveSymlink,
 
         // Approval
         (Char('y'), KM::NONE) => Action::Approve,
@@ -190,6 +228,8 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
 
         // Log filter (`/` when Log pane is focused)
         (Char('/'), KM::NONE) if focus == Focus::Log => Action::StartFilter,
+
+        (Esc, _) => Action::FocusChat,
 
         _ => Action::Unknown,
     }
@@ -236,6 +276,7 @@ pub fn map_key(
     _palette: &PaletteState,
     _nav_visible: bool,
     _log_filter_active: bool,
+    _log_files_modal_open: bool,
 ) -> Action {
     Action::Unknown
 }

@@ -42,6 +42,7 @@
 //!   multi-line arguments, ensuring they are automatically cleaned up even if
 //!   an operation times out or is cancelled.
 
+pub mod executor;
 mod preparer;
 mod types;
 
@@ -161,6 +162,8 @@ pub struct Adapter {
     temp_file_manager: preparer::TempFileManager,
     /// Optional retry configuration for transient error handling.
     retry_config: Option<RetryConfig>,
+    /// Custom command executor.
+    pub command_executor: Arc<dyn executor::CommandExecutor>,
 }
 
 impl Adapter {
@@ -186,7 +189,14 @@ impl Adapter {
             task_handles: Arc::new(Mutex::new(HashMap::new())),
             temp_file_manager: preparer::TempFileManager::new(),
             retry_config: None,
+            command_executor: Arc::new(executor::DefaultCommandExecutor),
         })
+    }
+
+    /// Sets a custom command executor on the adapter.
+    pub fn with_command_executor(mut self, executor: Arc<dyn executor::CommandExecutor>) -> Self {
+        self.command_executor = executor;
+        self
     }
 
     /// Sets retry configuration for transient error handling.
@@ -300,7 +310,13 @@ impl Adapter {
         // the caller has NOT already added the -c flag via a subcommand config.
         // For bash/powershell the preparer already embeds -c/-Command; always
         // use create_command so the sandbox wrapper is applied without double-wrapping.
-        let mut cmd = build_sandboxed_command(&self.sandbox, &program, &args_vec, &safe_wd)?;
+        let mut cmd = build_sandboxed_command(
+            self.command_executor.as_ref(),
+            &self.sandbox,
+            &program,
+            &args_vec,
+            &safe_wd,
+        )?;
 
         let output_res = tokio::time::timeout(timeout, cmd.output()).await;
 
@@ -475,6 +491,7 @@ impl Adapter {
             shell_pool,
             sandbox,
             task_handles,
+            command_executor: self.command_executor.clone(),
         }));
 
         // Store the handle for graceful shutdown
@@ -520,17 +537,13 @@ impl Adapter {
 /// Raw `/bin/sh` invocations use `create_shell_command` (injects `-c`); all other
 /// programs use `create_command` so the preparer's shell flags are not doubled.
 fn build_sandboxed_command(
+    executor: &dyn executor::CommandExecutor,
     sandbox: &sandbox::Sandbox,
     program: &str,
     args_vec: &[String],
     working_dir: &std::path::Path,
 ) -> Result<tokio::process::Command> {
-    if program == "/bin/sh" {
-        let full_command = args_vec.join(" ");
-        sandbox.create_shell_command(program, &full_command, working_dir)
-    } else {
-        sandbox.create_command(program, args_vec, working_dir)
-    }
+    executor.build_command(sandbox, program, args_vec, working_dir)
 }
 
 /// Interpret a completed synchronous process output as success text or an error.
@@ -562,6 +575,7 @@ struct AsyncOperationRun {
     shell_pool: Arc<ShellPoolManager>,
     sandbox: Arc<sandbox::Sandbox>,
     task_handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    command_executor: Arc<dyn executor::CommandExecutor>,
 }
 
 async fn run_async_operation(ctx: AsyncOperationRun) {
@@ -578,6 +592,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         shell_pool,
         sandbox,
         task_handles,
+        command_executor,
     } = ctx;
 
     let cancellation_token = match monitor.get_operation(&op_id).await {
@@ -610,7 +625,13 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
 
     let start_time = Instant::now();
     let wd_path = std::path::PathBuf::from(&working_dir);
-    let mut proc_cmd = match build_sandboxed_command(&sandbox, &program, &args_vec, &wd_path) {
+    let mut proc_cmd = match build_sandboxed_command(
+        command_executor.as_ref(),
+        &sandbox,
+        &program,
+        &args_vec,
+        &wd_path,
+    ) {
         Ok(cmd) => cmd,
         Err(e) => {
             fail_operation_with_error(
@@ -1067,6 +1088,7 @@ async fn execute_with_streaming(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_remaining_stream_lines(
     stderr_reader: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStderr>>,
     stdout_reader: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,

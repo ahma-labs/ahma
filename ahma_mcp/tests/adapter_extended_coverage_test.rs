@@ -531,8 +531,6 @@ fn create_subcommand_with_positional() -> SubcommandConfig {
     SubcommandConfig {
         name: "test_sub".to_string(),
         description: "Test subcommand".to_string(),
-        options: None,
-        positional_args_first: None,
         positional_args: Some(vec![CommandOption {
             name: "file".to_string(),
             option_type: "string".to_string(),
@@ -544,15 +542,8 @@ fn create_subcommand_with_positional() -> SubcommandConfig {
             file_flag: None,
             alias: None,
         }]),
-        synchronous: None,
-        timeout_seconds: None,
         enabled: true,
-        guidance_key: None,
-        subcommand: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     }
 }
 
@@ -603,17 +594,8 @@ async fn test_path_option_validation() {
             file_arg: None,
             file_flag: None,
         }]),
-        positional_args_first: None,
-        positional_args: None,
-        synchronous: None,
-        timeout_seconds: None,
         enabled: true,
-        guidance_key: None,
-        subcommand: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     };
 
     let mut args = Map::new();
@@ -668,17 +650,8 @@ async fn test_option_with_alias_uses_short_flag() {
             file_arg: None,
             file_flag: None,
         }]),
-        positional_args_first: None,
-        positional_args: None,
-        synchronous: None,
-        timeout_seconds: None,
         enabled: true,
-        guidance_key: None,
-        subcommand: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     };
 
     let mut args = Map::new();
@@ -917,17 +890,8 @@ async fn test_boolean_string_true() {
             file_arg: None,
             file_flag: None,
         }]),
-        positional_args_first: None,
-        positional_args: None,
-        synchronous: None,
-        timeout_seconds: None,
         enabled: true,
-        guidance_key: None,
-        subcommand: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     };
 
     let mut args = Map::new();
@@ -969,17 +933,8 @@ async fn test_boolean_string_false() {
             file_arg: None,
             file_flag: None,
         }]),
-        positional_args_first: None,
-        positional_args: None,
-        synchronous: None,
-        timeout_seconds: None,
         enabled: true,
-        guidance_key: None,
-        subcommand: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     };
 
     let mut args = Map::new();
@@ -1142,17 +1097,8 @@ fn create_subcommand_with_file_arg() -> SubcommandConfig {
             file_flag: Some("-F".to_string()),
             alias: None,
         }]),
-        positional_args_first: None,
-        positional_args: None,
-        synchronous: None,
-        timeout_seconds: None,
         enabled: true,
-        guidance_key: None,
-        subcommand: None,
-        sequence: None,
-        step_delay_ms: None,
-        availability_check: None,
-        install_instructions: None,
+        ..Default::default()
     }
 }
 
