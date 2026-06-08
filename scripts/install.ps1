@@ -9,7 +9,7 @@
 #   - Internet access to GitHub releases
 #
 # Version indicator for build script check:
-# -Version '0.11.8'
+# -Version '0.11.9'
 # Install-OneSkill -Version '0.11.8'
 #
 # Environment variables:
