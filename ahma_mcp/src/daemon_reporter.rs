@@ -14,20 +14,8 @@ use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use ahma_common::daemon_hub::{
     ClientMsg, DaemonEvent, connect_to_daemon, ensure_daemon_running, send_msg,
 };
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tracing::{debug, warn};
-
-// ─── Snapshot entry ───────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct SnapEntry {
-    tool_name: String,
-    description: String,
-    status: OperationStatus,
-    scope: String,
-    result_summary: Option<String>,
-    duration_ms: u64,
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
@@ -72,7 +60,7 @@ async fn run_reporter_loop(
     label: String,
 ) {
     let pid = std::process::id();
-    let mut backoff_secs: u64 = 5;
+    let mut backoff_secs: u64 = 1;
 
     loop {
         // ── Ensure daemon is running ─────────────────────────────────────────
@@ -95,7 +83,7 @@ async fn run_reporter_loop(
         };
 
         debug!("daemon_reporter: connected to hub daemon");
-        backoff_secs = 5; // reset back-off on successful connect
+        backoff_secs = 1; // reset back-off on successful connect
 
         // Split into half-owned writer — we only send, never receive.
         let (_, write_half) = tokio::io::split(stream);
@@ -113,8 +101,13 @@ async fn run_reporter_loop(
             continue;
         }
 
+        // Subscribe to events BEFORE replaying so we don't miss anything that starts
+        // while we are replaying the initial snapshot.
+        let mut event_rx = monitor.subscribe_events();
+
         // ── Replay completed operations ───────────────────────────────────────
         let completed_ops = monitor.get_completed_operations().await;
+        let mut replayed_completed = false;
         for op in &completed_ops {
             let started_ev = ClientMsg::Event {
                 payload: DaemonEvent::OpStarted {
@@ -125,6 +118,7 @@ async fn run_reporter_loop(
                 },
             };
             if send_msg(&mut writer, &started_ev).await.is_err() {
+                replayed_completed = true;
                 break;
             }
             let duration_ms = op
@@ -141,115 +135,81 @@ async fn run_reporter_loop(
                 },
             };
             if send_msg(&mut writer, &finished_ev).await.is_err() {
+                replayed_completed = true;
                 break;
             }
         }
-
-        // ── Event loop: poll monitor every 2 s ───────────────────────────────
-        let mut snapshot: HashMap<String, SnapEntry> = HashMap::new();
-        for op in &completed_ops {
-            let duration_ms = op
-                .end_time
-                .and_then(|end| end.duration_since(op.start_time).ok())
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            snapshot.insert(
-                op.id.clone(),
-                SnapEntry {
-                    tool_name: op.tool_name.clone(),
-                    description: op.description.clone(),
-                    status: op.state,
-                    scope: scope.clone(),
-                    result_summary: result_summary_from(op),
-                    duration_ms,
-                },
-            );
+        if replayed_completed {
+            continue;
         }
 
-        loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-
-            let active = monitor.get_all_active_operations().await;
-            let completed = monitor.get_completed_operations().await;
-
-            // Build new snapshot from both active and recently-completed ops.
-            let mut new_snap: HashMap<String, SnapEntry> = HashMap::new();
-            for op in active.iter().chain(completed.iter()) {
-                let duration_ms = op
-                    .end_time
-                    .and_then(|end| end.duration_since(op.start_time).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                new_snap.insert(
-                    op.id.clone(),
-                    SnapEntry {
-                        tool_name: op.tool_name.clone(),
-                        description: op.description.clone(),
-                        status: op.state,
-                        scope: scope.clone(),
-                        result_summary: result_summary_from(op),
-                        duration_ms,
-                    },
-                );
+        // ── Replay active operations ──────────────────────────────────────────
+        let active_ops = monitor.get_all_active_operations().await;
+        let mut replayed_active = false;
+        for op in &active_ops {
+            let started_ev = ClientMsg::Event {
+                payload: DaemonEvent::OpStarted {
+                    id: op.id.clone(),
+                    tool_name: op.tool_name.clone(),
+                    description: op.description.clone(),
+                    scope: scope.clone(),
+                },
+            };
+            if send_msg(&mut writer, &started_ev).await.is_err() {
+                replayed_active = true;
+                break;
             }
+        }
+        if replayed_active {
+            continue;
+        }
 
-            // Diff: detect newly-started and just-finished operations.
-            let mut events: Vec<ClientMsg> = Vec::new();
-
-            for (id, entry) in &new_snap {
-                if let Some(prev) = snapshot.get(id) {
-                    // Already known — check for terminal transition.
-                    if !prev.status.is_terminal() && entry.status.is_terminal() {
-                        events.push(ClientMsg::Event {
-                            payload: DaemonEvent::OpFinished {
-                                id: id.clone(),
-                                status: status_label(entry.status),
-                                result_summary: entry.result_summary.clone(),
-                                duration_ms: entry.duration_ms,
+        // ── Event loop: listen for OperationMonitor events ────────────────────
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    let client_msg = match event {
+                        crate::operation_monitor::OperationEvent::Started(op) => ClientMsg::Event {
+                            payload: DaemonEvent::OpStarted {
+                                id: op.id,
+                                tool_name: op.tool_name,
+                                description: op.description,
+                                scope: scope.clone(),
                             },
-                        });
-                    }
-                } else {
-                    // New operation we haven't seen yet.
-                    events.push(ClientMsg::Event {
-                        payload: DaemonEvent::OpStarted {
-                            id: id.clone(),
-                            tool_name: entry.tool_name.clone(),
-                            description: entry.description.clone(),
-                            scope: entry.scope.clone(),
                         },
-                    });
-                    if entry.status.is_terminal() {
-                        events.push(ClientMsg::Event {
-                            payload: DaemonEvent::OpFinished {
-                                id: id.clone(),
-                                status: status_label(entry.status),
-                                result_summary: entry.result_summary.clone(),
-                                duration_ms: entry.duration_ms,
-                            },
-                        });
+                        crate::operation_monitor::OperationEvent::Updated(op) => {
+                            if !op.state.is_terminal() {
+                                continue;
+                            }
+                            let duration_ms = op
+                                .end_time
+                                .and_then(|end| end.duration_since(op.start_time).ok())
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            let result_summary = result_summary_from(&op);
+                            ClientMsg::Event {
+                                payload: DaemonEvent::OpFinished {
+                                    id: op.id.clone(),
+                                    status: status_label(op.state),
+                                    result_summary,
+                                    duration_ms,
+                                },
+                            }
+                        }
+                    };
+
+                    if let Err(e) = send_msg(&mut writer, &client_msg).await {
+                        debug!("daemon_reporter: send failed ({e}), reconnecting");
+                        break;
                     }
                 }
-            }
-
-            // Send all accumulated events.
-            let mut disconnected = false;
-            for ev in events {
-                if let Err(e) = send_msg(&mut writer, &ev).await {
-                    debug!("daemon_reporter: send failed ({e}), reconnecting");
-                    disconnected = true;
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("daemon_reporter event queue lagged by {n} messages; continuing");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     break;
                 }
             }
-
-            snapshot = new_snap;
-
-            if disconnected {
-                break;
-            }
-
-            // Prune terminal operations that are old enough to drop from snapshot.
-            prune_old_terminals(&mut snapshot);
         }
 
         // Back-off before reconnect attempt.
@@ -292,14 +252,4 @@ fn result_summary_from(op: &Operation) -> Option<String> {
     } else {
         Some(summary)
     }
-}
-
-/// Remove terminal entries that have been in the snapshot for a long time
-/// to avoid unbounded growth.
-///
-/// The `completed` list returned by `get_completed_operations()` is bounded
-/// by the monitor itself, so we won't re-emit terminal operations as "started"
-/// after they are pruned.
-fn prune_old_terminals(snap: &mut HashMap<String, SnapEntry>) {
-    snap.retain(|_, v| !v.status.is_terminal());
 }

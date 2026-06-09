@@ -147,7 +147,7 @@ fn draw_single_window(
             Span::styled(w.label.clone(), theme.normal()),
         ];
         let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
-        let right_str = format!(" X{}", w.id);
+        let right_str = format!(" x{}", w.id);
         let pad_width = (area.width as usize).saturating_sub(left_len + right_str.len());
         if pad_width > 0 {
             spans.push(Span::raw(" ".repeat(pad_width)));
@@ -162,7 +162,7 @@ fn draw_single_window(
         let border_width = 2;
         let title_space = (area.width as usize).saturating_sub(border_width);
         let title_left = format!(" [-] {} {}", w.id, w.label);
-        let title_right = format!("X{} ", w.id);
+        let title_right = format!("x{} ", w.id);
         let pad_width = title_space.saturating_sub(title_left.len() + title_right.len());
         let title_combined = if pad_width > 0 {
             format!("{}{}{}", title_left, " ".repeat(pad_width), title_right)
@@ -515,6 +515,163 @@ fn assistant_stream_cursor(streaming: bool, unicode: bool) -> &'static str {
     }
 }
 
+#[cfg(feature = "tui")]
+fn grid_to_braille(grid: [[bool; 3]; 3]) -> String {
+    let mut s = String::with_capacity(9);
+    for col_data in &grid {
+        let mask = (col_data[0] as u32) | ((col_data[1] as u32) << 1) | ((col_data[2] as u32) << 2);
+        if let Some(c) = std::char::from_u32(0x2800 + mask) {
+            s.push(c);
+        }
+    }
+    s
+}
+
+#[cfg(feature = "tui")]
+fn get_animated_indicator(
+    state: &AppState,
+    frame: usize,
+    active: bool,
+    has_content: bool,
+    tool_running: bool,
+) -> String {
+    if !active {
+        // Idle standby state
+        if state.unicode {
+            "⠂⠂⠂".to_string()
+        } else {
+            "...".to_string()
+        }
+    } else if tool_running {
+        // Thinking / running tools
+        if state.unicode {
+            let f0 = [[true, true, true], [true, false, true], [true, true, true]];
+            let f1 = [
+                [false, true, true],
+                [false, true, false],
+                [false, true, true],
+            ];
+            let f2 = [[true, true, true], [false, true, false], [true, true, true]];
+            let f3 = [
+                [false, true, true],
+                [true, false, true],
+                [false, true, true],
+            ];
+            let list = [f0, f1, f2, f3];
+            grid_to_braille(list[frame % 4])
+        } else {
+            let ascii_frames = ["- -", "= =", "o o", "* *", "o o", "= ="];
+            ascii_frames[frame % ascii_frames.len()].to_string()
+        }
+    } else if !has_content {
+        // Connecting
+        if state.unicode {
+            let frames = [
+                [
+                    [true, true, false],
+                    [false, false, false],
+                    [false, false, false],
+                ],
+                [
+                    [true, false, false],
+                    [true, false, false],
+                    [false, false, false],
+                ],
+                [
+                    [false, false, false],
+                    [true, false, false],
+                    [true, false, false],
+                ],
+                [
+                    [false, false, false],
+                    [false, false, false],
+                    [true, true, false],
+                ],
+                [
+                    [false, false, false],
+                    [false, false, false],
+                    [false, true, true],
+                ],
+                [
+                    [false, false, false],
+                    [false, false, true],
+                    [false, false, true],
+                ],
+                [
+                    [false, false, true],
+                    [false, false, true],
+                    [false, false, false],
+                ],
+                [
+                    [false, true, true],
+                    [false, false, false],
+                    [false, false, false],
+                ],
+            ];
+            grid_to_braille(frames[frame % 8])
+        } else {
+            let ascii_frames = [".  ", ".. ", " ..", "  .", " ..", ".. "];
+            ascii_frames[frame % ascii_frames.len()].to_string()
+        }
+    } else {
+        // Answering
+        if state.unicode {
+            let frames = [
+                [
+                    [false, true, false],
+                    [false, false, false],
+                    [false, false, false],
+                ],
+                [
+                    [true, true, false],
+                    [false, true, false],
+                    [false, false, false],
+                ],
+                [
+                    [true, true, true],
+                    [true, true, false],
+                    [false, true, false],
+                ],
+                [[false, true, true], [true, true, true], [true, true, false]],
+                [
+                    [false, false, true],
+                    [false, true, true],
+                    [true, true, true],
+                ],
+                [
+                    [false, false, false],
+                    [false, false, true],
+                    [false, true, true],
+                ],
+            ];
+            grid_to_braille(frames[frame % 6])
+        } else {
+            let ascii_frames = [".  ", "o. ", "o  ", ".o ", "  o", "  ."];
+            ascii_frames[frame % ascii_frames.len()].to_string()
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
+fn get_animated_indicator_style(
+    theme: &Theme,
+    active: bool,
+    has_content: bool,
+    tool_running: bool,
+) -> Style {
+    if !active {
+        theme.dim()
+    } else if tool_running {
+        Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD)
+    } else if !has_content {
+        theme.pending()
+    } else {
+        theme.success()
+    }
+}
+
 fn push_assistant_chat_lines(
     lines: &mut Vec<Line<'static>>,
     content: &str,
@@ -525,17 +682,45 @@ fn push_assistant_chat_lines(
     let cursor = assistant_stream_cursor(streaming, state.unicode);
     let display = format!("{content}{cursor}");
 
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let frame = (ms / 150) as usize;
+
+    let tool_running = state
+        .chat
+        .entries()
+        .iter()
+        .any(|entry| matches!(entry, ChatEntry::ToolCall { result: None, .. }));
+
+    let indicator =
+        get_animated_indicator(state, frame, streaming, !content.is_empty(), tool_running);
+    let indicator_style =
+        get_animated_indicator_style(theme, streaming, !content.is_empty(), tool_running);
+    let indicator_prefix = format!("{indicator} ");
+    let indicator_len = indicator_prefix.chars().count();
+
     for (index, line_str) in display.lines().enumerate() {
-        let prefix = if index == 0 { " ahma " } else { "      " };
-        lines.push(Line::from(vec![
-            Span::styled(prefix, theme.running()),
-            Span::styled(line_str.to_string(), theme.normal()),
-        ]));
+        if index == 0 {
+            lines.push(Line::from(vec![
+                Span::styled(indicator_prefix.clone(), indicator_style),
+                Span::styled("ahma ", theme.running()),
+                Span::styled(line_str.to_string(), theme.normal()),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(" ".repeat(indicator_len), Style::default()),
+                Span::styled("     ", theme.running()),
+                Span::styled(line_str.to_string(), theme.normal()),
+            ]));
+        }
     }
 
     if display.is_empty() && streaming {
         lines.push(Line::from(vec![
-            Span::styled(" ahma ", theme.running()),
+            Span::styled(indicator_prefix, indicator_style),
+            Span::styled("ahma ", theme.running()),
             Span::styled(assistant_stream_cursor(true, state.unicode), theme.dim()),
         ]));
     }
@@ -628,13 +813,13 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
 
     let title_left = if state.llm_label == "no LLM" {
         Line::from(Span::styled(
-            " model: no LLM — /provider to configure ",
+            " ahma: no LLM — /provider to configure ",
             theme.title(),
         ))
         .left_aligned()
     } else {
         Line::from(Span::styled(
-            format!(" model: {} ", state.llm_label),
+            format!(" ahma: {} ", state.llm_label),
             theme.title(),
         ))
         .left_aligned()
@@ -1326,7 +1511,9 @@ fn build_ops_dag_item(
         (false, _) => "",
     };
 
-    let id_short = &op.id[..op.id.len().min(6)];
+    let clean_id_str = op.clean_id();
+    let id_part = format!(" [{}]", clean_id_str);
+    let elapsed_part = format!("  {}", op.elapsed_display());
     let instance_part = if let Some(label) = &op.instance_label {
         let pid_part = op.pid.map(|p| format!(":{}", p)).unwrap_or_default();
         format!(" [{}{}]", label, pid_part)
@@ -1334,18 +1521,12 @@ fn build_ops_dag_item(
         String::new()
     };
 
-    // Subtract some characters for prefix, status, id, etc. to find name_short width
-    let prefix_len = prefix.len() + sel_symbol.len();
-    let reserved_len = prefix_len + 15 + instance_part.len(); // status + id + spaces + instance_part
-    let name_short = truncate(&op.display_name(), width.saturating_sub(reserved_len));
+    let fixed_prefix_len = sel_symbol.len() + prefix.len() + 2;
+    let rem_width = width.saturating_sub(fixed_prefix_len);
 
-    let row_style = if index == state.ops_selected {
-        theme.selected_item()
-    } else {
-        theme.normal()
-    };
+    let display_name = op.display_name();
 
-    Line::from(vec![
+    let mut line_spans = vec![
         Span::styled(
             sel_symbol,
             if is_selected {
@@ -1359,11 +1540,50 @@ fn build_ops_dag_item(
             format!("{} ", op.status.glyph(state.unicode)),
             theme.op_status_style(&op.status),
         ),
-        Span::styled(format!("{id_short} "), theme.dim()),
-        Span::styled(instance_part, theme.dim()),
-        Span::styled(name_short, row_style),
-        Span::styled(format!("  {}", op.elapsed_display()), theme.dim()),
-    ])
+    ];
+
+    let row_style = if index == state.ops_selected {
+        theme.selected_item()
+    } else {
+        theme.normal()
+    };
+
+    let meta_len_full = id_part.len() + instance_part.len() + elapsed_part.len();
+    if rem_width.saturating_sub(meta_len_full) >= 15 {
+        let name_max_len = rem_width.saturating_sub(meta_len_full);
+        line_spans.push(Span::styled(
+            truncate(&display_name, name_max_len),
+            row_style,
+        ));
+        line_spans.push(Span::styled(id_part, theme.dim()));
+        line_spans.push(Span::styled(instance_part, theme.dim()));
+        line_spans.push(Span::styled(elapsed_part, theme.dim()));
+    } else {
+        let meta_len_no_inst = id_part.len() + elapsed_part.len();
+        if rem_width.saturating_sub(meta_len_no_inst) >= 15 {
+            let name_max_len = rem_width.saturating_sub(meta_len_no_inst);
+            line_spans.push(Span::styled(
+                truncate(&display_name, name_max_len),
+                row_style,
+            ));
+            line_spans.push(Span::styled(id_part, theme.dim()));
+            line_spans.push(Span::styled(elapsed_part, theme.dim()));
+        } else {
+            let meta_len_no_id_no_inst = elapsed_part.len();
+            if rem_width.saturating_sub(meta_len_no_id_no_inst) >= 10 {
+                let name_max_len = rem_width.saturating_sub(meta_len_no_id_no_inst);
+                line_spans.push(Span::styled(
+                    truncate(&display_name, name_max_len),
+                    row_style,
+                ));
+                line_spans.push(Span::styled(elapsed_part, theme.dim()));
+            } else {
+                line_spans.push(Span::styled(truncate(&display_name, rem_width), row_style));
+            }
+        }
+    }
+
+    Line::from(line_spans)
 }
 
 // ─── Detail pane ──────────────────────────────────────────────────────────────

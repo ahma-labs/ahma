@@ -53,6 +53,7 @@ pub enum SourceEvent {
 pub enum McpSourceCommand {
     SetActiveFile(Option<String>),
     RefreshLogs,
+    SetDaemonHealthy(bool),
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -134,6 +135,11 @@ async fn mcp_source_task(
                         {
                             send(&tx, SourceEvent::LogFilesUpdated { files }).await;
                         }
+                    }
+                    Some(McpSourceCommand::SetDaemonHealthy(healthy)) => {
+                        let interval_secs = if healthy { 10 } else { 3 };
+                        status_tick = tokio::time::interval(Duration::from_secs(interval_secs));
+                        status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     }
                     None => {
                         break;

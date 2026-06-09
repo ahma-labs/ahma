@@ -32,13 +32,30 @@ pub struct ToolInfo {
     pub input_schema: Value,
 }
 
-pub type StdioClient = Arc<rmcp::service::RunningService<rmcp::RoleClient, ()>>;
+#[derive(Debug, Clone)]
+pub struct TuiMcpClientHandler {
+    pub workspace_root: PathBuf,
+}
+
+impl rmcp::ClientHandler for TuiMcpClientHandler {
+    async fn list_roots(
+        &self,
+        _context: rmcp::service::RequestContext<rmcp::RoleClient>,
+    ) -> Result<rmcp::model::ListRootsResult, rmcp::ErrorData> {
+        let uri = format!("file://{}", self.workspace_root.display());
+        let root = rmcp::model::Root::new(uri).with_name("workspace");
+        Ok(rmcp::model::ListRootsResult::new(vec![root]))
+    }
+}
+
+pub type StdioClient = Arc<rmcp::service::RunningService<rmcp::RoleClient, TuiMcpClientHandler>>;
 
 #[derive(Clone)]
 pub struct McpConnectionManager {
     pub servers: Vec<McpServerConfig>,
     pub tools_by_server: BTreeMap<String, Vec<ToolInfo>>,
     pub stdio_clients: Arc<Mutex<BTreeMap<String, StdioClient>>>,
+    pub workspace_root: PathBuf,
 }
 
 impl Default for McpConnectionManager {
@@ -47,6 +64,7 @@ impl Default for McpConnectionManager {
             servers: Vec::new(),
             tools_by_server: BTreeMap::new(),
             stdio_clients: Arc::new(Mutex::new(BTreeMap::new())),
+            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
 }
@@ -88,6 +106,7 @@ impl McpConnectionManager {
             servers,
             tools_by_server: BTreeMap::new(),
             stdio_clients: Arc::new(Mutex::new(BTreeMap::new())),
+            workspace_root: cwd.to_path_buf(),
         })
     }
 
@@ -202,10 +221,14 @@ impl McpConnectionManager {
         cmd.args(args);
         cmd.kill_on_drop(true);
 
-        let client =
-            ().serve(TokioChildProcess::new(cmd.configure(|_c| {}))?)
-                .await
-                .context("Failed to start stdio MCP server process")?;
+        let handler = TuiMcpClientHandler {
+            workspace_root: self.workspace_root.clone(),
+        };
+
+        let client = handler
+            .serve(TokioChildProcess::new(cmd.configure(|_c| {}))?)
+            .await
+            .context("Failed to start stdio MCP server process")?;
 
         let client_arc = Arc::new(client);
         clients.insert(name.to_string(), client_arc.clone());

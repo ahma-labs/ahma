@@ -24,7 +24,6 @@ Standard tool configurations are compiled into the `ahma` binary. They are only 
 | `--git` | `git` | Git version control |
 | `--github` | `gh` | GitHub CLI (PRs, issues, releases) |
 | `--python` | `python` | Python interpreter and pip |
-| `--kotlin` | `kotlin` | Kotlin/Android Gradle wrapper |
 | `--simplify` | `simplify` | Code complexity metrics |
 
 Example: `ahma --mode stdio --rust --git --fileutils`
@@ -46,7 +45,6 @@ cargo run --example cargo_tool
 cargo run --example file-tools
 cargo run --example gh_tool
 cargo run --example git_tool
-cargo run --example gradlew_tool
 cargo run --example python_tool
 
 # Or run schema validation tests

@@ -641,7 +641,8 @@ impl Operation {
 
     pub fn display_name(&self) -> String {
         if self.tool_name == "run_terminal_command" {
-            let get_cmd = || -> Option<String> {
+            // Case 1: Structured JSON description (e.g. from local TUI runs)
+            let get_cmd_json = || -> Option<String> {
                 let start_idx = self.description.find('{')?;
                 let end_idx = self.description.rfind('}')?;
                 if start_idx >= end_idx {
@@ -653,11 +654,40 @@ impl Operation {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             };
-            if let Some(cmd) = get_cmd() {
+            if let Some(cmd) = get_cmd_json() {
                 return cmd;
+            }
+
+            // Case 2: "Execute <cmd> in <dir>" description from daemon_reporter
+            if self.description.starts_with("Execute ")
+                && let Some(in_idx) = self.description.rfind(" in ")
+            {
+                let cmd = &self.description["Execute ".len()..in_idx];
+                if !cmd.is_empty() {
+                    return cmd.to_string();
+                }
+            }
+
+            // Case 3: Try to extract details from the op_id as a fallback
+            if self.id.starts_with("op_") {
+                let parts: Vec<&str> = self.id.split('_').collect();
+                if parts.len() >= 3 && parts[1].chars().all(|c| c.is_ascii_digit()) {
+                    return parts[2..].join(" ").replace('_', " ");
+                }
             }
         }
         self.tool_name.clone()
+    }
+
+    pub fn clean_id(&self) -> String {
+        if self.id.starts_with("op_") || self.id.starts_with("op-") {
+            let sep = if self.id.starts_with("op_") { '_' } else { '-' };
+            let parts: Vec<&str> = self.id.split(sep).collect();
+            if parts.len() >= 2 && parts[1].chars().all(|c| c.is_ascii_digit()) {
+                return format!("op{}{}", sep, parts[1]);
+            }
+        }
+        self.id[..self.id.len().min(6)].to_string()
     }
 }
 
@@ -1371,9 +1401,43 @@ mod tests {
         op_term.description = "/bin/sh {\"c_flag\": true, \"command\": \"sleep 10\"}".to_string();
         assert_eq!(op_term.display_name(), "sleep 10");
 
+        // Test run_terminal_command with "Execute <cmd> in <dir>" description (daemon reporter)
+        let mut op_term_exec = Operation::new("op3", "run_terminal_command", OpStatus::Running);
+        op_term_exec.description =
+            "Execute sleep 30 in /Users/paulhoughton/github/ahma".to_string();
+        assert_eq!(op_term_exec.display_name(), "sleep 30");
+
+        // Test run_terminal_command with op_id fallback
+        let mut op_term_fallback_id = Operation::new(
+            "op_1_cargo_build_release",
+            "run_terminal_command",
+            OpStatus::Running,
+        );
+        op_term_fallback_id.description = "invalid description".to_string();
+        assert_eq!(op_term_fallback_id.display_name(), "cargo build release");
+
         // Test run_terminal_command with fallback description
-        let mut op_term_fallback = Operation::new("op3", "run_terminal_command", OpStatus::Running);
+        let mut op_term_fallback = Operation::new("op4", "run_terminal_command", OpStatus::Running);
         op_term_fallback.description = "invalid description".to_string();
         assert_eq!(op_term_fallback.display_name(), "run_terminal_command");
+    }
+
+    #[test]
+    fn test_operation_clean_id() {
+        let op1 = Operation::new("op_1_sleep_30", "run_terminal_command", OpStatus::Running);
+        assert_eq!(op1.clean_id(), "op_1");
+
+        let op2 = Operation::new(
+            "op_10_cargo_build",
+            "run_terminal_command",
+            OpStatus::Running,
+        );
+        assert_eq!(op2.clean_id(), "op_10");
+
+        let op3 = Operation::new("op-001", "run_terminal_command", OpStatus::Running);
+        assert_eq!(op3.clean_id(), "op-001");
+
+        let op4 = Operation::new("a8f9c2d3", "run_terminal_command", OpStatus::Running);
+        assert_eq!(op4.clean_id(), "a8f9c2");
     }
 }

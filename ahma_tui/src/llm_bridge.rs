@@ -372,11 +372,25 @@ pub fn spawn_agent_task(
     });
 }
 
+fn is_local_default_server(url: &str) -> bool {
+    if url.starts_with("unix://") {
+        return true;
+    }
+    let trimmed = url.trim_end_matches('/');
+    trimmed == "http://localhost:3000" || trimmed == "http://127.0.0.1:3000"
+}
+
 async fn spawn_local_tool_call(
     mcp: McpChatConfig,
     tool: &str,
     arguments: serde_json::Value,
 ) -> Result<(String, bool), String> {
+    if is_local_default_server(&mcp.base_url) {
+        crate::connection::ensure_server_running()
+            .await
+            .map_err(|e| format!("Failed to ensure bridge server is running: {e}"))?;
+    }
+
     let builder = reqwest::Client::builder();
     let (request_base_url, builder) = if let Some(path) = mcp.base_url.strip_prefix("unix://") {
         #[cfg(unix)]
@@ -474,6 +488,20 @@ pub fn spawn_tool_call_task(
                 args: args_str,
             })
             .await;
+
+        if is_local_default_server(&mcp.base_url) {
+            let res = crate::connection::ensure_server_running().await;
+            if let Err(e) = res {
+                let _ = tx
+                    .send(BridgeEvent::ToolCallFinished {
+                        id: id.clone(),
+                        result: format!("Error ensuring bridge server is running: {e}"),
+                        failed: true,
+                    })
+                    .await;
+                return;
+            }
+        }
 
         let builder = reqwest::Client::builder();
         let (request_base_url, builder) = if let Some(path) = mcp.base_url.strip_prefix("unix://") {

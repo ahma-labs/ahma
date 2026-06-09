@@ -13,11 +13,17 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{
-    RwLock,
+    RwLock, broadcast,
     watch::{self, Receiver as WatchReceiver},
 };
 use tokio_util::sync::CancellationToken;
 use tracing;
+
+#[derive(Debug, Clone)]
+pub enum OperationEvent {
+    Started(Operation),
+    Updated(Operation),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Represents the current state of an operation
@@ -223,16 +229,24 @@ pub struct OperationMonitor {
     completion_history: Arc<RwLock<HashMap<String, Operation>>>,
     #[allow(dead_code)]
     config: MonitorConfig,
+    event_tx: broadcast::Sender<OperationEvent>,
 }
 
 impl OperationMonitor {
     /// Create a new operation monitor
     pub fn new(config: MonitorConfig) -> Self {
+        let (event_tx, _) = broadcast::channel(128);
         Self {
             operations: Arc::new(RwLock::new(HashMap::new())),
             completion_history: Arc::new(RwLock::new(HashMap::new())),
             config,
+            event_tx,
         }
+    }
+
+    /// Subscribe to operation monitor events (started, completed, cancelled, etc.)
+    pub fn subscribe_events(&self) -> broadcast::Receiver<OperationEvent> {
+        self.event_tx.subscribe()
     }
 
     pub async fn add_operation(&self, operation: Operation) {
@@ -242,8 +256,12 @@ impl OperationMonitor {
             operation.id,
             operation.state
         );
+        let op_clone = operation.clone();
         ops.insert(operation.id.clone(), operation);
         tracing::debug!("Total operations in monitor after add: {}", ops.len());
+        drop(ops);
+
+        let _ = self.event_tx.send(OperationEvent::Started(op_clone));
     }
 
     pub async fn append_stdout_line(&self, id: &str, line: String) {
@@ -350,6 +368,7 @@ impl OperationMonitor {
         // Signal completion.  Ignore errors: a SendError means no subscribers,
         // which is fine — the result is already in completion_history.
         let _ = op.completion_watch.send(true);
+        let _ = self.event_tx.send(OperationEvent::Updated(op));
     }
 
     /// Returns all currently active (non-terminal) operations.
@@ -362,6 +381,7 @@ impl OperationMonitor {
     pub async fn update_status(&self, id: &str, status: OperationStatus, result: Option<Value>) {
         let mut ops = self.operations.write().await;
         let mut operation_to_move = None;
+        let mut updated_op = None;
 
         if let Some(op) = ops.get_mut(id) {
             // Guard: never overwrite an already-terminal state.  Terminal ops are removed
@@ -390,6 +410,8 @@ impl OperationMonitor {
             if status.is_terminal() {
                 op.end_time = Some(SystemTime::now());
                 operation_to_move = ops.remove(id);
+            } else {
+                updated_op = Some(op.clone());
             }
         }
 
@@ -401,6 +423,9 @@ impl OperationMonitor {
             tracing::debug!("Moved operation {} to completion history.", id);
             drop(history);
             let _ = op.completion_watch.send(true);
+            let _ = self.event_tx.send(OperationEvent::Updated(op));
+        } else if let Some(op) = updated_op {
+            let _ = self.event_tx.send(OperationEvent::Updated(op));
         }
     }
 
@@ -442,6 +467,7 @@ impl OperationMonitor {
         drop(history);
         // Signal any concurrent wait_for_operation callers.
         let _ = cancelled_op.completion_watch.send(true);
+        let _ = self.event_tx.send(OperationEvent::Updated(cancelled_op));
 
         true
     }
@@ -843,6 +869,55 @@ mod tests {
             "state must stay Completed; downgrade to InProgress must be blocked"
         );
     }
+
+    /// Verifies that subscribing to events on `OperationMonitor` yields `Started`
+    /// followed by `Updated` events in the correct order when operations are
+    /// added and transition to terminal status.
+    #[tokio::test]
+    async fn test_event_propagation_order() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+
+        let mut rx = monitor.subscribe_events();
+
+        let op_id = "test-event-op".to_string();
+        let op = Operation::new(
+            op_id.clone(),
+            "test_tool".to_string(),
+            "event test".to_string(),
+            None,
+        );
+
+        // 1. Add operation
+        monitor.add_operation(op).await;
+
+        // 2. We should receive Started event
+        let event1 = rx.recv().await.expect("Failed to receive Started event");
+        if let OperationEvent::Started(started_op) = event1 {
+            assert_eq!(started_op.id, op_id);
+            assert_eq!(started_op.state, OperationStatus::Pending);
+        } else {
+            panic!("Expected OperationEvent::Started, got {:?}", event1);
+        }
+
+        // 3. Update status to Completed
+        monitor
+            .update_status(
+                &op_id,
+                OperationStatus::Completed,
+                Some(serde_json::json!({"ok": true})),
+            )
+            .await;
+
+        // 4. We should receive Updated event
+        let event2 = rx.recv().await.expect("Failed to receive Updated event");
+        if let OperationEvent::Updated(updated_op) = event2 {
+            assert_eq!(updated_op.id, op_id);
+            assert_eq!(updated_op.state, OperationStatus::Completed);
+        } else {
+            panic!("Expected OperationEvent::Updated, got {:?}", event2);
+        }
+    }
 }
 
 // ─── OperationMonitorSink ────────────────────────────────────────────────────
@@ -866,7 +941,7 @@ mod tests {
 /// ```rust,no_run
 /// use std::sync::Arc;
 /// use ahma_common::event_dispatcher::EventDispatcher;
-/// use crate::operation_monitor::{MonitorConfig, OperationMonitor, OperationMonitorSink};
+/// use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor, OperationMonitorSink};
 ///
 /// # async fn example() {
 /// let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(

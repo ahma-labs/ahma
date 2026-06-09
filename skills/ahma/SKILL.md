@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.11.12
+version: 0.11.13
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -18,7 +18,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.11.12 | author: Paul Houghton -->
+<!-- version: 0.11.13 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -138,7 +138,6 @@ Ahma groups command-line tools into logical bundles that can be loaded at startu
 | `fileutils` | `--tools fileutils` | ls, cp, mv, rm, grep, find, diff | File operations |
 | `github` | `--tools github` | gh pr/issue/run/release | GitHub CLI operations |
 | `git` | `--tools git` | git status/commit/push/log/diff | Version control |
-| `kotlin` | `--tools kotlin` | gradle build/test/lint | Android/Kotlin |
 | `python` | `--tools python` | python script execution | Python projects |
 | `simplify` | `--tools simplify` | Code complexity analysis | Code quality work |
 

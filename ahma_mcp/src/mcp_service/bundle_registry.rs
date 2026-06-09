@@ -47,12 +47,6 @@ pub const BUNDLES: &[BundleInfo] = &[
         ai_hint: "Need to commit, push, check status, view logs, or manage branches? Activate 'git' for git version control commands.",
     },
     BundleInfo {
-        name: "kotlin",
-        config_tool_name: "kotlin",
-        description: "Kotlin/Android Gradle wrapper — build, test, lint, assemble, install",
-        ai_hint: "Need to build, test, or lint a Kotlin/Android/Gradle project? Activate 'kotlin' for gradlew commands.",
-    },
-    BundleInfo {
         name: "python",
         config_tool_name: "python",
         description: "Python interpreter — scripts, inline code, modules",
