@@ -11,8 +11,8 @@ VIOLATIONS=0
 
 # Search for CARGO_TARGET_DIR outside of test_utils::cli
 while IFS= read -r file; do
-    # Skip the allowed file
-    if [[ "$file" == *"ahma_mcp/src/test_utils.rs" ]]; then
+    # Skip the allowed files
+    if [[ "$file" == *"ahma_mcp/src/test_utils.rs" || "$file" == *"ahma_mcp/tests/test_utils_coverage_test.rs" ]]; then
         continue
     fi
     

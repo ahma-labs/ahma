@@ -49,7 +49,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.0
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 2
@@ -63,7 +63,7 @@ jobs:
 
       - name: Cache Cargo registry and git
         if: matrix.language == 'rust'
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -77,7 +77,7 @@ jobs:
 
       - name: Cache sccache
         if: matrix.language == 'rust'
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.0
+        uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.sccache
           key: sccache-codeql-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
@@ -87,7 +87,7 @@ jobs:
 
       - name: Setup Rust Toolchain
         if: matrix.language == 'rust'
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+        uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt, rust-src
           rustflags: ""
@@ -106,7 +106,7 @@ jobs:
 
       - name: Install sccache
         if: matrix.language == 'rust'
-        uses: taiki-e/install-action@50b4a718b59c718df4ef27a3b445f86cd57b9f00 # v2
+        uses: taiki-e/install-action@v2
         with:
           tool: sccache
 
@@ -115,13 +115,13 @@ jobs:
         run: cargo check --locked --all-targets
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        uses: github/codeql-action/init@v4
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
 
