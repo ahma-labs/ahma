@@ -186,7 +186,12 @@ jobs:
           echo "--- cargo nextest --version" && cargo nextest --version
           echo "--- Running cargo nextest run --profile ci"
           # Exclude kotlin/android tests - they run in job-android-nextest only
-          cargo nextest run --profile ci --locked --no-default-features -E 'not (test(kotlin) or test(android))'
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            echo "--- Running with --test-threads 1 on Windows to prevent resource/IPC starvation"
+            cargo nextest run --profile ci --locked --no-default-features --test-threads 1 -E 'not (test(kotlin) or test(android))'
+          else
+            cargo nextest run --profile ci --locked --no-default-features -E 'not (test(kotlin) or test(android))'
+          fi
 
       - name: ARM64 smoke validation (compile-only)
         if: matrix.test_mode == 'smoke'

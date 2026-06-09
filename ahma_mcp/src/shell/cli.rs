@@ -104,6 +104,10 @@ pub struct AppConfig {
     pub hot_reload_tools: bool,
     /// Skip tool availability probes at startup (AHMA_SKIP_PROBES=1).
     pub skip_availability_probes: bool,
+    /// Enable output compression and token minimization (AHMA_MINIMIZE_TOKENS=1).
+    pub minimize_tokens: bool,
+    /// Enable small-model harness adaptations (AHMA_SMALL_MODEL_HARNESS=1).
+    pub small_model_harness: bool,
 
     // ── Sandbox ─────────────────────────────────────────────────────────────
     /// Disable the kernel sandbox entirely (AHMA_DISABLE_SANDBOX=1).
@@ -194,6 +198,8 @@ impl Default for AppConfig {
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
+            minimize_tokens: false,
+            small_model_harness: false,
 
             no_sandbox: false,
             sandbox_scopes: vec![],
@@ -1141,6 +1147,14 @@ pub struct Cli {
     /// Use only in environments that provide their own containment (Docker, CI containers).
     #[arg(long = "no-sandbox", global = true)]
     pub no_sandbox: bool,
+
+    /// Enable output compression and token minimization.
+    #[arg(long = "minimize-tokens", global = true)]
+    pub minimize_tokens: bool,
+
+    /// Enable small-model harness adaptations.
+    #[arg(long = "small-model-harness", global = true)]
+    pub small_model_harness: bool,
 
     /// Default tool execution timeout in seconds.
     /// Individual tools can override this via the timeout_seconds field in their JSON definition.
@@ -2385,6 +2399,14 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     let (require_token, require_token_path, rate_limit_rps, rate_limit_burst, instance_label) =
         parse_auth_settings(cli, &s);
 
+    let minimize_tokens = cli.minimize_tokens
+        || check_env_flag_with_deprecation!("AHMA_MINIMIZE_TOKENS")
+        || s.tools.minimize_tokens;
+
+    let small_model_harness = cli.small_model_harness
+        || check_env_flag_with_deprecation!("AHMA_SMALL_MODEL_HARNESS")
+        || s.tools.small_model_harness;
+
     AppConfig {
         tools_dir,
         explicit_tools_dir,
@@ -2393,6 +2415,8 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         force_sync,
         hot_reload_tools,
         skip_availability_probes,
+        minimize_tokens,
+        small_model_harness,
 
         no_sandbox,
         sandbox_scopes,
@@ -2845,6 +2869,8 @@ mod tests {
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
+            minimize_tokens: false,
+            small_model_harness: false,
 
             no_sandbox: false,
             sandbox_scopes: vec![],

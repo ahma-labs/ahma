@@ -173,14 +173,9 @@ pub struct Adapter {
     /// Custom command executor.
     pub command_executor: Arc<dyn executor::CommandExecutor>,
     /// Unified event dispatcher (P2).
-    ///
-    /// All operation lifecycle events are broadcast here.  Subscribers receive every event
-    /// across all concurrent operations from this adapter.  Filter by `operation_id` if
-    /// you care about a specific operation.
-    ///
-    /// In a future pass (P5) the legacy `callback` / direct-monitor-update paths will be
-    /// removed and all notifications will flow exclusively through this dispatcher.
     pub event_dispatcher: EventDispatcher,
+    /// Token minimization and output optimizer context.
+    pub output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 }
 
 impl Adapter {
@@ -208,6 +203,9 @@ impl Adapter {
             retry_config: None,
             command_executor: Arc::new(executor::DefaultCommandExecutor),
             event_dispatcher: EventDispatcher::default(),
+            output_optimizer: Arc::new(tokio::sync::Mutex::new(
+                crate::output_optimizer::OutputOptimizer::new(false, None),
+            )),
         })
     }
 
@@ -526,6 +524,7 @@ impl Adapter {
             task_handles,
             command_executor: self.command_executor.clone(),
             event_dispatcher: self.event_dispatcher.clone(),
+            output_optimizer: self.output_optimizer.clone(),
         }));
 
         // Store the handle for graceful shutdown
@@ -612,6 +611,7 @@ struct AsyncOperationRun {
     command_executor: Arc<dyn executor::CommandExecutor>,
     /// Unified event dispatcher for P2 event stream.
     event_dispatcher: EventDispatcher,
+    output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 }
 
 async fn run_async_operation(ctx: AsyncOperationRun) {
@@ -630,6 +630,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         task_handles,
         command_executor,
         event_dispatcher,
+        output_optimizer,
     } = ctx;
 
     let cancellation_token = match monitor.get_operation(&op_id).await {
@@ -726,6 +727,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
             start_time,
             &monitor,
             &event_dispatcher,
+            &output_optimizer,
         )
         .await;
     } else {
@@ -739,6 +741,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
             &working_dir,
             start_time,
             &monitor,
+            &output_optimizer,
         )
         .await;
     }
@@ -945,6 +948,7 @@ async fn execute_batch(
     working_dir: &str,
     start_time: Instant,
     monitor: &Arc<OperationMonitor>,
+    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
     let proc_result =
         tokio::time::timeout(Duration::from_millis(timeout_ms), proc_cmd.output()).await;
@@ -968,6 +972,7 @@ async fn execute_batch(
                 working_dir,
                 duration_ms,
                 output,
+                output_optimizer,
             )
             .await;
         }
@@ -989,6 +994,7 @@ async fn execute_batch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_operation_with_output(
     monitor: &Arc<OperationMonitor>,
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
@@ -997,11 +1003,19 @@ async fn complete_operation_with_output(
     working_dir: &str,
     duration_ms: u64,
     output: std::process::Output,
+    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = output.status.code().unwrap_or(-1);
     let success = output.status.success();
+
+    let mut final_text = format!("Exit code: {exit_code}\nStdout:\n{stdout}\nStderr:\n{stderr}");
+    if let Ok(mut opt) = output_optimizer.try_lock()
+        && opt.enabled
+    {
+        final_text = opt.finalize_output(program, exit_code, &stdout, &stderr);
+    }
 
     let tail_source = if stdout.is_empty() { &stderr } else { &stdout };
     let tail_lines: Vec<String> = tail_source
@@ -1041,7 +1055,7 @@ async fn complete_operation_with_output(
             working_dir,
             success,
             duration_ms,
-            format!("Exit code: {exit_code}\nStdout:\n{stdout}\nStderr:\n{stderr}"),
+            final_text,
         ),
         op_id,
     )
@@ -1090,6 +1104,7 @@ async fn execute_with_streaming(
     start_time: Instant,
     op_monitor: &Arc<OperationMonitor>,
     event_dispatcher: &EventDispatcher,
+    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1153,12 +1168,12 @@ async fn execute_with_streaming(
 
             // Read stderr line
             result = stderr_reader.next_line() => {
-                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, callback, op_id, op_monitor, event_dispatcher).await;
+                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, callback, op_id, op_monitor, event_dispatcher, output_optimizer).await;
             }
 
             // Read stdout line
             result = stdout_reader.next_line() => {
-                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, callback, op_id, op_monitor, event_dispatcher).await;
+                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, callback, op_id, op_monitor, event_dispatcher, output_optimizer).await;
             }
         }
 
@@ -1177,6 +1192,7 @@ async fn execute_with_streaming(
                     op_id,
                     op_monitor,
                     event_dispatcher,
+                    output_optimizer,
                 )
                 .await;
                 break;
@@ -1203,6 +1219,7 @@ async fn execute_with_streaming(
             program,
             working_dir,
         },
+        output_optimizer,
     )
     .await;
 }
@@ -1218,6 +1235,7 @@ async fn drain_remaining_stream_lines(
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
     event_dispatcher: &EventDispatcher,
+    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
     while let Ok(Some(line)) = stderr_reader.next_line().await {
         process_streaming_line(
@@ -1229,6 +1247,7 @@ async fn drain_remaining_stream_lines(
             op_id,
             op_monitor,
             event_dispatcher,
+            output_optimizer,
         )
         .await;
     }
@@ -1242,11 +1261,13 @@ async fn drain_remaining_stream_lines(
             op_id,
             op_monitor,
             event_dispatcher,
+            output_optimizer,
         )
         .await;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_streaming_operation(
     child: &mut tokio::process::Child,
     start_time: Instant,
@@ -1255,6 +1276,7 @@ async fn finalize_streaming_operation(
     op_monitor: &Arc<OperationMonitor>,
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
     ctx: &StreamingOpContext<'_>,
+    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
     let op_id = ctx.op_id;
     let program = ctx.program;
@@ -1270,6 +1292,14 @@ async fn finalize_streaming_operation(
 
     let stdout_str = collected_stdout.rendered_output();
     let stderr_str = collected_stderr.rendered_output();
+
+    let mut final_text =
+        format!("Exit code: {exit_code}\nStdout:\n{stdout_str}\nStderr:\n{stderr_str}");
+    if let Ok(mut opt) = output_optimizer.try_lock()
+        && opt.enabled
+    {
+        final_text = opt.finalize_output(program, exit_code, &stdout_str, &stderr_str);
+    }
 
     let final_output = json!({
         "stdout": stdout_str,
@@ -1298,7 +1328,7 @@ async fn finalize_streaming_operation(
             working_dir,
             success,
             duration_ms,
-            format!("Exit code: {exit_code}\nStdout:\n{stdout_str}\nStderr:\n{stderr_str}"),
+            final_text,
         ),
         op_id,
     )
@@ -1351,6 +1381,7 @@ async fn handle_stream_line(
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
     event_dispatcher: &EventDispatcher,
+    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
     match result {
         Ok(Some(line)) => {
@@ -1363,6 +1394,7 @@ async fn handle_stream_line(
                 op_id,
                 op_monitor,
                 event_dispatcher,
+                output_optimizer,
             )
             .await;
         }
@@ -1385,19 +1417,27 @@ async fn process_streaming_line(
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
     event_dispatcher: &EventDispatcher,
+    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
     let safe_line = crate::log_monitor::redact_sensitive_line(line);
-    collector.push(safe_line.clone());
-    op_monitor
-        .append_stdout_line(op_id, safe_line.clone())
-        .await;
 
-    // Emit OutputLine to the unified dispatcher (P2).
-    event_dispatcher.emit(OperationEvent::OutputLine {
-        operation_id: op_id.to_string(),
-        line: safe_line,
-        is_stderr,
-    });
+    let opt_lines = if let Ok(mut opt) = output_optimizer.try_lock() {
+        opt.process_streaming_line(&safe_line)
+    } else {
+        vec![safe_line.clone()]
+    };
+
+    for opt_line in opt_lines {
+        collector.push(opt_line.clone());
+        op_monitor.append_stdout_line(op_id, opt_line.clone()).await;
+
+        // Emit OutputLine to the unified dispatcher (P2).
+        event_dispatcher.emit(OperationEvent::OutputLine {
+            operation_id: op_id.to_string(),
+            line: opt_line,
+            is_stderr,
+        });
+    }
 
     if let Some(snapshot) = log_monitor.process_line(line, is_stderr) {
         let alert_summary = format!("[{}] {}", snapshot.trigger_level, snapshot.trigger_line);

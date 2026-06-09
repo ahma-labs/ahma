@@ -288,6 +288,14 @@ fn approve_symlink(state: &mut crate::state::AppState) {
     {
         let tx = tx.clone();
         let file_to_approve = active_file.clone();
+        let settings = ahma_common::config::AhmaSettings::load();
+        let minimize_tokens = std::env::var("AHMA_MINIMIZE_TOKENS")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(settings.tools.minimize_tokens);
+        let small_model_harness = std::env::var("AHMA_SMALL_MODEL_HARNESS")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(settings.tools.small_model_harness);
+
         let mcp = crate::llm_bridge::McpChatConfig {
             base_url: state.server_url.clone(),
             workspace_root: std::path::PathBuf::from(&state.workspace),
@@ -296,6 +304,8 @@ fn approve_symlink(state: &mut crate::state::AppState) {
             max_turns: 8,
             tool_approval: false,
             mcp_connections: state.mcp_connections.clone(),
+            minimize_tokens,
+            small_model_harness,
         };
         tokio::spawn(async move {
             crate::llm_bridge::spawn_tool_call_task(
@@ -1078,6 +1088,14 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
         false
     };
 
+    let settings = ahma_common::config::AhmaSettings::load();
+    let minimize_tokens = std::env::var("AHMA_MINIMIZE_TOKENS")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(settings.tools.minimize_tokens);
+    let small_model_harness = std::env::var("AHMA_SMALL_MODEL_HARNESS")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(settings.tools.small_model_harness);
+
     crate::llm_bridge::McpChatConfig {
         base_url: state.mcp_http_base_url.clone(),
         workspace_root: std::path::PathBuf::from(&state.workspace),
@@ -1086,6 +1104,8 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
         max_turns,
         tool_approval,
         mcp_connections: state.mcp_connections.clone(),
+        minimize_tokens,
+        small_model_harness,
     }
 }
 
