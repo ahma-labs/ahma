@@ -51,82 +51,64 @@ simplify, ahma update, etc.).
 
 ---
 
-## `/ahmadev bump <X.Y.Z>` — Bump ahma Version
+## `/ahmadev bump [X.Y.Z]` — Bump ahma Version
 
 ### What it does
 
-Updates the ahma workspace version in `Cargo.toml` by setting:
-
-```
-[workspace.package]
-version = "X.Y.Z"
-```
-
-This subcommand intentionally targets `Cargo.toml` version bumping only.
+Bumps the version of the `ahma` workspace. This updates the version in `Cargo.toml` (`[workspace.package].version`) and runs `cargo xtask bump-version <X.Y.Z>` to propagate the new version across all other version-bearing files (such as installation scripts, skill files, and locks), making updates and signing run smoothly.
 
 ### Default: bump the patch version
 
-**When the user says "bump to the next version" or gives no explicit version, always increment the
-patch component** (`Z` in `X.Y.Z`), keeping the major and minor components unchanged.
-Example: `0.9.1` → `0.9.2`, **not** `0.10.0`.
+**When the user says "bump" or gives no explicit version, always increment the patch component** (`Z` in `X.Y.Z`), keeping the major and minor components unchanged.
+Example: `0.11.13` → `0.11.14`, **not** `0.12.0`.
 
 Only deviate from this rule when the user explicitly specifies a different version string.
 
 ### Usage examples
 
-```
+```bash
 # Unqualified "bump" or "bump to next version": increment patch
-/ahmadev bump          → reads current version, adds 1 to Z (e.g. 0.9.1 → 0.9.2)
+/ahmadev bump          → reads current version, adds 1 to Z (e.g. 0.11.13 → 0.11.14)
 
 # Explicit version override
-/ahmadev bump 0.9.2
+/ahmadev bump 0.11.15
 /ahmadev bump 1.0.0
 ```
 
 ### Workflow (how to invoke as an agent)
 
-1. Determine target version:
+1. **Determine target version**:
    - If the user provided `X.Y.Z` explicitly, use it as-is.
-   - Otherwise ("next version", no argument, etc.) read the current `[workspace.package].version`
-     from `Cargo.toml`, and increment `Z` by 1.
-2. Validate format (expect `X.Y.Z`, numeric semver core).
-3. Apply the bump by updating `Cargo.toml` `[workspace.package].version`.
-3. Verify the workspace still compiles:
-
+   - Otherwise ("next version", no argument, etc.) read the current `[workspace.package].version` from `Cargo.toml`, and increment the patch component `Z` by 1.
+2. **Validate format** (expect `X.Y.Z`, numeric semver core).
+3. **Run the xtask command**: Do NOT manually edit `Cargo.toml` or any other files. Run the xtask bump command to update `Cargo.toml` and synchronize all version-bearing files in a single atomic step:
+   ```bash
+   cargo xtask bump-version <X.Y.Z>
    ```
-   run_terminal_command("cargo check --workspace", working_directory=".")
+   *Note: This command updates `Cargo.toml`, `skills/ahma/SKILL.md`, `scripts/install.sh`, and `scripts/install.ps1` automatically. Running this command first prevents build panics/errors caused by version mismatches between files.*
+4. **Build and Verify the workspace**:
+   Build the debug binary and check the workspace to verify everything compiles:
+   ```bash
+   cargo build
+   cargo check --workspace
+   cargo nextest run
    ```
-
-4. Sync all other version-bearing files via xtask:
-
-   ```
-   run_terminal_command("cargo xtask bump-version <X.Y.Z>", working_directory=".")
-   ```
-
-   This updates `skills/ahma/SKILL.md`, `scripts/install.sh`, and `scripts/install.ps1`
-   automatically. The build script enforces consistency and will fail `cargo check` if any
-   file still references the old version.
-
-5. Review only the version-line diff:
-
-   ```
-   run_terminal_command("git diff Cargo.toml", working_directory=".")
+5. **Review git diff** to confirm version-bearing files are correctly modified:
+   ```bash
+   git diff
    ```
 
 ### Failure recovery
 
-If the change is incorrect, revert the file and retry with the intended version:
-
+If the change is incorrect or compilation fails, revert files and retry:
 ```bash
-git checkout -- Cargo.toml
+git checkout -- Cargo.toml Cargo.lock scripts/install.sh scripts/install.ps1 skills/ahma/SKILL.md
 ```
-
-Then run `/ahmadev bump <X.Y.Z>` again.
 
 ### Notes
 
-- Scope is limited to `Cargo.toml` version updates by design.
-- For broad release-version synchronization across additional files, use the repo's dedicated release workflow.
+- Do not manually edit `Cargo.toml` for version bumping. Always use `cargo xtask bump-version <X.Y.Z>` as it ensures script signature consistency and smooth updates.
+- This command coordinates the full release version synchronization across the repository.
 
 ---
 

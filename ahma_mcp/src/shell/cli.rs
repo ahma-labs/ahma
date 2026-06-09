@@ -222,7 +222,7 @@ impl Default for AppConfig {
             rate_limit_rps: 0,
             rate_limit_burst: 10,
             instance_label: "ahma".to_string(),
-            idle_timeout_secs: Some(10),
+            idle_timeout_secs: None,
             max_sessions: 10,
             is_server_child: false,
         }
@@ -560,7 +560,11 @@ fn check_powershell_available() {
 
 async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
     match serve_args.transport {
-        Some(ServeTransport::Stdio) => {
+        Some(ServeTransport::Stdio(stdio_args)) => {
+            let mut cfg = cfg;
+            if let Some(path) = stdio_args.path {
+                cfg.sandbox_scopes.push(path);
+            }
             let sandbox = initialize_sandbox(&cfg)?;
             let sandbox =
                 sandbox.ok_or_else(|| anyhow!("Sandbox failed to initialize for stdio mode"))?;
@@ -668,7 +672,7 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
         }
         Subcommands::Update(args) => {
             tracing::info!("Running in update mode");
-            crate::update::run(args).await
+            crate::update::run(args, &cfg).await
         }
         Subcommands::Verify(args) => {
             tracing::info!("Running in verify mode");
@@ -1081,25 +1085,18 @@ fn check_stdio_not_interactive() -> Result<()> {
     about = "Ahma MCP: secure, config-driven adapter for CLI tools"
 )]
 pub struct Cli {
-    /// Emit the full CLI reference as Markdown and exit.
-    ///
-    /// Pipe into a file to regenerate `docs/cli-reference.md`:
-    ///
-    ///   ahma --markdown-help > docs/cli-reference.md
+    /// Emit the full CLI reference as Markdown and exit. Pipe into a file to
+    /// regenerate `docs/cli-reference.md` via `ahma --markdown-help > docs/cli-reference.md`.
     #[arg(long, global = true, hide = true)]
     pub markdown_help: bool,
 
-    /// Ignore `~/.ahma/settings.toml` for this invocation.
-    ///
-    /// All settings fall back to their compiled-in defaults (and any deprecated
-    /// `AHMA_*` environment variables that are still set).
+    /// Ignore `~/.ahma/settings.toml` for this invocation. All settings fall
+    /// back to compiled-in defaults and any deprecated `AHMA_*` env vars.
     #[arg(long, global = true)]
     pub no_settings: bool,
 
-    /// Path to the settings file to use instead of `~/.ahma/settings.toml`.
-    ///
-    /// Useful for testing or per-project settings files.
-    /// Ignored when `--no-settings` is also supplied.
+    /// Path to settings file instead of `~/.ahma/settings.toml`. Useful for
+    /// testing or per-project settings. Ignored when `--no-settings` is supplied.
     #[arg(long, global = true, value_name = "PATH")]
     pub settings_path: Option<PathBuf>,
 
@@ -1162,11 +1159,12 @@ pub struct Cli {
     #[arg(long = "opentelemetry", value_name = "URL", global = true)]
     pub opentelemetry: Option<String>,
 
-    /// Run this server session inside an existing task vault.
-    ///
-    /// Sets the sandbox scope to <vault>/workdir/, initializes an audit log at
-    /// <vault>/audit.jsonl, and wires two-phase delete through <vault>/trash/.
-    /// The vault must exist (create with `ahma vault create <slug>` first).
+    /// Run this server session inside an existing task vault (a per-task isolated
+    /// directory containing inputs, workdir, outputs, trash, and audit logs).
+    /// Enforces the "dedicated folder per task" security principle by restricting
+    /// the sandbox scope to <vault>/workdir/, initializing an audit log at
+    /// <vault>/audit.jsonl, and routing deletions to <vault>/trash/. The vault
+    /// must exist (create with `ahma vault create <slug>` first).
     #[arg(long = "task-vault", value_name = "PATH", global = true)]
     pub task_vault: Option<PathBuf>,
 
@@ -1287,18 +1285,13 @@ pub enum Subcommands {
     Verify(crate::update::verify::VerifyArgs),
     /// Run the interactive or automated setup wizard.
     Setup(SetupArgs),
-    /// Start the TUI hub daemon for multi-instance aggregation.
-    ///
-    /// The daemon is a lightweight process that collects operation events from
-    /// all running ahma instances (including stdio processes spawned by IDEs)
-    /// and fans them out to TUI subscribers.  It is started automatically on
-    /// first use and exits automatically after 60 s of idle.
+    /// Start the TUI hub daemon for multi-instance aggregation. The daemon collects
+    /// operation events from running ahma instances (including stdio processes spawned
+    /// by IDEs) and fans them to TUI subscribers. Starts automatically on first use.
     Daemon(DaemonArgs),
-    /// Manage the user settings file (`~/.ahma/settings.toml`).
-    ///
-    /// The settings file is the primary place to configure Ahma behaviour.
-    /// It supersedes most `AHMA_*` environment variables and provides a
-    /// single, auditable, self-documented source of truth for all options.
+    /// Manage the settings file (`~/.ahma/settings.toml`). The primary place to
+    /// configure Ahma behaviour, superseding environment variables and providing a
+    /// single, auditable, self-documented source of truth.
     Settings(SettingsArgs),
     /// Manage LLM prompt templates (~/.ahma/prompts.toml).
     Prompts(PromptsArgs),
@@ -1457,19 +1450,9 @@ pub struct ServeArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ServeTransport {
-    /// Serve over stdio — the standard transport for MCP clients.
-    ///
-    /// The MCP client (Cursor, VS Code, Claude Desktop, …) spawns
-    /// ahma as a child process and communicates over stdin/stdout.
-    /// No network port is opened; sandboxing is applied per-session.
-    ///
-    /// To wire ahma into an MCP client add an entry like this to
-    /// your `mcp.json` (exact key names vary by client):
-    ///
-    ///   "ahma": {
-    ///     "command": "ahma",
-    ///     "args": ["serve", "stdio", "--tool", "rust,git"]
-    ///   }
+    /// Serve over stdio — standard transport for MCP clients. Spawns ahma as a
+    /// child process communicating over stdin/stdout. No network port is opened;
+    /// sandboxing is applied per-session.
     #[command(after_help = "EXAMPLES:
   # Minimal stdio server
   ahma serve stdio
@@ -1491,27 +1474,14 @@ pub enum ServeTransport {
 
   # Disable sandbox in a Docker container with its own isolation
   ahma serve stdio --no-sandbox")]
-    Stdio,
-    /// Serve over HTTP — a persistent multi-session bridge.
-    ///
-    /// Listens on a TCP port and routes MCP sessions over HTTP/2 and
-    /// (optionally) HTTP/3/QUIC.  Multiple MCP clients can connect
-    /// concurrently.  Suitable for CI runners, shared machines, or
-    /// remote integrations.
+    Stdio(StdioArgs),
+    /// Serve over HTTP — a persistent bridge. Listens on a TCP port and routes
+    /// MCP sessions over HTTP/2 and HTTP/3/QUIC. Multiple clients can connect
+    /// concurrently; suitable for CI runners or remote integrations.
     Http(HttpArgs),
-    /// Serve over a Unix domain socket (UDS) — for local IPC and Kubernetes sidecar proxies.
-    ///
-    /// Listens on a filesystem UDS path and routes MCP Streamable HTTP traffic
-    /// through that socket.  Useful when TCP/DNS is unavailable (e.g. Envoy
-    /// sidecars in K8s pods) or when you want socket-file-level access control
-    /// without a network port.
-    ///
-    /// Linux abstract sockets are supported with the `@` prefix:
-    ///   --socket-path @my-socket  →  binds `\0my-socket` in the kernel namespace
-    ///
-    /// Filesystem socket files are removed automatically on graceful shutdown.
-    ///
-    /// Not available on Windows; use `serve http` on that platform.
+    /// Serve over a Unix domain socket (UDS) for local IPC and sidecar proxies.
+    /// Listens on a UDS path and routes MCP Streamable HTTP traffic. Filesystem socket
+    /// files are removed automatically on graceful shutdown. Not available on Windows.
     #[cfg(unix)]
     #[command(after_help = "EXAMPLES:
   # Filesystem socket (default path)
@@ -1571,6 +1541,14 @@ pub struct HttpArgs {
     pub port: u16,
 }
 
+/// Arguments for `ahma serve stdio`.
+#[derive(Parser, Debug, Clone)]
+pub struct StdioArgs {
+    /// Optional path to set as the sandbox scope (defaults to client roots/list if not specified).
+    #[arg(index = 1, value_name = "PATH")]
+    pub path: Option<PathBuf>,
+}
+
 /// Arguments for `ahma serve unix`.
 #[cfg(unix)]
 #[derive(Parser, Debug)]
@@ -1615,12 +1593,9 @@ pub enum ToolCommand {
     Validate(ValidateArgs),
     /// List all tools available from an MCP server.
     List(ListArgs),
-    /// Execute a single tool command and print the result.
-    ///
-    /// Loads tool configurations, applies sandboxing, runs the named tool
-    /// with the supplied arguments, and prints the output to stdout.
-    /// Useful for scripting, CI pipelines, and debugging tool behaviour
-    /// outside the MCP protocol.
+    /// Execute a single tool command and print the result. Loads tool definitions,
+    /// applies sandboxing, executes the command, and prints stdout/stderr. Useful
+    /// for scripting, CI pipelines, and debugging outside MCP.
     #[command(after_help = "EXAMPLES:
   # Run a cargo build in release mode
   ahma tool run cargo_build -- --release
@@ -1631,11 +1606,9 @@ pub enum ToolCommand {
   # Run with a custom tools directory
   AHMA_TOOLS_DIR=/path/to/.ahma ahma tool run my_tool -- --flag value")]
     Run(RunArgs),
-    /// Show locally configured tools with descriptions and parameters.
-    ///
-    /// Loads tool definitions from the `.ahma/` directory (or `--tools-dir`)
-    /// and built-in bundles (activated with `--tools`), then prints a summary
-    /// of each tool including its subcommands, parameters, and hints.
+    /// Show locally configured tools, built-in bundles, descriptions, and parameters.
+    /// Loads definitions from the tools directory and active bundles, then prints a
+    /// summary of each tool.
     #[command(after_help = "EXAMPLES:
   # Show all tools from the local .ahma/ directory
   ahma tool info
@@ -1717,10 +1690,8 @@ pub struct VaultArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum VaultCommand {
-    /// Create a new task vault for a user question.
-    ///
-    /// Creates ~/.ahma/tasks/<date>-<slug>-<id>/ with inputs/, workdir/,
-    /// outputs/, trash/, and audit.jsonl.  Prints the vault root path to stdout.
+    /// Create a new task vault (a per-task isolated directory tree) for a user question
+    /// containing inputs/, workdir/, outputs/, trash/, and audit.jsonl. Prints the root path.
     #[command(after_help = "EXAMPLES:
   ahma vault create summarise-q4-report
   ahma vault create \"analyse customer data\"")]
@@ -1767,6 +1738,10 @@ pub struct TuiArgs {
     /// Launch directly with a specific agent profile.
     #[arg(long = "profile")]
     pub profile: Option<String>,
+
+    /// Optional path to set as the sandbox scope (defaults to current directory if server is spawned).
+    #[arg(index = 1, value_name = "PATH")]
+    pub path: Option<PathBuf>,
 }
 
 // ── tls ───────────────────────────────────────────────────────────────────────
@@ -1789,22 +1764,13 @@ pub struct TlsArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum TlsCommand {
-    /// Generate the local TLS certificate (first-time setup).
-    ///
-    /// Creates a self-signed certificate under `~/.ahma/tls/` (or `AHMA_TLS_DIR`).
-    /// The private key is written with mode 0600 on Unix.  Safe to re-run —
-    /// does nothing if the certificate already exists.
+    /// Generate the local TLS certificate (first-time setup) under `~/.ahma/tls/`.
+    /// The private key is written with mode 0600 on Unix. Safe to re-run.
     Init,
-    /// Rotate the local TLS certificate (replace with a freshly generated one).
-    ///
-    /// Deletes the existing certificate and generates a new self-signed certificate
-    /// under `~/.ahma/tls/`.  Use this when the certificate is approaching expiry
-    /// or has been compromised.
+    /// Rotate the local TLS certificate. Deletes the existing certificate and generates
+    /// a new self-signed certificate. Use when approaching expiry or compromised.
     Rotate,
-    /// Print the local TLS certificate status.
-    ///
-    /// Shows the certificate path, creation time, age, and whether rotation is
-    /// recommended (certificate older than 30 days).
+    /// Print the local TLS certificate status (path, age, and rotation recommendation).
     Status,
 }
 
@@ -1819,10 +1785,8 @@ pub struct BundleArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum BundleCommand {
-    /// Audit a bundle directory for security issues.
-    ///
-    /// Scans all JSON files for embedded secrets, missing path validation,
-    /// prompt-injection payloads, and other supply-chain risks.
+    /// Audit a bundle directory. Scans all JSON files for secrets, missing path
+    /// validation, prompt-injection payloads, and other security risks.
     Audit(BundleAuditArgs),
     /// Verify a bundle directory against its content manifest.
     Verify(BundleVerifyArgs),
@@ -1930,11 +1894,8 @@ pub struct LlmRemoveArgs {
   ahma cluster announce --port 3000 --models llama3.2,gemma4
   ahma cluster cert init --out-dir ~/.ahma/cluster/certs")]
 pub struct ClusterArgs {
-    /// Directory containing mTLS certificates for peer authentication.
-    ///
-    /// When set, all outbound peer connections use mTLS.  The directory must
-    /// contain `ca.pem`, `cert.pem`, and `key.pem` generated by
-    /// `ahma cluster cert init`.
+    /// Directory containing mTLS certificates (`ca.pem`, `cert.pem`, `key.pem`)
+    /// generated by `ahma cluster cert init`. When set, outbound connections use mTLS.
     #[arg(long, value_name = "DIR")]
     pub tls_dir: Option<std::path::PathBuf>,
 
@@ -1951,6 +1912,8 @@ pub enum ClusterCommand {
     AddPeer(ClusterAddPeerArgs),
     /// Ping a peer's /health endpoint.
     Ping(ClusterPingArgs),
+    /// Remove a worker peer from ~/.ahma/cluster/peers.json.
+    Remove(ClusterRemoveArgs),
     /// Show status of all configured peers (reachability + capabilities).
     Status,
     /// Browse the local network for ahma worker peers via mDNS and print what
@@ -1981,10 +1944,8 @@ pub struct ClusterAnnounceArgs {
 /// Sub-commands for `ahma cluster cert`.
 #[derive(Subcommand, Debug)]
 pub enum CertCommand {
-    /// Generate a self-signed CA plus a leaf certificate and key for this peer.
-    ///
-    /// Writes `ca.pem`, `cert.pem`, and `key.pem` to `--out-dir`.
-    /// Share `ca.pem` with all other peers so they can verify each other.
+    /// Generate a self-signed CA, leaf certificate, and key under `--out-dir`.
+    /// Share `ca.pem` with all other peers to allow mutual verification.
     Init {
         /// Directory where the generated PEM files are written.
         #[arg(long, default_value = "~/.ahma/cluster/certs")]
@@ -2010,6 +1971,14 @@ pub struct ClusterAddPeerArgs {
 #[derive(Parser, Debug)]
 pub struct ClusterPingArgs {
     /// Peer ID to ping (must exist in ~/.ahma/cluster/peers.json).
+    #[arg(value_name = "ID")]
+    pub id: String,
+}
+
+/// Arguments for `ahma cluster remove`.
+#[derive(Parser, Debug)]
+pub struct ClusterRemoveArgs {
+    /// Peer ID to remove (must exist in ~/.ahma/cluster/peers.json).
     #[arg(value_name = "ID")]
     pub id: String,
 }
@@ -2068,7 +2037,9 @@ fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
     if let Subcommands::Serve(s) = cmd {
         let (host, port) = match &s.transport {
             Some(ServeTransport::Http(h)) => (h.host.clone(), env_port.unwrap_or(h.port)),
-            Some(ServeTransport::Stdio) => ("127.0.0.1".to_string(), env_port.unwrap_or(3000u16)),
+            Some(ServeTransport::Stdio(_)) => {
+                ("127.0.0.1".to_string(), env_port.unwrap_or(3000u16))
+            }
             #[cfg(unix)]
             Some(ServeTransport::Unix(_)) => ("127.0.0.1".to_string(), env_port.unwrap_or(3000u16)),
             None => ("127.0.0.1".to_string(), env_port.unwrap_or(3000u16)),
@@ -2407,7 +2378,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         monitor_rate_limit_secs,
     ) = parse_sandbox_settings(cli, &s);
 
-    let idle_timeout_secs = cli.idle_timeout.or(Some(10));
+    let idle_timeout_secs = cli.idle_timeout;
 
     let (no_quic, disable_http1_1, handshake_timeout_secs) = parse_http_settings(cli, &s);
 
@@ -2902,7 +2873,7 @@ mod tests {
             rate_limit_rps: 0,
             rate_limit_burst: 10,
             instance_label: "ahma".to_string(),
-            idle_timeout_secs: Some(10),
+            idle_timeout_secs: None,
             max_sessions: 10,
             is_server_child: false,
         }
@@ -3278,10 +3249,24 @@ mod tests {
         assert!(matches!(
             cli.command,
             Subcommands::Serve(ServeArgs {
-                transport: Some(ServeTransport::Stdio),
+                transport: Some(ServeTransport::Stdio(_)),
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_cli_parse_serve_stdio_with_path() {
+        let cli = Cli::try_parse_from(["ahma", "serve", "stdio", "/some/path"]).unwrap();
+        if let Subcommands::Serve(ServeArgs {
+            transport: Some(ServeTransport::Stdio(args)),
+            ..
+        }) = cli.command
+        {
+            assert_eq!(args.path, Some(PathBuf::from("/some/path")));
+        } else {
+            panic!("Expected ServeTransport::Stdio");
+        }
     }
 
     #[test]

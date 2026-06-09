@@ -37,6 +37,9 @@
 | Unified Shell Output | tests-pass | stderr redirected to stdout (`2>&1`) |
 | Logging (File + Stderr) | tests-pass | Daily rolling logs, `--log-to-stderr` for debug |
 | Live Log Monitoring (LLM) | tests-pass | `tool_type: livelog` routes to LLM analysis pipeline; `ahma_llm_monitor` crate; OpenAI-compatible providers |
+| TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
+| Local Cluster Scheduler | tests-pass | mDNS discovery and signed task dispatch to remote worker peers |
+| `ahma cluster remove` | tests-pass | Subcommand to remove worker peers from peers configuration |
 
 ---
 
@@ -654,6 +657,10 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 
 **R-DOC.6 — No orphan docs**: Every file in `docs/` **must** be referenced from at least one of: `README.md`, `SPEC.md`, or another `docs/*.md` file. Orphan documentation is misleading and should not accumulate.
 
+**R-DOC.7 — CLI Help Text Guidelines**: Command-line interface help descriptions **must** follow two strict guidelines:
+- **Contiguous Layout**: Descriptions for arguments, flags, and subcommands **must** be written as contiguous blocks of text without blank lines (double carriage returns). Since Clap outputs help text inside lists, internal blank lines disrupt the alignment and layout.
+- **Educational Context**: Help text for complex or non-obvious features (e.g., `--task-vault`) **must** be educational. It must explain what the feature is and why/when a user or tool would use it, while remaining concise and precise.
+
 | Feature area | Stable doc | SPEC.md section |
 |---|---|---|
 | Kernel sandbox | [docs/security-sandbox.md](docs/security-sandbox.md) | R5, R6 |
@@ -673,6 +680,7 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Cluster scheduler | [docs/cluster-scheduler.md](docs/cluster-scheduler.md) | — |
 | Renewal contract | [docs/renewal-contract.md](docs/renewal-contract.md) | — |
 | ahma_core library | [docs/ahma-core-library.md](docs/ahma-core-library.md) | — |
+| Recursive task tree | [docs/recursive-task-tree.md](docs/recursive-task-tree.md) | — |
 
 ### 8.1 Core Principle: Use Ahma
 
@@ -1431,9 +1439,9 @@ commit format) into the skill, and do not copy agent usage recipes into AGENTS.m
 
 | Area | Item | Notes |
 |------|------|-------|
-| Cluster | **mDNS peer discovery** (`mdns-sd` crate, `_ahma-worker._tcp.local`) | Zero-config LAN; replaces `peers.json` bootstrap for trusted networks |
+| Cluster | **mDNS peer discovery** (`mdns-sd` crate, `_ahma-worker._tcp.local`) | ✓ Completed |
 | Cluster | **Named provider refs in tool files** (`llm_provider_ref: "ollama-local"`) | Avoids duplicating connection details across tool definitions |
-| UX | **`ratatui` TUI** — real-time task dashboard | Replace stub `ahma tui` with a full terminal UI showing active ops, peer status, VRAM gauges |
+| UX | **`ratatui` TUI** — real-time task dashboard | ✓ Completed (full ratatui TUI implemented) |
 | Economics | **Cost metering** — track token counts + estimated cost per tool call | Aggregate by provider; expose via `ahma tool info --cost-summary` |
 | Security | **Signed bundle index** (`bundle-index.json` with HMAC-SHA256 over manifest) | Prevent silent tampering with downloaded bundles |
 | Security | **`--require-token` key rotation** — reload token from file on SIGHUP | Zero-downtime key rotation for long-running HTTP bridge instances |
@@ -1443,7 +1451,7 @@ commit format) into the skill, and do not copy agent usage recipes into AGENTS.m
 | Area | Item | Notes |
 |------|------|-------|
 | Cluster | **Weighted scheduling** — factor GPU model, RAM, historical latency into `load_score_for` | Better affinity for large models |
-| Cluster | **`cluster remove` subcommand** — remove a peer from `peers.json` by ID | Complement `cluster add-peer` |
+| Cluster | **`cluster remove` subcommand** — remove a peer from `peers.json` by ID | ✓ Completed |
 | Security | **OS keyring integration** (`keyring` crate) — store API keys in system credential store instead of env vars | macOS Keychain, GNOME Secrets, Windows Credential Manager |
 | Config | **Encrypted secrets at rest** in `~/.ahma/config.toml` (age encryption) | Fallback when OS keyring is unavailable |
 

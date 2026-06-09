@@ -43,6 +43,7 @@ tokio = { workspace = true, features = [
 toml.workspace = true
 tracing.workspace = true
 tui-textarea = { workspace = true, optional = true }
+uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 ahma_http_bridge = { path = "../ahma_http_bridge" }

@@ -327,6 +327,48 @@ async fn check_bridge_running(socket_path: Option<&str>, http_url: Option<&str>)
 ///
 /// # Errors
 /// Returns an error if the server fails to start or encounters a fatal error.
+async fn restart_bridge_server(socket_path_opt: Option<&str>, http_url_opt: Option<&str>) {
+    tracing::info!(
+        "Client version is newer than running bridge version. Requesting bridge restart..."
+    );
+    if trigger_bridge_restart(socket_path_opt, http_url_opt).await {
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if !check_bridge_running(socket_path_opt, http_url_opt).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tracing::info!("Old bridge stopped. Starting new bridge...");
+    } else {
+        tracing::warn!("Failed to request bridge restart. Attempting to start anyway.");
+    }
+}
+
+fn re_exec_current_process() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&args);
+    cmd.env("AHMA_RESTARTED", "1");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        Err(anyhow::anyhow!("Failed to re-exec client process: {}", err))
+    }
+    #[cfg(not(unix))]
+    {
+        let mut child = cmd
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()?;
+        let status = child.wait()?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
+}
+
 async fn handle_version_checks(
     _config: &AppConfig,
     is_test: bool,
@@ -340,78 +382,41 @@ async fn handle_version_checks(
         get_bridge_version(socket_path_opt, http_url_opt).await
     };
 
-    if let Some(bridge_version) = bridge_version_opt {
-        if bridge_version == client_version {
-            tracing::info!(
-                "Local bridge server is already running (v{}). Forwarding stdio as a proxy client.",
-                bridge_version
-            );
-            crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
-                .await?;
-            return Ok(Some(()));
-        }
+    let Some(bridge_version) = bridge_version_opt else {
+        return Ok(None);
+    };
 
-        let c_ver = parse_version(client_version);
-        let b_ver = parse_version(&bridge_version);
-        let client_is_newer = match (c_ver, b_ver) {
-            (Some(c), Some(b)) => c > b,
-            _ => true,
-        };
+    if bridge_version == client_version {
+        tracing::info!(
+            "Local bridge server is already running (v{}). Forwarding stdio as a proxy client.",
+            bridge_version
+        );
+        crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt).await?;
+        return Ok(Some(()));
+    }
 
-        if client_is_newer {
-            tracing::info!(
-                "Client version (v{}) is newer than running bridge version (v{}). Requesting bridge restart...",
-                client_version,
-                bridge_version
-            );
-            if trigger_bridge_restart(socket_path_opt, http_url_opt).await {
-                let start = std::time::Instant::now();
-                while start.elapsed() < Duration::from_secs(2) {
-                    if !check_bridge_running(socket_path_opt, http_url_opt).await {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                tracing::info!("Old bridge stopped. Starting new bridge...");
-            } else {
-                tracing::warn!("Failed to request bridge restart. Attempting to start anyway.");
-            }
-        } else {
-            if std::env::var("AHMA_RESTARTED").is_err() {
-                tracing::info!(
-                    "Client version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
-                    client_version,
-                    bridge_version
-                );
-                let exe = std::env::current_exe()?;
-                let args: Vec<String> = std::env::args().skip(1).collect();
-                let mut cmd = std::process::Command::new(exe);
-                cmd.args(&args);
-                cmd.env("AHMA_RESTARTED", "1");
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::CommandExt;
-                    let err = cmd.exec();
-                    return Err(anyhow::anyhow!("Failed to re-exec client process: {}", err));
-                }
-                #[cfg(not(unix))]
-                {
-                    let mut child = cmd
-                        .stdin(std::process::Stdio::inherit())
-                        .stdout(std::process::Stdio::inherit())
-                        .stderr(std::process::Stdio::inherit())
-                        .spawn()?;
-                    let status = child.wait()?;
-                    std::process::exit(status.code().unwrap_or(0));
-                }
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Version mismatch: Client version (v{}) is older than running bridge version (v{}). Please update the client binary.",
-                    client_version,
-                    bridge_version
-                ));
-            }
-        }
+    let c_ver = parse_version(client_version);
+    let b_ver = parse_version(&bridge_version);
+    let client_is_newer = match (c_ver, b_ver) {
+        (Some(c), Some(b)) => c > b,
+        _ => true,
+    };
+
+    if client_is_newer {
+        restart_bridge_server(socket_path_opt, http_url_opt).await;
+    } else if std::env::var("AHMA_RESTARTED").is_ok() {
+        return Err(anyhow::anyhow!(
+            "Version mismatch: Client version (v{}) is older than running bridge version (v{}). Please update the client binary.",
+            client_version,
+            bridge_version
+        ));
+    } else {
+        tracing::info!(
+            "Client version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
+            client_version,
+            bridge_version
+        );
+        re_exec_current_process()?;
     }
     Ok(None)
 }
@@ -444,9 +449,12 @@ fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf])
         server_args.push(bundle.clone());
     }
 
-    if let Some(timeout) = config.idle_timeout_secs {
+    let timeout = config.idle_timeout_secs.or(Some(10));
+    if let Some(t) = timeout
+        && t > 0
+    {
         server_args.push("--idle-timeout".to_string());
-        server_args.push(timeout.to_string());
+        server_args.push(t.to_string());
     }
 
     if !config.unix_socket_path.is_empty() {
