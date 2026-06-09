@@ -2756,7 +2756,10 @@ pub fn env_flag_enabled(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::{LazyLock, Mutex};
     use tempfile::tempdir;
+
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn init_test() {
         crate::utils::logging::init_test_logging();
@@ -2766,12 +2769,14 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_unset() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_UNSET") };
         assert!(!env_flag_enabled("AHMA_TEST_FLAG_UNSET"));
     }
 
     #[test]
     fn test_env_flag_enabled_empty() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("AHMA_TEST_FLAG_EMPTY", "") };
         let result = env_flag_enabled("AHMA_TEST_FLAG_EMPTY");
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_EMPTY") };
@@ -2780,6 +2785,7 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_whitespace_only() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("AHMA_TEST_FLAG_WS", "   ") };
         let result = env_flag_enabled("AHMA_TEST_FLAG_WS");
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_WS") };
@@ -2788,6 +2794,7 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_true() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         for val in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "ON"] {
             unsafe { std::env::set_var("AHMA_TEST_FLAG_VAL", val) };
             let result = env_flag_enabled("AHMA_TEST_FLAG_VAL");
@@ -2798,6 +2805,7 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_false() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         for val in ["0", "false", "no", "off", "x", ""] {
             if val.is_empty() {
                 continue;
@@ -2811,6 +2819,7 @@ mod tests {
 
     #[test]
     fn test_env_sandbox_scopes_single_path() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         let temp = tempdir().expect("Failed to create temp dir");
         unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", temp.path()) };
         let scopes = AppConfig::env_sandbox_scopes();
@@ -2821,6 +2830,7 @@ mod tests {
 
     #[test]
     fn test_env_sandbox_scopes_tilde() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", "~") };
         let scopes = AppConfig::env_sandbox_scopes();
         unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
@@ -2832,6 +2842,7 @@ mod tests {
 
     #[test]
     fn test_env_sandbox_scopes_tilde_slash() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", "~/test_sandbox") };
         let scopes = AppConfig::env_sandbox_scopes();
         unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
@@ -2843,6 +2854,7 @@ mod tests {
 
     #[test]
     fn test_env_working_dirs_multiple_paths() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         let temp_a = tempdir().expect("Failed to create first temp dir");
         let temp_b = tempdir().expect("Failed to create second temp dir");
         let joined =
@@ -2919,6 +2931,7 @@ mod tests {
 
     #[test]
     fn test_resolve_sandbox_policy_strict_by_default() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         init_test();
         unsafe { std::env::remove_var("AHMA_DISABLE_SANDBOX") };
         let cfg = make_cfg();
@@ -2940,6 +2953,7 @@ mod tests {
 
     #[test]
     fn test_resolve_sandbox_policy_ahma_tmp_access_env() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         init_test();
         unsafe { std::env::set_var("AHMA_TMP_ACCESS", "1") };
         let cfg = AppConfig {
@@ -3463,6 +3477,7 @@ mod tests {
 
     #[test]
     fn test_app_config_env_flag_via_helper() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("AHMA_TEST_CFG_FLAG", "yes") };
         assert!(AppConfig::env_flag("AHMA_TEST_CFG_FLAG"));
         unsafe { std::env::remove_var("AHMA_TEST_CFG_FLAG") };
