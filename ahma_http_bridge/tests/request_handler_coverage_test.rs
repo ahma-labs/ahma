@@ -560,8 +560,12 @@ async fn test_task_vault_inheritance_and_staged_delete_sse() {
     run_task_vault_inheritance_and_staged_delete(TransportMode::Sse).await;
 }
 
-/// Test: notifications/initialized with Accept: text/event-stream.
-/// Covers forward_notification_sse.
+/// Test: notifications/initialized with Accept: text/event-stream returns HTTP 202 Accepted.
+///
+/// Per MCP Streamable HTTP spec §3.2.1, the server MUST respond with HTTP 202 (empty body)
+/// for JSON-RPC notifications, regardless of the Accept header.  Returning an SSE stream
+/// causes rmcp clients (e.g. the stdio proxy unix transport) to reject the response and
+/// close the transport channel, producing BrokenPipe on the next stdin write.
 #[tokio::test]
 async fn test_sse_notification_initialized() {
     let server = spawn_test_server()
@@ -607,7 +611,8 @@ async fn test_sse_notification_initialized() {
         .await
         .expect("SSE failed");
 
-    // Send notifications/initialized with Accept: text/event-stream
+    // Send notifications/initialized with Accept: text/event-stream.
+    // The server MUST return HTTP 202 Accepted (empty body) — NOT an SSE stream.
     let notif = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
     let resp = client
         .post(format!("{}/mcp", server.base_url()))
@@ -620,15 +625,15 @@ async fn test_sse_notification_initialized() {
         .await
         .expect("Notification failed");
 
-    assert!(resp.status().is_success(), "Should accept notification");
-    let ct = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::ACCEPTED,
+        "Notification response must be HTTP 202 Accepted per MCP spec §3.2.1"
+    );
+    let body = resp.bytes().await.unwrap_or_default();
     assert!(
-        ct.contains("text/event-stream"),
-        "Should return SSE: {}",
-        ct
+        body.is_empty(),
+        "HTTP 202 response to notification must have empty body, got: {:?}",
+        body
     );
 }

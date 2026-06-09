@@ -844,3 +844,293 @@ mod tests {
         );
     }
 }
+
+// ─── OperationMonitorSink ────────────────────────────────────────────────────
+
+/// An [`EventSink`] that drives [`OperationMonitor`] state transitions from
+/// the unified [`OperationEvent`] stream (P2).
+///
+/// Attach one of these to an [`EventDispatcher`] subscription loop so that
+/// any component emitting [`OperationEvent`]s automatically updates the
+/// monitor — decoupling emitters from the monitor implementation.
+///
+/// # Ordering invariant (SPEC R15.3)
+///
+/// `OperationMonitor::update_status` already persists terminal state into
+/// `completion_history` **before** signalling the `completion_watch` channel.
+/// `OperationMonitorSink` delegates to that method, so the invariant is
+/// preserved end-to-end.
+///
+/// # Usage
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+/// use ahma_common::event_dispatcher::EventDispatcher;
+/// use crate::operation_monitor::{MonitorConfig, OperationMonitor, OperationMonitorSink};
+///
+/// # async fn example() {
+/// let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+///     std::time::Duration::from_secs(300),
+/// )));
+/// let dispatcher = EventDispatcher::default();
+///
+/// // Spawn the sink loop as a background task.
+/// OperationMonitorSink::spawn(Arc::clone(&monitor), &dispatcher);
+/// # }
+/// ```
+pub struct OperationMonitorSink;
+
+impl OperationMonitorSink {
+    /// Spawn a background task that drives `monitor` from `dispatcher`'s
+    /// event stream.
+    ///
+    /// The task runs until the dispatcher is dropped (all senders gone) or
+    /// until the receiver lags too far behind and cannot recover.
+    pub fn spawn(
+        monitor: Arc<OperationMonitor>,
+        dispatcher: &ahma_common::event_dispatcher::EventDispatcher,
+    ) {
+        let mut rx = dispatcher.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => Self::handle_event(&monitor, &ev).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(
+                            "OperationMonitorSink lagged by {} events; some state updates may be missed",
+                            n
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::debug!("OperationMonitorSink: dispatcher closed, exiting");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Apply a single [`OperationEvent`] to the monitor.
+    ///
+    /// This is `pub` so callers can drive the sink synchronously in tests.
+    pub async fn handle_event(
+        monitor: &Arc<OperationMonitor>,
+        event: &ahma_common::event_dispatcher::OperationEvent,
+    ) {
+        use ahma_common::event_dispatcher::OperationEvent;
+        match event {
+            OperationEvent::Completed {
+                operation_id,
+                result,
+                ..
+            } => {
+                monitor
+                    .update_status(
+                        operation_id,
+                        OperationStatus::Completed,
+                        Some(result.clone()),
+                    )
+                    .await;
+            }
+            OperationEvent::Failed {
+                operation_id,
+                error,
+                ..
+            } => {
+                monitor
+                    .update_status(
+                        operation_id,
+                        OperationStatus::Failed,
+                        Some(serde_json::Value::String(error.clone())),
+                    )
+                    .await;
+            }
+            OperationEvent::Cancelled {
+                operation_id,
+                reason,
+                ..
+            } => {
+                monitor
+                    .update_status(
+                        operation_id,
+                        OperationStatus::Cancelled,
+                        Some(serde_json::Value::String(reason.clone())),
+                    )
+                    .await;
+            }
+            OperationEvent::TimedOut { operation_id, .. } => {
+                let msg = "operation timed out".to_string();
+                monitor
+                    .update_status(
+                        operation_id,
+                        OperationStatus::TimedOut,
+                        Some(serde_json::Value::String(msg)),
+                    )
+                    .await;
+            }
+            // Non-terminal events: no monitor update needed.
+            OperationEvent::Started { .. }
+            | OperationEvent::OutputLine { .. }
+            | OperationEvent::Progress { .. }
+            | OperationEvent::Alert { .. }
+            | OperationEvent::McpNotification { .. } => {}
+            // Future variants: do nothing to stay forward-compatible.
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod sink_tests {
+    use super::*;
+    use ahma_common::event_dispatcher::{EventDispatcher, OperationEvent};
+
+    fn make_monitor() -> Arc<OperationMonitor> {
+        Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(10),
+        )))
+    }
+
+    async fn add_op(monitor: &Arc<OperationMonitor>, id: &str) {
+        monitor
+            .add_operation(Operation::new(
+                id.to_string(),
+                "test_tool".to_string(),
+                "test".to_string(),
+                None,
+            ))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn sink_handle_event_completed_updates_monitor() {
+        let monitor = make_monitor();
+        add_op(&monitor, "op-1").await;
+
+        OperationMonitorSink::handle_event(
+            &monitor,
+            &OperationEvent::Completed {
+                operation_id: "op-1".into(),
+                result: serde_json::json!({"exit_code": 0}),
+                duration_ms: 100,
+            },
+        )
+        .await;
+
+        let hist = monitor.check_completion_history_pub("op-1").await;
+        assert!(hist.is_some(), "op should be in history after Completed");
+        assert_eq!(hist.unwrap().state, OperationStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn sink_handle_event_failed_updates_monitor() {
+        let monitor = make_monitor();
+        add_op(&monitor, "op-2").await;
+
+        OperationMonitorSink::handle_event(
+            &monitor,
+            &OperationEvent::Failed {
+                operation_id: "op-2".into(),
+                error: "something went wrong".into(),
+                duration_ms: 50,
+            },
+        )
+        .await;
+
+        let hist = monitor.check_completion_history_pub("op-2").await;
+        assert!(hist.is_some());
+        assert_eq!(hist.unwrap().state, OperationStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn sink_handle_event_cancelled_updates_monitor() {
+        let monitor = make_monitor();
+        add_op(&monitor, "op-3").await;
+
+        OperationMonitorSink::handle_event(
+            &monitor,
+            &OperationEvent::Cancelled {
+                operation_id: "op-3".into(),
+                reason: "user cancelled".into(),
+                duration_ms: 10,
+            },
+        )
+        .await;
+
+        let hist = monitor.check_completion_history_pub("op-3").await;
+        assert!(hist.is_some());
+        assert_eq!(hist.unwrap().state, OperationStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn sink_handle_event_timed_out_updates_monitor() {
+        let monitor = make_monitor();
+        add_op(&monitor, "op-4").await;
+
+        OperationMonitorSink::handle_event(
+            &monitor,
+            &OperationEvent::TimedOut {
+                operation_id: "op-4".into(),
+                duration_ms: 60_000,
+            },
+        )
+        .await;
+
+        let hist = monitor.check_completion_history_pub("op-4").await;
+        assert!(hist.is_some());
+        assert_eq!(hist.unwrap().state, OperationStatus::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn sink_spawn_reacts_to_dispatcher_events() {
+        let monitor = make_monitor();
+        add_op(&monitor, "op-5").await;
+
+        let dispatcher = EventDispatcher::default();
+        OperationMonitorSink::spawn(Arc::clone(&monitor), &dispatcher);
+
+        // Give the task a moment to start up.
+        tokio::task::yield_now().await;
+
+        dispatcher.emit(OperationEvent::Completed {
+            operation_id: "op-5".into(),
+            result: serde_json::json!({}),
+            duration_ms: 1,
+        });
+
+        // Allow the background task to process the event.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let hist = monitor.check_completion_history_pub("op-5").await;
+        assert!(
+            hist.is_some(),
+            "sink should have updated monitor from dispatcher event"
+        );
+        assert_eq!(hist.unwrap().state, OperationStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn sink_ignores_non_terminal_events() {
+        let monitor = make_monitor();
+        add_op(&monitor, "op-6").await;
+
+        // Sending non-terminal events should not change op state.
+        OperationMonitorSink::handle_event(
+            &monitor,
+            &OperationEvent::OutputLine {
+                operation_id: "op-6".into(),
+                line: "hello".into(),
+                is_stderr: false,
+            },
+        )
+        .await;
+
+        // Op should still be in active map (not moved to history).
+        let active = monitor.get_operation("op-6").await;
+        assert!(
+            active.is_some(),
+            "non-terminal event must not move op to history"
+        );
+    }
+}

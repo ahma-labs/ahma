@@ -149,6 +149,9 @@ async fn main() -> anyhow::Result<()> {
         active_sessions: None,
         idle_timeout_secs: args.idle_timeout_secs,
         max_sessions: args.max_sessions,
+        cluster_shared_key: None,
+        peer_factory: None,
+        bound_port_tx: None,
     };
 
     // Warn when listening on a non-loopback address without a token.

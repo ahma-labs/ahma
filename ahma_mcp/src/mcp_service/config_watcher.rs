@@ -353,10 +353,7 @@ impl AhmaMcpService {
                     vec![]
                 } else {
                     tracing::error!("Failed to request roots/list: {}", e);
-                    emit_sandbox_notification(
-                        "notifications/sandbox/failed",
-                        Some(&e.to_string()),
-                    );
+                    emit_sandbox_notification("notifications/sandbox/failed", Some(&e.to_string()));
                     return;
                 }
             }

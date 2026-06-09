@@ -488,7 +488,6 @@ fn builtin_tool_configs(config: &crate::shell::cli::AppConfig) -> Vec<(String, &
 
 fn builtin_tool_definition(bundle_name: &str) -> Option<&'static str> {
     match bundle_name {
-        "rust" => Some(include_str!("../../.ahma/rust.json")),
         "fileutils" => Some(include_str!("../../.ahma/file-tools.json")),
         "github" => Some(include_str!("../../.ahma/gh.json")),
         "git" => Some(include_str!("../../.ahma/git.json")),

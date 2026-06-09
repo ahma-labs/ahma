@@ -189,7 +189,7 @@ async fn execute_single_tool_call(
         // Route namespaced tools through the connection manager (handles both HTTP and stdio).
         // Fall back to the legacy HTTP-only map for backwards compatibility.
         let full_name = call.name.clone();
-        let mut conn = cfg.mcp_connections.clone();
+        let conn = cfg.mcp_connections.clone();
         let conn_has_server = conn.servers.iter().any(|s| s.name == server);
         if conn_has_server {
             match conn.call_tool(&full_name, args_value.clone()).await {

@@ -371,7 +371,7 @@ fn line_wrapped_rows(line: &ratatui::text::Line<'_>, width: usize) -> usize {
     if total_chars == 0 {
         1
     } else {
-        (total_chars + width - 1) / width
+        total_chars.div_ceil(width)
     }
 }
 
@@ -1617,6 +1617,41 @@ fn get_system_display_lines(
 }
 
 #[cfg(feature = "tui")]
+fn render_empty_log_hint(frame: &mut Frame, state: &AppState, theme: &Theme, inner: Rect) {
+    state.log_max_scroll.set(0);
+    let hint = if state.active_log_file.is_none() {
+        if state.log.is_empty() {
+            "  Awaiting log events…"
+        } else {
+            "  No entries match filter"
+        }
+    } else {
+        "  Log file is empty / awaiting data…"
+    };
+    frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
+}
+
+#[cfg(feature = "tui")]
+fn render_scrollbar(
+    frame: &mut Frame,
+    total_len: usize,
+    visible_h: usize,
+    scroll: usize,
+    inner: Rect,
+) {
+    if total_len > visible_h {
+        let sb = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        let mut sb_state = ScrollbarState::new(total_len)
+            .viewport_content_length(visible_h)
+            .position(scroll);
+        frame.render_stateful_widget(sb, inner, &mut sb_state);
+    }
+}
+
+#[cfg(feature = "tui")]
 fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Log;
     let border_style = if focused {
@@ -1668,17 +1703,7 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     };
 
     if display_lines.is_empty() {
-        state.log_max_scroll.set(0);
-        let hint = if state.active_log_file.is_none() {
-            if state.log.is_empty() {
-                "  Awaiting log events…"
-            } else {
-                "  No entries match filter"
-            }
-        } else {
-            "  Log file is empty / awaiting data…"
-        };
-        frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
+        render_empty_log_hint(frame, state, theme, inner);
         return;
     }
 
@@ -1695,17 +1720,7 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         .collect();
 
     frame.render_widget(Paragraph::new(visible_lines), inner);
-
-    if display_lines.len() > visible_h {
-        let sb = Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None);
-        let mut sb_state = ScrollbarState::new(display_lines.len())
-            .viewport_content_length(visible_h)
-            .position(scroll);
-        frame.render_stateful_widget(sb, inner, &mut sb_state);
-    }
+    render_scrollbar(frame, display_lines.len(), visible_h, scroll, inner);
 }
 
 #[cfg(feature = "tui")]
@@ -1744,6 +1759,46 @@ fn draw_blocked_symlink_banner(
 }
 
 #[cfg(feature = "tui")]
+fn build_log_file_list_item(
+    f: &crate::state::LogFileInfo,
+    is_active: bool,
+    is_selected: bool,
+    theme: &Theme,
+) -> ListItem<'static> {
+    let item_style = if is_selected {
+        theme.normal().bg(Color::Cyan).fg(Color::Black)
+    } else {
+        theme.normal()
+    };
+    let active_marker = if is_active { "● " } else { "  " };
+    let size_str = format_size(f.size_bytes);
+
+    let (status_str, status_style) = if f.is_symlink {
+        if f.is_approved {
+            (" [Approved Symlink]", theme.success())
+        } else {
+            (" [Blocked Out-of-Scope]", theme.failed().bold())
+        }
+    } else {
+        ("", theme.dim())
+    };
+
+    ListItem::new(Line::from(vec![
+        Span::styled(active_marker, theme.success()),
+        Span::styled(format!("{:<25}", f.name), item_style.bold()),
+        Span::styled(format!(" {:>8}", size_str), item_style),
+        Span::styled(
+            status_str,
+            if is_selected {
+                item_style
+            } else {
+                status_style
+            },
+        ),
+    ]))
+}
+
+#[cfg(feature = "tui")]
 fn draw_log_files_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let popup = centered_rect(70, 15, area);
     frame.render_widget(Clear, popup);
@@ -1777,38 +1832,7 @@ fn draw_log_files_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area
     for (i, f) in state.log_files.iter().enumerate() {
         let is_active = state.active_log_file.as_ref() == Some(&f.name);
         let is_selected = state.log_files_modal_selected == i + 1;
-        let item_style = if is_selected {
-            theme.normal().bg(Color::Cyan).fg(Color::Black)
-        } else {
-            theme.normal()
-        };
-        let active_marker = if is_active { "● " } else { "  " };
-
-        let size_str = format_size(f.size_bytes);
-
-        let (status_str, status_style) = if f.is_symlink {
-            if f.is_approved {
-                (" [Approved Symlink]", theme.success())
-            } else {
-                (" [Blocked Out-of-Scope]", theme.failed().bold())
-            }
-        } else {
-            ("", theme.dim())
-        };
-
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled(active_marker, theme.success()),
-            Span::styled(format!("{:<25}", f.name), item_style.bold()),
-            Span::styled(format!(" {:>8}", size_str), item_style),
-            Span::styled(
-                status_str,
-                if is_selected {
-                    item_style
-                } else {
-                    status_style
-                },
-            ),
-        ])));
+        items.push(build_log_file_list_item(f, is_active, is_selected, theme));
     }
 
     let list = List::new(items);

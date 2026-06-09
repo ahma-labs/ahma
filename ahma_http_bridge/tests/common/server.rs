@@ -551,3 +551,91 @@ pub async fn spawn_server_guard_with_config_extra_env(
 
     Ok(ServerGuard::new(child, startup_info.bound_port))
 }
+
+// ─── In-process bridge helpers (P5) ─────────────────────────────────────────
+
+/// A running in-process bridge server (no subprocess spawned).
+///
+/// The bridge runs in a background tokio task using an injected
+/// [`PeerFactory`] (typically [`InProcessMcpPeerFactory`]) so the MCP peer
+/// logic also runs in-process.  Only the TCP socket uses real networking
+/// (loopback only, port 0 → random).
+///
+/// Drop this value to abort the background task and release the port.
+///
+/// [`PeerFactory`]: ahma_http_bridge::peer::PeerFactory
+/// [`InProcessMcpPeerFactory`]: ahma_mcp::test_utils::bridge_peer::InProcessMcpPeerFactory
+pub struct InProcessServerInstance {
+    port: u16,
+    _abort: tokio::task::AbortHandle,
+}
+
+impl InProcessServerInstance {
+    /// HTTP base URL for this server, e.g. `http://127.0.0.1:PORT`.
+    pub fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// The port this server is listening on.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for InProcessServerInstance {
+    fn drop(&mut self) {
+        eprintln!(
+            "[InProcessServer] Shutting down in-process bridge on port {}",
+            self.port
+        );
+        self._abort.abort();
+    }
+}
+
+/// Start an in-process bridge, injecting `factory` for session peer creation.
+///
+/// This is the P5 alternative to [`spawn_test_server`]: no subprocess is
+/// spawned.  Only the TCP socket is real (loopback, OS-assigned port).
+///
+/// Returns `Err` if the bridge fails to bind within the startup timeout.
+pub async fn spawn_in_process_server(
+    factory: std::sync::Arc<dyn ahma_http_bridge::peer::PeerFactory>,
+) -> Result<InProcessServerInstance, String> {
+    use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+    use ahma_http_bridge::{BridgeConfig, start_bridge};
+    use tokio::sync::oneshot;
+
+    let (port_tx, port_rx) = oneshot::channel::<u16>();
+
+    let config = BridgeConfig::for_in_process_test(factory).with_bound_port_tx(port_tx);
+
+    let task = tokio::spawn(async move {
+        if let Err(e) = start_bridge(config).await {
+            eprintln!("[InProcessServer] Bridge exited with error: {e}");
+        }
+    });
+    let abort = task.abort_handle();
+
+    let startup_timeout = TestTimeouts::get(TimeoutCategory::ProcessSpawn);
+    let port = match tokio::time::timeout(startup_timeout, port_rx).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => {
+            abort.abort();
+            return Err("InProcessServer: bridge exited before reporting bound port".into());
+        }
+        Err(_) => {
+            abort.abort();
+            return Err(format!(
+                "InProcessServer: bridge did not bind within {:?}",
+                startup_timeout
+            ));
+        }
+    };
+
+    eprintln!("[InProcessServer] Bridge listening on port {port}");
+
+    Ok(InProcessServerInstance {
+        port,
+        _abort: abort,
+    })
+}

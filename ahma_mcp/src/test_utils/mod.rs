@@ -5,6 +5,11 @@
 //! conveniences. These APIs are intended for test-only code paths.
 
 pub mod assertions;
+/// In-memory `PeerFactory` adapters for testing the HTTP bridge without
+/// subprocess spawning.  Use [`bridge_peer::NullPeerFactory`] for lifecycle
+/// tests and [`bridge_peer::InProcessMcpPeerFactory`] for full MCP protocol
+/// tests.
+pub mod bridge_peer;
 pub mod cli;
 pub mod client;
 pub mod concurrency;

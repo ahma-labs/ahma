@@ -701,13 +701,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
 
     if !is_test {
         let resolved_scopes: Vec<PathBuf> = sandbox.scopes().to_vec();
-        spawn_background_bridge(
-            &config,
-            &resolved_scopes,
-            socket_path_opt,
-            http_url_opt,
-        )
-        .await?;
+        spawn_background_bridge(&config, &resolved_scopes, socket_path_opt, http_url_opt).await?;
         // Proceed with proxy setup
         return crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
             .await;

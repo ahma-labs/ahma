@@ -21,8 +21,9 @@ pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use sandbox_env::{SANDBOX_BYPASS_ENV_VARS, SandboxTestEnv};
 #[allow(unused_imports)]
 pub use server::{
-    ServerGuard, TestServerInstance, spawn_server_guard_with_config,
-    spawn_server_guard_with_config_extra_env, spawn_test_server, spawn_test_server_with_timeout,
+    InProcessServerInstance, ServerGuard, TestServerInstance, spawn_in_process_server,
+    spawn_server_guard_with_config, spawn_server_guard_with_config_extra_env, spawn_test_server,
+    spawn_test_server_with_timeout,
 };
 #[allow(unused_imports)]
 pub use uri::{
@@ -134,4 +135,57 @@ pub async fn setup_test_mcp(
         last_error
     );
     None
+}
+
+/// Spawn an **in-process** bridge (no subprocess) and complete the MCP handshake.
+///
+/// This is the P5 fast-path alternative to [`setup_test_mcp`]:
+/// - The bridge runs in a background tokio task (no forked process)
+/// - Sessions use `NullPeerFactory` by default (EOF-returning in-memory peer)
+///   so the handshake completes without spawning `ahma_mcp`
+/// - Only the TCP loopback socket is real
+///
+/// Use this for tests that exercise bridge behavior (session lifecycle,
+/// handshake state machine, auth middleware, CORS) without needing real tool
+/// execution.  For tests that need actual tool calls, build an
+/// `InProcessMcpPeerFactory` and use `spawn_in_process_server` directly.
+///
+/// Returns `None` on infrastructure failure (skips the test).
+pub async fn setup_in_process_mcp(
+    transport: TransportMode,
+) -> Option<(InProcessServerInstance, McpTestClient)> {
+    use ahma_mcp::test_utils::bridge_peer::NullPeerFactory;
+
+    let factory = std::sync::Arc::new(NullPeerFactory);
+    let server = match spawn_in_process_server(factory).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("WARNING  setup_in_process_mcp: bridge spawn failed: {e}");
+            return None;
+        }
+    };
+
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let handshake_timeout = TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Handshake);
+    let mut mcp = McpTestClient::with_url(&server.base_url()).with_transport(transport);
+
+    match tokio::time::timeout(
+        handshake_timeout,
+        mcp.initialize_with_roots("in-process-test-client", std::slice::from_ref(&root)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Some((server, mcp)),
+        Ok(Err(e)) => {
+            eprintln!("WARNING  setup_in_process_mcp: handshake failed: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "WARNING  setup_in_process_mcp: handshake timed out after {:?}",
+                handshake_timeout
+            );
+            None
+        }
+    }
 }

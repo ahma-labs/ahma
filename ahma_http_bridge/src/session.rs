@@ -40,6 +40,7 @@
 //! immediately terminated to prevent sandbox escape.
 
 use crate::error::{BridgeError, Result};
+use crate::peer::{PeerFactory, PeerShutdownFn, PeerStreams, SubprocessPeerFactory};
 use ahma_common::sandbox_state::{SandboxState, SandboxStateMachine};
 use chrono::Local;
 use dashmap::DashMap;
@@ -49,7 +50,6 @@ use serde_json::Value;
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -57,8 +57,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, Command},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     sync::{Mutex, Notify, broadcast, mpsc, oneshot},
 };
 use tracing::{debug, error, info, warn};
@@ -157,8 +156,11 @@ pub struct Session {
     terminated: AtomicBool,
     /// Termination reason (if terminated)
     termination_reason: Mutex<Option<SessionTerminationReason>>,
-    /// Handle to the subprocess (for cleanup)
-    child_handle: Mutex<Option<Child>>,
+    /// Async cleanup hook invoked on explicit session termination.
+    ///
+    /// For subprocess peers this kills the child process.  For in-memory peers
+    /// this is `None` (drop semantics handle cleanup).
+    peer_shutdown: Mutex<Option<PeerShutdownFn>>,
 
     /// Handshake state machine protected by a sync Mutex for atomic transitions
     handshake_state: std::sync::Mutex<HandshakeState>,
@@ -467,11 +469,19 @@ impl Session {
 }
 
 /// Configuration for the `SessionManager`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionManagerConfig {
     /// The executable command to start the MCP server (e.g., "ahma_mcp").
+    ///
+    /// Ignored when [`peer_factory`] is `Some`.
+    ///
+    /// [`peer_factory`]: Self::peer_factory
     pub server_command: String,
     /// Arguments to pass to the server executable.
+    ///
+    /// Ignored when [`peer_factory`] is `Some`.
+    ///
+    /// [`peer_factory`]: Self::peer_factory
     pub server_args: Vec<String>,
     /// Explicit fallback directory for clients that do not provide roots.
     ///
@@ -479,6 +489,10 @@ pub struct SessionManagerConfig {
     /// handshake before tool calls are allowed.
     pub default_scope: Option<PathBuf>,
     /// Whether to preserve ANSI colors in the server's output streams.
+    ///
+    /// Ignored when [`peer_factory`] is `Some`.
+    ///
+    /// [`peer_factory`]: Self::peer_factory
     pub enable_colored_output: bool,
     /// Timeout in seconds for the MCP handshake to complete.
     /// If the handshake (SSE connection + roots/list response) doesn't complete
@@ -487,6 +501,40 @@ pub struct SessionManagerConfig {
     pub handshake_timeout_secs: u64,
     /// Maximum concurrent sessions allowed.
     pub max_sessions: usize,
+
+    /// Optional override for the peer backend factory.
+    ///
+    /// When `Some`, this factory is called to produce the [`PeerStreams`] for
+    /// each new session, bypassing the default subprocess logic entirely.  Use
+    /// `InMemoryPeerFactory` (from `ahma_mcp::test_utils`) here to run bridge
+    /// integration tests without spawning real subprocesses.
+    ///
+    /// When `None` (the default), a [`SubprocessPeerFactory`] is constructed
+    /// from `server_command`, `server_args`, and `enable_colored_output`.
+    ///
+    /// [`PeerStreams`]: crate::peer::PeerStreams
+    pub peer_factory: Option<Arc<dyn PeerFactory>>,
+}
+
+impl std::fmt::Debug for SessionManagerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionManagerConfig")
+            .field("server_command", &self.server_command)
+            .field("server_args", &self.server_args)
+            .field("default_scope", &self.default_scope)
+            .field("enable_colored_output", &self.enable_colored_output)
+            .field("handshake_timeout_secs", &self.handshake_timeout_secs)
+            .field("max_sessions", &self.max_sessions)
+            .field(
+                "peer_factory",
+                if self.peer_factory.is_some() {
+                    &"Some(<PeerFactory>)"
+                } else {
+                    &"None"
+                },
+            )
+            .finish()
+    }
 }
 
 /// Manages the lifecycle of concurrent MCP sessions.
@@ -760,17 +808,20 @@ impl SessionManager {
         }
     }
 
-    /// Initializes a new session and spawns a specific `ahma_mcp` subprocess for it.
+    /// Initializes a new session and establishes a peer connection for it.
     ///
     /// This initiates the "deferred sandbox" flow:
     /// 1. A new session ID is generated.
-    /// 2. The subprocess is started with `--defer-sandbox`.
-    /// 3. The subprocess waits for the bridge to provide the sandbox scope (derived from client roots).
+    /// 2. A peer connection is created via [`SessionManagerConfig::peer_factory`]
+    ///    (or a [`SubprocessPeerFactory`] built from `server_command`/`server_args`).
+    /// 3. The peer waits for the bridge to provide the sandbox scope derived from
+    ///    client roots.
     ///
     /// # Returns
     ///
-    /// * `Ok(String)`: The new session ID (UUID v4). This ID must be included in the `Mcp-Session-Id` header for all subsequent requests.
-    /// * `Err(BridgeError)`: If the subprocess could not be spawned.
+    /// * `Ok(String)`: The new session ID (UUID v4). This ID must be included in
+    ///   the `Mcp-Session-Id` header for all subsequent requests.
+    /// * `Err(BridgeError)`: If the peer connection could not be established.
     pub async fn create_session(&self) -> Result<String> {
         let current_count = self.sessions.len();
         if current_count >= self.config.max_sessions {
@@ -781,56 +832,32 @@ impl SessionManager {
         }
 
         let session_id = Uuid::new_v4().to_string();
-
         info!(session_id = %session_id, "Creating new session");
 
-        // Spawn subprocess WITHOUT sandbox restriction initially
-        // Sandbox will be applied when roots/list is received
-        let stderr_mode = if self.config.enable_colored_output {
-            Stdio::piped()
-        } else {
-            Stdio::inherit()
-        };
-
-        let mut args = self.config.server_args.clone();
-        args.push("--defer-sandbox".to_string());
-        args.push("--server-child".to_string());
-
-        let mut child = Command::new(&self.config.server_command)
-            .args(&args)
-            // Propagate W3C trace context so subprocess spans are linked to the
-            // current session span (W3C Trace Context 1.0 §3.2).
-            .env(
-                "TRACEPARENT",
-                ahma_common::observability::current_traceparent().unwrap_or_default(),
+        // Create peer streams — either via the injected factory or via the
+        // default SubprocessPeerFactory built from config fields.
+        // PeerFactory::create now returns anyhow::Result (P6); convert to BridgeError.
+        let PeerStreams {
+            stdin,
+            stdout,
+            stderr,
+            shutdown_fn,
+        } = match &self.config.peer_factory {
+            Some(factory) => factory
+                .create()
+                .await
+                .map_err(|e| BridgeError::ServerProcess(e.to_string()))?,
+            None => SubprocessPeerFactory::new(
+                self.config.server_command.clone(),
+                self.config.server_args.clone(),
+                self.config.enable_colored_output,
             )
-            // SECURITY:
-            // Avoid inheriting env vars that can auto-enable permissive test mode in ahma_mcp,
-            // which can mask real sandbox-scoping behavior.
-            .env_remove("NEXTEST")
-            .env_remove("NEXTEST_EXECUTION_MODE")
-            .env_remove("CARGO_TARGET_DIR")
-            .env_remove("RUST_TEST_THREADS")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(stderr_mode)
-            // Ensure the subprocess does not outlive this process in the event a test exits early
-            // or fails to explicitly terminate the session.
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| {
-                BridgeError::ServerProcess(format!("Failed to spawn subprocess: {}", e))
-            })?;
-
-        let stdin = child.stdin.take().expect("Failed to get stdin");
-        let stdout = child.stdout.take().expect("Failed to get stdout");
-        let stderr = if self.config.enable_colored_output {
-            child.stderr.take()
-        } else {
-            None
+            .create()
+            .await
+            .map_err(|e| BridgeError::ServerProcess(e.to_string()))?,
         };
 
-        // Create channels
+        // Message channel: bridge request handlers → I/O task
         let (tx, rx) = mpsc::channel::<String>(100);
         let (broadcast_tx, _) = broadcast::channel::<(u64, String)>(256);
         let pending_requests = Arc::new(DashMap::new());
@@ -845,7 +872,7 @@ impl SessionManager {
             sandbox_scopes: Mutex::new(None),
             terminated: AtomicBool::new(false),
             termination_reason: Mutex::new(None),
-            child_handle: Mutex::new(Some(child)),
+            peer_shutdown: Mutex::new(shutdown_fn),
             handshake_state: std::sync::Mutex::new(HandshakeState::AwaitingBoth),
             mcp_initialized_notify: Notify::new(),
             sandbox_state_machine: Arc::new(SandboxStateMachine::new()),
@@ -1085,9 +1112,9 @@ impl SessionManager {
             session.terminated.store(true, Ordering::SeqCst);
             *session.termination_reason.lock().await = Some(reason);
 
-            // Kill the subprocess
-            if let Some(mut child) = session.child_handle.lock().await.take() {
-                let _ = child.kill().await;
+            // Run peer-specific cleanup (e.g. kill the subprocess).
+            if let Some(shutdown_fn) = session.peer_shutdown.lock().await.take() {
+                shutdown_fn().await;
             }
 
             // Clear pending requests
@@ -1113,13 +1140,17 @@ impl SessionManager {
         self.sessions.len()
     }
 
-    /// Handle I/O for a session subprocess
+    /// Handle I/O between the bridge and an MCP peer (subprocess or in-process).
+    ///
+    /// Works with any `AsyncWrite`/`AsyncRead` pair, enabling both the
+    /// production subprocess path and the in-memory test path to share the
+    /// same loop.
     async fn handle_session_io(
         session: Arc<Session>,
         mut rx: mpsc::Receiver<String>,
-        mut stdin: tokio::process::ChildStdin,
-        stdout: tokio::process::ChildStdout,
-        stderr: Option<tokio::process::ChildStderr>,
+        mut stdin: Box<dyn AsyncWrite + Send + Unpin + 'static>,
+        stdout: Box<dyn AsyncRead + Send + Unpin + 'static>,
+        stderr: Option<Box<dyn AsyncRead + Send + Unpin + 'static>>,
         colored_output: bool,
     ) {
         // Spawn a dedicated stdout reader to make stdout reading cancel-safe.

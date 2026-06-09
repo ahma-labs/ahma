@@ -56,6 +56,7 @@ use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use crate::retry::{self, RetryConfig};
 use crate::sandbox;
 use crate::shell_pool::ShellPoolManager;
+use ahma_common::event_dispatcher::{EventDispatcher, OperationEvent};
 use anyhow::Result;
 use serde_json::{Map, Value, json};
 use std::{
@@ -148,6 +149,13 @@ impl BoundedLineCollector {
 ///
 /// The `Adapter` is designed to be shared across threads (`Arc<Adapter>`) and uses internal
 /// synchronization to manage state safely.
+///
+/// # Event Stream (P2)
+///
+/// All operation lifecycle events are broadcast on [`Adapter::event_dispatcher`].  Tests
+/// and monitoring components subscribe to this stream to assert on the deterministic event
+/// sequence without racing against transport teardown.  Production callers continue to use
+/// the `callback` / `OperationMonitor` paths until P5.
 #[derive(Debug)]
 pub struct Adapter {
     /// Operation monitor for async tasks.
@@ -164,6 +172,15 @@ pub struct Adapter {
     retry_config: Option<RetryConfig>,
     /// Custom command executor.
     pub command_executor: Arc<dyn executor::CommandExecutor>,
+    /// Unified event dispatcher (P2).
+    ///
+    /// All operation lifecycle events are broadcast here.  Subscribers receive every event
+    /// across all concurrent operations from this adapter.  Filter by `operation_id` if
+    /// you care about a specific operation.
+    ///
+    /// In a future pass (P5) the legacy `callback` / direct-monitor-update paths will be
+    /// removed and all notifications will flow exclusively through this dispatcher.
+    pub event_dispatcher: EventDispatcher,
 }
 
 impl Adapter {
@@ -190,7 +207,23 @@ impl Adapter {
             temp_file_manager: preparer::TempFileManager::new(),
             retry_config: None,
             command_executor: Arc::new(executor::DefaultCommandExecutor),
+            event_dispatcher: EventDispatcher::default(),
         })
+    }
+
+    /// Subscribe to the unified operation event stream.
+    ///
+    /// Returns a `broadcast::Receiver` that yields every [`OperationEvent`] emitted
+    /// by this adapter.  Events are wrapped in `Arc` so cloning is cheap.
+    ///
+    /// # Note
+    ///
+    /// Events emitted before this call are not replayed.  Subscribe before triggering
+    /// the operation you want to observe.
+    pub fn subscribe_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<std::sync::Arc<OperationEvent>> {
+        self.event_dispatcher.subscribe()
     }
 
     /// Sets a custom command executor on the adapter.
@@ -492,6 +525,7 @@ impl Adapter {
             sandbox,
             task_handles,
             command_executor: self.command_executor.clone(),
+            event_dispatcher: self.event_dispatcher.clone(),
         }));
 
         // Store the handle for graceful shutdown
@@ -576,6 +610,8 @@ struct AsyncOperationRun {
     sandbox: Arc<sandbox::Sandbox>,
     task_handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     command_executor: Arc<dyn executor::CommandExecutor>,
+    /// Unified event dispatcher for P2 event stream.
+    event_dispatcher: EventDispatcher,
 }
 
 async fn run_async_operation(ctx: AsyncOperationRun) {
@@ -593,6 +629,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         sandbox,
         task_handles,
         command_executor,
+        event_dispatcher,
     } = ctx;
 
     let cancellation_token = match monitor.get_operation(&op_id).await {
@@ -607,6 +644,18 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         .update_status(&op_id, OperationStatus::InProgress, None)
         .await;
 
+    // Emit Started event to the unified dispatcher (P2).
+    let tool_name = monitor
+        .get_operation(&op_id)
+        .await
+        .map(|op| op.tool_name.clone())
+        .unwrap_or_else(|| command.clone());
+    event_dispatcher.emit(OperationEvent::Started {
+        operation_id: op_id.clone(),
+        tool_name,
+        description: execution_description(&command, &working_dir),
+    });
+
     if let Some(callback) = &callback {
         let _ = callback
             .send_progress(crate::callback_system::ProgressUpdate::Started {
@@ -620,6 +669,11 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     if cancellation_token.is_cancelled() {
         tracing::info!("Operation {} was cancelled before execution started", op_id);
         handle_cancellation(&monitor, &callback, &op_id, 0).await;
+        event_dispatcher.emit(OperationEvent::Cancelled {
+            operation_id: op_id.clone(),
+            reason: "cancelled before execution started".to_string(),
+            duration_ms: 0,
+        });
         return;
     }
 
@@ -634,6 +688,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     ) {
         Ok(cmd) => cmd,
         Err(e) => {
+            let err_msg = format!("Failed to create sandboxed command: {}", e);
             fail_operation_with_error(
                 &monitor,
                 &callback,
@@ -641,9 +696,14 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
                 &program,
                 &working_dir,
                 0,
-                format!("Failed to create sandboxed command: {}", e),
+                err_msg.clone(),
             )
             .await;
+            event_dispatcher.emit(OperationEvent::Failed {
+                operation_id: op_id.clone(),
+                error: err_msg,
+                duration_ms: 0,
+            });
             task_handles.lock().await.remove(&op_id);
             return;
         }
@@ -665,6 +725,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
             &working_dir,
             start_time,
             &monitor,
+            &event_dispatcher,
         )
         .await;
     } else {
@@ -680,6 +741,62 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
             &monitor,
         )
         .await;
+    }
+
+    // Emit terminal event to the unified dispatcher (P2).
+    // Terminal states move the operation from active map to completion_history inside
+    // update_status, so we must look in history — get_operation only checks active ops.
+    let elapsed_ms = start_time.elapsed().as_millis() as u64;
+    if let Some(op) = monitor.check_completion_history_pub(&op_id).await {
+        let terminal_event = match op.state {
+            OperationStatus::Completed => OperationEvent::Completed {
+                operation_id: op_id.clone(),
+                result: op.result.clone().unwrap_or(Value::Null),
+                duration_ms: op
+                    .end_time
+                    .and_then(|e| e.duration_since(op.start_time).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(elapsed_ms),
+            },
+            OperationStatus::Failed => OperationEvent::Failed {
+                operation_id: op_id.clone(),
+                error: op
+                    .result
+                    .as_ref()
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(|s| s.to_string())
+                            .or_else(|| serde_json::to_string(v).ok())
+                    })
+                    .unwrap_or_else(|| "unknown error".to_string()),
+                duration_ms: elapsed_ms,
+            },
+            OperationStatus::Cancelled => OperationEvent::Cancelled {
+                operation_id: op_id.clone(),
+                reason: op
+                    .result
+                    .as_ref()
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "cancelled".to_string()),
+                duration_ms: elapsed_ms,
+            },
+            OperationStatus::TimedOut => OperationEvent::TimedOut {
+                operation_id: op_id.clone(),
+                duration_ms: elapsed_ms,
+            },
+            _ => OperationEvent::Failed {
+                operation_id: op_id.clone(),
+                error: "operation ended in unexpected state".to_string(),
+                duration_ms: elapsed_ms,
+            },
+        };
+        event_dispatcher.emit(terminal_event);
+    } else {
+        tracing::warn!(
+            op_id = %op_id,
+            "run_async_operation: operation not in completion history after execution; \
+             terminal event will not be emitted",
+        );
     }
 
     task_handles.lock().await.remove(&op_id);
@@ -944,7 +1061,7 @@ async fn cancel_operation_timed_out(
     monitor
         .update_status(
             op_id,
-            OperationStatus::Cancelled,
+            OperationStatus::TimedOut,
             Some(Value::String(timeout_reason.clone())),
         )
         .await;
@@ -972,6 +1089,7 @@ async fn execute_with_streaming(
     working_dir: &str,
     start_time: Instant,
     op_monitor: &Arc<OperationMonitor>,
+    event_dispatcher: &EventDispatcher,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1035,12 +1153,12 @@ async fn execute_with_streaming(
 
             // Read stderr line
             result = stderr_reader.next_line() => {
-                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, callback, op_id, op_monitor).await;
+                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, callback, op_id, op_monitor, event_dispatcher).await;
             }
 
             // Read stdout line
             result = stdout_reader.next_line() => {
-                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, callback, op_id, op_monitor).await;
+                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, callback, op_id, op_monitor, event_dispatcher).await;
             }
         }
 
@@ -1058,6 +1176,7 @@ async fn execute_with_streaming(
                     callback,
                     op_id,
                     op_monitor,
+                    event_dispatcher,
                 )
                 .await;
                 break;
@@ -1098,6 +1217,7 @@ async fn drain_remaining_stream_lines(
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
+    event_dispatcher: &EventDispatcher,
 ) {
     while let Ok(Some(line)) = stderr_reader.next_line().await {
         process_streaming_line(
@@ -1108,6 +1228,7 @@ async fn drain_remaining_stream_lines(
             callback,
             op_id,
             op_monitor,
+            event_dispatcher,
         )
         .await;
     }
@@ -1120,6 +1241,7 @@ async fn drain_remaining_stream_lines(
             callback,
             op_id,
             op_monitor,
+            event_dispatcher,
         )
         .await;
     }
@@ -1219,6 +1341,7 @@ async fn handle_cancellation(
 ///
 /// Dispatches to `process_streaming_line` on success, ignores closed-stream
 /// signals (`Ok(None)`), and logs a warning on read errors.
+#[allow(clippy::too_many_arguments)]
 async fn handle_stream_line(
     result: Result<Option<String>, std::io::Error>,
     is_stderr: bool,
@@ -1227,6 +1350,7 @@ async fn handle_stream_line(
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
+    event_dispatcher: &EventDispatcher,
 ) {
     match result {
         Ok(Some(line)) => {
@@ -1238,6 +1362,7 @@ async fn handle_stream_line(
                 callback,
                 op_id,
                 op_monitor,
+                event_dispatcher,
             )
             .await;
         }
@@ -1250,6 +1375,7 @@ async fn handle_stream_line(
 }
 
 /// Redact, collect, and optionally send a log-monitor alert for a single streamed line.
+#[allow(clippy::too_many_arguments)]
 async fn process_streaming_line(
     line: &str,
     is_stderr: bool,
@@ -1258,14 +1384,30 @@ async fn process_streaming_line(
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
+    event_dispatcher: &EventDispatcher,
 ) {
     let safe_line = crate::log_monitor::redact_sensitive_line(line);
     collector.push(safe_line.clone());
-    op_monitor.append_stdout_line(op_id, safe_line).await;
+    op_monitor
+        .append_stdout_line(op_id, safe_line.clone())
+        .await;
+
+    // Emit OutputLine to the unified dispatcher (P2).
+    event_dispatcher.emit(OperationEvent::OutputLine {
+        operation_id: op_id.to_string(),
+        line: safe_line,
+        is_stderr,
+    });
 
     if let Some(snapshot) = log_monitor.process_line(line, is_stderr) {
         let alert_summary = format!("[{}] {}", snapshot.trigger_level, snapshot.trigger_line);
-        op_monitor.append_alert(op_id, alert_summary).await;
+        op_monitor.append_alert(op_id, alert_summary.clone()).await;
+
+        // Emit Alert to the unified dispatcher (P2).
+        event_dispatcher.emit(OperationEvent::Alert {
+            operation_id: op_id.to_string(),
+            message: alert_summary,
+        });
 
         if let Some(callback) = callback {
             let alert = crate::callback_system::ProgressUpdate::LogAlert {

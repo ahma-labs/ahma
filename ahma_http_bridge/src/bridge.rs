@@ -89,7 +89,6 @@ pub enum ListenerKind {
 ///     ..Default::default()
 /// };
 /// ```
-#[derive(Debug, Clone)]
 pub struct BridgeConfig {
     /// local address to bind the HTTP server to (e.g., `127.0.0.1:3000`).
     /// Use port 0 to bind to a random available port.
@@ -169,6 +168,45 @@ pub struct BridgeConfig {
 
     /// Maximum concurrent sessions allowed.
     pub max_sessions: usize,
+
+    /// Shared HMAC key used to authenticate forwarded MCP calls from cluster
+    /// peers (P3).
+    ///
+    /// When `Some`, requests that carry a valid `X-Ahma-Cluster-Manifest`
+    /// header are authenticated before the normal session flow proceeds.  The
+    /// manifest provides the task ID, tool name, nonce, and issued_at for
+    /// replay-protection.
+    ///
+    /// When `None`, cluster peer forwarding is disabled (all requests must go
+    /// through the regular session handshake).
+    pub cluster_shared_key: Option<Vec<u8>>,
+
+    /// Optional [`PeerFactory`] injection point (P5 — test harness).
+    ///
+    /// When `Some`, each new bridge session uses this factory instead of
+    /// spawning an `ahma_mcp` subprocess.  This allows tests to wire an
+    /// [`InProcessMcpPeerFactory`] (from `ahma_mcp::test_utils`) so the full
+    /// bridge session behaviour — handshake, sandbox gating, SSE replay,
+    /// dual-transport — runs entirely in-process without forking.
+    ///
+    /// When `None` (the default), sessions use a [`SubprocessPeerFactory`]
+    /// built from `server_command` and `server_args`.
+    ///
+    /// [`PeerFactory`]: crate::peer::PeerFactory
+    /// [`InProcessMcpPeerFactory`]: https://docs.rs/ahma_mcp/latest/ahma_mcp/test_utils/bridge_peer/struct.InProcessMcpPeerFactory.html
+    /// [`SubprocessPeerFactory`]: crate::peer::SubprocessPeerFactory
+    pub peer_factory: Option<std::sync::Arc<dyn crate::peer::PeerFactory>>,
+
+    /// Optional one-shot sender that receives the actual bound port when the
+    /// bridge starts listening (P5 — in-process test harness).
+    ///
+    /// Using `bind_addr` with port `0` lets the OS pick a free port; this
+    /// sender fires as soon as `listen()` succeeds so tests can discover the
+    /// actual port without parsing stderr.
+    ///
+    /// The sender is consumed on first use; subsequent bridge starts (after a
+    /// hypothetical restart) will not fire it.
+    pub bound_port_tx: Option<tokio::sync::oneshot::Sender<u16>>,
 }
 
 impl Default for BridgeConfig {
@@ -191,7 +229,136 @@ impl Default for BridgeConfig {
             active_sessions: None,
             idle_timeout_secs: None,
             max_sessions: 100,
+            cluster_shared_key: None,
+            peer_factory: None,
+            bound_port_tx: None,
         }
+    }
+}
+
+impl std::fmt::Debug for BridgeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("server_command", &self.server_command)
+            .field("server_args", &self.server_args)
+            .field("enable_colored_output", &self.enable_colored_output)
+            .field("default_sandbox_scope", &self.default_sandbox_scope)
+            .field("handshake_timeout_secs", &self.handshake_timeout_secs)
+            .field("enable_quic", &self.enable_quic)
+            .field("disable_http1_1", &self.disable_http1_1)
+            .field("listener_kind", &self.listener_kind)
+            .field(
+                "require_token",
+                &self.require_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("rate_limit_rps", &self.rate_limit_rps)
+            .field("rate_limit_burst", &self.rate_limit_burst)
+            .field("max_sessions", &self.max_sessions)
+            .field(
+                "cluster_shared_key",
+                &self.cluster_shared_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "peer_factory",
+                &self.peer_factory.as_ref().map(|_| "<PeerFactory>"),
+            )
+            .field(
+                "bound_port_tx",
+                &self.bound_port_tx.as_ref().map(|_| "<Sender>"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for BridgeConfig {
+    fn clone(&self) -> Self {
+        Self {
+            bind_addr: self.bind_addr,
+            server_command: self.server_command.clone(),
+            server_args: self.server_args.clone(),
+            enable_colored_output: self.enable_colored_output,
+            default_sandbox_scope: self.default_sandbox_scope.clone(),
+            handshake_timeout_secs: self.handshake_timeout_secs,
+            enable_quic: self.enable_quic,
+            disable_http1_1: self.disable_http1_1,
+            listener_kind: self.listener_kind.clone(),
+            require_token: self.require_token.clone(),
+            require_token_path: self.require_token_path.clone(),
+            rate_limit_rps: self.rate_limit_rps,
+            rate_limit_burst: self.rate_limit_burst,
+            active_sessions: self.active_sessions.clone(),
+            idle_timeout_secs: self.idle_timeout_secs,
+            max_sessions: self.max_sessions,
+            cluster_shared_key: self.cluster_shared_key.clone(),
+            peer_factory: self.peer_factory.clone(),
+            // oneshot::Sender is not Clone; cloning a BridgeConfig discards the
+            // port notifier. Tests that need the notification should call
+            // `with_bound_port_tx` on the config they are about to use.
+            bound_port_tx: None,
+        }
+    }
+}
+
+impl BridgeConfig {
+    /// Inject a [`PeerFactory`] override for in-process testing (P5).
+    ///
+    /// With this set, each bridge session uses `factory` instead of spawning
+    /// an `ahma_mcp` subprocess.  Set `bound_port_tx` to receive the actual
+    /// bound port without parsing stderr:
+    ///
+    /// ```rust,no_run
+    /// use ahma_http_bridge::BridgeConfig;
+    /// use tokio::sync::oneshot;
+    ///
+    /// # async fn example(my_factory: std::sync::Arc<dyn ahma_http_bridge::peer::PeerFactory>) {
+    /// let (port_tx, port_rx) = oneshot::channel();
+    /// let config = BridgeConfig::for_in_process_test(my_factory)
+    ///     .with_bound_port_tx(port_tx);
+    ///
+    /// // Spawn the bridge in the background.
+    /// tokio::spawn(ahma_http_bridge::start_bridge(config));
+    ///
+    /// // Wait for the bridge to bind.
+    /// let port = port_rx.await.expect("bridge did not start");
+    /// let url = format!("http://127.0.0.1:{port}");
+    /// # }
+    /// ```
+    ///
+    /// [`PeerFactory`]: crate::peer::PeerFactory
+    pub fn for_in_process_test(factory: std::sync::Arc<dyn crate::peer::PeerFactory>) -> Self {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        Self {
+            bind_addr,
+            server_command: String::new(),
+            server_args: vec![],
+            enable_colored_output: false,
+            default_sandbox_scope: None,
+            handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            enable_quic: false, // no QUIC needed for in-process tests
+            disable_http1_1: false,
+            listener_kind: ListenerKind::Tcp(bind_addr),
+            require_token: None,
+            require_token_path: None,
+            rate_limit_rps: 0,
+            rate_limit_burst: 10,
+            active_sessions: None,
+            idle_timeout_secs: None,
+            max_sessions: 100,
+            cluster_shared_key: None,
+            peer_factory: Some(factory),
+            bound_port_tx: None,
+        }
+    }
+
+    /// Set a one-shot sender that receives the actual bound port.
+    ///
+    /// Useful with `bind_addr` port `0` to discover the OS-assigned port
+    /// without parsing stderr output.
+    #[must_use]
+    pub fn with_bound_port_tx(mut self, tx: tokio::sync::oneshot::Sender<u16>) -> Self {
+        self.bound_port_tx = Some(tx);
+        self
     }
 }
 
@@ -217,6 +384,13 @@ pub struct BridgeState {
     require_token: ArcSwapOption<String>,
     /// The listener configuration, used for cleanup on restart.
     listener_kind: ListenerKind,
+    /// Optional HMAC key for authenticating cluster peer forwarded calls (P3).
+    ///
+    /// When `Some`, the bridge accepts `X-Ahma-Cluster-Manifest` headers and
+    /// verifies them before routing the request.
+    cluster_shared_key: Option<Vec<u8>>,
+    /// Nonce cache for cluster manifest replay protection (P3).
+    cluster_nonce_cache: Arc<crate::cluster_auth::ManifestNonceCache>,
 }
 
 /// Build a CORS layer appropriate for the bind address.
@@ -235,6 +409,9 @@ fn build_cors_layer(bind_addr: &SocketAddr) -> CorsLayer {
         "mcp-session-id".parse().unwrap(),
         "accept".parse().unwrap(),
         "last-event-id".parse().unwrap(),
+        crate::cluster_auth::CLUSTER_MANIFEST_HEADER
+            .parse()
+            .unwrap(),
     ]);
     let expose = tower_http::cors::ExposeHeaders::list(["mcp-session-id"
         .parse::<axum::http::HeaderName>()
@@ -346,6 +523,64 @@ async fn bearer_auth_middleware(
     }
 }
 
+// ─── Cluster-manifest authentication middleware ───────────────────────────────
+
+/// Axum middleware that verifies `X-Ahma-Cluster-Manifest` headers (P3).
+///
+/// **When a cluster shared key is configured** and the request carries
+/// `X-Ahma-Cluster-Manifest`, this middleware decodes and verifies the HMAC
+/// signature and rejects replayed nonces.
+///
+/// Requests **without** the header are passed through unchanged (normal MCP
+/// clients and bearer-token authenticated requests both lack it). Requests
+/// **with** the header but **without** a configured shared key are also rejected
+/// to prevent unsigned cluster calls from slipping through on unconfigured
+/// bridges.
+async fn cluster_auth_middleware(
+    State(state): State<Arc<BridgeState>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    use crate::cluster_auth::{CLUSTER_MANIFEST_HEADER, ClusterManifest};
+
+    let header_value = request
+        .headers()
+        .get(CLUSTER_MANIFEST_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    let Some(header_str) = header_value else {
+        // No cluster manifest — pass through.
+        return next.run(request).await;
+    };
+
+    // A manifest header is present.  Reject immediately if no key is configured
+    // on this bridge — an unsigned forwarded call is always a misconfiguration.
+    let Some(ref key) = state.cluster_shared_key else {
+        debug!("Cluster manifest header present but no shared key configured — rejecting");
+        return (StatusCode::UNAUTHORIZED, "cluster auth not configured").into_response();
+    };
+
+    match ClusterManifest::decode_and_verify(&header_str, key, &state.cluster_nonce_cache) {
+        Ok(manifest) => {
+            debug!(
+                tool = %manifest.tool_name,
+                issued_at = manifest.issued_at,
+                "Cluster manifest verified"
+            );
+            next.run(request).await
+        }
+        Err(e) => {
+            debug!(error = %e, "Cluster manifest verification failed");
+            (
+                StatusCode::UNAUTHORIZED,
+                format!("cluster auth failed: {e}"),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Starts the HTTP bridge server and blocks until shutdown.
 ///
 /// This function initializes the session manager, sets up the Axum router for MCP
@@ -420,6 +655,10 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
         enable_colored_output: config.enable_colored_output,
         handshake_timeout_secs: config.handshake_timeout_secs,
         max_sessions: config.max_sessions,
+        // Forward the injected PeerFactory (P5 in-process test harness support).
+        // When `Some`, sessions use an in-memory MCP service rather than
+        // spawning a subprocess — this is the key enabler for fast bridge tests.
+        peer_factory: config.peer_factory.clone(),
     };
     let mut session_manager = SessionManager::new(session_config);
     if let Some(ref counter) = config.active_sessions {
@@ -431,6 +670,8 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
         session_manager,
         require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),
         listener_kind: config.listener_kind.clone(),
+        cluster_shared_key: config.cluster_shared_key.clone(),
+        cluster_nonce_cache: Arc::new(crate::cluster_auth::ManifestNonceCache::new()),
     })
 }
 
@@ -501,6 +742,10 @@ fn build_mcp_router(
                 .delete(handle_session_delete),
         )
         .fallback(handle_not_found)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            cluster_auth_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             bearer_auth_middleware,
@@ -652,6 +897,13 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
 
     // Print machine-readable bound port for test infrastructure (always print, tests parse it)
     eprintln!("AHMA_BOUND_PORT={}", local_addr.port());
+
+    // Notify in-process test harness of the bound port (P5).
+    if let Some(tx) = config.bound_port_tx {
+        // Ignore send errors: the receiver may have been dropped if the test
+        // already timed out and is tearing down.
+        let _ = tx.send(local_addr.port());
+    }
 
     // Spawn QUIC accept loop as a background task.
     if let Some(qi) = quic_info {
@@ -1020,7 +1272,10 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
     match session.mark_sse_connected().await {
         Ok(true) => {
             // Handshake just reached RootsRequested; auto-lock from default_scope if configured.
-            state.session_manager.auto_lock_if_default_scope(&session_id).await;
+            state
+                .session_manager
+                .auto_lock_if_default_scope(&session_id)
+                .await;
         }
         Ok(false) => {}
         Err(e) => {
@@ -1288,6 +1543,9 @@ mod tests {
             active_sessions: None,
             idle_timeout_secs: None,
             max_sessions: 50,
+            cluster_shared_key: None,
+            peer_factory: None,
+            bound_port_tx: None,
         };
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
         assert_eq!(config.server_command, "custom_server");
@@ -1330,6 +1588,8 @@ mod tests {
             session_manager,
             require_token: ArcSwapOption::new(None),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
+            cluster_shared_key: None,
+            cluster_nonce_cache: Arc::new(crate::cluster_auth::ManifestNonceCache::new()),
         })
     }
 
@@ -1409,6 +1669,7 @@ for line in sys.stdin:
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
             max_sessions: 50,
+            peer_factory: None,
         }));
 
         let state = create_state_with_session_manager(Arc::clone(&session_manager));
@@ -1580,6 +1841,7 @@ for line in sys.stdin:
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
             max_sessions: 50,
+            peer_factory: None,
         }));
         let state = create_state_with_session_manager(session_manager);
         let app = create_app(state);
@@ -1670,6 +1932,7 @@ for line in sys.stdin:
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
             max_sessions: 50,
+            peer_factory: None,
         }));
 
         let session_id = session_manager
@@ -1713,6 +1976,7 @@ for line in sys.stdin:
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
             max_sessions: 50,
+            peer_factory: None,
         }));
 
         let state = create_state_with_session_manager(session_manager);
@@ -1754,15 +2018,22 @@ for line in sys.stdin:
                 enable_colored_output: false,
                 handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
                 max_sessions: 50,
+                peer_factory: None,
             })),
             require_token: ArcSwapOption::new(token.map(|s| Arc::new(s.to_owned()))),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
+            cluster_shared_key: None,
+            cluster_nonce_cache: Arc::new(crate::cluster_auth::ManifestNonceCache::new()),
         });
         let loopback_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         Router::new()
             .route(HEALTH_PATH, get(health_check))
             .route(MCP_PATH, post(handle_mcp_request))
             .fallback(handle_not_found)
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                cluster_auth_middleware,
+            ))
             .layer(middleware::from_fn_with_state(
                 state.clone(),
                 bearer_auth_middleware,
