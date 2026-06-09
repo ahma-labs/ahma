@@ -587,11 +587,25 @@ mod tests {
         manager.save(&cwd).unwrap();
 
         let loaded = McpConnectionManager::load(&cwd).unwrap();
-        assert_eq!(loaded.servers.len(), 2);
-        assert_eq!(loaded.servers[0].name, "test-http");
-        assert_eq!(loaded.servers[1].name, "test-stdio");
 
-        match &loaded.servers[1].kind {
+        // The two explicitly-saved servers must be present; IDE auto-discovery
+        // may add more entries, so we look up by name rather than asserting an
+        // exact count.
+        let http = loaded
+            .servers
+            .iter()
+            .find(|s| s.name == "test-http")
+            .expect("test-http not found after load");
+        let stdio = loaded
+            .servers
+            .iter()
+            .find(|s| s.name == "test-stdio")
+            .expect("test-stdio not found after load");
+
+        assert!(!http.enabled, "test-http should be disabled");
+        assert!(stdio.enabled, "test-stdio should be enabled");
+
+        match &stdio.kind {
             McpServerKind::Stdio { command, args } => {
                 assert_eq!(command, "echo");
                 assert_eq!(args, &vec!["hello".to_string()]);

@@ -18,10 +18,14 @@
 
 pub mod config;
 pub mod daemon_hub;
+pub mod event_dispatcher;
 pub mod file_uri;
 pub mod keepalive;
 pub mod local_tls;
 pub mod observability;
+/// Transport-agnostic MCP peer factory abstraction (P6).
+pub mod peer_factory;
+pub mod peer_transport;
 pub mod prompts;
 pub mod sandbox_state;
 pub mod state_machine;

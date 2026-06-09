@@ -21,12 +21,18 @@
 //! must provide access to its modified source code.
 
 pub mod discovery;
+/// MCP-based cluster peer dispatch (P3).
+pub mod mcp_dispatch;
 pub mod scheduler;
+/// Deterministic multi-node simulation harness for cluster tests (P4).
+pub mod test_grid;
 pub mod tls;
 pub mod transport;
 
 pub use ahma_common::config::TransportMode;
+pub use ahma_common::peer_transport::{InMemoryPeerDispatch, PeerDispatch};
 pub use discovery::{PeerInfo, WorkerRegistry};
+pub use mcp_dispatch::McpPeerDispatch;
 pub use scheduler::{ClusterScheduler, TaskManifest, TaskResult};
 pub use tls::{ClusterTlsConfig, generate_self_signed_cluster_certs, load_from_dir};
-pub use transport::ClusterTransport;
+pub use transport::{ClusterTransport, default_transport_preference, new_cluster_dispatch};

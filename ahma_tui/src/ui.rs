@@ -371,7 +371,7 @@ fn line_wrapped_rows(line: &ratatui::text::Line<'_>, width: usize) -> usize {
     if total_chars == 0 {
         1
     } else {
-        (total_chars + width - 1) / width
+        total_chars.div_ceil(width)
     }
 }
 

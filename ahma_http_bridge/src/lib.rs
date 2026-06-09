@@ -69,8 +69,12 @@
 
 /// HTTP bridge server implementation.
 pub mod bridge;
+/// Cluster peer authentication for forwarded MCP calls (P3).
+pub mod cluster_auth;
 /// Error types for bridge operations.
 pub mod error;
+/// Peer connection abstraction (transport port for bridge sessions).
+pub mod peer;
 /// QUIC / HTTP/3 server support.
 pub mod quic;
 /// Session lifecycle management for HTTP clients.
@@ -78,6 +82,7 @@ pub mod session;
 
 pub use bridge::{BridgeConfig, ListenerKind, start_bridge};
 pub use error::{BridgeError, Result};
+pub use peer::{PeerFactory, PeerShutdownFn, PeerStreams, SubprocessPeerFactory};
 pub use session::{
     DEFAULT_HANDSHAKE_TIMEOUT_SECS, McpRoot, Session, SessionManager, SessionManagerConfig,
     SessionTerminationReason,

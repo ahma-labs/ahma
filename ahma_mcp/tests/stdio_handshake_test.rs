@@ -108,11 +108,10 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
             match tokio::time::timeout(remaining, reader.read_line(&mut buf)).await {
                 Ok(Ok(0)) | Err(_) => return None,
                 Ok(Ok(_)) => {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(buf.trim()) {
-                        if pred(&v) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(buf.trim())
+                        && pred(&v) {
                             return Some(v);
                         }
-                    }
                 }
                 Ok(Err(_)) => return None,
             }
@@ -191,10 +190,8 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
     let _ = child.wait().await;
     let _ = std::fs::remove_file(&socket_path);
 
-    let resp = tools_resp.expect(&format!(
-        "Did not receive tools/list response within timeout (respond_to_roots={})",
-        respond_to_roots
-    ));
+    let resp = tools_resp.unwrap_or_else(|| panic!("Did not receive tools/list response within timeout (respond_to_roots={})",
+        respond_to_roots));
 
     assert!(
         resp.get("error").is_none(),

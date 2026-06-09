@@ -29,13 +29,23 @@
 //! self-signed leaf certificate is accepted.  If no CA PEM is supplied,
 //! certificate verification is **disabled** (appropriate for cluster peers on
 //! a trusted LAN that haven't yet distributed their CA cert).
+//!
+//! # `PeerDispatch` implementation
+//!
+//! `ClusterTransport` implements [`ahma_common::peer_transport::PeerDispatch`]
+//! so it can be stored as `Arc<dyn PeerDispatch>` inside [`ClusterScheduler`]
+//! and swapped out for the in-memory test double from `ahma_common`.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use ahma_common::config::TransportMode;
+use ahma_common::{
+    config::TransportMode,
+    peer_transport::{BoxFuture, PeerDispatch},
+};
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Serialize;
+use serde_json::Value;
 use tracing::{debug, warn};
 
 const DEFAULT_PEER_TIMEOUT_SECS: u64 = 120;
@@ -199,6 +209,110 @@ impl ClusterTransport {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// PeerDispatch implementation
+// ---------------------------------------------------------------------------
+
+/// Wrap `ClusterTransport` as an `Arc<dyn PeerDispatch>` adapter.
+///
+/// The dispatch method serialises `payload` as JSON, POSTs it to
+/// `{peer_addr}{path}` via the multi-transport fallback logic, then
+/// deserialises the response body as a `serde_json::Value`.
+impl PeerDispatch for ClusterTransport {
+    fn dispatch(
+        &self,
+        peer_addr: &str,
+        path: &str,
+        payload: Value,
+    ) -> BoxFuture<Result<Value>> {
+        // We need ownership of peer_addr and path inside the async block.
+        let peer_addr = peer_addr.to_string();
+        let path = path.to_string();
+
+        // Clone the reqwest clients so the future can be `'static`.
+        let http1 = self.http1.clone();
+        let http2 = self.http2.clone();
+        #[cfg(feature = "cluster-quic")]
+        let quic = self.quic.clone();
+        let preference = self.preference.clone();
+
+        Box::pin(async move {
+            let base = peer_addr.trim_end_matches('/');
+            let http_url = format!("{base}{path}");
+            // https_url is only used by the QUIC branch; suppress warning when
+            // the `cluster-quic` feature is not compiled in.
+            #[cfg_attr(not(feature = "cluster-quic"), allow(unused_variables))]
+            let https_url = if let Some(stripped) = http_url.strip_prefix("http://") {
+                format!("https://{stripped}")
+            } else {
+                http_url.clone()
+            };
+
+            let mut last_err: Option<anyhow::Error> = None;
+
+            for mode in &preference {
+                let (client, url) = match mode {
+                    TransportMode::Http1 => (&http1, http_url.as_str()),
+                    TransportMode::Http2 => (&http2, http_url.as_str()),
+                    TransportMode::Quic => {
+                        #[cfg(feature = "cluster-quic")]
+                        { (&quic, https_url.as_str()) }
+                        #[cfg(not(feature = "cluster-quic"))]
+                        { (&http2, http_url.as_str()) }
+                    }
+                };
+                debug!(transport = ?mode, url, "ClusterTransport::dispatch attempt");
+                match client.post(url).json(&payload).send().await {
+                    Ok(resp) => {
+                        let v: Value = resp
+                            .json()
+                            .await
+                            .context("Failed to parse peer response as JSON")?;
+                        return Ok(v);
+                    }
+                    Err(e) => {
+                        warn!(transport = ?mode, url, "dispatch attempt failed: {e}");
+                        last_err = Some(anyhow::Error::from(e));
+                    }
+                }
+            }
+
+            // Fallback to HTTP/1.1 if preference list was empty or all failed.
+            match http1.post(&http_url).json(&payload).send().await {
+                Ok(resp) => {
+                    let v: Value = resp
+                        .json()
+                        .await
+                        .context("Failed to parse fallback peer response as JSON")?;
+                    Ok(v)
+                }
+                Err(e) => Err(last_err.unwrap_or_else(|| anyhow::Error::from(e)).context(
+                    format!("All cluster transports failed for peer at {peer_addr}"),
+                )),
+            }
+        })
+    }
+}
+
+/// Convenience constructor — returns `ClusterTransport` wrapped in `Arc<dyn PeerDispatch>`.
+///
+/// Use this when you want to inject `ClusterTransport` into components that
+/// accept `Arc<dyn PeerDispatch>` without repeating the cast at each call site.
+pub fn new_cluster_dispatch(
+    preference: Vec<TransportMode>,
+    ca_pem: Option<&str>,
+) -> Arc<dyn PeerDispatch> {
+    Arc::new(ClusterTransport::new(preference, ca_pem))
+}
+
+/// Returns the default cluster transport preference order: QUIC → HTTP/2 → HTTP/1.
+///
+/// This is a module-level function so callers (e.g. `ClusterScheduler::new`) can
+/// access the default without importing `ClusterTransport` directly.
+pub fn default_transport_preference() -> Vec<TransportMode> {
+    ClusterTransport::default_preference()
 }
 
 // ---------------------------------------------------------------------------

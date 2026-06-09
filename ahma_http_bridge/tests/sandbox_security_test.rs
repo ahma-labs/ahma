@@ -32,6 +32,7 @@ fn test_no_temp_files_flag_in_server_args() {
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         max_sessions: 10,
+        peer_factory: None,
     };
 
     assert!(
@@ -85,6 +86,7 @@ fn test_session_manager_config_default_scope() {
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         max_sessions: 10,
+        peer_factory: None,
     };
 
     assert_eq!(
@@ -104,6 +106,7 @@ async fn test_session_isolation_creates_separate_sessions() {
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         max_sessions: 10,
+        peer_factory: None,
     };
 
     let manager = SessionManager::new(config);
@@ -141,6 +144,7 @@ async fn test_sandbox_lock_immutability() {
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         max_sessions: 10,
+        peer_factory: None,
     };
 
     let manager = SessionManager::new(config);
@@ -236,6 +240,7 @@ async fn test_multi_root_workspace_sandbox() {
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         max_sessions: 10,
+        peer_factory: None,
     };
 
     let manager = SessionManager::new(config);
@@ -297,6 +302,7 @@ async fn test_empty_roots_rejected() {
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         max_sessions: 10,
+        peer_factory: None,
     };
 
     let manager = SessionManager::new(config);
@@ -330,6 +336,7 @@ async fn test_empty_roots_use_explicit_fallback_scope() {
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         max_sessions: 10,
+        peer_factory: None,
     };
 
     let manager = SessionManager::new(config);

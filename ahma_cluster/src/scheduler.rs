@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ahma_common::config::TransportMode;
+use ahma_common::{
+    config::TransportMode,
+    peer_transport::PeerDispatch,
+};
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
@@ -18,7 +21,7 @@ use subtle::ConstantTimeEq;
 use tracing::{debug, info, warn};
 
 use super::discovery::{PeerInfo, WorkerRegistry};
-use super::transport::ClusterTransport;
+use super::transport::{new_cluster_dispatch, default_transport_preference};
 
 /// HMAC-SHA256 type alias.
 type HmacSha256 = Hmac<Sha256>;
@@ -153,7 +156,9 @@ impl NonceCache {
 pub struct ClusterScheduler {
     registry: WorkerRegistry,
     shared_key: Vec<u8>,
-    transport: ClusterTransport,
+    /// Cluster peer transport — production wraps `ClusterTransport` (HTTP/QUIC);
+    /// tests can inject [`ahma_common::peer_transport::InMemoryPeerDispatch`].
+    transport: Arc<dyn PeerDispatch>,
     /// Nonce cache used by the receiver-side `verify_with_nonce_cache`.
     #[allow(dead_code)]
     nonce_cache: NonceCache,
@@ -180,7 +185,7 @@ impl ClusterScheduler {
         Self {
             registry,
             shared_key: key_bytes,
-            transport: ClusterTransport::new(ClusterTransport::default_preference(), None),
+            transport: new_cluster_dispatch(default_transport_preference(), None),
             nonce_cache: NonceCache::default(),
         }
     }
@@ -191,7 +196,7 @@ impl ClusterScheduler {
     /// preference (`[Quic, Http2, Http1]`):
     ///
     /// ```no_run
-    /// use ahma_cluster::{ClusterScheduler, ClusterTransport};
+    /// use ahma_cluster::ClusterScheduler;
     /// use ahma_common::config::TransportMode;
     ///
     /// # async fn example() {
@@ -201,7 +206,44 @@ impl ClusterScheduler {
     /// ```
     #[must_use]
     pub fn with_transport(mut self, preference: Vec<TransportMode>, ca_pem: Option<&str>) -> Self {
-        self.transport = ClusterTransport::new(preference, ca_pem);
+        self.transport = new_cluster_dispatch(preference, ca_pem);
+        self
+    }
+
+    /// Inject a custom [`PeerDispatch`] implementation.
+    ///
+    /// Use this in tests to inject an [`ahma_common::peer_transport::InMemoryPeerDispatch`]
+    /// without spawning real network connections.
+    #[must_use]
+    pub fn with_peer_dispatch(mut self, dispatch: Arc<dyn PeerDispatch>) -> Self {
+        self.transport = dispatch;
+        self
+    }
+
+    /// Switch to the MCP-based cluster dispatch (P3).
+    ///
+    /// Replaces the default raw HTTP/QUIC transport with an [`McpPeerDispatch`]
+    /// that calls `tools/call` on the peer's MCP endpoint, authenticated via
+    /// `X-Ahma-Cluster-Manifest` (HMAC-SHA256 signed with the scheduler's
+    /// shared key).  This is the preferred dispatch method for P3+ clusters.
+    ///
+    /// * `preference` — transport preference order (same semantics as
+    ///   [`with_transport`]).  Pass [`default_transport_preference()`] for the
+    ///   recommended QUIC → HTTP/2 → HTTP/1 order.
+    /// * `ca_pem` — optional PEM CA cert for QUIC TLS peer verification.
+    ///
+    /// [`McpPeerDispatch`]: crate::mcp_dispatch::McpPeerDispatch
+    /// [`with_transport`]: Self::with_transport
+    /// [`default_transport_preference()`]: crate::transport::default_transport_preference
+    #[must_use]
+    pub fn use_mcp_dispatch(
+        mut self,
+        preference: Vec<TransportMode>,
+        ca_pem: Option<&str>,
+    ) -> Self {
+        use crate::mcp_dispatch::McpPeerDispatch;
+        self.transport =
+            McpPeerDispatch::new(self.shared_key.clone(), preference, ca_pem).into_arc_dispatch();
         self
     }
 
@@ -248,15 +290,44 @@ impl ClusterScheduler {
         let signed = manifest.sign(&self.shared_key);
         info!("Dispatching task {} to peer {}", signed.task_id, peer.id);
 
-        let resp = self
+        // Build an MCP `tools/call` JSON-RPC payload (P3).
+        //
+        // `McpPeerDispatch` performs the full MCP session lifecycle
+        // (initialize → notifications/initialized → tools/call → DELETE).
+        // The HMAC-signed cluster manifest travels in the
+        // `X-Ahma-Cluster-Manifest` header; authentication is fully
+        // decoupled from the tool arguments.
+        //
+        // `ClusterTransport` (legacy) ignores the JSON-RPC envelope and
+        // posts the raw value to `/tasks` — the path parameter keeps it
+        // working until all peers are upgraded.
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "run_llm_task",
+                "arguments": {
+                    "task_id": signed.task_id,
+                    "prompt": signed.prompt,
+                    "model": signed.model,
+                    "llm_base_url": signed.llm_base_url,
+                    "max_tokens": signed.max_tokens,
+                    "timeout_secs": signed.timeout_secs,
+                    "nonce": signed.nonce,
+                    "issued_at": signed.issued_at,
+                    "signature": signed.signature,
+                }
+            }
+        });
+
+        let response_value = self
             .transport
-            .post(&peer.addr, "/tasks", &signed)
+            .dispatch(&peer.addr, "/tasks", payload)
             .await
             .with_context(|| format!("Failed to dispatch task to peer {}", peer.id))?;
 
-        let result: TaskResult = resp
-            .json()
-            .await
+        let result: TaskResult = serde_json::from_value(response_value)
             .context("Failed to parse task result from peer")?;
 
         Ok(result)

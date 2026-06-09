@@ -54,6 +54,12 @@ success-output = "never"
 # adding a global test-threads limit, preventing IPC pipe starvation.
 # Using 4 (not 2) so that on a 10-CPU machine only ~2 bridge tests run at once;
 # this prevents handshake timeouts when --run-ignored all adds extra load.
+#
+# P5 NOTE: As bridge tests migrate to the in-process harness (spawn_in_process_server /
+# setup_in_process_mcp), the subprocess count drops and this throttle can be relaxed.
+# Target: keep threads-required = 4 for the subprocess smoke suite, but exclude
+# the in-process test binary from throttling once it is split into its own file
+# (e.g. `ahma_http_bridge::in_process_*`).
 [[profile.default.overrides]]
 filter = "package(ahma_http_bridge)"
 threads-required = 4

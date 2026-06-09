@@ -670,11 +670,6 @@ fn session_sse_event(session: &crate::session::Session, value: &Value) -> (u64, 
     (id, json_str)
 }
 
-/// Build an SSE response from a single JSON value, assigning an event ID from the session.
-fn sse_single_event_response(session: &crate::session::Session, value: Value) -> Response {
-    let (id, json_str) = session_sse_event(session, &value);
-    sse_single_event_response_with_id(id, json_str)
-}
 
 /// Handles POST requests that accept `text/event-stream` (SSE) responses.
 ///
@@ -878,7 +873,15 @@ async fn handle_initialize_sse(session_manager: &Arc<SessionManager>, payload: &
     }
 }
 
-/// Forward a notification (no id) and return a single SSE ack event.
+/// Forward a notification (no id) and return HTTP 202 Accepted.
+///
+/// Per MCP Streamable HTTP spec §3.2.1, the server MUST respond with HTTP 202
+/// for JSON-RPC notifications (messages without an `id`).  Returning an SSE
+/// stream here causes rmcp clients that call `expect_accepted_or_json()` to
+/// reject the response with `UnexpectedServerResponse("expect accepted or json,
+/// got Sse(...)")`, which terminates the proxy transport and — when the
+/// transport is the stdio proxy's Unix-socket client — causes BrokenPipe on
+/// the next stdin write from the test driver.
 async fn forward_notification_sse(
     session_manager: &SessionManager,
     session_id: &str,
@@ -892,14 +895,10 @@ async fn forward_notification_sse(
         .send_request(session_id, payload, Some(request_timeout))
         .await
     {
-        Ok(response) => {
+        Ok(_response) => {
             mark_session_initialized(session_manager, session_id, is_initialized_notification)
                 .await;
-            if let Some(session) = session_manager.get_session(session_id) {
-                with_session_header(sse_single_event_response(&session, response), session_id)
-            } else {
-                with_session_header(json_response(response), session_id)
-            }
+            with_session_header(StatusCode::ACCEPTED.into_response(), session_id)
         }
         Err(e) => {
             error!(session_id = %session_id, "Failed to forward notification: {}", e);

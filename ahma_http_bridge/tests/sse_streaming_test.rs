@@ -335,6 +335,7 @@ for line in sys.stdin:
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
         max_sessions: 100,
+        peer_factory: None,
     }));
 
     let session_id = sm.create_session().await.expect("create session");
