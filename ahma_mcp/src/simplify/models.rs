@@ -279,6 +279,8 @@ impl Language {
 /// # Examples
 ///
 /// ```
+/// use ahma_mcp::simplify::models::resolve_extensions;
+///
 /// // Language name
 /// assert_eq!(resolve_extensions(&["rust".to_string()]), vec!["rs"]);
 ///

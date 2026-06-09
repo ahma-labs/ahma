@@ -54,18 +54,13 @@ fn test_git_config_schema_validation() {
 }
 
 #[test]
-fn test_kotlin_config_schema_validation() {
-    validate_tool_config("kotlin").expect("kotlin.json should pass schema validation");
-}
-
-#[test]
 fn test_python_config_schema_validation() {
     validate_tool_config("python").expect("python.json should pass schema validation");
 }
 
 #[test]
 fn test_all_configs_are_enabled() {
-    let config_names = ["file-tools", "gh", "git", "kotlin", "python"];
+    let config_names = ["file-tools", "gh", "git", "python"];
 
     for config_name in &config_names {
         let config_path = get_config_path(config_name);
@@ -90,7 +85,7 @@ fn test_all_configs_are_enabled() {
 
 #[test]
 fn test_all_configs_have_valid_structure() {
-    let config_names = ["file-tools", "gh", "git", "kotlin", "python"];
+    let config_names = ["file-tools", "gh", "git", "python"];
     let validator = MtdfValidator::new();
 
     for config_name in &config_names {

@@ -182,6 +182,8 @@ async fn run_ratatui(
                     || (state.chat_input_height_current.get() - state.chat_input_height_target.get()).abs() > 0.01
                 {
                     Duration::from_millis(15)
+                } else if chat_in_progress(&state) {
+                    Duration::from_millis(100)
                 } else {
                     Duration::from_millis(250)
                 }) => {
@@ -851,6 +853,16 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
         return;
     }
     state.clear_chat_input();
+
+    let lower = text.to_lowercase();
+    if lower.starts_with('x')
+        && !lower[1..].is_empty()
+        && lower[1..].chars().all(|c| c.is_ascii_digit())
+        && let Ok(win_id) = lower[1..].parse::<usize>()
+    {
+        close_window_by_id(win_id, state);
+        return;
+    }
 
     if text.starts_with('/') {
         dispatch_nav_command(&text, state);
@@ -2548,7 +2560,14 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
     use crate::mcp_source::SourceEvent;
     match event {
         SourceEvent::HealthChanged { healthy } => state.server_healthy = healthy,
-        SourceEvent::DaemonHealthChanged { healthy } => state.daemon_healthy = healthy,
+        SourceEvent::DaemonHealthChanged { healthy } => {
+            state.daemon_healthy = healthy;
+            if let Some(ref tx) = state.mcp_source_tx {
+                let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetDaemonHealthy(
+                    healthy,
+                ));
+            }
+        }
         SourceEvent::OperationsUpdated { ops } => {
             for op in ops {
                 state.upsert_operation(op);
@@ -3095,6 +3114,19 @@ fn update_scroll_animations(state: &mut crate::state::AppState) {
     }
 }
 
+#[cfg(feature = "tui")]
+fn chat_in_progress(state: &crate::state::AppState) -> bool {
+    state.chat.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            crate::state::ChatEntry::Assistant {
+                streaming: true,
+                ..
+            } | crate::state::ChatEntry::ToolCall { result: None, .. }
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_run_command;
@@ -3271,5 +3303,46 @@ mod tests {
 
         super::handle_page_up_down(true, &mut state); // PageUp log -> target decreases
         assert_eq!(state.log_scroll_target.get(), 0.0);
+    }
+
+    #[test]
+    fn test_submit_chat_input_closes_window() {
+        use crate::state::{AppState, TuiWindow};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+
+        let w = TuiWindow {
+            id: 26,
+            label: "Test Window".to_string(),
+            status: "Running".to_string(),
+            content: vec![],
+            collapsed: false,
+            finished_at: None,
+            is_cli: true,
+            command: "pwd".to_string(),
+            working_dir: state.workspace.clone(),
+            llm_model: None,
+            visible: true,
+            abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            op_id: None,
+        };
+        state.windows.push(w);
+
+        // Type "x26" in chat input
+        state.chat_input.insert_str("x26");
+        super::submit_chat_input(&mut state);
+
+        assert!(!state.windows[0].visible);
+        assert_eq!(state.windows[0].status, "Cancelled");
+
+        // Restore window
+        state.windows[0].visible = true;
+        state.windows[0].status = "Running".to_string();
+
+        // Type "X26" in chat input
+        state.chat_input.insert_str("X26");
+        super::submit_chat_input(&mut state);
+
+        assert!(!state.windows[0].visible);
+        assert_eq!(state.windows[0].status, "Cancelled");
     }
 }

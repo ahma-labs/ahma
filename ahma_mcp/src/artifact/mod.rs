@@ -12,7 +12,7 @@
 //! ## Example
 //!
 //! ```no_run
-//! use ahma_mcp::artifact::{ArtifactBuilder, ArtifactServer};
+//! use ahma_mcp::artifact::ArtifactBuilder;
 //!
 //! let html = ArtifactBuilder::new("Q4 Revenue Analysis")
 //!     .data(serde_json::json!({"revenue": 42000, "growth": "12%"}))
@@ -20,7 +20,7 @@
 //!     .chat_model("llama3.2")
 //!     .build();
 //!
-//! std::fs::write("outputs/result.html", &html)?;
+//! html.save(std::path::Path::new("outputs/result.html"))?;
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 

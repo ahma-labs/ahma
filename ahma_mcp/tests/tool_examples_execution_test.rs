@@ -87,16 +87,6 @@ fn test_git_tool_config_valid() {
 }
 
 #[test]
-fn test_kotlin_tool_config_valid() {
-    let tool = validate_tool_config("kotlin.json");
-
-    assert_eq!(tool.name, "kotlin", "Name should be 'kotlin'");
-    assert_eq!(tool.command, "./gradlew", "Command should be './gradlew'");
-    assert!(tool.enabled, "Tool should be enabled");
-    assert!(tool.subcommand_count > 0, "Should have subcommands");
-}
-
-#[test]
 fn test_python_tool_config_valid() {
     let tool = validate_tool_config("python.json");
 
@@ -108,13 +98,7 @@ fn test_python_tool_config_valid() {
 
 #[test]
 fn test_all_example_configs_have_subcommands() {
-    let config_files = [
-        "file-tools.json",
-        "gh.json",
-        "git.json",
-        "kotlin.json",
-        "python.json",
-    ];
+    let config_files = ["file-tools.json", "gh.json", "git.json", "python.json"];
 
     for config_file in &config_files {
         let tool = validate_tool_config(config_file);

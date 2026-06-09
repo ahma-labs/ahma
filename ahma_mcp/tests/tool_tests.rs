@@ -8,9 +8,6 @@ pub use ahma_mcp::test_utils as common;
 #[path = "tool_suite/advanced_await_functionality_test.rs"]
 mod advanced_await_functionality_test;
 
-#[path = "tool_suite/android_gradlew_test.rs"]
-mod android_kotlin_test;
-
 #[path = "tool_suite/android_logcat_test.rs"]
 mod android_logcat_test;
 
@@ -40,12 +37,6 @@ mod file_tools_ls_bug_test;
 
 #[path = "tool_suite/gh_tool_expansion_test.rs"]
 mod gh_tool_expansion_test;
-
-#[path = "tool_suite/gradlew_async_test.rs"]
-mod kotlin_async_test;
-
-#[path = "tool_suite/gradlew_interactive_test.rs"]
-mod kotlin_interactive_test;
 
 #[path = "tool_suite/intelligent_await_timeout_test.rs"]
 mod intelligent_await_timeout_test;

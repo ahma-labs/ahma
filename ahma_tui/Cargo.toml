@@ -13,6 +13,7 @@ name = "ahma_tui"
 path = "src/lib.rs"
 
 [features]
+# Gated as a feature to allow headless/CI builds to compile without heavy terminal UI dependencies (speeding up builds).
 default = ["tui"]
 # Full ratatui terminal UI (disable for headless/CI builds)
 tui = ["dep:ratatui", "dep:crossterm", "dep:futures", "dep:tui-textarea"]
@@ -23,6 +24,7 @@ ahma_llm_monitor = { path = "../ahma_llm_monitor" }
 ahma_renewal = { path = "../ahma_renewal" }
 ahma_task_tree = { path = "../ahma_task_tree" }
 anyhow.workspace = true
+async-trait.workspace = true
 chrono = { workspace = true }
 crossterm = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }

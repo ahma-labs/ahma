@@ -491,7 +491,6 @@ fn builtin_tool_definition(bundle_name: &str) -> Option<&'static str> {
         "fileutils" => Some(include_str!("../../.ahma/file-tools.json")),
         "github" => Some(include_str!("../../.ahma/gh.json")),
         "git" => Some(include_str!("../../.ahma/git.json")),
-        "kotlin" => Some(include_str!("../../.ahma/kotlin.json")),
         "python" => Some(include_str!("../../.ahma/python.json")),
         "simplify" => Some(include_str!("../../.ahma/simplify.json")),
         _ => None,
