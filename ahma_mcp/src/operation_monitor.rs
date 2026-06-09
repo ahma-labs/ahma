@@ -1128,6 +1128,9 @@ mod sink_tests {
 
         // Op should still be in active map (not moved to history).
         let active = monitor.get_operation("op-6").await;
-        assert!(active.is_some(), "non-terminal event must not move op to history");
+        assert!(
+            active.is_some(),
+            "non-terminal event must not move op to history"
+        );
     }
 }

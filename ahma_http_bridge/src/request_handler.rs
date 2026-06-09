@@ -670,7 +670,6 @@ fn session_sse_event(session: &crate::session::Session, value: &Value) -> (u64, 
     (id, json_str)
 }
 
-
 /// Handles POST requests that accept `text/event-stream` (SSE) responses.
 ///
 /// Per MCP Streamable HTTP spec, POST with `Accept: text/event-stream` returns

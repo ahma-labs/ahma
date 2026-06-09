@@ -1340,6 +1340,101 @@ fn set_mode_and_focus(
 }
 
 #[cfg(feature = "tui")]
+fn handle_mcp_list(state: &mut crate::state::AppState) {
+    let servers = state.mcp_connections.list_servers();
+    if servers.is_empty() {
+        push_assistant_message(state, "No MCP client servers configured.");
+    } else {
+        let mut msg = String::from("Configured MCP servers:\n");
+        for s in servers {
+            let kind = match &s.kind {
+                crate::mcp_connections::McpServerKind::Http { url } => {
+                    format!("http {url}")
+                }
+                crate::mcp_connections::McpServerKind::Stdio { command, args } => {
+                    format!("stdio {} {}", command, args.join(" "))
+                }
+            };
+            msg.push_str(&format!(
+                "- {} [{}] {}\n",
+                s.name,
+                if s.enabled { "on" } else { "off" },
+                kind
+            ));
+        }
+        push_assistant_message(state, msg.trim_end());
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_mcp_add_http(rest: &str, state: &mut crate::state::AppState) {
+    let mut parts = rest.split_whitespace();
+    let Some(url) = parts.next() else {
+        push_assistant_message(state, "Usage: /mcp add http <url> [name]");
+        return;
+    };
+    let name = parts.next().unwrap_or("external-http").to_string();
+    state
+        .mcp_connections
+        .add_server(crate::mcp_connections::McpServerConfig {
+            name: name.clone(),
+            enabled: true,
+            kind: crate::mcp_connections::McpServerKind::Http {
+                url: url.to_string(),
+            },
+        });
+    if let Ok(cwd) = std::env::current_dir() {
+        let _ = state.mcp_connections.save(&cwd);
+    }
+    push_assistant_message(state, format!("Added HTTP MCP server `{name}` -> {url}"));
+}
+
+#[cfg(feature = "tui")]
+fn handle_mcp_add_stdio(rest: &str, state: &mut crate::state::AppState) {
+    let mut parts = rest.split_whitespace().peekable();
+    let Some(command) = parts.next() else {
+        push_assistant_message(
+            state,
+            "Usage: /mcp add stdio <command> [args...] [--name <name>]",
+        );
+        return;
+    };
+    let mut args: Vec<String> = Vec::new();
+    let mut name_override: Option<String> = None;
+    while let Some(part) = parts.next() {
+        if part == "--name" {
+            name_override = parts.next().map(String::from);
+        } else {
+            args.push(part.to_string());
+        }
+    }
+    let name = name_override.unwrap_or_else(|| {
+        std::path::Path::new(command)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(command)
+            .to_string()
+    });
+    state
+        .mcp_connections
+        .add_server(crate::mcp_connections::McpServerConfig {
+            name: name.clone(),
+            enabled: true,
+            kind: crate::mcp_connections::McpServerKind::Stdio {
+                command: command.to_string(),
+                args,
+            },
+        });
+    if let Ok(cwd) = std::env::current_dir() {
+        let _ = state.mcp_connections.save(&cwd);
+    }
+    push_assistant_message(
+        state,
+        format!("Added stdio MCP server `{name}` ({})", command),
+    );
+}
+
+#[cfg(feature = "tui")]
 fn handle_mcp_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     if cmd == "/mcp on" {
         set_mcp_enabled(state, true);
@@ -1351,29 +1446,7 @@ fn handle_mcp_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool
     }
 
     if cmd == "/mcp list" {
-        let servers = state.mcp_connections.list_servers();
-        if servers.is_empty() {
-            push_assistant_message(state, "No MCP client servers configured.");
-        } else {
-            let mut msg = String::from("Configured MCP servers:\n");
-            for s in servers {
-                let kind = match &s.kind {
-                    crate::mcp_connections::McpServerKind::Http { url } => {
-                        format!("http {url}")
-                    }
-                    crate::mcp_connections::McpServerKind::Stdio { command, args } => {
-                        format!("stdio {} {}", command, args.join(" "))
-                    }
-                };
-                msg.push_str(&format!(
-                    "- {} [{}] {}\n",
-                    s.name,
-                    if s.enabled { "on" } else { "off" },
-                    kind
-                ));
-            }
-            push_assistant_message(state, msg.trim_end());
-        }
+        handle_mcp_list(state);
         return true;
     }
 
@@ -1408,68 +1481,12 @@ fn handle_mcp_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool
     }
 
     if let Some(rest) = cmd.strip_prefix("/mcp add http ") {
-        let mut parts = rest.split_whitespace();
-        let Some(url) = parts.next() else {
-            push_assistant_message(state, "Usage: /mcp add http <url> [name]");
-            return true;
-        };
-        let name = parts.next().unwrap_or("external-http").to_string();
-        state
-            .mcp_connections
-            .add_server(crate::mcp_connections::McpServerConfig {
-                name: name.clone(),
-                enabled: true,
-                kind: crate::mcp_connections::McpServerKind::Http {
-                    url: url.to_string(),
-                },
-            });
-        if let Ok(cwd) = std::env::current_dir() {
-            let _ = state.mcp_connections.save(&cwd);
-        }
-        push_assistant_message(state, format!("Added HTTP MCP server `{name}` -> {url}"));
+        handle_mcp_add_http(rest, state);
         return true;
     }
 
     if let Some(rest) = cmd.strip_prefix("/mcp add stdio ") {
-        // Syntax: /mcp add stdio <command> [arg1 arg2 ...] [--name <name>]
-        let mut parts = rest.split_whitespace().peekable();
-        let Some(command) = parts.next() else {
-            push_assistant_message(
-                state,
-                "Usage: /mcp add stdio <command> [args...] [--name <name>]",
-            );
-            return true;
-        };
-        let mut args: Vec<String> = Vec::new();
-        let mut name_override: Option<String> = None;
-        while let Some(part) = parts.next() {
-            if part == "--name" {
-                name_override = parts.next().map(String::from);
-            } else {
-                args.push(part.to_string());
-            }
-        }
-        let name = name_override.unwrap_or_else(|| {
-            std::path::Path::new(command)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(command)
-                .to_string()
-        });
-        state
-            .mcp_connections
-            .add_server(crate::mcp_connections::McpServerConfig {
-                name: name.clone(),
-                enabled: true,
-                kind: crate::mcp_connections::McpServerKind::Stdio {
-                    command: command.to_string(),
-                    args,
-                },
-            });
-        if let Ok(cwd) = std::env::current_dir() {
-            let _ = state.mcp_connections.save(&cwd);
-        }
-        push_assistant_message(state, format!("Added stdio MCP server `{name}` ({})", command));
+        handle_mcp_add_stdio(rest, state);
         return true;
     }
 
@@ -2472,6 +2489,61 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
 // ─── Source event handler ────────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
+fn handle_event_tools_list_updated(
+    tools: Vec<crate::mcp_connections::ToolInfo>,
+    state: &mut crate::state::AppState,
+) {
+    let mut merged = tools;
+    for t in state.mcp_connections.aggregate_tools() {
+        if !merged.iter().any(|existing| existing.name == t.name) {
+            merged.push(t);
+        }
+    }
+    merged.sort_by(|a, b| a.name.cmp(&b.name));
+    state.tools_list = merged;
+}
+
+#[cfg(feature = "tui")]
+fn handle_event_log_files_updated(
+    files: Vec<crate::state::LogFileInfo>,
+    state: &mut crate::state::AppState,
+) {
+    state.log_files = files;
+    if state.active_log_file.is_none() && !state.log_files.is_empty() {
+        // Default to first file
+        let first = state.log_files[0].name.clone();
+        state.active_log_file = Some(first.clone());
+        if let Some(ref tx) = state.mcp_source_tx {
+            let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(Some(
+                first,
+            )));
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_event_log_lines_updated(
+    file: String,
+    content: String,
+    append: bool,
+    state: &mut crate::state::AppState,
+) {
+    if Some(&file) == state.active_log_file.as_ref() {
+        if append {
+            for line in content.lines() {
+                state.active_log_lines.push(line.to_string());
+            }
+            if state.active_log_lines.len() > 2000 {
+                let drain_len = state.active_log_lines.len() - 2000;
+                state.active_log_lines.drain(0..drain_len);
+            }
+        } else {
+            state.active_log_lines = content.lines().map(String::from).collect();
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
 fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate::state::AppState) {
     use crate::mcp_source::SourceEvent;
     match event {
@@ -2486,48 +2558,19 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         SourceEvent::AiActivity(entry) => state.push_activity(entry),
         SourceEvent::LogLine(entry) => state.push_log(entry),
         SourceEvent::ToolsListUpdated { tools } => {
-            let mut merged = tools;
-            for t in state.mcp_connections.aggregate_tools() {
-                if !merged.iter().any(|existing| existing.name == t.name) {
-                    merged.push(t);
-                }
-            }
-            merged.sort_by(|a, b| a.name.cmp(&b.name));
-            state.tools_list = merged;
+            handle_event_tools_list_updated(tools, state);
         }
         SourceEvent::SandboxStatus { status } => state.sandbox_status = status,
         SourceEvent::SessionId { id } => state.session_id = Some(id),
         SourceEvent::LogFilesUpdated { files } => {
-            state.log_files = files;
-            if state.active_log_file.is_none() && !state.log_files.is_empty() {
-                // Default to first file
-                let first = state.log_files[0].name.clone();
-                state.active_log_file = Some(first.clone());
-                if let Some(ref tx) = state.mcp_source_tx {
-                    let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(Some(
-                        first,
-                    )));
-                }
-            }
+            handle_event_log_files_updated(files, state);
         }
         SourceEvent::LogLinesUpdated {
             file,
             content,
             append,
         } => {
-            if Some(&file) == state.active_log_file.as_ref() {
-                if append {
-                    for line in content.lines() {
-                        state.active_log_lines.push(line.to_string());
-                    }
-                    if state.active_log_lines.len() > 2000 {
-                        let drain_len = state.active_log_lines.len() - 2000;
-                        state.active_log_lines.drain(0..drain_len);
-                    }
-                } else {
-                    state.active_log_lines = content.lines().map(String::from).collect();
-                }
-            }
+            handle_event_log_lines_updated(file, content, append, state);
         }
     }
 }
@@ -2811,58 +2854,54 @@ fn inside_rect(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
 }
 
 #[cfg(feature = "tui")]
-fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
+fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::state::AppState) {
     use crate::state::ClickTarget;
-
-    let click_targets = state.click_targets.borrow().clone();
-    for (target, rect) in click_targets {
-        if inside_rect(col, row, rect) {
-            match target {
-                ClickTarget::CancelOperation(op_id) => {
-                    let id = op_id.clone();
-                    state.push_log(crate::state::LogEntry {
-                        timestamp: chrono::Local::now(),
-                        level: crate::state::LogLevel::Info,
-                        message: format!("Cancel requested: {id}"),
-                    });
-                    if let Some(tx) = &state.bridge_tx {
-                        let mcp_config = mcp_chat_config(state);
-                        crate::llm_bridge::spawn_tool_call_task(
-                            "cancel".to_string(),
-                            serde_json::json!({ "id": id }),
-                            mcp_config,
-                            tx.clone(),
-                        );
-                    }
-                    state.focus = crate::state::Focus::OpsDag;
-                }
-                ClickTarget::PinOperation(op_id) => {
-                    if let Some(op) = state.operations.iter_mut().find(|o| o.id == op_id) {
-                        op.pinned = !op.pinned;
-                    }
-                    state.focus = crate::state::Focus::OpsDag;
-                }
-                ClickTarget::AnalyzeOperation(op_id) => {
-                    analyze_operation(state, &op_id);
-                    state.focus = crate::state::Focus::OpsDag;
-                }
-                ClickTarget::SelectOperation(op_idx) => {
-                    state.ops_selected = op_idx;
-                    state.focus = crate::state::Focus::OpsDag;
-                }
-                ClickTarget::CloseWindow(win_id) => {
-                    close_window_by_id(win_id, state);
-                }
-                ClickTarget::ToggleWindow(win_id) => {
-                    if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
-                        w.collapsed = !w.collapsed;
-                    }
-                }
+    match target {
+        ClickTarget::CancelOperation(op_id) => {
+            let id = op_id.clone();
+            state.push_log(crate::state::LogEntry {
+                timestamp: chrono::Local::now(),
+                level: crate::state::LogLevel::Info,
+                message: format!("Cancel requested: {id}"),
+            });
+            if let Some(tx) = &state.bridge_tx {
+                let mcp_config = mcp_chat_config(state);
+                crate::llm_bridge::spawn_tool_call_task(
+                    "cancel".to_string(),
+                    serde_json::json!({ "id": id }),
+                    mcp_config,
+                    tx.clone(),
+                );
             }
-            return;
+            state.focus = crate::state::Focus::OpsDag;
+        }
+        ClickTarget::PinOperation(op_id) => {
+            if let Some(op) = state.operations.iter_mut().find(|o| o.id == op_id) {
+                op.pinned = !op.pinned;
+            }
+            state.focus = crate::state::Focus::OpsDag;
+        }
+        ClickTarget::AnalyzeOperation(op_id) => {
+            analyze_operation(state, &op_id);
+            state.focus = crate::state::Focus::OpsDag;
+        }
+        ClickTarget::SelectOperation(op_idx) => {
+            state.ops_selected = op_idx;
+            state.focus = crate::state::Focus::OpsDag;
+        }
+        ClickTarget::CloseWindow(win_id) => {
+            close_window_by_id(win_id, state);
+        }
+        ClickTarget::ToggleWindow(win_id) => {
+            if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
+                w.collapsed = !w.collapsed;
+            }
         }
     }
+}
 
+#[cfg(feature = "tui")]
+fn handle_window_rect_click(col: u16, row: u16, state: &mut crate::state::AppState) -> bool {
     let mut clicked_close = None;
     let mut clicked_toggle = None;
 
@@ -2886,11 +2925,28 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
 
     if let Some(win_id) = clicked_close {
         close_window_by_id(win_id, state);
-        return;
+        true
     } else if let Some(win_id) = clicked_toggle
         && let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id)
     {
         w.collapsed = !w.collapsed;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
+    let click_targets = state.click_targets.borrow().clone();
+    for (target, rect) in click_targets {
+        if inside_rect(col, row, rect) {
+            handle_click_target(target, state);
+            return;
+        }
+    }
+
+    if handle_window_rect_click(col, row, state) {
         return;
     }
 

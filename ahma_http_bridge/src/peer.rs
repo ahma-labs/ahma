@@ -41,11 +41,7 @@ pub struct SubprocessPeerFactory {
 
 impl SubprocessPeerFactory {
     /// Construct a new factory.
-    pub fn new(
-        command: impl Into<String>,
-        args: Vec<String>,
-        enable_colored_output: bool,
-    ) -> Self {
+    pub fn new(command: impl Into<String>, args: Vec<String>, enable_colored_output: bool) -> Self {
         Self {
             command: command.into(),
             args,
@@ -108,10 +104,9 @@ impl PeerFactory for SubprocessPeerFactory {
                 .expect("subprocess stdout was not piped — this is a bug");
             let stderr_opt: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin + 'static>> =
                 if enable_colored_output {
-                    child
-                        .stderr
-                        .take()
-                        .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin + 'static>)
+                    child.stderr.take().map(|s| {
+                        Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin + 'static>
+                    })
                 } else {
                     None
                 };
@@ -141,8 +136,7 @@ mod tests {
 
     #[test]
     fn subprocess_factory_stores_fields() {
-        let factory =
-            SubprocessPeerFactory::new("ahma", vec!["--log-to-stderr".into()], false);
+        let factory = SubprocessPeerFactory::new("ahma", vec!["--log-to-stderr".into()], false);
         assert_eq!(factory.command, "ahma");
         assert_eq!(factory.args, &["--log-to-stderr"]);
         assert!(!factory.enable_colored_output);

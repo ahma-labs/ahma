@@ -57,16 +57,6 @@ fn validate_tool_config(config_file: &str) -> ValidatedTool {
 }
 
 #[test]
-fn test_rust_tool_config_valid() {
-    let tool = validate_tool_config("rust.json");
-
-    assert_eq!(tool.name, "cargo", "Name should be 'cargo'");
-    assert_eq!(tool.command, "cargo", "Command should be 'cargo'");
-    assert!(tool.enabled, "Tool should be enabled");
-    assert!(tool.subcommand_count > 0, "Should have subcommands");
-}
-
-#[test]
 fn test_file_tools_config_valid() {
     let tool = validate_tool_config("file-tools.json");
 
@@ -119,7 +109,6 @@ fn test_python_tool_config_valid() {
 #[test]
 fn test_all_example_configs_have_subcommands() {
     let config_files = [
-        "rust.json",
         "file-tools.json",
         "gh.json",
         "git.json",

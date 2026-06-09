@@ -119,43 +119,40 @@ MainActivity.onCreate(MainActivity.kt:42). Triggered by 3 lines at 14:32:06.
 
 ---
 
-## Rust Log Monitoring (Dogfooding)
+## Custom Rust Log Monitoring
 
-ahma ships a built-in `rust-log-monitor` livelog tool that watches tracing-appender output. This is used to monitor ahma's own logs during development.
+You can create a custom `rust-log-monitor` livelog tool to watch your application's tracing output or tail logs during development.
+
+### Example Tool Definition (`.ahma/rust-log-monitor.json`)
+
+```json
+{
+    "name": "rust-log-monitor",
+    "description": "Monitor Rust application logs.",
+    "command": "tail",
+    "tool_type": "livelog",
+    "enabled": true,
+    "livelog": {
+        "source_command": "tail",
+        "source_args": ["-F", "./logs/my-app.log"],
+        "detection_prompt": "Look for ERROR or WARN level tracing entries, thread panics, unwrap failures on Option::None or Result::Err, stack traces/backtraces, or signals (SIGSEGV, SIGABRT).",
+        "llm_provider": {
+            "base_url": "http://localhost:11434/v1",
+            "model": "llama3.2"
+        },
+        "chunk_max_lines": 50,
+        "chunk_max_seconds": 30,
+        "cooldown_seconds": 60
+    }
+}
+```
 
 ### Setup
 
+1. Create the file `.ahma/rust-log-monitor.json` with the definition above.
+2. Ensure Ollama is running and `llama3.2` is pulled:
 ```bash
-# Copy the built-in config
-cp .ahma/rust-log-monitor.json .ahma/
-
-# Ensure Ollama is running with llama3.2
 ollama pull llama3.2
-```
-
-### How It Works
-
-The tool runs `tail -F ./logs/ahma_mcp.log` and feeds output to a local LLM, which watches for:
-- `ERROR` or `WARN` level tracing entries
-- Thread panics (`thread 'main' panicked at ...`)
-- Unwrap failures on `Option::None` or `Result::Err`
-- Stack traces and backtraces
-- Signals (SIGSEGV, SIGABRT)
-
-### Example Alert
-
-```
-[rust-log-monitor] LLM alert: ERROR in ahma_mcp::sandbox — sandbox enforcement failed:
-"Landlock ruleset creation returned ENOSYS". This indicates the kernel does not support
-Landlock. Triggered by 2 lines at 09:15:32.
-```
-
-### Adapting for Other Rust Projects
-
-Edit `source_args` in the JSON to point to your application's log file:
-
-```json
-"source_args": ["-F", "./logs/my-app.log"]
 ```
 
 ---

@@ -887,8 +887,7 @@ impl SessionManager {
         let session_clone = session.clone();
         let colored_output = self.config.enable_colored_output;
         tokio::spawn(async move {
-            Self::handle_session_io(session_clone, rx, stdin, stdout, stderr, colored_output)
-                .await;
+            Self::handle_session_io(session_clone, rx, stdin, stdout, stderr, colored_output).await;
         });
 
         self.sessions.insert(session_id.clone(), session);

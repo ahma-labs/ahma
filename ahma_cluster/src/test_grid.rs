@@ -132,26 +132,20 @@ impl FaultInjectingDispatch {
     fn next_rand(&self) -> f64 {
         let mut c = self.counter.lock().unwrap();
         // LCG constants from Knuth
-        *c = c.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        *c = c
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         (*c >> 11) as f64 / (1u64 << 53) as f64
     }
 
     /// `true` if `peer_addr` is in the partitioned set.
     fn is_partitioned(&self, peer_addr: &str) -> bool {
-        self.model
-            .partitioned_peers
-            .iter()
-            .any(|p| p == peer_addr)
+        self.model.partitioned_peers.iter().any(|p| p == peer_addr)
     }
 }
 
 impl PeerDispatch for FaultInjectingDispatch {
-    fn dispatch(
-        &self,
-        peer_addr: &str,
-        path: &str,
-        payload: Value,
-    ) -> BoxFuture<Result<Value>> {
+    fn dispatch(&self, peer_addr: &str, path: &str, payload: Value) -> BoxFuture<Result<Value>> {
         if self.is_partitioned(peer_addr) {
             let peer_addr = peer_addr.to_string();
             return Box::pin(async move {
@@ -168,7 +162,9 @@ impl PeerDispatch for FaultInjectingDispatch {
                 drop_rate = self.model.drop_rate,
                 "FaultInjectingDispatch: dropping request"
             );
-            return Box::pin(async { Err(anyhow::anyhow!("FaultInjectingDispatch: packet dropped")) });
+            return Box::pin(async {
+                Err(anyhow::anyhow!("FaultInjectingDispatch: packet dropped"))
+            });
         }
 
         let latency = self.model.latency;
@@ -219,12 +215,7 @@ impl SecurityFaultDispatch {
 }
 
 impl PeerDispatch for SecurityFaultDispatch {
-    fn dispatch(
-        &self,
-        peer_addr: &str,
-        path: &str,
-        payload: Value,
-    ) -> BoxFuture<Result<Value>> {
+    fn dispatch(&self, peer_addr: &str, path: &str, payload: Value) -> BoxFuture<Result<Value>> {
         // For now, this dispatcher passes through to inner.
         // In a real scenario, the `SecurityFault` would be applied by
         // the `McpPeerDispatch` layer (mutating the manifest header).
@@ -296,11 +287,7 @@ impl TestGrid {
     /// dispatch to it in-process.
     ///
     /// Call this after building the grid to wire in a simulated peer responder.
-    pub fn register_peer_handler(
-        &self,
-        addr: impl Into<String>,
-        handler: Arc<dyn PeerHandler>,
-    ) {
+    pub fn register_peer_handler(&self, addr: impl Into<String>, handler: Arc<dyn PeerHandler>) {
         self.dispatch.register(addr, handler);
     }
 }
@@ -347,8 +334,7 @@ impl TestGridBuilder {
         let base_dispatch = Arc::new(InMemoryPeerDispatch::new());
 
         // Optionally wrap with fault injection.
-        let dispatch_for_schedulers: Arc<dyn PeerDispatch> = if let Some(model) = self.fault_model
-        {
+        let dispatch_for_schedulers: Arc<dyn PeerDispatch> = if let Some(model) = self.fault_model {
             Arc::new(FaultInjectingDispatch::new(
                 Arc::clone(&base_dispatch) as Arc<dyn PeerDispatch>,
                 model,
@@ -553,23 +539,14 @@ impl SlowPeerDispatch {
     }
 
     /// Add a slow peer that incurs `latency` on every request.
-    pub fn with_slow_peer(
-        mut self,
-        addr: impl Into<String>,
-        latency: Duration,
-    ) -> Self {
+    pub fn with_slow_peer(mut self, addr: impl Into<String>, latency: Duration) -> Self {
         self.slow_peers.insert(addr.into(), latency);
         self
     }
 }
 
 impl PeerDispatch for SlowPeerDispatch {
-    fn dispatch(
-        &self,
-        peer_addr: &str,
-        path: &str,
-        payload: Value,
-    ) -> BoxFuture<Result<Value>> {
+    fn dispatch(&self, peer_addr: &str, path: &str, payload: Value) -> BoxFuture<Result<Value>> {
         let latency = self.slow_peers.get(peer_addr).copied();
         let inner = Arc::clone(&self.inner);
         let peer_addr = peer_addr.to_string();
@@ -655,16 +632,9 @@ mod tests {
         );
 
         // Node 0 should be able to schedule to node-1.
-        let result = grid
-            .node(0)
-            .scheduler
-            .schedule(base_manifest())
-            .await;
+        let result = grid.node(0).scheduler.schedule(base_manifest()).await;
 
-        assert!(
-            result.is_some(),
-            "scheduler should have routed to node-1"
-        );
+        assert!(result.is_some(), "scheduler should have routed to node-1");
         assert_eq!(
             handler.call_count(),
             1,
@@ -766,6 +736,9 @@ mod tests {
         );
         let seq1: Vec<f64> = (0..8).map(|_| d1.next_rand()).collect();
         let seq2: Vec<f64> = (0..8).map(|_| d2.next_rand()).collect();
-        assert_ne!(seq1, seq2, "different seeds should produce different sequences");
+        assert_ne!(
+            seq1, seq2,
+            "different seeds should produce different sequences"
+        );
     }
 }

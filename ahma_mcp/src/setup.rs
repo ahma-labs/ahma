@@ -392,7 +392,7 @@ fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
             "serve",
             "stdio",
             "--tools",
-            "rust,simplify",
+            "simplify",
             "--tmp",
             "--log-monitor"
         ]
@@ -409,7 +409,7 @@ fn build_antigravity_servers_entry(transport: &str, home: &Path) -> serde_json::
             "serve",
             "stdio",
             "--tools",
-            "rust,simplify",
+            "simplify",
             "--tmp",
             "--log-monitor"
         ],
@@ -429,10 +429,10 @@ fn print_mcp_restart_hints(interactive: bool, configured: &[&str], transport: &s
     }
     match transport {
         "http" => println!(
-            "  Start the HTTP server before opening tools: ahma serve http --tools rust,simplify"
+            "  Start the HTTP server before opening tools: ahma serve http --tools simplify"
         ),
         "unix" => println!(
-            "  Start the Unix socket server before opening tools: ahma serve unix --socket-path /tmp/ahma.sock --tools rust,simplify"
+            "  Start the Unix socket server before opening tools: ahma serve unix --socket-path /tmp/ahma.sock --tools simplify"
         ),
         _ => {}
     }
@@ -537,7 +537,7 @@ fn build_codex_toml_value(transport: &str) -> toml::Value {
                 toml::Value::String("serve".to_string()),
                 toml::Value::String("stdio".to_string()),
                 toml::Value::String("--tools".to_string()),
-                toml::Value::String("rust,simplify".to_string()),
+                toml::Value::String("simplify".to_string()),
                 toml::Value::String("--tmp".to_string()),
                 toml::Value::String("--log-monitor".to_string()),
             ];

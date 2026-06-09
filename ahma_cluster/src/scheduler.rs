@@ -9,10 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ahma_common::{
-    config::TransportMode,
-    peer_transport::PeerDispatch,
-};
+use ahma_common::{config::TransportMode, peer_transport::PeerDispatch};
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
@@ -21,7 +18,7 @@ use subtle::ConstantTimeEq;
 use tracing::{debug, info, warn};
 
 use super::discovery::{PeerInfo, WorkerRegistry};
-use super::transport::{new_cluster_dispatch, default_transport_preference};
+use super::transport::{default_transport_preference, new_cluster_dispatch};
 
 /// HMAC-SHA256 type alias.
 type HmacSha256 = Hmac<Sha256>;

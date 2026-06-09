@@ -283,7 +283,10 @@ mod tests {
         let cache = ManifestNonceCache::new();
         let nonce = "unique-nonce-123";
         let ts = unix_now_secs();
-        assert!(cache.check_and_record(nonce, ts), "first record should succeed");
+        assert!(
+            cache.check_and_record(nonce, ts),
+            "first record should succeed"
+        );
         assert!(
             !cache.check_and_record(nonce, ts),
             "replay should be rejected"

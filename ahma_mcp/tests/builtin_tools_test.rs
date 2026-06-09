@@ -6,18 +6,6 @@ use tempfile::tempdir;
 async fn test_load_builtin_tools_async() {
     let temp_dir = tempdir().unwrap();
 
-    let config_rust = AppConfig {
-        tool_bundles: vec!["rust".to_string()],
-        ..AppConfig::default()
-    };
-    let configs_rust = load_tool_configs(&config_rust, Some(temp_dir.path()))
-        .await
-        .unwrap();
-    assert!(
-        configs_rust.contains_key("cargo"),
-        "Should load bundled rust.json (named cargo)"
-    );
-
     let config_python = AppConfig {
         tool_bundles: vec!["python".to_string()],
         ..AppConfig::default()
@@ -31,16 +19,19 @@ async fn test_load_builtin_tools_async() {
     );
 
     let config_multiple = AppConfig {
-        tool_bundles: vec!["rust".to_string(), "python".to_string()],
+        tool_bundles: vec!["python".to_string(), "simplify".to_string()],
         ..AppConfig::default()
     };
     let configs_multiple = load_tool_configs(&config_multiple, Some(temp_dir.path()))
         .await
         .unwrap();
-    assert!(configs_multiple.contains_key("cargo"), "Should load cargo");
     assert!(
         configs_multiple.contains_key("python"),
         "Should load python"
+    );
+    assert!(
+        configs_multiple.contains_key("simplify"),
+        "Should load simplify"
     );
 }
 
@@ -49,41 +40,41 @@ async fn test_load_builtin_tools_async() {
 async fn test_filesystem_overrides_bundled_tool() {
     let temp_dir = tempdir().unwrap();
 
-    // Create a local rust.json that defines "cargo" with a custom description
-    let custom_cargo = r#"{
-  "name": "cargo",
-  "description": "Custom user-defined cargo tool",
-  "command": "cargo",
+    // Create a local python.json that defines "python" with a custom description
+    let custom_python = r#"{
+  "name": "python",
+  "description": "Custom user-defined python tool",
+  "command": "python",
   "enabled": true,
   "subcommand": [
     {
-      "name": "build",
-      "description": "Custom build",
+      "name": "run",
+      "description": "Custom run",
       "options": [
         {
-          "name": "release",
+          "name": "version",
           "type": "boolean",
-          "description": "Release mode"
+          "description": "Show version"
         }
       ]
     }
   ]
 }"#;
-    std::fs::write(temp_dir.path().join("rust.json"), custom_cargo).unwrap();
+    std::fs::write(temp_dir.path().join("python.json"), custom_python).unwrap();
 
-    // Load with tool_bundles: ["rust"] (bundled) AND the local override
+    // Load with tool_bundles: ["python"] (bundled) AND the local override
     let config = AppConfig {
-        tool_bundles: vec!["rust".to_string()],
+        tool_bundles: vec!["python".to_string()],
         ..AppConfig::default()
     };
     let configs = load_tool_configs(&config, Some(temp_dir.path()))
         .await
         .unwrap();
 
-    assert!(configs.contains_key("cargo"), "Should have cargo tool");
-    let cargo = &configs["cargo"];
+    assert!(configs.contains_key("python"), "Should have python tool");
+    let python = &configs["python"];
     assert_eq!(
-        cargo.description, "Custom user-defined cargo tool",
+        python.description, "Custom user-defined python tool",
         "Local .ahma/ definition should override the bundled version"
     );
 }
@@ -120,13 +111,13 @@ async fn test_reserved_names_rejected() {
 }
 
 /// Verify that bundled tools load even when NO tools directory exists.
-/// This is the exact scenario when a user runs `ahma_mcp --rust --simplify`
+/// This is the exact scenario when a user runs `ahma_mcp --python --simplify`
 /// from a repo that has no `.ahma/` directory and no `--tools-dir` flag.
 #[tokio::test]
 async fn test_bundled_tools_load_without_tools_dir() {
-    // Pass tool_bundles with rust + simplify but NO tools_dir (None)
+    // Pass tool_bundles with python + simplify but NO tools_dir (None)
     let config = AppConfig {
-        tool_bundles: vec!["rust".to_string(), "simplify".to_string()],
+        tool_bundles: vec!["python".to_string(), "simplify".to_string()],
         ..AppConfig::default()
     };
 
@@ -134,8 +125,8 @@ async fn test_bundled_tools_load_without_tools_dir() {
     let configs = load_tool_configs(&config, None).await.unwrap();
 
     assert!(
-        configs.contains_key("cargo"),
-        "--tool rust flag should load bundled cargo tool even without tools_dir. Got keys: {:?}",
+        configs.contains_key("python"),
+        "--tool python flag should load bundled python tool even without tools_dir. Got keys: {:?}",
         configs.keys().collect::<Vec<_>>()
     );
     assert!(
@@ -155,7 +146,6 @@ async fn test_bundled_tools_load_without_tools_dir() {
 #[tokio::test]
 async fn test_each_bundled_flag_works_without_tools_dir() {
     let tool_and_expected: &[(&str, &str)] = &[
-        ("rust", "cargo"),
         ("simplify", "simplify"),
         ("python", "python"),
         ("git", "git"),
@@ -244,7 +234,7 @@ async fn test_bundle_flags_with_auto_detected_ahma_loads_all_local_tools() {
 
     // Create three local tool definitions: two match flags, one does not
     let tools = [
-        ("rust.json", "cargo", "Local cargo tool"),
+        ("python.json", "python", "Local python tool"),
         ("simplify.json", "simplify", "Local simplify tool"),
         ("git.json", "git", "Local git tool"),
     ];
@@ -262,9 +252,9 @@ async fn test_bundle_flags_with_auto_detected_ahma_loads_all_local_tools() {
         std::fs::write(temp_dir.path().join(file), json).unwrap();
     }
 
-    // tool_bundles: ["rust", "simplify"], but NOT git. Auto-detected dir (not explicit).
+    // tool_bundles: ["python", "simplify"], but NOT git. Auto-detected dir (not explicit).
     let config = AppConfig {
-        tool_bundles: vec!["rust".to_string(), "simplify".to_string()],
+        tool_bundles: vec!["python".to_string(), "simplify".to_string()],
         explicit_tools_dir: false,
         ..AppConfig::default()
     };
@@ -275,8 +265,8 @@ async fn test_bundle_flags_with_auto_detected_ahma_loads_all_local_tools() {
 
     // ALL three local tools should be loaded (local .ahma/ always fully loaded)
     assert!(
-        configs.contains_key("cargo"),
-        "Local cargo should be loaded. Keys: {:?}",
+        configs.contains_key("python"),
+        "Local python should be loaded. Keys: {:?}",
         configs.keys().collect::<Vec<_>>()
     );
     assert!(
@@ -292,7 +282,7 @@ async fn test_bundle_flags_with_auto_detected_ahma_loads_all_local_tools() {
 
     // Verify local definitions are used (not bundled fallbacks)
     assert_eq!(
-        configs["cargo"].description, "Local cargo tool",
+        configs["python"].description, "Local python tool",
         "Local .ahma/ definition should be used, not the bundled version"
     );
     assert_eq!(
@@ -307,15 +297,15 @@ async fn test_bundle_flags_with_auto_detected_ahma_loads_all_local_tools() {
 async fn test_local_ahma_overrides_bundled_with_all_loaded() {
     let temp_dir = tempdir().unwrap();
 
-    // Create a local rust.json with custom description + a non-flagged tool
-    let custom_cargo = r#"{
-  "name": "cargo",
-  "description": "Overridden cargo from local .ahma/",
-  "command": "cargo",
+    // Create a local python.json with custom description + a non-flagged tool
+    let custom_python = r#"{
+  "name": "python",
+  "description": "Overridden python from local .ahma/",
+  "command": "python",
   "enabled": true,
-  "subcommand": [{ "name": "build", "description": "Build" }]
+  "subcommand": [{ "name": "run", "description": "Run" }]
 }"#;
-    std::fs::write(temp_dir.path().join("rust.json"), custom_cargo).unwrap();
+    std::fs::write(temp_dir.path().join("python.json"), custom_python).unwrap();
 
     let extra_tool = r#"{
   "name": "my_extra_tool",
@@ -327,7 +317,7 @@ async fn test_local_ahma_overrides_bundled_with_all_loaded() {
     std::fs::write(temp_dir.path().join("extra.json"), extra_tool).unwrap();
 
     let config = AppConfig {
-        tool_bundles: vec!["rust".to_string()],
+        tool_bundles: vec!["python".to_string()],
         explicit_tools_dir: false,
         ..AppConfig::default()
     };
@@ -336,9 +326,9 @@ async fn test_local_ahma_overrides_bundled_with_all_loaded() {
         .await
         .unwrap();
 
-    // Local cargo should override bundled
+    // Local python should override bundled
     assert_eq!(
-        configs["cargo"].description, "Overridden cargo from local .ahma/",
+        configs["python"].description, "Overridden python from local .ahma/",
         "Local definition should override bundled"
     );
 

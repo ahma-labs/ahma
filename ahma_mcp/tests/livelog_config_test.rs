@@ -212,19 +212,6 @@ fn test_android_logcat_json_loads() {
     assert!(!lc.detection_prompt.is_empty());
 }
 
-#[test]
-fn test_rust_log_monitor_json_loads() {
-    let json = include_str!("../../.ahma/rust-log-monitor.json");
-    let config: ToolConfig =
-        serde_json::from_str(json).expect("rust-log-monitor.json should parse");
-    assert_eq!(config.name, "rust-log-monitor");
-    assert_eq!(config.tool_type, Some(ToolType::Livelog));
-    let lc = config.livelog.expect("livelog block required");
-    assert_eq!(lc.source_command, "tail");
-    assert!(lc.source_args.contains(&"-F".to_string()));
-    assert!(!lc.detection_prompt.is_empty());
-}
-
 // ---------------------------------------------------------------------------
 // Edge cases: zero-valued tunables
 // ---------------------------------------------------------------------------

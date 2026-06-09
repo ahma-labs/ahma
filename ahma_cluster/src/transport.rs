@@ -221,12 +221,7 @@ impl ClusterTransport {
 /// `{peer_addr}{path}` via the multi-transport fallback logic, then
 /// deserialises the response body as a `serde_json::Value`.
 impl PeerDispatch for ClusterTransport {
-    fn dispatch(
-        &self,
-        peer_addr: &str,
-        path: &str,
-        payload: Value,
-    ) -> BoxFuture<Result<Value>> {
+    fn dispatch(&self, peer_addr: &str, path: &str, payload: Value) -> BoxFuture<Result<Value>> {
         // We need ownership of peer_addr and path inside the async block.
         let peer_addr = peer_addr.to_string();
         let path = path.to_string();
@@ -258,9 +253,13 @@ impl PeerDispatch for ClusterTransport {
                     TransportMode::Http2 => (&http2, http_url.as_str()),
                     TransportMode::Quic => {
                         #[cfg(feature = "cluster-quic")]
-                        { (&quic, https_url.as_str()) }
+                        {
+                            (&quic, https_url.as_str())
+                        }
                         #[cfg(not(feature = "cluster-quic"))]
-                        { (&http2, http_url.as_str()) }
+                        {
+                            (&http2, http_url.as_str())
+                        }
                     }
                 };
                 debug!(transport = ?mode, url, "ClusterTransport::dispatch attempt");
@@ -288,9 +287,11 @@ impl PeerDispatch for ClusterTransport {
                         .context("Failed to parse fallback peer response as JSON")?;
                     Ok(v)
                 }
-                Err(e) => Err(last_err.unwrap_or_else(|| anyhow::Error::from(e)).context(
-                    format!("All cluster transports failed for peer at {peer_addr}"),
-                )),
+                Err(e) => Err(last_err
+                    .unwrap_or_else(|| anyhow::Error::from(e))
+                    .context(format!(
+                        "All cluster transports failed for peer at {peer_addr}"
+                    ))),
             }
         })
     }

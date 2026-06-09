@@ -248,13 +248,25 @@ impl std::fmt::Debug for BridgeConfig {
             .field("enable_quic", &self.enable_quic)
             .field("disable_http1_1", &self.disable_http1_1)
             .field("listener_kind", &self.listener_kind)
-            .field("require_token", &self.require_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "require_token",
+                &self.require_token.as_ref().map(|_| "<redacted>"),
+            )
             .field("rate_limit_rps", &self.rate_limit_rps)
             .field("rate_limit_burst", &self.rate_limit_burst)
             .field("max_sessions", &self.max_sessions)
-            .field("cluster_shared_key", &self.cluster_shared_key.as_ref().map(|_| "<redacted>"))
-            .field("peer_factory", &self.peer_factory.as_ref().map(|_| "<PeerFactory>"))
-            .field("bound_port_tx", &self.bound_port_tx.as_ref().map(|_| "<Sender>"))
+            .field(
+                "cluster_shared_key",
+                &self.cluster_shared_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "peer_factory",
+                &self.peer_factory.as_ref().map(|_| "<PeerFactory>"),
+            )
+            .field(
+                "bound_port_tx",
+                &self.bound_port_tx.as_ref().map(|_| "<Sender>"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -314,9 +326,7 @@ impl BridgeConfig {
     /// ```
     ///
     /// [`PeerFactory`]: crate::peer::PeerFactory
-    pub fn for_in_process_test(
-        factory: std::sync::Arc<dyn crate::peer::PeerFactory>,
-    ) -> Self {
+    pub fn for_in_process_test(factory: std::sync::Arc<dyn crate::peer::PeerFactory>) -> Self {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         Self {
             bind_addr,
@@ -399,7 +409,9 @@ fn build_cors_layer(bind_addr: &SocketAddr) -> CorsLayer {
         "mcp-session-id".parse().unwrap(),
         "accept".parse().unwrap(),
         "last-event-id".parse().unwrap(),
-        crate::cluster_auth::CLUSTER_MANIFEST_HEADER.parse().unwrap(),
+        crate::cluster_auth::CLUSTER_MANIFEST_HEADER
+            .parse()
+            .unwrap(),
     ]);
     let expose = tower_http::cors::ExposeHeaders::list(["mcp-session-id"
         .parse::<axum::http::HeaderName>()
@@ -529,7 +541,7 @@ async fn cluster_auth_middleware(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    use crate::cluster_auth::{ClusterManifest, CLUSTER_MANIFEST_HEADER};
+    use crate::cluster_auth::{CLUSTER_MANIFEST_HEADER, ClusterManifest};
 
     let header_value = request
         .headers()
@@ -560,7 +572,11 @@ async fn cluster_auth_middleware(
         }
         Err(e) => {
             debug!(error = %e, "Cluster manifest verification failed");
-            (StatusCode::UNAUTHORIZED, format!("cluster auth failed: {e}")).into_response()
+            (
+                StatusCode::UNAUTHORIZED,
+                format!("cluster auth failed: {e}"),
+            )
+                .into_response()
         }
     }
 }
@@ -1256,7 +1272,10 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
     match session.mark_sse_connected().await {
         Ok(true) => {
             // Handshake just reached RootsRequested; auto-lock from default_scope if configured.
-            state.session_manager.auto_lock_if_default_scope(&session_id).await;
+            state
+                .session_manager
+                .auto_lock_if_default_scope(&session_id)
+                .await;
         }
         Ok(false) => {}
         Err(e) => {

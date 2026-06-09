@@ -38,8 +38,8 @@ the config in place. There are several approaches, from zero-friction to global:
 **The Ahma project already provides `.vscode/mcp.json` with three configurations to try:**
 
 - `ahma` — stdio mode (recommended, automatic per-client instances)
-- `ahma-http` — shared HTTP server on port 3000 (run `ahma serve http --tools rust,git,fileutils --tmp --log-monitor`)
-- `ahma-unix` — shared HTTP server over Unix socket (run `ahma serve unix --socket-path /tmp/ahma.sock --tools rust,git,fileutils --tmp --log-monitor`)
+- `ahma-http` — shared HTTP server on port 3000 (run `ahma serve http --tools git,fileutils --tmp --log-monitor`)
+- `ahma-unix` — shared HTTP server over Unix socket (run `ahma serve unix --socket-path /tmp/ahma.sock --tools git,fileutils --tmp --log-monitor`)
 
 You can copy or customize this for your own projects. Create `.vscode/mcp.json` in your project root and commit it. Every VS Code user
 who opens the project gets Ahma configured automatically (prompted to trust once):
@@ -50,7 +50,7 @@ who opens the project gets Ahma configured automatically (prompted to trust once
     "ahma": {
       "type": "stdio",
       "command": "ahma",
-      "args": ["serve", "stdio", "--tools", "rust,git,fileutils", "--tmp", "--log-monitor"]
+      "args": ["serve", "stdio", "--tools", "git,fileutils", "--tmp", "--log-monitor"]
     }
   }
 }
@@ -87,7 +87,7 @@ are auto-approved (no confirmation dialogs). Pairs well with Ahma's kernel sandb
     "ahma": {
       "type": "stdio",
       "command": "ahma",
-      "args": ["serve", "stdio", "--tools", "rust,git,fileutils", "--tmp"],
+      "args": ["serve", "stdio", "--tools", "git,fileutils", "--tmp"],
       "sandboxEnabled": true,
       "sandbox": {
         "filesystem": { "allowWrite": ["${workspaceFolder}"] }
@@ -124,7 +124,7 @@ Combine with `.vscode/mcp.json` committed to the repo.
 
 If a user asks you to use Ahma but it isn't configured, help them by:
 1. Check if `.vscode/mcp.json` exists — if not, offer to create it
-2. Ask which bundles they need (rust, git, python, etc.)
+2. Ask which bundles they need (git, python, etc.)
 3. Create the config and tell them to reload the window (`Developer: Reload Window`)
 
 ## Tool Bundles
@@ -135,7 +135,6 @@ Ahma groups command-line tools into logical bundles that can be loaded at startu
 
 | Bundle | Activate with | Key tools | When to use |
 |--------|--------------|-----------|-------------|
-| `rust` | `--tools rust` | cargo build/test/clippy/fmt/nextest/add | Rust/Cargo projects |
 | `fileutils` | `--tools fileutils` | ls, cp, mv, rm, grep, find, diff | File operations |
 | `github` | `--tools github` | gh pr/issue/run/release | GitHub CLI operations |
 | `git` | `--tools git` | git status/commit/push/log/diff | Version control |
@@ -145,7 +144,7 @@ Ahma groups command-line tools into logical bundles that can be loaded at startu
 
 To enable bundles at startup:
 ```json
-"args": ["serve", "stdio", "--tools", "rust,git,fileutils"]
+"args": ["serve", "stdio", "--tools", "git,fileutils"]
 ```
 
 ---
@@ -324,7 +323,7 @@ For tools defined in `.ahma/` with `"tool_type": "livelog"`:
 }
 ```
 
-Built-in examples (activate with `--tools`): `android-logcat`, `rust-log-monitor`.
+Built-in examples (activate with `--tools`): `android-logcat`.
 
 ---
 
@@ -418,7 +417,7 @@ Full reference: [environment-variables.md](https://github.com/paulirotta/ahma/bl
 
 ```bash
 # Start MCP server (stdio — for IDE integration)
-ahma serve stdio [--tools rust,git] [--tmp] [--log-monitor]
+ahma serve stdio [--tools git,fileutils] [--tmp] [--log-monitor]
 
 # Start HTTP server (local development, multiple clients)
 ahma serve http [--port 3000] [--host 0.0.0.0] [--disable-quic]
@@ -427,7 +426,6 @@ ahma serve http [--port 3000] [--host 0.0.0.0] [--disable-quic]
 ahma serve unix [--socket-path /tmp/ahma.sock]
 
 # Run a single tool from the CLI
-ahma tool run cargo_build -- --release
 ahma tool run run_terminal_command -- "echo hello"
 
 # Validate .ahma/ tool configs
@@ -437,7 +435,7 @@ ahma tool validate [.ahma/]
 ahma tool list [--http http://localhost:3000] [--format json]
 
 # Show locally configured tools with descriptions
-ahma tool info [--tools rust,git]
+ahma tool info [--tools git,fileutils]
 
 # Local TLS certificate management (required for QUIC/HTTP3 transport)
 ahma tls init      # Generate cert at ~/.ahma/tls/ (idempotent)
@@ -449,12 +447,12 @@ ahma tls status    # Show cert path, age, and rotation recommendation
 
 ## Common Recipes
 
-### Rust project — full quality pipeline
+### Git project — full version control pipeline
 
 ```
-cargo_fmt(subcommand="fmt")
-cargo_clippy(subcommand="clippy")
-cargo_nextest_run(subcommand="nextest run")
+git_status(subcommand="status")
+git_commit(subcommand="commit", message="Update docs")
+git_push(subcommand="push")
 ```
 
 ### Run arbitrary shell commands
@@ -474,7 +472,7 @@ android_logcat(...)   # if defined in .ahma/android-logcat.json
 
 ## Troubleshooting
 
-**Tool not found**: Make sure the bundle is specified in the `--tools` parameter at startup (e.g., `--tools rust,git`).
+**Tool not found**: Make sure the bundle is specified in the `--tools` parameter at startup (e.g., `--tools git,fileutils`).
 
 **Timeout**: Set `AHMA_TIMEOUT=600` in mcp.json env, or pass `timeout_seconds` per tool call.
 
@@ -714,14 +712,14 @@ Language names are case-insensitive and expand to their extensions automatically
 ### Prerequisites
 
 **Via MCP tool (preferred):** The `simplify` tool must be active — start Ahma with `--tools simplify`
-or `--tools rust,simplify`.
+or `--tools git,simplify`.
 
 **Via CLI:** `ahma simplify` is the subcommand. Run `ahma simplify --help` to verify.
 
 ### CRITICAL: Fail-Closed Rule
 
 **If the `simplify` MCP tool is not available:**
-1. Ensure `simplify` is listed in `--tools` at startup (e.g. `--tools rust,simplify`), OR
+1. Ensure `simplify` is listed in `--tools` at startup (e.g. `--tools git,simplify`), OR
 2. Run `ahma simplify <directory> --ai-fix 1` directly via the sandboxed shell.
 
 **NEVER substitute shell heuristics** such as `find ... | wc -l` (line counts) or `wc -c` (file sizes) as a proxy for complexity. File length is not a complexity metric. Using it will produce incorrect rankings and mislead refactoring effort. If neither the tool nor the CLI is available, tell the user and stop — do not improvise.

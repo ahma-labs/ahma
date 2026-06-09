@@ -146,10 +146,7 @@ impl PeerFactory for InProcessMcpPeerFactory {
         use crate::sandbox::{Sandbox, SandboxMode};
         use crate::shell_pool::{ShellPoolConfig, ShellPoolManager};
         use anyhow::Context as _;
-        use rmcp::{
-            ServiceExt,
-            transport::async_rw::AsyncRwTransport,
-        };
+        use rmcp::{ServiceExt, transport::async_rw::AsyncRwTransport};
 
         let configs = Arc::clone(&self.configs);
         let scopes = self.scopes.clone();
@@ -176,8 +173,12 @@ impl PeerFactory for InProcessMcpPeerFactory {
             let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
             let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
             let adapter = Arc::new(
-                Adapter::new(Arc::clone(&operation_monitor), shell_pool, Arc::new(sandbox))
-                    .context("Adapter construction failed")?,
+                Adapter::new(
+                    Arc::clone(&operation_monitor),
+                    shell_pool,
+                    Arc::new(sandbox),
+                )
+                .context("Adapter construction failed")?,
             );
 
             let service = AhmaMcpService::new(

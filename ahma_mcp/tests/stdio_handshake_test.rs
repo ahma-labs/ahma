@@ -44,6 +44,13 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
     let _ = std::fs::remove_file(&socket_path);
     let socket_str = socket_path.to_string_lossy().into_owned();
 
+    // Find a free TCP port to avoid conflicts.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind free port")
+        .local_addr()
+        .expect("local_addr")
+        .port();
+
     // Use a tmp dir as the sandbox scope so the bridge can lock without real roots.
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let scope = tmp.path().to_string_lossy().into_owned();
@@ -52,7 +59,7 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
         .current_dir(&workspace)
         .env("RUST_LOG", "warn")
         .env("AHMA_UNIX_SOCKET", &socket_str)
-        .env("AHMA_HTTP_PORT", "0")
+        .env("AHMA_HTTP_PORT", port.to_string())
         // Deliberately DO NOT set CARGO_MANIFEST_DIR or NEXTEST so the
         // production proxy + background bridge path runs.
         .env_remove("NEXTEST")
@@ -81,10 +88,7 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
         ($msg:expr) => {{
             let mut line = serde_json::to_string(&$msg).unwrap();
             line.push('\n');
-            stdin
-                .write_all(line.as_bytes())
-                .await
-                .expect("write stdin");
+            stdin.write_all(line.as_bytes()).await.expect("write stdin");
         }};
     }
 
@@ -109,9 +113,10 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
                 Ok(Ok(0)) | Err(_) => return None,
                 Ok(Ok(_)) => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(buf.trim())
-                        && pred(&v) {
-                            return Some(v);
-                        }
+                        && pred(&v)
+                    {
+                        return Some(v);
+                    }
                 }
                 Ok(Err(_)) => return None,
             }
@@ -190,8 +195,12 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
     let _ = child.wait().await;
     let _ = std::fs::remove_file(&socket_path);
 
-    let resp = tools_resp.unwrap_or_else(|| panic!("Did not receive tools/list response within timeout (respond_to_roots={})",
-        respond_to_roots));
+    let resp = tools_resp.unwrap_or_else(|| {
+        panic!(
+            "Did not receive tools/list response within timeout (respond_to_roots={})",
+            respond_to_roots
+        )
+    });
 
     assert!(
         resp.get("error").is_none(),

@@ -51,6 +51,28 @@ macro_rules! deprecated_env {
     };
 }
 
+macro_rules! check_env_flag_with_deprecation {
+    ($name:expr) => {
+        if std::env::var_os($name).is_some() {
+            deprecated_env!($name);
+            AppConfig::env_flag($name)
+        } else {
+            false
+        }
+    };
+}
+
+macro_rules! get_env_var_with_deprecation {
+    ($name:expr) => {
+        if std::env::var_os($name).is_some() {
+            deprecated_env!($name);
+            std::env::var($name).ok()
+        } else {
+            None
+        }
+    };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // AppConfig — single immutable application configuration
 //
@@ -2139,36 +2161,25 @@ fn parse_execution_settings(
     cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
 ) -> (u64, bool, bool, bool) {
-    if std::env::var_os("AHMA_TIMEOUT").is_some() {
-        deprecated_env!("AHMA_TIMEOUT");
-    }
     let timeout_secs = if let Some(t) = cli.timeout {
         t
-    } else if let Some(val) = std::env::var("AHMA_TIMEOUT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    } else if let Some(val) =
+        get_env_var_with_deprecation!("AHMA_TIMEOUT").and_then(|v| v.trim().parse::<u64>().ok())
     {
         val
     } else {
         s.tools.timeout_secs
     };
 
-    if std::env::var_os("AHMA_SYNC").is_some() {
-        deprecated_env!("AHMA_SYNC");
-    }
-    let force_sync = cli.sync || AppConfig::env_flag("AHMA_SYNC") || s.tools.force_sync;
+    let force_sync =
+        cli.sync || check_env_flag_with_deprecation!("AHMA_SYNC") || s.tools.force_sync;
 
-    if std::env::var_os("AHMA_HOT_RELOAD").is_some() {
-        deprecated_env!("AHMA_HOT_RELOAD");
-    }
     let hot_reload_tools =
-        cli.hot_reload || AppConfig::env_flag("AHMA_HOT_RELOAD") || s.tools.hot_reload;
+        cli.hot_reload || check_env_flag_with_deprecation!("AHMA_HOT_RELOAD") || s.tools.hot_reload;
 
-    if std::env::var_os("AHMA_SKIP_PROBES").is_some() {
-        deprecated_env!("AHMA_SKIP_PROBES");
-    }
-    let skip_availability_probes =
-        cli.skip_probes || AppConfig::env_flag("AHMA_SKIP_PROBES") || s.tools.skip_probes;
+    let skip_availability_probes = cli.skip_probes
+        || check_env_flag_with_deprecation!("AHMA_SKIP_PROBES")
+        || s.tools.skip_probes;
 
     (
         timeout_secs,
@@ -2182,42 +2193,28 @@ fn parse_sandbox_settings(
     cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
 ) -> (bool, bool, bool, bool, bool, u64) {
-    if std::env::var_os("AHMA_DISABLE_SANDBOX").is_some() {
-        deprecated_env!("AHMA_DISABLE_SANDBOX");
-    }
-    let no_sandbox =
-        cli.no_sandbox || AppConfig::env_flag("AHMA_DISABLE_SANDBOX") || s.sandbox.disable;
+    let no_sandbox = cli.no_sandbox
+        || check_env_flag_with_deprecation!("AHMA_DISABLE_SANDBOX")
+        || s.sandbox.disable;
 
-    if std::env::var_os("AHMA_SANDBOX_DEFER").is_some() {
-        deprecated_env!("AHMA_SANDBOX_DEFER");
-    }
-    let defer_sandbox =
-        cli.defer_sandbox || AppConfig::env_flag("AHMA_SANDBOX_DEFER") || s.sandbox.defer;
+    let defer_sandbox = cli.defer_sandbox
+        || check_env_flag_with_deprecation!("AHMA_SANDBOX_DEFER")
+        || s.sandbox.defer;
 
-    if std::env::var_os("AHMA_TMP_ACCESS").is_some() {
-        deprecated_env!("AHMA_TMP_ACCESS");
-    }
-    let tmp_access = cli.tmp || AppConfig::env_flag("AHMA_TMP_ACCESS") || s.sandbox.tmp_access;
+    let tmp_access =
+        cli.tmp || check_env_flag_with_deprecation!("AHMA_TMP_ACCESS") || s.sandbox.tmp_access;
 
-    if std::env::var_os("AHMA_DISABLE_TEMP").is_some() {
-        deprecated_env!("AHMA_DISABLE_TEMP");
-    }
-    let no_temp_files =
-        cli.no_temp_files || AppConfig::env_flag("AHMA_DISABLE_TEMP") || s.sandbox.disable_temp;
+    let no_temp_files = cli.no_temp_files
+        || check_env_flag_with_deprecation!("AHMA_DISABLE_TEMP")
+        || s.sandbox.disable_temp;
 
-    if std::env::var_os("AHMA_LOG_MONITOR").is_some() {
-        deprecated_env!("AHMA_LOG_MONITOR");
-    }
-    let log_monitor =
-        cli.log_monitor || AppConfig::env_flag("AHMA_LOG_MONITOR") || s.logging.log_monitor;
+    let log_monitor = cli.log_monitor
+        || check_env_flag_with_deprecation!("AHMA_LOG_MONITOR")
+        || s.logging.log_monitor;
 
-    if std::env::var_os("AHMA_MONITOR_RATE_LIMIT").is_some() {
-        deprecated_env!("AHMA_MONITOR_RATE_LIMIT");
-    }
     let monitor_rate_limit_secs = if let Some(r) = cli.monitor_rate_limit {
         r
-    } else if let Some(val) = std::env::var("AHMA_MONITOR_RATE_LIMIT")
-        .ok()
+    } else if let Some(val) = get_env_var_with_deprecation!("AHMA_MONITOR_RATE_LIMIT")
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
         val
@@ -2236,26 +2233,17 @@ fn parse_sandbox_settings(
 }
 
 fn parse_http_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> (bool, bool, u64) {
-    if std::env::var_os("AHMA_DISABLE_QUIC").is_some() {
-        deprecated_env!("AHMA_DISABLE_QUIC");
-    }
-    let no_quic =
-        cli.disable_quic || AppConfig::env_flag("AHMA_DISABLE_QUIC") || s.http.disable_quic;
+    let no_quic = cli.disable_quic
+        || check_env_flag_with_deprecation!("AHMA_DISABLE_QUIC")
+        || s.http.disable_quic;
 
-    if std::env::var_os("AHMA_DISABLE_HTTP1_1").is_some() {
-        deprecated_env!("AHMA_DISABLE_HTTP1_1");
-    }
     let disable_http1_1 = cli.disable_http1_1
-        || AppConfig::env_flag("AHMA_DISABLE_HTTP1_1")
+        || check_env_flag_with_deprecation!("AHMA_DISABLE_HTTP1_1")
         || s.http.disable_http1_1;
 
-    if std::env::var_os("AHMA_HANDSHAKE_TIMEOUT").is_some() {
-        deprecated_env!("AHMA_HANDSHAKE_TIMEOUT");
-    }
     let handshake_timeout_secs = if let Some(t) = cli.handshake_timeout {
         t
-    } else if let Some(val) = std::env::var("AHMA_HANDSHAKE_TIMEOUT")
-        .ok()
+    } else if let Some(val) = get_env_var_with_deprecation!("AHMA_HANDSHAKE_TIMEOUT")
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
         val
@@ -2270,30 +2258,18 @@ fn parse_auth_settings(
     cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
 ) -> (Option<String>, Option<PathBuf>, u64, u32, String) {
-    if std::env::var_os("AHMA_REQUIRE_TOKEN").is_some() {
-        deprecated_env!("AHMA_REQUIRE_TOKEN");
-    }
     let require_token = cli
         .require_token
         .clone()
         .or_else(|| {
-            std::env::var("AHMA_REQUIRE_TOKEN")
-                .ok()
-                .map(|v| v.trim().to_owned())
+            get_env_var_with_deprecation!("AHMA_REQUIRE_TOKEN").map(|v| v.trim().to_owned())
         })
         .or_else(|| s.auth.require_token.clone());
 
-    if std::env::var_os("AHMA_REQUIRE_TOKEN_PATH").is_some() {
-        deprecated_env!("AHMA_REQUIRE_TOKEN_PATH");
-    }
     let require_token_path = cli
         .require_token_path
         .clone()
-        .or_else(|| {
-            std::env::var("AHMA_REQUIRE_TOKEN_PATH")
-                .ok()
-                .map(PathBuf::from)
-        })
+        .or_else(|| get_env_var_with_deprecation!("AHMA_REQUIRE_TOKEN_PATH").map(PathBuf::from))
         .or_else(|| {
             if s.auth.require_token_path.is_empty() {
                 None
@@ -2302,40 +2278,27 @@ fn parse_auth_settings(
             }
         });
 
-    if std::env::var_os("AHMA_RATE_LIMIT_RPS").is_some() {
-        deprecated_env!("AHMA_RATE_LIMIT_RPS");
-    }
     let rate_limit_rps = cli
         .rate_limit_rps
         .or_else(|| {
-            std::env::var("AHMA_RATE_LIMIT_RPS")
-                .ok()
+            get_env_var_with_deprecation!("AHMA_RATE_LIMIT_RPS")
                 .and_then(|v| v.trim().parse::<u64>().ok())
         })
         .unwrap_or(s.auth.rate_limit_rps);
 
-    if std::env::var_os("AHMA_RATE_LIMIT_BURST").is_some() {
-        deprecated_env!("AHMA_RATE_LIMIT_BURST");
-    }
     let rate_limit_burst = cli
         .rate_limit_burst
         .or_else(|| {
-            std::env::var("AHMA_RATE_LIMIT_BURST")
-                .ok()
+            get_env_var_with_deprecation!("AHMA_RATE_LIMIT_BURST")
                 .and_then(|v| v.trim().parse::<u32>().ok())
         })
         .unwrap_or(s.auth.rate_limit_burst);
 
-    if std::env::var_os("AHMA_INSTANCE_LABEL").is_some() {
-        deprecated_env!("AHMA_INSTANCE_LABEL");
-    }
     let instance_label = cli
         .instance_label
         .clone()
         .or_else(|| {
-            std::env::var("AHMA_INSTANCE_LABEL")
-                .ok()
-                .map(|v| v.trim().to_owned())
+            get_env_var_with_deprecation!("AHMA_INSTANCE_LABEL").map(|v| v.trim().to_owned())
         })
         .unwrap_or_else(|| s.instance.label.clone());
 
@@ -2348,44 +2311,23 @@ fn parse_auth_settings(
     )
 }
 
-pub fn build_app_config(cli: &Cli) -> AppConfig {
-    let serve = extract_serve_fields(&cli.command);
-    let tool = extract_tool_fields(&cli.command);
-
-    // Load user settings (priority layer 2: below CLI flags, above env vars)
-    let s = load_settings(cli);
-
-    // ── Tool loading ────────────────────────────────────────────────────────
-    if std::env::var_os("AHMA_TOOLS_DIR").is_some() {
-        deprecated_env!("AHMA_TOOLS_DIR");
+fn resolve_tool_bundles(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut bundles = cli.tool_bundles.clone();
+    if bundles.is_empty() {
+        bundles = s.tools.tool_bundles.clone();
     }
-    let explicit_tools_dir =
-        cli.tools_dir.is_some() || std::env::var_os("AHMA_TOOLS_DIR").is_some();
-    let raw_tools_dir = cli
-        .tools_dir
-        .clone()
-        .or_else(|| std::env::var("AHMA_TOOLS_DIR").ok().map(PathBuf::from))
-        .or_else(|| s.tools.tools_dir.clone());
-    let tools_dir = resolution::normalize_tools_dir(raw_tools_dir);
+    bundles
+        .into_iter()
+        .filter(|b| seen.insert(b.clone()))
+        .collect()
+}
 
-    // Flatten and deduplicate tool bundles
-    let tool_bundles = {
-        let mut seen = std::collections::HashSet::new();
-        let mut bundles = cli.tool_bundles.clone();
-        if bundles.is_empty() {
-            bundles = s.tools.tool_bundles.clone();
-        }
-        bundles
-            .into_iter()
-            .filter(|b| seen.insert(b.clone()))
-            .collect()
-    };
-
-    // ── Sandbox scope ───────────────────────────────────────────────────────
+fn resolve_sandbox_scopes_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> Vec<PathBuf> {
     if std::env::var_os("AHMA_SANDBOX_SCOPE").is_some() {
         deprecated_env!("AHMA_SANDBOX_SCOPE");
     }
-    let sandbox_scopes = if !cli.sandbox_scopes.is_empty() {
+    if !cli.sandbox_scopes.is_empty() {
         cli.sandbox_scopes
             .iter()
             .map(|p| expand_tilde(p.clone()))
@@ -2401,12 +2343,14 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
                 .map(|p| expand_tilde(p.clone()))
                 .collect()
         }
-    };
+    }
+}
 
+fn resolve_working_dirs_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> Vec<PathBuf> {
     if std::env::var_os("AHMA_WORKING_DIRS").is_some() {
         deprecated_env!("AHMA_WORKING_DIRS");
     }
-    let working_dirs = if !cli.working_dirs.is_empty() {
+    if !cli.working_dirs.is_empty() {
         cli.working_dirs
             .iter()
             .map(|p| expand_tilde(p.clone()))
@@ -2422,7 +2366,33 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
                 .map(|p| expand_tilde(p.clone()))
                 .collect()
         }
-    };
+    }
+}
+
+pub fn build_app_config(cli: &Cli) -> AppConfig {
+    let serve = extract_serve_fields(&cli.command);
+    let tool = extract_tool_fields(&cli.command);
+
+    // Load user settings (priority layer 2: below CLI flags, above env vars)
+    let s = load_settings(cli);
+
+    // ── Tool loading ────────────────────────────────────────────────────────
+    let explicit_tools_dir =
+        cli.tools_dir.is_some() || std::env::var_os("AHMA_TOOLS_DIR").is_some();
+    let raw_tools_dir = cli
+        .tools_dir
+        .clone()
+        .or_else(|| get_env_var_with_deprecation!("AHMA_TOOLS_DIR").map(PathBuf::from))
+        .or_else(|| s.tools.tools_dir.clone());
+    let tools_dir = resolution::normalize_tools_dir(raw_tools_dir);
+
+    // Flatten and deduplicate tool bundles
+    let tool_bundles = resolve_tool_bundles(cli, &s);
+
+    // ── Sandbox scope ───────────────────────────────────────────────────────
+    let sandbox_scopes = resolve_sandbox_scopes_cli(cli, &s);
+
+    let working_dirs = resolve_working_dirs_cli(cli, &s);
 
     // ── Parse settings sections via modular helper functions ─────────────────
     let (timeout_secs, force_sync, hot_reload_tools, skip_availability_probes) =

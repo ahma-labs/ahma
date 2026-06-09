@@ -24,7 +24,7 @@
 | Built-in `await` Tool | tests-pass | Blocking wait for operation completion |
 | Built-in `cancel` Tool | tests-pass | Cancel running operations |
 | Built-in `run_terminal_command` | tests-pass | Execute arbitrary shell commands within sandbox |
-| Batteries-Included Tools | tests-pass | Built-in MTDF setups activated via CLI flags (e.g. `--rust`, `--python`) |
+| Batteries-Included Tools | tests-pass | Built-in MTDF setups activated via CLI flags (e.g. `--python`, `--git`) |
 | MTDF Schema Validation | tests-pass | JSON schema validation at startup |
 | Sequence Tools | tests-pass | Chain multiple commands into workflows |
 | Tool Hot-Reload | tests-pass | Opt-in `--hot-reload-tools` watches `tools/` directory and reloads on changes |
@@ -550,12 +550,12 @@ ahma serve stdio
 
 Alternatively, standard tool configurations are bundled directly inside the binary. Enable them using the `--tools` flag to activate built-in fallback definitions:
 ```bash
-ahma serve stdio --tools rust,python,git,github,fileutils,simplify,kotlin
+ahma serve stdio --tools python,git,github,fileutils,simplify,kotlin
 ```
 
 Note: Core tools (`run_terminal_command`, `await`, `status`, `cancel`) are always available without any flags.
 
-**Tool loading priority**: When an `.ahma/` directory exists (auto-detected or via explicit `--tools-dir`), **all** tool definitions in it are always loaded regardless of bundle flags. Bundle flags (`--tools rust`, `--tools simplify`, etc.) additionally activate built-in tool definitions compiled into the binary, serving as **fallbacks** for tools not defined locally. Local `.ahma/` definitions override bundled defaults with the same name. If *no* `.ahma/` directory exists and no `--tools-dir` is given, only bundle-flag tools plus core built-ins are available.
+**Tool loading priority**: When an `.ahma/` directory exists (auto-detected or via explicit `--tools-dir`), **all** tool definitions in it are always loaded regardless of bundle flags. Bundle flags (`--tools python`, `--tools simplify`, etc.) additionally activate built-in tool definitions compiled into the binary, serving as **fallbacks** for tools not defined locally. Local `.ahma/` definitions override bundled defaults with the same name. If *no* `.ahma/` directory exists and no `--tools-dir` is given, only bundle-flag tools plus core built-ins are available.
 
 ### 6.2 HTTP Bridge Mode
 

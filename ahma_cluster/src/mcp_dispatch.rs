@@ -103,12 +103,7 @@ impl std::fmt::Debug for McpPeerDispatch {
 }
 
 impl PeerDispatch for McpPeerDispatch {
-    fn dispatch(
-        &self,
-        peer_addr: &str,
-        _path: &str,
-        payload: Value,
-    ) -> BoxFuture<Result<Value>> {
+    fn dispatch(&self, peer_addr: &str, _path: &str, payload: Value) -> BoxFuture<Result<Value>> {
         let shared_key = self.shared_key.clone();
         let client = self.client.clone();
         let peer_addr = peer_addr.to_string();
@@ -190,10 +185,10 @@ impl PeerDispatch for McpPeerDispatch {
                 "params": {}
             });
 
-            let mut notif_req = client.post(&mcp_url).json(&notif_body).header(
-                manifest_header.clone(),
-                manifest_header_value.clone(),
-            );
+            let mut notif_req = client
+                .post(&mcp_url)
+                .json(&notif_body)
+                .header(manifest_header.clone(), manifest_header_value.clone());
             if let Some(ref sid) = session_id {
                 notif_req = notif_req.header("mcp-session-id", sid.as_str());
             }
@@ -202,10 +197,10 @@ impl PeerDispatch for McpPeerDispatch {
 
             // ── Step 3: tools/call ────────────────────────────────────────────
             debug!(peer = %peer_addr, tool = %tool_name, "McpPeerDispatch: calling tool");
-            let mut call_req = client.post(&mcp_url).json(&payload).header(
-                manifest_header.clone(),
-                manifest_header_value.clone(),
-            );
+            let mut call_req = client
+                .post(&mcp_url)
+                .json(&payload)
+                .header(manifest_header.clone(), manifest_header_value.clone());
             if let Some(ref sid) = session_id {
                 call_req = call_req.header("mcp-session-id", sid.as_str());
             }
@@ -260,7 +255,9 @@ async fn post_with_manifest(
             .header(manifest_header.clone(), manifest_value);
         match req.send().await {
             Ok(resp) => return Ok(resp),
-            Err(e) => warn!(transport = ?mode, url = target_url, "McpPeerDispatch post failed: {e}"),
+            Err(e) => {
+                warn!(transport = ?mode, url = target_url, "McpPeerDispatch post failed: {e}")
+            }
         }
     }
 
@@ -282,7 +279,10 @@ mod tests {
     fn mcp_dispatch_debug_does_not_expose_key() {
         let d = McpPeerDispatch::new(b"secret-key".to_vec(), vec![], None);
         let s = format!("{d:?}");
-        assert!(!s.contains("secret-key"), "key must not appear in Debug output");
+        assert!(
+            !s.contains("secret-key"),
+            "key must not appear in Debug output"
+        );
         assert!(s.contains("McpPeerDispatch"), "should include struct name");
     }
 

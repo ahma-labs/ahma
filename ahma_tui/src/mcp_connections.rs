@@ -338,7 +338,11 @@ pub fn discover_ide_servers() -> Vec<McpServerConfig> {
     // VS Code (Linux): ~/.config/Code/User/mcp.json
     #[cfg(target_os = "linux")]
     {
-        let vscode_path = home.join(".config").join("Code").join("User").join("mcp.json");
+        let vscode_path = home
+            .join(".config")
+            .join("Code")
+            .join("User")
+            .join("mcp.json");
         parse_ide_mcp_json(&vscode_path, &mut results);
     }
 
@@ -346,8 +350,10 @@ pub fn discover_ide_servers() -> Vec<McpServerConfig> {
     #[cfg(windows)]
     {
         if let Some(appdata) = std::env::var_os("APPDATA") {
-            let vscode_path =
-                std::path::PathBuf::from(appdata).join("Code").join("User").join("mcp.json");
+            let vscode_path = std::path::PathBuf::from(appdata)
+                .join("Code")
+                .join("User")
+                .join("mcp.json");
             parse_ide_mcp_json(&vscode_path, &mut results);
         }
     }
@@ -394,7 +400,9 @@ fn ide_entry_to_server(name: &str, entry: &Value) -> Option<McpServerConfig> {
         return Some(McpServerConfig {
             name: name.to_string(),
             enabled: true,
-            kind: McpServerKind::Http { url: url.to_string() },
+            kind: McpServerKind::Http {
+                url: url.to_string(),
+            },
         });
     }
 
@@ -413,7 +421,10 @@ fn ide_entry_to_server(name: &str, entry: &Value) -> Option<McpServerConfig> {
     Some(McpServerConfig {
         name: name.to_string(),
         enabled: true,
-        kind: McpServerKind::Stdio { command: command.to_string(), args },
+        kind: McpServerKind::Stdio {
+            command: command.to_string(),
+            args,
+        },
     })
 }
 

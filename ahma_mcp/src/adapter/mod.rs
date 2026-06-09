@@ -1388,7 +1388,9 @@ async fn process_streaming_line(
 ) {
     let safe_line = crate::log_monitor::redact_sensitive_line(line);
     collector.push(safe_line.clone());
-    op_monitor.append_stdout_line(op_id, safe_line.clone()).await;
+    op_monitor
+        .append_stdout_line(op_id, safe_line.clone())
+        .await;
 
     // Emit OutputLine to the unified dispatcher (P2).
     event_dispatcher.emit(OperationEvent::OutputLine {

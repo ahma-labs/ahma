@@ -42,12 +42,7 @@ pub trait PeerDispatch: Send + Sync + 'static {
     ///
     /// `peer_addr` — base URL, e.g. `http://10.0.0.5:7000`.
     /// `path`      — request path, e.g. `/mcp` or `/tasks`.
-    fn dispatch(
-        &self,
-        peer_addr: &str,
-        path: &str,
-        payload: Value,
-    ) -> BoxFuture<Result<Value>>;
+    fn dispatch(&self, peer_addr: &str, path: &str, payload: Value) -> BoxFuture<Result<Value>>;
 }
 
 // ─── PeerHandler (test helper) ────────────────────────────────────────────────
@@ -112,12 +107,7 @@ impl InMemoryPeerDispatch {
 }
 
 impl PeerDispatch for InMemoryPeerDispatch {
-    fn dispatch(
-        &self,
-        peer_addr: &str,
-        path: &str,
-        payload: Value,
-    ) -> BoxFuture<Result<Value>> {
+    fn dispatch(&self, peer_addr: &str, path: &str, payload: Value) -> BoxFuture<Result<Value>> {
         let handlers = self.handlers.clone();
         let peer_addr = peer_addr.to_string();
         let path = path.to_string();
