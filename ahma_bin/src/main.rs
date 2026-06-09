@@ -53,7 +53,12 @@ async fn main() -> Result<()> {
         }
         Subcommands::Tui(tui_args) => {
             tracing::info!("Starting TUI control plane");
-            ahma_tui::run_tui(tui_args.connect.as_deref(), tui_args.profile.clone()).await
+            ahma_tui::run_tui(
+                tui_args.connect.as_deref(),
+                tui_args.profile.clone(),
+                tui_args.path.clone(),
+            )
+            .await
         }
         Subcommands::Tls(tls_args) => {
             tracing::info!("TLS subcommand");
@@ -400,6 +405,21 @@ async fn dispatch_cluster(args: ahma_mcp::shell::ClusterArgs) -> Result<()> {
 
             write_peers(&peers)?;
             println!("Added peer '{}'.", add_args.id);
+            Ok(())
+        }
+
+        ClusterCommand::Remove(rm_args) => {
+            let mut peers = read_peers()?;
+            let before = peers.len();
+            peers.retain(|p| p.id != rm_args.id);
+            if peers.len() == before {
+                anyhow::bail!(
+                    "Peer '{}' not found. List peers with: ahma cluster list",
+                    rm_args.id
+                );
+            }
+            write_peers(&peers)?;
+            println!("Removed peer '{}'.", rm_args.id);
             Ok(())
         }
 

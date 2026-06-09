@@ -476,7 +476,13 @@ fn detect_project_root() -> Result<PathBuf> {
     Ok(cwd)
 }
 
-fn extract_tool_args(input: &Value) -> Result<Option<(Map<String, Value>, String)>> {
+struct ExtractedToolArgs {
+    tool_input: Map<String, Value>,
+    command: String,
+    arg_key: String,
+}
+
+fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
     let Some(raw_args) = input.get("tool_input").or_else(|| input.get("toolArgs")) else {
         // Not a shell tool invocation — allow through without modification
         return Ok(None);
@@ -492,12 +498,20 @@ fn extract_tool_args(input: &Value) -> Result<Option<(Map<String, Value>, String
         .as_object()
         .ok_or_else(|| anyhow!("Tool arguments must be a JSON object"))?;
 
-    let Some(command) = args_obj.get("command").and_then(Value::as_str) else {
+    let (command, key) = if let Some(c) = args_obj.get("command").and_then(Value::as_str) {
+        (c, "command")
+    } else if let Some(c) = args_obj.get("CommandLine").and_then(Value::as_str) {
+        (c, "CommandLine")
+    } else {
         // Tool does not invoke a shell command (e.g. editFiles, createFile) — allow through
         return Ok(None);
     };
 
-    Ok(Some((args_obj.clone(), command.to_string())))
+    Ok(Some(ExtractedToolArgs {
+        tool_input: args_obj.clone(),
+        command: command.to_string(),
+        arg_key: key.to_string(),
+    }))
 }
 
 fn resolve_exec_updated_input(
@@ -505,15 +519,19 @@ fn resolve_exec_updated_input(
     scope: HookScope,
     env: &HookEnvironment,
 ) -> Result<Option<Value>> {
-    let Some((tool_input, original_command)) = extract_tool_args(input)? else {
+    let Some(args) = extract_tool_args(input)? else {
         return Ok(None);
     };
-    if is_wrapped_shell_command(&original_command) {
+    if is_wrapped_shell_command(&args.command) {
         return Ok(None);
     }
-    let cwd = extract_command_cwd(input, &tool_input)?;
-    let wrapped_command = build_wrapped_shell_command(scope, env, &cwd, &original_command)?;
-    Ok(Some(updated_tool_input(&tool_input, wrapped_command)))
+    let cwd = extract_command_cwd(input, &args.tool_input)?;
+    let wrapped_command = build_wrapped_shell_command(scope, env, &cwd, &args.command)?;
+    Ok(Some(updated_tool_input(
+        &args.tool_input,
+        wrapped_command,
+        &args.arg_key,
+    )))
 }
 
 fn build_exec_response(
@@ -545,9 +563,9 @@ fn extract_command_cwd(input: &Value, tool_input: &Map<String, Value>) -> Result
     Ok(cwd.to_string_lossy().into_owned())
 }
 
-fn updated_tool_input(tool_input: &Map<String, Value>, command: String) -> Value {
+fn updated_tool_input(tool_input: &Map<String, Value>, command: String, key: &str) -> Value {
     let mut updated = tool_input.clone();
-    updated.insert("command".to_string(), Value::String(command));
+    updated.insert(key.to_string(), Value::String(command));
     Value::Object(updated)
 }
 
@@ -1276,6 +1294,30 @@ mod tests {
         assert!(command.starts_with("ahma hooks run-shell"));
         assert!(command.contains(WRAPPED_BY_MARKER));
         assert_eq!(updated["description"].as_str(), Some("Run tests"));
+    }
+
+    #[test]
+    fn test_exec_response_rewrites_command_line_and_preserves_fields() {
+        let env = test_env();
+        let input = json!({
+            "cwd": "/tmp/project",
+            "tool_input": {
+                "CommandLine": "cargo test --bin ahma",
+                "description": "Run specific test binary"
+            }
+        });
+
+        let output =
+            build_exec_response(&input, HookPlatform::Antigravity, HookScope::Project, &env)
+                .unwrap();
+        let updated = &output["hookSpecificOutput"]["updatedInput"];
+        let command = updated["CommandLine"].as_str().unwrap();
+        assert!(command.starts_with("ahma hooks run-shell"));
+        assert!(command.contains(WRAPPED_BY_MARKER));
+        assert_eq!(
+            updated["description"].as_str(),
+            Some("Run specific test binary")
+        );
     }
 
     #[test]

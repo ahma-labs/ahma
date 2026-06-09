@@ -75,7 +75,6 @@ pub struct UpdateArgs {
     pub dry_run: bool,
 
     /// Skip Sigstore attestation verification (insecure — for offline/air-gapped use only).
-    ///
     /// Equivalent to setting `AHMA_INSECURE_SKIP_VERIFY=1`.
     #[arg(long, alias = "insecure-skip-signature")]
     pub insecure_skip_verify: bool,
@@ -89,7 +88,24 @@ struct UpdateOutcome {
 }
 
 /// Entry point for `ahma update`.
-pub async fn run(args: UpdateArgs) -> Result<()> {
+pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result<()> {
+    if !args.dry_run {
+        println!("Stopping running background processes...");
+        let _ = ahma_common::daemon_hub::stop_daemon().await;
+
+        let socket_path_opt = if cfg!(unix) && !cfg.unix_socket_path.is_empty() {
+            Some(cfg.unix_socket_path.as_str())
+        } else if cfg!(unix) {
+            Some("/tmp/ahma.sock")
+        } else {
+            None
+        };
+        let http_url = format!("http://{}:{}", cfg.http_host, cfg.http_port);
+        let http_url_opt = Some(http_url.as_str());
+        let _ = crate::shell::modes::server::trigger_bridge_restart(socket_path_opt, http_url_opt)
+            .await;
+    }
+
     let install_dir = args
         .install_dir
         .clone()

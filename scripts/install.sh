@@ -15,7 +15,7 @@ set -euo pipefail
 
 # Skill version — keep in sync with [workspace.package] version in Cargo.toml.
 # CI guardrails verify this matches. Bump via: cargo xtask bump-version X.Y.Z
-AHMA_VERSION="0.11.13"
+AHMA_VERSION="0.11.14"
 
 # Parse CLI arguments
 VERIFY_ONLY=0
@@ -282,6 +282,22 @@ fi
 
 # Extract
 tar -xzf "$TEMP_DIR/$ASSET_NAME" -C "$TEMP_DIR"
+
+# Clean up running instances to avoid locking and stale processes
+echo "Stopping running ahma processes..."
+if command -v pgrep >/dev/null 2>&1; then
+    for proc in ahma ahma-http-bridge; do
+        pids=$(pgrep -x "$proc" || true)
+        if [ -n "$pids" ]; then
+            for pid in $pids; do
+                if [ "$pid" != "$$" ]; then
+                    echo "Killing running process $proc (PID $pid)..."
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
+            done
+        fi
+    done
+fi
 
 # Install binaries
 echo "Installing binaries to ${INSTALL_DIR}..."

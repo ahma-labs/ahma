@@ -65,7 +65,20 @@ pub fn spawn_embedded_hub_source(
         loop {
             match rx.recv().await {
                 Ok(msg) => {
+                    let is_instance_change = matches!(
+                        msg,
+                        DaemonMsg::InstanceList { .. }
+                            | DaemonMsg::InstanceRegistered { .. }
+                            | DaemonMsg::InstanceUnregistered { .. }
+                    );
                     let changed = apply_msg(&mut state, msg);
+                    if is_instance_change {
+                        let _ = tx
+                            .send(SourceEvent::InstancesUpdated {
+                                instances: state.all_instances(),
+                            })
+                            .await;
+                    }
                     if changed {
                         let ops = state.all_ops();
                         if tx
@@ -107,6 +120,10 @@ impl DaemonState {
             instances: HashMap::new(),
             ops: HashMap::new(),
         }
+    }
+
+    fn all_instances(&self) -> Vec<InstanceInfo> {
+        self.instances.values().cloned().collect()
     }
 
     fn add_instance(&mut self, info: InstanceInfo) {
@@ -259,7 +276,20 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
         loop {
             match recv_msg::<_, DaemonMsg>(&mut reader).await {
                 Ok(msg) => {
+                    let is_instance_change = matches!(
+                        msg,
+                        DaemonMsg::InstanceList { .. }
+                            | DaemonMsg::InstanceRegistered { .. }
+                            | DaemonMsg::InstanceUnregistered { .. }
+                    );
                     let changed = apply_msg(&mut state, msg);
+                    if is_instance_change {
+                        let _ = tx
+                            .send(SourceEvent::InstancesUpdated {
+                                instances: state.all_instances(),
+                            })
+                            .await;
+                    }
                     if changed {
                         prune_counter += 1;
                         if prune_counter >= 10 {

@@ -184,9 +184,26 @@ pub struct Session {
     event_id_counter: AtomicU64,
     /// Bounded ring buffer of recent SSE events for `Last-Event-Id` replay.
     event_history: std::sync::Mutex<VecDeque<(u64, String)>>,
+
+    /// Client info sent in initialize request
+    pub client_info: Mutex<Option<Value>>,
+    /// Client capabilities sent in initialize request
+    pub capabilities: Mutex<Option<Value>>,
+    /// Weak reference back to the session manager
+    pub session_manager: Mutex<Option<std::sync::Weak<SessionManager>>>,
+    /// Map of pending routed request IDs to response channels
+    pub routed_requests: Arc<DashMap<String, oneshot::Sender<Value>>>,
+    /// Mutex to serialize routed sampling requests to the client
+    pub sampling_lock: tokio::sync::Mutex<()>,
 }
 
 impl Session {
+    /// Set the client info and capabilities for this session.
+    pub async fn set_client_info(&self, client_info: Value, capabilities: Value) {
+        *self.client_info.lock().await = Some(client_info);
+        *self.capabilities.lock().await = Some(capabilities);
+    }
+
     /// Check if the session is terminated
     pub fn is_terminated(&self) -> bool {
         self.terminated.load(Ordering::SeqCst)
@@ -881,6 +898,11 @@ impl SessionManager {
             lagged_events: AtomicU64::new(0),
             event_id_counter: AtomicU64::new(0),
             event_history: std::sync::Mutex::new(VecDeque::new()),
+            client_info: Mutex::new(None),
+            capabilities: Mutex::new(None),
+            session_manager: Mutex::new(None),
+            routed_requests: Arc::new(DashMap::new()),
+            sampling_lock: tokio::sync::Mutex::new(()),
         });
 
         // Spawn the I/O handler task
@@ -902,6 +924,14 @@ impl SessionManager {
     /// Get a session by ID
     pub fn get_session(&self, session_id: &str) -> Option<Arc<Session>> {
         self.sessions.get(session_id).map(|s| s.clone())
+    }
+
+    /// Get all active sessions
+    pub fn get_all_sessions(&self) -> Vec<Arc<Session>> {
+        self.sessions
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     /// Resolve the sandbox scopes that should be locked for this session.
@@ -1125,6 +1155,14 @@ impl SessionManager {
         }
 
         Ok(())
+    }
+
+    /// Terminate all active sessions
+    pub async fn terminate_all(&self, reason: SessionTerminationReason) {
+        let session_ids: Vec<String> = self.sessions.iter().map(|r| r.key().clone()).collect();
+        for id in session_ids {
+            let _ = self.terminate_session(&id, reason).await;
+        }
     }
 
     /// Check if a session exists and is not terminated

@@ -116,27 +116,17 @@ impl TaskTreeOrchestrator {
         .boxed()
     }
 
-    async fn execute_planning_node(
+    async fn plan_and_create_children(
         &self,
         tree: &mut TaskTree,
         node_id: NodeId,
-        node: crate::tree::TaskNode,
-    ) -> Result<NodeResult> {
-        let max_subtasks = self.config.max_depth.unwrap_or(4);
+        node: &crate::tree::TaskNode,
+        max_subtasks: usize,
+        goal: &str,
+    ) -> Result<Vec<NodeId>> {
         let branch_context = self.build_branch_context(tree, node_id);
-        let goal = tree
-            .root_id
-            .and_then(|id| tree.get_node(id))
-            .map(|n| n.task_description.clone())
-            .unwrap_or_else(|| node.task_description.clone());
-
-        info!(
-            "Decomposing planning node {} (description: {})",
-            node_id.0, node.task_description
-        );
-
         let prompt =
-            build_planning_prompt(&goal, &node.task_description, &branch_context, max_subtasks);
+            build_planning_prompt(goal, &node.task_description, &branch_context, max_subtasks);
 
         let system_msg = json!({
             "role": "system",
@@ -185,11 +175,27 @@ impl TaskTreeOrchestrator {
             child_ids.push(child_id);
         }
 
-        let mut overall_success = true;
+        Ok(child_ids)
+    }
+
+    async fn execute_child_queue(
+        &self,
+        tree: &mut TaskTree,
+        node_id: NodeId,
+        node: &crate::tree::TaskNode,
+        child_ids: Vec<NodeId>,
+        max_subtasks: usize,
+        goal: &str,
+    ) -> Result<(bool, Vec<String>)> {
+        let parent_scopes = self.get_effective_parent_scopes(tree, node_id);
+        let parent_tools = self.get_effective_parent_allowed_tools(tree, node_id);
+        let parent_domains = self.get_effective_parent_allowed_domains(tree, node_id);
+
         let mut child_summaries = Vec::new();
         let max_retries = self.config.max_retries.unwrap_or(2);
-
         let mut queue = std::collections::VecDeque::from(child_ids);
+        let mut overall_success = true;
+
         while let Some(child_id) = queue.pop_front() {
             let mut success = false;
             for retry in 0..=max_retries {
@@ -229,11 +235,11 @@ impl TaskTreeOrchestrator {
                     .handle_recovery_backtracking(
                         tree,
                         node_id,
-                        &node,
+                        node,
                         child_id,
                         &mut queue,
                         max_subtasks,
-                        &goal,
+                        goal,
                         &parent_scopes,
                         &parent_tools,
                         &parent_domains,
@@ -248,6 +254,35 @@ impl TaskTreeOrchestrator {
                 break;
             }
         }
+
+        Ok((overall_success, child_summaries))
+    }
+
+    async fn execute_planning_node(
+        &self,
+        tree: &mut TaskTree,
+        node_id: NodeId,
+        node: crate::tree::TaskNode,
+    ) -> Result<NodeResult> {
+        let max_subtasks = self.config.max_depth.unwrap_or(4);
+        let goal = tree
+            .root_id
+            .and_then(|id| tree.get_node(id))
+            .map(|n| n.task_description.clone())
+            .unwrap_or_else(|| node.task_description.clone());
+
+        info!(
+            "Decomposing planning node {} (description: {})",
+            node_id.0, node.task_description
+        );
+
+        let child_ids = self
+            .plan_and_create_children(tree, node_id, &node, max_subtasks, &goal)
+            .await?;
+
+        let (overall_success, child_summaries) = self
+            .execute_child_queue(tree, node_id, &node, child_ids, max_subtasks, &goal)
+            .await?;
 
         let summary = if overall_success {
             let joined_summaries = child_summaries.join("\n");

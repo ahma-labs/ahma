@@ -91,14 +91,161 @@ pub fn spawn_model_refresh(base_url: String, tx: Sender<BridgeEvent>) {
     });
 }
 
+async fn call_mcp_sampling_routed(
+    mcp: &McpChatConfig,
+    target_label: &str,
+    messages: Vec<serde_json::Value>,
+    system_prompt: Option<&str>,
+) -> Result<ahma_llm_monitor::client::ChatCompletionResponse, String> {
+    if is_local_default_server(&mcp.base_url) {
+        crate::connection::ensure_server_running(Some(&mcp.workspace_root))
+            .await
+            .map_err(|e| format!("Failed to ensure bridge server is running: {e}"))?;
+    }
+
+    let builder = reqwest::Client::builder();
+    let (request_base_url, builder) = if let Some(path) = mcp.base_url.strip_prefix("unix://") {
+        #[cfg(unix)]
+        {
+            ("http://localhost".to_string(), builder.unix_socket(path))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            (mcp.base_url.clone(), builder)
+        }
+    } else {
+        (mcp.base_url.clone(), builder)
+    };
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let url = format!("{}/mcp", request_base_url);
+    let session_id = get_or_create_session(&client, &url, mcp).await?;
+
+    let mut mcp_messages = Vec::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        mcp_messages.push(serde_json::json!({
+            "role": role,
+            "content": {
+                "type": "text",
+                "text": content
+            }
+        }));
+    }
+
+    let request_id = format!("route_tui_{}", uuid::Uuid::new_v4());
+    let mut params = serde_json::json!({
+        "messages": mcp_messages,
+    });
+    if let Some(sys) = system_prompt {
+        params["systemPrompt"] = serde_json::json!(sys);
+    }
+    params["__route_target_label"] = serde_json::json!(target_label);
+
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "sampling/createMessage",
+        "params": params
+    });
+
+    let resp = client
+        .post(&url)
+        .header("mcp-session-id", &session_id)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send sampling request: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(format!("HTTP {status}: {body_text}"));
+    }
+
+    let response_json = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("Failed to parse response: {e}"))?;
+
+    if let Some(error) = response_json.get("error") {
+        let msg = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown error");
+        return Err(msg.to_string());
+    }
+
+    let result = response_json
+        .get("result")
+        .ok_or_else(|| "Missing result in response".to_string())?;
+    let content_arr = result
+        .get("content")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| "Missing or invalid content in result".to_string())?;
+
+    let mut completion_text = String::new();
+    for item in content_arr {
+        if item.get("type").and_then(|t| t.as_str()) == Some("text")
+            && let Some(text) = item.get("text").and_then(|t| t.as_str())
+        {
+            completion_text.push_str(text);
+        }
+    }
+
+    Ok(ahma_llm_monitor::client::ChatCompletionResponse {
+        content: completion_text,
+        tool_calls: Vec::new(),
+        assistant_message: serde_json::Value::Null,
+        usage: None,
+    })
+}
+
 pub fn spawn_chat_task(
     client: LlmClient,
     messages: Vec<ChatMessage>,
     system_prompt: Option<String>,
-    _mcp: Option<McpChatConfig>,
+    mcp: Option<McpChatConfig>,
     tx: Sender<BridgeEvent>,
 ) {
     tokio::spawn(async move {
+        if client.base_url().starts_with("mcp://") {
+            let Some(mcp_cfg) = mcp else {
+                let _ = tx
+                    .send(BridgeEvent::Error(
+                        "MCP config missing for sampling".to_string(),
+                    ))
+                    .await;
+                return;
+            };
+            let target_label = client.base_url().strip_prefix("mcp://").unwrap_or("");
+            let mut msg_vals = Vec::new();
+            for msg in messages {
+                msg_vals.push(serde_json::json!({
+                    "role": msg.role,
+                    "content": msg.content
+                }));
+            }
+            match call_mcp_sampling_routed(
+                &mcp_cfg,
+                target_label,
+                msg_vals,
+                system_prompt.as_deref(),
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let _ = tx.send(BridgeEvent::Token(resp.content)).await;
+                    let _ = tx.send(BridgeEvent::Done).await;
+                }
+                Err(e) => {
+                    let _ = tx.send(BridgeEvent::Error(e)).await;
+                }
+            }
+            return;
+        }
+
         let stream = client.chat_stream(messages, system_prompt.as_deref());
         tokio::pin!(stream);
         use futures::StreamExt;
@@ -185,26 +332,7 @@ async fn execute_single_tool_call(
         })
         .await;
 
-    let result = if let Some((server, _tool)) = call.name.split_once("::") {
-        // Route namespaced tools through the connection manager (handles both HTTP and stdio).
-        // Fall back to the legacy HTTP-only map for backwards compatibility.
-        let full_name = call.name.clone();
-        let conn = cfg.mcp_connections.clone();
-        let conn_has_server = conn.servers.iter().any(|s| s.name == server);
-        if conn_has_server {
-            match conn.call_tool(&full_name, args_value.clone()).await {
-                Ok(pair) => Ok(pair),
-                Err(e) => Err(format!("MCP tool error ({full_name}): {e}")),
-            }
-        } else if let Some(base_url) = cfg.external_http_servers.get(server) {
-            let base = base_url.clone();
-            spawn_external_tool_call_http(&base, _tool, args_value).await
-        } else {
-            Err(format!("Unknown external MCP server `{server}`"))
-        }
-    } else {
-        spawn_local_tool_call(cfg, &call.name, args_value).await
-    };
+    let result = dispatch_tool_execution(&call.name, args_value, &cfg).await;
     match result {
         Ok((text, failed)) => {
             let _ = tx
@@ -240,6 +368,30 @@ async fn execute_single_tool_call(
     }
 }
 
+async fn dispatch_tool_execution(
+    name: &str,
+    args_value: serde_json::Value,
+    cfg: &McpChatConfig,
+) -> Result<(String, bool), String> {
+    if let Some((server, _tool)) = name.split_once("::") {
+        let conn = cfg.mcp_connections.clone();
+        let conn_has_server = conn.servers.iter().any(|s| s.name == server);
+        if conn_has_server {
+            match conn.call_tool(name, args_value.clone()).await {
+                Ok(pair) => Ok(pair),
+                Err(e) => Err(format!("MCP tool error ({name}): {e}")),
+            }
+        } else if let Some(base_url) = cfg.external_http_servers.get(server) {
+            let base = base_url.clone();
+            spawn_external_tool_call_http(&base, _tool, args_value).await
+        } else {
+            Err(format!("Unknown external MCP server `{server}`"))
+        }
+    } else {
+        spawn_local_tool_call(cfg.clone(), name, args_value).await
+    }
+}
+
 async fn execute_agent_turn(
     client: &LlmClient,
     msg_json: &mut Vec<serde_json::Value>,
@@ -249,33 +401,60 @@ async fn execute_agent_turn(
     messages: &[ChatMessage],
     system_prompt: &Option<String>,
 ) -> bool {
-    let completion = match client
-        .chat_completion_with_tools(msg_json.clone(), tool_defs)
+    let completion = if client.base_url().starts_with("mcp://") {
+        let Some(mcp_cfg) = mcp else {
+            let _ = tx
+                .send(BridgeEvent::Error(
+                    "MCP config missing for sampling".to_string(),
+                ))
+                .await;
+            return false;
+        };
+        let target_label = client.base_url().strip_prefix("mcp://").unwrap_or("");
+        match call_mcp_sampling_routed(
+            mcp_cfg,
+            target_label,
+            msg_json.clone(),
+            system_prompt.as_deref(),
+        )
         .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let err_msg = e.to_string().to_lowercase();
-            if err_msg.contains("400")
-                || err_msg.contains("tool")
-                || err_msg.contains("not supported")
-            {
-                let _ = tx
-                    .send(BridgeEvent::Error(
-                        "Model does not support tools. Falling back to standard chat.".to_string(),
-                    ))
-                    .await;
-                spawn_chat_task(
-                    client.clone(),
-                    messages.to_vec(),
-                    system_prompt.clone(),
-                    mcp.clone(),
-                    tx.clone(),
-                );
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(BridgeEvent::Error(e)).await;
                 return false;
             }
-            let _ = tx.send(BridgeEvent::Error(e.to_string())).await;
-            return false;
+        }
+    } else {
+        match client
+            .chat_completion_with_tools(msg_json.clone(), tool_defs)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let err_msg = e.to_string().to_lowercase();
+                if err_msg.contains("400")
+                    || err_msg.contains("tool")
+                    || err_msg.contains("not supported")
+                {
+                    let _ = tx
+                        .send(BridgeEvent::Error(
+                            "Model does not support tools. Falling back to standard chat."
+                                .to_string(),
+                        ))
+                        .await;
+                    spawn_chat_task(
+                        client.clone(),
+                        messages.to_vec(),
+                        system_prompt.clone(),
+                        mcp.clone(),
+                        tx.clone(),
+                    );
+                    return false;
+                }
+                let _ = tx.send(BridgeEvent::Error(e.to_string())).await;
+                return false;
+            }
         }
     };
 
@@ -386,7 +565,7 @@ async fn spawn_local_tool_call(
     arguments: serde_json::Value,
 ) -> Result<(String, bool), String> {
     if is_local_default_server(&mcp.base_url) {
-        crate::connection::ensure_server_running()
+        crate::connection::ensure_server_running(Some(&mcp.workspace_root))
             .await
             .map_err(|e| format!("Failed to ensure bridge server is running: {e}"))?;
     }
@@ -490,7 +669,7 @@ pub fn spawn_tool_call_task(
             .await;
 
         if is_local_default_server(&mcp.base_url) {
-            let res = crate::connection::ensure_server_running().await;
+            let res = crate::connection::ensure_server_running(Some(&mcp.workspace_root)).await;
             if let Err(e) = res {
                 let _ = tx
                     .send(BridgeEvent::ToolCallFinished {
@@ -624,29 +803,37 @@ fn parse_mcp_response(json_resp: &serde_json::Value) -> (String, bool) {
             .unwrap_or(false));
 
     let content_str = if let Some(err) = json_resp.get("error") {
-        format!(
-            "Error: {}",
-            err.get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error")
-        )
+        parse_error_message(err)
     } else if let Some(res) = result_val {
-        if let Some(content_array) = res.get("content").and_then(|c| c.as_array()) {
-            let mut texts = Vec::new();
-            for item in content_array {
-                if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                    texts.push(t.to_string());
-                }
-            }
-            texts.join("\n")
-        } else {
-            serde_json::to_string_pretty(res).unwrap_or_default()
-        }
+        extract_content_text(res)
     } else {
         "Empty result".to_string()
     };
 
     (content_str, is_error)
+}
+
+fn parse_error_message(err: &serde_json::Value) -> String {
+    format!(
+        "Error: {}",
+        err.get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error")
+    )
+}
+
+fn extract_content_text(res: &serde_json::Value) -> String {
+    if let Some(content_array) = res.get("content").and_then(|c| c.as_array()) {
+        let mut texts = Vec::new();
+        for item in content_array {
+            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                texts.push(t.to_string());
+            }
+        }
+        texts.join("\n")
+    } else {
+        serde_json::to_string_pretty(res).unwrap_or_default()
+    }
 }
 
 async fn call_mcp_tool_http(

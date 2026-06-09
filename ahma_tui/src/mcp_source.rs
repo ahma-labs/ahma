@@ -47,6 +47,9 @@ pub enum SourceEvent {
         content: String,
         append: bool,
     },
+    InstancesUpdated {
+        instances: Vec<ahma_common::daemon_hub::InstanceInfo>,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -598,6 +598,42 @@ pub struct Operation {
     pub scope: Option<String>,
 }
 
+fn try_parse_run_terminal_command(description: &str, id: &str) -> Option<String> {
+    let get_cmd_json = || -> Option<String> {
+        let start_idx = description.find('{')?;
+        let end_idx = description.rfind('}')?;
+        if start_idx >= end_idx {
+            return None;
+        }
+        let val: serde_json::Value =
+            serde_json::from_str(&description[start_idx..=end_idx]).ok()?;
+        val.get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    if let Some(cmd) = get_cmd_json() {
+        return Some(cmd);
+    }
+
+    if description.starts_with("Execute ")
+        && let Some(in_idx) = description.rfind(" in ")
+    {
+        let cmd = &description["Execute ".len()..in_idx];
+        if !cmd.is_empty() {
+            return Some(cmd.to_string());
+        }
+    }
+
+    if id.starts_with("op_") {
+        let parts: Vec<&str> = id.split('_').collect();
+        if parts.len() >= 3 && parts[1].chars().all(|c| c.is_ascii_digit()) {
+            return Some(parts[2..].join(" ").replace('_', " "));
+        }
+    }
+
+    None
+}
+
 impl Operation {
     pub fn new(id: impl Into<String>, tool_name: impl Into<String>, status: OpStatus) -> Self {
         Self {
@@ -640,41 +676,10 @@ impl Operation {
     }
 
     pub fn display_name(&self) -> String {
-        if self.tool_name == "run_terminal_command" {
-            // Case 1: Structured JSON description (e.g. from local TUI runs)
-            let get_cmd_json = || -> Option<String> {
-                let start_idx = self.description.find('{')?;
-                let end_idx = self.description.rfind('}')?;
-                if start_idx >= end_idx {
-                    return None;
-                }
-                let val: serde_json::Value =
-                    serde_json::from_str(&self.description[start_idx..=end_idx]).ok()?;
-                val.get("command")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            };
-            if let Some(cmd) = get_cmd_json() {
-                return cmd;
-            }
-
-            // Case 2: "Execute <cmd> in <dir>" description from daemon_reporter
-            if self.description.starts_with("Execute ")
-                && let Some(in_idx) = self.description.rfind(" in ")
-            {
-                let cmd = &self.description["Execute ".len()..in_idx];
-                if !cmd.is_empty() {
-                    return cmd.to_string();
-                }
-            }
-
-            // Case 3: Try to extract details from the op_id as a fallback
-            if self.id.starts_with("op_") {
-                let parts: Vec<&str> = self.id.split('_').collect();
-                if parts.len() >= 3 && parts[1].chars().all(|c| c.is_ascii_digit()) {
-                    return parts[2..].join(" ").replace('_', " ");
-                }
-            }
+        if self.tool_name == "run_terminal_command"
+            && let Some(cmd) = try_parse_run_terminal_command(&self.description, &self.id)
+        {
+            return cmd;
         }
         self.tool_name.clone()
     }
@@ -878,6 +883,10 @@ pub struct AppState {
     pub mcp_enabled: bool,
     /// Discovered + configured providers.
     pub available_providers: Vec<ahma_llm_monitor::LocalProvider>,
+    /// Discovered providers (from probing/local discovery)
+    pub discovered_providers: Vec<ahma_llm_monitor::LocalProvider>,
+    /// Active instances registered with the daemon
+    pub active_instances: Vec<ahma_common::daemon_hub::InstanceInfo>,
     /// Available models for the current provider.
     pub available_models: Vec<String>,
     /// Chat scroll offset (lines from bottom = 0 is newest).
@@ -1030,6 +1039,8 @@ impl AppState {
             active_profile,
             mcp_enabled,
             available_providers: vec![],
+            discovered_providers: vec![],
+            active_instances: vec![],
             available_models: vec![],
             chat_scroll: 0,
             navigator: CommandNavigator::default(),
@@ -1167,6 +1178,22 @@ fn parse_word_len<I: Iterator<Item = char>>(
     word_len
 }
 
+fn handle_word_fit(current_line_len: &mut usize, lines: &mut usize, word_len: usize, width: usize) {
+    if *current_line_len + word_len <= width {
+        *current_line_len += word_len;
+    } else {
+        if *current_line_len > 0 {
+            *lines += 1;
+        }
+        let mut rem = word_len;
+        while rem > width {
+            *lines += 1;
+            rem -= width;
+        }
+        *current_line_len = rem;
+    }
+}
+
 #[cfg(feature = "tui")]
 fn count_wrapped_lines(line: &str, width: usize) -> usize {
     let width = width.max(1);
@@ -1186,19 +1213,7 @@ fn count_wrapped_lines(line: &str, width: usize) -> usize {
             }
         } else {
             let word_len = parse_word_len(c, &mut chars);
-            if current_line_len + word_len <= width {
-                current_line_len += word_len;
-            } else {
-                if current_line_len > 0 {
-                    lines += 1;
-                }
-                let mut rem = word_len;
-                while rem > width {
-                    lines += 1;
-                    rem -= width;
-                }
-                current_line_len = rem;
-            }
+            handle_word_fit(&mut current_line_len, &mut lines, word_len, width);
         }
     }
     if current_line_len > 0 {

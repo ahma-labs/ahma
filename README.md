@@ -258,6 +258,12 @@ The `ahma_core` crate exposes vaults, orchestration, egress, workers, and the re
 
 See [docs/ahma-core-library.md](docs/ahma-core-library.md).
 
+### Recursive Task Tree — LLM-orchestrated depth-first subtask execution
+
+The `ahma_task_tree` crate implements recursive task decomposition and execution, where complex goals are broken into a tree of LLM-planned subtasks interspersed with sandboxed shell tool calls.
+
+See [docs/recursive-task-tree.md](docs/recursive-task-tree.md).
+
 ## MCP Server Connection Modes
 
 `ahma` supports **STDIO** (default — IDE spawns a subprocess per workspace), **HTTP Bridge** (proxy for web clients and debugging), and **HTTP Streaming** (MCP Streamable HTTP with event replay and full-duplex).

@@ -9,8 +9,8 @@
 #   - Internet access to GitHub releases
 #
 # Version indicator for build script check:
-# -Version '0.11.13'
-# Install-OneSkill -Version '0.11.13'
+# -Version '0.11.14'
+# Install-OneSkill -Version '0.11.14'
 #
 # Environment variables:
 #   AHMA_INSTALL_DIR     - Override install directory (default: $HOME\.local\bin)
@@ -181,6 +181,10 @@ Actual:   $actualHash
 
     # Expand archive
     Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
+
+    # Clean up running instances to avoid locked files or stale running versions
+    Write-Host "Stopping running ahma processes..."
+    Get-Process -Name ahma, ahma-http-bridge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
     # ── Install binaries ───────────────────────────────────────────────────────
     Write-Host "Installing binaries to $installDir ..."

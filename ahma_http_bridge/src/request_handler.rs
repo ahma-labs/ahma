@@ -10,6 +10,7 @@ use axum::{
 use futures::stream::{self, StreamExt};
 use serde_json::Value;
 use std::{convert::Infallible, sync::Arc, time::Duration};
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, error, info, warn};
 
@@ -78,6 +79,151 @@ fn session_not_found_response() -> Response {
     )
 }
 
+async fn find_target_session_for_sampling(
+    session_manager: &SessionManager,
+    current_session_id: &str,
+    target_label: Option<&str>,
+) -> Option<Arc<crate::session::Session>> {
+    for s in session_manager.get_all_sessions() {
+        if s.id == current_session_id {
+            continue;
+        }
+
+        let has_sampling = {
+            let caps = s.capabilities.lock().await;
+            caps.as_ref().and_then(|c| c.get("sampling")).is_some()
+        };
+        if !has_sampling {
+            continue;
+        }
+
+        let is_match = if let Some(target) = target_label {
+            let info_guard = s.client_info.lock().await;
+            if let Some(info) = info_guard.as_ref() {
+                if let Some(name) = info.get("name").and_then(|n| n.as_str()) {
+                    name.to_lowercase().contains(&target.to_lowercase())
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+
+        if is_match {
+            return Some(s);
+        }
+    }
+
+    // Fallback: if label didn't match exactly, just return any session with sampling
+    if target_label.is_some() {
+        for s in session_manager.get_all_sessions() {
+            if s.id == current_session_id {
+                continue;
+            }
+            let has_sampling = {
+                let caps = s.capabilities.lock().await;
+                caps.as_ref().and_then(|c| c.get("sampling")).is_some()
+            };
+            if has_sampling {
+                return Some(s);
+            }
+        }
+    }
+
+    None
+}
+
+async fn handle_routed_sampling_request(
+    session_manager: &SessionManager,
+    session_id: &str,
+    payload: &Value,
+    is_sse: bool,
+) -> Response {
+    let params = payload.get("params");
+    let target_label = params
+        .and_then(|p| p.get("__route_target_label"))
+        .and_then(|l| l.as_str())
+        .map(String::from);
+
+    let target_session = match find_target_session_for_sampling(
+        session_manager,
+        session_id,
+        target_label.as_deref(),
+    )
+    .await
+    {
+        Some(s) => s,
+        None => {
+            let err_msg =
+                "No active IDE session (Cursor, VS Code, etc.) with sampling capability found. \
+                 Make sure your IDE is running and connected to ahma."
+                    .to_string();
+            return error_response(-32603, &err_msg);
+        }
+    };
+
+    // Acquire target session's sampling lock to serialize requests (concurrency limit of 1)
+    let _guard = target_session.sampling_lock.lock().await;
+
+    let routed_id = format!("route_{}", uuid::Uuid::new_v4());
+    let (tx, rx) = oneshot::channel();
+    target_session.routed_requests.insert(routed_id.clone(), tx);
+
+    let mut routed_payload = payload.clone();
+    routed_payload["id"] = serde_json::json!(routed_id);
+    if let Some(params_mut) = routed_payload
+        .get_mut("params")
+        .and_then(|p| p.as_object_mut())
+    {
+        params_mut.remove("__route_target_label");
+    }
+
+    let json_str = match serde_json::to_string(&routed_payload) {
+        Ok(s) => s,
+        Err(e) => {
+            target_session.routed_requests.remove(&routed_id);
+            return error_response(-32603, &format!("Failed to serialize routed payload: {e}"));
+        }
+    };
+
+    if target_session.broadcast(json_str).is_err() {
+        target_session.routed_requests.remove(&routed_id);
+        return error_response(-32603, "Target session's SSE channel is closed");
+    }
+
+    let timeout = Duration::from_secs(120);
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(response)) => {
+            let mut final_response = response;
+            final_response["id"] = payload
+                .get("id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if is_sse {
+                if let Some(session) = session_manager.get_session(session_id) {
+                    let (id, json_str) = session_sse_event(&session, &final_response);
+                    with_session_header(sse_single_event_response_with_id(id, json_str), session_id)
+                } else {
+                    with_session_header(
+                        sse_single_event_response_with_id(1, serialize_sse_data(&final_response)),
+                        session_id,
+                    )
+                }
+            } else {
+                with_session_header(json_response(final_response), session_id)
+            }
+        }
+        Ok(Err(_)) => error_response(-32603, "Routed request sender dropped"),
+        Err(_) => {
+            target_session.routed_requests.remove(&routed_id);
+            error_response(-32002, "Request timed out on the client side")
+        }
+    }
+}
+
 /// Handles requests in session isolation mode.
 #[tracing::instrument(skip_all, fields(method, session_id))]
 pub async fn handle_session_isolated_request(
@@ -99,6 +245,10 @@ pub async fn handle_session_isolated_request(
         return handle_initialize(&session_manager, &payload).await;
     }
     if let Some(session_id) = session_id {
+        if method == Some("sampling/createMessage") {
+            return handle_routed_sampling_request(&session_manager, &session_id, &payload, false)
+                .await;
+        }
         return handle_existing_session_request(&session_manager, &session_id, method, &payload)
             .await;
     }
@@ -141,6 +291,28 @@ async fn handle_initialize_error(
     error_response(-32603, &format!("Failed to initialize session: {}", error))
 }
 
+async fn register_session_details(
+    session_manager: &Arc<SessionManager>,
+    session_id: &str,
+    payload: &Value,
+) {
+    if let Some(session) = session_manager.get_session(session_id) {
+        *session.session_manager.lock().await = Some(Arc::downgrade(session_manager));
+
+        let client_info = payload
+            .get("params")
+            .and_then(|p| p.get("clientInfo"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let capabilities = payload
+            .get("params")
+            .and_then(|p| p.get("capabilities"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        session.set_client_info(client_info, capabilities).await;
+    }
+}
+
 /// Handles initialization requests by creating a new session.
 #[tracing::instrument(skip_all, fields(session_id))]
 async fn handle_initialize(session_manager: &Arc<SessionManager>, payload: &Value) -> Response {
@@ -165,6 +337,8 @@ async fn handle_initialize(session_manager: &Arc<SessionManager>, payload: &Valu
             return error_response(-32603, &format!("Failed to create session: {}", e));
         }
     };
+
+    register_session_details(session_manager, &new_session_id, payload).await;
 
     info!(session_id = %new_session_id, "Session created, forwarding initialize request");
     match session_manager
@@ -444,6 +618,21 @@ async fn handle_client_response(
     let response_id = payload.get("id");
     let has_result = payload.get("result").is_some();
     let has_error = payload.get("error").is_some();
+
+    if let Some(id_val) = response_id {
+        let id_str = id_val
+            .as_str()
+            .map_or_else(|| id_val.to_string(), str::to_string);
+        if let Some(session) = session_manager.get_session(session_id)
+            && let Some((_, sender)) = session.routed_requests.remove(&id_str)
+        {
+            let _ = sender.send(payload.clone());
+            return with_session_header(
+                json_response_with_status(StatusCode::ACCEPTED, serde_json::json!({})),
+                session_id,
+            );
+        }
+    }
 
     debug!(
         session_id = %session_id,
@@ -791,6 +980,10 @@ pub async fn handle_session_isolated_request_sse(
         return missing_session_id_response();
     };
 
+    if method == Some("sampling/createMessage") {
+        return handle_routed_sampling_request(&session_manager, &session_id, &payload, true).await;
+    }
+
     let is_initialized_notification = method == Some("notifications/initialized");
 
     if let Some(response) = check_sse_request_gating(
@@ -849,6 +1042,8 @@ async fn handle_initialize_sse(session_manager: &Arc<SessionManager>, payload: &
             return error_response(-32603, &format!("Failed to create session: {}", e));
         }
     };
+
+    register_session_details(session_manager, &new_session_id, payload).await;
 
     match session_manager
         .send_request(

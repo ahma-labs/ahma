@@ -54,27 +54,20 @@ struct Args {
     #[arg(long, global = true)]
     opentelemetry: Option<String>,
 
-    /// Path to a file containing the bearer token required on every request.
-    ///
-    /// The file should contain a single line with the secret token.
-    /// Using a file instead of `--token` avoids exposing the secret in `ps` output.
-    ///
-    /// **Required** when `--bind-addr` is not a loopback address.
+    /// Path to a file containing the bearer token required on every request. The file
+    /// should contain a single line with the secret token. Using a file instead of
+    /// `--token` avoids exposing the secret in `ps` output. Required when `--bind-addr` is non-loopback.
     #[arg(long, value_name = "PATH")]
     require_token: Option<PathBuf>,
 
-    /// Maximum request rate per client IP (requests/second).
-    ///
-    /// `0` disables rate limiting (default).  Once a client exceeds the limit,
-    /// subsequent requests receive HTTP 429 with a `Retry-After` header.
-    /// The `/health` endpoint is always exempt.
+    /// Maximum request rate per client IP (requests/second). `0` disables rate limiting.
+    /// Once a client exceeds the limit, subsequent requests receive HTTP 429.
     #[arg(long, default_value = "0")]
     rate_limit_rps: u64,
 
     /// Burst allowance for the per-IP token bucket (requests above the sustained
-    /// rate that are permitted before limiting kicks in).
-    ///
-    /// Defaults to `10`.  Only effective when `--rate-limit-rps > 0`.
+    /// rate permitted before limiting kicks in). Defaults to `50`. Only effective
+    /// when `--rate-limit-rps > 0`.
     #[arg(long, default_value = "50")]
     rate_limit_burst: u32,
 

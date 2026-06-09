@@ -1,6 +1,6 @@
 # Recursive Task Tree: LLM-Orchestrated Depth-First Execution
 
-> **Status**: Design document — not yet implemented.
+> **Status**: Implemented
 > This document describes the architecture for recursive task decomposition and execution in ahma,
 > where large jobs are broken into a tree of LLM-planned subtasks interspersed with sandboxed
 > shell tool calls, all within a single security scope.

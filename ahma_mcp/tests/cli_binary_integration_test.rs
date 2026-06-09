@@ -618,4 +618,74 @@ mod ahma_list_tools_mode_tests {
             stdout
         );
     }
+
+    #[test]
+    fn test_ahma_cluster_add_and_remove_peer() {
+        let binary = build_binary_cached("ahma_bin", "ahma");
+        let temp = tempfile::tempdir().unwrap();
+
+        // Add peer
+        let output = test_command(&binary)
+            .env("HOME", temp.path())
+            .env("USERPROFILE", temp.path())
+            .args([
+                "cluster",
+                "add-peer",
+                "--id",
+                "test-workstation",
+                "--addr",
+                "http://127.0.0.1:9090",
+                "--models",
+                "llama3.2,gemma",
+            ])
+            .output()
+            .expect("Failed to run ahma cluster add-peer");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "add-peer failed. stdout: {}, stderr: {}",
+            stdout,
+            stderr
+        );
+        assert!(stdout.contains("Added peer 'test-workstation'"));
+
+        // List peers
+        let list_output = test_command(&binary)
+            .env("HOME", temp.path())
+            .env("USERPROFILE", temp.path())
+            .args(["cluster", "list"])
+            .output()
+            .expect("Failed to run ahma cluster list");
+
+        let list_stdout = String::from_utf8_lossy(&list_output.stdout);
+        assert!(list_output.status.success());
+        assert!(list_stdout.contains("test-workstation"));
+        assert!(list_stdout.contains("http://127.0.0.1:9090"));
+
+        // Remove peer
+        let rm_output = test_command(&binary)
+            .env("HOME", temp.path())
+            .env("USERPROFILE", temp.path())
+            .args(["cluster", "remove", "test-workstation"])
+            .output()
+            .expect("Failed to run ahma cluster remove");
+
+        let rm_stdout = String::from_utf8_lossy(&rm_output.stdout);
+        assert!(rm_output.status.success(), "remove failed: {}", rm_stdout);
+        assert!(rm_stdout.contains("Removed peer 'test-workstation'"));
+
+        // List peers again (should be empty)
+        let list2_output = test_command(&binary)
+            .env("HOME", temp.path())
+            .env("USERPROFILE", temp.path())
+            .args(["cluster", "list"])
+            .output()
+            .expect("Failed to run ahma cluster list");
+
+        let list2_stdout = String::from_utf8_lossy(&list2_output.stdout);
+        assert!(list2_output.status.success());
+        assert!(list2_stdout.contains("No peers configured."));
+    }
 }

@@ -145,6 +145,11 @@ impl LlmClient {
         }
     }
 
+    /// Get the base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Analyse a chunk of log lines against the detection prompt.
     ///
     /// Returns `Ok(Some(summary))` if the LLM detected an issue, or `Ok(None)` if clean.
@@ -286,7 +291,7 @@ impl LlmClient {
             .http
             .post(format!("{}/chat/completions", self.base_url))
             .json(&body)
-            .timeout(Duration::from_secs(30));
+            .timeout(Duration::from_secs(120));
 
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);

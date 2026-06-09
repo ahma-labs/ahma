@@ -126,6 +126,8 @@ pub enum ClientMsg {
     Unregister,
     /// Liveness response to a hub [`DaemonMsg::Ping`].
     Pong { seq: u32 },
+    /// Ask the daemon to shut down and exit immediately.
+    Shutdown,
 }
 
 /// Message from the daemon to a subscriber (TUI).
@@ -277,6 +279,14 @@ pub async fn ensure_daemon_running() -> Result<()> {
     )
 }
 
+/// Stop the running hub daemon immediately.
+pub async fn stop_daemon() -> Result<()> {
+    if let Ok(mut stream) = connect_to_daemon().await {
+        send_msg(&mut stream, &ClientMsg::Shutdown).await?;
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Framing helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -316,16 +326,18 @@ struct DaemonHub {
     instances: Arc<Mutex<std::collections::HashMap<String, InstanceInfo>>>,
     broadcast: broadcast::Sender<DaemonMsg>,
     connection_count: Arc<AtomicUsize>,
+    socket_path: Option<PathBuf>,
 }
 
 impl DaemonHub {
-    fn new() -> (Self, broadcast::Receiver<DaemonMsg>) {
+    fn new(socket_path: Option<PathBuf>) -> (Self, broadcast::Receiver<DaemonMsg>) {
         let (tx, rx) = broadcast::channel(512);
         (
             Self {
                 instances: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 broadcast: tx,
                 connection_count: Arc::new(AtomicUsize::new(0)),
+                socket_path,
             },
             rx,
         )
@@ -358,7 +370,7 @@ pub async fn run_daemon_at(socket_path: PathBuf) -> Result<()> {
 
     info!("ahma daemon: listening on {}", socket_path.display());
 
-    let (hub, _) = DaemonHub::new();
+    let (hub, _) = DaemonHub::new(Some(socket_path.clone()));
     let hub = Arc::new(hub);
 
     // ── Idle-exit watcher ─────────────────────────────────────────────────────
@@ -457,7 +469,7 @@ pub async fn try_start_hub_server_at(socket_path: PathBuf) -> Result<Option<Embe
         socket_path.display()
     );
 
-    let (hub, _) = DaemonHub::new();
+    let (hub, _) = DaemonHub::new(Some(socket_path.clone()));
     let hub = Arc::new(hub);
     let broadcast = hub.broadcast.clone();
 
@@ -743,6 +755,15 @@ where
                 hub.instances.lock().await.values().cloned().collect();
             let _ = send_msg(&mut writer, &DaemonMsg::InstanceList { instances }).await;
             // One-shot query — connection closes after response.
+        }
+
+        ClientMsg::Shutdown => {
+            info!("daemon: shutdown requested, exiting");
+            if let Some(ref path) = hub.socket_path {
+                #[cfg(unix)]
+                let _ = std::fs::remove_file(path);
+            }
+            std::process::exit(0);
         }
 
         _ => {

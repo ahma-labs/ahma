@@ -627,7 +627,7 @@ fn spawn_server_process(exe: &std::path::Path, args: &[&str]) -> Result<()> {
 /// Ensure a local server is running by probing available local transports.
 /// If none is reachable, spawns a background `ahma serve unix` (on macOS/Linux)
 /// or `ahma serve http` (on Windows) and polls until healthy.
-pub async fn ensure_server_running() -> Result<()> {
+pub async fn ensure_server_running(scope_path: Option<&std::path::Path>) -> Result<()> {
     let client_version = env!("CARGO_PKG_VERSION");
     let candidates = default_candidates();
     for candidate in &candidates {
@@ -642,13 +642,31 @@ pub async fn ensure_server_running() -> Result<()> {
     }
 
     let exe = std::env::current_exe()?;
-    #[cfg(unix)]
-    let args = ["serve", "unix"];
-    #[cfg(not(unix))]
-    let args = ["serve", "http"];
+    let path_to_use = match scope_path {
+        Some(p) => Some(p.to_path_buf()),
+        None => std::env::current_dir().ok(),
+    };
 
-    tracing::info!("Spawning background server: {} {:?}", exe.display(), args);
-    spawn_server_process(&exe, &args)?;
+    let mut args = Vec::new();
+    args.push("serve".to_string());
+    #[cfg(unix)]
+    args.push("unix".to_string());
+    #[cfg(not(unix))]
+    args.push("http".to_string());
+
+    if let Some(ref path) = path_to_use {
+        args.push("--sandbox-scope".to_string());
+        args.push(path.to_string_lossy().into_owned());
+    }
+
+    let args_slices: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    tracing::info!(
+        "Spawning background server: {} {:?}",
+        exe.display(),
+        args_slices
+    );
+    spawn_server_process(&exe, &args_slices)?;
 
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_secs(2) {

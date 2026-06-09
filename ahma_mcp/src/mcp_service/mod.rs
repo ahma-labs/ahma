@@ -718,17 +718,18 @@ impl AhmaMcpService {
             .unwrap_or(false);
         #[allow(deprecated)]
         let sync_override = Self::sync_override_from_config(subcommand_config, tool_config);
-        let explicit_mode_str = arguments.get("execution_mode").and_then(|v| v.as_str());
 
         if self.force_synchronous || dynamic_blocking || sync_override == Some(true) {
-            crate::adapter::ExecutionMode::Synchronous
-        } else if sync_override == Some(false) {
-            crate::adapter::ExecutionMode::AsyncResultPush
-        } else if explicit_mode_str == Some("Synchronous") {
-            crate::adapter::ExecutionMode::Synchronous
-        } else {
-            crate::adapter::ExecutionMode::AsyncResultPush
+            return crate::adapter::ExecutionMode::Synchronous;
         }
+        if sync_override == Some(false) {
+            return crate::adapter::ExecutionMode::AsyncResultPush;
+        }
+        let explicit_mode_str = arguments.get("execution_mode").and_then(|v| v.as_str());
+        if explicit_mode_str == Some("Synchronous") {
+            return crate::adapter::ExecutionMode::Synchronous;
+        }
+        crate::adapter::ExecutionMode::AsyncResultPush
     }
 
     fn sync_tool_progress_description(base_command: &str, working_directory: &str) -> String {
@@ -1370,28 +1371,32 @@ impl AhmaMcpService {
         if let Some(base_url) = llm_base_url
             && let Some(model) = llm_model
         {
-            crate::config::LlmProviderConfig {
+            return crate::config::LlmProviderConfig {
                 base_url,
                 model,
                 api_key: llm_api_key,
-            }
-        } else {
-            let configs_lock = self.configs.read().unwrap();
-            let mut found_provider = None;
-            for config in configs_lock.values() {
-                if let Some(livelog) = &config.livelog {
-                    found_provider = Some(livelog.llm_provider.clone());
-                    break;
-                }
-            }
-            drop(configs_lock);
-
-            found_provider.unwrap_or_else(|| crate::config::LlmProviderConfig {
-                base_url: "http://localhost:11434/v1".to_string(),
-                model: "llama3.2".to_string(),
-                api_key: None,
-            })
+            };
         }
+
+        self.fallback_llm_provider()
+    }
+
+    fn fallback_llm_provider(&self) -> crate::config::LlmProviderConfig {
+        let configs_lock = self.configs.read().unwrap();
+        let mut found_provider = None;
+        for config in configs_lock.values() {
+            if let Some(livelog) = &config.livelog {
+                found_provider = Some(livelog.llm_provider.clone());
+                break;
+            }
+        }
+        drop(configs_lock);
+
+        found_provider.unwrap_or_else(|| crate::config::LlmProviderConfig {
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "llama3.2".to_string(),
+            api_key: None,
+        })
     }
 
     pub async fn handle_log_monitor(
@@ -1516,21 +1521,22 @@ impl AhmaMcpService {
     }
 
     fn get_extension_key(&self, config: &ToolConfig) -> Option<String> {
-        if config.tool_type == Some(crate::config::ToolType::Extension) {
-            if config.task_tree.is_some() {
-                return Some("task_tree".to_string());
-            }
-            if config.decompose.is_some() {
-                return Some("decompose".to_string());
-            }
-            if config.worker.is_some() {
-                return Some("worker".to_string());
-            }
-            let handlers = self.extension_handlers.read().unwrap();
-            for key in config.extra.keys() {
-                if handlers.contains_key(key) {
-                    return Some(key.clone());
-                }
+        if config.tool_type != Some(crate::config::ToolType::Extension) {
+            return None;
+        }
+        if config.task_tree.is_some() {
+            return Some("task_tree".to_string());
+        }
+        if config.decompose.is_some() {
+            return Some("decompose".to_string());
+        }
+        if config.worker.is_some() {
+            return Some("worker".to_string());
+        }
+        let handlers = self.extension_handlers.read().unwrap();
+        for key in config.extra.keys() {
+            if handlers.contains_key(key) {
+                return Some(key.clone());
             }
         }
         None
@@ -1543,19 +1549,19 @@ impl AhmaMcpService {
         config: ToolConfig,
         flattened_subcommand: Option<String>,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(key) = self.get_extension_key(&config) {
-            let handler_opt = self.extension_handlers.read().unwrap().get(&key).cloned();
-            if let Some(handler) = handler_opt {
-                return handler
-                    .call(
-                        params,
-                        context,
-                        config,
-                        self.adapter.clone(),
-                        self.operation_monitor.clone(),
-                    )
-                    .await;
-            }
+        let handler_opt = self
+            .get_extension_key(&config)
+            .and_then(|key| self.extension_handlers.read().unwrap().get(&key).cloned());
+        if let Some(handler) = handler_opt {
+            return handler
+                .call(
+                    params,
+                    context,
+                    config,
+                    self.adapter.clone(),
+                    self.operation_monitor.clone(),
+                )
+                .await;
         }
 
         if config.sequence.is_some() {

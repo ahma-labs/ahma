@@ -610,20 +610,36 @@ async fn cluster_auth_middleware(
 ///    }
 /// }
 /// ```
-fn spawn_idle_timeout_checker(timeout: u64, counter: Arc<std::sync::atomic::AtomicUsize>) {
+fn spawn_idle_timeout_checker(timeout: u64, state: Arc<BridgeState>) {
+    let session_manager = state.session_manager.clone();
+    let listener_kind = state.listener_kind.clone();
+    let counter = session_manager
+        .active_sessions
+        .clone()
+        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
     tokio::spawn(async move {
         let mut idle_duration = std::time::Duration::ZERO;
         let check_interval = std::time::Duration::from_secs(1);
         loop {
             tokio::time::sleep(check_interval).await;
-            if counter.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                idle_duration += check_interval;
-                if idle_duration.as_secs() >= timeout {
-                    tracing::info!("No active clients for {} seconds. Shutting down.", timeout);
-                    std::process::exit(0);
-                }
-            } else {
+            if counter.load(std::sync::atomic::Ordering::SeqCst) > 0 {
                 idle_duration = std::time::Duration::ZERO;
+                continue;
+            }
+
+            idle_duration += check_interval;
+            if idle_duration.as_secs() >= timeout {
+                tracing::info!("No active clients for {} seconds. Shutting down.", timeout);
+                session_manager
+                    .terminate_all(crate::session::SessionTerminationReason::Timeout)
+                    .await;
+                #[cfg(unix)]
+                if let ListenerKind::Unix(ref path) = listener_kind
+                    && !path.starts_with('\0')
+                {
+                    let _ = std::fs::remove_file(path);
+                }
+                std::process::exit(0);
             }
         }
     });
@@ -632,11 +648,6 @@ fn spawn_idle_timeout_checker(timeout: u64, counter: Arc<std::sync::atomic::Atom
 pub async fn start_bridge(mut config: BridgeConfig) -> Result<()> {
     if config.idle_timeout_secs.is_some() && config.active_sessions.is_none() {
         config.active_sessions = Some(Arc::new(std::sync::atomic::AtomicUsize::new(0)));
-    }
-    if let Some(timeout) = config.idle_timeout_secs
-        && let Some(counter) = config.active_sessions.clone()
-    {
-        spawn_idle_timeout_checker(timeout, counter);
     }
 
     #[cfg(unix)]
@@ -681,6 +692,25 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
 ///
 /// No-op on non-Unix platforms (Windows has no SIGHUP).
 #[cfg(unix)]
+fn reload_token_from_path(state: &BridgeState, p: &std::path::Path) {
+    match std::fs::read_to_string(p) {
+        Ok(raw) => {
+            let token = raw.trim().to_owned();
+            if token.is_empty() {
+                warn!(
+                    "Token file {} is empty after SIGHUP — keeping current token",
+                    p.display()
+                );
+            } else {
+                state.require_token.store(Some(Arc::new(token)));
+                info!("Bearer token reloaded from {} after SIGHUP", p.display());
+            }
+        }
+        Err(e) => warn!("Failed to reload token on SIGHUP from {}: {e}", p.display()),
+    }
+}
+
+#[cfg(unix)]
 fn maybe_install_sighup_handler(state: Arc<BridgeState>, path: Option<PathBuf>) {
     let Some(p) = path else { return };
     tokio::spawn(async move {
@@ -694,21 +724,7 @@ fn maybe_install_sighup_handler(state: Arc<BridgeState>, path: Option<PathBuf>) 
         info!("SIGHUP token reload enabled — watching {}", p.display());
         loop {
             sig.recv().await;
-            match std::fs::read_to_string(&p) {
-                Ok(raw) => {
-                    let token = raw.trim().to_owned();
-                    if token.is_empty() {
-                        warn!(
-                            "Token file {} is empty after SIGHUP — keeping current token",
-                            p.display()
-                        );
-                    } else {
-                        state.require_token.store(Some(Arc::new(token)));
-                        info!("Bearer token reloaded from {} after SIGHUP", p.display());
-                    }
-                }
-                Err(e) => warn!("Failed to reload token on SIGHUP from {}: {e}", p.display()),
-            }
+            reload_token_from_path(&state, &p);
         }
     });
 }
@@ -856,6 +872,11 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
 
     info!("Session isolation: ENABLED (always-on)");
     let state = build_bridge_state(&config);
+    if let Some(timeout) = config.idle_timeout_secs
+        && timeout > 0
+    {
+        spawn_idle_timeout_checker(timeout, state.clone());
+    }
     // Install SIGHUP handler for zero-downtime token rotation.
     maybe_install_sighup_handler(state.clone(), config.require_token_path.clone());
 
@@ -953,6 +974,11 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
     info!("Session isolation: ENABLED (always-on)");
 
     let state = build_bridge_state(&config);
+    if let Some(timeout) = config.idle_timeout_secs
+        && timeout > 0
+    {
+        spawn_idle_timeout_checker(timeout, state.clone());
+    }
     // Install SIGHUP handler for zero-downtime token rotation.
     maybe_install_sighup_handler(state.clone(), config.require_token_path.clone());
 
@@ -1107,7 +1133,11 @@ async fn health_check() -> impl IntoResponse {
 async fn handle_restart(State(state): State<Arc<BridgeState>>) -> impl IntoResponse {
     info!("Restart requested. Shutting down bridge process...");
     let listener_kind = state.listener_kind.clone();
+    let session_manager = state.session_manager.clone();
     tokio::spawn(async move {
+        session_manager
+            .terminate_all(crate::session::SessionTerminationReason::ClientRequested)
+            .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         #[cfg(unix)]
         if let ListenerKind::Unix(ref path) = listener_kind

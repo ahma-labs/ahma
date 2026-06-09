@@ -840,20 +840,7 @@ fn backspace_chat_input(state: &mut crate::state::AppState) {
     });
 }
 
-#[cfg(feature = "tui")]
-fn submit_chat_input(state: &mut crate::state::AppState) {
-    use crate::llm_bridge::{
-        spawn_agent_task, spawn_chat_task, spawn_decompose_task, spawn_window_cli_task,
-    };
-    use crate::state::{ChatEntry, LogEntry, LogLevel, TuiWindow};
-    use ahma_llm_monitor::client::LlmClient;
-
-    let text = state.chat_input_text().trim().to_string();
-    if text.is_empty() {
-        return;
-    }
-    state.clear_chat_input();
-
+fn maybe_close_window_shortcut(text: &str, state: &mut crate::state::AppState) -> bool {
     let lower = text.to_lowercase();
     if lower.starts_with('x')
         && !lower[1..].is_empty()
@@ -861,36 +848,49 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
         && let Ok(win_id) = lower[1..].parse::<usize>()
     {
         close_window_by_id(win_id, state);
-        return;
+        true
+    } else {
+        false
     }
+}
 
-    if text.starts_with('/') {
-        dispatch_nav_command(&text, state);
-        return;
-    }
-
-    let (base_url, model) = parse_llm_selection(state);
+fn maybe_decompose_goal(
+    text: &str,
+    base_url: &str,
+    model: &str,
+    state: &mut crate::state::AppState,
+) -> bool {
+    use crate::llm_bridge::spawn_decompose_task;
+    use crate::state::{LogEntry, LogLevel};
+    use ahma_llm_monitor::client::LlmClient;
 
     if let Some(stripped_goal) = text.strip_prefix('!') {
         let goal = stripped_goal.trim().to_string();
         if goal.is_empty() {
-            return;
+            return true;
         }
         if base_url.is_empty() {
             push_assistant_message(state, "No LLM configured. Use /provider to select one.");
-            return;
+            return true;
         }
         state.push_log(LogEntry {
             timestamp: chrono::Local::now(),
             level: LogLevel::Info,
             message: format!("Decomposing goal: {}", goal),
         });
-        let client = LlmClient::new(base_url, model, None);
+        let client = LlmClient::new(base_url.to_string(), model.to_string(), None);
         if let Some(tx) = &state.bridge_tx {
             spawn_decompose_task(client, goal, tx.clone());
         }
-        return;
+        true
+    } else {
+        false
     }
+}
+
+fn maybe_run_cli_command(text: &str, state: &mut crate::state::AppState) -> bool {
+    use crate::llm_bridge::spawn_window_cli_task;
+    use crate::state::TuiWindow;
 
     if let Some(stripped_cmd) = text
         .strip_prefix('%')
@@ -899,7 +899,7 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     {
         let cmd_str = stripped_cmd.trim().to_string();
         if cmd_str.is_empty() {
-            return;
+            return true;
         }
         let win_id = state.next_window_id;
         state.next_window_id = (state.next_window_id + 1) % 100;
@@ -936,6 +936,40 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
         if let Some(tx) = &state.bridge_tx {
             spawn_window_cli_task(win_id, cmd_str, working_dir, abort_rx, tx.clone());
         }
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(feature = "tui")]
+fn submit_chat_input(state: &mut crate::state::AppState) {
+    use crate::llm_bridge::{spawn_agent_task, spawn_chat_task};
+    use crate::state::ChatEntry;
+    use ahma_llm_monitor::client::LlmClient;
+
+    let text = state.chat_input_text().trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    state.clear_chat_input();
+
+    if maybe_close_window_shortcut(&text, state) {
+        return;
+    }
+
+    if text.starts_with('/') {
+        dispatch_nav_command(&text, state);
+        return;
+    }
+
+    let (base_url, model) = parse_llm_selection(state);
+
+    if maybe_decompose_goal(&text, &base_url, &model, state) {
+        return;
+    }
+
+    if maybe_run_cli_command(&text, state) {
         return;
     }
 
@@ -1527,6 +1561,82 @@ fn handle_tools_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
     true
 }
 
+fn handle_agent_list(cwd: &std::path::Path, state: &mut crate::state::AppState) {
+    match crate::agent_config::load_profiles(cwd) {
+        Ok(file) => {
+            if file.profiles.is_empty() {
+                push_assistant_message(state, "No saved agent profiles.");
+            } else {
+                let mut msg = String::from("Saved agent profiles:\n");
+                for name in file.profiles.keys() {
+                    msg.push_str(&format!("- {name}\n"));
+                }
+                push_assistant_message(state, msg.trim_end());
+            }
+        }
+        Err(e) => push_assistant_message(state, format!("Failed to load profiles: {e}")),
+    }
+}
+
+fn handle_agent_save(cwd: &std::path::Path, name: &str, state: &mut crate::state::AppState) {
+    let name = name.trim();
+    if name.is_empty() {
+        push_assistant_message(state, "Usage: /agent save <name>");
+        return;
+    }
+    let profile = crate::agent_config::AgentProfile {
+        name: name.to_string(),
+        model: state.selected_model(),
+        provider_url: state.current_provider_url.clone().unwrap_or_default(),
+        system_prompt: "Use tools when needed, prefer concise reasoning.".to_string(),
+        tool_approval: false,
+        max_turns: 8,
+        mcp_servers: state
+            .mcp_connections
+            .servers
+            .iter()
+            .map(|s| s.name.clone())
+            .collect(),
+    };
+    match crate::agent_config::upsert_profile(cwd, profile) {
+        Ok(()) => {
+            state.active_profile = Some(name.to_string());
+            push_assistant_message(state, format!("Saved profile `{name}`."));
+        }
+        Err(e) => push_assistant_message(state, format!("Failed to save profile: {e}")),
+    }
+}
+
+fn handle_agent_load(cwd: &std::path::Path, name: &str, state: &mut crate::state::AppState) {
+    let name = name.trim();
+    if name.is_empty() {
+        push_assistant_message(state, "Usage: /agent load <name>");
+        return;
+    }
+    match crate::agent_config::get_profile(cwd, name) {
+        Ok(profile) => {
+            state.active_profile = Some(profile.name.clone());
+            state.current_provider_url = Some(profile.provider_url);
+            state.llm_label = format!("profile:{name} / {}", profile.model);
+            push_assistant_message(state, format!("Loaded profile `{name}`."));
+        }
+        Err(e) => push_assistant_message(state, format!("Failed to load profile: {e}")),
+    }
+}
+
+fn handle_agent_delete(cwd: &std::path::Path, name: &str, state: &mut crate::state::AppState) {
+    let name = name.trim();
+    if name.is_empty() {
+        push_assistant_message(state, "Usage: /agent delete <name>");
+        return;
+    }
+    match crate::agent_config::delete_profile(cwd, name) {
+        Ok(true) => push_assistant_message(state, format!("Deleted profile `{name}`.")),
+        Ok(false) => push_assistant_message(state, format!("Profile `{name}` not found.")),
+        Err(e) => push_assistant_message(state, format!("Failed to delete profile: {e}")),
+    }
+}
+
 #[cfg(feature = "tui")]
 fn handle_agent_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     let Ok(cwd) = std::env::current_dir() else {
@@ -1535,82 +1645,22 @@ fn handle_agent_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
     };
 
     if cmd == "/agent list" {
-        match crate::agent_config::load_profiles(&cwd) {
-            Ok(file) => {
-                if file.profiles.is_empty() {
-                    push_assistant_message(state, "No saved agent profiles.");
-                } else {
-                    let mut msg = String::from("Saved agent profiles:\n");
-                    for name in file.profiles.keys() {
-                        msg.push_str(&format!("- {name}\n"));
-                    }
-                    push_assistant_message(state, msg.trim_end());
-                }
-            }
-            Err(e) => push_assistant_message(state, format!("Failed to load profiles: {e}")),
-        }
+        handle_agent_list(&cwd, state);
         return true;
     }
 
     if let Some(name) = cmd.strip_prefix("/agent save ") {
-        let name = name.trim();
-        if name.is_empty() {
-            push_assistant_message(state, "Usage: /agent save <name>");
-            return true;
-        }
-        let profile = crate::agent_config::AgentProfile {
-            name: name.to_string(),
-            model: state.selected_model(),
-            provider_url: state.current_provider_url.clone().unwrap_or_default(),
-            system_prompt: "Use tools when needed, prefer concise reasoning.".to_string(),
-            tool_approval: false,
-            max_turns: 8,
-            mcp_servers: state
-                .mcp_connections
-                .servers
-                .iter()
-                .map(|s| s.name.clone())
-                .collect(),
-        };
-        match crate::agent_config::upsert_profile(&cwd, profile) {
-            Ok(()) => {
-                state.active_profile = Some(name.to_string());
-                push_assistant_message(state, format!("Saved profile `{name}`."));
-            }
-            Err(e) => push_assistant_message(state, format!("Failed to save profile: {e}")),
-        }
+        handle_agent_save(&cwd, name, state);
         return true;
     }
 
     if let Some(name) = cmd.strip_prefix("/agent load ") {
-        let name = name.trim();
-        if name.is_empty() {
-            push_assistant_message(state, "Usage: /agent load <name>");
-            return true;
-        }
-        match crate::agent_config::get_profile(&cwd, name) {
-            Ok(profile) => {
-                state.active_profile = Some(profile.name.clone());
-                state.current_provider_url = Some(profile.provider_url);
-                state.llm_label = format!("profile:{name} / {}", profile.model);
-                push_assistant_message(state, format!("Loaded profile `{name}`."));
-            }
-            Err(e) => push_assistant_message(state, format!("Failed to load profile: {e}")),
-        }
+        handle_agent_load(&cwd, name, state);
         return true;
     }
 
     if let Some(name) = cmd.strip_prefix("/agent delete ") {
-        let name = name.trim();
-        if name.is_empty() {
-            push_assistant_message(state, "Usage: /agent delete <name>");
-            return true;
-        }
-        match crate::agent_config::delete_profile(&cwd, name) {
-            Ok(true) => push_assistant_message(state, format!("Deleted profile `{name}`.")),
-            Ok(false) => push_assistant_message(state, format!("Profile `{name}` not found.")),
-            Err(e) => push_assistant_message(state, format!("Failed to delete profile: {e}")),
-        }
+        handle_agent_delete(&cwd, name, state);
         return true;
     }
 
@@ -1977,21 +2027,97 @@ fn save_session(state: &crate::state::AppState) {
 // ─── Bridge event handler ─────────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
+fn virtual_provider_for_instance(label: &str) -> Option<ahma_llm_monitor::LocalProvider> {
+    let normalized = label.to_lowercase();
+    if normalized.contains("cursor") {
+        Some(ahma_llm_monitor::LocalProvider {
+            name: "Cursor (Sampling)".to_string(),
+            base_url: "mcp://Cursor".to_string(),
+            models: vec![
+                "Claude 3.5 Sonnet (IDE subscription)".to_string(),
+                "GPT-4o (IDE subscription)".to_string(),
+                "Gemini 1.5 Pro (IDE subscription)".to_string(),
+            ],
+        })
+    } else if normalized.contains("vscode")
+        || normalized.contains("vs code")
+        || normalized.contains("visual studio code")
+    {
+        Some(ahma_llm_monitor::LocalProvider {
+            name: "VS Code (Sampling)".to_string(),
+            base_url: "mcp://VS Code".to_string(),
+            models: vec![
+                "Claude 3.5 Sonnet (IDE subscription)".to_string(),
+                "GPT-4o (IDE subscription)".to_string(),
+                "Gemini 1.5 Pro (IDE subscription)".to_string(),
+            ],
+        })
+    } else if normalized.contains("antigravity") {
+        Some(ahma_llm_monitor::LocalProvider {
+            name: "Antigravity (Sampling)".to_string(),
+            base_url: "mcp://Antigravity".to_string(),
+            models: vec![
+                "Gemini 1.5 Pro (Google Cloud bill)".to_string(),
+                "Gemini 1.5 Flash (Google Cloud bill)".to_string(),
+            ],
+        })
+    } else if normalized.contains("claude") {
+        Some(ahma_llm_monitor::LocalProvider {
+            name: "Claude Code (Sampling)".to_string(),
+            base_url: "mcp://Claude Code".to_string(),
+            models: vec![
+                "Claude 3.5 Sonnet (Anthropic API bill)".to_string(),
+                "Claude 3 Opus (Anthropic API bill)".to_string(),
+            ],
+        })
+    } else {
+        Some(ahma_llm_monitor::LocalProvider {
+            name: format!("{label} (Sampling)"),
+            base_url: format!("mcp://{label}"),
+            models: vec!["Default Model (IDE subscription)".to_string()],
+        })
+    }
+}
+
+#[cfg(feature = "tui")]
+fn rebuild_available_providers(state: &mut crate::state::AppState) {
+    let mut combined = state.discovered_providers.clone();
+    for inst in &state.active_instances {
+        if let Some(virtual_provider) = virtual_provider_for_instance(&inst.label)
+            && !combined.iter().any(|p| p.name == virtual_provider.name)
+        {
+            combined.push(virtual_provider);
+        }
+    }
+    state.available_providers = combined;
+}
+
+#[cfg(feature = "tui")]
+fn handle_instances_updated(
+    instances: Vec<ahma_common::daemon_hub::InstanceInfo>,
+    state: &mut crate::state::AppState,
+) {
+    state.active_instances = instances;
+    rebuild_available_providers(state);
+}
+
+#[cfg(feature = "tui")]
 fn handle_providers_discovered(
     providers: Vec<ahma_llm_monitor::LocalProvider>,
     state: &mut crate::state::AppState,
 ) {
-    state.available_providers = providers.clone();
+    state.discovered_providers = providers.clone();
+    rebuild_available_providers(state);
 
     if state.llm_label == "no LLM" {
-        if let Some(provider) = providers.first() {
-            auto_select_first_provider(state, provider);
+        if let Some(provider) = state.available_providers.first().cloned() {
+            auto_select_first_provider(state, &provider);
         }
         return;
     }
 
     if let Some(current_url) = state.current_provider_url.clone() {
-        refresh_current_provider_models(state, &providers, &current_url);
+        refresh_current_provider_models(state, &current_url);
     }
 }
 
@@ -2008,15 +2134,16 @@ fn auto_select_first_provider(
 }
 
 #[cfg(feature = "tui")]
-fn refresh_current_provider_models(
-    state: &mut crate::state::AppState,
-    providers: &[ahma_llm_monitor::LocalProvider],
-    current_url: &str,
-) {
-    let Some(provider) = providers.iter().find(|p| p.base_url == current_url) else {
+fn refresh_current_provider_models(state: &mut crate::state::AppState, current_url: &str) {
+    let Some(provider) = state
+        .available_providers
+        .iter()
+        .find(|p| p.base_url == current_url)
+        .cloned()
+    else {
         return;
     };
-    state.available_models = provider.models.clone();
+    state.available_models = provider.models;
     let model = state.selected_model();
     if !model.is_empty() {
         state.llm_label = format!("{} / {}", provider.name, model);
@@ -2266,44 +2393,47 @@ fn clean_up_summary(summary: &str) -> String {
     summary.to_string()
 }
 
+fn extract_args_summary(tool_name: &str, description: &str) -> Option<String> {
+    let start_idx = description.find('{')?;
+    let end_idx = description.rfind('}')?;
+    if start_idx >= end_idx {
+        return None;
+    }
+    let val = serde_json::from_str::<serde_json::Value>(&description[start_idx..=end_idx]).ok()?;
+    let obj = val.as_object()?;
+    if tool_name == "run_terminal_command" {
+        obj.get("command")
+            .and_then(|v| v.as_str())
+            .map(|cmd| format!("command: {cmd}"))
+    } else {
+        let parts: Vec<String> = obj
+            .iter()
+            .filter(|(k, _)| {
+                *k != "working_directory" && *k != "working_dir" && *k != "synchronous"
+            })
+            .map(|(k, v)| {
+                let val_str = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => v.to_string(),
+                };
+                format!("{k}={val_str}")
+            })
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(", "))
+        }
+    }
+}
+
 #[cfg(feature = "tui")]
 fn format_friendly_start(
     tool_name: &str,
     description: &str,
     start_time: chrono::DateTime<chrono::Local>,
 ) -> String {
-    let mut args_summary = String::new();
-    if let Some(start_idx) = description.find('{')
-        && let Some(end_idx) = description.rfind('}')
-        && start_idx < end_idx
-        && let Ok(val) =
-            serde_json::from_str::<serde_json::Value>(&description[start_idx..=end_idx])
-        && let Some(obj) = val.as_object()
-    {
-        if tool_name == "run_terminal_command" {
-            if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
-                args_summary = format!("command: {cmd}");
-            }
-        } else {
-            let parts: Vec<String> = obj
-                .iter()
-                .filter(|(k, _)| {
-                    *k != "working_directory" && *k != "working_dir" && *k != "synchronous"
-                })
-                .map(|(k, v)| {
-                    let val_str = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        _ => v.to_string(),
-                    };
-                    format!("{k}={val_str}")
-                })
-                .collect();
-            if !parts.is_empty() {
-                args_summary = parts.join(", ");
-            }
-        }
-    }
-
+    let args_summary = extract_args_summary(tool_name, description).unwrap_or_default();
     let time_str = start_time.format("%H:%M:%S").to_string();
     if args_summary.is_empty() {
         format!("Starting {tool_name} at {time_str}")
@@ -2591,6 +2721,9 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         } => {
             handle_event_log_lines_updated(file, content, append, state);
         }
+        SourceEvent::InstancesUpdated { instances } => {
+            handle_instances_updated(instances, state);
+        }
     }
 }
 
@@ -2682,14 +2815,8 @@ fn close_window_by_id(win_id: usize, state: &mut crate::state::AppState) {
     }
 }
 
-#[cfg(feature = "tui")]
-fn handle_monitor_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
-    if !cmd.starts_with("/monitor file ") {
-        return false;
-    }
-
-    let rest = cmd.strip_prefix("/monitor file ").unwrap().trim();
-    let (path, prompt) = if rest.starts_with('"') {
+fn parse_monitor_path_and_prompt(rest: &str) -> (String, String) {
+    if rest.starts_with('"') {
         let mut chars = rest.chars().skip(1);
         let mut path_str = String::new();
         let mut closed = false;
@@ -2710,7 +2837,17 @@ fn handle_monitor_nav_command(cmd: &str, state: &mut crate::state::AppState) -> 
         let path = parts[0].to_string();
         let prompt = parts.get(1).map(|&s| s.to_string()).unwrap_or_default();
         (path, prompt)
-    };
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_monitor_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    if !cmd.starts_with("/monitor file ") {
+        return false;
+    }
+
+    let rest = cmd.strip_prefix("/monitor file ").unwrap().trim();
+    let (path, prompt) = parse_monitor_path_and_prompt(rest);
 
     if path.is_empty() {
         push_assistant_message(state, "Usage: /monitor file <path> [prompt]");
@@ -3024,10 +3161,7 @@ fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::A
     }
 }
 
-#[cfg(feature = "tui")]
-fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
-    let mut scrolled_panel = None;
-
+fn determine_scrolled_panel(state: &crate::state::AppState) -> &'static str {
     if let Some((col, row)) = state.last_mouse_pos.get() {
         let chat_area = state.chat_area.get();
         let log_area = state.log_area.get();
@@ -3037,23 +3171,27 @@ fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
             && row >= chat_area.y
             && row < chat_area.y + chat_area.height
         {
-            scrolled_panel = Some("chat");
-        } else if col >= log_area.x
+            return "chat";
+        }
+        if col >= log_area.x
             && col < log_area.x + log_area.width
             && row >= log_area.y
             && row < log_area.y + log_area.height
         {
-            scrolled_panel = Some("log");
+            return "log";
         }
     }
 
-    let panel = scrolled_panel.unwrap_or_else(|| {
-        if state.mode == crate::state::Mode::Monitor && state.focus == crate::state::Focus::Log {
-            "log"
-        } else {
-            "chat"
-        }
-    });
+    if state.mode == crate::state::Mode::Monitor && state.focus == crate::state::Focus::Log {
+        "log"
+    } else {
+        "chat"
+    }
+}
+
+#[cfg(feature = "tui")]
+fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
+    let panel = determine_scrolled_panel(state);
 
     if panel == "chat" {
         let height = state.chat_area.get().height;
