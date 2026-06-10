@@ -1062,12 +1062,7 @@ fn build_system_prompt(state: &crate::state::AppState) -> String {
     }
 
     // Recent operations (last 5, most recent first).
-    let recent_ops: Vec<&crate::state::Operation> = state
-        .operations
-        .iter()
-        .rev()
-        .take(5)
-        .collect();
+    let recent_ops: Vec<&crate::state::Operation> = state.operations.iter().rev().take(5).collect();
 
     if !recent_ops.is_empty() {
         ctx.push_str("\nRecent operations:\n");
@@ -1104,7 +1099,11 @@ fn build_system_prompt(state: &crate::state::AppState) -> String {
     if !failures.is_empty() {
         ctx.push_str("\nRecent failures (tail output):\n");
         for op in &failures {
-            ctx.push_str(&format!("  {} ({}):\n", op.display_name(), op.elapsed_display()));
+            ctx.push_str(&format!(
+                "  {} ({}):\n",
+                op.display_name(),
+                op.elapsed_display()
+            ));
             let tail: Vec<&str> = op
                 .stdout_tail
                 .iter()

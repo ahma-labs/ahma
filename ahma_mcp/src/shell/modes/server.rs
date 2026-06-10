@@ -453,15 +453,14 @@ fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf])
         );
     }
 
-    if config.explicit_tools_dir {
-        if let Some(ref tools_dir) = config.tools_dir {
+    if config.explicit_tools_dir
+        && let Some(ref tools_dir) = config.tools_dir {
             push_val(
                 &mut args,
                 "--tools-dir",
                 tools_dir.to_string_lossy().to_string(),
             );
         }
-    }
 
     if let Some(ref task_vault) = config.task_vault {
         push_val(

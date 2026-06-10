@@ -752,7 +752,16 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
                     "Timed out waiting for exclusive cargo lock after {GATE_TIMEOUT_SECS}s. \
                      Another cargo operation is still running. Try again after it completes."
                 );
-                fail_operation_with_error(&monitor, &callback, &op_id, &command, &working_dir, 0, err.clone()).await;
+                fail_operation_with_error(
+                    &monitor,
+                    &callback,
+                    &op_id,
+                    &command,
+                    &working_dir,
+                    0,
+                    err.clone(),
+                )
+                .await;
                 event_dispatcher.emit(OperationEvent::Failed {
                     operation_id: op_id.clone(),
                     error: err,

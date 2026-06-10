@@ -82,11 +82,41 @@ pub fn detect_log_role_from_startup() -> &'static str {
     }
 }
 
-/// Project log directory: `<cwd>/logs`.
+/// Project log directory: `<cwd>/logs`, falling back to `~/.ahma/logs` if CWD is unwriteable or is root.
 pub fn project_log_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("logs")
+    if let Ok(val) = std::env::var("AHMA_LOG_DIR")
+        && !val.is_empty()
+    {
+        return PathBuf::from(val);
+    }
+
+    if let Ok(cwd) = std::env::current_dir()
+        && cwd.parent().is_some()
+    {
+        let log_dir = cwd.join("logs");
+        let exists_and_writeable = log_dir.exists() && is_writeable(&log_dir);
+        let can_create = !log_dir.exists() && is_writeable(&cwd);
+        if exists_and_writeable || can_create {
+            return log_dir;
+        }
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".ahma").join("logs");
+    }
+
+    PathBuf::from(".").join("logs")
+}
+
+fn is_writeable(path: &Path) -> bool {
+    let test_file = path.join(".ahma_write_test");
+    match std::fs::write(&test_file, "test") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&test_file);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Paths for background bridge stdout/stderr capture under [`project_log_dir`].
@@ -417,6 +447,45 @@ mod tests {
         fs::write(&path, "0123456789").unwrap();
         let tail = read_log_tail(&path, 4);
         assert_eq!(tail, "6789");
+    }
+
+    #[test]
+    fn test_project_log_dir_env_override() {
+        unsafe {
+            std::env::set_var("AHMA_LOG_DIR", "/custom/log/dir");
+        }
+        let dir = project_log_dir();
+        unsafe {
+            std::env::remove_var("AHMA_LOG_DIR");
+        }
+        assert_eq!(dir, PathBuf::from("/custom/log/dir"));
+    }
+
+    #[test]
+    fn test_project_log_dir_cwd_writeable() {
+        let temp = tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let dir = project_log_dir();
+        assert_eq!(dir, temp.path().join("logs"));
+
+        let _ = std::env::set_current_dir(prev);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_project_log_dir_cwd_root_fallback() {
+        let prev = std::env::current_dir().unwrap();
+        if std::env::set_current_dir(Path::new("/")).is_ok() {
+            let dir = project_log_dir();
+            if let Some(home) = dirs::home_dir() {
+                assert_eq!(dir, home.join(".ahma").join("logs"));
+            } else {
+                assert_eq!(dir, PathBuf::from(".").join("logs"));
+            }
+            let _ = std::env::set_current_dir(prev);
+        }
     }
 
     fn role_for_args(args: &[&str]) -> &'static str {
