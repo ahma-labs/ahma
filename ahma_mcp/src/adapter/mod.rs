@@ -1094,6 +1094,8 @@ async fn execute_batch(
 
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the first (immediate) tick so heartbeats start at t+10s, not t+0.
+    interval.tick().await;
     let mut elapsed_secs: u64 = 0;
 
     // Drive the child process.  `child.wait()` borrows `child` mutably but
@@ -1334,6 +1336,8 @@ async fn execute_with_streaming(
 
     let mut still_running_interval = tokio::time::interval(Duration::from_secs(10));
     still_running_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the first (immediate) tick so heartbeats start at t+10s, not t+0.
+    still_running_interval.tick().await;
     let mut elapsed_secs = 0;
 
     loop {
