@@ -148,7 +148,10 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
         })?
         .to_string();
 
-    let resp_bytes = response.bytes().await.context("Failed to read initialize response body")?;
+    let resp_bytes = response
+        .bytes()
+        .await
+        .context("Failed to read initialize response body")?;
     let resp_msg: TxJsonRpcMessage<RoleServer> =
         serde_json::from_slice(&resp_bytes).context("Failed to parse initialize response JSON")?;
     stdio

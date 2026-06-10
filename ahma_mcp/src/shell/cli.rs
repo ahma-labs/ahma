@@ -25,9 +25,7 @@ use super::{list_tools, modes, resolution};
 
 use crate::{
     sandbox,
-    utils::logging::{
-        detect_log_role_from_startup, init_logging_with_observability, set_log_role,
-    },
+    utils::logging::{detect_log_role_from_startup, init_logging_with_observability, set_log_role},
 };
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -854,30 +852,27 @@ fn handle_prompts_init(force: bool, project: bool, path: Option<PathBuf>) -> Res
     Ok(())
 }
 
+fn load_prompts_from_path(path: &std::path::Path) -> Option<ahma_common::prompts::AhmaPrompts> {
+    if !path.exists() {
+        return None;
+    }
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| toml::from_str(&c).ok())
+}
+
 fn handle_prompts_show() -> Result<()> {
     use ahma_common::prompts::{AhmaPrompts, global_prompts_path};
-    use std::fs;
 
     let s = AhmaPrompts::load();
 
-    let mut global_p = AhmaPrompts::default();
-    if let Some(parsed) = global_prompts_path()
-        .filter(|p| p.exists())
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|c| toml::from_str::<AhmaPrompts>(&c).ok())
-    {
-        global_p = parsed;
-    }
+    let global_p = global_prompts_path()
+        .as_deref()
+        .and_then(load_prompts_from_path)
+        .unwrap_or_default();
 
-    let mut local_p = AhmaPrompts::default();
     let local_path = PathBuf::from(".ahma").join("prompts.toml");
-    if let Some(parsed) = Some(&local_path)
-        .filter(|p| p.exists())
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|c| toml::from_str::<AhmaPrompts>(&c).ok())
-    {
-        local_p = parsed;
-    }
+    let local_p = load_prompts_from_path(&local_path).unwrap_or_default();
 
     println!("# Effective Ahma LLM Prompts");
     println!(
@@ -2084,51 +2079,47 @@ struct ToolFields {
     run_tool_args: Vec<String>,
 }
 
+fn default_tool_fields() -> ToolFields {
+    ToolFields {
+        list_server: None,
+        mcp_config: PathBuf::from("mcp.json"),
+        list_http: None,
+        list_format: list_tools::OutputFormat::Text,
+        run_tool: None,
+        run_tool_args: vec![],
+    }
+}
+
 fn extract_tool_fields(cmd: &Subcommands) -> ToolFields {
-    if let Subcommands::Tool(ToolArgs { command }) = cmd {
-        match command {
-            ToolCommand::List(la) => {
-                let mut run_tool = None;
-                let mut run_tool_args = vec![];
-                if !la.server_args.is_empty() {
-                    run_tool = Some(la.server_args[0].clone());
-                    run_tool_args = la.server_args[1..].to_vec();
-                }
-                ToolFields {
-                    list_server: la.server.clone(),
-                    mcp_config: la.mcp_config.clone(),
-                    list_http: la.http.clone(),
-                    list_format: la.format.clone(),
-                    run_tool,
-                    run_tool_args,
-                }
+    let Subcommands::Tool(ToolArgs { command }) = cmd else {
+        return default_tool_fields();
+    };
+    match command {
+        ToolCommand::List(la) => {
+            let mut run_tool = None;
+            let mut run_tool_args = vec![];
+            if !la.server_args.is_empty() {
+                run_tool = Some(la.server_args[0].clone());
+                run_tool_args = la.server_args[1..].to_vec();
             }
-            ToolCommand::Run(r) => ToolFields {
-                list_server: None,
-                mcp_config: PathBuf::from("mcp.json"),
-                list_http: None,
-                list_format: list_tools::OutputFormat::Text,
-                run_tool: Some(r.tool.clone()),
-                run_tool_args: r.tool_args.clone(),
-            },
-            _ => ToolFields {
-                list_server: None,
-                mcp_config: PathBuf::from("mcp.json"),
-                list_http: None,
-                list_format: list_tools::OutputFormat::Text,
-                run_tool: None,
-                run_tool_args: vec![],
-            },
+            ToolFields {
+                list_server: la.server.clone(),
+                mcp_config: la.mcp_config.clone(),
+                list_http: la.http.clone(),
+                list_format: la.format.clone(),
+                run_tool,
+                run_tool_args,
+            }
         }
-    } else {
-        ToolFields {
+        ToolCommand::Run(r) => ToolFields {
             list_server: None,
             mcp_config: PathBuf::from("mcp.json"),
             list_http: None,
             list_format: list_tools::OutputFormat::Text,
-            run_tool: None,
-            run_tool_args: vec![],
-        }
+            run_tool: Some(r.tool.clone()),
+            run_tool_args: r.tool_args.clone(),
+        },
+        _ => default_tool_fields(),
     }
 }
 

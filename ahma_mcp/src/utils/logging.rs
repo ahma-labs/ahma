@@ -13,8 +13,7 @@ use std::{
 use tracing_subscriber::{
     EnvFilter,
     fmt::{
-        self,
-        FmtContext,
+        self, FmtContext,
         format::{FormatEvent, Writer},
         time::SystemTime,
     },
@@ -93,10 +92,7 @@ pub fn project_log_dir() -> PathBuf {
 /// Paths for background bridge stdout/stderr capture under [`project_log_dir`].
 pub fn bridge_capture_paths() -> (PathBuf, PathBuf) {
     let dir = project_log_dir();
-    (
-        dir.join(BRIDGE_STDOUT_NAME),
-        dir.join(BRIDGE_STDERR_NAME),
-    )
+    (dir.join(BRIDGE_STDOUT_NAME), dir.join(BRIDGE_STDERR_NAME))
 }
 
 /// Ensure `logs/` exists, prune stale files, and create bridge capture files with a header.
@@ -170,12 +166,7 @@ where
         mut writer: Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> std::fmt::Result {
-        write!(
-            writer,
-            "pid={} role={} ",
-            std::process::id(),
-            log_role()
-        )?;
+        write!(writer, "pid={} role={} ", std::process::id(), log_role())?;
         self.inner.format_event(ctx, writer, event)
     }
 }

@@ -2255,6 +2255,32 @@ fn draw_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
 // ─── Help overlay ─────────────────────────────────────────────────────────────
 
+/// Format a slice of (key, description) pairs into styled [`Line`]s.
+///
+/// `key_width` controls the left-column padding so two-column and single-column
+/// layouts can each use the width that fits their available space.
+#[cfg(feature = "tui")]
+fn format_help_rows<'a>(
+    rows: &[(&'a str, &'a str)],
+    key_width: usize,
+    theme: &Theme,
+) -> Vec<Line<'a>> {
+    rows.iter()
+        .map(|(key, desc)| {
+            if key.is_empty() {
+                Line::default()
+            } else if desc.is_empty() {
+                Line::from(Span::styled(format!(" {key}"), theme.title()))
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("  {:<key_width$}", key), theme.footer_key()),
+                    Span::styled(desc.to_string(), theme.normal()),
+                ])
+            }
+        })
+        .collect()
+}
+
 #[cfg(feature = "tui")]
 fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
     let use_two_columns = area.width >= 100;
@@ -2418,25 +2444,8 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ])
         .split(inner);
 
-        let format_rows = |rows: &[(&str, &str)]| -> Vec<Line> {
-            rows.iter()
-                .map(|(key, desc)| {
-                    if key.is_empty() {
-                        Line::default()
-                    } else if desc.is_empty() {
-                        Line::from(Span::styled(format!(" {key}"), theme.title()))
-                    } else {
-                        Line::from(vec![
-                            Span::styled(format!("  {:<21}", key), theme.footer_key()),
-                            Span::styled(desc.to_string(), theme.normal()),
-                        ])
-                    }
-                })
-                .collect()
-        };
-
-        let left_lines = format_rows(left_rows);
-        let right_lines = format_rows(right_rows);
+        let left_lines = format_help_rows(left_rows, 21, theme);
+        let right_lines = format_help_rows(right_rows, 21, theme);
 
         let left_para = Paragraph::new(Text::from(left_lines)).wrap(Wrap { trim: false });
         let right_para = Paragraph::new(Text::from(right_lines)).wrap(Wrap { trim: false });
@@ -2449,22 +2458,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         frame.render_widget(sep, chunks[1]);
         frame.render_widget(right_para, chunks[2]);
     } else {
-        let lines: Vec<Line> = single_rows
-            .iter()
-            .map(|(key, desc)| {
-                if key.is_empty() {
-                    Line::default()
-                } else if desc.is_empty() {
-                    Line::from(Span::styled(format!(" {key}"), theme.title()))
-                } else {
-                    Line::from(vec![
-                        Span::styled(format!("  {:<24}", key), theme.footer_key()),
-                        Span::styled(desc.to_string(), theme.normal()),
-                    ])
-                }
-            })
-            .collect();
-
+        let lines = format_help_rows(single_rows, 24, theme);
         let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
         frame.render_widget(para, inner);
     }
