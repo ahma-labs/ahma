@@ -1,7 +1,7 @@
 //! Automatic Async Integration Tests
 //!
 //! Tests that verify the "automatic async" feature: when an async operation
-//! completes within `AUTOMATIC_ASYNC_TIMEOUT_SECS` (5 seconds), the result
+//! completes within `AUTOMATIC_ASYNC_TIMEOUT_SECS` (2 seconds), the result
 //! is returned inline instead of requiring a separate `await` call.
 
 use ahma_mcp::test_utils::client::ClientBuilder;
@@ -159,14 +159,15 @@ async fn test_automatic_async_slow_command_returns_async_id() -> Result<()> {
         all_text
     );
 
-    // Should have waited approximately AUTOMATIC_ASYNC_TIMEOUT_SECS (5s) before returning
+    // Should have waited approximately AUTOMATIC_ASYNC_TIMEOUT_SECS (2s) before returning.
+    // We allow a 1s lower bound to tolerate slow CI runners.
     assert!(
-        duration.as_secs() >= 4,
-        "Should have waited ~5 seconds before returning async ID. Actual: {:.1}s",
+        duration.as_secs() >= 1,
+        "Should have waited ~2 seconds before returning async ID. Actual: {:.1}s",
         duration.as_secs_f64()
     );
     assert!(
-        duration.as_secs() <= 10,
+        duration.as_secs() <= 8,
         "Should not have waited too long. Actual: {:.1}s",
         duration.as_secs_f64()
     );

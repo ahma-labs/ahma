@@ -126,6 +126,12 @@ async fn mcp_source_task(
     let mut prev_status_ok = true;
     let mut mcp_state: Option<McpSession> = None;
 
+    // Backoff state for MCP session init failures.  After each consecutive
+    // failure the wait grows (1 s → 3 s → 8 s → 20 s → 60 s cap) to avoid
+    // flooding the server with 409/403 during startup.
+    let mut init_fail_count: u32 = 0;
+    let mut next_init_attempt = tokio::time::Instant::now();
+
     let mut active_log_file: Option<String> = None;
     let mut last_read_file: Option<String> = None;
     let mut last_read_offset: usize = 0;
@@ -188,10 +194,14 @@ async fn mcp_source_task(
                         level: if healthy { LogLevel::Info } else { LogLevel::Warn },
                         message: msg,
                     })).await;
-                    // Reset MCP session on disconnect
+                    // Reset MCP session on disconnect; reset backoff on reconnect.
                     if !healthy {
                         mcp_state = None;
                         prev_status_ok = true;
+                    } else {
+                        // Fresh connection — allow immediate init attempt.
+                        init_fail_count = 0;
+                        next_init_attempt = tokio::time::Instant::now();
                     }
                 }
             }
@@ -199,10 +209,15 @@ async fn mcp_source_task(
             _ = status_tick.tick() => {
                 if !prev_healthy { continue; }
 
-                // Ensure we have an MCP session
+                // Ensure we have an MCP session, with exponential backoff after failures.
                 if mcp_state.is_none() {
+                    if tokio::time::Instant::now() < next_init_attempt {
+                        // Still in backoff window — skip this tick.
+                        continue;
+                    }
                     match init_mcp_session(&client, &sse_client, &request_base_url, workspace_path.clone()).await {
                         Ok(session) => {
+                            init_fail_count = 0;
                             send(&tx, SourceEvent::SessionId { id: session.id.clone() }).await;
                             // Fetch tools list once after connecting
                             if let Ok(tools) = call_tools_list(&client, &request_base_url, &session).await {
@@ -211,7 +226,18 @@ async fn mcp_source_task(
                             mcp_state = Some(session);
                         }
                         Err(e) => {
-                            debug!("MCP init failed (will retry): {e:#}");
+                            init_fail_count = init_fail_count.saturating_add(1);
+                            // Exponential backoff capped at 60 s: 1 → 3 → 8 → 20 → 60
+                            let backoff_secs: u64 = match init_fail_count {
+                                1 => 1,
+                                2 => 3,
+                                3 => 8,
+                                4 => 20,
+                                _ => 60,
+                            };
+                            debug!("MCP init failed (attempt {init_fail_count}, retry in {backoff_secs}s): {e:#}");
+                            next_init_attempt = tokio::time::Instant::now()
+                                + tokio::time::Duration::from_secs(backoff_secs);
                         }
                     }
                 }

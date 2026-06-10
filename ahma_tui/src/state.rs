@@ -1286,7 +1286,59 @@ impl AppState {
             .iter_mut()
             .find(|o| o.id == op.id && o.instance_id == op.instance_id)
         {
-            *existing = op;
+            // Merge: status-poll updates (from the daemon HTTP source) may arrive
+            // interleaved with push updates (from the daemon hub).  Each source may
+            // populate a different subset of fields, so we merge rather than replace
+            // to avoid clobbering output that was delivered by a different path.
+
+            // Status always advances (but never regresses from terminal back to running).
+            if !existing.status.is_terminal() || op.status.is_terminal() {
+                existing.status = op.status;
+            }
+
+            // Scalar metadata: take from incoming if it carries a richer value.
+            if !op.description.is_empty() {
+                existing.description = op.description;
+            }
+            if op.cwd.is_some() {
+                existing.cwd = op.cwd;
+            }
+            if !op.args.is_empty() {
+                existing.args = op.args;
+            }
+            if op.pid.is_some() {
+                existing.pid = op.pid;
+            }
+            if op.scope.is_some() {
+                existing.scope = op.scope;
+            }
+            if op.result_summary.is_some() {
+                existing.result_summary = op.result_summary;
+            }
+            if op.completed_at.is_some() {
+                existing.completed_at = op.completed_at;
+            }
+            if op.duration_ms.is_some() {
+                existing.duration_ms = op.duration_ms;
+            }
+
+            // Append stdout lines rather than replacing so neither source loses output.
+            for line in op.stdout_tail {
+                if existing.stdout_tail.len() >= STDOUT_TAIL_CAP {
+                    existing.stdout_tail.pop_front();
+                }
+                existing.stdout_tail.push_back(line);
+            }
+
+            // Append new alerts (deduplicate by content).
+            for alert in op.alerts {
+                if !existing.alerts.contains(&alert) {
+                    existing.alerts.push(alert);
+                }
+            }
+
+            // pinned is sticky — once pinned it stays pinned.
+            existing.pinned = existing.pinned || op.pinned;
         } else {
             self.operations.push(op);
         }

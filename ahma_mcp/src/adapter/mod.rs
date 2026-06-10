@@ -71,6 +71,44 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+// ─── Exclusive-tool gate ───────────────────────────────────────────────────────
+//
+// Some tool families (cargo build/test/clippy/check/nextest) use a shared file
+// lock (Cargo.lock) and a shared compilation cache (target/).  Running them
+// concurrently does not cause correctness issues — cargo itself serialises
+// internal steps — but it does cause heavy I/O contention and duplicated work.
+// We gate them behind a single-permit semaphore so at most one such command
+// runs at a time per process.  The gate is opt-in: tools that are NOT in the
+// exclusive list run freely in parallel.
+//
+// Timeout: if the gate cannot be acquired within 5 minutes the operation fails
+// with a clear message rather than hanging indefinitely.
+
+static EXCLUSIVE_CARGO_GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+fn exclusive_cargo_gate() -> Arc<tokio::sync::Semaphore> {
+    EXCLUSIVE_CARGO_GATE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
+
+/// Returns `true` when `command` is a cargo subcommand that contends on the
+/// shared target directory and should therefore be serialised.
+fn is_exclusive_cargo_command(command: &str) -> bool {
+    let low = command.to_ascii_lowercase();
+    let words: Vec<&str> = low.split_whitespace().collect();
+    if words.first() != Some(&"cargo") {
+        return false;
+    }
+    const EXCLUSIVE_SUBCOMMANDS: &[&str] = &[
+        "build", "b", "test", "t", "clippy", "check", "c", "nextest", "bench",
+    ];
+    words
+        .get(1)
+        .is_some_and(|sub| EXCLUSIVE_SUBCOMMANDS.contains(sub))
+}
+
 fn generate_id(tool_name: &str, command: &str) -> String {
     let id = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     crate::utils::operation::generate_id_with_details(id, tool_name, command)
@@ -678,6 +716,56 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         return;
     }
 
+    // ── Exclusive-cargo gate ──────────────────────────────────────────────────
+    // Serialise cargo build / test / clippy / check / nextest so they don't
+    // contend on the shared target directory.  The permit is held for the
+    // entire execution and dropped automatically when this function returns.
+    let _exclusive_permit = if is_exclusive_cargo_command(&command) {
+        const GATE_TIMEOUT_SECS: u64 = 300; // 5 min
+        send_progress_best_effort(
+            &callback,
+            crate::callback_system::ProgressUpdate::Progress {
+                id: op_id.clone(),
+                message: "Waiting for cargo exclusive lock (another build is running)".to_string(),
+                percentage: None,
+                current_step: None,
+            },
+        )
+        .await;
+        match tokio::time::timeout(
+            Duration::from_secs(GATE_TIMEOUT_SECS),
+            exclusive_cargo_gate().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => {
+                tracing::debug!(op_id = %op_id, "Acquired cargo exclusive gate");
+                Some(permit)
+            }
+            Ok(Err(_)) => {
+                // Semaphore was closed — should never happen; proceed without gate.
+                tracing::warn!("cargo exclusive semaphore unexpectedly closed");
+                None
+            }
+            Err(_) => {
+                let err = format!(
+                    "Timed out waiting for exclusive cargo lock after {GATE_TIMEOUT_SECS}s. \
+                     Another cargo operation is still running. Try again after it completes."
+                );
+                fail_operation_with_error(&monitor, &callback, &op_id, &command, &working_dir, 0, err.clone()).await;
+                event_dispatcher.emit(OperationEvent::Failed {
+                    operation_id: op_id.clone(),
+                    error: err,
+                    duration_ms: 0,
+                });
+                task_handles.lock().await.remove(&op_id);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     let start_time = Instant::now();
     let wd_path = std::path::PathBuf::from(&working_dir);
     let mut proc_cmd = match build_sandboxed_command(
@@ -936,7 +1024,12 @@ struct StreamingOpContext<'a> {
     working_dir: &'a str,
 }
 
-/// Execute a command in batch mode (existing behavior): collect all output at once.
+/// Execute a command in batch mode: collect all output, then report.
+///
+/// Unlike `execute_with_streaming`, this function waits for the process to
+/// finish before reporting anything — suitable for short commands where
+/// live output is not needed.  It still emits "still running" heartbeats
+/// every 10 s so long-running batch commands remain visible in the TUI.
 #[allow(clippy::too_many_arguments)]
 async fn execute_batch(
     proc_cmd: &mut tokio::process::Command,
@@ -950,20 +1043,133 @@ async fn execute_batch(
     monitor: &Arc<OperationMonitor>,
     output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
-    let proc_result =
-        tokio::time::timeout(Duration::from_millis(timeout_ms), proc_cmd.output()).await;
+    // Pipe both streams so we can collect output even for long-running commands.
+    proc_cmd.stdout(std::process::Stdio::piped());
+    proc_cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match proc_cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            fail_operation_with_error(
+                monitor,
+                callback,
+                op_id,
+                program,
+                working_dir,
+                0,
+                e.to_string(),
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Take I/O handles *before* the select loop so `child` stays alive and
+    // we can call `child.kill()` if a timeout or cancellation fires.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    // Drain stdout/stderr concurrently in background tasks.
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout_pipe {
+            tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf)
+                .await
+                .ok();
+        }
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr_pipe {
+            tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf)
+                .await
+                .ok();
+        }
+        buf
+    });
+
+    let timeout_fut = tokio::time::sleep(Duration::from_millis(timeout_ms));
+    tokio::pin!(timeout_fut);
+
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the first (immediate) tick so heartbeats start at t+10s, not t+0.
+    interval.tick().await;
+    let mut elapsed_secs: u64 = 0;
+
+    // Drive the child process.  `child.wait()` borrows `child` mutably but
+    // does NOT consume it, so we can still call `child.kill()` in other branches.
+    let exit_result: Result<std::process::ExitStatus, std::io::Error> = loop {
+        tokio::select! {
+            _ = cancellation_token.cancelled() => {
+                tracing::info!("Operation {} cancelled during batch execution", op_id);
+                let _ = child.kill().await;
+                stdout_task.abort();
+                stderr_task.abort();
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+                handle_cancellation(monitor, callback, op_id, duration_ms).await;
+                return;
+            }
+            _ = &mut timeout_fut => {
+                let _ = child.kill().await;
+                stdout_task.abort();
+                stderr_task.abort();
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Command timed out",
+                ));
+            }
+            status = child.wait() => {
+                break status;
+            }
+            _ = interval.tick() => {
+                elapsed_secs += 10;
+                let elapsed_msg = format!("still running ({}s elapsed)", elapsed_secs);
+                tracing::info!("Operation {}: {}", op_id, elapsed_msg);
+                if let Some(cb) = callback {
+                    let _ = cb
+                        .send_progress(crate::callback_system::ProgressUpdate::Progress {
+                            id: op_id.to_string(),
+                            message: elapsed_msg,
+                            percentage: None,
+                            current_step: None,
+                        })
+                        .await;
+                }
+            }
+        }
+    };
 
     let duration_ms = start_time.elapsed().as_millis() as u64;
 
-    // Check for cancellation after command execution
-    if cancellation_token.is_cancelled() {
-        tracing::info!("Operation {} was cancelled after shell execution", op_id);
-        handle_cancellation(monitor, callback, op_id, duration_ms).await;
-        return;
-    }
-
-    match proc_result {
-        Ok(Ok(output)) => {
+    match exit_result {
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                cancel_operation_timed_out(monitor, callback, op_id, duration_ms).await;
+            } else {
+                fail_operation_with_error(
+                    monitor,
+                    callback,
+                    op_id,
+                    program,
+                    working_dir,
+                    duration_ms,
+                    e.to_string(),
+                )
+                .await;
+            }
+        }
+        Ok(status) => {
+            // Collect the accumulated output (tasks will have finished by now since
+            // the process has exited and its pipe ends are closed).
+            let stdout_bytes = stdout_task.await.unwrap_or_default();
+            let stderr_bytes = stderr_task.await.unwrap_or_default();
+            let output = std::process::Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            };
             complete_operation_with_output(
                 monitor,
                 callback,
@@ -975,21 +1181,6 @@ async fn execute_batch(
                 output_optimizer,
             )
             .await;
-        }
-        Ok(Err(e)) => {
-            fail_operation_with_error(
-                monitor,
-                callback,
-                op_id,
-                program,
-                working_dir,
-                duration_ms,
-                e.to_string(),
-            )
-            .await;
-        }
-        Err(_) => {
-            cancel_operation_timed_out(monitor, callback, op_id, duration_ms).await;
         }
     }
 }
@@ -1143,6 +1334,12 @@ async fn execute_with_streaming(
 
     let timeout_deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
 
+    let mut still_running_interval = tokio::time::interval(Duration::from_secs(10));
+    still_running_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume the first (immediate) tick so heartbeats start at t+10s, not t+0.
+    still_running_interval.tick().await;
+    let mut elapsed_secs = 0;
+
     loop {
         tokio::select! {
             // Bias stderr to prioritize error-related output
@@ -1164,6 +1361,20 @@ async fn execute_with_streaming(
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 cancel_operation_timed_out(op_monitor, callback, op_id, duration_ms).await;
                 return;
+            }
+
+            _ = still_running_interval.tick() => {
+                elapsed_secs += 10;
+                let elapsed_msg = format!("still running ({}s elapsed)", elapsed_secs);
+                tracing::info!("Operation {}: {}", op_id, elapsed_msg);
+                if let Some(cb) = callback {
+                    let _ = cb.send_progress(crate::callback_system::ProgressUpdate::Progress {
+                        id: op_id.to_string(),
+                        message: elapsed_msg,
+                        percentage: None,
+                        current_step: None,
+                    }).await;
+                }
             }
 
             // Read stderr line
