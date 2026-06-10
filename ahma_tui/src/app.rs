@@ -1011,9 +1011,7 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     };
 
     let client = LlmClient::new(base_url, model, None);
-    let system = state.mcp_enabled.then(|| {
-        "Use ahma tools when they would materially improve the answer. Prefer direct answers when no tool is needed.".to_string()
-    });
+    let system = Some(build_system_prompt(state));
     if state.mcp_enabled {
         spawn_agent_task(
             client,
@@ -1031,6 +1029,114 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
             optional_mcp_chat_config(state),
             tx.clone(),
         );
+    }
+}
+
+/// Build the system prompt sent with every LLM request.
+///
+/// Combines (in priority order):
+/// 1. The active agent profile's `system_prompt` (if any).
+/// 2. A concise snapshot of live workspace context: scope, sandbox status,
+///    recent operations with their status, and recent failures.
+///
+/// The context block is intentionally short (<500 tokens) so it does not eat
+/// into the user's context window.
+#[cfg(feature = "tui")]
+fn build_system_prompt(state: &crate::state::AppState) -> String {
+    use crate::state::OpStatus;
+
+    // 1. Profile system prompt (may override defaults).
+    let profile_prompt = profile_field(state, |p| p.system_prompt, String::new());
+
+    // 2. Live context block.
+    let mut ctx = String::new();
+
+    // Workspace / scope.
+    if !state.workspace.is_empty() {
+        ctx.push_str(&format!("Workspace: {}\n", state.workspace));
+    }
+
+    // Sandbox / server status.
+    if !state.sandbox_status.is_empty() && state.sandbox_status != "unknown" {
+        ctx.push_str(&format!("Sandbox: {}\n", state.sandbox_status));
+    }
+
+    // Recent operations (last 5, most recent first).
+    let recent_ops: Vec<&crate::state::Operation> = state
+        .operations
+        .iter()
+        .rev()
+        .take(5)
+        .collect();
+
+    if !recent_ops.is_empty() {
+        ctx.push_str("\nRecent operations:\n");
+        for op in &recent_ops {
+            let status_label = match &op.status {
+                OpStatus::Running => "running",
+                OpStatus::Pending => "pending",
+                OpStatus::Succeeded => "ok",
+                OpStatus::Failed => "FAILED",
+                OpStatus::Cancelled => "cancelled",
+                OpStatus::Waiting => "waiting",
+            };
+            let name = op.display_name();
+            let elapsed = op.elapsed_display();
+            let summary = op
+                .result_summary
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(" — {}", s.lines().next().unwrap_or(s)))
+                .unwrap_or_default();
+            ctx.push_str(&format!("  [{status_label}] {name} ({elapsed}){summary}\n"));
+        }
+    }
+
+    // Recent failures — include a brief stdout tail to help with "why did it fail?" queries.
+    let failures: Vec<&crate::state::Operation> = state
+        .operations
+        .iter()
+        .rev()
+        .filter(|o| o.status == OpStatus::Failed)
+        .take(2)
+        .collect();
+
+    if !failures.is_empty() {
+        ctx.push_str("\nRecent failures (tail output):\n");
+        for op in &failures {
+            ctx.push_str(&format!("  {} ({}):\n", op.display_name(), op.elapsed_display()));
+            let tail: Vec<&str> = op
+                .stdout_tail
+                .iter()
+                .rev()
+                .take(8)
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            for line in tail {
+                ctx.push_str(&format!("    {line}\n"));
+            }
+        }
+    }
+
+    // 3. Assemble final prompt.
+    let base = if state.mcp_enabled {
+        "Use ahma tools when they would materially improve the answer. \
+         Prefer direct answers when no tool is needed."
+    } else {
+        "Provide concise, accurate answers."
+    };
+
+    if profile_prompt.is_empty() && ctx.is_empty() {
+        base.to_string()
+    } else if profile_prompt.is_empty() {
+        format!("{base}\n\n--- Live context ---\n{ctx}")
+    } else if ctx.is_empty() {
+        format!("{profile_prompt}\n\n{base}")
+    } else {
+        format!("{profile_prompt}\n\n{base}\n\n--- Live context ---\n{ctx}")
     }
 }
 

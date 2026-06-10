@@ -286,6 +286,12 @@ Supported Hook Platforms:
 - **Codex**: Configures `${HOME}/.codex/hooks.json`
 - **GitHub Copilot / Copilot CLI**: Configures `${HOME}/.copilot/hooks/ahma.json` (user) and `.github/hooks/ahma.json` (project)
 
+> [!IMPORTANT]
+> **Coexistence Guideline**: Avoid having BOTH terminal hooks and an active MCP server configured for "ahma" at the same time. This causes redundant wrapping, sandbox-initialization, and execution overhead. If you use the `ahma` MCP server inside Claude Desktop or Cursor, it is recommended to uninstall terminal hooks:
+> ```bash
+> ahma hooks uninstall --scope user
+> ```
+
 ---
 
 ## Live Log Monitoring

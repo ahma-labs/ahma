@@ -193,8 +193,11 @@ pub struct Session {
     pub session_manager: Mutex<Option<std::sync::Weak<SessionManager>>>,
     /// Map of pending routed request IDs to response channels
     pub routed_requests: Arc<DashMap<String, oneshot::Sender<Value>>>,
-    /// Mutex to serialize routed sampling requests to the client
-    pub sampling_lock: tokio::sync::Mutex<()>,
+    /// Semaphore limiting concurrent routed sampling requests to the client (default: 3).
+    /// A bounded semaphore replaces the old 1-at-a-time Mutex so that up to N sampling
+    /// requests can be in-flight simultaneously, preventing head-of-line blocking when
+    /// an IDE session hosts multiple agents.
+    pub sampling_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl Session {
@@ -902,7 +905,7 @@ impl SessionManager {
             capabilities: Mutex::new(None),
             session_manager: Mutex::new(None),
             routed_requests: Arc::new(DashMap::new()),
-            sampling_lock: tokio::sync::Mutex::new(()),
+            sampling_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
         });
 
         // Spawn the I/O handler task

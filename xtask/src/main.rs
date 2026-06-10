@@ -1036,6 +1036,9 @@ mod tests {
             "old version must not remain anywhere — replace_substring must update ALL occurrences"
         );
     }
+
+    #[test]
+    fn test_parse_cargo_update_output() {
         let sample_output = r#"
     Updating bitflags v2.11.1 -> v2.12.1
     Updating cc v1.2.62 -> v1.2.63

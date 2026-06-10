@@ -161,8 +161,14 @@ async fn handle_routed_sampling_request(
         }
     };
 
-    // Acquire target session's sampling lock to serialize requests (concurrency limit of 1)
-    let _guard = target_session.sampling_lock.lock().await;
+    // Acquire a sampling permit (bounded concurrency — default 3 simultaneous requests).
+    // `acquire()` is cancel-safe and returns Err only if the semaphore is closed, which
+    // cannot happen here because the semaphore lives in the Session arc.
+    let _permit = target_session
+        .sampling_semaphore
+        .acquire()
+        .await
+        .expect("sampling semaphore closed unexpectedly");
 
     let routed_id = format!("route_{}", uuid::Uuid::new_v4());
     let (tx, rx) = oneshot::channel();

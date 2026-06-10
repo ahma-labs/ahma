@@ -181,27 +181,43 @@ fn draw_expanded_window(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let content_text: Vec<Line> = w
-        .content
-        .iter()
-        .map(|line| {
-            let style = if line.starts_with("Starting") {
-                theme.dim()
-            } else if line.starts_with("Finished successfully") {
-                theme.success()
-            } else if line.starts_with("Failed") {
-                theme.failed()
-            } else if line.starts_with("Cancelled") {
-                theme.cancelled()
-            } else if line.starts_with("──") || line.starts_with("--") {
-                theme.dim()
-            } else {
-                theme.normal()
-            };
-            Line::from(Span::styled(line.clone(), style))
-        })
-        .collect();
-    let para = Paragraph::new(content_text).wrap(Wrap { trim: false });
+    // ── Command → output card layout ─────────────────────────────────────────
+    // Show the shell command as a distinct header line followed by a separator,
+    // then the output.  This gives the "command → output" visual structure that
+    // makes it easy to match output back to the operation that produced it.
+    let mut content_lines: Vec<Line> = Vec::new();
+
+    // Command header (shown when non-empty and distinct from the label).
+    if !w.command.is_empty() && w.command != w.label {
+        let cmd_display = format!("$ {}", w.command);
+        content_lines.push(Line::from(Span::styled(cmd_display, theme.dim())));
+        // Separator
+        let sep_char = if area.width > 0 { "─" } else { "-" };
+        content_lines.push(Line::from(Span::styled(
+            sep_char.repeat(inner.width as usize),
+            theme.dim(),
+        )));
+    }
+
+    // Output lines
+    for line in &w.content {
+        let style = if line.starts_with("Starting") {
+            theme.dim()
+        } else if line.starts_with("Finished successfully") {
+            theme.success()
+        } else if line.starts_with("Failed") {
+            theme.failed()
+        } else if line.starts_with("Cancelled") {
+            theme.cancelled()
+        } else if line.starts_with("──") || line.starts_with("--") {
+            theme.dim()
+        } else {
+            theme.normal()
+        };
+        content_lines.push(Line::from(Span::styled(line.clone(), style)));
+    }
+
+    let para = Paragraph::new(content_lines).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
 }
 
@@ -882,21 +898,34 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
 
 #[cfg(feature = "tui")]
 fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let quit_key = if state.focus == Focus::Chat {
-        "/quit"
-    } else {
-        "q"
+    // Mode indicator at the left.
+    let mode_label = match state.mode {
+        Mode::Chat => "CHAT",
+        Mode::Monitor => "MONITOR",
     };
 
-    let keys: &[(&str, &str)] = &[
-        ("Enter", "send"),
-        ("Shift+Enter", "newline"),
-        ("/", "commands"),
-        ("Tab", "monitor panels"),
-        (quit_key, "quit"),
-    ];
+    // Mode-specific key hints.
+    let keys: &[(&str, &str)] = match state.mode {
+        Mode::Chat => &[
+            ("Enter", "send"),
+            ("Shift+Enter", "newline"),
+            ("/", "commands"),
+            ("Tab", "monitor panels"),
+            ("/quit", "quit"),
+        ],
+        Mode::Monitor => &[
+            ("↑↓", "navigate ops"),
+            ("Tab", "cycle panels"),
+            ("Enter", "send chat"),
+            ("/mode chat", "chat view"),
+            ("q", "quit"),
+        ],
+    };
 
-    let mut spans: Vec<Span> = vec![];
+    let mut spans: Vec<Span> = vec![
+        Span::styled(format!(" {mode_label} "), theme.footer_key()),
+        Span::styled(" │", theme.dim()),
+    ];
     for (key, desc) in keys {
         spans.push(Span::styled(format!("  {key} "), theme.footer_key()));
         spans.push(Span::styled(desc.to_string(), theme.footer()));

@@ -39,7 +39,7 @@ pub const SEQUENCE_STEP_DELAY_MS: u64 = 100;
 /// Maximum time (in seconds) to wait for an async operation to complete before
 /// returning an async operation ID. If the operation finishes within this window,
 /// its result is returned inline, saving the LLM an extra `await` round-trip.
-pub const AUTOMATIC_ASYNC_TIMEOUT_SECS: u64 = 5;
+pub const AUTOMATIC_ASYNC_TIMEOUT_SECS: u64 = 2;
 
 #[cfg(test)]
 mod tests {
@@ -92,7 +92,7 @@ mod tests {
             "Automatic async timeout too long - defeats purpose of async"
         );
         assert_eq!(
-            AUTOMATIC_ASYNC_TIMEOUT_SECS, 5,
+            AUTOMATIC_ASYNC_TIMEOUT_SECS, 2,
             "Automatic async timeout should be 600 seconds (10 minutes) as documented"
         );
     }
