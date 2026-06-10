@@ -241,7 +241,7 @@ fn transform_first_anchored_match(
     (restore_trailing_newline(&body, content), replaced)
 }
 
-/// Replace the first exact substring occurrence of `old` with `new`.
+/// Replace all exact substring occurrences of `old` with `new`.
 fn replace_substring(path: &Path, old: &str, new: &str, label: &str) {
     let content = fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("ERROR: Failed to read {}: {e}", path.display());
@@ -251,7 +251,7 @@ fn replace_substring(path: &Path, old: &str, new: &str, label: &str) {
         eprintln!("WARNING: Pattern '{old}' not found in {label} — skipping");
         return;
     }
-    let new_content = content.replacen(old, new, 1);
+    let new_content = content.replace(old, new);
     fs::write(path, new_content).unwrap_or_else(|e| {
         eprintln!("ERROR: Failed to write {}: {e}", path.display());
         process::exit(1);
@@ -1011,7 +1011,31 @@ fn apply_upgrade(root: &Path, name: &str, version: &str, is_direct: bool) {
 mod tests {
 
     #[test]
-    fn test_proposed_lockfile_updates_parsing() {
+    fn test_replace_substring_updates_all_occurrences() {
+        // Regression: replace_substring previously used replacen(..., 1) which only updated
+        // the first occurrence. install.ps1 has two `-Version 'X.Y.Z'` lines; only the
+        // second one (Install-OneSkill) is checked by the invariant test, so bumps were
+        // silently skipped on the line that matters.
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "# -Version '1.2.3'").unwrap();
+        writeln!(f, "# Install-OneSkill -Version '1.2.3'").unwrap();
+        f.flush().unwrap();
+
+        super::replace_substring(f.path(), "-Version '1.2.3'", "-Version '1.2.4'", "test");
+
+        let result = std::fs::read_to_string(f.path()).unwrap();
+        assert!(
+            result.contains("-Version '1.2.4'"),
+            "new version must appear"
+        );
+        assert!(
+            !result.contains("-Version '1.2.3'"),
+            "old version must not remain anywhere — replace_substring must update ALL occurrences"
+        );
+    }
         let sample_output = r#"
     Updating bitflags v2.11.1 -> v2.12.1
     Updating cc v1.2.62 -> v1.2.63
