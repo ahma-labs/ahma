@@ -502,7 +502,7 @@ mod tests {
             Some("daemon") => "daemon",
             Some("update") => "update",
             Some("setup") => "setup",
-            Some("hooks") if args.iter().any(|a| *a == "run-shell") => "cli",
+            Some("hooks") if args.contains(&"run-shell") => "cli",
             Some("tool") if args.get(1).copied() == Some("run") => "cli",
             _ => "cli",
         }

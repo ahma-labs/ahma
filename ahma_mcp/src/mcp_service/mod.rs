@@ -1269,9 +1269,10 @@ impl ServerHandler for AhmaMcpService {
             let mut tool_args = params.arguments.clone();
 
             if is_guard_active
-                && let Some(early) = self.harness_guard_preprocess(&mut tool_name, &mut tool_args) {
-                    return Ok(early);
-                }
+                && let Some(early) = self.harness_guard_preprocess(&mut tool_name, &mut tool_args)
+            {
+                return Ok(early);
+            }
 
             let mut run_params = CallToolRequestParams::new(tool_name.clone());
             run_params.arguments = tool_args.clone();

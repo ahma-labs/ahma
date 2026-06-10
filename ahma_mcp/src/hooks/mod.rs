@@ -410,9 +410,10 @@ fn detect_mcp_config_exists() -> bool {
     for path in paths {
         if path.exists()
             && let Ok(content) = std::fs::read_to_string(&path)
-                && content.contains("\"ahma\"") {
-                    return true;
-                }
+            && content.contains("\"ahma\"")
+        {
+            return true;
+        }
     }
     false
 }
