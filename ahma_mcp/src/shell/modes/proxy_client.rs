@@ -5,7 +5,7 @@
 //! JSON-RPC traffic to the running server.
 
 use crate::transport_patch::PatchedStdioTransport;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 #[cfg(unix)]
 use rmcp::service::RoleClient;
@@ -18,12 +18,12 @@ use tokio::sync::mpsc;
 pub async fn run_proxy_client(uds_path: Option<&str>, http_url: Option<&str>) -> Result<()> {
     #[cfg(unix)]
     if let Some(path) = uds_path {
-        tracing::info!("Proxying stdio to Unix Domain Socket: {}", path);
+        tracing::info!(socket = path, "Proxying stdio to Unix Domain Socket");
         return run_proxy_client_unix(path).await;
     }
 
     if let Some(url) = http_url {
-        tracing::info!("Proxying stdio to HTTP server: {}", url);
+        tracing::info!(url = url, "Proxying stdio to HTTP server");
         return run_proxy_client_http(url).await;
     }
 
@@ -37,14 +37,20 @@ pub async fn run_proxy_client(uds_path: Option<&str>, http_url: Option<&str>) ->
 async fn run_proxy_client_unix(socket_path: &str) -> Result<()> {
     use ahma_http_mcp_client::unix_client::unix_socket_transport;
 
-    let client_transport = unix_socket_transport(socket_path, "http://localhost/mcp")?;
+    let client_transport = unix_socket_transport(socket_path, "http://localhost/mcp")
+        .with_context(|| format!("Failed to connect proxy to UDS {socket_path}"))?;
     let stdio_transport = PatchedStdioTransport::new_stdio();
 
-    run_transport_proxy(stdio_transport, client_transport).await
+    tracing::info!(socket = socket_path, "Proxy connected to bridge via UDS");
+    let result = run_transport_proxy(stdio_transport, client_transport, "unix").await;
+    if let Err(ref e) = result {
+        tracing::error!(socket = socket_path, error = %e, "Proxy session ended with error");
+    }
+    result
 }
 
 #[cfg(unix)]
-async fn run_transport_proxy<S, C>(mut stdio: S, mut client: C) -> Result<()>
+async fn run_transport_proxy<S, C>(mut stdio: S, mut client: C, transport: &str) -> Result<()>
 where
     S: Transport<RoleServer> + Send + 'static,
     C: Transport<RoleClient> + Send + 'static,
@@ -55,25 +61,36 @@ where
         tokio::select! {
             stdio_msg = stdio.receive() => {
                 let Some(msg) = stdio_msg else {
-                    tracing::info!("Stdio connection closed");
+                    tracing::info!(transport, "Proxy exiting: stdio EOF (Cursor client disconnected)");
                     break;
                 };
                 let val = serde_json::to_value(msg).unwrap();
                 let tx_msg = serde_json::from_value(val).unwrap();
                 if let Err(e) = client.send(tx_msg).await {
-                    tracing::error!("Proxy error forwarding to client: {:?}", e);
+                    tracing::error!(
+                        transport,
+                        error = ?e,
+                        "Proxy exiting: failed to forward message to bridge"
+                    );
                     break;
                 }
             }
             client_msg = client.receive() => {
                 let Some(msg) = client_msg else {
-                    tracing::info!("Client connection closed");
+                    tracing::info!(
+                        transport,
+                        "Proxy exiting: bridge connection closed"
+                    );
                     break;
                 };
                 let val = serde_json::to_value(msg).unwrap();
                 let tx_msg = serde_json::from_value(val).unwrap();
                 if let Err(e) = stdio.send(tx_msg).await {
-                    tracing::error!("Proxy error forwarding to stdio: {:?}", e);
+                    tracing::error!(
+                        transport,
+                        error = ?e,
+                        "Proxy exiting: failed to forward message to stdio"
+                    );
                     break;
                 }
             }
@@ -85,17 +102,18 @@ where
 async fn run_proxy_client_http(base_url: &str) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
-        .build()?;
+        .build()
+        .context("Failed to build HTTP client for stdio proxy")?;
 
     let mcp_url = format!("{}/mcp", base_url.trim_end_matches('/'));
 
     let mut stdio = PatchedStdioTransport::new_stdio();
 
     // 1. Handshake / Initialize
-    let init_msg = stdio
-        .receive()
-        .await
-        .ok_or_else(|| anyhow!("No initialize message on stdin"))?;
+    let init_msg = stdio.receive().await.ok_or_else(|| {
+        tracing::error!("Proxy HTTP handshake failed: no initialize message on stdin");
+        anyhow!("No initialize message on stdin")
+    })?;
     let init_val = serde_json::to_value(&init_msg)?;
 
     let response = client
@@ -104,18 +122,45 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
         .header(reqwest::header::ACCEPT, "application/json")
         .json(&init_val)
         .send()
-        .await?;
+        .await
+        .with_context(|| format!("Proxy HTTP initialize POST failed for {mcp_url}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        tracing::error!(
+            url = %mcp_url,
+            status = %status,
+            "Proxy HTTP initialize returned non-success status"
+        );
+        return Err(anyhow!("Initialize failed with HTTP {status}"));
+    }
 
     let session_id = response
         .headers()
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow!("Missing mcp-session-id header in initialize response"))?
+        .ok_or_else(|| {
+            tracing::error!(
+                url = %mcp_url,
+                "Proxy HTTP initialize missing mcp-session-id header"
+            );
+            anyhow!("Missing mcp-session-id header in initialize response")
+        })?
         .to_string();
 
-    let resp_bytes = response.bytes().await?;
-    let resp_msg: TxJsonRpcMessage<RoleServer> = serde_json::from_slice(&resp_bytes)?;
-    stdio.send(resp_msg).await?;
+    let resp_bytes = response.bytes().await.context("Failed to read initialize response body")?;
+    let resp_msg: TxJsonRpcMessage<RoleServer> =
+        serde_json::from_slice(&resp_bytes).context("Failed to parse initialize response JSON")?;
+    stdio
+        .send(resp_msg)
+        .await
+        .context("Failed to forward initialize response to stdio")?;
+
+    tracing::info!(
+        url = %mcp_url,
+        session_id = %session_id,
+        "Proxy connected to bridge via HTTP"
+    );
 
     // 2. Start SSE listener in background
     let (sse_tx, mut sse_rx) = mpsc::channel::<TxJsonRpcMessage<RoleServer>>(100);
@@ -137,10 +182,19 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
         let res = match sse_client.get(&sse_url).headers(headers).send().await {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("SSE connection failed: {}", e);
+                tracing::error!(url = %sse_url, error = %e, "Proxy SSE connection failed");
                 return;
             }
         };
+
+        if !res.status().is_success() {
+            tracing::error!(
+                url = %sse_url,
+                status = %res.status(),
+                "Proxy SSE stream returned non-success status"
+            );
+            return;
+        }
 
         let mut stream = res.bytes_stream();
         let mut buffer = String::new();
@@ -148,7 +202,7 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!("SSE stream error: {}", e);
+                    tracing::error!(url = %sse_url, error = %e, "Proxy SSE stream error");
                     break;
                 }
             };
@@ -165,28 +219,30 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
                         && let Ok(msg) = serde_json::from_str::<TxJsonRpcMessage<RoleServer>>(data)
                         && sse_tx.send(msg).await.is_err()
                     {
+                        tracing::info!(url = %sse_url, "Proxy SSE forward channel closed");
                         break;
                     }
                 }
             }
         }
+        tracing::info!(url = %sse_url, "Proxy SSE stream ended");
     });
 
     // 3. Stdio loop
     loop {
         tokio::select! {
-            // Read from stdin, send to HTTP POST
             stdio_msg = stdio.receive() => {
                 let Some(msg) = stdio_msg else {
-                    break; // EOF
+                    tracing::info!(
+                        url = %mcp_url,
+                        session_id = %session_id,
+                        "Proxy exiting: stdio EOF (Cursor client disconnected)"
+                    );
+                    break;
                 };
 
                 let val = serde_json::to_value(&msg)?;
                 let has_id = val.get("id").is_some();
-                // A message is a JSON-RPC *request* when it has both "id" and "method".
-                // A message with "id" but no "method" is a *response* (e.g. the client
-                // answering the server's roots/list request). For responses the bridge
-                // returns HTTP 202 with an empty body — don't try to parse it.
                 let is_request = val.get("method").is_some();
 
                 let mut req = client.post(&mcp_url)
@@ -198,8 +254,17 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
                     req = req.header(reqwest::header::ACCEPT, "application/json");
                 }
 
-                let resp = req.send().await?;
+                let resp = req.send().await.with_context(|| {
+                    format!("Proxy HTTP POST to {mcp_url} failed (session={session_id})")
+                })?;
                 if has_id && is_request {
+                    if !resp.status().is_success() {
+                        tracing::warn!(
+                            url = %mcp_url,
+                            status = %resp.status(),
+                            "Proxy HTTP tool/request returned non-success status"
+                        );
+                    }
                     let bytes = resp.bytes().await?;
                     if !bytes.is_empty() {
                         let resp_msg: TxJsonRpcMessage<RoleServer> = serde_json::from_slice(&bytes)?;
@@ -208,9 +273,13 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
                 }
             }
 
-            // Read from SSE, send to stdout
             sse_msg = sse_rx.recv() => {
                 let Some(msg) = sse_msg else {
+                    tracing::info!(
+                        url = %mcp_url,
+                        session_id = %session_id,
+                        "Proxy exiting: SSE channel closed"
+                    );
                     break;
                 };
                 stdio.send(msg).await?;
@@ -218,7 +287,6 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
         }
     }
 
-    // Terminate session on exit
     let _ = client
         .delete(&mcp_url)
         .header("mcp-session-id", &session_id)

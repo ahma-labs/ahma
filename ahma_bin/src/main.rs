@@ -10,7 +10,9 @@ use ahma_mcp::shell::cli::{
     dispatch_subcommand, load_settings,
 };
 
-use ahma_mcp::utils::logging::init_logging_with_observability;
+use ahma_mcp::utils::logging::{
+    detect_log_role_from_startup, init_logging_with_observability, set_log_role,
+};
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -30,6 +32,8 @@ async fn main() -> Result<()> {
         );
     }
     let log_to_stderr = cli.log_to_stderr || settings_for_log.log_to_stderr();
+
+    set_log_role(detect_log_role_from_startup());
 
     let cfg = build_app_config(&cli);
     let subcommand = cli.command;

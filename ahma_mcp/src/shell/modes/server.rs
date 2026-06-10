@@ -7,6 +7,7 @@ use crate::{
     config::ServerConfig as MpcServerConfig,
     sandbox,
     service_builder::{BuiltService, ServiceBuilder},
+    utils::logging::{read_log_tail, BRIDGE_CAPTURE_HEADER, prepare_bridge_capture_files},
     utils::stdio::emit_stdout_notification,
 };
 use ahma_http_mcp_client::client::HttpMcpTransport;
@@ -386,10 +387,15 @@ async fn handle_version_checks(
         return Ok(None);
     };
 
+    tracing::info!(
+        client_version = client_version,
+        bridge_version = %bridge_version,
+        "Bridge version check: client={client_version} bridge={bridge_version}"
+    );
+
     if bridge_version == client_version {
         tracing::info!(
-            "Local bridge server is already running (v{}). Forwarding stdio as a proxy client.",
-            bridge_version
+            "Local bridge server is already running (v{bridge_version}). Forwarding stdio as a proxy client."
         );
         crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt).await?;
         return Ok(Some(()));
@@ -403,6 +409,11 @@ async fn handle_version_checks(
     };
 
     if client_is_newer {
+        tracing::info!(
+            client_version = client_version,
+            bridge_version = %bridge_version,
+            "Client is newer than bridge; requesting bridge restart"
+        );
         restart_bridge_server(socket_path_opt, http_url_opt).await;
     } else if std::env::var("AHMA_RESTARTED").is_ok() {
         return Err(anyhow::anyhow!(
@@ -422,7 +433,7 @@ async fn handle_version_checks(
 }
 
 fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf]) -> Vec<String> {
-    let mut server_args = vec!["serve".to_string()];
+    let mut server_args = vec!["serve".to_string(), "--server-child".to_string()];
 
     // Forward the resolved sandbox scope(s) so the bridge can use them as a fallback
     // for clients that don't send roots/list (e.g. Antigravity) and so the bridge
@@ -524,7 +535,7 @@ async fn spawn_background_bridge(
     let server_args = build_background_bridge_args(config, resolved_scopes);
 
     let mut cmd = tokio::process::Command::new(&server_command);
-    cmd.args(&server_args);
+    cmd.args(&server_args).env("AHMA_SERVER_CHILD", "1");
 
     #[cfg(unix)]
     {
@@ -536,29 +547,40 @@ async fn spawn_background_bridge(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let temp = std::env::temp_dir();
-    let stdout_path = temp.join("ahma_grandchild.stdout");
-    let stderr_path = temp.join("ahma_grandchild.stderr");
+    let (stdout_path, stderr_path) = match prepare_bridge_capture_files() {
+        Ok(paths) => paths,
+        Err(e) => {
+            tracing::error!("Failed to prepare bridge capture files in logs/: {e:#}");
+            return Err(e);
+        }
+    };
 
-    let stdout_file = match std::fs::File::create(&stdout_path) {
+    let spawn_banner = format!(
+        "{BRIDGE_CAPTURE_HEADER}# bridge spawn parent_pid={}\n",
+        std::process::id()
+    );
+
+    let stdout_file = match std::fs::write(&stdout_path, &spawn_banner)
+        .and_then(|_| std::fs::OpenOptions::new().append(true).open(&stdout_path))
+    {
         Ok(f) => Some(f),
         Err(e) => {
             tracing::warn!(
-                "Failed to create grandchild stdout at {:?}: {}",
-                stdout_path,
-                e
+                "Failed to create bridge stdout capture at {}: {e}",
+                stdout_path.display()
             );
             None
         }
     };
 
-    let stderr_file = match std::fs::File::create(&stderr_path) {
+    let stderr_file = match std::fs::write(&stderr_path, &spawn_banner)
+        .and_then(|_| std::fs::OpenOptions::new().append(true).open(&stderr_path))
+    {
         Ok(f) => Some(f),
         Err(e) => {
             tracing::warn!(
-                "Failed to create grandchild stderr at {:?}: {}",
-                stderr_path,
-                e
+                "Failed to create bridge stderr capture at {}: {e}",
+                stderr_path.display()
             );
             None
         }
@@ -594,15 +616,30 @@ async fn spawn_background_bridge(
         tokio::time::sleep(ahma_common::timeouts::TestTimeouts::poll_interval()).await;
     }
     if !healthy {
+        let stderr_tail = read_log_tail(&stderr_path, 8192);
+        if stderr_tail.is_empty() {
+            tracing::error!(
+                bridge_stderr = %stderr_path.display(),
+                "Background bridge failed health check within {timeout:?}; bridge stderr capture is empty"
+            );
+        } else {
+            tracing::error!(
+                bridge_stderr = %stderr_path.display(),
+                bridge_stderr_tail = %stderr_tail,
+                "Background bridge failed health check within {timeout:?}"
+            );
+        }
         return Err(anyhow::anyhow!(
-            "Background bridge server failed to become healthy within {:?}. \
-             Check logs at {:?} for details.",
-            timeout,
-            std::env::temp_dir().join("ahma_grandchild.stderr")
+            "Background bridge server failed to become healthy within {timeout:?}. \
+             Check {} and logs/ahma_mcp.log for details.",
+            stderr_path.display()
         ));
-    } else {
-        tracing::info!("Background bridge server started successfully and is healthy");
     }
+    tracing::info!(
+        bridge_stdout = %stdout_path.display(),
+        bridge_stderr = %stderr_path.display(),
+        "Background bridge server started successfully and is healthy"
+    );
 
     Ok(())
 }
