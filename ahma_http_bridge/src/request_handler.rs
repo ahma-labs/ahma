@@ -774,12 +774,11 @@ async fn mark_session_initialized(
     }
     if let Some(session) = session_manager.get_session(session_id) {
         match session.mark_mcp_initialized().await {
-            Ok(true) => {
-                // Handshake just reached RootsRequested; auto-lock from default_scope
-                // if configured so that clients that don't send roots/list still work.
+            Ok(true) | Ok(false) => {
+                // Auto-lock from default_scope if configured so that clients
+                // that don't send roots/list (or don't open an SSE stream) still work.
                 session_manager.auto_lock_if_default_scope(session_id).await;
             }
-            Ok(false) => {}
             Err(e) => {
                 warn!(
                     session_id = %session_id,

@@ -13,9 +13,13 @@ use crate::connection::ResolvedConnection;
 
 /// Launch the TUI.  Restores the terminal on exit (even on error) when the
 /// full ratatui UI is compiled in.
-pub async fn run(connection: &ResolvedConnection, profile: Option<String>) -> Result<()> {
+pub async fn run(
+    connection: &ResolvedConnection,
+    profile: Option<String>,
+    path: Option<std::path::PathBuf>,
+) -> Result<()> {
     #[cfg(feature = "tui")]
-    return run_ratatui(connection, profile).await;
+    return run_ratatui(connection, profile, path).await;
 
     #[cfg(not(feature = "tui"))]
     return run_text_stub(connection).await;
@@ -27,6 +31,7 @@ pub async fn run(connection: &ResolvedConnection, profile: Option<String>) -> Re
 async fn run_ratatui(
     connection: &ResolvedConnection,
     profile_override: Option<String>,
+    workspace_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     use std::io;
     use std::time::Duration;
@@ -71,7 +76,11 @@ async fn run_ratatui(
     }
 
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<SourceEvent>(256);
-    state.mcp_source_tx = Some(spawn_mcp_source(connection.clone(), mcp_tx.clone()));
+    state.mcp_source_tx = Some(spawn_mcp_source(
+        connection.clone(),
+        mcp_tx.clone(),
+        workspace_path,
+    ));
     // Start the hub server inside this TUI process so its lifecycle matches the
     // TUI — no dangling socket if the TUI crashes. ahma instances connect via
     // Unix socket (macOS/Linux) or TCP loopback (Windows) using push messaging.
@@ -97,6 +106,11 @@ async fn run_ratatui(
     // Bridge channel carries both provider discovery results and LLM tokens.
     let (bridge_tx, mut bridge_rx) = mpsc::channel::<BridgeEvent>(512);
     spawn_discovery_task(bridge_tx.clone());
+    // Populate the external MCP tools counter at startup (avoids needing `/mcp refresh`).
+    crate::llm_bridge::spawn_external_tools_refresh(
+        state.mcp_connections.clone(),
+        bridge_tx.clone(),
+    );
     // Store the sender so chat actions can spawn tasks later.
     state.bridge_tx = Some(bridge_tx);
 
@@ -2730,7 +2744,9 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             handle_event_tools_list_updated(tools, state);
         }
         SourceEvent::SandboxStatus { status } => state.sandbox_status = status,
-        SourceEvent::SessionId { id } => state.session_id = Some(id),
+        SourceEvent::SessionId { id } => {
+            state.session_id = if id.is_empty() { None } else { Some(id) };
+        }
         SourceEvent::LogFilesUpdated { files } => {
             handle_event_log_files_updated(files, state);
         }
@@ -3350,21 +3366,21 @@ mod tests {
         assert!(!state.windows[0].visible);
         assert_eq!(state.windows[0].status, "Cancelled");
 
-        // Test /exit to quit
-        let handled_exit = super::handle_window_nav_commands("/exit", &mut state);
-        assert!(handled_exit);
-        assert!(state.should_quit);
+        // Test /quit (primary advertised command) to quit
+        let mut state_quit = AppState::new("http://localhost:3000", "HTTP", true);
+        let handled_quit = super::handle_window_nav_commands("/quit", &mut state_quit);
+        assert!(handled_quit);
+        assert!(state_quit.should_quit);
 
-        // Test /q and /quit to quit
+        // Test /q (alias) and /exit (unadvertised alias) also quit
         let mut state_q = AppState::new("http://localhost:3000", "HTTP", true);
         let handled_q = super::handle_window_nav_commands("/q", &mut state_q);
         assert!(handled_q);
         assert!(state_q.should_quit);
 
-        let mut state_quit = AppState::new("http://localhost:3000", "HTTP", true);
-        let handled_quit = super::handle_window_nav_commands("/quit", &mut state_quit);
-        assert!(handled_quit);
-        assert!(state_quit.should_quit);
+        let handled_exit = super::handle_window_nav_commands("/exit", &mut state);
+        assert!(handled_exit);
+        assert!(state.should_quit);
     }
 
     #[test]

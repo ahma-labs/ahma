@@ -43,5 +43,5 @@ pub async fn run_tui(
         tracing::warn!("Could not ensure server is running: {}", e);
     }
     let connection = connection::resolve_connection(connect).await?;
-    app::run(&connection, profile).await
+    app::run(&connection, profile, path).await
 }

@@ -66,10 +66,11 @@ pub enum McpSourceCommand {
 pub fn spawn_mcp_source(
     connection: ResolvedConnection,
     tx: mpsc::Sender<SourceEvent>,
+    workspace_path: Option<std::path::PathBuf>,
 ) -> mpsc::Sender<McpSourceCommand> {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        mcp_source_task(connection, tx, cmd_rx).await;
+        mcp_source_task(connection, tx, cmd_rx, workspace_path).await;
     });
     cmd_tx
 }
@@ -80,6 +81,7 @@ async fn mcp_source_task(
     connection: ResolvedConnection,
     tx: mpsc::Sender<SourceEvent>,
     mut cmd_rx: mpsc::Receiver<McpSourceCommand>,
+    workspace_path: Option<std::path::PathBuf>,
 ) {
     let base_url = extract_http_base_url(&connection);
     debug!("mcp_source: base_url={base_url}");
@@ -93,6 +95,17 @@ async fn mcp_source_task(
         builder
     };
     let client = builder.build().expect("reqwest client build failed");
+
+    let sse_builder = reqwest::Client::builder();
+    #[cfg(unix)]
+    let sse_builder = if let Some(path) = socket_path {
+        sse_builder.unix_socket(path)
+    } else {
+        sse_builder
+    };
+    let sse_client = sse_builder
+        .build()
+        .expect("reqwest sse client build failed");
 
     let request_base_url = if socket_path.is_some() {
         "http://localhost".to_string()
@@ -175,7 +188,7 @@ async fn mcp_source_task(
 
                 // Ensure we have an MCP session
                 if mcp_state.is_none() {
-                    match init_mcp_session(&client, &request_base_url).await {
+                    match init_mcp_session(&client, &sse_client, &request_base_url, workspace_path.clone()).await {
                         Ok(session) => {
                             send(&tx, SourceEvent::SessionId { id: session.id.clone() }).await;
                             // Fetch tools list once after connecting
@@ -197,8 +210,10 @@ async fn mcp_source_task(
                             send(&tx, SourceEvent::OperationsUpdated { ops }).await;
                         }
                         Err(e) => {
-                            debug!("status call failed: {e:#}");
-                            mcp_state = None; // force re-init next tick
+                            debug!("status call failed (resetting session): {e:#}");
+                            mcp_state = None;
+                            // Clear the session id in the UI so it doesn't use the dead id for tool calls.
+                            send(&tx, SourceEvent::SessionId { id: String::new() }).await;
                         }
                     }
                 }
@@ -292,8 +307,13 @@ impl McpSession {
 }
 
 /// Perform the minimal MCP handshake required before tool calls:
-/// `initialize` → get session ID, `notifications/initialized` → ready.
-async fn init_mcp_session(client: &reqwest::Client, base_url: &str) -> Result<McpSession> {
+/// `initialize` → get session ID, `notifications/initialized` → ready, and start long-lived GET /mcp SSE stream.
+async fn init_mcp_session(
+    client: &reqwest::Client,
+    sse_client: &reqwest::Client,
+    base_url: &str,
+    workspace_path: Option<std::path::PathBuf>,
+) -> Result<McpSession> {
     let url = format!("{base_url}/mcp");
 
     // Step 1: initialize
@@ -322,6 +342,27 @@ async fn init_mcp_session(client: &reqwest::Client, base_url: &str) -> Result<Mc
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow::anyhow!("no mcp-session-id in initialize response"))?;
 
+    // Step 1.5: Spawn the SSE listener in the background to handle the roots/list protocol requirements
+    let sse_client_clone = sse_client.clone();
+    let client_clone = client.clone();
+    let sse_url_clone = url.clone();
+    let session_id_clone = session_id.clone();
+    let workspace_path_clone = workspace_path.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = run_sse_listener(
+            sse_client_clone,
+            client_clone,
+            sse_url_clone,
+            session_id_clone,
+            workspace_path_clone,
+        )
+        .await
+        {
+            debug!("SSE listener terminated with error: {:?}", e);
+        }
+    });
+
     // Step 2: notifications/initialized
     let notif_body = json!({
         "jsonrpc": "2.0",
@@ -336,7 +377,7 @@ async fn init_mcp_session(client: &reqwest::Client, base_url: &str) -> Result<Mc
         .await;
 
     // Step 3: respond to roots/list if the server requests it
-    // (We send an empty roots list proactively to unblock sandbox init.)
+    // (We also send an empty roots list proactively to unblock sandbox init in case server doesn't support SSE)
     let roots_resp_body = json!({
         "jsonrpc": "2.0",
         "id": 2,
@@ -351,6 +392,173 @@ async fn init_mcp_session(client: &reqwest::Client, base_url: &str) -> Result<Mc
         .await;
 
     Ok(McpSession::new(session_id))
+}
+
+/// Helper function to encode a filesystem path as a file:// URI path component.
+fn encode_file_uri(path: &std::path::Path) -> String {
+    let mut path_str = path.to_string_lossy().into_owned();
+
+    // Strip Windows extended-length prefix (\\?\) if present.
+    if path_str.starts_with(r"\\?\") {
+        path_str = path_str[4..].to_string();
+    }
+
+    // Normalise path separators to forward slashes.
+    path_str = path_str.replace('\\', "/");
+
+    let mut out = String::with_capacity(path_str.len() + 10);
+    out.push_str("file://");
+
+    #[cfg(target_os = "windows")]
+    {
+        let is_drive = path_str.len() >= 2
+            && path_str.as_bytes()[0].is_ascii_alphabetic()
+            && path_str.as_bytes()[1] == b':';
+        if is_drive {
+            out.push('/');
+        }
+    }
+
+    out.push_str(&path_str);
+    out
+}
+
+fn first_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {
+    let lf = buffer.find("\n\n").map(|idx| (idx, 2));
+    let crlf = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
+
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn pop_next_sse_event(buffer: &mut String) -> Option<String> {
+    let (idx, delimiter_len) = first_sse_event_boundary(buffer)?;
+    let raw_event = buffer[..idx].to_string();
+    *buffer = buffer[idx + delimiter_len..].to_string();
+    Some(raw_event)
+}
+
+fn event_data_to_json(raw_event: &str) -> Option<Value> {
+    let data: Vec<&str> = raw_event
+        .lines()
+        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
+        .map(str::trim)
+        .collect();
+
+    if data.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Value>(&data.join("\n")).ok()
+}
+
+async fn handle_sse_event(
+    client: &reqwest::Client,
+    mcp_url: &str,
+    value: &Value,
+    session_id: &str,
+    workspace_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let method = value.get("method").and_then(|m| m.as_str());
+
+    if method == Some("notifications/sandbox/failed") {
+        let error = value
+            .get("params")
+            .and_then(|p| p.get("error"))
+            .and_then(|e| e.as_str())
+            .unwrap_or("unknown");
+        warn!("Sandbox configuration failed: {}", error);
+    }
+
+    if method == Some("notifications/sandbox/configured") {
+        debug!("Sandbox configured successfully!");
+    }
+
+    if method == Some("roots/list") {
+        let request_id = value
+            .get("id")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("roots/list must include id"))?;
+
+        // Determine workspace path to send
+        let actual_path = workspace_path.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        });
+
+        let roots_json = vec![json!({
+            "uri": encode_file_uri(&actual_path),
+            "name": actual_path.file_name().and_then(|n| n.to_str()).unwrap_or("workspace")
+        })];
+
+        let roots_response = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "roots": roots_json
+            }
+        });
+
+        debug!("Sending roots response: {:?}", roots_response);
+        let _ = client
+            .post(mcp_url)
+            .header("Content-Type", "application/json")
+            .header("mcp-session-id", session_id)
+            .json(&roots_response)
+            .send()
+            .await;
+    }
+
+    Ok(())
+}
+
+async fn run_sse_listener(
+    sse_client: reqwest::Client,
+    client: reqwest::Client,
+    sse_url: String,
+    session_id: String,
+    workspace_path: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let response = sse_client
+        .get(&sse_url)
+        .header("Accept", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("mcp-session-id", &session_id)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "SSE stream failed with HTTP {}",
+            response.status()
+        ));
+    }
+
+    let mut resp = response;
+    let mut buffer = String::new();
+    while let Ok(Some(bytes)) = resp.chunk().await {
+        if let Ok(chunk_str) = std::str::from_utf8(&bytes) {
+            buffer.push_str(chunk_str);
+            while let Some(raw_event) = pop_next_sse_event(&mut buffer) {
+                if let Some(json_val) = event_data_to_json(&raw_event)
+                    && let Err(e) = handle_sse_event(
+                        &client,
+                        &sse_url,
+                        &json_val,
+                        &session_id,
+                        workspace_path.as_deref(),
+                    )
+                    .await
+                {
+                    debug!("Error handling SSE event: {:?}", e);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ─── Tool calls ───────────────────────────────────────────────────────────────
@@ -433,8 +641,7 @@ async fn call_status(
 
     if !resp.status().is_success() {
         let s = resp.status();
-        warn!("status call returned HTTP {s}");
-        return Ok(vec![]);
+        return Err(anyhow::anyhow!("status call returned HTTP {s}"));
     }
 
     let val = resp.json::<Value>().await?;
@@ -679,4 +886,96 @@ async fn call_logs_read(
         .ok_or_else(|| anyhow::anyhow!("Invalid response format for logs_read"))?;
 
     Ok(text.to_string())
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── pop_next_sse_event ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_pop_next_sse_event_lf_delimiter() {
+        let mut buf = "event: ping\ndata: {}\n\nmore".to_string();
+        let event = pop_next_sse_event(&mut buf);
+        assert_eq!(event.as_deref(), Some("event: ping\ndata: {}"));
+        assert_eq!(buf, "more");
+    }
+
+    #[test]
+    fn test_pop_next_sse_event_crlf_delimiter() {
+        let mut buf = "data: hello\r\n\r\nremainder".to_string();
+        let event = pop_next_sse_event(&mut buf);
+        assert_eq!(event.as_deref(), Some("data: hello"));
+        assert_eq!(buf, "remainder");
+    }
+
+    #[test]
+    fn test_pop_next_sse_event_no_delimiter_returns_none() {
+        let mut buf = "data: incomplete".to_string();
+        assert!(pop_next_sse_event(&mut buf).is_none());
+        assert_eq!(buf, "data: incomplete");
+    }
+
+    #[test]
+    fn test_pop_next_sse_event_empty_buf() {
+        let mut buf = String::new();
+        assert!(pop_next_sse_event(&mut buf).is_none());
+    }
+
+    #[test]
+    fn test_pop_next_sse_event_multiple_events() {
+        let mut buf = "data: 1\n\ndata: 2\n\n".to_string();
+        assert_eq!(pop_next_sse_event(&mut buf).as_deref(), Some("data: 1"));
+        assert_eq!(pop_next_sse_event(&mut buf).as_deref(), Some("data: 2"));
+        assert!(pop_next_sse_event(&mut buf).is_none());
+    }
+
+    // ── event_data_to_json ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_event_data_to_json_single_data_line() {
+        let raw = "data: {\"method\":\"roots/list\",\"id\":1}";
+        let v = event_data_to_json(raw).expect("should parse");
+        assert_eq!(v["method"].as_str(), Some("roots/list"));
+    }
+
+    #[test]
+    fn test_event_data_to_json_no_data_prefix_returns_none() {
+        let raw = "event: ping\n: comment";
+        assert!(event_data_to_json(raw).is_none());
+    }
+
+    #[test]
+    fn test_event_data_to_json_invalid_json_returns_none() {
+        let raw = "data: not-valid-json";
+        assert!(event_data_to_json(raw).is_none());
+    }
+
+    #[test]
+    fn test_event_data_to_json_strips_data_prefix() {
+        let raw = "data: {\"ok\":true}";
+        let v = event_data_to_json(raw).expect("should parse");
+        assert_eq!(v["ok"].as_bool(), Some(true));
+    }
+
+    // ── encode_file_uri ───────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_encode_file_uri_unix_absolute() {
+        let path = std::path::Path::new("/home/user/project");
+        let uri = encode_file_uri(path);
+        assert_eq!(uri, "file:///home/user/project");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_encode_file_uri_unix_nested() {
+        let path = std::path::Path::new("/tmp/foo/bar baz");
+        let uri = encode_file_uri(path);
+        assert_eq!(uri, "file:///tmp/foo/bar baz");
+    }
 }

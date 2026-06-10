@@ -277,17 +277,14 @@ pub fn builtin_commands() -> Vec<NavCommand> {
             description: "export chat transcript to markdown",
         },
         NavCommand {
-            command: "/exit".into(),
+            command: "/quit".into(),
             description: "quit the application",
         },
         NavCommand {
             command: "/q".into(),
             description: "quit the application (alias)",
         },
-        NavCommand {
-            command: "/quit".into(),
-            description: "quit the application (alias)",
-        },
+        // /exit intentionally omitted — still handled, just not advertised
     ]
 }
 
