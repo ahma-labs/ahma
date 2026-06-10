@@ -171,7 +171,7 @@ jobs:
           fi
 
       - name: Install cargo-nextest
-        if: runner.os != 'Windows'
+        if: matrix.test_mode == 'full'
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
@@ -195,21 +195,13 @@ jobs:
         run: cargo build --locked --no-default-features -p ahma_bin
 
       - name: Cargo Nextest (excluding Android/Kotlin tests)
-        if: matrix.test_mode == 'full' && runner.os != 'Windows'
+        if: matrix.test_mode == 'full'
         timeout-minutes: 40
         run: |
           echo "--- cargo --version" && cargo --version
           echo "--- cargo nextest --version" && cargo nextest --version
           echo "--- Running cargo nextest run --profile ci"
           cargo nextest run --profile ci --locked --no-default-features -E 'not (test(kotlin) or test(android))'
-
-      - name: Cargo Test (Windows, excluding Android/Kotlin tests)
-        if: matrix.test_mode == 'full' && runner.os == 'Windows'
-        timeout-minutes: 40
-        run: |
-          echo "--- cargo --version" && cargo --version
-          echo "--- Running plain cargo test"
-          cargo test --locked --no-default-features -- --skip android --skip kotlin
 
       - name: ARM64 smoke validation (compile-only)
         if: matrix.test_mode == 'smoke'
