@@ -172,13 +172,13 @@ async fn test_routed_sampling_flow() {
     let base = server.base_url();
 
     // 1. Initialize Target Client (Session A) which has sampling capability
-    let (session_a_id, _) = initialize_session(&http, &*base, "Cursor", true).await;
+    let (session_a_id, _) = initialize_session(&http, &base, "Cursor", true).await;
     let sse_a_stream = open_sse_stream(http.clone(), base.clone(), session_a_id.clone()).await;
-    send_initialized(&http, &*base, &session_a_id).await;
+    send_initialized(&http, &base, &session_a_id).await;
 
     // 2. Initialize Agent Client (Session B)
-    let (session_b_id, _) = initialize_session(&http, &*base, "TUI", false).await;
-    send_initialized(&http, &*base, &session_b_id).await;
+    let (session_b_id, _) = initialize_session(&http, &base, "TUI", false).await;
+    send_initialized(&http, &base, &session_b_id).await;
 
     // Monitor Session A's SSE stream in the background and respond to requests
     let (tx_ready, rx_ready) = oneshot::channel();
@@ -281,12 +281,12 @@ async fn test_sampling_concurrency_lock() {
     let base = server.base_url();
 
     // Initialize Target A (with sampling) and Agent B
-    let (session_a_id, _) = initialize_session(&http, &*base, "Cursor", true).await;
+    let (session_a_id, _) = initialize_session(&http, &base, "Cursor", true).await;
     let sse_a_stream = open_sse_stream(http.clone(), base.clone(), session_a_id.clone()).await;
-    send_initialized(&http, &*base, &session_a_id).await;
+    send_initialized(&http, &base, &session_a_id).await;
 
-    let (session_b_id, _) = initialize_session(&http, &*base, "TUI", false).await;
-    send_initialized(&http, &*base, &session_b_id).await;
+    let (session_b_id, _) = initialize_session(&http, &base, "TUI", false).await;
+    send_initialized(&http, &base, &session_b_id).await;
 
     // Start background task to process events; sleep before each sampling response
     // to keep the per-session lock held long enough to prove serialization.

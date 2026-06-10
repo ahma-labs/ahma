@@ -720,10 +720,7 @@ impl TaskTreeOrchestrator {
     }
 
     /// Collect ancestor nodes from root down to the immediate parent of `node_id`.
-    fn collect_ancestors<'t>(
-        tree: &'t TaskTree,
-        node_id: NodeId,
-    ) -> Vec<&'t crate::tree::TaskNode> {
+    fn collect_ancestors(tree: &TaskTree, node_id: NodeId) -> Vec<&crate::tree::TaskNode> {
         let mut ancestors = Vec::new();
         let mut curr = tree.get_node(node_id);
         while let Some(node) = curr {
@@ -741,10 +738,7 @@ impl TaskTreeOrchestrator {
     }
 
     /// Collect completed sibling nodes that appear before `node_id` in the parent's child list.
-    fn collect_prior_siblings<'t>(
-        tree: &'t TaskTree,
-        node_id: NodeId,
-    ) -> Vec<&'t crate::tree::TaskNode> {
+    fn collect_prior_siblings(tree: &TaskTree, node_id: NodeId) -> Vec<&crate::tree::TaskNode> {
         let parent = tree
             .get_node(node_id)
             .and_then(|n| n.parent_id)

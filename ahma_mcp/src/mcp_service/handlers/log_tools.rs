@@ -14,6 +14,7 @@
 use super::common::{mcp_internal, mcp_invalid_params, text_result};
 use crate::AhmaMcpService;
 use crate::log_monitor::redact_sensitive_line;
+use crate::utils::logging::project_log_dir;
 use rmcp::model::{CallToolResult, ErrorData as McpError};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -296,13 +297,6 @@ pub fn logs_approve_schema() -> Arc<Map<String, Value>> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Returns the canonical project log directory (`<cwd>/logs`).
-fn project_log_dir() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("logs")
-}
 
 /// Validates and resolves a caller-supplied log file name into a safe absolute path.
 ///

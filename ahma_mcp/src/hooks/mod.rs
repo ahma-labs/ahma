@@ -408,12 +408,11 @@ fn detect_mcp_config_exists() -> bool {
     }
 
     for path in paths {
-        if path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if content.contains("\"ahma\"") {
-                    return true;
-                }
-            }
+        if path.exists()
+            && let Ok(content) = std::fs::read_to_string(&path)
+            && content.contains("\"ahma\"")
+        {
+            return true;
         }
     }
     false
@@ -485,14 +484,19 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     let sandbox = crate::shell::cli::initialize_sandbox(&cfg)?
         .ok_or_else(|| anyhow!("Sandbox scopes must be initialized for run-shell mode"))?;
 
-    let monitor_config = crate::operation_monitor::MonitorConfig::with_timeout(std::time::Duration::from_secs(cfg.timeout_secs));
-    let operation_monitor = std::sync::Arc::new(crate::operation_monitor::OperationMonitor::new(monitor_config));
+    let monitor_config = crate::operation_monitor::MonitorConfig::with_timeout(
+        std::time::Duration::from_secs(cfg.timeout_secs),
+    );
+    let operation_monitor = std::sync::Arc::new(crate::operation_monitor::OperationMonitor::new(
+        monitor_config,
+    ));
 
     let shell_pool_config = crate::shell_pool::ShellPoolConfig {
         command_timeout: std::time::Duration::from_secs(cfg.timeout_secs),
         ..Default::default()
     };
-    let shell_pool_manager = std::sync::Arc::new(crate::shell_pool::ShellPoolManager::new(shell_pool_config));
+    let shell_pool_manager =
+        std::sync::Arc::new(crate::shell_pool::ShellPoolManager::new(shell_pool_config));
 
     let adapter = std::sync::Arc::new(crate::adapter::Adapter::new(
         operation_monitor,
@@ -501,19 +505,27 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     )?);
 
     let mut adapter_args = serde_json::Map::new();
-    adapter_args.insert("command".to_string(), serde_json::Value::String(payload.command));
+    adapter_args.insert(
+        "command".to_string(),
+        serde_json::Value::String(payload.command),
+    );
     adapter_args.insert("c_flag".to_string(), serde_json::Value::Bool(true));
 
     let timeout = Some(cfg.timeout_secs);
-    let subcommand_config = crate::AhmaMcpService::build_shell_subcommand_config(timeout, &crate::adapter::ExecutionMode::Synchronous);
-
-    let result = adapter.execute_sync_in_dir(
-        crate::shell_pool::platform_shell_program(),
-        Some(adapter_args),
-        &payload.cwd,
+    let subcommand_config = crate::AhmaMcpService::build_shell_subcommand_config(
         timeout,
-        Some(&subcommand_config),
-    ).await;
+        &crate::adapter::ExecutionMode::Synchronous,
+    );
+
+    let result = adapter
+        .execute_sync_in_dir(
+            crate::shell_pool::platform_shell_program(),
+            Some(adapter_args),
+            &payload.cwd,
+            timeout,
+            Some(&subcommand_config),
+        )
+        .await;
 
     match result {
         Ok(output) => {
