@@ -123,6 +123,7 @@ async fn mcp_source_task(
     logs_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut prev_healthy = false;
+    let mut prev_status_ok = true;
     let mut mcp_state: Option<McpSession> = None;
 
     let mut active_log_file: Option<String> = None;
@@ -167,6 +168,15 @@ async fn mcp_source_task(
                 let healthy = check_health(&client, &request_base_url).await;
                 if healthy != prev_healthy {
                     prev_healthy = healthy;
+                    if healthy {
+                        tracing::info!(
+                            url = %base_url,
+                            transport = %connection.transport_label(),
+                            "TUI connected to bridge"
+                        );
+                    } else {
+                        tracing::warn!(url = %base_url, "TUI bridge unreachable");
+                    }
                     send(&tx, SourceEvent::HealthChanged { healthy }).await;
                     let msg = if healthy {
                         format!("Connected to {} ({})", base_url, connection.transport_label())
@@ -179,7 +189,10 @@ async fn mcp_source_task(
                         message: msg,
                     })).await;
                     // Reset MCP session on disconnect
-                    if !healthy { mcp_state = None; }
+                    if !healthy {
+                        mcp_state = None;
+                        prev_status_ok = true;
+                    }
                 }
             }
 
@@ -207,10 +220,16 @@ async fn mcp_source_task(
                 if let Some(ref session) = mcp_state {
                     match call_status(&client, &request_base_url, session).await {
                         Ok(ops) => {
+                            prev_status_ok = true;
                             send(&tx, SourceEvent::OperationsUpdated { ops }).await;
                         }
                         Err(e) => {
-                            debug!("status call failed (resetting session): {e:#}");
+                            if prev_status_ok {
+                                tracing::warn!(error = %e, "TUI status poll failed; resetting MCP session");
+                                prev_status_ok = false;
+                            } else {
+                                debug!("status call failed (resetting session): {e:#}");
+                            }
                             mcp_state = None;
                             // Clear the session id in the UI so it doesn't use the dead id for tool calls.
                             send(&tx, SourceEvent::SessionId { id: String::new() }).await;
@@ -616,6 +635,17 @@ async fn call_tools_list(
     Ok(tools)
 }
 
+fn status_call_error(url: &str, status: reqwest::StatusCode) -> anyhow::Error {
+    let hint = match status.as_u16() {
+        409 => "sandbox still initializing — complete MCP handshake (roots/list) before tools/call",
+        403 => "forbidden — check bearer token, session id, or bridge auth settings",
+        401 => "unauthorized — bearer token missing or invalid",
+        404 => "session not found — MCP session may have expired; reconnect",
+        _ => "unexpected HTTP status from status tool",
+    };
+    anyhow::anyhow!("status call to {url} returned HTTP {status} ({hint})")
+}
+
 async fn call_status(
     client: &reqwest::Client,
     base_url: &str,
@@ -641,7 +671,7 @@ async fn call_status(
 
     if !resp.status().is_success() {
         let s = resp.status();
-        return Err(anyhow::anyhow!("status call returned HTTP {s}"));
+        return Err(status_call_error(&url, s));
     }
 
     let val = resp.json::<Value>().await?;
@@ -977,5 +1007,13 @@ mod tests {
         let path = std::path::Path::new("/tmp/foo/bar baz");
         let uri = encode_file_uri(path);
         assert_eq!(uri, "file:///tmp/foo/bar baz");
+    }
+
+    #[test]
+    fn test_status_call_error_includes_actionable_hint() {
+        let err = super::status_call_error("http://localhost/mcp", reqwest::StatusCode::CONFLICT);
+        let msg = format!("{err:#}");
+        assert!(msg.contains("409"));
+        assert!(msg.contains("sandbox"));
     }
 }

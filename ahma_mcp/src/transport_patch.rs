@@ -21,6 +21,23 @@ use tokio::io::{
 use tokio::sync::Mutex;
 use tracing;
 
+/// Summarize a JSON-RPC payload for debug logging (full body is logged at TRACE only).
+fn summarize_jsonrpc_payload(json: &str) -> String {
+    let bytes = json.trim_end().len();
+    let Ok(value) = serde_json::from_str::<Value>(json) else {
+        return format!("bytes={bytes} parse=invalid");
+    };
+    let id = value
+        .get("id")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    format!("bytes={bytes} id={id} method={method}")
+}
+
 /// Transport wrapper supporting mixed MCP framing styles.
 #[derive(Clone)]
 pub struct PatchedTransport<R, W> {
@@ -83,7 +100,11 @@ where
             let mut json = json_res?;
             json.push('\n');
             let mut w = writer.lock().await;
-            tracing::debug!("[AhmaTransport] SEND: {}", json.trim_end());
+            tracing::trace!("[AhmaTransport] SEND full: {}", json.trim_end());
+            tracing::debug!(
+                "[AhmaTransport] SEND {}",
+                summarize_jsonrpc_payload(&json)
+            );
             w.write_all(json.as_bytes()).await?;
             w.flush().await?;
             Ok(())
@@ -155,7 +176,14 @@ where
                 // Try to parse as Value to inspect and patch
                 let mut value: Value = match serde_json::from_str(&message_body) {
                     Ok(v) => {
-                        tracing::debug!("[AhmaTransport] RECV RAW: {}", message_body.trim());
+                        tracing::trace!(
+                            "[AhmaTransport] RECV full: {}",
+                            message_body.trim()
+                        );
+                        tracing::debug!(
+                            "[AhmaTransport] RECV {}",
+                            summarize_jsonrpc_payload(&message_body)
+                        );
                         v
                     }
                     Err(e) => {
@@ -227,5 +255,25 @@ where
             return Err(e);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::summarize_jsonrpc_payload;
+
+    #[test]
+    fn summarize_jsonrpc_includes_method_and_id() {
+        let json = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let summary = summarize_jsonrpc_payload(json);
+        assert!(summary.contains("method=tools/list"));
+        assert!(summary.contains("id=1"));
+        assert!(summary.contains("bytes="));
+    }
+
+    #[test]
+    fn summarize_jsonrpc_invalid_json() {
+        let summary = summarize_jsonrpc_payload("not-json");
+        assert!(summary.contains("parse=invalid"));
     }
 }

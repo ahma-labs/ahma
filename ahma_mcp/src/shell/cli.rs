@@ -23,7 +23,12 @@
 
 use super::{list_tools, modes, resolution};
 
-use crate::{sandbox, utils::logging::init_logging_with_observability};
+use crate::{
+    sandbox,
+    utils::logging::{
+        detect_log_role_from_startup, init_logging_with_observability, set_log_role,
+    },
+};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use dunce;
@@ -2485,6 +2490,8 @@ pub async fn run() -> Result<()> {
     } else {
         false
     };
+
+    set_log_role(detect_log_role_from_startup());
 
     let cfg = build_app_config(&cli);
     let subcommand = cli.command;

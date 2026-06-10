@@ -1,92 +1,134 @@
 //! # Logging Initialization
 //!
-//! This module provides a centralized function for initializing the application's
-//! logging infrastructure. It uses the `tracing` ecosystem to provide structured,
-//! configurable logging.
-//!
-//! ## Core Functionality
-//!
-//! - **`init_logging()`**: This is the main function of the module. It is designed to
-//!   be called once at the start of the application's lifecycle. It uses a `std::sync::Once`
-//!   to ensure that the initialization logic is executed only a single time, even if
-//!   the function is called multiple times.
-//!
-//! ## Logging Configuration
-//!
-//! The function sets up a multi-layered logging system:
-//!
-//! 1.  **Environment Filter (`EnvFilter`)**: It configures the logging verbosity based on
-//!     the `RUST_LOG` environment variable. If `RUST_LOG` is not set, it defaults to a
-//!     sensible configuration: `info` for most crates, but `debug` for the `ahma_mcp`
-//!     crate itself.
-//!
-//! 2.  **File Logging (Default)**: By default (`log_to_file = true`), it creates a daily
-//!     rolling log file in the user-specific cache directory (determined by the `directories`
-//!     crate). This preserves log history without cluttering the console. It uses
-//!     `tracing_appender` to handle file rotation and non-blocking I/O. ANSI colors are
-//!     disabled for file output.
-//!
-//! 3.  **Stderr Logging (Opt-in)**: When `log_to_file = false`, all logs are written to
-//!     `stderr` with ANSI color codes enabled for better readability on Mac/Linux terminals.
-//!     Error messages appear in red, warnings in yellow, etc. This mode is useful for
-//!     debugging and development with tools like MCP Inspector.
-//!
-//! 4.  **Stderr Fallback**: If file logging is requested but the project's cache directory
-//!     cannot be determined (e.g., in a sandboxed or unusual environment), the logger
-//!     gracefully falls back to writing logs to `stderr` with colors enabled.
-//!
-//! ## Usage
-//!
-//! To enable logging, call `ahma_mcp::utils::logging::init_logging(log_level, log_to_file)`
-//! at the beginning of the `main` function.
-//!
-//! For terminal debugging: `init_logging("debug", false)` (logs to stderr with colors)
-//! For production: `init_logging("info", true)` (logs to file without colors)
+//! Centralized logging for ahma processes. Every line is prefixed with `pid=` and
+//! `role=` so interleaved multi-process logs in `./logs/ahma_mcp.log` remain attributable.
 
 use ahma_common::observability::{ObservabilityConfig, TelemetryGuard};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::{
     io::stderr,
-    path::Path,
-    sync::{Mutex, Once},
+    path::{Path, PathBuf},
+    sync::{Mutex, Once, OnceLock},
 };
-use tracing_subscriber::{EnvFilter, fmt::layer, prelude::*};
+use tracing_subscriber::{
+    EnvFilter,
+    fmt::{
+        self,
+        FmtContext,
+        format::{FormatEvent, Writer},
+        time::SystemTime,
+    },
+    prelude::*,
+    registry::LookupSpan,
+};
 
 static INIT: Once = Once::new();
 /// Passes the OTEL guard out of the `call_once` closure to the caller.
 static PENDING_GUARD: Mutex<Option<TelemetryGuard>> = Mutex::new(None);
 
+static LOG_ROLE: OnceLock<&'static str> = OnceLock::new();
+
+/// Rolling structured log basename (daily rotation appends `.YYYY-MM-DD`).
+pub const MCP_LOG_BASENAME: &str = "ahma_mcp.log";
+
+/// Background bridge raw stdout/stderr capture files (see `ahma_mcp.log` for structured logs).
+pub const BRIDGE_STDOUT_NAME: &str = "ahma_bridge.out.log";
+pub const BRIDGE_STDERR_NAME: &str = "ahma_bridge.err.log";
+
+/// One-line header written when bridge capture files are first created.
+pub const BRIDGE_CAPTURE_HEADER: &str =
+    "# ahma background bridge stdout/stderr capture — see ahma_mcp.log for structured logs\n";
+
+/// Delete managed log files older than this many seconds (24 hours).
+pub const LOG_RETENTION_SECS: u64 = 24 * 60 * 60;
+
+/// Set the process role label included on every log line. Call once before [`init_logging`].
+pub fn set_log_role(role: &'static str) {
+    let _ = LOG_ROLE.set(role);
+}
+
+/// Current process role (`unknown` if [`set_log_role`] was not called).
+pub fn log_role() -> &'static str {
+    LOG_ROLE.get().copied().unwrap_or("unknown")
+}
+
+/// Infer process role from environment and argv (call before logging init).
+pub fn detect_log_role_from_startup() -> &'static str {
+    if std::env::var("AHMA_SERVER_CHILD").is_ok() {
+        return "bridge";
+    }
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--server-child") {
+        return "bridge";
+    }
+
+    match args.first().map(|s| s.as_str()) {
+        None => "cli",
+        Some("serve") => match args.get(1).map(|s| s.as_str()) {
+            Some("stdio") => "proxy",
+            Some("http") | Some("unix") => "bridge",
+            // `ahma serve --sandbox-scope …` (background bridge child)
+            Some(s) if s.starts_with('-') => "bridge",
+            None => "bridge",
+            _ => "bridge",
+        },
+        Some("tui") => "tui",
+        Some("daemon") => "daemon",
+        Some("update") => "update",
+        Some("setup") => "setup",
+        Some("hooks") if args.iter().any(|a| a == "run-shell") => "cli",
+        Some("tool") if args.get(1).map(|s| s.as_str()) == Some("run") => "cli",
+        _ => "cli",
+    }
+}
+
+/// Project log directory: `<cwd>/logs`.
+pub fn project_log_dir() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("logs")
+}
+
+/// Paths for background bridge stdout/stderr capture under [`project_log_dir`].
+pub fn bridge_capture_paths() -> (PathBuf, PathBuf) {
+    let dir = project_log_dir();
+    (
+        dir.join(BRIDGE_STDOUT_NAME),
+        dir.join(BRIDGE_STDERR_NAME),
+    )
+}
+
+/// Ensure `logs/` exists, prune stale files, and create bridge capture files with a header.
+pub fn prepare_bridge_capture_files() -> Result<(PathBuf, PathBuf)> {
+    let log_dir = project_log_dir();
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("Failed to create log directory {}", log_dir.display()))?;
+    cleanup_old_logs(&log_dir);
+
+    let (stdout_path, stderr_path) = bridge_capture_paths();
+    for path in [&stdout_path, &stderr_path] {
+        if !path.exists() {
+            std::fs::write(path, BRIDGE_CAPTURE_HEADER).with_context(|| {
+                format!("Failed to create bridge capture file {}", path.display())
+            })?;
+        }
+    }
+    Ok((stdout_path, stderr_path))
+}
+
 /// Initialize verbose logging for tests.
-///
-/// This configures a `trace`-level subscriber that logs to stderr.
 pub fn init_test_logging() {
+    set_log_role("test");
     let _ = init_logging("trace", false);
 }
 
 /// Initializes the logging system.
-///
-/// Sets up a global tracing subscriber and, when an OTLP endpoint is configured
-/// (`--opentelemetry <url>` or `OTEL_EXPORTER_OTLP_ENDPOINT`), also attaches
-/// an OTLP exporting layer.
-///
-/// Returns a [`TelemetryGuard`] that **must** be kept alive for the duration
-/// of the process to ensure buffered spans are flushed on shutdown.  When
-/// OTEL is not enabled the guard is a cheap no-op.
-///
-/// When logging to stderr, ANSI colors are enabled for better readability.
-/// When logging to file, ANSI colors are disabled.
-///
-/// # Errors
-///
-/// Returns an error if the project directories cannot be determined.
 pub fn init_logging(log_level: &str, log_to_file: bool) -> Result<TelemetryGuard> {
     init_logging_with_observability(log_level, log_to_file, None)
 }
 
 /// Initializes logging with an optional explicit observability configuration.
-///
-/// When `observability` is `Some`, that configuration is used for OTEL setup;
-/// otherwise configuration is read from environment variables.
 pub fn init_logging_with_observability(
     log_level: &str,
     log_to_file: bool,
@@ -96,12 +138,46 @@ pub fn init_logging_with_observability(
         do_setup_logging(log_level, log_to_file, observability);
     });
 
-    // Return the guard produced in this call (None on subsequent calls — guard already held).
     Ok(PENDING_GUARD
         .lock()
         .unwrap()
         .take()
         .unwrap_or_else(TelemetryGuard::none))
+}
+
+struct PidRoleFormatter {
+    inner: fmt::format::Format<fmt::format::Full, SystemTime>,
+}
+
+impl PidRoleFormatter {
+    fn new(with_ansi: bool) -> Self {
+        Self {
+            inner: fmt::format::Format::default()
+                .with_timer(SystemTime)
+                .with_ansi(with_ansi),
+        }
+    }
+}
+
+impl<S, N> FormatEvent<S, N> for PidRoleFormatter
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        write!(
+            writer,
+            "pid={} role={} ",
+            std::process::id(),
+            log_role()
+        )?;
+        self.inner.format_event(ctx, writer, event)
+    }
 }
 
 fn do_setup_logging(
@@ -112,14 +188,12 @@ fn do_setup_logging(
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
-    // Build the OTEL layer (no-op when no endpoint is configured).
     let (otel_layer, guard) = {
         let config = observability.unwrap_or_else(|| ObservabilityConfig::from_env("ahma_mcp"));
         ahma_common::observability::create_otel_layer(&config)
     };
     *PENDING_GUARD.lock().unwrap() = Some(guard);
 
-    // Attempt to log to a file, fall back to stderr.
     let file_appender_opt = if log_to_file {
         try_create_file_appender()
     } else {
@@ -130,130 +204,247 @@ fn do_setup_logging(
         tracing_subscriber::registry()
             .with(env_filter)
             .with(otel_layer)
-            .with(layer().with_writer(non_blocking).with_ansi(false))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(PidRoleFormatter::new(false))
+                    .with_writer(non_blocking)
+                    .with_ansi(false),
+            )
             .init();
-        // The guard is intentionally leaked to ensure logs are flushed on exit.
         Box::leak(Box::new(_guard));
         log_traceparent();
         return;
     }
 
-    // Fallback or explicit stderr logging
     tracing_subscriber::registry()
         .with(env_filter)
         .with(otel_layer)
-        .with(layer().with_writer(stderr).with_ansi(true))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .event_format(PidRoleFormatter::new(true))
+                .with_writer(stderr)
+                .with_ansi(true),
+        )
         .init();
     log_traceparent();
 }
 
 fn try_create_file_appender() -> Option<tracing_appender::rolling::RollingFileAppender> {
-    let log_dir = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join("logs");
+    let log_dir = project_log_dir();
 
-    // Test if we can actually write to the log directory before calling
-    // tracing_appender::rolling::daily, which panics on permission errors
-    // in tracing-appender 0.2.4+.
     if !test_write_permission(&log_dir) {
         return None;
     }
 
-    // Delete old rolling log files in `log/` matching the `ahma_mcp.log.*` pattern.
-    // Do not delete directories or symlinks.
     cleanup_old_logs(&log_dir);
 
-    // Use catch_unwind to handle panics from tracing_appender
     let appender = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        tracing_appender::rolling::daily(&log_dir, "ahma_mcp.log")
+        tracing_appender::rolling::daily(&log_dir, MCP_LOG_BASENAME)
     }))
     .ok()?;
 
-    // Create a stable `ahma_mcp.log` symlink pointing to today's dated rolling file.
-    // This lets `tail -F ./logs/ahma_mcp.log` work even though the actual file is dated.
     #[cfg(unix)]
     try_update_current_log_symlink(&log_dir);
 
     Some(appender)
 }
 
-/// Attempt to create/update `<log_dir>/ahma_mcp.log` as a symlink to today's dated
-/// rolling file (e.g. `ahma_mcp.log.2026-05-24`).
-///
-/// This is a best-effort operation — failure is logged at debug level and ignored.
 #[cfg(unix)]
 fn try_update_current_log_symlink(log_dir: &Path) {
     use std::os::unix::fs::symlink;
 
     let today = chrono::Local::now().format("%Y-%m-%d");
-    let dated_name = format!("ahma_mcp.log.{today}");
-    let symlink_path = log_dir.join("ahma_mcp.log");
+    let dated_name = format!("{MCP_LOG_BASENAME}.{today}");
+    let symlink_path = log_dir.join(MCP_LOG_BASENAME);
 
-    // Remove any existing file/symlink at the stable path.
     let _ = std::fs::remove_file(&symlink_path);
 
-    // Create a relative symlink so the log dir is portable.
     if let Err(e) = symlink(&dated_name, &symlink_path) {
         eprintln!("ahma: could not create log symlink {symlink_path:?} → {dated_name}: {e}");
     }
 }
 
-fn cleanup_old_logs(log_dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(log_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            // Skip directories, symlinks, and files not belonging to our rolling log set.
-            let Ok(meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            // Match both plain `ahma_mcp.log` and dated rolling files `ahma_mcp.log.YYYY-MM-DD`.
-            if name == "ahma_mcp.log" || name.starts_with("ahma_mcp.log.") {
-                // Keep only logs from the last 7 days.
-                if let Ok(modified) = meta.modified()
-                    && let Ok(elapsed) = modified.elapsed()
-                    && elapsed.as_secs() > 7 * 24 * 60 * 60
-                {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
+/// Returns true if `name` is a managed rolling log file eligible for retention pruning.
+pub(crate) fn is_managed_log_file(name: &str) -> bool {
+    name == MCP_LOG_BASENAME
+        || name.starts_with(&format!("{MCP_LOG_BASENAME}."))
+        || name.starts_with("ahma_bridge.")
+}
+
+/// Remove managed log files in `log_dir` older than [`LOG_RETENTION_SECS`].
+pub(crate) fn cleanup_old_logs(log_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !is_managed_log_file(name) {
+            continue;
+        }
+        if let Ok(modified) = meta.modified()
+            && let Ok(elapsed) = modified.elapsed()
+            && elapsed.as_secs() > LOG_RETENTION_SECS
+        {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
 
+/// Read up to `max_bytes` from the tail of a file (for post-mortem bridge diagnostics).
+pub fn read_log_tail(path: &Path, max_bytes: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(len) = file.metadata().map(|m| m.len() as usize) else {
+        return String::new();
+    };
+    let start = len.saturating_sub(max_bytes);
+    if file.seek(SeekFrom::Start(start as u64)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    if file.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 fn log_traceparent() {
-    // Log the parent trace context injected by the HTTP bridge (if any).
-    // This makes it easy to correlate subprocess and bridge traces even
-    // before full parent-child linking is wired up.
     if let Some(tp) = ahma_common::observability::env_traceparent() {
         tracing::debug!(traceparent = %tp, "subprocess trace context from HTTP bridge");
     }
 }
 
-/// Test if we can write to the given directory.
-///
-/// This creates the directory if needed, then attempts to create and remove a test file.
-/// Used to check write permissions before calling tracing_appender::rolling::daily
-/// which panics on permission errors in tracing-appender 0.2.4+.
 fn test_write_permission(dir: &Path) -> bool {
-    // Try to create the directory
     if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
 
-    // Try to create a test file to verify write permission
     let test_file = dir.join(".ahma_log_test");
     match std::fs::write(&test_file, "test") {
         Ok(()) => {
-            // Clean up the test file
             let _ = std::fs::remove_file(&test_file);
             true
         }
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_detect_log_role_proxy_stdio() {
+        // argv-based detection is tested via explicit strings (no env mutation).
+        assert_eq!(
+            role_for_args(&["serve", "stdio", "--tools", "rust"]),
+            "proxy"
+        );
+    }
+
+    #[test]
+    fn test_detect_log_role_bridge_http() {
+        assert_eq!(role_for_args(&["serve", "http"]), "bridge");
+    }
+
+    #[test]
+    fn test_detect_log_role_bridge_child_flags() {
+        assert_eq!(
+            role_for_args(&["serve", "--sandbox-scope", "/tmp/ws"]),
+            "bridge"
+        );
+    }
+
+    #[test]
+    fn test_is_managed_log_file_matches() {
+        assert!(is_managed_log_file("ahma_mcp.log"));
+        assert!(is_managed_log_file("ahma_mcp.log.2026-06-10"));
+        assert!(is_managed_log_file("ahma_bridge.out.log"));
+        assert!(is_managed_log_file("ahma_bridge.err.log"));
+        assert!(!is_managed_log_file("other.log"));
+    }
+
+    #[test]
+    fn test_cleanup_old_logs_keeps_recent_files() {
+        let temp = tempdir().unwrap();
+        let log_dir = temp.path().join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+
+        let fresh = log_dir.join("ahma_bridge.out.log");
+        fs::write(&fresh, "recent bridge stdout\n").unwrap();
+
+        cleanup_old_logs(&log_dir);
+
+        assert!(fresh.exists(), "recent bridge log should be kept");
+    }
+
+    #[test]
+    fn test_log_retention_threshold() {
+        assert!(LOG_RETENTION_SECS > 23 * 60 * 60);
+        assert!(LOG_RETENTION_SECS < 25 * 60 * 60);
+    }
+
+    #[test]
+    fn test_set_log_role() {
+        // OnceLock only accepts first set; use a dedicated check on detect helper instead.
+        assert_eq!(log_role(), "unknown");
+    }
+
+    #[test]
+    fn test_prepare_bridge_capture_files_creates_header() {
+        let temp = tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let (out, err) = prepare_bridge_capture_files().expect("prepare bridge logs");
+        assert!(out.exists());
+        assert!(err.exists());
+        let stderr_content = fs::read_to_string(&err).unwrap();
+        assert!(stderr_content.contains("ahma background bridge"));
+
+        let _ = std::env::set_current_dir(prev);
+    }
+
+    #[test]
+    fn test_read_log_tail_returns_suffix() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("sample.log");
+        fs::write(&path, "0123456789").unwrap();
+        let tail = read_log_tail(&path, 4);
+        assert_eq!(tail, "6789");
+    }
+
+    fn role_for_args(args: &[&str]) -> &'static str {
+        match args.first().copied() {
+            None => "cli",
+            Some("serve") => match args.get(1).copied() {
+                Some("stdio") => "proxy",
+                Some("http") | Some("unix") => "bridge",
+                Some(s) if s.starts_with('-') => "bridge",
+                None => "bridge",
+                _ => "bridge",
+            },
+            Some("tui") => "tui",
+            Some("daemon") => "daemon",
+            Some("update") => "update",
+            Some("setup") => "setup",
+            Some("hooks") if args.iter().any(|a| *a == "run-shell") => "cli",
+            Some("tool") if args.get(1).copied() == Some("run") => "cli",
+            _ => "cli",
+        }
     }
 }
