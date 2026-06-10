@@ -59,6 +59,8 @@ pub struct McpChatConfig {
     pub tool_approval: bool,
     /// All external MCP servers (HTTP and stdio) for agent tool routing.
     pub mcp_connections: crate::mcp_connections::McpConnectionManager,
+    pub minimize_tokens: bool,
+    pub small_model_harness: bool,
 }
 
 pub fn spawn_external_tools_refresh(
@@ -392,6 +394,7 @@ async fn dispatch_tool_execution(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_agent_turn(
     client: &LlmClient,
     msg_json: &mut Vec<serde_json::Value>,
@@ -400,6 +403,8 @@ async fn execute_agent_turn(
     tx: &Sender<BridgeEvent>,
     messages: &[ChatMessage],
     system_prompt: &Option<String>,
+    read_file_hinted: &mut bool,
+    error_hinted: &mut bool,
 ) -> bool {
     let completion = if client.base_url().starts_with("mcp://") {
         let Some(mcp_cfg) = mcp else {
@@ -492,11 +497,50 @@ async fn execute_agent_turn(
         .map(|call| execute_single_tool_call(call, mcp_cfg.clone(), tx.clone()));
 
     let tool_results = join_all(call_futures).await;
-    for (tool_call_id, _tool_name, payload, _failed) in tool_results {
+
+    let mut inject_error_hint = false;
+    let mut inject_read_hint = false;
+
+    if mcp_cfg.small_model_harness {
+        for (_, tool_name, _, failed) in &tool_results {
+            if *failed && !*error_hinted {
+                inject_error_hint = true;
+            }
+            if (*tool_name == "read_file" || *tool_name == "list_dir") && !*read_file_hinted {
+                inject_read_hint = true;
+            }
+        }
+    }
+
+    for (tool_call_id, tool_name, payload, failed) in tool_results {
+        let mut final_payload = payload.clone();
+        if let Some(obj) = final_payload.as_object_mut() {
+            if failed && inject_error_hint && !*error_hinted {
+                *error_hinted = true;
+                let val = if obj.contains_key("error") {
+                    obj.get_mut("error")
+                } else {
+                    obj.get_mut("output")
+                };
+                if let Some(serde_json::Value::String(s)) = val {
+                    s.push_str("\n💡 [Harness Hint: The previous tool call failed. Carefully read the error output above. Ensure parameter values are correct, check for typo errors, and try a different approach.]");
+                }
+            }
+            if (tool_name == "read_file" || tool_name == "list_dir")
+                && inject_read_hint
+                && !*read_file_hinted
+            {
+                *read_file_hinted = true;
+                if let Some(serde_json::Value::String(s)) = obj.get_mut("output") {
+                    s.push_str("\n💡 [Harness Hint: When modifying files that already exist, you MUST use `replace_in_file` with exact old/new string matching. Avoid using `write_file` for existing files.]");
+                }
+            }
+        }
+
         msg_json.push(serde_json::json!({
             "role": "tool",
             "tool_call_id": tool_call_id,
-            "content": payload.to_string()
+            "content": final_payload.to_string()
         }));
     }
 
@@ -512,8 +556,19 @@ pub fn spawn_agent_task(
     tx: Sender<BridgeEvent>,
 ) {
     tokio::spawn(async move {
+        let mut sys_prompt = system_prompt.clone();
+        if let Some(ref cfg) = mcp
+            && cfg.minimize_tokens
+        {
+            let conciseness_rule = "\n\nRespond concisely. No preamble, no conversational filler. Output only the tool call, code, or bare answer.";
+            match sys_prompt {
+                Some(ref mut s) => s.push_str(conciseness_rule),
+                None => sys_prompt = Some(conciseness_rule.trim().to_string()),
+            }
+        }
+
         let mut msg_json: Vec<serde_json::Value> = Vec::new();
-        if let Some(ref system) = system_prompt {
+        if let Some(ref system) = sys_prompt {
             msg_json.push(serde_json::json!({"role": "system", "content": system}));
         }
         for msg in &messages {
@@ -524,6 +579,9 @@ pub fn spawn_agent_task(
 
         let max_turns = mcp.as_ref().map(|c| c.max_turns).unwrap_or(8);
         let mut completed = false;
+        let mut read_file_hinted = false;
+        let mut error_hinted = false;
+
         for _ in 0..max_turns {
             if !execute_agent_turn(
                 &client,
@@ -532,7 +590,9 @@ pub fn spawn_agent_task(
                 &mcp,
                 &tx,
                 &messages,
-                &system_prompt,
+                &sys_prompt,
+                &mut read_file_hinted,
+                &mut error_hinted,
             )
             .await
             {
@@ -1192,6 +1252,8 @@ mod tests {
             max_turns: 2,
             tool_approval: false,
             mcp_connections: crate::mcp_connections::McpConnectionManager::default(),
+            minimize_tokens: false,
+            small_model_harness: false,
         };
 
         let (tx, mut rx) = mpsc::channel(100);

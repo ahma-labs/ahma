@@ -104,6 +104,10 @@ pub struct AppConfig {
     pub hot_reload_tools: bool,
     /// Skip tool availability probes at startup (AHMA_SKIP_PROBES=1).
     pub skip_availability_probes: bool,
+    /// Enable output compression and token minimization (AHMA_MINIMIZE_TOKENS=1).
+    pub minimize_tokens: bool,
+    /// Enable small-model harness adaptations (AHMA_SMALL_MODEL_HARNESS=1).
+    pub small_model_harness: bool,
 
     // ── Sandbox ─────────────────────────────────────────────────────────────
     /// Disable the kernel sandbox entirely (AHMA_DISABLE_SANDBOX=1).
@@ -194,6 +198,8 @@ impl Default for AppConfig {
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
+            minimize_tokens: false,
+            small_model_harness: false,
 
             no_sandbox: false,
             sandbox_scopes: vec![],
@@ -1141,6 +1147,14 @@ pub struct Cli {
     /// Use only in environments that provide their own containment (Docker, CI containers).
     #[arg(long = "no-sandbox", global = true)]
     pub no_sandbox: bool,
+
+    /// Enable output compression and token minimization.
+    #[arg(long = "minimize-tokens", global = true)]
+    pub minimize_tokens: bool,
+
+    /// Enable small-model harness adaptations.
+    #[arg(long = "small-model-harness", global = true)]
+    pub small_model_harness: bool,
 
     /// Default tool execution timeout in seconds.
     /// Individual tools can override this via the timeout_seconds field in their JSON definition.
@@ -2385,6 +2399,14 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     let (require_token, require_token_path, rate_limit_rps, rate_limit_burst, instance_label) =
         parse_auth_settings(cli, &s);
 
+    let minimize_tokens = cli.minimize_tokens
+        || check_env_flag_with_deprecation!("AHMA_MINIMIZE_TOKENS")
+        || s.tools.minimize_tokens;
+
+    let small_model_harness = cli.small_model_harness
+        || check_env_flag_with_deprecation!("AHMA_SMALL_MODEL_HARNESS")
+        || s.tools.small_model_harness;
+
     AppConfig {
         tools_dir,
         explicit_tools_dir,
@@ -2393,6 +2415,8 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         force_sync,
         hot_reload_tools,
         skip_availability_probes,
+        minimize_tokens,
+        small_model_harness,
 
         no_sandbox,
         sandbox_scopes,
@@ -2732,7 +2756,10 @@ pub fn env_flag_enabled(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::{LazyLock, Mutex};
     use tempfile::tempdir;
+
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn init_test() {
         crate::utils::logging::init_test_logging();
@@ -2742,12 +2769,14 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_unset() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_UNSET") };
         assert!(!env_flag_enabled("AHMA_TEST_FLAG_UNSET"));
     }
 
     #[test]
     fn test_env_flag_enabled_empty() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("AHMA_TEST_FLAG_EMPTY", "") };
         let result = env_flag_enabled("AHMA_TEST_FLAG_EMPTY");
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_EMPTY") };
@@ -2756,6 +2785,7 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_whitespace_only() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("AHMA_TEST_FLAG_WS", "   ") };
         let result = env_flag_enabled("AHMA_TEST_FLAG_WS");
         unsafe { std::env::remove_var("AHMA_TEST_FLAG_WS") };
@@ -2764,6 +2794,7 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_true() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         for val in ["1", "true", "True", "TRUE", "yes", "Yes", "on", "ON"] {
             unsafe { std::env::set_var("AHMA_TEST_FLAG_VAL", val) };
             let result = env_flag_enabled("AHMA_TEST_FLAG_VAL");
@@ -2774,6 +2805,7 @@ mod tests {
 
     #[test]
     fn test_env_flag_enabled_false() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         for val in ["0", "false", "no", "off", "x", ""] {
             if val.is_empty() {
                 continue;
@@ -2787,6 +2819,7 @@ mod tests {
 
     #[test]
     fn test_env_sandbox_scopes_single_path() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         let temp = tempdir().expect("Failed to create temp dir");
         unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", temp.path()) };
         let scopes = AppConfig::env_sandbox_scopes();
@@ -2797,6 +2830,7 @@ mod tests {
 
     #[test]
     fn test_env_sandbox_scopes_tilde() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", "~") };
         let scopes = AppConfig::env_sandbox_scopes();
         unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
@@ -2808,6 +2842,7 @@ mod tests {
 
     #[test]
     fn test_env_sandbox_scopes_tilde_slash() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", "~/test_sandbox") };
         let scopes = AppConfig::env_sandbox_scopes();
         unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
@@ -2819,6 +2854,7 @@ mod tests {
 
     #[test]
     fn test_env_working_dirs_multiple_paths() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         let temp_a = tempdir().expect("Failed to create first temp dir");
         let temp_b = tempdir().expect("Failed to create second temp dir");
         let joined =
@@ -2845,6 +2881,8 @@ mod tests {
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
+            minimize_tokens: false,
+            small_model_harness: false,
 
             no_sandbox: false,
             sandbox_scopes: vec![],
@@ -2893,6 +2931,7 @@ mod tests {
 
     #[test]
     fn test_resolve_sandbox_policy_strict_by_default() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         init_test();
         unsafe { std::env::remove_var("AHMA_DISABLE_SANDBOX") };
         let cfg = make_cfg();
@@ -2914,6 +2953,7 @@ mod tests {
 
     #[test]
     fn test_resolve_sandbox_policy_ahma_tmp_access_env() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         init_test();
         unsafe { std::env::set_var("AHMA_TMP_ACCESS", "1") };
         let cfg = AppConfig {
@@ -3437,6 +3477,7 @@ mod tests {
 
     #[test]
     fn test_app_config_env_flag_via_helper() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         unsafe { std::env::set_var("AHMA_TEST_CFG_FLAG", "yes") };
         assert!(AppConfig::env_flag("AHMA_TEST_CFG_FLAG"));
         unsafe { std::env::remove_var("AHMA_TEST_CFG_FLAG") };

@@ -55,7 +55,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 rust-version = "1.95.0"
-version = "0.11.14"
+version = "0.11.15"
 
 [workspace.dependencies]
 anyhow = "1.0"

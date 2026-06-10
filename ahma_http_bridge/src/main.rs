@@ -165,7 +165,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn detect_local_debug_binary(base_dir: &Path) -> Option<String> {
-    let binary_path = base_dir.join("target").join("debug").join("ahma");
+    let binary_name = format!("ahma{}", std::env::consts::EXE_SUFFIX);
+    let binary_path = base_dir.join("target").join("debug").join(binary_name);
     if binary_path.exists() {
         Some(binary_path.to_str()?.to_owned())
     } else {
@@ -194,7 +195,8 @@ mod tests {
     #[test]
     fn detect_local_debug_binary_finds_existing_path() {
         let tmp = tempdir().unwrap();
-        let binary_path = tmp.path().join("target").join("debug").join("ahma");
+        let binary_name = format!("ahma{}", std::env::consts::EXE_SUFFIX);
+        let binary_path = tmp.path().join("target").join("debug").join(binary_name);
         fs::create_dir_all(binary_path.parent().unwrap()).unwrap();
         fs::write(&binary_path, b"test").unwrap();
 

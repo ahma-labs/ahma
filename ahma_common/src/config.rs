@@ -432,6 +432,12 @@ pub struct ToolSettings {
     /// Tool bundles to enable.
     /// Default: empty list
     pub tool_bundles: Vec<String>,
+    /// Enable output compression and token minimization.
+    /// Default: `false`
+    pub minimize_tokens: bool,
+    /// Enable small-model harness adaptations.
+    /// Default: `false`
+    pub small_model_harness: bool,
 }
 
 impl Default for ToolSettings {
@@ -443,6 +449,8 @@ impl Default for ToolSettings {
             skip_probes: false,
             tools_dir: None,
             tool_bundles: Vec::new(),
+            minimize_tokens: false,
+            small_model_harness: false,
         }
     }
 }
@@ -726,6 +734,8 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # skip_probes  = false    # skip availability probes at startup
 # tools_dir    = ".ahma"  # path to tools directory containing JSON tool definitions
 # tool_bundles = []       # tool bundles to enable (e.g. ["rust", "git"])
+# minimize_tokens     = false # enable output compression and token minimization
+# small_model_harness = false # enable small-model harness adaptations
 
 # ── Sandbox & filesystem security ────────────────────────────────────────────
 # [sandbox]

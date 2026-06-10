@@ -134,6 +134,9 @@ fn which_command(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn test_build_cargo_install_command() {
@@ -155,6 +158,7 @@ mod tests {
 
     #[test]
     fn test_required_rustflags_sets_reqwest_unstable() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         // With no pre-existing RUSTFLAGS the flag should be set.
         // SAFETY: test-only; single-threaded by nextest process isolation.
         unsafe { std::env::remove_var("RUSTFLAGS") };
@@ -167,6 +171,7 @@ mod tests {
 
     #[test]
     fn test_required_rustflags_appends_to_existing() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         // SAFETY: test-only; single-threaded by nextest process isolation.
         unsafe { std::env::set_var("RUSTFLAGS", "-C opt-level=2") };
         let flags = required_rustflags();
@@ -183,6 +188,7 @@ mod tests {
 
     #[test]
     fn test_required_rustflags_no_duplicate() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         // SAFETY: test-only; single-threaded by nextest process isolation.
         unsafe { std::env::set_var("RUSTFLAGS", "--cfg reqwest_unstable") };
         let flags = required_rustflags();

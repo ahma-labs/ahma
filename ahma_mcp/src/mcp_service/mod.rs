@@ -194,6 +194,10 @@ pub struct AhmaMcpService {
     pub last_received_signal: Arc<std::sync::atomic::AtomicU64>,
     /// True if the connected peer is an Ahma node.
     pub is_ahma_peer: Arc<std::sync::atomic::AtomicBool>,
+    /// Token minimization and output optimizer context.
+    pub output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
+    /// Safety harness guard context.
+    pub harness_guard: Arc<tokio::sync::Mutex<crate::harness_guard::HarnessGuard>>,
 }
 
 impl AhmaMcpService {
@@ -486,6 +490,12 @@ impl AhmaMcpService {
                 ahma_common::keepalive::current_timestamp_ms(),
             )),
             is_ahma_peer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            output_optimizer: Arc::new(tokio::sync::Mutex::new(
+                crate::output_optimizer::OutputOptimizer::new(false, None),
+            )),
+            harness_guard: Arc::new(tokio::sync::Mutex::new(
+                crate::harness_guard::HarnessGuard::new(false),
+            )),
         })
     }
 
@@ -512,6 +522,12 @@ impl AhmaMcpService {
     pub fn set_app_config(&self, config: Arc<crate::shell::cli::AppConfig>) {
         if let Some(dir) = config.tools_dir.clone() {
             *self.current_tools_dir.write().unwrap() = Some(dir);
+        }
+        if let Ok(mut opt) = self.output_optimizer.try_lock() {
+            opt.enabled = config.minimize_tokens;
+        }
+        if let Ok(mut guard) = self.harness_guard.try_lock() {
+            guard.enabled = config.small_model_harness;
         }
         *self.app_config.write().unwrap() = Some(config);
     }
@@ -1243,72 +1259,146 @@ impl ServerHandler for AhmaMcpService {
         );
         let span = tracing::info_span!("call_tool", tool = &*params.name);
         async move {
-            match params.name.as_ref() as &str {
+            let is_guard_active = {
+                if let Ok(guard) = self.harness_guard.try_lock() {
+                    guard.enabled
+                } else {
+                    false
+                }
+            };
+
+            let mut tool_name = params.name.clone();
+            let mut tool_args = params.arguments.clone();
+
+            if is_guard_active {
+                // 1. Tool name format healing
+                let known = Self::HARDCODED_TOOLS.to_vec();
+                let configs_lock = self.configs.read().unwrap();
+                let config_names: Vec<String> = configs_lock.keys().cloned().collect();
+                let mut known_str: Vec<&str> = known.clone();
+                for name in &config_names {
+                    known_str.push(name);
+                }
+
+                if let Some(healed_name) = crate::harness_guard::heal_tool_name(tool_name.as_ref(), &known_str)
+                    && healed_name.as_str() != &*tool_name
+                {
+                    tracing::warn!("Healed tool name from '{}' to '{}'", tool_name, healed_name);
+                    tool_name = healed_name.into();
+                }
+
+                // 2. Tool arguments format healing
+                if let Some(ref mut map) = tool_args {
+                    crate::harness_guard::heal_tool_arguments(tool_name.as_ref(), map);
+                }
+
+                // 3. Loop detection
+                let args_str = tool_args.as_ref().map(|v| serde_json::Value::Object(v.clone()).to_string()).unwrap_or_default();
+                let is_loop = if let Ok(guard) = self.harness_guard.try_lock() {
+                    guard.loop_detector.is_loop(tool_name.as_ref(), &args_str)
+                } else {
+                    false
+                };
+
+                if is_loop {
+                    return Ok(CallToolResult::error(vec![
+                        rmcp::model::Content::text(
+                            "LOOP_DETECTED: This exact call has failed 3 times. The approach is not working.\n\
+                             Hint: Re-read the error messages above. Try a fundamentally different approach or read relevant documentation first."
+                        )
+                    ]));
+                }
+            }
+
+            let mut run_params = CallToolRequestParams::new(tool_name.clone());
+            run_params.arguments = tool_args.clone();
+            run_params.meta = params.meta.clone();
+            run_params.task = params.task.clone();
+
+            let result = match tool_name.as_ref() {
                 "status" => {
-                    self.handle_status(params.arguments.unwrap_or_default())
+                    self.handle_status(run_params.arguments.unwrap_or_default())
                         .await
                 }
-                "await" => self.handle_await(params).await,
-                "run_terminal_command" => self.handle_run_terminal_command(params, context).await,
+                "await" => self.handle_await(run_params).await,
+                "run_terminal_command" => self.handle_run_terminal_command(run_params, context).await,
                 "cancel" => {
-                    self.handle_cancel(params.arguments.unwrap_or_default())
+                    self.handle_cancel(run_params.arguments.unwrap_or_default())
                         .await
                 }
 
                 "logs_list" => {
-                    self.handle_logs_list(params.arguments.unwrap_or_default())
+                    self.handle_logs_list(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "logs_approve" => {
-                    self.handle_logs_approve(params.arguments.unwrap_or_default())
+                    self.handle_logs_approve(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "logs_read" => {
-                    self.handle_logs_read(params.arguments.unwrap_or_default())
+                    self.handle_logs_read(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "logs_search" => {
-                    self.handle_logs_search(params.arguments.unwrap_or_default())
+                    self.handle_logs_search(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "restart" => {
-                    self.handle_restart(params.arguments.unwrap_or_default())
+                    self.handle_restart(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "read_file" => {
-                    self.handle_read_file(params.arguments.unwrap_or_default())
+                    self.handle_read_file(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "list_dir" => {
-                    self.handle_list_dir(params.arguments.unwrap_or_default())
+                    self.handle_list_dir(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "file_search" => {
-                    self.handle_file_search(params.arguments.unwrap_or_default())
+                    self.handle_file_search(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "grep_search" => {
-                    self.handle_grep_search(params.arguments.unwrap_or_default())
+                    self.handle_grep_search(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "fetch_webpage" => {
-                    self.handle_fetch_webpage(params.arguments.unwrap_or_default())
+                    self.handle_fetch_webpage(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "write_file" => {
-                    self.handle_write_file(params.arguments.unwrap_or_default())
+                    self.handle_write_file(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "replace_in_file" => {
-                    self.handle_replace_in_file(params.arguments.unwrap_or_default())
+                    self.handle_replace_in_file(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "log_monitor" => {
-                    self.handle_log_monitor(params.arguments.unwrap_or_default(), context)
+                    self.handle_log_monitor(run_params.arguments.unwrap_or_default(), context)
                         .await
                 }
-                _ => self.dispatch_configured_tool(params, context).await,
+                _ => self.dispatch_configured_tool(run_params, context).await,
+            };
+
+            // 4. Record success/failure in loop detector
+            if is_guard_active {
+                let args_str = tool_args.as_ref().map(|v| serde_json::Value::Object(v.clone()).to_string()).unwrap_or_default();
+                let is_error = match &result {
+                    Ok(res) => res.is_error.unwrap_or(false),
+                    Err(_) => true,
+                };
+                if let Ok(mut guard) = self.harness_guard.try_lock() {
+                    if is_error {
+                        guard.loop_detector.record_failure(tool_name.as_ref(), &args_str);
+                    } else {
+                        guard.loop_detector.record_success();
+                    }
+                }
             }
+
+            result
         }
         .instrument(span)
     }

@@ -1254,9 +1254,9 @@ To maintain high performance and avoid cache bloat, the following strategies are
 - **R13.1.2**: `restore-keys` **must** be used to fall back to the most recent previous cache (from earlier in the day or a previous day).
 
 ### 13.2 Distributed Caching (sccache)
-- **R13.2.1**: **sccache** **must** be used as the compiler wrapper across all CI jobs.
-- **R13.2.2**: The **GitHub Actions Backend** (`SCCACHE_GHA_ENABLED: "true"`) **must** be used for `sccache` to allow atomic uploads of object files directly to the GHA cache API.
-- **R13.2.3**: `SCCACHE_DIRECT: "true"` **should** be enabled for Windows runners to optimize compiler invocation.
+- **R13.2.1**: **sccache** **must** be used as the compiler wrapper across all macOS and Linux CI jobs. Windows CI is exempt from sccache and instead relies on plain Cargo target caching.
+- **R13.2.2**: The **GitHub Actions Backend** (`SCCACHE_GHA_ENABLED: "true"`) **must** be used for `sccache` on macOS/Linux to allow atomic uploads of object files directly to the GHA cache API.
+- **R13.2.3**: Windows CI is exempt from sccache requirements, and compiles without a compiler wrapper.
 - **R13.2.4**: Each CI job **must** use unique `SCCACHE_GHA_CACHE_TO` keys to prevent concurrent write conflicts. Key format: `sccache-{OS}-{ARCH}-{JOB}-day{DAY}`.
 - **R13.2.5**: Each CI job **must** use `SCCACHE_GHA_CACHE_FROM` with comma-separated fallbacks to enable cache sharing between related jobs on the same platform.
 - **R13.2.6**: Debug-profile jobs on the same platform (clippy, nextest, android, coverage) **should** include each other in their `CACHE_FROM` lists since they produce compatible cache entries.
@@ -1264,6 +1264,10 @@ To maintain high performance and avoid cache bloat, the following strategies are
 
 ### 13.3 Cargo Registry Caching
 - **R13.3.1**: The Cargo registry (`~/.cargo/registry`) and git database (`~/.cargo/git`) **must** be cached using `actions/cache` or specialized actions, adhering to the Daily Rotation rule.
+
+### 13.4 GitHub Actions Versioning
+- **R13.4.1**: GitHub Actions **must** be referenced by version tags (e.g. `@v6`, `@v5`) rather than full commit hashes, to ensure readability, maintainability, and automatic receipt of minor version updates and security patches.
+- **R13.4.2**: Workflows **must** be updated to target the latest available major versions of each respective action.
 
 ---
 

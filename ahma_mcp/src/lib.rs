@@ -186,6 +186,12 @@ pub mod artifact;
 /// Bundle signing and supply-chain auditor.
 pub mod bundle;
 
+/// Token minimization and output optimization.
+pub mod output_optimizer;
+
+/// Harness guards and small-model adaptations.
+pub mod harness_guard;
+
 // Test utilities
 /// Test helpers for integration and unit tests.
 pub mod test_utils;
