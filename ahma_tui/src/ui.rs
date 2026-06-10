@@ -883,7 +883,7 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
 #[cfg(feature = "tui")]
 fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let quit_key = if state.focus == Focus::Chat {
-        "/q"
+        "/quit"
     } else {
         "q"
     };
@@ -2324,7 +2324,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("WINDOW ACTIONS", ""),
         ("/n", "Restore/expand window n"),
         ("/xn", "Close/cancel window n"),
-        ("/exit, /q, /quit", "Quit the application"),
+        ("/quit, /q", "Quit the application"),
         ("Mouse Click on Xn", "Close/cancel window"),
         ("Mouse Click on Window", "Toggle expand/collapse"),
         ("", ""),
@@ -2405,7 +2405,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("WINDOW ACTIONS", ""),
         ("/n", "Restore/expand window n (e.g. /3)"),
         ("/xn", "Close/cancel window n (e.g. /x3)"),
-        ("/exit, /q, /quit", "Quit the application"),
+        ("/quit, /q", "Quit the application"),
         ("Mouse Click on Xn", "Close/cancel window"),
         ("Mouse Click on Window", "Toggle expand/collapse"),
     ];

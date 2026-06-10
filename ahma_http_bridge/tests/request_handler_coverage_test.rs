@@ -637,3 +637,66 @@ async fn test_sse_notification_initialized() {
         body
     );
 }
+
+// ─── Regression: no-SSE client can call tools when default_scope is configured ─
+
+/// Regression guard: a client that sends only `initialize` + `notifications/initialized`
+/// (no SSE stream, no explicit `roots/list`) MUST be able to call tools when the
+/// bridge has a server-side `default_scope` (`--sandbox-scope`).
+///
+/// Before the `bridge-autolock` fix, `mark_session_initialized` only called
+/// `auto_lock_if_default_scope` on the `Ok(true)` branch (first call). After the fix
+/// it is called on **both** `Ok(true)` and `Ok(false)`, so the sandbox auto-locks
+/// regardless of previous state, allowing the TUI and other minimal clients to work.
+async fn run_no_sse_autolock(mode: TransportMode) {
+    let server = match spawn_test_server().await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("WARNING  no-SSE autolock test: server spawn failed: {e}");
+            return; // infrastructure unavailable — skip gracefully
+        }
+    };
+
+    let mut mcp = McpTestClient::with_url(&server.base_url()).with_transport(mode);
+
+    // Only initialize + notifications/initialized — NO SSE stream, NO roots/list.
+    mcp.initialize_only("no-sse-tui-client")
+        .await
+        .expect("initialize failed");
+    mcp.send_initialized()
+        .await
+        .expect("notifications/initialized failed");
+
+    // Poll until tools/list succeeds (bridge should auto-lock from default_scope).
+    let deadline = Instant::now() + TestTimeouts::get(TimeoutCategory::SandboxReady);
+    let poll_interval = TestTimeouts::poll_interval();
+    loop {
+        match mcp.list_tools().await {
+            Ok(tools) => {
+                // Success — sandbox was locked without SSE.  At least `status` should exist.
+                assert!(
+                    !tools.is_empty(),
+                    "Expected at least one tool after no-SSE autolock, got empty list"
+                );
+                return;
+            }
+            Err(e) if e.contains("409") || e.contains("-32001") => {
+                if Instant::now() >= deadline {
+                    panic!("Timed out waiting for sandbox to auto-lock from default_scope: {e}");
+                }
+                sleep(poll_interval).await;
+            }
+            Err(e) => panic!("Unexpected error while waiting for sandbox autolock: {e}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_no_sse_client_autolock_via_default_scope_json() {
+    run_no_sse_autolock(TransportMode::Json).await;
+}
+
+#[tokio::test]
+async fn test_no_sse_client_autolock_via_default_scope_sse() {
+    run_no_sse_autolock(TransportMode::Sse).await;
+}

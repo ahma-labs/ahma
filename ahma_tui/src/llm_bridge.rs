@@ -785,22 +785,31 @@ pub fn spawn_tool_call_task(
             }
         };
 
-        match call_mcp_tool_http(&client, &url, &session_id, &tool, arguments).await {
-            Ok((result, failed)) => {
-                let _ = tx
-                    .send(BridgeEvent::ToolCallFinished { id, result, failed })
-                    .await;
+        let tool_result =
+            call_mcp_tool_http(&client, &url, &session_id, &tool, arguments.clone()).await;
+        let (result, failed) = match tool_result {
+            Ok((result, failed)) => (result, failed),
+            Err(ref err) if err.contains("HTTP 403") => {
+                // Session may have expired — re-handshake once and retry.
+                let fresh_mcp = McpChatConfig {
+                    session_id: None,
+                    ..mcp.clone()
+                };
+                match get_or_create_session(&client, &url, &fresh_mcp).await {
+                    Ok(new_sid) => {
+                        match call_mcp_tool_http(&client, &url, &new_sid, &tool, arguments).await {
+                            Ok((result, failed)) => (result, failed),
+                            Err(e) => (format!("Error: {e}"), true),
+                        }
+                    }
+                    Err(e) => (format!("Error: {e}"), true),
+                }
             }
-            Err(err) => {
-                let _ = tx
-                    .send(BridgeEvent::ToolCallFinished {
-                        id,
-                        result: format!("Error: {err}"),
-                        failed: true,
-                    })
-                    .await;
-            }
-        }
+            Err(err) => (format!("Error: {err}"), true),
+        };
+        let _ = tx
+            .send(BridgeEvent::ToolCallFinished { id, result, failed })
+            .await;
     });
 }
 
@@ -809,7 +818,9 @@ async fn get_or_create_session(
     url: &str,
     mcp: &McpChatConfig,
 ) -> Result<String, String> {
-    if let Some(sid) = &mcp.session_id {
+    if let Some(sid) = &mcp.session_id
+        && !sid.is_empty()
+    {
         return Ok(sid.clone());
     }
 
