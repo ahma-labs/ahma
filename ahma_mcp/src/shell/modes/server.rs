@@ -7,7 +7,7 @@ use crate::{
     config::ServerConfig as MpcServerConfig,
     sandbox,
     service_builder::{BuiltService, ServiceBuilder},
-    utils::logging::{read_log_tail, BRIDGE_CAPTURE_HEADER, prepare_bridge_capture_files},
+    utils::logging::{BRIDGE_CAPTURE_HEADER, prepare_bridge_capture_files, read_log_tail},
     utils::stdio::emit_stdout_notification,
 };
 use ahma_http_mcp_client::client::HttpMcpTransport;
@@ -433,92 +433,140 @@ async fn handle_version_checks(
 }
 
 fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf]) -> Vec<String> {
-    let mut server_args = vec!["serve".to_string(), "--server-child".to_string()];
+    let mut args = vec!["serve".to_string(), "--server-child".to_string()];
+
+    // Helper closures to reduce push-pair verbosity.
+    let push = |a: &mut Vec<String>, flag: &str| a.push(flag.to_string());
+    let push_val = |a: &mut Vec<String>, flag: &str, val: String| {
+        a.push(flag.to_string());
+        a.push(val);
+    };
 
     // Forward the resolved sandbox scope(s) so the bridge can use them as a fallback
     // for clients that don't send roots/list (e.g. Antigravity) and so the bridge
     // can pass them on to per-session subprocesses.
     for scope in resolved_scopes {
-        server_args.push("--sandbox-scope".to_string());
-        server_args.push(scope.to_string_lossy().to_string());
+        push_val(
+            &mut args,
+            "--sandbox-scope",
+            scope.to_string_lossy().to_string(),
+        );
     }
 
-    if config.explicit_tools_dir
-        && let Some(ref tools_dir) = config.tools_dir
-    {
-        server_args.push("--tools-dir".to_string());
-        server_args.push(tools_dir.to_string_lossy().to_string());
+    if config.explicit_tools_dir {
+        if let Some(ref tools_dir) = config.tools_dir {
+            push_val(
+                &mut args,
+                "--tools-dir",
+                tools_dir.to_string_lossy().to_string(),
+            );
+        }
     }
 
     if let Some(ref task_vault) = config.task_vault {
-        server_args.push("--task-vault".to_string());
-        server_args.push(task_vault.to_string_lossy().to_string());
+        push_val(
+            &mut args,
+            "--task-vault",
+            task_vault.to_string_lossy().to_string(),
+        );
     }
 
     for bundle in &config.tool_bundles {
-        server_args.push("--tools".to_string());
-        server_args.push(bundle.clone());
+        push_val(&mut args, "--tools", bundle.clone());
     }
 
     let timeout = config.idle_timeout_secs.or(Some(10));
     if let Some(t) = timeout
         && t > 0
     {
-        server_args.push("--idle-timeout".to_string());
-        server_args.push(t.to_string());
+        push_val(&mut args, "--idle-timeout", t.to_string());
     }
 
     if !config.unix_socket_path.is_empty() {
-        server_args.push("--unix-socket-path".to_string());
-        server_args.push(config.unix_socket_path.clone());
-    }
-    if config.no_sandbox {
-        server_args.push("--no-sandbox".to_string());
-    }
-    if config.skip_availability_probes {
-        server_args.push("--skip-probes".to_string());
-    }
-    if config.force_sync {
-        server_args.push("--sync".to_string());
-    }
-    if config.hot_reload_tools {
-        server_args.push("--hot-reload".to_string());
-    }
-    if config.defer_sandbox {
-        server_args.push("--defer-sandbox".to_string());
-    }
-    if config.tmp_access {
-        server_args.push("--tmp".to_string());
-    }
-    if config.no_temp_files {
-        server_args.push("--disable-temp-files".to_string());
-    }
-    if config.rate_limit_rps > 0 {
-        server_args.push("--rate-limit-rps".to_string());
-        server_args.push(config.rate_limit_rps.to_string());
-    }
-    if config.rate_limit_burst > 0 {
-        server_args.push("--rate-limit-burst".to_string());
-        server_args.push(config.rate_limit_burst.to_string());
-    }
-    if config.handshake_timeout_secs > 0 {
-        server_args.push("--handshake-timeout".to_string());
-        server_args.push(config.handshake_timeout_secs.to_string());
-    }
-    if let Some(ref token) = config.require_token {
-        server_args.push("--require-token".to_string());
-        server_args.push(token.clone());
-    }
-    if let Some(ref path) = config.require_token_path {
-        server_args.push("--require-token-path".to_string());
-        server_args.push(path.to_string_lossy().to_string());
-    }
-    if !config.instance_label.is_empty() {
-        server_args.push("--instance-label".to_string());
-        server_args.push(config.instance_label.clone());
+        push_val(
+            &mut args,
+            "--unix-socket-path",
+            config.unix_socket_path.clone(),
+        );
     }
 
-    server_args
+    // Boolean flags — each enabled only when the config field is set.
+    if config.no_sandbox {
+        push(&mut args, "--no-sandbox");
+    }
+    if config.skip_availability_probes {
+        push(&mut args, "--skip-probes");
+    }
+    if config.force_sync {
+        push(&mut args, "--sync");
+    }
+    if config.hot_reload_tools {
+        push(&mut args, "--hot-reload");
+    }
+    if config.defer_sandbox {
+        push(&mut args, "--defer-sandbox");
+    }
+    if config.tmp_access {
+        push(&mut args, "--tmp");
+    }
+    if config.no_temp_files {
+        push(&mut args, "--disable-temp-files");
+    }
+
+    // Numeric flags — forwarded only when non-zero.
+    if config.rate_limit_rps > 0 {
+        push_val(
+            &mut args,
+            "--rate-limit-rps",
+            config.rate_limit_rps.to_string(),
+        );
+    }
+    if config.rate_limit_burst > 0 {
+        push_val(
+            &mut args,
+            "--rate-limit-burst",
+            config.rate_limit_burst.to_string(),
+        );
+    }
+    if config.handshake_timeout_secs > 0 {
+        push_val(
+            &mut args,
+            "--handshake-timeout",
+            config.handshake_timeout_secs.to_string(),
+        );
+    }
+
+    // Auth flags.
+    if let Some(ref token) = config.require_token {
+        push_val(&mut args, "--require-token", token.clone());
+    }
+    if let Some(ref path) = config.require_token_path {
+        push_val(
+            &mut args,
+            "--require-token-path",
+            path.to_string_lossy().to_string(),
+        );
+    }
+
+    if !config.instance_label.is_empty() {
+        push_val(&mut args, "--instance-label", config.instance_label.clone());
+    }
+
+    args
+}
+
+/// Open a capture file for bridge output, writing `banner` as its first line.
+/// Returns `None` (and logs a warning) if the file can't be created or opened.
+fn open_capture_file(path: &std::path::Path, banner: &str) -> Option<std::fs::File> {
+    match std::fs::write(path, banner)
+        .and_then(|_| std::fs::OpenOptions::new().append(true).open(path))
+    {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!("Failed to create bridge capture at {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 async fn spawn_background_bridge(
@@ -560,42 +608,14 @@ async fn spawn_background_bridge(
         std::process::id()
     );
 
-    let stdout_file = match std::fs::write(&stdout_path, &spawn_banner)
-        .and_then(|_| std::fs::OpenOptions::new().append(true).open(&stdout_path))
-    {
-        Ok(f) => Some(f),
-        Err(e) => {
-            tracing::warn!(
-                "Failed to create bridge stdout capture at {}: {e}",
-                stdout_path.display()
-            );
-            None
-        }
+    match open_capture_file(&stdout_path, &spawn_banner) {
+        Some(f) => cmd.stdout(f),
+        None => cmd.stdout(std::process::Stdio::null()),
     };
-
-    let stderr_file = match std::fs::write(&stderr_path, &spawn_banner)
-        .and_then(|_| std::fs::OpenOptions::new().append(true).open(&stderr_path))
-    {
-        Ok(f) => Some(f),
-        Err(e) => {
-            tracing::warn!(
-                "Failed to create bridge stderr capture at {}: {e}",
-                stderr_path.display()
-            );
-            None
-        }
+    match open_capture_file(&stderr_path, &spawn_banner) {
+        Some(f) => cmd.stderr(f),
+        None => cmd.stderr(std::process::Stdio::null()),
     };
-
-    if let Some(out) = stdout_file {
-        cmd.stdout(out);
-    } else {
-        cmd.stdout(std::process::Stdio::null());
-    }
-    if let Some(err) = stderr_file {
-        cmd.stderr(err);
-    } else {
-        cmd.stderr(std::process::Stdio::null());
-    }
     cmd.stdin(std::process::Stdio::null());
 
     match cmd.spawn() {
@@ -644,20 +664,33 @@ async fn spawn_background_bridge(
     Ok(())
 }
 
-pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
-    let is_test = std::env::var("NEXTEST").is_ok()
+/// Returns true when the process is running inside a test harness or as a server-child.
+/// In these modes we skip the background bridge spawn and run the service directly.
+fn is_test_or_server_child(config: &AppConfig) -> bool {
+    std::env::var("NEXTEST").is_ok()
         || std::env::var("CARGO_MANIFEST_DIR").is_ok()
         || std::env::var("AHMA_SERVER_CHILD").is_ok()
-        || config.is_server_child;
+        || config.is_server_child
+}
 
-    let socket_path = if let Ok(path) = std::env::var("AHMA_UNIX_SOCKET") {
-        path
-    } else if config.unix_socket_path.is_empty() {
-        "/tmp/ahma.sock".to_string()
-    } else {
-        config.unix_socket_path.clone()
-    };
+/// Resolve the Unix socket path and HTTP URL used to communicate with the background bridge.
+/// Returns `(socket_path_string, http_url_string)`.
+fn resolve_bridge_endpoints(config: &AppConfig) -> (String, String) {
+    let socket_path = std::env::var("AHMA_UNIX_SOCKET").unwrap_or_else(|_| {
+        if config.unix_socket_path.is_empty() {
+            "/tmp/ahma.sock".to_string()
+        } else {
+            config.unix_socket_path.clone()
+        }
+    });
     let http_url = format!("http://{}:{}", config.http_host, config.http_port);
+    (socket_path, http_url)
+}
+
+pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
+    let is_test = is_test_or_server_child(&config);
+
+    let (socket_path, http_url) = resolve_bridge_endpoints(&config);
 
     let socket_path_opt = if cfg!(unix) {
         Some(socket_path.as_str())
@@ -718,12 +751,11 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
 
     // Hot-reload is opt-in because runtime writes can change tool behavior mid-session.
     if config.hot_reload_tools {
-        if let Some(tools_dir) = config.tools_dir.clone() {
-            service_handler.start_config_watcher(tools_dir, config.clone());
-        } else {
-            tracing::warn!(
+        match config.tools_dir.clone() {
+            Some(tools_dir) => service_handler.start_config_watcher(tools_dir, config.clone()),
+            None => tracing::warn!(
                 "AHMA_HOT_RELOAD=1 but no tools directory is configured; hot-reload is disabled"
-            );
+            ),
         }
     }
 

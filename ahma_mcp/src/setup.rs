@@ -331,15 +331,15 @@ fn parse_selection_string(input: &str, max_val: usize) -> Vec<usize> {
 
 fn parse_digit_sequence(input: &str, max_val: usize) -> Vec<usize> {
     let mut selections = Vec::new();
-    for c in input.chars() {
-        if let Some(digit) = c.to_digit(10) {
-            let num = digit as usize;
-            if num >= 1 && num <= max_val {
-                let idx = num - 1;
-                if !selections.contains(&idx) {
-                    selections.push(idx);
-                }
-            }
+    let valid_indices = input
+        .chars()
+        .filter_map(|c| c.to_digit(10))
+        .map(|d| d as usize)
+        .filter(|&n| n >= 1 && n <= max_val)
+        .map(|n| n - 1);
+    for idx in valid_indices {
+        if !selections.contains(&idx) {
+            selections.push(idx);
         }
     }
     selections
@@ -348,16 +348,14 @@ fn parse_digit_sequence(input: &str, max_val: usize) -> Vec<usize> {
 fn parse_separated_list(input: &str, max_val: usize) -> Vec<usize> {
     let mut selections = Vec::new();
     let normalized = input.replace([',', '.', ';'], " ");
-    for part in normalized.split_whitespace() {
-        if let Some(num) = part
-            .parse::<usize>()
-            .ok()
-            .filter(|&n| n >= 1 && n <= max_val)
-        {
-            let idx = num - 1;
-            if !selections.contains(&idx) {
-                selections.push(idx);
-            }
+    let valid_indices = normalized
+        .split_whitespace()
+        .filter_map(|part| part.parse::<usize>().ok())
+        .filter(|&n| n >= 1 && n <= max_val)
+        .map(|n| n - 1);
+    for idx in valid_indices {
+        if !selections.contains(&idx) {
+            selections.push(idx);
         }
     }
     selections
@@ -632,22 +630,20 @@ fn setup_tls() -> Result<()> {
 }
 
 fn maybe_install_claude_plugin(home: &Path, interactive: bool) {
-    if home.join(".claude").exists() {
-        match install_claude_code_plugin(home) {
-            Ok(plugin_dir) => {
-                if interactive {
-                    println!(
-                        "✓ Installed ahma as Claude Code plugin at {}",
-                        plugin_dir.display()
-                    );
-                }
-            }
-            Err(e) => {
-                if interactive {
-                    println!("  Note: Could not install Claude Code plugin: {e}");
-                }
-            }
+    if !home.join(".claude").exists() {
+        return;
+    }
+    match install_claude_code_plugin(home) {
+        Ok(plugin_dir) if interactive => {
+            println!(
+                "✓ Installed ahma as Claude Code plugin at {}",
+                plugin_dir.display()
+            );
         }
+        Err(e) if interactive => {
+            println!("  Note: Could not install Claude Code plugin: {e}");
+        }
+        _ => {}
     }
 }
 
@@ -682,30 +678,37 @@ async fn prompt_and_backup_prompts_file(
     use std::fs;
 
     let current_content = fs::read_to_string(path)?;
-    if current_content != new_template {
-        if interactive {
-            println!(
-                "\nNotice: A new version of default prompts is available, or your global prompts file has been modified."
-            );
-            if prompt_yes_no_setup("Would you like to replace ~/.ahma/prompts.toml with the latest default template? (A backup will be created) [y/N]: ").await? {
-                let backup_path = path.with_extension("toml.bak");
-                if backup_path.exists() {
-                    let _ = fs::remove_file(&backup_path);
-                }
-                fs::rename(path, &backup_path)?;
-                fs::write(path, new_template)?;
-                println!("✓ Updated ~/.ahma/prompts.toml. Old version backed up to {}", backup_path.display());
-                println!();
-            } else {
-                println!("Keeping existing ~/.ahma/prompts.toml intact.");
-                println!();
-            }
-        } else {
-            println!(
-                "Notice: Your global prompts file (~/.ahma/prompts.toml) differs from compiled-in defaults. Run 'ahma prompts update' to overwrite with defaults."
-            );
-        }
+    if current_content == new_template {
+        return Ok(());
     }
+
+    if !interactive {
+        println!(
+            "Notice: Your global prompts file (~/.ahma/prompts.toml) differs from compiled-in defaults. Run 'ahma prompts update' to overwrite with defaults."
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\nNotice: A new version of default prompts is available, or your global prompts file has been modified."
+    );
+    if !prompt_yes_no_setup("Would you like to replace ~/.ahma/prompts.toml with the latest default template? (A backup will be created) [y/N]: ").await? {
+        println!("Keeping existing ~/.ahma/prompts.toml intact.");
+        println!();
+        return Ok(());
+    }
+
+    let backup_path = path.with_extension("toml.bak");
+    if backup_path.exists() {
+        let _ = fs::remove_file(&backup_path);
+    }
+    fs::rename(path, &backup_path)?;
+    fs::write(path, new_template)?;
+    println!(
+        "✓ Updated ~/.ahma/prompts.toml. Old version backed up to {}",
+        backup_path.display()
+    );
+    println!();
     Ok(())
 }
 

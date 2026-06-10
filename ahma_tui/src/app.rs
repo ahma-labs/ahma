@@ -266,31 +266,28 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
 }
 
 #[cfg(feature = "tui")]
-#[cfg(feature = "tui")]
 fn submit_log_switcher(state: &mut crate::state::AppState) {
-    if state.log_files_modal_open {
-        let idx = state.log_files_modal_selected;
-        if idx == 0 {
-            state.active_log_file = None;
-            state.active_log_lines.clear();
-            if let Some(ref tx) = state.mcp_source_tx {
-                let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(None));
-            }
-        } else {
-            let file_idx = idx - 1;
-            if file_idx < state.log_files.len() {
-                let file_name = state.log_files[file_idx].name.clone();
-                state.active_log_file = Some(file_name.clone());
-                state.active_log_lines.clear();
-                if let Some(ref tx) = state.mcp_source_tx {
-                    let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(Some(
-                        file_name,
-                    )));
-                }
-            }
-        }
-        state.log_files_modal_open = false;
+    if !state.log_files_modal_open {
+        return;
     }
+    let idx = state.log_files_modal_selected;
+    let new_file: Option<String> = if idx == 0 {
+        None
+    } else {
+        let file_idx = idx - 1;
+        if file_idx < state.log_files.len() {
+            Some(state.log_files[file_idx].name.clone())
+        } else {
+            state.log_files_modal_open = false;
+            return;
+        }
+    };
+    state.active_log_file = new_file.clone();
+    state.active_log_lines.clear();
+    if let Some(ref tx) = state.mcp_source_tx {
+        let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(new_file));
+    }
+    state.log_files_modal_open = false;
 }
 
 #[cfg(feature = "tui")]
@@ -1064,6 +1061,24 @@ fn optional_mcp_chat_config(
     (state.mcp_enabled && !state.mcp_http_base_url.is_empty()).then(|| mcp_chat_config(state))
 }
 
+/// Look up a single field from the active agent profile.
+/// Returns `default` when there is no active profile or the profile cannot be loaded.
+#[cfg(feature = "tui")]
+fn profile_field<T, F>(state: &crate::state::AppState, extract: F, default: T) -> T
+where
+    F: FnOnce(crate::agent_config::AgentProfile) -> T,
+{
+    let Some(profile_name) = &state.active_profile else {
+        return default;
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return default;
+    };
+    crate::agent_config::get_profile(&cwd, profile_name)
+        .map(extract)
+        .unwrap_or(default)
+}
+
 #[cfg(feature = "tui")]
 fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChatConfig {
     let external_http_servers = state
@@ -1078,29 +1093,8 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
         })
         .collect();
 
-    let max_turns = if let Some(profile_name) = &state.active_profile {
-        if let Ok(cwd) = std::env::current_dir() {
-            crate::agent_config::get_profile(&cwd, profile_name)
-                .map(|p| p.max_turns)
-                .unwrap_or(8)
-        } else {
-            8
-        }
-    } else {
-        8
-    };
-
-    let tool_approval = if let Some(profile_name) = &state.active_profile {
-        if let Ok(cwd) = std::env::current_dir() {
-            crate::agent_config::get_profile(&cwd, profile_name)
-                .map(|p| p.tool_approval)
-                .unwrap_or(false)
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let max_turns = profile_field(state, |p| p.max_turns, 8);
+    let tool_approval = profile_field(state, |p| p.tool_approval, false);
 
     let settings = ahma_common::config::AhmaSettings::load();
     let minimize_tokens = std::env::var("AHMA_MINIMIZE_TOKENS")
@@ -3092,39 +3086,52 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
     }
 }
 
+/// Returns true when the click position falls on the close button area of a window.
+/// Single-height windows use their entire right edge; taller windows require
+/// the click to be on the title row.
+#[cfg(feature = "tui")]
+fn is_close_button_click(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
+    let in_close_zone = col >= rect.x + rect.width.saturating_sub(5);
+    if rect.height == 1 {
+        in_close_zone
+    } else {
+        row == rect.y && in_close_zone
+    }
+}
+
 #[cfg(feature = "tui")]
 fn handle_window_rect_click(col: u16, row: u16, state: &mut crate::state::AppState) -> bool {
-    let mut clicked_close = None;
-    let mut clicked_toggle = None;
-
-    let rects = state.window_rects.borrow().clone();
-    for &(win_id, rect) in &rects {
-        if inside_rect(col, row, rect) {
-            let is_close_click = if rect.height == 1 {
-                col >= rect.x + rect.width.saturating_sub(5)
-            } else {
-                row == rect.y && col >= rect.x + rect.width.saturating_sub(5)
-            };
-
-            if is_close_click {
-                clicked_close = Some(win_id);
-            } else {
-                clicked_toggle = Some(win_id);
-            }
-            break;
-        }
+    // Collect the hit result first; acting on it requires a mutable borrow of `state`.
+    enum Hit {
+        Close(usize),
+        Toggle(usize),
     }
+    let hit = {
+        let rects = state.window_rects.borrow();
+        rects.iter().find_map(|&(win_id, rect)| {
+            if !inside_rect(col, row, rect) {
+                return None;
+            }
+            if is_close_button_click(col, row, rect) {
+                Some(Hit::Close(win_id))
+            } else {
+                Some(Hit::Toggle(win_id))
+            }
+        })
+    };
 
-    if let Some(win_id) = clicked_close {
-        close_window_by_id(win_id, state);
-        true
-    } else if let Some(win_id) = clicked_toggle
-        && let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id)
-    {
-        w.collapsed = !w.collapsed;
-        true
-    } else {
-        false
+    match hit {
+        Some(Hit::Close(win_id)) => {
+            close_window_by_id(win_id, state);
+            true
+        }
+        Some(Hit::Toggle(win_id)) => {
+            if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
+                w.collapsed = !w.collapsed;
+            }
+            true
+        }
+        None => false,
     }
 }
 
@@ -3225,30 +3232,36 @@ fn determine_scrolled_panel(state: &crate::state::AppState) -> &'static str {
     }
 }
 
+/// Compute the page size for a panel given its rendered height.
+#[cfg(feature = "tui")]
+fn page_size_for_height(height: u16) -> f64 {
+    (if height > 2 { height - 2 } else { 10 }) as f64
+}
+
 #[cfg(feature = "tui")]
 fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
     let panel = determine_scrolled_panel(state);
 
     if panel == "chat" {
-        let height = state.chat_area.get().height;
-        let page_size = if height > 2 { height - 2 } else { 10 } as f64;
+        // Chat: up scrolls forward (higher offset), down scrolls back.
+        let page_size = page_size_for_height(state.chat_area.get().height);
         let max_scroll = state.chat_max_scroll.get() as f64;
-        let current_target = state.chat_scroll_target.get();
+        let current = state.chat_scroll_target.get();
         let new_target = if up {
-            (current_target + page_size).min(max_scroll)
+            (current + page_size).min(max_scroll)
         } else {
-            (current_target - page_size).max(0.0)
+            (current - page_size).max(0.0)
         };
         state.chat_scroll_target.set(new_target);
     } else {
-        let height = state.log_area.get().height;
-        let page_size = if height > 2 { height - 2 } else { 10 } as f64;
+        // Log: up scrolls back (lower offset), down scrolls forward.
+        let page_size = page_size_for_height(state.log_area.get().height);
         let max_scroll = state.log_max_scroll.get() as f64;
-        let current_target = state.log_scroll_target.get();
+        let current = state.log_scroll_target.get();
         let new_target = if up {
-            (current_target - page_size).max(0.0)
+            (current - page_size).max(0.0)
         } else {
-            (current_target + page_size).min(max_scroll)
+            (current + page_size).min(max_scroll)
         };
         state.log_scroll_target.set(new_target);
     }

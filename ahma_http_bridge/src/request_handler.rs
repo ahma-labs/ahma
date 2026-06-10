@@ -79,55 +79,51 @@ fn session_not_found_response() -> Response {
     )
 }
 
+async fn session_has_sampling(s: &crate::session::Session) -> bool {
+    let caps = s.capabilities.lock().await;
+    caps.as_ref().and_then(|c| c.get("sampling")).is_some()
+}
+
+async fn session_name_matches_label(s: &crate::session::Session, target: &str) -> bool {
+    let info_guard = s.client_info.lock().await;
+    let name = info_guard
+        .as_ref()
+        .and_then(|info| info.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    name.to_lowercase().contains(&target.to_lowercase())
+}
+
 async fn find_target_session_for_sampling(
     session_manager: &SessionManager,
     current_session_id: &str,
     target_label: Option<&str>,
 ) -> Option<Arc<crate::session::Session>> {
-    for s in session_manager.get_all_sessions() {
-        if s.id == current_session_id {
+    let other_sessions = || {
+        session_manager
+            .get_all_sessions()
+            .into_iter()
+            .filter(|s| s.id != current_session_id)
+    };
+
+    // First pass: find a session with sampling that also matches the label (if given)
+    for s in other_sessions() {
+        if !session_has_sampling(&s).await {
             continue;
         }
-
-        let has_sampling = {
-            let caps = s.capabilities.lock().await;
-            caps.as_ref().and_then(|c| c.get("sampling")).is_some()
+        let label_matches = match target_label {
+            Some(target) => session_name_matches_label(&s, target).await,
+            None => true,
         };
-        if !has_sampling {
-            continue;
-        }
-
-        let is_match = if let Some(target) = target_label {
-            let info_guard = s.client_info.lock().await;
-            if let Some(info) = info_guard.as_ref() {
-                if let Some(name) = info.get("name").and_then(|n| n.as_str()) {
-                    name.to_lowercase().contains(&target.to_lowercase())
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            true
-        };
-
-        if is_match {
+        if label_matches {
             return Some(s);
         }
     }
 
-    // Fallback: if label didn't match exactly, just return any session with sampling
+    // Fallback: if label didn't match exactly, return any session with sampling
     if target_label.is_some() {
-        for s in session_manager.get_all_sessions() {
-            if s.id == current_session_id {
-                continue;
-            }
-            let has_sampling = {
-                let caps = s.capabilities.lock().await;
-                caps.as_ref().and_then(|c| c.get("sampling")).is_some()
-            };
-            if has_sampling {
+        for s in other_sessions() {
+            if session_has_sampling(&s).await {
                 return Some(s);
             }
         }
@@ -323,19 +319,9 @@ async fn handle_initialize(session_manager: &Arc<SessionManager>, payload: &Valu
     }
 
     info!("Creating new session for initialize request");
-    let new_session_id = match session_manager.create_session().await {
+    let new_session_id = match create_session_or_error(session_manager).await {
         Ok(id) => id,
-        Err(e) => {
-            error!("Failed to create session: {}", e);
-            if e.to_string().contains("Session limit exceeded") {
-                return error_response_with_status(
-                    axum::http::StatusCode::TOO_MANY_REQUESTS,
-                    -32002,
-                    &format!("Failed to create session: {}", e),
-                );
-            }
-            return error_response(-32603, &format!("Failed to create session: {}", e));
-        }
+        Err(e) => return e,
     };
 
     register_session_details(session_manager, &new_session_id, payload).await;
@@ -351,6 +337,30 @@ async fn handle_initialize(session_manager: &Arc<SessionManager>, payload: &Valu
     {
         Ok(response) => with_session_header(json_response(response), &new_session_id),
         Err(e) => handle_initialize_error(session_manager, &new_session_id, e).await,
+    }
+}
+
+/// Create a new session or return an error response.
+///
+/// Distinguishes session-limit errors (HTTP 429) from other failures (HTTP 500).
+async fn create_session_or_error(
+    session_manager: &Arc<SessionManager>,
+) -> Result<String, Response> {
+    match session_manager.create_session().await {
+        Ok(id) => Ok(id),
+        Err(e) => {
+            error!("Failed to create session: {}", e);
+            let response = if e.to_string().contains("Session limit exceeded") {
+                error_response_with_status(
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    -32002,
+                    &format!("Failed to create session: {}", e),
+                )
+            } else {
+                error_response(-32603, &format!("Failed to create session: {}", e))
+            };
+            Err(response)
+        }
     }
 }
 
@@ -1021,25 +1031,27 @@ pub async fn handle_session_isolated_request_sse(
     .await
 }
 
+fn build_initialize_sse_response(
+    session_manager: &Arc<SessionManager>,
+    session_id: &str,
+    response: &Value,
+) -> Response {
+    let (event_id, json_str) = session_manager
+        .get_session(session_id)
+        .map(|session| session_sse_event(&session, response))
+        .unwrap_or_else(|| (1, serialize_sse_data(response)));
+    sse_single_event_response_with_id(event_id, json_str)
+}
+
 /// Handle initialize with SSE response.
 async fn handle_initialize_sse(session_manager: &Arc<SessionManager>, payload: &Value) -> Response {
     if let Some(err_response) = validate_initialize_payload(payload) {
         return err_response;
     }
 
-    let new_session_id = match session_manager.create_session().await {
+    let new_session_id = match create_session_or_error(session_manager).await {
         Ok(id) => id,
-        Err(e) => {
-            error!("Failed to create session: {}", e);
-            if e.to_string().contains("Session limit exceeded") {
-                return error_response_with_status(
-                    axum::http::StatusCode::TOO_MANY_REQUESTS,
-                    -32002,
-                    &format!("Failed to create session: {}", e),
-                );
-            }
-            return error_response(-32603, &format!("Failed to create session: {}", e));
-        }
+        Err(e) => return e,
     };
 
     register_session_details(session_manager, &new_session_id, payload).await;
@@ -1052,16 +1064,10 @@ async fn handle_initialize_sse(session_manager: &Arc<SessionManager>, payload: &
         )
         .await
     {
-        Ok(response) => {
-            let sse_response = if let Some(session) = session_manager.get_session(&new_session_id) {
-                let (id, json_str) = session_sse_event(&session, &response);
-                sse_single_event_response_with_id(id, json_str)
-            } else {
-                sse_single_event_response_with_id(1, serialize_sse_data(&response))
-            };
-
-            with_session_header(sse_response, &new_session_id)
-        }
+        Ok(response) => with_session_header(
+            build_initialize_sse_response(session_manager, &new_session_id, &response),
+            &new_session_id,
+        ),
         Err(e) => handle_initialize_error(session_manager, &new_session_id, e).await,
     }
 }

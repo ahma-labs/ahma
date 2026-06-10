@@ -394,48 +394,50 @@ async fn dispatch_tool_execution(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute_agent_turn(
+/// Fetch an LLM completion for the current turn, routing through either the MCP sampling
+/// protocol or the standard tool-calling API depending on the client URL scheme.
+///
+/// Returns `None` and sends the appropriate `BridgeEvent` to `tx` on error (including the
+/// "tools not supported" fallback that re-launches a plain chat task).
+async fn fetch_completion(
     client: &LlmClient,
-    msg_json: &mut Vec<serde_json::Value>,
+    msg_json: &[serde_json::Value],
     tool_defs: &[serde_json::Value],
     mcp: &Option<McpChatConfig>,
     tx: &Sender<BridgeEvent>,
     messages: &[ChatMessage],
     system_prompt: &Option<String>,
-    read_file_hinted: &mut bool,
-    error_hinted: &mut bool,
-) -> bool {
-    let completion = if client.base_url().starts_with("mcp://") {
+) -> Option<ahma_llm_monitor::client::ChatCompletionResponse> {
+    if client.base_url().starts_with("mcp://") {
         let Some(mcp_cfg) = mcp else {
             let _ = tx
                 .send(BridgeEvent::Error(
                     "MCP config missing for sampling".to_string(),
                 ))
                 .await;
-            return false;
+            return None;
         };
         let target_label = client.base_url().strip_prefix("mcp://").unwrap_or("");
         match call_mcp_sampling_routed(
             mcp_cfg,
             target_label,
-            msg_json.clone(),
+            msg_json.to_vec(),
             system_prompt.as_deref(),
         )
         .await
         {
-            Ok(c) => c,
+            Ok(c) => Some(c),
             Err(e) => {
                 let _ = tx.send(BridgeEvent::Error(e)).await;
-                return false;
+                None
             }
         }
     } else {
         match client
-            .chat_completion_with_tools(msg_json.clone(), tool_defs)
+            .chat_completion_with_tools(msg_json.to_vec(), tool_defs)
             .await
         {
-            Ok(c) => c,
+            Ok(c) => Some(c),
             Err(e) => {
                 let err_msg = e.to_string().to_lowercase();
                 if err_msg.contains("400")
@@ -455,22 +457,125 @@ async fn execute_agent_turn(
                         mcp.clone(),
                         tx.clone(),
                     );
-                    return false;
+                } else {
+                    let _ = tx.send(BridgeEvent::Error(e.to_string())).await;
                 }
-                let _ = tx.send(BridgeEvent::Error(e.to_string())).await;
-                return false;
+                None
             }
         }
+    }
+}
+
+/// Determine which harness hints should be injected for this batch of tool results.
+/// Returns `(inject_error_hint, inject_read_hint)`.
+fn plan_harness_hints(
+    tool_results: &[(String, String, serde_json::Value, bool)],
+    error_hinted: bool,
+    read_file_hinted: bool,
+) -> (bool, bool) {
+    let mut inject_error_hint = false;
+    let mut inject_read_hint = false;
+    for (_, tool_name, _, failed) in tool_results {
+        if *failed && !error_hinted {
+            inject_error_hint = true;
+        }
+        if (*tool_name == "read_file" || *tool_name == "list_dir") && !read_file_hinted {
+            inject_read_hint = true;
+        }
+    }
+    (inject_error_hint, inject_read_hint)
+}
+
+/// Append a coaching hint to the string at `key` inside a tool-result JSON object, if present.
+fn append_hint_to_field(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    hint: &str,
+) {
+    if let Some(serde_json::Value::String(s)) = obj.get_mut(key) {
+        s.push_str(hint);
+    }
+}
+
+/// Apply any applicable harness hints to `payload`, then push a `tool` message onto `msg_json`.
+fn push_tool_message_with_hints(
+    msg_json: &mut Vec<serde_json::Value>,
+    tool_call_id: String,
+    tool_name: &str,
+    payload: serde_json::Value,
+    failed: bool,
+    inject_error_hint: bool,
+    inject_read_hint: bool,
+    error_hinted: &mut bool,
+    read_file_hinted: &mut bool,
+) {
+    let mut final_payload = payload;
+    if let Some(obj) = final_payload.as_object_mut() {
+        if failed && inject_error_hint && !*error_hinted {
+            *error_hinted = true;
+            let key = if obj.contains_key("error") {
+                "error"
+            } else {
+                "output"
+            };
+            append_hint_to_field(
+                obj,
+                key,
+                "\n\u{1f4a1} [Harness Hint: The previous tool call failed. Carefully read the error output above. Ensure parameter values are correct, check for typo errors, and try a different approach.]",
+            );
+        }
+        if (tool_name == "read_file" || tool_name == "list_dir")
+            && inject_read_hint
+            && !*read_file_hinted
+        {
+            *read_file_hinted = true;
+            append_hint_to_field(
+                obj,
+                "output",
+                "\n\u{1f4a1} [Harness Hint: When modifying files that already exist, you MUST use `replace_in_file` with exact old/new string matching. Avoid using `write_file` for existing files.]",
+            );
+        }
+    }
+    msg_json.push(serde_json::json!({
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": final_payload.to_string()
+    }));
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_agent_turn(
+    client: &LlmClient,
+    msg_json: &mut Vec<serde_json::Value>,
+    tool_defs: &[serde_json::Value],
+    mcp: &Option<McpChatConfig>,
+    tx: &Sender<BridgeEvent>,
+    messages: &[ChatMessage],
+    system_prompt: &Option<String>,
+    read_file_hinted: &mut bool,
+    error_hinted: &mut bool,
+) -> bool {
+    let Some(completion) = fetch_completion(
+        client,
+        msg_json,
+        tool_defs,
+        mcp,
+        tx,
+        messages,
+        system_prompt,
+    )
+    .await
+    else {
+        return false;
     };
 
     if let Some(usage) = &completion.usage {
         let _ = tx.send(BridgeEvent::Usage(usage.clone())).await;
     }
 
-    let assistant_content = completion.content.clone();
     msg_json.push(serde_json::json!({
         "role": "assistant",
-        "content": assistant_content,
+        "content": completion.content.clone(),
         "tool_calls": completion.assistant_message.get("tool_calls").cloned().unwrap_or(serde_json::Value::Null)
     }));
 
@@ -491,57 +596,30 @@ async fn execute_agent_turn(
         return false;
     };
 
-    let calls = completion.tool_calls;
-    let call_futures = calls
+    let call_futures = completion
+        .tool_calls
         .into_iter()
         .map(|call| execute_single_tool_call(call, mcp_cfg.clone(), tx.clone()));
-
     let tool_results = join_all(call_futures).await;
 
-    let mut inject_error_hint = false;
-    let mut inject_read_hint = false;
-
-    if mcp_cfg.small_model_harness {
-        for (_, tool_name, _, failed) in &tool_results {
-            if *failed && !*error_hinted {
-                inject_error_hint = true;
-            }
-            if (*tool_name == "read_file" || *tool_name == "list_dir") && !*read_file_hinted {
-                inject_read_hint = true;
-            }
-        }
-    }
+    let (inject_error_hint, inject_read_hint) = if mcp_cfg.small_model_harness {
+        plan_harness_hints(&tool_results, *error_hinted, *read_file_hinted)
+    } else {
+        (false, false)
+    };
 
     for (tool_call_id, tool_name, payload, failed) in tool_results {
-        let mut final_payload = payload.clone();
-        if let Some(obj) = final_payload.as_object_mut() {
-            if failed && inject_error_hint && !*error_hinted {
-                *error_hinted = true;
-                let val = if obj.contains_key("error") {
-                    obj.get_mut("error")
-                } else {
-                    obj.get_mut("output")
-                };
-                if let Some(serde_json::Value::String(s)) = val {
-                    s.push_str("\n💡 [Harness Hint: The previous tool call failed. Carefully read the error output above. Ensure parameter values are correct, check for typo errors, and try a different approach.]");
-                }
-            }
-            if (tool_name == "read_file" || tool_name == "list_dir")
-                && inject_read_hint
-                && !*read_file_hinted
-            {
-                *read_file_hinted = true;
-                if let Some(serde_json::Value::String(s)) = obj.get_mut("output") {
-                    s.push_str("\n💡 [Harness Hint: When modifying files that already exist, you MUST use `replace_in_file` with exact old/new string matching. Avoid using `write_file` for existing files.]");
-                }
-            }
-        }
-
-        msg_json.push(serde_json::json!({
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": final_payload.to_string()
-        }));
+        push_tool_message_with_hints(
+            msg_json,
+            tool_call_id,
+            &tool_name,
+            payload,
+            failed,
+            inject_error_hint,
+            inject_read_hint,
+            error_hinted,
+            read_file_hinted,
+        );
     }
 
     true

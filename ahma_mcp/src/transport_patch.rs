@@ -31,10 +31,7 @@ fn summarize_jsonrpc_payload(json: &str) -> String {
         .get("id")
         .map(|v| v.to_string())
         .unwrap_or_else(|| "-".to_string());
-    let method = value
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
+    let method = value.get("method").and_then(Value::as_str).unwrap_or("-");
     format!("bytes={bytes} id={id} method={method}")
 }
 
@@ -101,10 +98,7 @@ where
             json.push('\n');
             let mut w = writer.lock().await;
             tracing::trace!("[AhmaTransport] SEND full: {}", json.trim_end());
-            tracing::debug!(
-                "[AhmaTransport] SEND {}",
-                summarize_jsonrpc_payload(&json)
-            );
+            tracing::debug!("[AhmaTransport] SEND {}", summarize_jsonrpc_payload(&json));
             w.write_all(json.as_bytes()).await?;
             w.flush().await?;
             Ok(())
@@ -176,10 +170,7 @@ where
                 // Try to parse as Value to inspect and patch
                 let mut value: Value = match serde_json::from_str(&message_body) {
                     Ok(v) => {
-                        tracing::trace!(
-                            "[AhmaTransport] RECV full: {}",
-                            message_body.trim()
-                        );
+                        tracing::trace!("[AhmaTransport] RECV full: {}", message_body.trim());
                         tracing::debug!(
                             "[AhmaTransport] RECV {}",
                             summarize_jsonrpc_payload(&message_body)

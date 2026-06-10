@@ -1259,54 +1259,18 @@ impl ServerHandler for AhmaMcpService {
         );
         let span = tracing::info_span!("call_tool", tool = &*params.name);
         async move {
-            let is_guard_active = {
-                if let Ok(guard) = self.harness_guard.try_lock() {
-                    guard.enabled
-                } else {
-                    false
-                }
-            };
+            let is_guard_active = self
+                .harness_guard
+                .try_lock()
+                .map(|g| g.enabled)
+                .unwrap_or(false);
 
             let mut tool_name = params.name.clone();
             let mut tool_args = params.arguments.clone();
 
             if is_guard_active {
-                // 1. Tool name format healing
-                let known = Self::HARDCODED_TOOLS.to_vec();
-                let configs_lock = self.configs.read().unwrap();
-                let config_names: Vec<String> = configs_lock.keys().cloned().collect();
-                let mut known_str: Vec<&str> = known.clone();
-                for name in &config_names {
-                    known_str.push(name);
-                }
-
-                if let Some(healed_name) = crate::harness_guard::heal_tool_name(tool_name.as_ref(), &known_str)
-                    && healed_name.as_str() != &*tool_name
-                {
-                    tracing::warn!("Healed tool name from '{}' to '{}'", tool_name, healed_name);
-                    tool_name = healed_name.into();
-                }
-
-                // 2. Tool arguments format healing
-                if let Some(ref mut map) = tool_args {
-                    crate::harness_guard::heal_tool_arguments(tool_name.as_ref(), map);
-                }
-
-                // 3. Loop detection
-                let args_str = tool_args.as_ref().map(|v| serde_json::Value::Object(v.clone()).to_string()).unwrap_or_default();
-                let is_loop = if let Ok(guard) = self.harness_guard.try_lock() {
-                    guard.loop_detector.is_loop(tool_name.as_ref(), &args_str)
-                } else {
-                    false
-                };
-
-                if is_loop {
-                    return Ok(CallToolResult::error(vec![
-                        rmcp::model::Content::text(
-                            "LOOP_DETECTED: This exact call has failed 3 times. The approach is not working.\n\
-                             Hint: Re-read the error messages above. Try a fundamentally different approach or read relevant documentation first."
-                        )
-                    ]));
+                if let Some(early) = self.harness_guard_preprocess(&mut tool_name, &mut tool_args) {
+                    return Ok(early);
                 }
             }
 
@@ -1321,12 +1285,13 @@ impl ServerHandler for AhmaMcpService {
                         .await
                 }
                 "await" => self.handle_await(run_params).await,
-                "run_terminal_command" => self.handle_run_terminal_command(run_params, context).await,
+                "run_terminal_command" => {
+                    self.handle_run_terminal_command(run_params, context).await
+                }
                 "cancel" => {
                     self.handle_cancel(run_params.arguments.unwrap_or_default())
                         .await
                 }
-
                 "logs_list" => {
                     self.handle_logs_list(run_params.arguments.unwrap_or_default())
                         .await
@@ -1382,20 +1347,8 @@ impl ServerHandler for AhmaMcpService {
                 _ => self.dispatch_configured_tool(run_params, context).await,
             };
 
-            // 4. Record success/failure in loop detector
             if is_guard_active {
-                let args_str = tool_args.as_ref().map(|v| serde_json::Value::Object(v.clone()).to_string()).unwrap_or_default();
-                let is_error = match &result {
-                    Ok(res) => res.is_error.unwrap_or(false),
-                    Err(_) => true,
-                };
-                if let Ok(mut guard) = self.harness_guard.try_lock() {
-                    if is_error {
-                        guard.loop_detector.record_failure(tool_name.as_ref(), &args_str);
-                    } else {
-                        guard.loop_detector.record_success();
-                    }
-                }
+                self.record_result_in_loop_detector(tool_name.as_ref(), &tool_args, &result);
             }
 
             result
@@ -1430,6 +1383,85 @@ impl ServerHandler for AhmaMcpService {
 }
 
 impl AhmaMcpService {
+    /// Heals the tool name and arguments via the harness guard, and checks for
+    /// repeated identical failures (loop detection). Returns `Some(result)` when a
+    /// loop is detected — the caller should return that result immediately.
+    /// Returns `None` to proceed normally. Mutates `tool_name` and `tool_args` in
+    /// place when healing is applied.
+    fn harness_guard_preprocess(
+        &self,
+        tool_name: &mut std::borrow::Cow<'static, str>,
+        tool_args: &mut Option<serde_json::Map<String, Value>>,
+    ) -> Option<CallToolResult> {
+        // 1. Tool name format healing
+        let known = Self::HARDCODED_TOOLS.to_vec();
+        let configs_lock = self.configs.read().unwrap();
+        let config_names: Vec<String> = configs_lock.keys().cloned().collect();
+        drop(configs_lock);
+        let mut known_str: Vec<&str> = known.clone();
+        for name in &config_names {
+            known_str.push(name);
+        }
+
+        if let Some(healed_name) =
+            crate::harness_guard::heal_tool_name(tool_name.as_ref(), &known_str)
+            && healed_name.as_str() != &**tool_name
+        {
+            tracing::warn!("Healed tool name from '{}' to '{}'", tool_name, healed_name);
+            *tool_name = std::borrow::Cow::Owned(healed_name);
+        }
+
+        // 2. Tool arguments format healing
+        if let Some(map) = tool_args.as_mut() {
+            crate::harness_guard::heal_tool_arguments(tool_name.as_ref(), map);
+        }
+
+        // 3. Loop detection — block the call if the same invocation has failed 3 times
+        let args_str = tool_args
+            .as_ref()
+            .map(|v| serde_json::Value::Object(v.clone()).to_string())
+            .unwrap_or_default();
+        let is_loop = self
+            .harness_guard
+            .try_lock()
+            .map(|g| g.loop_detector.is_loop(tool_name.as_ref(), &args_str))
+            .unwrap_or(false);
+
+        if is_loop {
+            return Some(CallToolResult::error(vec![rmcp::model::Content::text(
+                "LOOP_DETECTED: This exact call has failed 3 times. The approach is not working.\n\
+                 Hint: Re-read the error messages above. Try a fundamentally different approach or read relevant documentation first.",
+            )]));
+        }
+
+        None
+    }
+
+    /// Records the success or failure of a completed tool call into the loop
+    /// detector so that repeated identical failures can be detected on future calls.
+    fn record_result_in_loop_detector(
+        &self,
+        tool_name: &str,
+        tool_args: &Option<serde_json::Map<String, Value>>,
+        result: &Result<CallToolResult, McpError>,
+    ) {
+        let args_str = tool_args
+            .as_ref()
+            .map(|v| serde_json::Value::Object(v.clone()).to_string())
+            .unwrap_or_default();
+        let is_error = match result {
+            Ok(res) => res.is_error.unwrap_or(false),
+            Err(_) => true,
+        };
+        if let Ok(mut guard) = self.harness_guard.try_lock() {
+            if is_error {
+                guard.loop_detector.record_failure(tool_name, &args_str);
+            } else {
+                guard.loop_detector.record_success();
+            }
+        }
+    }
+
     fn guard_sandbox_ready_for_tool_calls(&self) -> Result<(), McpError> {
         if self.adapter.sandbox().is_ready_for_tool_calls() {
             return Ok(());

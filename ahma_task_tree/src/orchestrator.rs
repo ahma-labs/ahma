@@ -178,6 +178,45 @@ impl TaskTreeOrchestrator {
         Ok(child_ids)
     }
 
+    /// Try to execute a single child node with retries. Returns the task summary on success,
+    /// or `None` if all attempts failed.
+    async fn execute_child_with_retries(
+        &self,
+        tree: &mut TaskTree,
+        child_id: NodeId,
+        max_retries: usize,
+    ) -> Option<String> {
+        for retry in 0..=max_retries {
+            if retry > 0 {
+                info!(
+                    "Retrying child node {} (attempt {}/{})",
+                    child_id.0, retry, max_retries
+                );
+                if let Some(child_node) = tree.get_node_mut(child_id) {
+                    child_node.retry_count = retry;
+                    child_node.state = NodeState::Created;
+                }
+            }
+
+            match self.execute_node(tree, child_id).await {
+                Ok(child_res) if child_res.success => {
+                    let desc = tree
+                        .get_node(child_id)
+                        .map(|n| n.task_description.as_str())
+                        .unwrap_or("");
+                    return Some(format!("Task '{}': {}", desc, child_res.summary));
+                }
+                Ok(child_res) => {
+                    warn!("Child node {} failed: {}", child_id.0, child_res.summary);
+                }
+                Err(e) => {
+                    warn!("Error executing child node {}: {}", child_id.0, e);
+                }
+            }
+        }
+        None
+    }
+
     async fn execute_child_queue(
         &self,
         tree: &mut TaskTree,
@@ -194,68 +233,38 @@ impl TaskTreeOrchestrator {
         let mut child_summaries = Vec::new();
         let max_retries = self.config.max_retries.unwrap_or(2);
         let mut queue = std::collections::VecDeque::from(child_ids);
-        let mut overall_success = true;
 
         while let Some(child_id) = queue.pop_front() {
-            let mut success = false;
-            for retry in 0..=max_retries {
-                if retry > 0 {
-                    info!(
-                        "Retrying child node {} (attempt {}/{})",
-                        child_id.0, retry, max_retries
-                    );
-                    if let Some(child_node) = tree.get_node_mut(child_id) {
-                        child_node.retry_count = retry;
-                        child_node.state = NodeState::Created;
-                    }
-                }
-
-                match self.execute_node(tree, child_id).await {
-                    Ok(child_res) => {
-                        if child_res.success {
-                            success = true;
-                            child_summaries.push(format!(
-                                "Task '{}': {}",
-                                tree.get_node(child_id).unwrap().task_description,
-                                child_res.summary
-                            ));
-                            break;
-                        } else {
-                            warn!("Child node {} failed: {}", child_id.0, child_res.summary);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Error executing child node {}: {}", child_id.0, e);
-                    }
-                }
+            if let Some(summary) = self
+                .execute_child_with_retries(tree, child_id, max_retries)
+                .await
+            {
+                child_summaries.push(summary);
+                continue;
             }
 
-            if !success {
-                let recovery_success = self
-                    .handle_recovery_backtracking(
-                        tree,
-                        node_id,
-                        node,
-                        child_id,
-                        &mut queue,
-                        max_subtasks,
-                        goal,
-                        &parent_scopes,
-                        &parent_tools,
-                        &parent_domains,
-                    )
-                    .await?;
+            // All retries exhausted — attempt recovery/backtracking.
+            let recovered = self
+                .handle_recovery_backtracking(
+                    tree,
+                    node_id,
+                    node,
+                    child_id,
+                    &mut queue,
+                    max_subtasks,
+                    goal,
+                    &parent_scopes,
+                    &parent_tools,
+                    &parent_domains,
+                )
+                .await?;
 
-                if recovery_success {
-                    continue;
-                }
-
-                overall_success = false;
-                break;
+            if !recovered {
+                return Ok((false, child_summaries));
             }
         }
 
-        Ok((overall_success, child_summaries))
+        Ok((true, child_summaries))
     }
 
     async fn execute_planning_node(
@@ -304,27 +313,32 @@ impl TaskTreeOrchestrator {
         })
     }
 
+    fn security_violation_msg(
+        context: &str,
+        kind: &str,
+        value: &str,
+        permitted: &[String],
+    ) -> String {
+        format!(
+            "Security violation{}: Child task specifies allowed {} {:?} which is not permitted by parent allowed {}s {:?}",
+            context, kind, value, kind, permitted
+        )
+    }
+
     fn validate_child_tools(
         child_tools: &[String],
         parent_tools: &Option<Vec<String>>,
         is_replan: bool,
     ) -> Result<()> {
-        if let Some(p_tools) = parent_tools {
-            for tool in child_tools {
-                if !p_tools.iter().any(|pt| tool == pt || tool.starts_with(pt)) {
-                    let msg = if is_replan {
-                        format!(
-                            "Security violation during re-plan: Child task specifies allowed tool {:?} which is not permitted by parent allowed tools {:?}",
-                            tool, p_tools
-                        )
-                    } else {
-                        format!(
-                            "Security violation: Child task specifies allowed tool {:?} which is not permitted by parent allowed tools {:?}",
-                            tool, p_tools
-                        )
-                    };
-                    return Err(anyhow!(msg));
-                }
+        let Some(p_tools) = parent_tools else {
+            return Ok(());
+        };
+        let context = if is_replan { " during re-plan" } else { "" };
+        for tool in child_tools {
+            if !p_tools.iter().any(|pt| tool == pt || tool.starts_with(pt)) {
+                return Err(anyhow!(Self::security_violation_msg(
+                    context, "tool", tool, p_tools
+                )));
             }
         }
         Ok(())
@@ -335,22 +349,15 @@ impl TaskTreeOrchestrator {
         parent_domains: &Option<Vec<String>>,
         is_replan: bool,
     ) -> Result<()> {
-        if let Some(p_domains) = parent_domains {
-            for domain in child_domains {
-                if !p_domains.contains(domain) {
-                    let msg = if is_replan {
-                        format!(
-                            "Security violation during re-plan: Child task specifies allowed domain {:?} which is not permitted by parent allowed domains {:?}",
-                            domain, p_domains
-                        )
-                    } else {
-                        format!(
-                            "Security violation: Child task specifies allowed domain {:?} which is not permitted by parent allowed domains {:?}",
-                            domain, p_domains
-                        )
-                    };
-                    return Err(anyhow!(msg));
-                }
+        let Some(p_domains) = parent_domains else {
+            return Ok(());
+        };
+        let context = if is_replan { " during re-plan" } else { "" };
+        for domain in child_domains {
+            if !p_domains.contains(domain) {
+                return Err(anyhow!(Self::security_violation_msg(
+                    context, "domain", domain, p_domains
+                )));
             }
         }
         Ok(())
@@ -712,26 +719,51 @@ impl TaskTreeOrchestrator {
         })
     }
 
+    /// Collect ancestor nodes from root down to the immediate parent of `node_id`.
+    fn collect_ancestors<'t>(
+        tree: &'t TaskTree,
+        node_id: NodeId,
+    ) -> Vec<&'t crate::tree::TaskNode> {
+        let mut ancestors = Vec::new();
+        let mut curr = tree.get_node(node_id);
+        while let Some(node) = curr {
+            let Some(parent_id) = node.parent_id else {
+                break;
+            };
+            let Some(parent) = tree.get_node(parent_id) else {
+                break;
+            };
+            ancestors.push(parent);
+            curr = Some(parent);
+        }
+        ancestors.reverse();
+        ancestors
+    }
+
+    /// Collect completed sibling nodes that appear before `node_id` in the parent's child list.
+    fn collect_prior_siblings<'t>(
+        tree: &'t TaskTree,
+        node_id: NodeId,
+    ) -> Vec<&'t crate::tree::TaskNode> {
+        let parent = tree
+            .get_node(node_id)
+            .and_then(|n| n.parent_id)
+            .and_then(|pid| tree.get_node(pid));
+        let Some(parent) = parent else {
+            return Vec::new();
+        };
+        parent
+            .children
+            .iter()
+            .take_while(|&&id| id != node_id)
+            .filter_map(|&id| tree.get_node(id))
+            .collect()
+    }
+
     fn build_branch_context(&self, tree: &TaskTree, node_id: NodeId) -> String {
         let mut context = Vec::new();
 
-        let mut curr = tree.get_node(node_id);
-        let mut ancestors = Vec::new();
-        while let Some(node) = curr {
-            if let Some(parent_id) = node.parent_id {
-                if let Some(parent) = tree.get_node(parent_id) {
-                    ancestors.push(parent);
-                    curr = Some(parent);
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        ancestors.reverse();
-
-        for ancestor in ancestors {
+        for ancestor in Self::collect_ancestors(tree, node_id) {
             let summary = ancestor
                 .result
                 .as_ref()
@@ -743,27 +775,16 @@ impl TaskTreeOrchestrator {
             ));
         }
 
-        if let Some(parent) = tree
-            .get_node(node_id)
-            .and_then(|n| n.parent_id)
-            .and_then(|parent_id| tree.get_node(parent_id))
-        {
-            for &sib_id in &parent.children {
-                if sib_id == node_id {
-                    break;
-                }
-                if let Some(sib) = tree.get_node(sib_id) {
-                    let outcome = sib
-                        .result
-                        .as_ref()
-                        .map(|r| r.summary.as_str())
-                        .unwrap_or("No summary available");
-                    context.push(format!(
-                        "Completed Sibling Task [{}]: {}\nOutcome: {}",
-                        sib.id.0, sib.task_description, outcome
-                    ));
-                }
-            }
+        for sib in Self::collect_prior_siblings(tree, node_id) {
+            let outcome = sib
+                .result
+                .as_ref()
+                .map(|r| r.summary.as_str())
+                .unwrap_or("No summary available");
+            context.push(format!(
+                "Completed Sibling Task [{}]: {}\nOutcome: {}",
+                sib.id.0, sib.task_description, outcome
+            ));
         }
 
         if context.is_empty() {
@@ -773,34 +794,39 @@ impl TaskTreeOrchestrator {
         }
     }
 
+    /// Resolve a list of scope strings against a base path, canonicalising each entry.
+    fn resolve_scopes(&self, scopes: &[String]) -> Vec<PathBuf> {
+        let base_scope = self
+            .adapter
+            .sandbox()
+            .scopes()
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        scopes
+            .iter()
+            .map(|s| {
+                let p = PathBuf::from(s);
+                let full = if p.is_absolute() {
+                    p
+                } else {
+                    base_scope.join(p)
+                };
+                dunce::canonicalize(&full).unwrap_or(full)
+            })
+            .collect()
+    }
+
     fn get_effective_parent_scopes(&self, tree: &TaskTree, node_id: NodeId) -> Vec<PathBuf> {
         let mut curr_node_id = Some(node_id);
         while let Some(curr_id) = curr_node_id {
-            if let Some(node) = tree.get_node(curr_id) {
-                if let Some(ref scopes) = node.sandbox_scopes {
-                    let mut resolved = Vec::new();
-                    let base_scope = self
-                        .adapter
-                        .sandbox()
-                        .scopes()
-                        .first()
-                        .cloned()
-                        .unwrap_or_default();
-                    for s in scopes {
-                        let p = PathBuf::from(s);
-                        let full = if p.is_absolute() {
-                            p
-                        } else {
-                            base_scope.join(p)
-                        };
-                        resolved.push(dunce::canonicalize(&full).unwrap_or(full));
-                    }
-                    return resolved;
-                }
-                curr_node_id = node.parent_id;
-            } else {
+            let Some(node) = tree.get_node(curr_id) else {
                 break;
+            };
+            if let Some(ref scopes) = node.sandbox_scopes {
+                return self.resolve_scopes(scopes);
             }
+            curr_node_id = node.parent_id;
         }
         self.adapter.sandbox().scopes().to_vec()
     }
