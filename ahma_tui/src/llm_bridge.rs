@@ -498,6 +498,7 @@ fn append_hint_to_field(
 }
 
 /// Apply any applicable harness hints to `payload`, then push a `tool` message onto `msg_json`.
+#[allow(clippy::too_many_arguments)]
 fn push_tool_message_with_hints(
     msg_json: &mut Vec<serde_json::Value>,
     tool_call_id: String,
