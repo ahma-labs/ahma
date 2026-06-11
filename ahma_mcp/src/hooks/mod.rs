@@ -578,7 +578,15 @@ struct ExtractedToolArgs {
 }
 
 fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
-    let Some(raw_args) = input.get("tool_input").or_else(|| input.get("toolArgs")) else {
+    let raw_args = if let Some(tool_call) = input.get("toolCall") {
+        if let Some(args_json) = tool_call.get("argumentsJson") {
+            args_json
+        } else {
+            return Ok(None);
+        }
+    } else if let Some(raw) = input.get("tool_input").or_else(|| input.get("toolArgs")) {
+        raw
+    } else {
         // Not a shell tool invocation — allow through without modification
         return Ok(None);
     };
@@ -622,11 +630,20 @@ fn resolve_exec_updated_input(
     }
     let cwd = extract_command_cwd(input, &args.tool_input)?;
     let wrapped_command = build_wrapped_shell_command(scope, env, &cwd, &args.command)?;
-    Ok(Some(updated_tool_input(
-        &args.tool_input,
-        wrapped_command,
-        &args.arg_key,
-    )))
+    let updated_args = updated_tool_input(&args.tool_input, wrapped_command, &args.arg_key);
+
+    if input.get("toolCall").is_some() {
+        // Antigravity format: rebuild the toolCall object and return updated root
+        let mut tool_call_obj = input.get("toolCall").unwrap().as_object().unwrap().clone();
+        let serialized_args = serde_json::to_string(&updated_args)?;
+        tool_call_obj.insert("argumentsJson".to_string(), Value::String(serialized_args));
+
+        let mut updated_root = input.as_object().unwrap().clone();
+        updated_root.insert("toolCall".to_string(), Value::Object(tool_call_obj));
+        Ok(Some(Value::Object(updated_root)))
+    } else {
+        Ok(Some(updated_args))
+    }
 }
 
 fn build_exec_response(
@@ -649,6 +666,8 @@ fn extract_command_cwd(input: &Value, tool_input: &Map<String, Value>) -> Result
     if let Some(cwd) = tool_input
         .get("working_directory")
         .and_then(Value::as_str)
+        .or_else(|| tool_input.get("Cwd").and_then(Value::as_str))
+        .or_else(|| tool_input.get("cwd").and_then(Value::as_str))
         .or_else(|| input.get("cwd").and_then(Value::as_str))
     {
         return Ok(cwd.to_string());
@@ -1413,6 +1432,33 @@ mod tests {
             updated["description"].as_str(),
             Some("Run specific test binary")
         );
+    }
+
+    #[test]
+    fn test_exec_response_rewrites_antigravity_tool_call_format() {
+        let env = test_env();
+        let input = json!({
+            "toolCall": {
+                "id": "test-id",
+                "name": "run_command",
+                "argumentsJson": "{\"CommandLine\":\"cargo build\",\"Cwd\":\"/tmp/project\"}"
+            }
+        });
+
+        let output =
+            build_exec_response(&input, HookPlatform::Antigravity, HookScope::Project, &env)
+                .unwrap();
+        let updated_root = &output["hookSpecificOutput"]["updatedInput"];
+        let tool_call = &updated_root["toolCall"];
+        assert_eq!(tool_call["id"].as_str(), Some("test-id"));
+        assert_eq!(tool_call["name"].as_str(), Some("run_command"));
+
+        let args_json_str = tool_call["argumentsJson"].as_str().unwrap();
+        let args: serde_json::Value = serde_json::from_str(args_json_str).unwrap();
+        let command = args["CommandLine"].as_str().unwrap();
+        assert!(command.starts_with("ahma hooks run-shell"));
+        assert!(command.contains(WRAPPED_BY_MARKER));
+        assert_eq!(args["Cwd"].as_str(), Some("/tmp/project"));
     }
 
     #[test]

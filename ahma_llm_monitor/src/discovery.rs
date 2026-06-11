@@ -21,7 +21,7 @@ pub async fn discover_local_providers() -> Result<Vec<LocalProvider>, LlmMonitor
         }
 
         let client = LlmClient::new(url, "", None);
-        let models = client.list_models().await;
+        let models = client.list_model().await;
         if !models.is_empty() {
             discovered.push(LocalProvider {
                 name: name.to_string(),

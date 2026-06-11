@@ -320,7 +320,7 @@ impl LlmClient {
     /// Returns model IDs sorted alphabetically.  Returns an empty vec (not an
     /// error) when the endpoint is unreachable — callers should treat that as
     /// "no models available right now".
-    pub async fn list_models(&self) -> Vec<String> {
+    pub async fn list_model(&self) -> Vec<String> {
         let url = format!("{}/models", self.base_url);
         let mut req = self.http.get(&url).timeout(Duration::from_secs(3));
         if let Some(key) = &self.api_key {

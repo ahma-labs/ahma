@@ -31,9 +31,9 @@ const MDNS_SERVICE_TYPE: &str = "_ahma-worker._tcp.local.";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerCapabilities {
     /// All models available (downloaded but not necessarily loaded).
-    pub models_available: Vec<String>,
+    pub model_available: Vec<String>,
     /// Models currently resident in GPU/CPU RAM — loading is instant.
-    pub models_loaded: Vec<String>,
+    pub model_loaded: Vec<String>,
     /// Maximum concurrent inference operations this peer supports.
     pub max_concurrent: usize,
     /// How many inference operations are currently running.
@@ -79,7 +79,7 @@ impl PeerInfo {
     /// Return `true` if `model` is currently loaded in memory on this peer.
     pub fn has_model_loaded(&self, model: &str) -> bool {
         self.capabilities.as_ref().is_some_and(|c| {
-            c.models_loaded
+            c.model_loaded
                 .iter()
                 .any(|m| m == model || m.starts_with(&format!("{model}:")))
         })
@@ -117,8 +117,8 @@ impl PeerInfo {
     pub fn apply_capabilities(&mut self, caps: PeerCapabilities) {
         self.active_ops = caps.active_ops;
         // Merge: heartbeat available models win over static list.
-        if !caps.models_available.is_empty() {
-            self.models = caps.models_available.clone();
+        if !caps.model_available.is_empty() {
+            self.models = caps.model_available.clone();
         }
         self.capabilities = Some(caps);
         self.reachable = true;
@@ -482,8 +482,8 @@ mod tests {
         let score_unloaded = peer.load_score_for("gemma");
         // Apply heartbeat with model loaded.
         let caps = PeerCapabilities {
-            models_available: vec!["gemma:4b".into()],
-            models_loaded: vec!["gemma:4b".into()],
+            model_available: vec!["gemma:4b".into()],
+            model_loaded: vec!["gemma:4b".into()],
             active_ops: 0,
             max_concurrent: 4,
             vram_free_mb: Some(8192),
@@ -502,8 +502,8 @@ mod tests {
         reg.upsert(make_peer("worker-a", "gemma:4b"));
 
         let caps = PeerCapabilities {
-            models_available: vec!["gemma:4b".into()],
-            models_loaded: vec!["gemma:4b".into()],
+            model_available: vec!["gemma:4b".into()],
+            model_loaded: vec!["gemma:4b".into()],
             active_ops: 3,
             max_concurrent: 4,
             vram_free_mb: Some(4096),
@@ -526,8 +526,8 @@ mod tests {
     fn vram_penalty_applied_when_low() {
         let mut peer = make_peer("x", "model");
         let caps = PeerCapabilities {
-            models_available: vec!["model".into()],
-            models_loaded: vec!["model".into()],
+            model_available: vec!["model".into()],
+            model_loaded: vec!["model".into()],
             active_ops: 0,
             max_concurrent: 4,
             vram_free_mb: Some(512), // < 1024 MiB threshold
@@ -551,8 +551,8 @@ mod tests {
         reg.upsert(make_peer("node-a", "gemma:4b"));
 
         let caps = PeerCapabilities {
-            models_available: vec!["gemma:4b".into()],
-            models_loaded: vec![],
+            model_available: vec!["gemma:4b".into()],
+            model_loaded: vec![],
             active_ops: 1,
             max_concurrent: 4,
             vram_free_mb: Some(8192),

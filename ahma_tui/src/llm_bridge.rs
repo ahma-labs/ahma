@@ -86,7 +86,7 @@ pub fn spawn_discovery_task(tx: Sender<BridgeEvent>) {
 pub fn spawn_model_refresh(base_url: String, tx: Sender<BridgeEvent>) {
     tokio::spawn(async move {
         let client = LlmClient::new(base_url.clone(), "", None);
-        let models = client.list_models().await;
+        let models = client.list_model().await;
         let _ = tx
             .send(BridgeEvent::ModelsRefreshed { base_url, models })
             .await;
