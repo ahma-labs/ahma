@@ -383,6 +383,7 @@ enum Applied {
 
 impl Applied {
     /// True when the merged operation list changed and should be re-emitted.
+    #[cfg(test)]
     fn is_list_changed(&self) -> bool {
         matches!(self, Applied::ListChanged)
     }

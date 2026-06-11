@@ -16,14 +16,24 @@ description = "The ahma binary: wires the MIT ahma_mcp library with the AGPL-lic
 name = "ahma"
 path = "src/main.rs"
 
+[features]
+# Lean default: MCP server, sandbox, shell pool, TUI, task planning.
+# Incubating features are opt-in; `full` enables everything.
+default = []
+# Local cluster scheduler (`ahma cluster ...`): mDNS discovery, signed dispatch. Incubating.
+cluster = ["dep:ahma_cluster"]
+# Task vault storage (`ahma vault ...`). Incubating.
+vault = ["dep:ahma_vault"]
+# Code complexity analysis (`ahma simplify ...`).
+simplify = ["ahma_mcp/simplify"]
+# Everything, including incubating features.
+full = ["cluster", "vault", "simplify"]
+
 [dependencies]
 ahma_mcp = { path = "../ahma_mcp" }
-ahma_vault = { path = "../ahma_vault" }
-ahma_decompose = { path = "../ahma_decompose" }
+ahma_vault = { path = "../ahma_vault", optional = true }
 ahma_task_tree = { path = "../ahma_task_tree" }
-ahma_worker = { path = "../ahma_worker" }
-ahma_cluster = { path = "../ahma_cluster" }
-ahma_renewal = { path = "../ahma_renewal" }
+ahma_cluster = { path = "../ahma_cluster", optional = true }
 ahma_tui = { path = "../ahma_tui" }
 ahma_common = { path = "../ahma_common" }
 anyhow.workspace = true

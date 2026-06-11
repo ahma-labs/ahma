@@ -61,6 +61,120 @@ pub struct McpChatConfig {
     pub mcp_connections: crate::mcp_connections::McpConnectionManager,
     pub minimize_tokens: bool,
     pub small_model_harness: bool,
+    /// Model context window in tokens (from `--context-length`, settings, or
+    /// profile). Sizes the conversation and tool-result character budgets so
+    /// small local models are not flooded past their window.  `None` uses
+    /// generous defaults (tighter ones when `small_model_harness` is on).
+    pub context_length: Option<u32>,
+}
+
+// ─── Context budgets (small-model support) ───────────────────────────────────
+//
+// Local models have hard context windows; flooding them silently truncates
+// the *oldest* content (often the system prompt) and degrades tool use.
+// These budgets keep the conversation and individual tool results inside a
+// predictable share of the window.  All budgets are in characters with a
+// ~4 chars/token approximation; exact tokenisation is model-specific and not
+// worth a tokenizer dependency here.
+
+/// Approximate characters per token for budget math.
+const CHARS_PER_TOKEN: usize = 4;
+/// Single tool-result cap (chars) when the context window is unknown.
+const DEFAULT_TOOL_RESULT_CHAR_CAP: usize = 60_000;
+/// Tighter tool-result cap under `--small-model-harness`.
+const SMALL_MODEL_TOOL_RESULT_CHAR_CAP: usize = 8_000;
+/// Conversation budget (chars) when the context window is unknown.
+const DEFAULT_CONVERSATION_CHAR_BUDGET: usize = 240_000;
+/// Tighter conversation budget under `--small-model-harness`.
+const SMALL_MODEL_CONVERSATION_CHAR_BUDGET: usize = 24_000;
+
+/// Character cap for a single tool result injected into the conversation.
+fn tool_result_char_cap(cfg: &McpChatConfig) -> usize {
+    match cfg.context_length {
+        // A single tool result may use at most a quarter of the window.
+        Some(tokens) => ((tokens as usize) * CHARS_PER_TOKEN / 4).max(1_000),
+        None if cfg.small_model_harness => SMALL_MODEL_TOOL_RESULT_CHAR_CAP,
+        None => DEFAULT_TOOL_RESULT_CHAR_CAP,
+    }
+}
+
+/// Total character budget for the conversation sent to the model.
+fn conversation_char_budget(cfg: &McpChatConfig) -> usize {
+    match cfg.context_length {
+        // Keep a quarter of the window free for the model's response.
+        Some(tokens) => ((tokens as usize) * CHARS_PER_TOKEN * 3 / 4).max(4_000),
+        None if cfg.small_model_harness => SMALL_MODEL_CONVERSATION_CHAR_BUDGET,
+        None => DEFAULT_CONVERSATION_CHAR_BUDGET,
+    }
+}
+
+/// Truncate the middle of `s` to at most `cap` characters, keeping the head
+/// (where commands/errors usually start) and the tail (where summaries and
+/// exit codes land), with an explicit marker so the model knows content was
+/// elided.
+fn truncate_middle(s: &str, cap: usize) -> String {
+    let total_chars = s.chars().count();
+    if total_chars <= cap {
+        return s.to_string();
+    }
+    let head_chars = cap * 3 / 5;
+    let tail_chars = cap - head_chars;
+    let head: String = s.chars().take(head_chars).collect();
+    let tail: String = s
+        .chars()
+        .skip(total_chars.saturating_sub(tail_chars))
+        .collect();
+    format!(
+        "{head}\n…[{} characters elided to fit the model context — use the `status` tool for the full output]…\n{tail}",
+        total_chars - cap
+    )
+}
+
+/// Trim the oldest non-system messages until the conversation fits `budget`
+/// characters.  The system prompt (first message) and the two most recent
+/// messages are always preserved so the model keeps its instructions and the
+/// immediate task state.
+fn trim_conversation(msg_json: &mut Vec<serde_json::Value>, budget: usize) {
+    let total = |msgs: &[serde_json::Value]| -> usize {
+        msgs.iter()
+            .map(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.len())
+                    .unwrap_or(0)
+            })
+            .sum()
+    };
+
+    if total(msg_json) <= budget {
+        return;
+    }
+
+    let has_system = msg_json
+        .first()
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("system");
+    let protected_head = if has_system { 1 } else { 0 };
+
+    let mut dropped = 0usize;
+    while total(msg_json) > budget && msg_json.len() > protected_head + 2 {
+        msg_json.remove(protected_head);
+        dropped += 1;
+    }
+    if dropped > 0 {
+        tracing::info!(
+            "small-model context: dropped {dropped} oldest message(s) to fit the {budget}-char conversation budget"
+        );
+        // Tell the model history was elided so it doesn't hallucinate it.
+        msg_json.insert(
+            protected_head,
+            serde_json::json!({
+                "role": "user",
+                "content": format!("[{dropped} earlier message(s) were removed to fit your context window. Continue from the latest state below.]"),
+            }),
+        );
+    }
 }
 
 pub fn spawn_external_tools_refresh(
@@ -498,6 +612,8 @@ fn append_hint_to_field(
 }
 
 /// Apply any applicable harness hints to `payload`, then push a `tool` message onto `msg_json`.
+/// The serialised result is capped at `result_char_cap` characters (head+tail)
+/// so a single chatty command cannot blow out a small model's context window.
 #[allow(clippy::too_many_arguments)]
 fn push_tool_message_with_hints(
     msg_json: &mut Vec<serde_json::Value>,
@@ -509,6 +625,7 @@ fn push_tool_message_with_hints(
     inject_read_hint: bool,
     error_hinted: &mut bool,
     read_file_hinted: &mut bool,
+    result_char_cap: usize,
 ) {
     let mut final_payload = payload;
     if let Some(obj) = final_payload.as_object_mut() {
@@ -540,7 +657,7 @@ fn push_tool_message_with_hints(
     msg_json.push(serde_json::json!({
         "role": "tool",
         "tool_call_id": tool_call_id,
-        "content": final_payload.to_string()
+        "content": truncate_middle(&final_payload.to_string(), result_char_cap)
     }));
 }
 
@@ -556,6 +673,12 @@ async fn execute_agent_turn(
     read_file_hinted: &mut bool,
     error_hinted: &mut bool,
 ) -> bool {
+    // Keep the conversation inside the model's context budget BEFORE each
+    // request — local models silently lose the oldest content otherwise.
+    if let Some(cfg) = mcp {
+        trim_conversation(msg_json, conversation_char_budget(cfg));
+    }
+
     let Some(completion) = fetch_completion(
         client,
         msg_json,
@@ -609,6 +732,7 @@ async fn execute_agent_turn(
         (false, false)
     };
 
+    let result_char_cap = tool_result_char_cap(&mcp_cfg);
     for (tool_call_id, tool_name, payload, failed) in tool_results {
         push_tool_message_with_hints(
             msg_json,
@@ -620,6 +744,7 @@ async fn execute_agent_turn(
             inject_read_hint,
             error_hinted,
             read_file_hinted,
+            result_char_cap,
         );
     }
 
@@ -1254,6 +1379,93 @@ mod tests {
     use std::path::PathBuf;
     use tokio::sync::mpsc;
 
+    // ── Small-model context budgets ───────────────────────────────────────────
+
+    fn cfg_with(context_length: Option<u32>, small_model_harness: bool) -> McpChatConfig {
+        McpChatConfig {
+            base_url: "http://localhost:3000".to_string(),
+            workspace_root: PathBuf::from("/tmp"),
+            session_id: None,
+            external_http_servers: BTreeMap::new(),
+            max_turns: 8,
+            tool_approval: false,
+            mcp_connections: crate::mcp_connections::McpConnectionManager::default(),
+            minimize_tokens: false,
+            small_model_harness,
+            context_length,
+        }
+    }
+
+    #[test]
+    fn budgets_scale_with_context_length() {
+        // 8k-token model: tool result cap = 8192*4/4 = 8192 chars,
+        // conversation budget = 8192*4*3/4 = 24576 chars.
+        let cfg = cfg_with(Some(8192), false);
+        assert_eq!(tool_result_char_cap(&cfg), 8192);
+        assert_eq!(conversation_char_budget(&cfg), 24576);
+    }
+
+    #[test]
+    fn small_model_harness_tightens_default_budgets() {
+        let small = cfg_with(None, true);
+        let normal = cfg_with(None, false);
+        assert!(tool_result_char_cap(&small) < tool_result_char_cap(&normal));
+        assert!(conversation_char_budget(&small) < conversation_char_budget(&normal));
+    }
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail() {
+        let s = format!("{}MIDDLE{}", "a".repeat(5000), "z".repeat(5000));
+        let out = truncate_middle(&s, 1000);
+        assert!(out.starts_with("aaa"), "head preserved");
+        assert!(out.ends_with("zzz"), "tail preserved");
+        assert!(out.contains("characters elided"), "marker present");
+        // Output is bounded near the cap (cap + marker text).
+        assert!(out.chars().count() < 1200, "got {}", out.chars().count());
+        // Short strings pass through untouched.
+        assert_eq!(truncate_middle("short", 1000), "short");
+    }
+
+    #[test]
+    fn trim_conversation_preserves_system_and_recent() {
+        let mut msgs = vec![serde_json::json!({"role": "system", "content": "SYS"})];
+        for i in 0..20 {
+            msgs.push(serde_json::json!({"role": "user", "content": format!("msg-{i}-{}", "x".repeat(500))}));
+        }
+        trim_conversation(&mut msgs, 2_000);
+
+        // System prompt survives.
+        assert_eq!(msgs[0]["role"], "system");
+        // An elision notice was inserted after the system prompt.
+        assert!(
+            msgs[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("removed to fit"),
+            "elision notice present"
+        );
+        // The most recent message survives.
+        let last = msgs.last().unwrap()["content"].as_str().unwrap();
+        assert!(last.starts_with("msg-19"), "latest message preserved");
+        // Under budget (allowing for the inserted notice).
+        let total: usize = msgs
+            .iter()
+            .map(|m| m["content"].as_str().map(|s| s.len()).unwrap_or(0))
+            .sum();
+        assert!(total < 3_000, "trimmed total = {total}");
+    }
+
+    #[test]
+    fn trim_conversation_noop_under_budget() {
+        let mut msgs = vec![
+            serde_json::json!({"role": "system", "content": "SYS"}),
+            serde_json::json!({"role": "user", "content": "hello"}),
+        ];
+        let before = msgs.clone();
+        trim_conversation(&mut msgs, 10_000);
+        assert_eq!(msgs, before);
+    }
+
     #[tokio::test]
     async fn test_agent_task_tool_call_loop() {
         let llm_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1344,6 +1556,7 @@ mod tests {
             mcp_connections: crate::mcp_connections::McpConnectionManager::default(),
             minimize_tokens: false,
             small_model_harness: false,
+            context_length: None,
         };
 
         let (tx, mut rx) = mpsc::channel(100);

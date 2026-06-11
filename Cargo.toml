@@ -1,4 +1,9 @@
 [workspace]
+# Default members are the lean product core: MCP server, sandbox, shell pool,
+# transports, TUI, and the binary.  Incubating crates (vault, decompose,
+# worker, renewal, cluster) stay workspace members — built and tested via
+# `--workspace` / explicit `-p` (see CI) — but are excluded from the default
+# build and from the default feature set of ahma_bin.
 default-members = [
     # Permissive crates (MIT OR Apache-2.0)
     "ahma_mcp",
@@ -11,15 +16,9 @@ default-members = [
     "ahma_test_support",
     "ahma_harness_tools",
     # AGPL-3.0-or-later crates (end-user product surface)
-    "ahma_vault",
-    "ahma_decompose",
     "ahma_task_tree",
-    "ahma_worker",
-    "ahma_renewal",
     "ahma_tui",
     "ahma_bin",
-    # AGPL-3.0-or-later (network-facing cluster scheduler)
-    "ahma_cluster",
 ]
 
 members = [

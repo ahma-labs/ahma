@@ -1158,9 +1158,34 @@ pub struct Cli {
     #[arg(long = "minimize-tokens", global = true)]
     pub minimize_tokens: bool,
 
-    /// Enable small-model harness adaptations.
+    /// Disable output compression and token minimization
+    /// (overrides settings.toml and the deprecated AHMA_MINIMIZE_TOKENS env var).
+    #[arg(
+        long = "no-minimize-tokens",
+        global = true,
+        conflicts_with = "minimize_tokens"
+    )]
+    pub no_minimize_tokens: bool,
+
+    /// Enable small-model harness adaptations: per-turn coaching hints and
+    /// tighter context budgets for local models with small context windows.
     #[arg(long = "small-model-harness", global = true)]
     pub small_model_harness: bool,
+
+    /// Disable small-model harness adaptations
+    /// (overrides settings.toml and the deprecated AHMA_SMALL_MODEL_HARNESS env var).
+    #[arg(
+        long = "no-small-model-harness",
+        global = true,
+        conflicts_with = "small_model_harness"
+    )]
+    pub no_small_model_harness: bool,
+
+    /// Model context window size in tokens for the TUI's local-LLM chat agent.
+    /// Sizes the conversation and tool-result budgets so small models are not
+    /// flooded past their window (e.g. --context-length 8192 for an 8k model).
+    #[arg(long = "context-length", value_name = "TOKENS", global = true)]
+    pub context_length: Option<u32>,
 
     /// Default tool execution timeout in seconds.
     /// Individual tools can override this via the timeout_seconds field in their JSON definition.
@@ -1258,6 +1283,29 @@ pub struct Cli {
     /// Log to stderr instead of rolling log files.
     #[arg(long = "log-to-stderr", global = true)]
     pub log_to_stderr: bool,
+
+    /// Directory for rolling log files.
+    /// Defaults to `<cwd>/logs`, falling back to `~/.ahma/logs`.
+    /// Replaces the deprecated AHMA_LOG_DIR environment variable.
+    #[arg(long = "log-dir", value_name = "PATH", global = true)]
+    pub log_dir: Option<PathBuf>,
+
+    /// Terminal hook behaviour: `on` forces hooks active, `off` disables them,
+    /// `auto` (default) activates when an ahma MCP server is configured in an
+    /// editor. Takes precedence over the AHMA_HOOKS environment variable
+    /// (which remains supported for hook subprocesses).
+    #[arg(long = "hooks", value_name = "on|off|auto", global = true)]
+    pub hooks_mode: Option<String>,
+
+    /// Directory for local TLS certificates (default: `~/.ahma/tls`).
+    /// Replaces the deprecated AHMA_TLS_DIR environment variable.
+    #[arg(long = "tls-dir", value_name = "PATH", global = true)]
+    pub tls_dir: Option<PathBuf>,
+
+    /// Hub daemon socket path (Unix socket path; `host:port` on Windows).
+    /// Replaces the deprecated AHMA_DAEMON_SOCK environment variable.
+    #[arg(long = "daemon-socket", value_name = "PATH", global = true)]
+    pub daemon_socket: Option<PathBuf>,
 
     /// Indicate that this process is spawned as a child server subprocess.
     #[arg(long = "server-child", global = true)]
@@ -2370,6 +2418,22 @@ fn resolve_working_dirs_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) ->
 }
 
 pub fn build_app_config(cli: &Cli) -> AppConfig {
+    // Apply process-wide overrides from CLI flags BEFORE anything reads the
+    // corresponding deprecated env vars — flags are the visible, diagnosable
+    // configuration path (no ambient OS/ENV state leaking in).
+    if let Some(dir) = &cli.log_dir {
+        crate::utils::logging::set_log_dir_override(dir.clone());
+    }
+    if let Some(mode) = &cli.hooks_mode {
+        crate::hooks::set_hooks_mode_override(mode);
+    }
+    if let Some(dir) = &cli.tls_dir {
+        ahma_common::local_tls::LocalTlsConfig::set_dir_override(dir.clone());
+    }
+    if let Some(path) = &cli.daemon_socket {
+        ahma_common::daemon_hub::set_socket_path_override(path.clone());
+    }
+
     let serve = extract_serve_fields(&cli.command);
     let tool = extract_tool_fields(&cli.command);
 

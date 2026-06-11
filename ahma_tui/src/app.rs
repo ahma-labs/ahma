@@ -17,12 +17,16 @@ pub async fn run(
     connection: &ResolvedConnection,
     profile: Option<String>,
     path: Option<std::path::PathBuf>,
+    token_prefs: crate::TokenPrefs,
 ) -> Result<()> {
     #[cfg(feature = "tui")]
-    return run_ratatui(connection, profile, path).await;
+    return run_ratatui(connection, profile, path, token_prefs).await;
 
     #[cfg(not(feature = "tui"))]
-    return run_text_stub(connection).await;
+    {
+        let _ = token_prefs;
+        return run_text_stub(connection).await;
+    }
 }
 
 // ─── Ratatui implementation (feature = "tui") ─────────────────────────────────
@@ -32,6 +36,7 @@ async fn run_ratatui(
     connection: &ResolvedConnection,
     profile_override: Option<String>,
     workspace_path: Option<std::path::PathBuf>,
+    token_prefs: crate::TokenPrefs,
 ) -> Result<()> {
     use std::io;
     use std::time::Duration;
@@ -62,6 +67,7 @@ async fn run_ratatui(
         unicode,
     );
     state.mcp_http_base_url = http_base_url(connection);
+    state.token_prefs = token_prefs;
 
     if let Some(profile_name) = profile_override
         && let Ok(cwd) = std::env::current_dir()
@@ -299,13 +305,7 @@ fn approve_symlink(state: &mut crate::state::AppState) {
     {
         let tx = tx.clone();
         let file_to_approve = active_file.clone();
-        let settings = ahma_common::config::AhmaSettings::load();
-        let minimize_tokens = std::env::var("AHMA_MINIMIZE_TOKENS")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(settings.tools.minimize_tokens);
-        let small_model_harness = std::env::var("AHMA_SMALL_MODEL_HARNESS")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(settings.tools.small_model_harness);
+        let (minimize_tokens, small_model_harness, context_length) = resolve_token_prefs(state);
 
         let mcp = crate::llm_bridge::McpChatConfig {
             base_url: state.server_url.clone(),
@@ -317,6 +317,7 @@ fn approve_symlink(state: &mut crate::state::AppState) {
             mcp_connections: state.mcp_connections.clone(),
             minimize_tokens,
             small_model_harness,
+            context_length,
         };
         tokio::spawn(async move {
             crate::llm_bridge::spawn_tool_call_task(
@@ -1184,6 +1185,38 @@ where
         .unwrap_or(default)
 }
 
+/// Resolve token/context preferences: CLI flag > deprecated env var > settings.
+/// Returns `(minimize_tokens, small_model_harness, context_length)`.
+#[cfg(feature = "tui")]
+fn resolve_token_prefs(state: &crate::state::AppState) -> (bool, bool, Option<u32>) {
+    let settings = ahma_common::config::AhmaSettings::load();
+
+    fn env_bool(name: &str) -> Option<bool> {
+        std::env::var(name).ok().map(|v| {
+            tracing::warn!(
+                "Deprecated: {name} environment variable is set. Use the corresponding CLI flag instead."
+            );
+            v == "1" || v.to_lowercase() == "true"
+        })
+    }
+
+    let minimize_tokens = state
+        .token_prefs
+        .minimize_tokens
+        .or_else(|| env_bool("AHMA_MINIMIZE_TOKENS"))
+        .unwrap_or(settings.tools.minimize_tokens);
+    let small_model_harness = state
+        .token_prefs
+        .small_model_harness
+        .or_else(|| env_bool("AHMA_SMALL_MODEL_HARNESS"))
+        .unwrap_or(settings.tools.small_model_harness);
+    (
+        minimize_tokens,
+        small_model_harness,
+        state.token_prefs.context_length,
+    )
+}
+
 #[cfg(feature = "tui")]
 fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChatConfig {
     let external_http_servers = state
@@ -1201,13 +1234,7 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
     let max_turns = profile_field(state, |p| p.max_turns, 8);
     let tool_approval = profile_field(state, |p| p.tool_approval, false);
 
-    let settings = ahma_common::config::AhmaSettings::load();
-    let minimize_tokens = std::env::var("AHMA_MINIMIZE_TOKENS")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(settings.tools.minimize_tokens);
-    let small_model_harness = std::env::var("AHMA_SMALL_MODEL_HARNESS")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(settings.tools.small_model_harness);
+    let (minimize_tokens, small_model_harness, context_length) = resolve_token_prefs(state);
 
     crate::llm_bridge::McpChatConfig {
         base_url: state.mcp_http_base_url.clone(),
@@ -1219,6 +1246,7 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
         mcp_connections: state.mcp_connections.clone(),
         minimize_tokens,
         small_model_harness,
+        context_length,
     }
 }
 

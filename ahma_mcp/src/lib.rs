@@ -178,9 +178,13 @@ pub mod validation;
 // they must NOT be depended on from this crate.
 
 /// Egress sandbox: per-task HTTP proxy with domain allowlist.
+/// Incubating — enable with the `egress` feature.
+#[cfg(feature = "egress")]
 pub mod egress;
 
 /// HTML+WASM artifact channel: interactive output with embedded LLM chat.
+/// Incubating — enable with the `artifact` feature.
+#[cfg(feature = "artifact")]
 pub mod artifact;
 
 /// Bundle signing and supply-chain auditor.

@@ -854,6 +854,10 @@ pub struct AppState {
     pub session_id: Option<String>,
     pub sandbox_status: String,
     pub workspace: String,
+    /// Token/context preferences resolved from CLI flags (`--minimize-tokens`,
+    /// `--small-model-harness`, `--context-length`).  Flag values override
+    /// settings.toml and the deprecated env vars.
+    pub token_prefs: crate::TokenPrefs,
 
     // ── Panel data ──
     pub ai_activity: VecDeque<AiActivityEntry>,
@@ -1021,6 +1025,7 @@ impl AppState {
             session_id: None,
             sandbox_status: "UNKNOWN".to_string(),
             workspace,
+            token_prefs: crate::TokenPrefs::default(),
             ai_activity: VecDeque::with_capacity(ACTIVITY_RING_CAP),
             operations: vec![],
             log: VecDeque::with_capacity(LOG_RING_CAP),

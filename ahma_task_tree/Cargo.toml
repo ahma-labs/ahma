@@ -16,7 +16,7 @@ path = "src/lib.rs"
 ahma_common = { path = "../ahma_common" }
 ahma_llm_monitor = { path = "../ahma_llm_monitor" }
 ahma_vault = { path = "../ahma_vault" }
-ahma_mcp = { path = "../ahma_mcp" }
+ahma_mcp = { path = "../ahma_mcp", features = ["egress"] }
 anyhow.workspace = true
 async-trait.workspace = true
 futures.workspace = true

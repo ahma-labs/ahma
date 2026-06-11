@@ -5,9 +5,12 @@
 use anyhow::{Context, Result};
 use clap::Parser as _;
 
+#[cfg(feature = "cluster")]
+use ahma_mcp::shell::cli::ClusterCommand;
+#[cfg(feature = "vault")]
+use ahma_mcp::shell::cli::VaultCommand;
 use ahma_mcp::shell::cli::{
-    Cli, ClusterCommand, LlmCommand, Subcommands, TlsCommand, VaultCommand, build_app_config,
-    dispatch_subcommand, load_settings,
+    Cli, LlmCommand, Subcommands, TlsCommand, build_app_config, dispatch_subcommand, load_settings,
 };
 
 use ahma_mcp::utils::logging::{
@@ -57,10 +60,25 @@ async fn main() -> Result<()> {
         }
         Subcommands::Tui(tui_args) => {
             tracing::info!("Starting TUI control plane");
+            // Resolve explicit on/off token-preference flags; None = fall back
+            // to settings.toml and the deprecated env vars.
+            let flag_pair = |on: bool, off: bool| -> Option<bool> {
+                match (on, off) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                }
+            };
+            let token_prefs = ahma_tui::TokenPrefs {
+                minimize_tokens: flag_pair(cli.minimize_tokens, cli.no_minimize_tokens),
+                small_model_harness: flag_pair(cli.small_model_harness, cli.no_small_model_harness),
+                context_length: cli.context_length,
+            };
             ahma_tui::run_tui(
                 tui_args.connect.as_deref(),
                 tui_args.profile.clone(),
                 tui_args.path.clone(),
+                token_prefs,
             )
             .await
         }
@@ -150,6 +168,24 @@ fn dispatch_tls(args: ahma_mcp::shell::TlsArgs) -> Result<()> {
     Ok(())
 }
 
+/// Graceful degradation when an incubating feature is compiled out: the
+/// subcommand still parses, but explains how to get a build that includes it.
+#[allow(dead_code)]
+fn feature_not_compiled(subcommand: &str, feature: &str) -> Result<()> {
+    anyhow::bail!(
+        "`ahma {subcommand}` is not included in this build.\n\
+         It is an incubating feature, compiled in with:\n\
+         \n    cargo install --path ahma_bin --features {feature}\n\
+         \n(or `--features full` for all incubating features)"
+    )
+}
+
+#[cfg(not(feature = "vault"))]
+fn dispatch_vault(_args: ahma_mcp::shell::VaultArgs) -> Result<()> {
+    feature_not_compiled("vault", "vault")
+}
+
+#[cfg(feature = "vault")]
 fn dispatch_vault(args: ahma_mcp::shell::VaultArgs) -> Result<()> {
     match args.command {
         VaultCommand::Create(create_args) => {
@@ -331,7 +367,13 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
 // Cluster peer subcommand handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(not(feature = "cluster"))]
+async fn dispatch_cluster(_args: ahma_mcp::shell::ClusterArgs) -> Result<()> {
+    feature_not_compiled("cluster", "cluster")
+}
+
 /// Path to the static peers file.
+#[cfg(feature = "cluster")]
 fn peers_path() -> Result<std::path::PathBuf> {
     dirs::home_dir()
         .context("Cannot determine home directory for ~/.ahma/cluster/peers.json")
@@ -339,6 +381,7 @@ fn peers_path() -> Result<std::path::PathBuf> {
 }
 
 /// Read the peers list from disk, returning an empty vec if the file is absent.
+#[cfg(feature = "cluster")]
 fn read_peers() -> Result<Vec<ahma_cluster::PeerInfo>> {
     let path = peers_path()?;
     if !path.exists() {
@@ -350,6 +393,7 @@ fn read_peers() -> Result<Vec<ahma_cluster::PeerInfo>> {
 }
 
 /// Write the peers list to disk (creates directory if needed).
+#[cfg(feature = "cluster")]
 fn write_peers(peers: &[ahma_cluster::PeerInfo]) -> Result<()> {
     let path = peers_path()?;
     if let Some(parent) = path.parent() {
@@ -359,6 +403,7 @@ fn write_peers(peers: &[ahma_cluster::PeerInfo]) -> Result<()> {
     std::fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))
 }
 
+#[cfg(feature = "cluster")]
 async fn dispatch_cluster(args: ahma_mcp::shell::ClusterArgs) -> Result<()> {
     match args.command {
         ClusterCommand::List => {
@@ -556,6 +601,7 @@ async fn dispatch_cluster(args: ahma_mcp::shell::ClusterArgs) -> Result<()> {
     }
 }
 
+#[cfg(feature = "cluster")]
 fn dispatch_cert(cmd: ahma_mcp::shell::CertCommand) -> Result<()> {
     use ahma_mcp::shell::CertCommand;
     match cmd {
