@@ -28,6 +28,14 @@ pub enum SourceEvent {
     OperationsUpdated {
         ops: Vec<Operation>,
     },
+    /// A single live output line from a running operation, streamed as the
+    /// child process produces it (pushed via the daemon hub).
+    OperationOutput {
+        instance_id: Option<String>,
+        op_id: String,
+        line: String,
+        is_stderr: bool,
+    },
     AiActivity(AiActivityEntry),
     LogLine(LogEntry),
     ToolsListUpdated {

@@ -71,7 +71,7 @@ pub fn spawn_embedded_hub_source(
                             | DaemonMsg::InstanceRegistered { .. }
                             | DaemonMsg::InstanceUnregistered { .. }
                     );
-                    let changed = apply_msg(&mut state, msg);
+                    let applied = apply_msg(&mut state, msg);
                     if is_instance_change {
                         let _ = tx
                             .send(SourceEvent::InstancesUpdated {
@@ -79,15 +79,37 @@ pub fn spawn_embedded_hub_source(
                             })
                             .await;
                     }
-                    if changed {
-                        let ops = state.all_ops();
-                        if tx
-                            .send(SourceEvent::OperationsUpdated { ops })
-                            .await
-                            .is_err()
-                        {
-                            return; // TUI channel closed
+                    match applied {
+                        Applied::ListChanged => {
+                            let ops = state.all_ops();
+                            if tx
+                                .send(SourceEvent::OperationsUpdated { ops })
+                                .await
+                                .is_err()
+                            {
+                                return; // TUI channel closed
+                            }
                         }
+                        Applied::Output {
+                            instance_id,
+                            op_id,
+                            line,
+                            is_stderr,
+                        } => {
+                            if tx
+                                .send(SourceEvent::OperationOutput {
+                                    instance_id: Some(instance_id),
+                                    op_id,
+                                    line,
+                                    is_stderr,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return; // TUI channel closed
+                            }
+                        }
+                        Applied::None => {}
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -282,7 +304,7 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
                             | DaemonMsg::InstanceRegistered { .. }
                             | DaemonMsg::InstanceUnregistered { .. }
                     );
-                    let changed = apply_msg(&mut state, msg);
+                    let applied = apply_msg(&mut state, msg);
                     if is_instance_change {
                         let _ = tx
                             .send(SourceEvent::InstancesUpdated {
@@ -290,21 +312,43 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
                             })
                             .await;
                     }
-                    if changed {
-                        prune_counter += 1;
-                        if prune_counter >= 10 {
-                            state.prune_terminal();
-                            prune_counter = 0;
+                    match applied {
+                        Applied::ListChanged => {
+                            prune_counter += 1;
+                            if prune_counter >= 10 {
+                                state.prune_terminal();
+                                prune_counter = 0;
+                            }
+                            let ops = state.all_ops();
+                            if tx
+                                .send(SourceEvent::OperationsUpdated { ops })
+                                .await
+                                .is_err()
+                            {
+                                // Channel closed — TUI exited.
+                                return;
+                            }
                         }
-                        let ops = state.all_ops();
-                        if tx
-                            .send(SourceEvent::OperationsUpdated { ops })
-                            .await
-                            .is_err()
-                        {
-                            // Channel closed — TUI exited.
-                            return;
+                        Applied::Output {
+                            instance_id,
+                            op_id,
+                            line,
+                            is_stderr,
+                        } => {
+                            if tx
+                                .send(SourceEvent::OperationOutput {
+                                    instance_id: Some(instance_id),
+                                    op_id,
+                                    line,
+                                    is_stderr,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
+                        Applied::None => {}
                     }
                 }
                 Err(e) => {
@@ -322,24 +366,45 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
     }
 }
 
-/// Apply one daemon message to the state.  Returns `true` if the operation
-/// list changed and should be re-emitted.
-fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> bool {
+/// Result of applying one daemon message to the state.
+enum Applied {
+    /// Nothing the TUI needs to react to.
+    None,
+    /// The operation list changed — re-emit the merged snapshot.
+    ListChanged,
+    /// A live output line — forward incrementally, do NOT re-emit the list.
+    Output {
+        instance_id: String,
+        op_id: String,
+        line: String,
+        is_stderr: bool,
+    },
+}
+
+impl Applied {
+    /// True when the merged operation list changed and should be re-emitted.
+    fn is_list_changed(&self) -> bool {
+        matches!(self, Applied::ListChanged)
+    }
+}
+
+/// Apply one daemon message to the state.
+fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
     match msg {
         DaemonMsg::InstanceList { instances } => {
             for info in instances {
                 state.add_instance(info);
             }
             // Initial snapshot — emit even if empty so TUI sees "daemon connected".
-            true
+            Applied::ListChanged
         }
         DaemonMsg::InstanceRegistered { instance } => {
             state.add_instance(instance);
-            true
+            Applied::ListChanged
         }
         DaemonMsg::InstanceUnregistered { id } => {
             state.remove_instance(&id);
-            true
+            Applied::ListChanged
         }
         DaemonMsg::Event {
             instance_id,
@@ -352,7 +417,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> bool {
                 scope,
             } => {
                 state.on_op_started(&instance_id, id, tool_name, description, Some(scope));
-                true
+                Applied::ListChanged
             }
             DaemonEvent::OpFinished {
                 id,
@@ -361,11 +426,25 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> bool {
                 duration_ms,
             } => {
                 state.on_op_finished(&instance_id, &id, &status, result_summary, duration_ms);
-                true
+                Applied::ListChanged
             }
-            DaemonEvent::LogLine { .. } => false, // not yet surfaced in TUI
+            // Output lines are forwarded incrementally to the TUI and are NOT
+            // accumulated in DaemonState: the merged-list snapshot would be
+            // re-appended by `upsert_operation` on every re-emit, duplicating
+            // lines.  The TUI app state owns the per-operation tail buffer.
+            DaemonEvent::OpOutput {
+                id,
+                line,
+                is_stderr,
+            } => Applied::Output {
+                instance_id,
+                op_id: id,
+                line,
+                is_stderr,
+            },
+            DaemonEvent::LogLine { .. } => Applied::None, // not yet surfaced in TUI
         },
-        DaemonMsg::Ping { .. } => false, // hub-to-instance ping; no state change for subscribers
+        DaemonMsg::Ping { .. } => Applied::None, // hub-to-instance ping; no state change for subscribers
     }
 }
 
@@ -582,7 +661,7 @@ mod tests {
                 instances: vec![inst("i1", "IDE")],
             },
         );
-        assert!(changed, "InstanceList should flag change");
+        assert!(changed.is_list_changed(), "InstanceList should flag change");
         assert_eq!(s.instances.len(), 1);
     }
 
@@ -592,7 +671,7 @@ mod tests {
         let mut s = DaemonState::new();
         let changed = apply_msg(&mut s, DaemonMsg::InstanceList { instances: vec![] });
         assert!(
-            changed,
+            changed.is_list_changed(),
             "empty InstanceList is still a change (daemon-connected signal)"
         );
     }
@@ -606,7 +685,7 @@ mod tests {
                 instance: inst("i2", "IDE"),
             },
         );
-        assert!(changed);
+        assert!(changed.is_list_changed());
         assert!(s.instances.contains_key("i2"));
     }
 
@@ -620,7 +699,7 @@ mod tests {
                 id: "i3".to_string(),
             },
         );
-        assert!(changed);
+        assert!(changed.is_list_changed());
         assert!(s.instances.is_empty());
     }
 
@@ -641,7 +720,7 @@ mod tests {
                 },
             },
         );
-        assert!(c1);
+        assert!(c1.is_list_changed());
         assert_eq!(s.all_ops().len(), 1);
         assert_eq!(s.all_ops()[0].scope, Some("/test/scope".to_string()));
 
@@ -657,7 +736,7 @@ mod tests {
                 },
             },
         );
-        assert!(c2);
+        assert!(c2.is_list_changed());
         assert_eq!(s.all_ops()[0].status, OpStatus::Succeeded);
         assert_eq!(s.all_ops()[0].result_summary, Some("success".to_string()));
         assert_eq!(s.all_ops()[0].duration_ms, Some(1200));
@@ -677,7 +756,57 @@ mod tests {
                 },
             },
         );
-        assert!(!changed, "LogLine should not trigger state change");
+        assert!(
+            !changed.is_list_changed(),
+            "LogLine should not trigger state change"
+        );
+    }
+
+    #[test]
+    fn apply_msg_op_output_forwards_incrementally() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Test"));
+        apply_msg(
+            &mut s,
+            DaemonMsg::Event {
+                instance_id: "i1".to_string(),
+                payload: DaemonEvent::OpStarted {
+                    id: "op-1".to_string(),
+                    tool_name: "tool".to_string(),
+                    description: "".to_string(),
+                    scope: "/test".to_string(),
+                },
+            },
+        );
+
+        let applied = apply_msg(
+            &mut s,
+            DaemonMsg::Event {
+                instance_id: "i1".to_string(),
+                payload: DaemonEvent::OpOutput {
+                    id: "op-1".to_string(),
+                    line: "compiling...".to_string(),
+                    is_stderr: false,
+                },
+            },
+        );
+        match applied {
+            Applied::Output {
+                instance_id,
+                op_id,
+                line,
+                is_stderr,
+            } => {
+                assert_eq!(instance_id, "i1");
+                assert_eq!(op_id, "op-1");
+                assert_eq!(line, "compiling...");
+                assert!(!is_stderr);
+            }
+            _ => panic!("OpOutput must map to Applied::Output"),
+        }
+        // Output is NOT accumulated in DaemonState (the TUI app state owns
+        // the tail buffer) — the snapshot list stays line-free.
+        assert!(s.all_ops()[0].stdout_tail.is_empty());
     }
 
     // ── parse_op_status ────────────────────────────────────────────────────────
