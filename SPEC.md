@@ -231,8 +231,9 @@ The sandbox scope defines the root directory boundary. AI has **full read/write 
 
 - **R6.2.1**: Uses `sandbox-exec` with Seatbelt profiles (SBPL).
 - **R6.2.2**: Profile uses `(deny default)` with allowed reads and writes **strictly limited** to the sandbox scope, necessary system paths, and necessary temp paths.
-- **R6.2.3**: **Read Limitation**: The security guarantee is **read and write isolation**. By default, it operates identical to Landlock: standard system binaries (`/usr`, `/etc`, `~/.cargo`) are whitelisted for read/execute, and all other paths outside the scope are denied.
+- **R6.2.3**: **Read/Write Limitation**: The security guarantee is **read and write isolation**. By default, it operates identical to Landlock: standard system binaries (`/usr`, `/etc`, `~/.cargo`) are whitelisted for read/execute, and all other paths outside the scope are denied.  `~/.cargo/registry` and `~/.cargo/git` receive **additional write access** by default so agents can fetch new dependency versions (see R6.2.5).
 - **R6.2.4**: **CRITICAL**: `/var` is symlink to `/private/var` on macOS; profiles **must** use real paths.
+- **R6.2.5**: **Package Cache Write** (default on): `~/.cargo/registry/` and `~/.cargo/git/` (and cargo's root lock files) are writable by default so that `cargo add` / `cargo update` work inside the sandbox without manual `--sandbox-scope ~/.cargo` which would grant write to the entire cargo home including binaries and credentials. The writable set is computed from `$CARGO_HOME` (or `~/.cargo`) and excludes `bin/`, `config.toml`, and `credentials.toml`.  Disable with `--no-package-cache-write` / `AHMA_NO_PACKAGE_CACHE_WRITE=1` / `[sandbox] package_cache_write = false` for the strictest isolation.
 
 #### R6.3: Windows (AppContainer / Job Objects) — _in-progress_
 

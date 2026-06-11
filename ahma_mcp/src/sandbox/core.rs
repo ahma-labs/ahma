@@ -163,6 +163,9 @@ pub struct Sandbox {
     /// When true, the canonical temp directory is preserved across scope updates.
     pub(super) tmp_access: bool,
     pub(super) livelog: bool,
+    /// Allow package-manager caches (cargo registry/git) to be written.
+    /// Default `true`; disable with `--no-package-cache-write`.
+    pub(super) package_cache_write: bool,
 }
 
 impl Clone for Sandbox {
@@ -174,6 +177,7 @@ impl Clone for Sandbox {
             no_temp_files: self.no_temp_files,
             tmp_access: self.tmp_access,
             livelog: self.livelog,
+            package_cache_write: self.package_cache_write,
         }
     }
 }
@@ -187,6 +191,7 @@ impl std::fmt::Debug for Sandbox {
             .field("no_temp_files", &self.no_temp_files)
             .field("tmp_access", &self.tmp_access)
             .field("livelog", &self.livelog)
+            .field("package_cache_write", &self.package_cache_write)
             .finish()
     }
 }
@@ -220,7 +225,19 @@ impl Sandbox {
             no_temp_files,
             tmp_access,
             livelog,
+            package_cache_write: true,
         })
+    }
+
+    /// Override the package-cache-write flag.
+    ///
+    /// The default is `true` (on). Pass `false` to disable write access to the
+    /// package-manager cache directories (cargo registry/git, etc.).  This is
+    /// the builder counterpart of `--no-package-cache-write`.
+    #[must_use]
+    pub fn with_package_cache_write(mut self, enabled: bool) -> Self {
+        self.package_cache_write = enabled;
+        self
     }
 
     /// Update the sandbox scopes, preserving the temp directory if `--tmp` was set.
@@ -276,6 +293,11 @@ impl Sandbox {
     /// Check if tmp_access is enabled.
     pub fn is_tmp_access(&self) -> bool {
         self.tmp_access
+    }
+
+    /// Check if package-cache writes are enabled (default `true`).
+    pub fn package_cache_write(&self) -> bool {
+        self.package_cache_write
     }
 
     /// Get the allowed scopes.

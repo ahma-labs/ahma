@@ -17,6 +17,13 @@ impl Sandbox {
         Ok(("sandbox-exec".to_string(), args))
     }
 
+    /// Expose the seatbelt profile string for test inspection.
+    /// Hidden from docs — not part of the public API contract.
+    #[doc(hidden)]
+    pub fn generate_seatbelt_profile_test(&self, working_dir: &Path) -> String {
+        self.generate_seatbelt_profile(working_dir)
+    }
+
     fn generate_seatbelt_profile(&self, working_dir: &Path) -> String {
         let wd_str = working_dir.to_string_lossy();
         let scope_rules = self.get_macos_scope_rules();
@@ -24,6 +31,7 @@ impl Sandbox {
         let system_rules = self.get_macos_system_rules();
         let user_tool_rules = self.get_macos_user_tool_rules();
         let temp_rules = self.get_macos_temp_rules();
+        let pkg_cache_rules = self.get_macos_package_cache_write_rules();
 
         let profile = format!(
             r#"(version 1)
@@ -33,7 +41,7 @@ impl Sandbox {
 (allow sysctl-read)
 {system_rules}{user_tool_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
 (allow file-write* (subpath "{working_dir}"))
-{temp_rules}(allow file-read* (literal "/dev/null"))
+{pkg_cache_rules}{temp_rules}(allow file-read* (literal "/dev/null"))
 (allow file-write* (literal "/dev/null"))
 (allow file-read* (literal "/dev/tty"))
 (allow file-write* (literal "/dev/tty"))
@@ -48,6 +56,7 @@ impl Sandbox {
             user_tool_rules = user_tool_rules,
             scope_rules = scope_rules,
             read_scopes_rules = read_scopes_rules,
+            pkg_cache_rules = pkg_cache_rules,
             temp_rules = temp_rules,
         );
 
@@ -101,6 +110,41 @@ impl Sandbox {
                     "(allow file-read* (subpath \"{}\"))\n",
                     path.display()
                 ));
+            }
+        }
+        rules
+    }
+
+    /// Generate macOS Seatbelt write rules for package-manager caches.
+    ///
+    /// When `package_cache_write` is enabled (the default), grants `file-write*`
+    /// for `registry/`, `git/`, and the two cargo lock files.  Sensitive paths
+    /// (`bin/`, `config.toml`, `credentials.toml`) receive no write rule and
+    /// remain under the existing global `file-read*` rule only.
+    fn get_macos_package_cache_write_rules(&self) -> String {
+        if !self.package_cache_write {
+            return String::new();
+        }
+
+        use super::pkg_cache::{all_writable_package_cache_paths, pre_create_package_cache_paths};
+
+        let mut rules = String::new();
+        for cache in all_writable_package_cache_paths() {
+            pre_create_package_cache_paths(&cache);
+
+            for dir in &cache.writable_dirs {
+                rules.push_str(&format!(
+                    "(allow file-write* (subpath \"{}\"))\n",
+                    dir.display()
+                ));
+            }
+            for file in &cache.writable_files {
+                if file.exists() {
+                    rules.push_str(&format!(
+                        "(allow file-write* (literal \"{}\"))\n",
+                        file.display()
+                    ));
+                }
             }
         }
         rules

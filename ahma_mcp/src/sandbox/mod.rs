@@ -40,6 +40,7 @@ pub(crate) mod core;
 mod error;
 #[cfg(target_os = "linux")]
 mod landlock;
+pub(crate) mod pkg_cache;
 mod prerequisites;
 mod scopes;
 #[cfg(target_os = "macos")]

@@ -55,6 +55,35 @@ detection, and example `mcp.json` configurations.
 | `AHMA_WORKING_DIRS` | — | — | Colon-separated fallback working directories used when `AHMA_SANDBOX_DEFER=1` is set but the client does not provide roots. Has no effect when `AHMA_SANDBOX_DEFER` is off. |
 | `AHMA_TMP_ACCESS` | `--tmp` | off | Add the system temp directory (`/tmp` or equivalent) to the sandbox scope. Useful for workflows that need scratch space (compilers, build systems). See [security-sandbox.md](security-sandbox.md) for security trade-offs. |
 | `AHMA_DISABLE_TEMP` | — | off | Block all access to the system temp directory. Takes precedence over `AHMA_TMP_ACCESS`. |
+| `AHMA_NO_PACKAGE_CACHE_WRITE` | `--no-package-cache-write` | off | Disable write access to package-manager caches (`~/.cargo/registry`, `~/.cargo/git`, and cargo lock files). By default these are writable so agents can fetch new dependencies. Set to `1` for strictest isolation. See [security-sandbox.md](security-sandbox.md#package-manager-cache-write---no-package-cache-write). |
+
+---
+
+## Terminal Hooks
+
+These variables control the behaviour of `ahma hooks exec` — the hook process that Cursor,
+Claude Code, and other supported agents invoke before running shell commands.
+
+| Variable | Default | Description |
+|---|---|---|
+| `AHMA_HOOKS` | `auto` | Controls whether the hook routes commands through ahma's sandbox. Values: `on` (always sandbox), `off` (always pass through to default terminal), `auto` (sandbox when an ahma MCP server is detected in editor config files). **`off` is the safe escape hatch** — set this to let commands run in the default terminal without uninstalling the hook. |
+| `AHMA_DISABLE_HOOKS` | off | Alias for `AHMA_HOOKS=off`. Set to `1` or `true` to disable hook routing. Takes effect immediately without requiring a Cursor restart. |
+
+```bash
+# Temporarily disable sandbox routing while keeping the hook installed
+AHMA_HOOKS=off ahma serve stdio   # or just export in your shell
+
+# Always route through sandbox regardless of MCP config state
+AHMA_HOOKS=on
+
+# Auto mode (default): route when ahma MCP is configured, pass through when it's not
+AHMA_HOOKS=auto   # or unset
+```
+
+**Security note**: `AHMA_HOOKS` is read from the OS environment by the `ahma` binary, which the editor spawns for each hook invocation. An attacker-controlled command string cannot change this variable — it's set only by the shell before `ahma` is invoked. The three safe ways to turn off sandbox routing are:
+1. Set `AHMA_HOOKS=off` (or `AHMA_DISABLE_HOOKS=1`) in your shell profile
+2. Remove the `ahma` entry from `~/.cursor/mcp.json` (auto-mode sees no MCP → passes through)
+3. Run `ahma hooks uninstall` to remove the hook entries entirely
 
 ```bash
 # Sandbox scoped to two project directories
@@ -148,6 +177,10 @@ AHMA_SANDBOX_DEFER         Defer sandbox until client provides roots (1=yes)
 AHMA_WORKING_DIRS          Fallback dirs for deferred sandbox
 AHMA_TMP_ACCESS            Add temp dir to sandbox scope (1=yes)
 AHMA_DISABLE_TEMP          Block all temp dir access (1=yes)
+AHMA_NO_PACKAGE_CACHE_WRITE Disable package cache writes, e.g. cargo fetch (1=yes)
+
+AHMA_HOOKS                 Hook routing: on | off | auto (default auto)
+AHMA_DISABLE_HOOKS         Alias for AHMA_HOOKS=off (1=yes)
 
 RUST_LOG                   Log verbosity (debug | info | warn | error)
 AHMA_LOG_TARGET            Log destination (stderr | file)
