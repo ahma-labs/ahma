@@ -222,11 +222,12 @@ async fn run_reporter_loop(
 
 fn status_label(s: OperationStatus) -> String {
     match s {
+        OperationStatus::Pending => "Pending",
+        OperationStatus::InProgress => "InProgress",
         OperationStatus::Completed => "Completed",
         OperationStatus::Failed => "Failed",
         OperationStatus::Cancelled => "Cancelled",
         OperationStatus::TimedOut => "TimedOut",
-        _ => "Unknown",
     }
     .to_string()
 }

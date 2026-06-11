@@ -278,18 +278,18 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
 
             // Resolve the key (expand ${VAR})
             let resolved = entry.resolve()?;
-            let models_url = format!("{}/models", resolved.base_url.trim_end_matches('/'));
+            let model_url = format!("{}/models", resolved.base_url.trim_end_matches('/'));
 
-            print!("Testing '{}' at {} ... ", test_args.name, models_url);
+            print!("Testing '{}' at {} ... ", test_args.name, model_url);
 
-            let mut req = reqwest::Client::new().get(&models_url);
+            let mut req = reqwest::Client::new().get(&model_url);
             if let Some(key) = &resolved.api_key {
                 req = req.bearer_auth(key);
             }
             let resp = req
                 .send()
                 .await
-                .with_context(|| format!("Failed to reach {models_url}"))?;
+                .with_context(|| format!("Failed to reach {model_url}"))?;
 
             let status = resp.status();
             if status.is_success() {
@@ -487,7 +487,7 @@ async fn dispatch_cluster(args: ahma_mcp::shell::ClusterArgs) -> Result<()> {
                 if let Some(caps) = &p.capabilities {
                     println!(
                         "        loaded: {}  active: {}  vram_free: {}",
-                        caps.models_loaded.join(", "),
+                        caps.model_loaded.join(", "),
                         caps.active_ops,
                         caps.vram_free_mb
                             .map(|v| format!("{v} MiB"))

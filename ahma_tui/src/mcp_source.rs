@@ -724,21 +724,16 @@ fn parse_operations(val: &Value) -> Vec<Operation> {
                 .and_then(|t| t.as_str())
                 .unwrap_or_default();
 
-            // Try to parse the text as JSON; fall back to raw text op list
+            // Try to parse the text as JSON; if it is not a JSON object, skip it.
             let op_val: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+            if !op_val.is_object() {
+                return None;
+            }
 
             let id = op_val
                 .get("id")
                 .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .or_else(|| {
-                    // Fallback: use the whole line as id
-                    if !text.is_empty() {
-                        Some(text.chars().take(12).collect())
-                    } else {
-                        None
-                    }
-                })?;
+                .map(str::to_string)?;
 
             let tool = op_val
                 .get("tool")
@@ -749,6 +744,7 @@ fn parse_operations(val: &Value) -> Vec<Operation> {
 
             let status_str = op_val
                 .get("status")
+                .or_else(|| op_val.get("state"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("Running");
 

@@ -2284,7 +2284,7 @@ fn refresh_current_provider_models(state: &mut crate::state::AppState, current_u
 }
 
 #[cfg(feature = "tui")]
-fn handle_models_refreshed(
+fn handle_model_refreshed(
     base_url: String,
     models: Vec<String>,
     state: &mut crate::state::AppState,
@@ -2476,7 +2476,7 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             handle_providers_discovered(providers, state);
         }
         BridgeEvent::ModelsRefreshed { base_url, models } => {
-            handle_models_refreshed(base_url, models, state);
+            handle_model_refreshed(base_url, models, state);
         }
         BridgeEvent::ExternalToolsRefreshed { manager } => {
             state.mcp_connections = manager;

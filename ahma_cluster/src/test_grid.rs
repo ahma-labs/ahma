@@ -367,8 +367,8 @@ impl TestGridBuilder {
                     active_ops: 0,
                     reachable: true,
                     capabilities: Some(PeerCapabilities {
-                        models_available: self.default_models.clone(),
-                        models_loaded: self.default_models.clone(),
+                        model_available: self.default_models.clone(),
+                        model_loaded: self.default_models.clone(),
                         max_concurrent: 4,
                         active_ops: 0,
                         vram_free_mb: Some(8192),

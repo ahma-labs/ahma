@@ -125,7 +125,7 @@ async fn test_detect_issues_sends_bearer_auth() {
 }
 
 #[tokio::test]
-async fn test_list_models_success() {
+async fn test_list_model_success() {
     let server = MockServer::start().await;
     let mock_response = json!({
         "data": [
@@ -141,14 +141,14 @@ async fn test_list_models_success() {
         .await;
 
     let client = LlmClient::new(server.uri(), "test-model", None);
-    let models = client.list_models().await;
+    let models = client.list_model().await;
 
     // Check alphabetical sorting
     assert_eq!(models, vec!["gemma".to_string(), "llama3.2".to_string()]);
 }
 
 #[tokio::test]
-async fn test_list_models_failure_returns_empty() {
+async fn test_list_model_failure_returns_empty() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
@@ -158,7 +158,7 @@ async fn test_list_models_failure_returns_empty() {
         .await;
 
     let client = LlmClient::new(server.uri(), "test-model", None);
-    let models = client.list_models().await;
+    let models = client.list_model().await;
 
     assert!(models.is_empty());
 }

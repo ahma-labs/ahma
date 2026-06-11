@@ -660,7 +660,9 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         }
         Err(e) => {
             eprintln!("ahma: sandbox execution failed: {e}");
-            eprintln!("To use the default terminal without sandboxing, set AHMA_HOOKS=off or run `ahma hooks uninstall`.");
+            eprintln!(
+                "To use the default terminal without sandboxing, set AHMA_HOOKS=off or run `ahma hooks uninstall`."
+            );
             Err(anyhow::anyhow!("ahma sandbox execution failed: {e}"))
         }
     }
@@ -744,11 +746,7 @@ fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
 /// 3. `AHMA_HOOKS=off` or auto with no MCP configured → allow unchanged (passthrough).
 /// 4. Shell command + ahma active → rewrite to `ahma hooks run-shell` (sandbox path).
 /// 5. Active but rewrite fails → deny with actionable message.
-fn compute_exec_decision(
-    input: &Value,
-    scope: HookScope,
-    env: &HookEnvironment,
-) -> HooksDecision {
+fn compute_exec_decision(input: &Value, scope: HookScope, env: &HookEnvironment) -> HooksDecision {
     compute_exec_decision_internal(input, scope, env, is_ahma_hooks_active())
 }
 
@@ -835,7 +833,10 @@ fn build_cursor_hook_output(decision: HooksDecision) -> Value {
             "permission": "allow",
             "updated_input": updated_input,
         }),
-        HooksDecision::Deny { user_message, agent_message } => json!({
+        HooksDecision::Deny {
+            user_message,
+            agent_message,
+        } => json!({
             "permission": "deny",
             "user_message": user_message,
             "agent_message": agent_message,
@@ -855,7 +856,10 @@ fn build_structured_hook_output(decision: HooksDecision) -> Value {
             "updatedInput": updated_input.clone(),
             "modifiedArgs": updated_input,
         }),
-        HooksDecision::Deny { user_message, agent_message } => json!({
+        HooksDecision::Deny {
+            user_message,
+            agent_message,
+        } => json!({
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": user_message,
@@ -1558,8 +1562,7 @@ mod tests {
             }
         });
 
-        let decision =
-            compute_exec_decision_internal(&input, HookScope::Project, &env, true);
+        let decision = compute_exec_decision_internal(&input, HookScope::Project, &env, true);
         let output = build_exec_output(decision, HookPlatform::Claude);
         let updated = &output["hookSpecificOutput"]["updatedInput"];
         let command = updated["command"].as_str().unwrap();
@@ -1579,8 +1582,7 @@ mod tests {
             }
         });
 
-        let decision =
-            compute_exec_decision_internal(&input, HookScope::Project, &env, true);
+        let decision = compute_exec_decision_internal(&input, HookScope::Project, &env, true);
         let output = build_exec_output(decision, HookPlatform::Antigravity);
         let updated = &output["hookSpecificOutput"]["updatedInput"];
         let command = updated["CommandLine"].as_str().unwrap();
@@ -1610,8 +1612,7 @@ mod tests {
                 "cwd": "/tmp/project",
             });
             // active=true: even when ahma is on, non-shell tools must pass through
-            let decision =
-                compute_exec_decision_internal(&input, HookScope::User, &env, true);
+            let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true);
             let output = build_exec_output(decision, HookPlatform::Copilot);
             // Must return allow with no input modification
             assert_eq!(
@@ -1627,8 +1628,7 @@ mod tests {
 
         // Also check: completely missing tool_input field
         let input_no_args = json!({"tool_name": "unknown", "cwd": "/tmp"});
-        let decision =
-            compute_exec_decision_internal(&input_no_args, HookScope::User, &env, true);
+        let decision = compute_exec_decision_internal(&input_no_args, HookScope::User, &env, true);
         let output = build_exec_output(decision, HookPlatform::Copilot);
         assert_eq!(
             output["hookSpecificOutput"]["permissionDecision"].as_str(),
@@ -1790,14 +1790,18 @@ mod tests {
         let decision = compute_exec_decision_internal(&input, HookScope::User, &env, false);
         let output = build_exec_output(decision, HookPlatform::Cursor);
         assert_eq!(output["permission"].as_str(), Some("allow"));
-        assert!(output.get("updated_input").is_none(), "passthrough must not rewrite the command");
+        assert!(
+            output.get("updated_input").is_none(),
+            "passthrough must not rewrite the command"
+        );
     }
 
     #[test]
     fn test_exec_deny_when_active_but_already_wrapped_passes_through() {
         // Already-wrapped commands must never be double-wrapped, even when active
         let env = test_env();
-        let already_wrapped = format!("ahma hooks run-shell --payload-base64 abc --wrapped-by {WRAPPED_BY_MARKER}");
+        let already_wrapped =
+            format!("ahma hooks run-shell --payload-base64 abc --wrapped-by {WRAPPED_BY_MARKER}");
         let input = json!({
             "cwd": "/tmp/project",
             "tool_input": { "command": already_wrapped }

@@ -86,7 +86,7 @@ pub fn spawn_discovery_task(tx: Sender<BridgeEvent>) {
 pub fn spawn_model_refresh(base_url: String, tx: Sender<BridgeEvent>) {
     tokio::spawn(async move {
         let client = LlmClient::new(base_url.clone(), "", None);
-        let models = client.list_models().await;
+        let models = client.list_model().await;
         let _ = tx
             .send(BridgeEvent::ModelsRefreshed { base_url, models })
             .await;
@@ -498,6 +498,7 @@ fn append_hint_to_field(
 }
 
 /// Apply any applicable harness hints to `payload`, then push a `tool` message onto `msg_json`.
+#[allow(clippy::too_many_arguments)]
 fn push_tool_message_with_hints(
     msg_json: &mut Vec<serde_json::Value>,
     tool_call_id: String,

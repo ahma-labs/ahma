@@ -94,10 +94,10 @@ pub fn all_writable_package_cache_paths() -> Vec<PackageCachePaths> {
 /// sandbox still starts even in restricted environments.
 pub fn pre_create_package_cache_paths(paths: &PackageCachePaths) {
     for dir in &paths.writable_dirs {
-        if !dir.exists() {
-            if let Err(e) = std::fs::create_dir_all(dir) {
-                tracing::debug!("Could not pre-create package-cache dir {:?}: {}", dir, e);
-            }
+        if !dir.exists()
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
+            tracing::debug!("Could not pre-create package-cache dir {:?}: {}", dir, e);
         }
     }
     for file in &paths.writable_files {

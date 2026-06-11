@@ -718,7 +718,7 @@ fn collect_valid_mcp_roots(session_id: &str, roots: &[Value]) -> Vec<McpRoot> {
 fn parse_roots_list_result(session_id: &str, result: &Value) -> Option<Vec<McpRoot>> {
     let Some(roots) = result.get("roots").and_then(|r| r.as_array()) else {
         warn!(session_id = %session_id, "roots/list response missing 'roots' array or it is invalid: {:?}", result);
-        return None;
+        return Some(vec![]);
     };
 
     Some(collect_valid_mcp_roots(session_id, roots))
