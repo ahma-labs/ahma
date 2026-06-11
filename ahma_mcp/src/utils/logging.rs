@@ -429,7 +429,8 @@ mod tests {
     fn test_prepare_bridge_capture_files_creates_header() {
         let temp = tempdir().unwrap();
         let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(temp.path()).unwrap();
+        let temp_path_canonical = dunce::canonicalize(temp.path()).unwrap();
+        std::env::set_current_dir(&temp_path_canonical).unwrap();
 
         let (out, err) = prepare_bridge_capture_files().expect("prepare bridge logs");
         assert!(out.exists());
@@ -465,10 +466,11 @@ mod tests {
     fn test_project_log_dir_cwd_writeable() {
         let temp = tempdir().unwrap();
         let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(temp.path()).unwrap();
+        let temp_path_canonical = dunce::canonicalize(temp.path()).unwrap();
+        std::env::set_current_dir(&temp_path_canonical).unwrap();
 
         let dir = project_log_dir();
-        assert_eq!(dir, temp.path().join("logs"));
+        assert_eq!(dir, temp_path_canonical.join("logs"));
 
         let _ = std::env::set_current_dir(prev);
     }
