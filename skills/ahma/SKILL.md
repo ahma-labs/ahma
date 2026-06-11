@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.11.16
+version: 0.11.17
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -18,7 +18,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.11.16 | author: Paul Houghton -->
+<!-- version: 0.11.17 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -270,7 +270,7 @@ Use the `hooks` subcommand to configure and verify hooks:
 # Check current hook installation status across all platforms
 ahma hooks status
 
-# Install user-scoped hooks for all supported tools (Cursor, Claude, Codex, Copilot)
+# Install user-scoped hooks for all supported tools (excludes Cursor)
 ahma hooks install --scope user
 
 # Install project-scoped hooks for GitHub Copilot specifically
@@ -281,10 +281,12 @@ ahma hooks uninstall --platform copilot --scope user
 ```
 
 Supported Hook Platforms:
-- **Cursor**: Configures `${HOME}/.cursor/hooks.json`
 - **Claude Code**: Configures `${HOME}/.claude/settings.json`
 - **Codex**: Configures `${HOME}/.codex/hooks.json`
 - **GitHub Copilot / Copilot CLI**: Configures `${HOME}/.copilot/hooks/ahma.json` (user) and `.github/hooks/ahma.json` (project)
+
+> [!NOTE]
+> **Cursor and VS Code Hook Support**: Cursor and VS Code do not support shell execution hooks. The installer does not configure them, as VS Code/Cursor lacks hook-trigger support for native terminal command executions.
 
 > [!IMPORTANT]
 > **Coexistence Guideline**: Avoid having BOTH terminal hooks and an active MCP server configured for "ahma" at the same time. This causes redundant wrapping, sandbox-initialization, and execution overhead. If you use the `ahma` MCP server inside Claude Desktop or Cursor, it is recommended to uninstall terminal hooks:
