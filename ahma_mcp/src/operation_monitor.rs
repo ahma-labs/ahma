@@ -5,6 +5,7 @@
 //! automatic cleanup, and detailed logging for debugging.
 
 use crate::utils::time;
+use ahma_common::event_dispatcher::{EventDispatcher, OperationEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -19,11 +20,14 @@ use tokio::sync::{
 use tokio_util::sync::CancellationToken;
 use tracing;
 
-#[derive(Debug, Clone)]
-pub enum OperationEvent {
-    Started(Operation),
-    Updated(Operation),
-}
+/// Broadcast capacity for the unified operation event stream.
+///
+/// Sized for high-volume `OutputLine` traffic: a slow subscriber that falls
+/// more than this many events behind receives `RecvError::Lagged` and must
+/// reconcile from [`OperationMonitor`] state (the store of record).  Operation
+/// completion semantics never depend on the broadcast — `await` uses the
+/// per-operation watch channel plus `completion_history`.
+const EVENT_STREAM_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Represents the current state of an operation
@@ -229,24 +233,37 @@ pub struct OperationMonitor {
     completion_history: Arc<RwLock<HashMap<String, Operation>>>,
     #[allow(dead_code)]
     config: MonitorConfig,
-    event_tx: broadcast::Sender<OperationEvent>,
+    /// Unified event stream (SPEC R15).  The monitor is the single emitter of
+    /// operation lifecycle events: `Started` on insert, `OutputLine`/`Alert`
+    /// while streaming, and exactly one terminal event when the operation
+    /// moves to `completion_history`.
+    events: EventDispatcher,
 }
 
 impl OperationMonitor {
     /// Create a new operation monitor
     pub fn new(config: MonitorConfig) -> Self {
-        let (event_tx, _) = broadcast::channel(128);
         Self {
             operations: Arc::new(RwLock::new(HashMap::new())),
             completion_history: Arc::new(RwLock::new(HashMap::new())),
             config,
-            event_tx,
+            events: EventDispatcher::new(EVENT_STREAM_CAPACITY),
         }
     }
 
-    /// Subscribe to operation monitor events (started, completed, cancelled, etc.)
-    pub fn subscribe_events(&self) -> broadcast::Receiver<OperationEvent> {
-        self.event_tx.subscribe()
+    /// Subscribe to the unified operation event stream.
+    ///
+    /// Subscribers MUST handle `RecvError::Lagged` by reconciling from monitor
+    /// state (`get_all_active_operations` / `get_completed_operations`) — the
+    /// broadcast is a live feed, not the store of record.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Arc<OperationEvent>> {
+        self.events.subscribe()
+    }
+
+    /// The shared event dispatcher.  Components that emit supplementary events
+    /// (e.g. the adapter) clone this so all events flow through one stream.
+    pub fn event_dispatcher(&self) -> &EventDispatcher {
+        &self.events
     }
 
     pub async fn add_operation(&self, operation: Operation) {
@@ -256,29 +273,61 @@ impl OperationMonitor {
             operation.id,
             operation.state
         );
-        let op_clone = operation.clone();
-        ops.insert(operation.id.clone(), operation);
+        let started_event = OperationEvent::Started {
+            operation_id: operation.id.clone(),
+            tool_name: operation.tool_name.clone(),
+            description: operation.description.clone(),
+        };
+        let was_new = ops.insert(operation.id.clone(), operation).is_none();
         tracing::debug!("Total operations in monitor after add: {}", ops.len());
         drop(ops);
 
-        let _ = self.event_tx.send(OperationEvent::Started(op_clone));
+        // `add_operation` doubles as an upsert for in-place updates; only a
+        // genuinely new operation emits `Started`.
+        if was_new {
+            self.events.emit(started_event);
+        }
     }
 
-    pub async fn append_stdout_line(&self, id: &str, line: String) {
+    /// Append a line of live output to the operation's tail buffer and stream
+    /// it to event subscribers.
+    pub async fn append_output_line(&self, id: &str, line: String, is_stderr: bool) {
         let mut ops = self.operations.write().await;
         if let Some(op) = ops.get_mut(id) {
             if op.stdout_tail.len() >= 100 {
                 op.stdout_tail.remove(0);
             }
-            op.stdout_tail.push(line);
+            op.stdout_tail.push(line.clone());
+        } else {
+            return;
         }
+        drop(ops);
+
+        self.events.emit(OperationEvent::OutputLine {
+            operation_id: id.to_string(),
+            line,
+            is_stderr,
+        });
+    }
+
+    /// Backwards-compatible wrapper for stdout lines.
+    pub async fn append_stdout_line(&self, id: &str, line: String) {
+        self.append_output_line(id, line, false).await;
     }
 
     pub async fn append_alert(&self, id: &str, alert: String) {
         let mut ops = self.operations.write().await;
         if let Some(op) = ops.get_mut(id) {
-            op.alerts.push(alert);
+            op.alerts.push(alert.clone());
+        } else {
+            return;
         }
+        drop(ops);
+
+        self.events.emit(OperationEvent::Alert {
+            operation_id: id.to_string(),
+            message: alert,
+        });
     }
 
     pub async fn get_operation(&self, id: &str) -> Option<Operation> {
@@ -360,6 +409,9 @@ impl OperationMonitor {
     /// any subscriber that calls `subscribe_completion()` *after* this point
     /// will immediately observe `true` — eliminating the race that existed with
     /// the old `Arc<Notify>` approach where late subscribers missed the wakeup.
+    ///
+    /// Ordering invariant (SPEC R15.3): history write → watch signal → event
+    /// emission, so any consumer woken by either channel observes final state.
     async fn move_to_history_and_notify(&self, id: &str, operation: Option<Operation>) {
         let Some(op) = operation else { return };
         let mut history = self.completion_history.write().await;
@@ -368,7 +420,7 @@ impl OperationMonitor {
         // Signal completion.  Ignore errors: a SendError means no subscribers,
         // which is fine — the result is already in completion_history.
         let _ = op.completion_watch.send(true);
-        let _ = self.event_tx.send(OperationEvent::Updated(op));
+        self.events.emit(terminal_event_for(&op));
     }
 
     /// Returns all currently active (non-terminal) operations.
@@ -418,14 +470,14 @@ impl OperationMonitor {
         drop(ops);
 
         if let Some(op) = operation_to_move {
-            let mut history = self.completion_history.write().await;
-            history.insert(id.to_string(), op.clone());
-            tracing::debug!("Moved operation {} to completion history.", id);
-            drop(history);
-            let _ = op.completion_watch.send(true);
-            let _ = self.event_tx.send(OperationEvent::Updated(op));
+            tracing::debug!("Moving operation {} to completion history.", id);
+            self.move_to_history_and_notify(id, Some(op)).await;
         } else if let Some(op) = updated_op {
-            let _ = self.event_tx.send(OperationEvent::Updated(op));
+            self.events.emit(OperationEvent::Progress {
+                operation_id: op.id.clone(),
+                message: format!("status: {:?}", op.state),
+                percent: None,
+            });
         }
     }
 
@@ -461,13 +513,9 @@ impl OperationMonitor {
         ops.remove(id);
         drop(ops);
 
-        let mut history = self.completion_history.write().await;
-        history.insert(id.to_string(), cancelled_op.clone());
-        tracing::debug!("Moved cancelled operation {} to completion history.", id);
-        drop(history);
-        // Signal any concurrent wait_for_operation callers.
-        let _ = cancelled_op.completion_watch.send(true);
-        let _ = self.event_tx.send(OperationEvent::Updated(cancelled_op));
+        tracing::debug!("Moving cancelled operation {} to completion history.", id);
+        self.move_to_history_and_notify(id, Some(cancelled_op))
+            .await;
 
         true
     }
@@ -689,6 +737,63 @@ impl OperationMonitor {
     }
 }
 
+/// Map a terminal [`Operation`] to its unified terminal event.
+///
+/// Exactly one terminal event is emitted per operation, at the moment it
+/// moves into `completion_history`.
+fn terminal_event_for(op: &Operation) -> OperationEvent {
+    let duration_ms = op
+        .end_time
+        .and_then(|end| end.duration_since(op.start_time).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    match op.state {
+        OperationStatus::Completed => OperationEvent::Completed {
+            operation_id: op.id.clone(),
+            result: op.result.clone().unwrap_or(Value::Null),
+            duration_ms,
+        },
+        OperationStatus::Failed => OperationEvent::Failed {
+            operation_id: op.id.clone(),
+            error: op
+                .result
+                .as_ref()
+                .and_then(|v| {
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| serde_json::to_string(v).ok())
+                })
+                .unwrap_or_else(|| "unknown error".to_string()),
+            duration_ms,
+        },
+        OperationStatus::Cancelled => OperationEvent::Cancelled {
+            operation_id: op.id.clone(),
+            reason: op
+                .result
+                .as_ref()
+                .and_then(|v| {
+                    v.get("reason")
+                        .and_then(|r| r.as_str())
+                        .or_else(|| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "cancelled".to_string()),
+            duration_ms,
+        },
+        OperationStatus::TimedOut => OperationEvent::TimedOut {
+            operation_id: op.id.clone(),
+            duration_ms,
+        },
+        // Non-terminal states should never reach here; map defensively.
+        OperationStatus::Pending | OperationStatus::InProgress => OperationEvent::Failed {
+            operation_id: op.id.clone(),
+            error: "operation ended in unexpected non-terminal state".to_string(),
+            duration_ms,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,9 +998,14 @@ mod tests {
 
         // 2. We should receive Started event
         let event1 = rx.recv().await.expect("Failed to receive Started event");
-        if let OperationEvent::Started(started_op) = event1 {
-            assert_eq!(started_op.id, op_id);
-            assert_eq!(started_op.state, OperationStatus::Pending);
+        if let OperationEvent::Started {
+            operation_id,
+            tool_name,
+            ..
+        } = event1.as_ref()
+        {
+            assert_eq!(operation_id, &op_id);
+            assert_eq!(tool_name, "test_tool");
         } else {
             panic!("Expected OperationEvent::Started, got {:?}", event1);
         }
@@ -909,303 +1019,72 @@ mod tests {
             )
             .await;
 
-        // 4. We should receive Updated event
-        let event2 = rx.recv().await.expect("Failed to receive Updated event");
-        if let OperationEvent::Updated(updated_op) = event2 {
-            assert_eq!(updated_op.id, op_id);
-            assert_eq!(updated_op.state, OperationStatus::Completed);
+        // 4. We should receive exactly one terminal Completed event
+        let event2 = rx.recv().await.expect("Failed to receive Completed event");
+        if let OperationEvent::Completed {
+            operation_id,
+            result,
+            ..
+        } = event2.as_ref()
+        {
+            assert_eq!(operation_id, &op_id);
+            assert_eq!(result, &serde_json::json!({"ok": true}));
         } else {
-            panic!("Expected OperationEvent::Updated, got {:?}", event2);
+            panic!("Expected OperationEvent::Completed, got {:?}", event2);
         }
     }
-}
 
-// ─── OperationMonitorSink ────────────────────────────────────────────────────
+    /// Output lines appended to a live operation are streamed on the unified
+    /// event channel, and `Started` is emitted only for genuinely new ops
+    /// (re-inserting via the upsert path must not duplicate it).
+    #[tokio::test]
+    async fn test_output_line_streaming_and_upsert_dedup() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let mut rx = monitor.subscribe_events();
 
-/// An [`EventSink`] that drives [`OperationMonitor`] state transitions from
-/// the unified [`OperationEvent`] stream (P2).
-///
-/// Attach one of these to an [`EventDispatcher`] subscription loop so that
-/// any component emitting [`OperationEvent`]s automatically updates the
-/// monitor — decoupling emitters from the monitor implementation.
-///
-/// # Ordering invariant (SPEC R15.3)
-///
-/// `OperationMonitor::update_status` already persists terminal state into
-/// `completion_history` **before** signalling the `completion_watch` channel.
-/// `OperationMonitorSink` delegates to that method, so the invariant is
-/// preserved end-to-end.
-///
-/// # Usage
-///
-/// ```rust,no_run
-/// use std::sync::Arc;
-/// use ahma_common::event_dispatcher::EventDispatcher;
-/// use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor, OperationMonitorSink};
-///
-/// # async fn example() {
-/// let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-///     std::time::Duration::from_secs(300),
-/// )));
-/// let dispatcher = EventDispatcher::default();
-///
-/// // Spawn the sink loop as a background task.
-/// OperationMonitorSink::spawn(Arc::clone(&monitor), &dispatcher);
-/// # }
-/// ```
-pub struct OperationMonitorSink;
+        let op_id = "stream-test".to_string();
+        let op = Operation::new(
+            op_id.clone(),
+            "test_tool".to_string(),
+            "stream test".to_string(),
+            None,
+        );
+        monitor.add_operation(op.clone()).await;
+        // Upsert the same op again — must NOT emit a second Started.
+        monitor.add_operation(op).await;
 
-impl OperationMonitorSink {
-    /// Spawn a background task that drives `monitor` from `dispatcher`'s
-    /// event stream.
-    ///
-    /// The task runs until the dispatcher is dropped (all senders gone) or
-    /// until the receiver lags too far behind and cannot recover.
-    pub fn spawn(
-        monitor: Arc<OperationMonitor>,
-        dispatcher: &ahma_common::event_dispatcher::EventDispatcher,
-    ) {
-        let mut rx = dispatcher.subscribe();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(ev) => Self::handle_event(&monitor, &ev).await,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(
-                            "OperationMonitorSink lagged by {} events; some state updates may be missed",
-                            n
-                        );
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::debug!("OperationMonitorSink: dispatcher closed, exiting");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    /// Apply a single [`OperationEvent`] to the monitor.
-    ///
-    /// This is `pub` so callers can drive the sink synchronously in tests.
-    pub async fn handle_event(
-        monitor: &Arc<OperationMonitor>,
-        event: &ahma_common::event_dispatcher::OperationEvent,
-    ) {
-        use ahma_common::event_dispatcher::OperationEvent;
-        match event {
-            OperationEvent::Completed {
-                operation_id,
-                result,
-                ..
-            } => {
-                monitor
-                    .update_status(
-                        operation_id,
-                        OperationStatus::Completed,
-                        Some(result.clone()),
-                    )
-                    .await;
-            }
-            OperationEvent::Failed {
-                operation_id,
-                error,
-                ..
-            } => {
-                monitor
-                    .update_status(
-                        operation_id,
-                        OperationStatus::Failed,
-                        Some(serde_json::Value::String(error.clone())),
-                    )
-                    .await;
-            }
-            OperationEvent::Cancelled {
-                operation_id,
-                reason,
-                ..
-            } => {
-                monitor
-                    .update_status(
-                        operation_id,
-                        OperationStatus::Cancelled,
-                        Some(serde_json::Value::String(reason.clone())),
-                    )
-                    .await;
-            }
-            OperationEvent::TimedOut { operation_id, .. } => {
-                let msg = "operation timed out".to_string();
-                monitor
-                    .update_status(
-                        operation_id,
-                        OperationStatus::TimedOut,
-                        Some(serde_json::Value::String(msg)),
-                    )
-                    .await;
-            }
-            // Non-terminal events: no monitor update needed.
-            OperationEvent::Started { .. }
-            | OperationEvent::OutputLine { .. }
-            | OperationEvent::Progress { .. }
-            | OperationEvent::Alert { .. }
-            | OperationEvent::McpNotification { .. } => {}
-            // Future variants: do nothing to stay forward-compatible.
-            #[allow(unreachable_patterns)]
-            _ => {}
-        }
-    }
-}
-
-#[cfg(test)]
-mod sink_tests {
-    use super::*;
-    use ahma_common::event_dispatcher::{EventDispatcher, OperationEvent};
-
-    fn make_monitor() -> Arc<OperationMonitor> {
-        Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-            Duration::from_secs(10),
-        )))
-    }
-
-    async fn add_op(monitor: &Arc<OperationMonitor>, id: &str) {
         monitor
-            .add_operation(Operation::new(
-                id.to_string(),
-                "test_tool".to_string(),
-                "test".to_string(),
-                None,
-            ))
+            .append_output_line(&op_id, "hello".to_string(), false)
             .await;
-    }
+        monitor
+            .append_output_line(&op_id, "oops".to_string(), true)
+            .await;
 
-    #[tokio::test]
-    async fn sink_handle_event_completed_updates_monitor() {
-        let monitor = make_monitor();
-        add_op(&monitor, "op-1").await;
-
-        OperationMonitorSink::handle_event(
-            &monitor,
-            &OperationEvent::Completed {
-                operation_id: "op-1".into(),
-                result: serde_json::json!({"exit_code": 0}),
-                duration_ms: 100,
-            },
-        )
-        .await;
-
-        let hist = monitor.check_completion_history_pub("op-1").await;
-        assert!(hist.is_some(), "op should be in history after Completed");
-        assert_eq!(hist.unwrap().state, OperationStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn sink_handle_event_failed_updates_monitor() {
-        let monitor = make_monitor();
-        add_op(&monitor, "op-2").await;
-
-        OperationMonitorSink::handle_event(
-            &monitor,
-            &OperationEvent::Failed {
-                operation_id: "op-2".into(),
-                error: "something went wrong".into(),
-                duration_ms: 50,
-            },
-        )
-        .await;
-
-        let hist = monitor.check_completion_history_pub("op-2").await;
-        assert!(hist.is_some());
-        assert_eq!(hist.unwrap().state, OperationStatus::Failed);
-    }
-
-    #[tokio::test]
-    async fn sink_handle_event_cancelled_updates_monitor() {
-        let monitor = make_monitor();
-        add_op(&monitor, "op-3").await;
-
-        OperationMonitorSink::handle_event(
-            &monitor,
-            &OperationEvent::Cancelled {
-                operation_id: "op-3".into(),
-                reason: "user cancelled".into(),
-                duration_ms: 10,
-            },
-        )
-        .await;
-
-        let hist = monitor.check_completion_history_pub("op-3").await;
-        assert!(hist.is_some());
-        assert_eq!(hist.unwrap().state, OperationStatus::Cancelled);
-    }
-
-    #[tokio::test]
-    async fn sink_handle_event_timed_out_updates_monitor() {
-        let monitor = make_monitor();
-        add_op(&monitor, "op-4").await;
-
-        OperationMonitorSink::handle_event(
-            &monitor,
-            &OperationEvent::TimedOut {
-                operation_id: "op-4".into(),
-                duration_ms: 60_000,
-            },
-        )
-        .await;
-
-        let hist = monitor.check_completion_history_pub("op-4").await;
-        assert!(hist.is_some());
-        assert_eq!(hist.unwrap().state, OperationStatus::TimedOut);
-    }
-
-    #[tokio::test]
-    async fn sink_spawn_reacts_to_dispatcher_events() {
-        let monitor = make_monitor();
-        add_op(&monitor, "op-5").await;
-
-        let dispatcher = EventDispatcher::default();
-        OperationMonitorSink::spawn(Arc::clone(&monitor), &dispatcher);
-
-        // Give the task a moment to start up.
-        tokio::task::yield_now().await;
-
-        dispatcher.emit(OperationEvent::Completed {
-            operation_id: "op-5".into(),
-            result: serde_json::json!({}),
-            duration_ms: 1,
-        });
-
-        // Allow the background task to process the event.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let hist = monitor.check_completion_history_pub("op-5").await;
-        assert!(
-            hist.is_some(),
-            "sink should have updated monitor from dispatcher event"
-        );
-        assert_eq!(hist.unwrap().state, OperationStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn sink_ignores_non_terminal_events() {
-        let monitor = make_monitor();
-        add_op(&monitor, "op-6").await;
-
-        // Sending non-terminal events should not change op state.
-        OperationMonitorSink::handle_event(
-            &monitor,
-            &OperationEvent::OutputLine {
-                operation_id: "op-6".into(),
-                line: "hello".into(),
-                is_stderr: false,
-            },
-        )
-        .await;
-
-        // Op should still be in active map (not moved to history).
-        let active = monitor.get_operation("op-6").await;
-        assert!(
-            active.is_some(),
-            "non-terminal event must not move op to history"
-        );
+        // Started (exactly once)
+        match rx.recv().await.expect("Started").as_ref() {
+            OperationEvent::Started { operation_id, .. } => assert_eq!(operation_id, &op_id),
+            other => panic!("expected Started, got {other:?}"),
+        }
+        // First output line (stdout)
+        match rx.recv().await.expect("OutputLine 1").as_ref() {
+            OperationEvent::OutputLine {
+                line, is_stderr, ..
+            } => {
+                assert_eq!(line, "hello");
+                assert!(!is_stderr);
+            }
+            other => panic!("expected OutputLine, got {other:?}"),
+        }
+        // Second output line (stderr)
+        match rx.recv().await.expect("OutputLine 2").as_ref() {
+            OperationEvent::OutputLine {
+                line, is_stderr, ..
+            } => {
+                assert_eq!(line, "oops");
+                assert!(is_stderr);
+            }
+            other => panic!("expected OutputLine, got {other:?}"),
+        }
     }
 }

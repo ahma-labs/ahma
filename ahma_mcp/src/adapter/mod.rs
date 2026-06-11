@@ -232,6 +232,10 @@ impl Adapter {
         shell_pool: Arc<ShellPoolManager>,
         sandbox: Arc<sandbox::Sandbox>,
     ) -> Result<Self> {
+        // Share the monitor's dispatcher so every component emits into ONE
+        // unified event stream (SPEC R15) — the monitor owns lifecycle events,
+        // the adapter only adds supplementary ones.
+        let event_dispatcher = monitor.event_dispatcher().clone();
         Ok(Self {
             monitor,
             shell_pool,
@@ -240,7 +244,7 @@ impl Adapter {
             temp_file_manager: preparer::TempFileManager::new(),
             retry_config: None,
             command_executor: Arc::new(executor::DefaultCommandExecutor),
-            event_dispatcher: EventDispatcher::default(),
+            event_dispatcher,
             output_optimizer: Arc::new(tokio::sync::Mutex::new(
                 crate::output_optimizer::OutputOptimizer::new(false, None),
             )),
@@ -561,7 +565,6 @@ impl Adapter {
             sandbox,
             task_handles,
             command_executor: self.command_executor.clone(),
-            event_dispatcher: self.event_dispatcher.clone(),
             output_optimizer: self.output_optimizer.clone(),
         }));
 
@@ -647,8 +650,6 @@ struct AsyncOperationRun {
     sandbox: Arc<sandbox::Sandbox>,
     task_handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     command_executor: Arc<dyn executor::CommandExecutor>,
-    /// Unified event dispatcher for P2 event stream.
-    event_dispatcher: EventDispatcher,
     output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 }
 
@@ -667,7 +668,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         sandbox,
         task_handles,
         command_executor,
-        event_dispatcher,
         output_optimizer,
     } = ctx;
 
@@ -683,17 +683,9 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         .update_status(&op_id, OperationStatus::InProgress, None)
         .await;
 
-    // Emit Started event to the unified dispatcher (P2).
-    let tool_name = monitor
-        .get_operation(&op_id)
-        .await
-        .map(|op| op.tool_name.clone())
-        .unwrap_or_else(|| command.clone());
-    event_dispatcher.emit(OperationEvent::Started {
-        operation_id: op_id.clone(),
-        tool_name,
-        description: execution_description(&command, &working_dir),
-    });
+    // Lifecycle events (Started / terminal) are emitted by the OperationMonitor
+    // at each state transition — the single emission point for the unified
+    // event stream (SPEC R15).
 
     if let Some(callback) = &callback {
         let _ = callback
@@ -708,11 +700,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     if cancellation_token.is_cancelled() {
         tracing::info!("Operation {} was cancelled before execution started", op_id);
         handle_cancellation(&monitor, &callback, &op_id, 0).await;
-        event_dispatcher.emit(OperationEvent::Cancelled {
-            operation_id: op_id.clone(),
-            reason: "cancelled before execution started".to_string(),
-            duration_ms: 0,
-        });
         return;
     }
 
@@ -762,11 +749,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
                     err.clone(),
                 )
                 .await;
-                event_dispatcher.emit(OperationEvent::Failed {
-                    operation_id: op_id.clone(),
-                    error: err,
-                    duration_ms: 0,
-                });
                 task_handles.lock().await.remove(&op_id);
                 return;
             }
@@ -797,11 +779,6 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
                 err_msg.clone(),
             )
             .await;
-            event_dispatcher.emit(OperationEvent::Failed {
-                operation_id: op_id.clone(),
-                error: err_msg,
-                duration_ms: 0,
-            });
             task_handles.lock().await.remove(&op_id);
             return;
         }
@@ -811,93 +788,25 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         .map(|t| t * 1000)
         .unwrap_or_else(|| shell_pool.config().command_timeout.as_millis() as u64);
 
-    if let Some(monitor_config) = log_monitor_config {
-        execute_with_streaming(
-            &mut proc_cmd,
-            timeout_ms,
-            monitor_config,
-            &cancellation_token,
-            &callback,
-            &op_id,
-            &program,
-            &working_dir,
-            start_time,
-            &monitor,
-            &event_dispatcher,
-            &output_optimizer,
-        )
-        .await;
-    } else {
-        execute_batch(
-            &mut proc_cmd,
-            timeout_ms,
-            &cancellation_token,
-            &callback,
-            &op_id,
-            &program,
-            &working_dir,
-            start_time,
-            &monitor,
-            &output_optimizer,
-        )
-        .await;
-    }
-
-    // Emit terminal event to the unified dispatcher (P2).
-    // Terminal states move the operation from active map to completion_history inside
-    // update_status, so we must look in history — get_operation only checks active ops.
-    let elapsed_ms = start_time.elapsed().as_millis() as u64;
-    if let Some(op) = monitor.check_completion_history_pub(&op_id).await {
-        let terminal_event = match op.state {
-            OperationStatus::Completed => OperationEvent::Completed {
-                operation_id: op_id.clone(),
-                result: op.result.clone().unwrap_or(Value::Null),
-                duration_ms: op
-                    .end_time
-                    .and_then(|e| e.duration_since(op.start_time).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(elapsed_ms),
-            },
-            OperationStatus::Failed => OperationEvent::Failed {
-                operation_id: op_id.clone(),
-                error: op
-                    .result
-                    .as_ref()
-                    .and_then(|v| {
-                        v.as_str()
-                            .map(|s| s.to_string())
-                            .or_else(|| serde_json::to_string(v).ok())
-                    })
-                    .unwrap_or_else(|| "unknown error".to_string()),
-                duration_ms: elapsed_ms,
-            },
-            OperationStatus::Cancelled => OperationEvent::Cancelled {
-                operation_id: op_id.clone(),
-                reason: op
-                    .result
-                    .as_ref()
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "cancelled".to_string()),
-                duration_ms: elapsed_ms,
-            },
-            OperationStatus::TimedOut => OperationEvent::TimedOut {
-                operation_id: op_id.clone(),
-                duration_ms: elapsed_ms,
-            },
-            _ => OperationEvent::Failed {
-                operation_id: op_id.clone(),
-                error: "operation ended in unexpected state".to_string(),
-                duration_ms: elapsed_ms,
-            },
-        };
-        event_dispatcher.emit(terminal_event);
-    } else {
-        tracing::warn!(
-            op_id = %op_id,
-            "run_async_operation: operation not in completion history after execution; \
-             terminal event will not be emitted",
-        );
-    }
+    // Single execution path: stream stdout/stderr line-by-line for every
+    // operation (SPEC R15.2).  Lines flow through the OperationMonitor, which
+    // appends to the tail buffer and emits `OutputLine` on the unified event
+    // stream — so the TUI and hub subscribers see output as it is produced.
+    // Log-monitor alerting only runs when a config was provided.
+    execute_with_streaming(
+        &mut proc_cmd,
+        timeout_ms,
+        log_monitor_config,
+        &cancellation_token,
+        &callback,
+        &op_id,
+        &program,
+        &working_dir,
+        start_time,
+        &monitor,
+        &output_optimizer,
+    )
+    .await;
 
     task_handles.lock().await.remove(&op_id);
 }
@@ -1033,235 +942,6 @@ struct StreamingOpContext<'a> {
     working_dir: &'a str,
 }
 
-/// Execute a command in batch mode: collect all output, then report.
-///
-/// Unlike `execute_with_streaming`, this function waits for the process to
-/// finish before reporting anything — suitable for short commands where
-/// live output is not needed.  It still emits "still running" heartbeats
-/// every 10 s so long-running batch commands remain visible in the TUI.
-#[allow(clippy::too_many_arguments)]
-async fn execute_batch(
-    proc_cmd: &mut tokio::process::Command,
-    timeout_ms: u64,
-    cancellation_token: &tokio_util::sync::CancellationToken,
-    callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
-    op_id: &str,
-    program: &str,
-    working_dir: &str,
-    start_time: Instant,
-    monitor: &Arc<OperationMonitor>,
-    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
-) {
-    // Pipe both streams so we can collect output even for long-running commands.
-    proc_cmd.stdout(std::process::Stdio::piped());
-    proc_cmd.stderr(std::process::Stdio::piped());
-
-    let mut child = match proc_cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            fail_operation_with_error(
-                monitor,
-                callback,
-                op_id,
-                program,
-                working_dir,
-                0,
-                e.to_string(),
-            )
-            .await;
-            return;
-        }
-    };
-
-    // Take I/O handles *before* the select loop so `child` stays alive and
-    // we can call `child.kill()` if a timeout or cancellation fires.
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-
-    // Drain stdout/stderr concurrently in background tasks.
-    let stdout_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut s) = stdout_pipe {
-            tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf)
-                .await
-                .ok();
-        }
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut s) = stderr_pipe {
-            tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf)
-                .await
-                .ok();
-        }
-        buf
-    });
-
-    let timeout_fut = tokio::time::sleep(Duration::from_millis(timeout_ms));
-    tokio::pin!(timeout_fut);
-
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Consume the first (immediate) tick so heartbeats start at t+10s, not t+0.
-    interval.tick().await;
-    let mut elapsed_secs: u64 = 0;
-
-    // Drive the child process.  `child.wait()` borrows `child` mutably but
-    // does NOT consume it, so we can still call `child.kill()` in other branches.
-    let exit_result: Result<std::process::ExitStatus, std::io::Error> = loop {
-        tokio::select! {
-            _ = cancellation_token.cancelled() => {
-                tracing::info!("Operation {} cancelled during batch execution", op_id);
-                let _ = child.kill().await;
-                stdout_task.abort();
-                stderr_task.abort();
-                let duration_ms = start_time.elapsed().as_millis() as u64;
-                handle_cancellation(monitor, callback, op_id, duration_ms).await;
-                return;
-            }
-            _ = &mut timeout_fut => {
-                let _ = child.kill().await;
-                stdout_task.abort();
-                stderr_task.abort();
-                break Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Command timed out",
-                ));
-            }
-            status = child.wait() => {
-                break status;
-            }
-            _ = interval.tick() => {
-                elapsed_secs += 10;
-                let elapsed_msg = format!("still running ({}s elapsed)", elapsed_secs);
-                tracing::info!("Operation {}: {}", op_id, elapsed_msg);
-                if let Some(cb) = callback {
-                    let _ = cb
-                        .send_progress(crate::callback_system::ProgressUpdate::Progress {
-                            id: op_id.to_string(),
-                            message: elapsed_msg,
-                            percentage: None,
-                            current_step: None,
-                        })
-                        .await;
-                }
-            }
-        }
-    };
-
-    let duration_ms = start_time.elapsed().as_millis() as u64;
-
-    match exit_result {
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                cancel_operation_timed_out(monitor, callback, op_id, duration_ms).await;
-            } else {
-                fail_operation_with_error(
-                    monitor,
-                    callback,
-                    op_id,
-                    program,
-                    working_dir,
-                    duration_ms,
-                    e.to_string(),
-                )
-                .await;
-            }
-        }
-        Ok(status) => {
-            // Collect the accumulated output (tasks will have finished by now since
-            // the process has exited and its pipe ends are closed).
-            let stdout_bytes = stdout_task.await.unwrap_or_default();
-            let stderr_bytes = stderr_task.await.unwrap_or_default();
-            let output = std::process::Output {
-                status,
-                stdout: stdout_bytes,
-                stderr: stderr_bytes,
-            };
-            complete_operation_with_output(
-                monitor,
-                callback,
-                op_id,
-                program,
-                working_dir,
-                duration_ms,
-                output,
-                output_optimizer,
-            )
-            .await;
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn complete_operation_with_output(
-    monitor: &Arc<OperationMonitor>,
-    callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
-    op_id: &str,
-    program: &str,
-    working_dir: &str,
-    duration_ms: u64,
-    output: std::process::Output,
-    output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
-) {
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
-    let success = output.status.success();
-
-    let mut final_text = format!("Exit code: {exit_code}\nStdout:\n{stdout}\nStderr:\n{stderr}");
-    if let Ok(mut opt) = output_optimizer.try_lock()
-        && opt.enabled
-    {
-        final_text = opt.finalize_output(program, exit_code, &stdout, &stderr);
-    }
-
-    let tail_source = if stdout.is_empty() { &stderr } else { &stdout };
-    let tail_lines: Vec<String> = tail_source
-        .lines()
-        .rev()
-        .take(100)
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-
-    if let Some(mut op) = monitor.get_operation(op_id).await {
-        op.stdout_tail = tail_lines;
-        monitor.add_operation(op).await;
-    }
-
-    let final_output = json!({
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": exit_code,
-    });
-    let status = if success {
-        OperationStatus::Completed
-    } else {
-        OperationStatus::Failed
-    };
-    monitor
-        .update_status(op_id, status, Some(final_output))
-        .await;
-
-    send_final_result_progress(
-        callback,
-        final_result_progress_update(
-            op_id,
-            program,
-            working_dir,
-            success,
-            duration_ms,
-            final_text,
-        ),
-        op_id,
-    )
-    .await;
-}
-
 async fn cancel_operation_timed_out(
     monitor: &Arc<OperationMonitor>,
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
@@ -1286,16 +966,20 @@ async fn cancel_operation_timed_out(
     .await;
 }
 
-/// Execute a command with line-by-line streaming and log monitoring.
+/// Execute a command with line-by-line streaming and optional log monitoring.
 ///
-/// Instead of buffering all output, this spawns the process and reads stdout/stderr
-/// concurrently via `BufReader::lines()`. Each line is fed through a `LogMonitor`
-/// which checks for error/warning patterns and fires alerts via the callback.
+/// This is the single execution path for async operations.  Instead of
+/// buffering all output, it spawns the process and reads stdout/stderr
+/// concurrently via `BufReader::lines()`.  Each line is appended to the
+/// operation's tail buffer (which emits `OutputLine` on the unified event
+/// stream).  When `monitor_config` is `Some`, each line is additionally fed
+/// through a `LogMonitor` which checks for error/warning patterns and fires
+/// alerts via the callback.
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_streaming(
     proc_cmd: &mut tokio::process::Command,
     timeout_ms: u64,
-    monitor_config: crate::log_monitor::LogMonitorConfig,
+    monitor_config: Option<crate::log_monitor::LogMonitorConfig>,
     cancellation_token: &tokio_util::sync::CancellationToken,
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
     op_id: &str,
@@ -1303,7 +987,6 @@ async fn execute_with_streaming(
     working_dir: &str,
     start_time: Instant,
     op_monitor: &Arc<OperationMonitor>,
-    event_dispatcher: &EventDispatcher,
     output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1335,7 +1018,7 @@ async fn execute_with_streaming(
     let mut stdout_reader = BufReader::new(stdout).lines();
     let mut stderr_reader = BufReader::new(stderr).lines();
 
-    let mut log_monitor = crate::log_monitor::LogMonitor::new(monitor_config);
+    let mut log_monitor = monitor_config.map(crate::log_monitor::LogMonitor::new);
 
     // Collected output for the final result (bounded to prevent unbounded memory growth).
     let mut collected_stdout = BoundedLineCollector::default();
@@ -1388,12 +1071,12 @@ async fn execute_with_streaming(
 
             // Read stderr line
             result = stderr_reader.next_line() => {
-                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, callback, op_id, op_monitor, event_dispatcher, output_optimizer).await;
+                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, callback, op_id, op_monitor, output_optimizer).await;
             }
 
             // Read stdout line
             result = stdout_reader.next_line() => {
-                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, callback, op_id, op_monitor, event_dispatcher, output_optimizer).await;
+                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, callback, op_id, op_monitor, output_optimizer).await;
             }
         }
 
@@ -1411,7 +1094,6 @@ async fn execute_with_streaming(
                     callback,
                     op_id,
                     op_monitor,
-                    event_dispatcher,
                     output_optimizer,
                 )
                 .await;
@@ -1450,11 +1132,10 @@ async fn drain_remaining_stream_lines(
     stdout_reader: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
     collected_stdout: &mut BoundedLineCollector,
     collected_stderr: &mut BoundedLineCollector,
-    log_monitor: &mut crate::log_monitor::LogMonitor,
+    log_monitor: &mut Option<crate::log_monitor::LogMonitor>,
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
-    event_dispatcher: &EventDispatcher,
     output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
     while let Ok(Some(line)) = stderr_reader.next_line().await {
@@ -1466,7 +1147,6 @@ async fn drain_remaining_stream_lines(
             callback,
             op_id,
             op_monitor,
-            event_dispatcher,
             output_optimizer,
         )
         .await;
@@ -1480,7 +1160,6 @@ async fn drain_remaining_stream_lines(
             callback,
             op_id,
             op_monitor,
-            event_dispatcher,
             output_optimizer,
         )
         .await;
@@ -1596,11 +1275,10 @@ async fn handle_stream_line(
     result: Result<Option<String>, std::io::Error>,
     is_stderr: bool,
     collector: &mut BoundedLineCollector,
-    log_monitor: &mut crate::log_monitor::LogMonitor,
+    log_monitor: &mut Option<crate::log_monitor::LogMonitor>,
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
-    event_dispatcher: &EventDispatcher,
     output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
     match result {
@@ -1613,7 +1291,6 @@ async fn handle_stream_line(
                 callback,
                 op_id,
                 op_monitor,
-                event_dispatcher,
                 output_optimizer,
             )
             .await;
@@ -1627,16 +1304,19 @@ async fn handle_stream_line(
 }
 
 /// Redact, collect, and optionally send a log-monitor alert for a single streamed line.
+///
+/// `op_monitor.append_output_line` is the single emission point for
+/// `OutputLine` events on the unified stream; `append_alert` likewise emits
+/// `Alert` — no direct dispatcher access is needed here.
 #[allow(clippy::too_many_arguments)]
 async fn process_streaming_line(
     line: &str,
     is_stderr: bool,
     collector: &mut BoundedLineCollector,
-    log_monitor: &mut crate::log_monitor::LogMonitor,
+    log_monitor: &mut Option<crate::log_monitor::LogMonitor>,
     callback: &Option<Box<dyn crate::callback_system::CallbackSender>>,
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
-    event_dispatcher: &EventDispatcher,
     output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
 ) {
     let safe_line = crate::log_monitor::redact_sensitive_line(line);
@@ -1649,25 +1329,16 @@ async fn process_streaming_line(
 
     for opt_line in opt_lines {
         collector.push(opt_line.clone());
-        op_monitor.append_stdout_line(op_id, opt_line.clone()).await;
-
-        // Emit OutputLine to the unified dispatcher (P2).
-        event_dispatcher.emit(OperationEvent::OutputLine {
-            operation_id: op_id.to_string(),
-            line: opt_line,
-            is_stderr,
-        });
+        op_monitor
+            .append_output_line(op_id, opt_line, is_stderr)
+            .await;
     }
 
-    if let Some(snapshot) = log_monitor.process_line(line, is_stderr) {
+    if let Some(log_monitor) = log_monitor
+        && let Some(snapshot) = log_monitor.process_line(line, is_stderr)
+    {
         let alert_summary = format!("[{}] {}", snapshot.trigger_level, snapshot.trigger_line);
-        op_monitor.append_alert(op_id, alert_summary.clone()).await;
-
-        // Emit Alert to the unified dispatcher (P2).
-        event_dispatcher.emit(OperationEvent::Alert {
-            operation_id: op_id.to_string(),
-            message: alert_summary,
-        });
+        op_monitor.append_alert(op_id, alert_summary).await;
 
         if let Some(callback) = callback {
             let alert = crate::callback_system::ProgressUpdate::LogAlert {

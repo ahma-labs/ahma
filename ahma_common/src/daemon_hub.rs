@@ -99,6 +99,14 @@ pub enum DaemonEvent {
         result_summary: Option<String>,
         duration_ms: u64,
     },
+    /// A single line of live output from a running operation.
+    /// Streamed as the child process produces it, so subscribers (TUI) can
+    /// render output in real time instead of waiting for completion.
+    OpOutput {
+        id: String,
+        line: String,
+        is_stderr: bool,
+    },
     LogLine {
         level: String,
         message: String,
