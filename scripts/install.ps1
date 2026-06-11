@@ -11,7 +11,6 @@
 # Version indicator for build script check:
 # -Version '0.11.17'
 # Install-OneSkill -Version '0.11.17'
-
 #
 # Environment variables:
 #   AHMA_INSTALL_DIR     - Override install directory (default: $HOME\.local\bin)

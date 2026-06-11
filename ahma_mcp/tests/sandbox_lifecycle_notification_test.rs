@@ -1,5 +1,6 @@
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::test_utils;
+use rmcp::service::{RoleServer, TxJsonRpcMessage};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -163,5 +164,53 @@ fn test_sandbox_lifecycle_notifications() {
         log.contains("session_ended"),
         "Notification reason mismatch in log: {}",
         log
+    );
+}
+
+/// Regression test: `notifications/sandbox/configured` must not serialize as
+/// `"params": null` after being round-tripped through rmcp's typed message model.
+///
+/// The bug: ahma emitted the notification without a `params` field.  When the
+/// stdio proxy deserialized it as a `TxJsonRpcMessage<RoleServer>` and then
+/// re-serialized it, rmcp's `CustomNotification { params: None }` would produce
+/// `"params": null`.  Cursor's Zod schema rejects that, tearing down the
+/// transport immediately after connect.
+///
+/// The fix: always emit `"params": {}` so the round-trip produces an object.
+#[test]
+fn test_sandbox_configured_notification_no_params_null_after_rmcp_round_trip() {
+    // Simulate the fixed emission from emit_sandbox_notification (None branch).
+    let raw_json = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/sandbox/configured",
+        "params": {}
+    });
+    let raw_str = serde_json::to_string(&raw_json).unwrap();
+
+    // Round-trip through rmcp: this is exactly what proxy_client.rs does.
+    let parsed: TxJsonRpcMessage<RoleServer> =
+        serde_json::from_str(&raw_str).expect("rmcp must be able to parse the notification");
+    let re_serialized =
+        serde_json::to_string(&parsed).expect("rmcp must be able to serialize back to JSON");
+
+    // Core assertion: Cursor (and spec-compliant clients) must not see params: null.
+    assert!(
+        !re_serialized.contains("\"params\":null"),
+        "Re-serialized notification must not contain \"params\":null — Cursor rejects it.\nGot: {re_serialized}"
+    );
+
+    // The params field must be an object (or absent) after round-trip.
+    let re_parsed: serde_json::Value = serde_json::from_str(&re_serialized).unwrap();
+    if let Some(params) = re_parsed.get("params") {
+        assert!(
+            params.is_object(),
+            "If params is present it must be an object, not: {params}"
+        );
+    }
+    // method must be preserved.
+    assert_eq!(
+        re_parsed.get("method").and_then(|v| v.as_str()),
+        Some("notifications/sandbox/configured"),
+        "method field must survive the round-trip"
     );
 }

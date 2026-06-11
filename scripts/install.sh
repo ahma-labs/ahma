@@ -17,7 +17,6 @@ set -euo pipefail
 # CI guardrails verify this matches. Bump via: cargo xtask bump-version X.Y.Z
 AHMA_VERSION="0.11.17"
 
-
 # Parse CLI arguments
 VERIFY_ONLY=0
 while [ $# -gt 0 ]; do

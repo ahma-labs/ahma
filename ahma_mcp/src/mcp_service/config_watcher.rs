@@ -23,6 +23,7 @@ fn emit_sandbox_notification(method: &str, error: Option<&str>) {
         None => serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
+            "params": {}
         }),
     };
     match serde_json::to_string(&payload) {
@@ -235,6 +236,7 @@ impl AhmaMcpService {
                 &new_scopes,
                 &self.adapter.sandbox().read_scopes(),
                 self.adapter.sandbox().is_no_temp_files(),
+                self.adapter.sandbox().package_cache_write(),
             ) {
                 tracing::error!(
                     "FATAL: Failed to enforce Landlock sandbox: {}. \

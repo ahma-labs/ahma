@@ -102,6 +102,35 @@ Common `mcp.json` for nested environments (VS Code with workspace scoping):
 }
 ```
 
+## Package Manager Cache Write (`--no-package-cache-write`)
+
+By default, ahma grants **write access** to the package-manager fetch directories so that agents can autonomously upgrade dependencies (e.g. `cargo add sqlx@0.9`, `cargo update`) without requiring `--sandbox-scope ~/.cargo`:
+
+| Path | Access |
+|------|--------|
+| `~/.cargo/registry/` | Read + Write |
+| `~/.cargo/git/` | Read + Write |
+| `~/.cargo/.package-cache` | Read + Write |
+| `~/.cargo/.package-cache-mutate` | Read + Write |
+| `~/.cargo/bin/` | Read only |
+| `~/.cargo/config.toml` | Read only |
+| `~/.cargo/credentials.toml` | Read only |
+
+> **Do not use `--sandbox-scope ~/.cargo`**: that flag grants **read-write to the entire cargo home**, including installed binaries and credentials. The built-in `package_cache_write` feature is narrower and safer.
+
+To disable (strictest isolation):
+
+```bash
+ahma serve stdio --no-package-cache-write
+# or
+AHMA_NO_PACKAGE_CACHE_WRITE=1 ahma serve stdio
+# or in ~/.config/ahma/settings.toml:
+# [sandbox]
+# package_cache_write = false
+```
+
+`$CARGO_HOME` is respected; defaults to `~/.cargo`.
+
 ## Temp Directory Access (`--tmp`)
 
 By default, the system temp directory is accessible only via platform-implicit rules. Use `--tmp` (or `AHMA_TMP_ACCESS=1`) to add it as an explicit read/write scope — useful for compilers and build tools.

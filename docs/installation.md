@@ -92,13 +92,15 @@ Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 
 ## After installation
 
-- The install script now offers optional user-scoped terminal hook setup for Cursor, Claude Code, and Codex.
+- The install script now offers optional user-scoped terminal hook setup for Cursor, Claude Code, and Codex. (Note: VS Code does not support execution hooks).
 - Configure your MCP client — see [connection-modes.md](connection-modes.md).
-- Optional terminal hooks for Cursor, Claude Code, and Codex:
-	- `ahma hooks install` installs user-scoped managed hooks using the current binary path.
+- Optional terminal hooks for Cursor, Claude Code, Codex, and Copilot CLI:
+	- `ahma hooks install` installs user-scoped managed hooks for all supported platforms including Cursor.
 	- `ahma hooks install --scope project` writes portable project hooks that call `ahma` from `PATH`.
 	- `ahma hooks status` shows both user and project hook status.
 	- `ahma hooks uninstall` removes managed hooks again if you no longer want shell-tool wrapping.
+	- **Cursor hooks use `failClosed: true`** — a missing/crashing binary blocks rather than silently bypassing the sandbox. Fix with `ahma hooks uninstall --platform cursor` or reinstall ahma.
+	- **Off-switch**: set `AHMA_HOOKS=off` (or `AHMA_DISABLE_HOOKS=1`) in your shell environment to pass all commands through to the default terminal without uninstalling. The hook also auto-detects when ahma is removed from `mcp.json` and passes through.
 - Optional agent skill — see [agent-skills.md](agent-skills.md).
 - Restart MCP clients or reload your IDE after updating the binary.
 

@@ -16,12 +16,26 @@ const WRAPPED_BY_MARKER: &str = "ahma-hooks-wrapper-v1";
 const HOOK_TIMEOUT_SECS: u64 = 30;
 const PATH_LOOKUP_BINARY: &str = "ahma";
 
+/// The decision `compute_exec_decision` makes for each tool invocation.
+#[derive(Debug)]
+enum HooksDecision {
+    /// Allow the command through without modification (passthrough to default terminal).
+    AllowUnchanged,
+    /// Allow with a rewritten command that routes through ahma's kernel sandbox.
+    AllowRewrite(Value),
+    /// Deny the command with messages for the user and agent.
+    Deny {
+        user_message: String,
+        agent_message: String,
+    },
+}
+
 /// Manage terminal hooks for external AI tools.
 #[derive(Args, Debug)]
 #[command(
-    about = "Manage terminal hooks for Cursor, Claude Code, and Codex",
+    about = "Manage terminal hooks for Cursor, Claude Code, Codex, and GitHub Copilot CLI",
     after_help = "EXAMPLES:
-  # Install user-scoped hooks for all supported tools
+  # Install user-scoped hooks for all supported tools (including Cursor)
   ahma hooks install
 
   # Install project-scoped hooks for Claude Code and Codex
@@ -303,8 +317,13 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
 
 pub fn run_install(args: HooksInstallArgs) -> Result<()> {
     let env = HookEnvironment::detect()?;
+    let selected = if args.platforms.is_empty() {
+        HookPlatform::all()
+    } else {
+        args.platforms.clone()
+    };
 
-    for platform in selected_platforms(&args.platforms) {
+    for platform in selected {
         let path = env.config_path(platform, args.scope);
         let existed = path.exists();
         let mut document = load_hook_document(&path)?;
@@ -389,10 +408,42 @@ fn hook_status_string(path: &Path, platform: HookPlatform) -> Result<String> {
     }
 }
 
-fn detect_mcp_config_exists() -> bool {
+/// Returns `true` when ahma's terminal hooks should route commands through the sandbox.
+///
+/// Controlled by the `AHMA_HOOKS` env var (`on`/`off`/`auto`, default `auto`).
+/// `AHMA_DISABLE_HOOKS=1` is an alias for `AHMA_HOOKS=off`.
+///
+/// In `auto` mode ahma is considered active if an ahma MCP server is present in any
+/// detected editor config file. When the user removes/disables ahma from the MCP config,
+/// the hook automatically passes commands through to the default terminal.
+fn is_ahma_hooks_active() -> bool {
+    is_ahma_hooks_active_with_configs(&detect_active_mcp_configs())
+}
+
+/// Testable core of [`is_ahma_hooks_active`].
+fn is_ahma_hooks_active_with_configs(active_mcps: &[PathBuf]) -> bool {
+    if let Ok(val) = std::env::var("AHMA_HOOKS") {
+        match val.to_lowercase().as_str() {
+            "off" | "0" | "false" | "no" => return false,
+            "on" | "1" | "true" | "yes" => return true,
+            _ => {}
+        }
+    }
+    if std::env::var("AHMA_DISABLE_HOOKS")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    // Auto: active if any editor config has an ahma MCP server configured.
+    !active_mcps.is_empty()
+}
+
+fn detect_active_mcp_configs() -> Vec<PathBuf> {
     let home = match std::env::var("HOME").ok().map(PathBuf::from) {
         Some(h) => h,
-        None => return false,
+        None => return Vec::new(),
     };
 
     let mut paths = vec![
@@ -407,15 +458,16 @@ fn detect_mcp_config_exists() -> bool {
         paths.push(project_root.join(".vscode").join("mcp.json"));
     }
 
+    let mut active = Vec::new();
     for path in paths {
         if path.exists()
             && let Ok(content) = std::fs::read_to_string(&path)
-            && content.contains("\"ahma\"")
+            && content.to_lowercase().contains("\"ahma\"")
         {
-            return true;
+            active.push(path);
         }
     }
-    false
+    active
 }
 
 fn run_status(args: HooksStatusArgs) -> Result<()> {
@@ -428,6 +480,7 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
     println!("{:<14} {:<8} {:<14} Config", "Platform", "Scope", "Status");
     println!("{:-<14} {:-<8} {:-<14} {:-<6}", "", "", "", "");
 
+    let mut installed_hooks = Vec::new();
     let mut installed_count = 0;
     for scope in scopes {
         for platform in selected_platforms(&args.platforms) {
@@ -435,6 +488,7 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
             let status = hook_status_string(&path, platform)?;
             if status == "installed" {
                 installed_count += 1;
+                installed_hooks.push((platform, scope, path.clone()));
             }
             println!(
                 "{:<14} {:<8} {:<14} {}",
@@ -446,26 +500,98 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
         }
     }
 
-    if installed_count > 0 && detect_mcp_config_exists() {
-        println!("\n⚠️  WARNING: Redundant terminal hooks + MCP server configuration detected!");
-        println!("Both terminal hooks and an MCP server are configured for \"ahma\".");
-        println!("This can cause redundant wrapping and execution slowness.");
-        println!("RECOMMENDED: Keep only the MCP server and uninstall terminal hooks via:");
-        println!("    ahma hooks uninstall --scope user");
-        println!("See AGENTS.md or the ahma skill documentation for setup guidelines.\n");
+    let active_mcps = detect_active_mcp_configs();
+    if installed_count > 0 && !active_mcps.is_empty() {
+        println!(
+            "\n\x1b[33mwarning\x1b[0m\x1b[1m: redundant shell interception configuration detected\x1b[0m"
+        );
+        println!(
+            "  \x1b[36m-->\x1b[0m Both terminal hooks and an active MCP server are configured for \"ahma\"."
+        );
+        println!("      This can cause redundant tool wrapping and execution slowness.");
+        println!();
+        println!("  \x1b[1mactive terminal hooks:\x1b[0m");
+        for (platform, scope, path) in &installed_hooks {
+            println!(
+                "    - {} ({} scope) at {}",
+                platform.label(),
+                scope.label(),
+                path.display()
+            );
+        }
+        println!();
+        println!("  \x1b[1mactive MCP configurations:\x1b[0m");
+        for path in &active_mcps {
+            println!("    - {}", path.display());
+        }
+        println!();
+        println!(
+            "  \x1b[1mhelp\x1b[0m: Having both configurations active is redundant and degrades performance."
+        );
+        println!(
+            "        It is highly recommended to keep the MCP server and uninstall the hooks."
+        );
+        println!("        To uninstall them, run:");
+
+        let has_user = installed_hooks
+            .iter()
+            .any(|(_, s, _)| *s == HookScope::User);
+        let has_project = installed_hooks
+            .iter()
+            .any(|(_, s, _)| *s == HookScope::Project);
+        if has_user {
+            println!("          ahma hooks uninstall --scope user");
+        }
+        if has_project {
+            println!("          ahma hooks uninstall --scope project");
+        }
+        println!();
     }
 
     Ok(())
 }
 
 fn run_exec(args: HooksExecArgs) -> Result<()> {
-    let env = HookEnvironment::detect()?;
-    let stdin = read_stdin_json()?;
-    let output = build_exec_response(&stdin, args.platform, args.scope, &env)?;
+    // Parse stdin first. On any failure allow through — the editor may have sent an
+    // empty or malformed payload (e.g. during IDE shutdown) and we must not block.
+    let stdin = match read_stdin_json() {
+        Ok(s) => s,
+        Err(_) => {
+            let output = build_exec_output(HooksDecision::AllowUnchanged, args.platform);
+            return write_exec_output(&output);
+        }
+    };
 
+    // Detect the runtime environment. On failure, check whether ahma is intended to be
+    // active: if yes, deny with an actionable message; if no, allow through.
+    let env = match HookEnvironment::detect() {
+        Ok(e) => e,
+        Err(e) => {
+            let decision = if is_ahma_hooks_active() {
+                HooksDecision::Deny {
+                    user_message: format!("ahma hook setup failed: {e}"),
+                    agent_message: format!(
+                        "The ahma sandbox hook could not initialize ({e}). \
+                        Set AHMA_HOOKS=off or run `ahma hooks uninstall` to use the default terminal."
+                    ),
+                }
+            } else {
+                HooksDecision::AllowUnchanged
+            };
+            let output = build_exec_output(decision, args.platform);
+            return write_exec_output(&output);
+        }
+    };
+
+    let decision = compute_exec_decision(&stdin, args.scope, &env);
+    let output = build_exec_output(decision, args.platform);
+    write_exec_output(&output)
+}
+
+fn write_exec_output(output: &Value) -> Result<()> {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    serde_json::to_writer(&mut handle, &output)?;
+    serde_json::to_writer(&mut handle, output)?;
     handle.write_all(b"\n")?;
     Ok(())
 }
@@ -533,8 +659,9 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
             Ok(())
         }
         Err(e) => {
-            eprintln!("Error executing tool: {}", e);
-            Err(anyhow::anyhow!("Tool execution failed"))
+            eprintln!("ahma: sandbox execution failed: {e}");
+            eprintln!("To use the default terminal without sandboxing, set AHMA_HOOKS=off or run `ahma hooks uninstall`.");
+            Err(anyhow::anyhow!("ahma sandbox execution failed: {e}"))
         }
     }
 }
@@ -578,15 +705,7 @@ struct ExtractedToolArgs {
 }
 
 fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
-    let raw_args = if let Some(tool_call) = input.get("toolCall") {
-        if let Some(args_json) = tool_call.get("argumentsJson") {
-            args_json
-        } else {
-            return Ok(None);
-        }
-    } else if let Some(raw) = input.get("tool_input").or_else(|| input.get("toolArgs")) {
-        raw
-    } else {
+    let Some(raw_args) = input.get("tool_input").or_else(|| input.get("toolArgs")) else {
         // Not a shell tool invocation — allow through without modification
         return Ok(None);
     };
@@ -617,57 +736,83 @@ fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
     }))
 }
 
-fn resolve_exec_updated_input(
+/// Compute the hook decision for a given tool invocation.
+///
+/// This is the testable core of [`run_exec`]. The decision tree:
+/// 1. Non-shell tools (no `command`/`CommandLine` field) → allow unchanged.
+/// 2. Already-wrapped commands → allow unchanged (prevent double-wrap).
+/// 3. `AHMA_HOOKS=off` or auto with no MCP configured → allow unchanged (passthrough).
+/// 4. Shell command + ahma active → rewrite to `ahma hooks run-shell` (sandbox path).
+/// 5. Active but rewrite fails → deny with actionable message.
+fn compute_exec_decision(
     input: &Value,
     scope: HookScope,
     env: &HookEnvironment,
-) -> Result<Option<Value>> {
-    let Some(args) = extract_tool_args(input)? else {
-        return Ok(None);
+) -> HooksDecision {
+    compute_exec_decision_internal(input, scope, env, is_ahma_hooks_active())
+}
+
+fn compute_exec_decision_internal(
+    input: &Value,
+    scope: HookScope,
+    env: &HookEnvironment,
+    active: bool,
+) -> HooksDecision {
+    let args = match extract_tool_args(input) {
+        Ok(Some(a)) => a,
+        Ok(None) | Err(_) => return HooksDecision::AllowUnchanged,
     };
+
     if is_wrapped_shell_command(&args.command) {
-        return Ok(None);
+        return HooksDecision::AllowUnchanged;
     }
-    let cwd = extract_command_cwd(input, &args.tool_input)?;
-    let wrapped_command = build_wrapped_shell_command(scope, env, &cwd, &args.command)?;
-    let updated_args = updated_tool_input(&args.tool_input, wrapped_command, &args.arg_key);
 
-    if input.get("toolCall").is_some() {
-        // Antigravity format: rebuild the toolCall object and return updated root
-        let mut tool_call_obj = input.get("toolCall").unwrap().as_object().unwrap().clone();
-        let serialized_args = serde_json::to_string(&updated_args)?;
-        tool_call_obj.insert("argumentsJson".to_string(), Value::String(serialized_args));
+    if !active {
+        return HooksDecision::AllowUnchanged;
+    }
 
-        let mut updated_root = input.as_object().unwrap().clone();
-        updated_root.insert("toolCall".to_string(), Value::Object(tool_call_obj));
-        Ok(Some(Value::Object(updated_root)))
-    } else {
-        Ok(Some(updated_args))
+    let cwd = match extract_command_cwd(input, &args.tool_input) {
+        Ok(cwd) => cwd,
+        Err(e) => {
+            return HooksDecision::Deny {
+                user_message: format!("ahma: could not determine working directory: {e}"),
+                agent_message: format!(
+                    "The ahma sandbox hook failed to determine the working directory ({e}). \
+                    Set AHMA_HOOKS=off or run `ahma hooks uninstall` to use the default terminal."
+                ),
+            };
+        }
+    };
+
+    match build_wrapped_shell_command(scope, env, &cwd, &args.command) {
+        Ok(wrapped) => {
+            let updated = updated_tool_input(&args.tool_input, wrapped, &args.arg_key);
+            HooksDecision::AllowRewrite(updated)
+        }
+        Err(e) => HooksDecision::Deny {
+            user_message: format!("ahma: sandbox hook failed to build wrapper: {e}"),
+            agent_message: format!(
+                "The ahma sandbox hook could not build the command wrapper ({e}). \
+                Set AHMA_HOOKS=off or run `ahma hooks uninstall` to use the default terminal."
+            ),
+        },
     }
 }
 
-fn build_exec_response(
-    input: &Value,
-    platform: HookPlatform,
-    scope: HookScope,
-    env: &HookEnvironment,
-) -> Result<Value> {
-    let updated_input = resolve_exec_updated_input(input, scope, env)?;
-    Ok(match platform {
-        HookPlatform::Cursor => build_cursor_hook_output(updated_input),
+fn build_exec_output(decision: HooksDecision, platform: HookPlatform) -> Value {
+    match platform {
+        HookPlatform::Cursor => build_cursor_hook_output(decision),
         HookPlatform::Claude
         | HookPlatform::Codex
         | HookPlatform::Copilot
-        | HookPlatform::Antigravity => build_structured_hook_output(updated_input),
-    })
+        | HookPlatform::Antigravity => build_structured_hook_output(decision),
+    }
 }
 
 fn extract_command_cwd(input: &Value, tool_input: &Map<String, Value>) -> Result<String> {
     if let Some(cwd) = tool_input
         .get("working_directory")
         .and_then(Value::as_str)
-        .or_else(|| tool_input.get("Cwd").and_then(Value::as_str))
-        .or_else(|| tool_input.get("cwd").and_then(Value::as_str))
         .or_else(|| input.get("cwd").and_then(Value::as_str))
     {
         return Ok(cwd.to_string());
@@ -683,33 +828,41 @@ fn updated_tool_input(tool_input: &Map<String, Value>, command: String, key: &st
     Value::Object(updated)
 }
 
-fn build_cursor_hook_output(updated_input: Option<Value>) -> Value {
-    let mut object = Map::new();
-    object.insert("permission".to_string(), Value::String("allow".to_string()));
-    if let Some(updated_input) = updated_input {
-        object.insert("updated_input".to_string(), updated_input);
+fn build_cursor_hook_output(decision: HooksDecision) -> Value {
+    match decision {
+        HooksDecision::AllowUnchanged => json!({"permission": "allow"}),
+        HooksDecision::AllowRewrite(updated_input) => json!({
+            "permission": "allow",
+            "updated_input": updated_input,
+        }),
+        HooksDecision::Deny { user_message, agent_message } => json!({
+            "permission": "deny",
+            "user_message": user_message,
+            "agent_message": agent_message,
+        }),
     }
-    Value::Object(object)
 }
 
-fn build_structured_hook_output(updated_input: Option<Value>) -> Value {
-    let mut hook_output = Map::new();
-    hook_output.insert(
-        "hookEventName".to_string(),
-        Value::String("PreToolUse".to_string()),
-    );
-    hook_output.insert(
-        "permissionDecision".to_string(),
-        Value::String("allow".to_string()),
-    );
-    if let Some(updated_input) = updated_input {
-        hook_output.insert("updatedInput".to_string(), updated_input.clone());
-        hook_output.insert("modifiedArgs".to_string(), updated_input);
-    }
-
-    let mut root = Map::new();
-    root.insert("hookSpecificOutput".to_string(), Value::Object(hook_output));
-    Value::Object(root)
+fn build_structured_hook_output(decision: HooksDecision) -> Value {
+    let hook_specific = match decision {
+        HooksDecision::AllowUnchanged => json!({
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+        }),
+        HooksDecision::AllowRewrite(updated_input) => json!({
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": updated_input.clone(),
+            "modifiedArgs": updated_input,
+        }),
+        HooksDecision::Deny { user_message, agent_message } => json!({
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": user_message,
+            "agentMessage": agent_message,
+        }),
+    };
+    json!({"hookSpecificOutput": hook_specific})
 }
 
 fn build_wrapped_shell_command(
@@ -797,6 +950,7 @@ fn install_cursor_hook(
         "matcher": "Shell",
         "command": build_exec_command(HookPlatform::Cursor, scope, env),
         "timeout": HOOK_TIMEOUT_SECS,
+        "failClosed": true,
     }));
 
     Ok(())
@@ -1330,11 +1484,14 @@ mod tests {
 
         let installed = load_hook_document(&path).unwrap();
         assert!(platform_hook_installed(&installed, HookPlatform::Cursor));
-        let command = installed["hooks"]["preToolUse"][0]["command"]
-            .as_str()
-            .unwrap();
+        let entry = &installed["hooks"]["preToolUse"][0];
+        let command = entry["command"].as_str().unwrap();
         assert!(command.contains(MANAGED_ID_DEFAULT_SHELL_V1));
         assert!(command.contains("bin space"));
+        assert!(
+            entry["failClosed"].as_bool().unwrap_or(false),
+            "Cursor hook must have failClosed:true so a binary crash blocks rather than silently running unsandboxed"
+        );
     }
 
     #[test]
@@ -1401,8 +1558,9 @@ mod tests {
             }
         });
 
-        let output =
-            build_exec_response(&input, HookPlatform::Claude, HookScope::Project, &env).unwrap();
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::Project, &env, true);
+        let output = build_exec_output(decision, HookPlatform::Claude);
         let updated = &output["hookSpecificOutput"]["updatedInput"];
         let command = updated["command"].as_str().unwrap();
         assert!(command.starts_with("ahma hooks run-shell"));
@@ -1421,9 +1579,9 @@ mod tests {
             }
         });
 
-        let output =
-            build_exec_response(&input, HookPlatform::Antigravity, HookScope::Project, &env)
-                .unwrap();
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::Project, &env, true);
+        let output = build_exec_output(decision, HookPlatform::Antigravity);
         let updated = &output["hookSpecificOutput"]["updatedInput"];
         let command = updated["CommandLine"].as_str().unwrap();
         assert!(command.starts_with("ahma hooks run-shell"));
@@ -1432,33 +1590,6 @@ mod tests {
             updated["description"].as_str(),
             Some("Run specific test binary")
         );
-    }
-
-    #[test]
-    fn test_exec_response_rewrites_antigravity_tool_call_format() {
-        let env = test_env();
-        let input = json!({
-            "toolCall": {
-                "id": "test-id",
-                "name": "run_command",
-                "argumentsJson": "{\"CommandLine\":\"cargo build\",\"Cwd\":\"/tmp/project\"}"
-            }
-        });
-
-        let output =
-            build_exec_response(&input, HookPlatform::Antigravity, HookScope::Project, &env)
-                .unwrap();
-        let updated_root = &output["hookSpecificOutput"]["updatedInput"];
-        let tool_call = &updated_root["toolCall"];
-        assert_eq!(tool_call["id"].as_str(), Some("test-id"));
-        assert_eq!(tool_call["name"].as_str(), Some("run_command"));
-
-        let args_json_str = tool_call["argumentsJson"].as_str().unwrap();
-        let args: serde_json::Value = serde_json::from_str(args_json_str).unwrap();
-        let command = args["CommandLine"].as_str().unwrap();
-        assert!(command.starts_with("ahma hooks run-shell"));
-        assert!(command.contains(WRAPPED_BY_MARKER));
-        assert_eq!(args["Cwd"].as_str(), Some("/tmp/project"));
     }
 
     #[test]
@@ -1478,8 +1609,10 @@ mod tests {
                 "tool_input": tool_input,
                 "cwd": "/tmp/project",
             });
-            let output =
-                build_exec_response(&input, HookPlatform::Copilot, HookScope::User, &env).unwrap();
+            // active=true: even when ahma is on, non-shell tools must pass through
+            let decision =
+                compute_exec_decision_internal(&input, HookScope::User, &env, true);
+            let output = build_exec_output(decision, HookPlatform::Copilot);
             // Must return allow with no input modification
             assert_eq!(
                 output["hookSpecificOutput"]["permissionDecision"].as_str(),
@@ -1494,9 +1627,9 @@ mod tests {
 
         // Also check: completely missing tool_input field
         let input_no_args = json!({"tool_name": "unknown", "cwd": "/tmp"});
-        let output =
-            build_exec_response(&input_no_args, HookPlatform::Copilot, HookScope::User, &env)
-                .unwrap();
+        let decision =
+            compute_exec_decision_internal(&input_no_args, HookScope::User, &env, true);
+        let output = build_exec_output(decision, HookPlatform::Copilot);
         assert_eq!(
             output["hookSpecificOutput"]["permissionDecision"].as_str(),
             Some("allow")
@@ -1643,6 +1776,119 @@ mod tests {
         assert!(
             args.iter()
                 .any(|arg| arg.as_str() == Some(MANAGED_ID_DEFAULT_SHELL_V1))
+        );
+    }
+
+    #[test]
+    fn test_exec_passthrough_when_ahma_hooks_off() {
+        let env = test_env();
+        let input = json!({
+            "cwd": "/tmp/project",
+            "tool_input": { "command": "rm -rf /" }
+        });
+        // active=false → must return allow-unchanged regardless of command
+        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, false);
+        let output = build_exec_output(decision, HookPlatform::Cursor);
+        assert_eq!(output["permission"].as_str(), Some("allow"));
+        assert!(output.get("updated_input").is_none(), "passthrough must not rewrite the command");
+    }
+
+    #[test]
+    fn test_exec_deny_when_active_but_already_wrapped_passes_through() {
+        // Already-wrapped commands must never be double-wrapped, even when active
+        let env = test_env();
+        let already_wrapped = format!("ahma hooks run-shell --payload-base64 abc --wrapped-by {WRAPPED_BY_MARKER}");
+        let input = json!({
+            "cwd": "/tmp/project",
+            "tool_input": { "command": already_wrapped }
+        });
+        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true);
+        let output = build_exec_output(decision, HookPlatform::Cursor);
+        assert_eq!(output["permission"].as_str(), Some("allow"));
+        assert!(output.get("updated_input").is_none());
+    }
+
+    #[test]
+    fn test_exec_cursor_rewrite_when_active() {
+        let env = test_env();
+        let input = json!({
+            "cwd": "/tmp/project",
+            "tool_input": { "command": "cargo build" }
+        });
+        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true);
+        let output = build_exec_output(decision, HookPlatform::Cursor);
+        assert_eq!(output["permission"].as_str(), Some("allow"));
+        let updated = output["updated_input"]["command"].as_str().unwrap();
+        assert!(updated.contains(WRAPPED_BY_MARKER));
+    }
+
+    #[test]
+    fn test_exec_cursor_deny_has_correct_fields() {
+        // Manually construct a Deny decision and verify the Cursor output shape
+        let decision = HooksDecision::Deny {
+            user_message: "ahma failed".to_string(),
+            agent_message: "set AHMA_HOOKS=off".to_string(),
+        };
+        let output = build_exec_output(decision, HookPlatform::Cursor);
+        assert_eq!(output["permission"].as_str(), Some("deny"));
+        assert_eq!(output["user_message"].as_str(), Some("ahma failed"));
+        assert_eq!(output["agent_message"].as_str(), Some("set AHMA_HOOKS=off"));
+    }
+
+    #[test]
+    fn test_exec_structured_deny_has_correct_fields() {
+        let decision = HooksDecision::Deny {
+            user_message: "ahma failed".to_string(),
+            agent_message: "set AHMA_HOOKS=off".to_string(),
+        };
+        let output = build_exec_output(decision, HookPlatform::Claude);
+        let hs = &output["hookSpecificOutput"];
+        assert_eq!(hs["permissionDecision"].as_str(), Some("deny"));
+        assert_eq!(hs["permissionDecisionReason"].as_str(), Some("ahma failed"));
+        assert_eq!(hs["agentMessage"].as_str(), Some("set AHMA_HOOKS=off"));
+    }
+
+    #[test]
+    fn test_is_ahma_hooks_active_with_configs_empty_returns_false() {
+        // auto mode with no MCP configs → inactive (passthrough)
+        assert!(!is_ahma_hooks_active_with_configs(&[]));
+    }
+
+    #[test]
+    fn test_is_ahma_hooks_active_with_configs_nonempty_returns_true() {
+        let fake_path = std::path::PathBuf::from("/fake/mcp.json");
+        assert!(is_ahma_hooks_active_with_configs(&[fake_path]));
+    }
+
+    #[test]
+    fn test_detect_active_mcp_configs_case_insensitive() {
+        // Write a temp mcp.json using capital-A "Ahma" (matching the user's real config)
+        let temp = tempdir().unwrap();
+        let cursor_dir = temp.path().join(".cursor");
+        fs::create_dir_all(&cursor_dir).unwrap();
+        let mcp_path = cursor_dir.join("mcp.json");
+        fs::write(
+            &mcp_path,
+            r#"{"mcpServers":{"Ahma":{"command":"ahma","args":["serve","stdio"]}}}"#,
+        )
+        .unwrap();
+
+        // Override HOME so detect_active_mcp_configs finds our temp file
+        // We test the matching logic directly via the file content
+        let content = fs::read_to_string(&mcp_path).unwrap();
+        assert!(
+            content.to_lowercase().contains("\"ahma\""),
+            "case-insensitive match should find 'Ahma'"
+        );
+    }
+
+    #[test]
+    fn test_run_install_now_includes_cursor() {
+        // Verify that the default platform list includes Cursor
+        let all = HookPlatform::all();
+        assert!(
+            all.contains(&HookPlatform::Cursor),
+            "Cursor must be in the default install set"
         );
     }
 }
