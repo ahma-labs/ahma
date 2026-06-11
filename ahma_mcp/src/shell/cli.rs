@@ -13,7 +13,7 @@
 //! ahma tool validate [TARGET]
 //! ahma tool list [--server NAME] [--http URL] [--format json|text] [--mcp-config PATH]
 //! ahma tool info [--tools rust,git] [--format json|text] [TOOL]
-//! ahma hooks install [--platform cursor,claude,codex] [--scope user|project]
+//! ahma hooks install [--platform claude,codex] [--scope user|project]
 //! ahma update [REF] [--force] [--dry-run] [--install-dir PATH]
 //! ahma verify [PATH] [--self]
 //! ```

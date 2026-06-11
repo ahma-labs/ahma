@@ -92,9 +92,9 @@ Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 
 ## After installation
 
-- The install script now offers optional user-scoped terminal hook setup for Cursor, Claude Code, and Codex.
+- The install script now offers optional user-scoped terminal hook setup for Claude Code and Codex. (Note: Cursor and VS Code do not support execution hooks).
 - Configure your MCP client — see [connection-modes.md](connection-modes.md).
-- Optional terminal hooks for Cursor, Claude Code, and Codex:
+- Optional terminal hooks for Claude Code and Codex:
 	- `ahma hooks install` installs user-scoped managed hooks using the current binary path.
 	- `ahma hooks install --scope project` writes portable project hooks that call `ahma` from `PATH`.
 	- `ahma hooks status` shows both user and project hook status.

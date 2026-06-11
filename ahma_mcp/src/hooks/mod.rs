@@ -19,9 +19,9 @@ const PATH_LOOKUP_BINARY: &str = "ahma";
 /// Manage terminal hooks for external AI tools.
 #[derive(Args, Debug)]
 #[command(
-    about = "Manage terminal hooks for Cursor, Claude Code, and Codex",
+    about = "Manage terminal hooks for Claude Code, Codex, and GitHub Copilot CLI",
     after_help = "EXAMPLES:
-  # Install user-scoped hooks for all supported tools
+  # Install user-scoped hooks for all supported tools (excludes Cursor)
   ahma hooks install
 
   # Install project-scoped hooks for Claude Code and Codex
@@ -303,8 +303,20 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
 
 pub fn run_install(args: HooksInstallArgs) -> Result<()> {
     let env = HookEnvironment::detect()?;
+    let selected = if args.platforms.is_empty() {
+        HookPlatform::all()
+            .into_iter()
+            .filter(|&p| p != HookPlatform::Cursor)
+            .collect::<Vec<_>>()
+    } else {
+        args.platforms.clone()
+    };
 
-    for platform in selected_platforms(&args.platforms) {
+    for platform in selected {
+        if platform == HookPlatform::Cursor {
+            println!("Cursor does not support terminal hooks. Skipping hook installation for Cursor.");
+            continue;
+        }
         let path = env.config_path(platform, args.scope);
         let existed = path.exists();
         let mut document = load_hook_document(&path)?;
@@ -389,10 +401,10 @@ fn hook_status_string(path: &Path, platform: HookPlatform) -> Result<String> {
     }
 }
 
-fn detect_mcp_config_exists() -> bool {
+fn detect_active_mcp_configs() -> Vec<PathBuf> {
     let home = match std::env::var("HOME").ok().map(PathBuf::from) {
         Some(h) => h,
-        None => return false,
+        None => return Vec::new(),
     };
 
     let mut paths = vec![
@@ -407,15 +419,16 @@ fn detect_mcp_config_exists() -> bool {
         paths.push(project_root.join(".vscode").join("mcp.json"));
     }
 
+    let mut active = Vec::new();
     for path in paths {
         if path.exists()
             && let Ok(content) = std::fs::read_to_string(&path)
             && content.contains("\"ahma\"")
         {
-            return true;
+            active.push(path);
         }
     }
-    false
+    active
 }
 
 fn run_status(args: HooksStatusArgs) -> Result<()> {
@@ -428,6 +441,7 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
     println!("{:<14} {:<8} {:<14} Config", "Platform", "Scope", "Status");
     println!("{:-<14} {:-<8} {:-<14} {:-<6}", "", "", "", "");
 
+    let mut installed_hooks = Vec::new();
     let mut installed_count = 0;
     for scope in scopes {
         for platform in selected_platforms(&args.platforms) {
@@ -435,6 +449,7 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
             let status = hook_status_string(&path, platform)?;
             if status == "installed" {
                 installed_count += 1;
+                installed_hooks.push((platform, scope, path.clone()));
             }
             println!(
                 "{:<14} {:<8} {:<14} {}",
@@ -446,13 +461,52 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
         }
     }
 
-    if installed_count > 0 && detect_mcp_config_exists() {
-        println!("\n⚠️  WARNING: Redundant terminal hooks + MCP server configuration detected!");
-        println!("Both terminal hooks and an MCP server are configured for \"ahma\".");
-        println!("This can cause redundant wrapping and execution slowness.");
-        println!("RECOMMENDED: Keep only the MCP server and uninstall terminal hooks via:");
-        println!("    ahma hooks uninstall --scope user");
-        println!("See AGENTS.md or the ahma skill documentation for setup guidelines.\n");
+    let active_mcps = detect_active_mcp_configs();
+    if installed_count > 0 && !active_mcps.is_empty() {
+        println!(
+            "\n\x1b[33mwarning\x1b[0m\x1b[1m: redundant shell interception configuration detected\x1b[0m"
+        );
+        println!(
+            "  \x1b[36m-->\x1b[0m Both terminal hooks and an active MCP server are configured for \"ahma\"."
+        );
+        println!("      This can cause redundant tool wrapping and execution slowness.");
+        println!();
+        println!("  \x1b[1mactive terminal hooks:\x1b[0m");
+        for (platform, scope, path) in &installed_hooks {
+            println!(
+                "    - {} ({} scope) at {}",
+                platform.label(),
+                scope.label(),
+                path.display()
+            );
+        }
+        println!();
+        println!("  \x1b[1mactive MCP configurations:\x1b[0m");
+        for path in &active_mcps {
+            println!("    - {}", path.display());
+        }
+        println!();
+        println!(
+            "  \x1b[1mhelp\x1b[0m: Having both configurations active is redundant and degrades performance."
+        );
+        println!(
+            "        It is highly recommended to keep the MCP server and uninstall the hooks."
+        );
+        println!("        To uninstall them, run:");
+
+        let has_user = installed_hooks
+            .iter()
+            .any(|(_, s, _)| *s == HookScope::User);
+        let has_project = installed_hooks
+            .iter()
+            .any(|(_, s, _)| *s == HookScope::Project);
+        if has_user {
+            println!("          ahma hooks uninstall --scope user");
+        }
+        if has_project {
+            println!("          ahma hooks uninstall --scope project");
+        }
+        println!();
     }
 
     Ok(())
