@@ -7,6 +7,7 @@ pub fn enforce_landlock_sandbox(
     scopes: &[PathBuf],
     read_scopes: &[PathBuf],
     no_temp_files: bool,
+    package_cache_write: bool,
 ) -> Result<()> {
     use anyhow::Context;
     use landlock::{
@@ -47,7 +48,7 @@ pub fn enforce_landlock_sandbox(
     }
 
     add_landlock_system_rules(&mut ruleset, access_read)?;
-    add_landlock_home_tool_rules(&mut ruleset, access_read)?;
+    add_landlock_home_tool_rules(&mut ruleset, access_read, access_all, package_cache_write)?;
 
     if !no_temp_files {
         add_landlock_temp_rules(&mut ruleset, access_all)?;
@@ -99,6 +100,8 @@ fn add_landlock_system_rules(
 fn add_landlock_home_tool_rules(
     ruleset: &mut landlock::RulesetCreated,
     access_read: landlock::BitFlags<landlock::AccessFs>,
+    access_all: landlock::BitFlags<landlock::AccessFs>,
+    package_cache_write: bool,
 ) -> Result<()> {
     use landlock::{PathBeneath, PathFd, RulesetCreatedAttr};
     if let Ok(home) = std::env::var("HOME") {
@@ -113,6 +116,52 @@ fn add_landlock_home_tool_rules(
             }
         }
     }
+
+    if package_cache_write {
+        add_landlock_package_cache_write_rules(ruleset, access_all)?;
+    }
+
+    Ok(())
+}
+
+/// Add Landlock write rules for package-manager caches when `package_cache_write` is on.
+#[cfg(target_os = "linux")]
+fn add_landlock_package_cache_write_rules(
+    ruleset: &mut landlock::RulesetCreated,
+    access_all: landlock::BitFlags<landlock::AccessFs>,
+) -> Result<()> {
+    use super::pkg_cache::{all_writable_package_cache_paths, pre_create_package_cache_paths};
+    use landlock::{PathBeneath, PathFd, RulesetCreatedAttr};
+
+    for cache in all_writable_package_cache_paths() {
+        // Ensure paths exist so PathFd::new succeeds.
+        pre_create_package_cache_paths(&cache);
+
+        for dir in &cache.writable_dirs {
+            if dir.exists()
+                && let Ok(fd) = PathFd::new(dir)
+            {
+                tracing::debug!(
+                    "Landlock: granting write access to package cache dir: {:?}",
+                    dir
+                );
+                let _ = ruleset.add_rule(PathBeneath::new(fd, access_all));
+            }
+        }
+
+        for file in &cache.writable_files {
+            if file.exists()
+                && let Ok(fd) = PathFd::new(file)
+            {
+                tracing::debug!(
+                    "Landlock: granting write access to package cache file: {:?}",
+                    file
+                );
+                let _ = ruleset.add_rule(PathBeneath::new(fd, access_all));
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -136,6 +185,7 @@ pub fn enforce_landlock_sandbox(
     _scopes: &[PathBuf],
     _read_scopes: &[PathBuf],
     _no_temp_files: bool,
+    _package_cache_write: bool,
 ) -> Result<()> {
     Ok(())
 }

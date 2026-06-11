@@ -202,6 +202,10 @@ pub enum TransportMode {
     Http1,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_transport_preference() -> Vec<TransportMode> {
     vec![
         TransportMode::Quic,
@@ -485,6 +489,14 @@ pub struct SandboxSettings {
     /// Directories containing allowed working directories.
     /// Default: empty list
     pub working_dirs: Vec<PathBuf>,
+    /// Allow package-manager caches (cargo registry/git, etc.) to be written inside
+    /// the sandbox.  Grants write access only to the subdirs that package managers
+    /// need when fetching new dependencies; sensitive config and binaries remain
+    /// read-only.  Disable with `--no-package-cache-write` when you want the
+    /// strictest possible isolation.
+    /// Default: `true`
+    #[serde(default = "default_true")]
+    pub package_cache_write: bool,
 }
 
 /// Logging and log-monitoring settings.
@@ -739,12 +751,13 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 
 # ── Sandbox & filesystem security ────────────────────────────────────────────
 # [sandbox]
-# disable      = false    # UNSAFE: disable kernel sandbox entirely
-# tmp_access   = false    # add system temp dir to sandbox scope
-# disable_temp = false    # block all access to system temp dir (overrides tmp_access)
-# defer        = false    # defer sandbox lock until client provides roots/list
-# task_vault   = ""       # run this server session inside an existing task vault
-# scopes       = []       # paths allowed for read/write access under the sandbox
+# disable              = false    # UNSAFE: disable kernel sandbox entirely
+# tmp_access           = false    # add system temp dir to sandbox scope
+# disable_temp         = false    # block all access to system temp dir (overrides tmp_access)
+# defer                = false    # defer sandbox lock until client provides roots/list
+# task_vault           = ""       # run this server session inside an existing task vault
+# scopes               = []       # paths allowed for read/write access under the sandbox
+# package_cache_write  = true     # allow package-manager caches (cargo registry/git) to be written
 # working_dirs = []       # directories containing allowed working directories
 
 # ── Logging ──────────────────────────────────────────────────────────────────

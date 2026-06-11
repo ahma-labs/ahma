@@ -103,7 +103,7 @@ impl Platform {
     }
 
     fn supports_hooks(self) -> bool {
-        !matches!(self, Platform::VsCode | Platform::Cursor)
+        !matches!(self, Platform::VsCode)
     }
 
     fn hook_platform(self) -> Option<HookPlatform> {

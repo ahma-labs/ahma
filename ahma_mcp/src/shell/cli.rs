@@ -129,6 +129,9 @@ pub struct AppConfig {
     pub log_monitor: bool,
     /// Minimum seconds between log-monitor alerts (AHMA_MONITOR_RATE_LIMIT, default 60).
     pub monitor_rate_limit_secs: u64,
+    /// Allow package-manager caches (cargo registry/git) to be written inside
+    /// the sandbox (default `true`; disable with `AHMA_NO_PACKAGE_CACHE_WRITE=1`).
+    pub package_cache_write: bool,
 
     // ── HTTP serve mode ─────────────────────────────────────────────────────
     /// Bind host for HTTP mode (default 127.0.0.1).
@@ -212,6 +215,7 @@ impl Default for AppConfig {
             no_temp_files: false,
             log_monitor: false,
             monitor_rate_limit_secs: 60,
+            package_cache_write: true,
             http_host: "127.0.0.1".to_string(),
             http_port: 3000,
             no_quic: false,
@@ -478,7 +482,8 @@ fn create_sandbox_instance(
         cfg.log_monitor,
         policy.tmp_access,
     )
-    .context("Failed to initialize sandbox")?;
+    .context("Failed to initialize sandbox")?
+    .with_package_cache_write(cfg.package_cache_write);
 
     tracing::info!("Sandbox scopes initialized: {:?}", scopes);
 
@@ -500,6 +505,7 @@ fn apply_platform_sandbox_enforcement(
                 &sandbox.scopes(),
                 &sandbox.read_scopes(),
                 sandbox.is_no_temp_files(),
+                sandbox.package_cache_write(),
             )
         {
             tracing::error!("Failed to enforce Landlock sandbox: {}", e);
@@ -1209,6 +1215,13 @@ pub struct Cli {
     /// Block all access to the system temp directory.
     #[arg(long = "disable-temp-files", global = true)]
     pub no_temp_files: bool,
+
+    /// Disable write access to package-manager caches (cargo registry/git, etc.).
+    /// By default, ahma grants write access to these subdirs so that agents can
+    /// fetch new dependency versions.  Sensitive paths (bin, config.toml,
+    /// credentials.toml) are always kept read-only.
+    #[arg(long = "no-package-cache-write", global = true)]
+    pub no_package_cache_write: bool,
 
     /// Watch the tools directory for JSON changes and reload tool definitions at runtime.
     #[arg(long = "hot-reload", global = true)]
@@ -2173,7 +2186,7 @@ fn parse_execution_settings(
 fn parse_sandbox_settings(
     cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
-) -> (bool, bool, bool, bool, bool, u64) {
+) -> (bool, bool, bool, bool, bool, u64, bool) {
     let no_sandbox = cli.no_sandbox
         || check_env_flag_with_deprecation!("AHMA_DISABLE_SANDBOX")
         || s.sandbox.disable;
@@ -2203,6 +2216,11 @@ fn parse_sandbox_settings(
         s.logging.monitor_rate_limit_secs
     };
 
+    // `--no-package-cache-write` negates the default-on feature.
+    let package_cache_write = !cli.no_package_cache_write
+        && !AppConfig::env_flag("AHMA_NO_PACKAGE_CACHE_WRITE")
+        && s.sandbox.package_cache_write;
+
     (
         no_sandbox,
         defer_sandbox,
@@ -2210,6 +2228,7 @@ fn parse_sandbox_settings(
         no_temp_files,
         log_monitor,
         monitor_rate_limit_secs,
+        package_cache_write,
     )
 }
 
@@ -2386,6 +2405,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         no_temp_files,
         log_monitor,
         monitor_rate_limit_secs,
+        package_cache_write,
     ) = parse_sandbox_settings(cli, &s);
 
     let idle_timeout_secs = cli.idle_timeout;
@@ -2422,6 +2442,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         no_temp_files,
         log_monitor,
         monitor_rate_limit_secs,
+        package_cache_write,
         http_host: serve.http_host,
         http_port: serve.http_port,
         no_quic,
@@ -2890,6 +2911,7 @@ mod tests {
             no_temp_files: false,
             log_monitor: false,
             monitor_rate_limit_secs: 60,
+            package_cache_write: true,
             http_host: "127.0.0.1".to_string(),
             http_port: 3000,
             no_quic: false,

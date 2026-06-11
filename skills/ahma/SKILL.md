@@ -281,12 +281,24 @@ ahma hooks uninstall --platform copilot --scope user
 ```
 
 Supported Hook Platforms:
+- **Cursor**: Configures `${HOME}/.cursor/hooks.json` (user) or `<repo>/.cursor/hooks.json` (project)
 - **Claude Code**: Configures `${HOME}/.claude/settings.json`
 - **Codex**: Configures `${HOME}/.codex/hooks.json`
 - **GitHub Copilot / Copilot CLI**: Configures `${HOME}/.copilot/hooks/ahma.json` (user) and `.github/hooks/ahma.json` (project)
 
 > [!NOTE]
-> **Cursor and VS Code Hook Support**: Cursor and VS Code do not support shell execution hooks. The installer does not configure them, as VS Code/Cursor lacks hook-trigger support for native terminal command executions.
+> **Cursor hooks use `failClosed: true`**: if the `ahma` binary is missing or crashes before it can emit JSON, Cursor blocks the command rather than letting it run unsandboxed. Fix by reinstalling ahma or running `ahma hooks uninstall --platform cursor`.
+
+> [!IMPORTANT]
+> **Turning off ahma without breaking your terminal**: When you intentionally disable ahma (remove it from `mcp.json`, set `AHMA_HOOKS=off`, or run `ahma hooks uninstall`), the hook automatically passes commands to the default terminal. It never bricks your workflow. The three safe off-switches:
+> 1. Remove/comment out the `ahma` entry in `~/.cursor/mcp.json`
+> 2. Set `AHMA_HOOKS=off` in your shell environment (also accepts `AHMA_DISABLE_HOOKS=1`)
+> 3. Run `ahma hooks uninstall --platform cursor`
+>
+> The hook reads `AHMA_HOOKS` and the MCP config at invocation time — no Cursor restart needed for options 1 and 2.
+
+> [!NOTE]
+> **Cursor and VS Code Hook Support**: Cursor supports shell execution hooks as of June 2026 via `~/.cursor/hooks.json` or `<project>/.cursor/hooks.json`. The installer configures them automatically. VS Code does not have hook support and is not configured.
 
 > [!IMPORTANT]
 > **Coexistence Guideline**: Avoid having BOTH terminal hooks and an active MCP server configured for "ahma" at the same time. This causes redundant wrapping, sandbox-initialization, and execution overhead. If you use the `ahma` MCP server inside Claude Desktop or Cursor, it is recommended to uninstall terminal hooks:
@@ -410,6 +422,7 @@ Hot-reload while authoring (dev only): `AHMA_HOT_RELOAD=1 ahma serve stdio`
 | `AHMA_SANDBOX_SCOPE` | cwd | Colon-separated scope paths |
 | `AHMA_TMP_ACCESS` | off | Add temp dir to sandbox scope |
 | `AHMA_DISABLE_TEMP` | off | Block all temp dir access |
+| `AHMA_NO_PACKAGE_CACHE_WRITE` | off | Disable cargo cache writes (strictest isolation) |
 | `AHMA_LOG_TARGET` | file | Set `stderr` to log to stderr |
 | `AHMA_LOG_MONITOR` | off | Enable live log monitoring |
 | `AHMA_MONITOR_RATE_LIMIT` | `60` | Min seconds between log alerts |
@@ -485,6 +498,8 @@ android_logcat(...)   # if defined in .ahma/android-logcat.json
 
 **Permission denied / sandbox error**: The file is outside the sandbox scope.
 Check `AHMA_SANDBOX_SCOPE` or add `--tmp` if needed for temp files.
+
+> **Cargo dependency errors**: If `cargo add` or `cargo update` fail with permission errors, do **not** add `--sandbox-scope ~/.cargo` to your `mcp.json` — that grants write to the entire cargo home including binaries and credentials.  Instead, the built-in `package_cache_write` feature (on by default) handles this correctly, granting write only to `registry/`, `git/`, and the cargo lock files.  If you previously had `--sandbox-scope ~/.cargo` in your config, remove it — it is no longer needed.
 
 **Nested sandbox warning**: Ahma detected an outer sandbox (Cursor, VS Code, Docker).
 Internal sandbox auto-disabled. Set `AHMA_DISABLE_SANDBOX=1` to suppress the warning.
