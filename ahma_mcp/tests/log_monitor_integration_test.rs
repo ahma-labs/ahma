@@ -1,46 +1,21 @@
 //! Integration tests for the live log monitoring feature.
+//!
+//! Alerts and final results are observed through the `OperationMonitor`
+//! store of record: log-monitor alerts are appended to `Operation::alerts`
+//! (and emitted as `Alert` events on the unified stream), and the final
+//! result is stored on the completed operation.
 
 use ahma_mcp::adapter::{Adapter, AsyncExecOptions};
-use ahma_mcp::callback_system::{CallbackError, CallbackSender, ProgressUpdate};
 use ahma_mcp::log_monitor::{LogLevel, LogMonitorConfig, MonitorStream};
-use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
+use ahma_mcp::operation_monitor::{MonitorConfig, Operation, OperationMonitor};
 use ahma_mcp::sandbox::Sandbox;
 use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
-use ahma_mcp::test_utils::concurrency::wait_for_condition;
-use async_trait::async_trait;
 use serde_json::Map;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
-use tokio::sync::Mutex;
 
-#[derive(Clone)]
-struct TestCallback {
-    updates: Arc<Mutex<Vec<ProgressUpdate>>>,
-}
-
-impl TestCallback {
-    fn new() -> (Self, Arc<Mutex<Vec<ProgressUpdate>>>) {
-        let updates = Arc::new(Mutex::new(Vec::new()));
-        let cb = Self {
-            updates: updates.clone(),
-        };
-        (cb, updates)
-    }
-}
-
-#[async_trait]
-impl CallbackSender for TestCallback {
-    async fn send_progress(&self, update: ProgressUpdate) -> Result<(), CallbackError> {
-        self.updates.lock().await.push(update);
-        Ok(())
-    }
-    async fn should_cancel(&self) -> bool {
-        false
-    }
-}
-
-async fn create_test_adapter() -> Adapter {
+async fn create_test_adapter() -> (Adapter, Arc<OperationMonitor>) {
     let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(30));
     let monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_pool_config = ShellPoolConfig::default();
@@ -55,7 +30,10 @@ async fn create_test_adapter() -> Adapter {
         )
         .unwrap(),
     );
-    Adapter::new(monitor, shell_pool, sandbox).unwrap()
+    (
+        Adapter::new(monitor.clone(), shell_pool, sandbox).unwrap(),
+        monitor,
+    )
 }
 
 fn monitor_config(level: LogLevel, stream: MonitorStream) -> Option<LogMonitorConfig> {
@@ -66,25 +44,22 @@ fn monitor_config(level: LogLevel, stream: MonitorStream) -> Option<LogMonitorCo
     })
 }
 
-async fn wait_for_completion(updates: &Arc<Mutex<Vec<ProgressUpdate>>>) {
-    let completed = wait_for_condition(Duration::from_secs(10), Duration::from_millis(50), || {
-        let u = updates.clone();
-        async move {
-            let guard = u.lock().await;
-            guard
-                .iter()
-                .any(|up| matches!(up, ProgressUpdate::FinalResult { .. }))
-        }
-    })
-    .await;
-    assert!(completed, "Timed out waiting for operation to complete");
+/// Wait for the operation to reach a terminal state and return it (with its
+/// alerts and final result).
+async fn wait_for_completion(monitor: &OperationMonitor, op_id: &str) -> Operation {
+    tokio::time::timeout(Duration::from_secs(15), monitor.wait_for_operation(op_id))
+        .await
+        .expect("Timed out waiting for operation to complete")
+        .expect("Operation should have completed")
 }
 
-fn count_log_alerts(updates: &[ProgressUpdate]) -> usize {
-    updates
-        .iter()
-        .filter(|up| matches!(up, ProgressUpdate::LogAlert { .. }))
-        .count()
+fn result_stdout_stderr(op: &Operation) -> String {
+    let result = op.result.as_ref().expect("missing final result");
+    format!(
+        "{}\n{}",
+        result.get("stdout").and_then(|v| v.as_str()).unwrap_or(""),
+        result.get("stderr").and_then(|v| v.as_str()).unwrap_or(""),
+    )
 }
 
 #[allow(unused_variables)]
@@ -114,22 +89,11 @@ fn write_cross_platform_script(
     }
 }
 
-fn final_result_output(updates: &[ProgressUpdate]) -> Option<String> {
-    updates.iter().find_map(|update| {
-        if let ProgressUpdate::FinalResult { full_output, .. } = update {
-            Some(full_output.clone())
-        } else {
-            None
-        }
-    })
-}
-
 #[tokio::test]
 async fn streaming_stderr_error_triggers_log_alert() {
-    let adapter = create_test_adapter().await;
+    let (adapter, monitor) = create_test_adapter().await;
     let temp_dir = tempdir().unwrap();
     let working_dir = temp_dir.path().to_str().unwrap();
-    let (callback, updates) = TestCallback::new();
     let cmd = write_cross_platform_script(
         temp_dir.path(),
         "emit_error",
@@ -145,41 +109,31 @@ async fn streaming_stderr_error_triggers_log_alert() {
                 id: Some("test_op_1".to_string()),
                 args: Some(Map::new()),
                 timeout: Some(10),
-                callback: Some(Box::new(callback)),
                 subcommand_config: None,
                 log_monitor_config: monitor_config(LogLevel::Error, MonitorStream::Stderr),
             },
         )
         .await;
     assert!(result.is_ok());
-    wait_for_completion(&updates).await;
-    let guard = updates.lock().await;
-    let alerts: Vec<_> = guard
-        .iter()
-        .filter(|up| matches!(up, ProgressUpdate::LogAlert { .. }))
-        .collect();
-    assert!(!alerts.is_empty(), "Expected LogAlert, got: {:?}", *guard);
-    if let ProgressUpdate::LogAlert {
-        trigger_level,
-        context_snapshot,
-        ..
-    } = &alerts[0]
-    {
-        assert_eq!(trigger_level, "error");
-        assert!(
-            context_snapshot.contains("mismatched types"),
-            "snapshot: {}",
-            context_snapshot
-        );
-    }
+    let op = wait_for_completion(&monitor, "test_op_1").await;
+    assert!(!op.alerts.is_empty(), "Expected alert, got: {:?}", op);
+    assert!(
+        op.alerts[0].contains("LOG ALERT (error"),
+        "alert: {}",
+        op.alerts[0]
+    );
+    assert!(
+        op.alerts[0].contains("mismatched types"),
+        "alert: {}",
+        op.alerts[0]
+    );
 }
 
 #[tokio::test]
 async fn streaming_stdout_error_triggers_when_monitoring_both() {
-    let adapter = create_test_adapter().await;
+    let (adapter, monitor) = create_test_adapter().await;
     let temp_dir = tempdir().unwrap();
     let working_dir = temp_dir.path().to_str().unwrap();
-    let (callback, updates) = TestCallback::new();
     let cmd = write_cross_platform_script(
         temp_dir.path(),
         "emit_stdout_error",
@@ -195,28 +149,21 @@ async fn streaming_stdout_error_triggers_when_monitoring_both() {
                 id: Some("test_op_2".to_string()),
                 args: Some(Map::new()),
                 timeout: Some(10),
-                callback: Some(Box::new(callback)),
                 subcommand_config: None,
                 log_monitor_config: monitor_config(LogLevel::Error, MonitorStream::Both),
             },
         )
         .await;
     assert!(result.is_ok());
-    wait_for_completion(&updates).await;
-    let guard = updates.lock().await;
-    assert!(
-        count_log_alerts(&guard) > 0,
-        "Expected LogAlert: {:?}",
-        *guard
-    );
+    let op = wait_for_completion(&monitor, "test_op_2").await;
+    assert!(!op.alerts.is_empty(), "Expected alert: {:?}", op.alerts);
 }
 
 #[tokio::test]
 async fn streaming_no_alert_when_output_is_clean() {
-    let adapter = create_test_adapter().await;
+    let (adapter, monitor) = create_test_adapter().await;
     let temp_dir = tempdir().unwrap();
     let working_dir = temp_dir.path().to_str().unwrap();
-    let (callback, updates) = TestCallback::new();
     let cmd = write_cross_platform_script(
         temp_dir.path(),
         "clean",
@@ -232,29 +179,25 @@ async fn streaming_no_alert_when_output_is_clean() {
                 id: Some("test_op_3".to_string()),
                 args: Some(Map::new()),
                 timeout: Some(10),
-                callback: Some(Box::new(callback)),
                 subcommand_config: None,
                 log_monitor_config: monitor_config(LogLevel::Error, MonitorStream::Both),
             },
         )
         .await;
     assert!(result.is_ok());
-    wait_for_completion(&updates).await;
-    let guard = updates.lock().await;
-    assert_eq!(
-        count_log_alerts(&guard),
-        0,
+    let op = wait_for_completion(&monitor, "test_op_3").await;
+    assert!(
+        op.alerts.is_empty(),
         "Clean output should not trigger: {:?}",
-        *guard
+        op.alerts
     );
 }
 
 #[tokio::test]
 async fn streaming_warn_level_triggers_on_warning() {
-    let adapter = create_test_adapter().await;
+    let (adapter, monitor) = create_test_adapter().await;
     let temp_dir = tempdir().unwrap();
     let working_dir = temp_dir.path().to_str().unwrap();
-    let (callback, updates) = TestCallback::new();
     let cmd = write_cross_platform_script(
         temp_dir.path(),
         "emit_warn",
@@ -270,35 +213,30 @@ async fn streaming_warn_level_triggers_on_warning() {
                 id: Some("test_op_4".to_string()),
                 args: Some(Map::new()),
                 timeout: Some(10),
-                callback: Some(Box::new(callback)),
                 subcommand_config: None,
                 log_monitor_config: monitor_config(LogLevel::Warn, MonitorStream::Stderr),
             },
         )
         .await;
     assert!(result.is_ok());
-    wait_for_completion(&updates).await;
-    let guard = updates.lock().await;
-    let alerts: Vec<_> = guard
-        .iter()
-        .filter(|up| matches!(up, ProgressUpdate::LogAlert { .. }))
-        .collect();
+    let op = wait_for_completion(&monitor, "test_op_4").await;
     assert!(
-        !alerts.is_empty(),
-        "Expected LogAlert for warning: {:?}",
-        *guard
+        !op.alerts.is_empty(),
+        "Expected alert for warning: {:?}",
+        op.alerts
     );
-    if let ProgressUpdate::LogAlert { trigger_level, .. } = &alerts[0] {
-        assert_eq!(trigger_level, "warn");
-    }
+    assert!(
+        op.alerts[0].contains("LOG ALERT (warn"),
+        "alert: {}",
+        op.alerts[0]
+    );
 }
 
 #[tokio::test]
 async fn streaming_error_level_ignores_warnings() {
-    let adapter = create_test_adapter().await;
+    let (adapter, monitor) = create_test_adapter().await;
     let temp_dir = tempdir().unwrap();
     let working_dir = temp_dir.path().to_str().unwrap();
-    let (callback, updates) = TestCallback::new();
     let cmd = write_cross_platform_script(
         temp_dir.path(),
         "warn_only",
@@ -314,29 +252,25 @@ async fn streaming_error_level_ignores_warnings() {
                 id: Some("test_op_5".to_string()),
                 args: Some(Map::new()),
                 timeout: Some(10),
-                callback: Some(Box::new(callback)),
                 subcommand_config: None,
                 log_monitor_config: monitor_config(LogLevel::Error, MonitorStream::Stderr),
             },
         )
         .await;
     assert!(result.is_ok());
-    wait_for_completion(&updates).await;
-    let guard = updates.lock().await;
-    assert_eq!(
-        count_log_alerts(&guard),
-        0,
+    let op = wait_for_completion(&monitor, "test_op_5").await;
+    assert!(
+        op.alerts.is_empty(),
         "Warning should not trigger at Error level: {:?}",
-        *guard
+        op.alerts
     );
 }
 
 #[tokio::test]
-async fn streaming_no_monitor_uses_batch_path() {
-    let adapter = create_test_adapter().await;
+async fn streaming_without_monitor_produces_no_alerts() {
+    let (adapter, monitor) = create_test_adapter().await;
     let temp_dir = tempdir().unwrap();
     let working_dir = temp_dir.path().to_str().unwrap();
-    let (callback, updates) = TestCallback::new();
     let cmd = write_cross_platform_script(
         temp_dir.path(),
         "batch",
@@ -352,34 +286,26 @@ async fn streaming_no_monitor_uses_batch_path() {
                 id: Some("test_op_6".to_string()),
                 args: Some(Map::new()),
                 timeout: Some(10),
-                callback: Some(Box::new(callback)),
                 subcommand_config: None,
                 log_monitor_config: None,
             },
         )
         .await;
     assert!(result.is_ok());
-    wait_for_completion(&updates).await;
-    let guard = updates.lock().await;
-    assert_eq!(
-        count_log_alerts(&guard),
-        0,
-        "Batch path should not produce LogAlert: {:?}",
-        *guard
-    );
+    let op = wait_for_completion(&monitor, "test_op_6").await;
     assert!(
-        guard
-            .iter()
-            .any(|up| matches!(up, ProgressUpdate::FinalResult { .. }))
+        op.alerts.is_empty(),
+        "No-monitor run should not produce alerts: {:?}",
+        op.alerts
     );
+    assert!(op.result.is_some(), "Final result must be stored");
 }
 
 #[tokio::test]
 async fn streaming_alert_includes_context_lines() {
-    let adapter = create_test_adapter().await;
+    let (adapter, monitor) = create_test_adapter().await;
     let temp_dir = tempdir().unwrap();
     let working_dir = temp_dir.path().to_str().unwrap();
-    let (callback, updates) = TestCallback::new();
     let bash_script = "#!/bin/bash\nfor i in $(seq 1 5); do echo \"info: compiling module $i\" >&2; done\necho 'error[E0277]: the trait bound is not satisfied' >&2\n";
     let ps1_script = "1..5 | ForEach-Object { [Console]::Error.WriteLine(\"info: compiling module $_\") }\n[Console]::Error.WriteLine('error[E0277]: the trait bound is not satisfied')\n";
     let cmd = write_cross_platform_script(temp_dir.path(), "context", bash_script, ps1_script);
@@ -392,43 +318,28 @@ async fn streaming_alert_includes_context_lines() {
                 id: Some("test_op_7".to_string()),
                 args: Some(Map::new()),
                 timeout: Some(10),
-                callback: Some(Box::new(callback)),
                 subcommand_config: None,
                 log_monitor_config: monitor_config(LogLevel::Error, MonitorStream::Stderr),
             },
         )
         .await;
     assert!(result.is_ok());
-    wait_for_completion(&updates).await;
-    let guard = updates.lock().await;
-    let alerts: Vec<_> = guard
-        .iter()
-        .filter(|up| matches!(up, ProgressUpdate::LogAlert { .. }))
-        .collect();
-    assert!(!alerts.is_empty(), "Expected LogAlert: {:?}", *guard);
-    if let ProgressUpdate::LogAlert {
-        context_snapshot, ..
-    } = &alerts[0]
-    {
-        assert!(
-            context_snapshot.contains("compiling module"),
-            "Missing context: {}",
-            context_snapshot
-        );
-        assert!(
-            context_snapshot.contains("E0277"),
-            "Missing trigger: {}",
-            context_snapshot
-        );
-    }
+    let op = wait_for_completion(&monitor, "test_op_7").await;
+    assert!(!op.alerts.is_empty(), "Expected alert: {:?}", op.alerts);
+    let alert = &op.alerts[0];
+    assert!(
+        alert.contains("compiling module"),
+        "Missing context: {}",
+        alert
+    );
+    assert!(alert.contains("E0277"), "Missing trigger: {}", alert);
 }
 
 #[tokio::test]
 async fn streaming_multiline_errors_with_rate_limit() {
-    let adapter = create_test_adapter().await;
+    let (adapter, monitor) = create_test_adapter().await;
     let temp_dir = tempdir().unwrap();
     let working_dir = temp_dir.path().to_str().unwrap();
-    let (callback, updates) = TestCallback::new();
     let bash_script = "#!/bin/bash\necho 'error[E0308]: mismatched types' >&2\necho 'error[E0277]: trait bound' >&2\necho 'error[E0599]: no method' >&2\n";
     let ps1_script = "[Console]::Error.WriteLine('error[E0308]: mismatched types')\n[Console]::Error.WriteLine('error[E0277]: trait bound')\n[Console]::Error.WriteLine('error[E0599]: no method')\n";
     let cmd = write_cross_platform_script(temp_dir.path(), "multi_error", bash_script, ps1_script);
@@ -441,7 +352,6 @@ async fn streaming_multiline_errors_with_rate_limit() {
                 id: Some("test_op_8".to_string()),
                 args: Some(Map::new()),
                 timeout: Some(10),
-                callback: Some(Box::new(callback)),
                 subcommand_config: None,
                 log_monitor_config: Some(LogMonitorConfig {
                     monitor_level: LogLevel::Error,
@@ -452,22 +362,20 @@ async fn streaming_multiline_errors_with_rate_limit() {
         )
         .await;
     assert!(result.is_ok());
-    wait_for_completion(&updates).await;
-    let guard = updates.lock().await;
+    let op = wait_for_completion(&monitor, "test_op_8").await;
     assert_eq!(
-        count_log_alerts(&guard),
+        op.alerts.len(),
         1,
         "Rate limit should suppress: {:?}",
-        *guard
+        op.alerts
     );
 }
 
 #[tokio::test]
 async fn streaming_stderr_only_ignores_stdout_patterns() {
-    let adapter = create_test_adapter().await;
+    let (adapter, monitor) = create_test_adapter().await;
     let temp_dir = tempdir().unwrap();
     let working_dir = temp_dir.path().to_str().unwrap();
-    let (callback, updates) = TestCallback::new();
     let cmd = write_cross_platform_script(
         temp_dir.path(),
         "stdout_error",
@@ -483,29 +391,25 @@ async fn streaming_stderr_only_ignores_stdout_patterns() {
                 id: Some("test_op_9".to_string()),
                 args: Some(Map::new()),
                 timeout: Some(10),
-                callback: Some(Box::new(callback)),
                 subcommand_config: None,
                 log_monitor_config: monitor_config(LogLevel::Error, MonitorStream::Stderr),
             },
         )
         .await;
     assert!(result.is_ok());
-    wait_for_completion(&updates).await;
-    let guard = updates.lock().await;
-    assert_eq!(
-        count_log_alerts(&guard),
-        0,
+    let op = wait_for_completion(&monitor, "test_op_9").await;
+    assert!(
+        op.alerts.is_empty(),
         "Stderr-only should ignore stdout: {:?}",
-        *guard
+        op.alerts
     );
 }
 
 #[tokio::test]
 async fn streaming_final_result_redacts_sensitive_output() {
-    let adapter = create_test_adapter().await;
+    let (adapter, monitor) = create_test_adapter().await;
     let temp_dir = tempdir().unwrap();
     let working_dir = temp_dir.path().to_str().unwrap();
-    let (callback, updates) = TestCallback::new();
     let cmd = write_cross_platform_script(
         temp_dir.path(),
         "secret_output",
@@ -522,7 +426,6 @@ async fn streaming_final_result_redacts_sensitive_output() {
                 id: Some("test_op_10".to_string()),
                 args: Some(Map::new()),
                 timeout: Some(10),
-                callback: Some(Box::new(callback)),
                 subcommand_config: None,
                 log_monitor_config: monitor_config(LogLevel::Error, MonitorStream::Both),
             },
@@ -530,9 +433,8 @@ async fn streaming_final_result_redacts_sensitive_output() {
         .await;
     assert!(result.is_ok());
 
-    wait_for_completion(&updates).await;
-    let guard = updates.lock().await;
-    let output = final_result_output(&guard).expect("missing final result output");
+    let op = wait_for_completion(&monitor, "test_op_10").await;
+    let output = result_stdout_stderr(&op);
     assert!(!output.contains("supersecret123"), "output: {}", output);
     assert!(!output.contains("abcdefghijklmnop"), "output: {}", output);
     assert!(output.contains("[REDACTED]"), "output: {}", output);
@@ -540,10 +442,9 @@ async fn streaming_final_result_redacts_sensitive_output() {
 
 #[tokio::test]
 async fn streaming_final_result_is_bounded_and_marks_truncation() {
-    let adapter = create_test_adapter().await;
+    let (adapter, monitor) = create_test_adapter().await;
     let temp_dir = tempdir().unwrap();
     let working_dir = temp_dir.path().to_str().unwrap();
-    let (callback, updates) = TestCallback::new();
     let cmd = write_cross_platform_script(
         temp_dir.path(),
         "many_lines",
@@ -560,7 +461,6 @@ async fn streaming_final_result_is_bounded_and_marks_truncation() {
                 id: Some("test_op_11".to_string()),
                 args: Some(Map::new()),
                 timeout: Some(20),
-                callback: Some(Box::new(callback)),
                 subcommand_config: None,
                 log_monitor_config: monitor_config(LogLevel::Error, MonitorStream::Both),
             },
@@ -568,15 +468,17 @@ async fn streaming_final_result_is_bounded_and_marks_truncation() {
         .await;
     assert!(result.is_ok());
 
-    wait_for_completion(&updates).await;
-    let guard = updates.lock().await;
-    let output = final_result_output(&guard).expect("missing final result output");
+    let op = wait_for_completion(&monitor, "test_op_11").await;
+    let output = result_stdout_stderr(&op);
     assert!(
         output.contains("[output truncated: dropped"),
         "output: {}",
         output
     );
-    assert!(!output.contains("line-1"), "oldest lines should be dropped");
+    assert!(
+        !output.contains("line-1\n"),
+        "oldest lines should be dropped"
+    );
     assert!(
         output.contains("line-7000"),
         "latest line should be retained"

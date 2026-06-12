@@ -96,8 +96,6 @@
 // Public modules
 /// Core adapter for tool execution.
 pub mod adapter;
-/// Progress callback system for async operations.
-pub mod callback_system;
 mod check_service_ext;
 /// Client helpers for talking to Ahma.
 pub mod client;
@@ -121,8 +119,6 @@ pub mod llm_service;
 pub mod log_monitor;
 /// Logging helpers for the core crate.
 pub mod logging;
-/// MCP callback sender integration.
-pub mod mcp_callback;
 /// MCP server implementation.
 pub mod mcp_service;
 /// Operation monitor for async tasks.

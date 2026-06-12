@@ -322,6 +322,18 @@ impl OperationMonitor {
         self.append_output_line(id, line, false).await;
     }
 
+    /// Emit a transient `Progress` event on the unified stream without
+    /// persisting anything to operation state.  Used for heartbeat messages
+    /// ("still running") and wait notices that are useful live but not worth
+    /// storing.
+    pub fn note_progress(&self, id: &str, message: String) {
+        self.events.emit(OperationEvent::Progress {
+            operation_id: id.to_string(),
+            message,
+            percent: None,
+        });
+    }
+
     pub async fn append_alert(&self, id: &str, alert: String) {
         let mut ops = self.operations.write().await;
         if let Some(op) = ops.get_mut(id) {

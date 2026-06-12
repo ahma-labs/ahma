@@ -73,7 +73,6 @@ async fn test_operation_cancellation_functionality() {
             }),
             &temp_path,
             Some(30), // 30 second timeout
-            None,
         )
         .await
         .expect("Failed to start async operation");

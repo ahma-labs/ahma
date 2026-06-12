@@ -11,7 +11,9 @@ use serde_json::Map;
 pub enum ExecutionMode {
     /// Run the tool inline and return the final output to the caller.
     Synchronous,
-    /// Run the tool asynchronously and push results via callbacks.
+    /// Run the tool asynchronously; results are stored in the
+    /// `OperationMonitor` and pushed to subscribers via the unified
+    /// operation event stream.
     AsyncResultPush,
 }
 
@@ -23,8 +25,6 @@ pub struct AsyncExecOptions<'a> {
     pub args: Option<Map<String, serde_json::Value>>,
     /// Timeout in seconds for the command; falls back to shell pool default if None.
     pub timeout: Option<u64>,
-    /// Optional callback to receive progress and final result notifications.
-    pub callback: Option<Box<dyn crate::callback_system::CallbackSender>>,
     /// Subcommand configuration for handling positional arguments and aliases.
     pub subcommand_config: Option<&'a crate::config::SubcommandConfig>,
     /// Optional log monitor configuration for live stderr/stdout monitoring.

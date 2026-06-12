@@ -3,9 +3,10 @@
 //! These tests exercise the full pipeline at two layers:
 //!
 //! **Layer 1 — Handler integration** (`handle_livelog_start` → `run_livelog_pipeline`):
-//! Calls the handler directly with a mock callback and a wiremock LLM endpoint.  Verifies
-//! that the operation lifecycle (registered → in-progress → completed) and the
-//! `ProgressUpdate::LogAlert` notification delivery work end-to-end.
+//! Calls the handler directly with a wiremock LLM endpoint.  Verifies that the
+//! operation lifecycle (registered → in-progress → completed) and alert
+//! recording (`Operation::alerts`, emitted as `Alert` events on the unified
+//! stream) work end-to-end.
 //!
 //! **Layer 2 — MCP dispatch** (`tools/call` → handler):
 //! Uses an in-process MCP pair to verify that the MCP service routes livelog tool calls
@@ -17,11 +18,10 @@
 //! - `tempfile::tempdir()` for all filesystem state (no repository pollution).
 
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use async_trait::async_trait;
 use serde_json::json;
 use tempfile::tempdir;
 use tokio::fs;
@@ -32,7 +32,6 @@ use wiremock::{
 };
 
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
-use ahma_mcp::callback_system::{CallbackError, CallbackSender, ProgressUpdate};
 use ahma_mcp::config::{LivelogConfig, LlmProviderConfig, ToolConfig, ToolType};
 use ahma_mcp::mcp_service::handlers::livelog_tool::handle_livelog_start;
 use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor, OperationStatus};
@@ -43,40 +42,6 @@ use ahma_mcp::test_utils::concurrency::{
 use ahma_mcp::test_utils::in_process::create_in_process_mcp_from_dir;
 use ahma_mcp::utils::logging::init_test_logging;
 use rmcp::model::CallToolRequestParams;
-
-// ---------------------------------------------------------------------------
-// Shared mock callback sender
-// ---------------------------------------------------------------------------
-
-/// Captures all `ProgressUpdate::LogAlert` notifications emitted by the pipeline.
-#[derive(Clone, Default)]
-struct MockCallback {
-    alerts: Arc<Mutex<Vec<ProgressUpdate>>>,
-}
-
-impl MockCallback {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn captured_alerts(&self) -> Vec<ProgressUpdate> {
-        self.alerts.lock().unwrap().clone()
-    }
-}
-
-#[async_trait]
-impl CallbackSender for MockCallback {
-    async fn send_progress(&self, update: ProgressUpdate) -> Result<(), CallbackError> {
-        if matches!(update, ProgressUpdate::LogAlert { .. }) {
-            self.alerts.lock().unwrap().push(update);
-        }
-        Ok(())
-    }
-
-    async fn should_cancel(&self) -> bool {
-        false
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -148,11 +113,20 @@ fn poll_interval() -> Duration {
     TestTimeouts::poll_interval()
 }
 
+/// Fetch the alerts recorded on a finished operation (from completion history).
+async fn completed_alerts(monitor: &OperationMonitor, op_id: &str) -> Vec<String> {
+    monitor
+        .wait_for_operation(op_id)
+        .await
+        .map(|op| op.alerts)
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Layer 1 — Handler integration tests
 // ---------------------------------------------------------------------------
 
-/// Full pipeline: echo produces one line, LLM returns an issue summary → one LogAlert.
+/// Full pipeline: echo produces one line, LLM returns an issue summary → one alert.
 #[tokio::test]
 async fn test_livelog_handler_issue_detected_sends_alert() {
     init_test_logging();
@@ -181,14 +155,12 @@ async fn test_livelog_handler_issue_detected_sends_alert() {
         ),
     );
 
-    let callback = MockCallback::new();
     let op_id = handle_livelog_start(
         "test-op-issue".to_string(),
         &config,
         &serde_json::Map::new(),
         monitor.clone(),
         sandbox,
-        Some(Box::new(callback.clone())),
         Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
@@ -202,45 +174,36 @@ async fn test_livelog_handler_issue_detected_sends_alert() {
         "operation '{op_id}' should reach a terminal state within the timeout"
     );
 
-    // Verify the operation reached Completed (not Failed/Cancelled).
-    let op = monitor.get_operation(&op_id).await;
-    if let Some(op) = op {
-        assert_eq!(
-            op.state,
-            OperationStatus::Completed,
-            "operation should be Completed, was {:?}",
-            op.state
-        );
-    }
-
-    // Verify exactly one alert was delivered.
-    let alerts = callback.captured_alerts();
+    // Verify the operation reached Completed (not Failed/Cancelled) and
+    // carries exactly one alert containing the LLM diagnosis and raw context.
+    let op = monitor
+        .wait_for_operation(&op_id)
+        .await
+        .expect("completed operation should be in history");
     assert_eq!(
-        alerts.len(),
-        1,
-        "expected exactly one LogAlert, got: {alerts:?}"
+        op.state,
+        OperationStatus::Completed,
+        "operation should be Completed, was {:?}",
+        op.state
     );
-
-    match &alerts[0] {
-        ProgressUpdate::LogAlert {
-            id,
-            llm_summary,
-            trigger_lines,
-            ..
-        } => {
-            assert_eq!(id, "test-op-issue", "alert id should match operation id");
-            let summary = llm_summary.as_deref().unwrap_or("");
-            assert!(
-                summary.contains("NullPointerException"),
-                "summary should mention the exception, got: {summary}"
-            );
-            assert!(trigger_lines.is_some(), "trigger_lines should be populated");
-        }
-        other => panic!("expected LogAlert, got: {other:?}"),
-    }
+    assert_eq!(
+        op.alerts.len(),
+        1,
+        "expected exactly one alert, got: {:?}",
+        op.alerts
+    );
+    let alert = &op.alerts[0];
+    assert!(
+        alert.contains("NullPointerException"),
+        "alert should mention the exception, got: {alert}"
+    );
+    assert!(
+        alert.contains("FATAL EXCEPTION"),
+        "alert should contain the raw log context, got: {alert}"
+    );
 }
 
-/// Full pipeline: echo produces one line, LLM returns "CLEAN" → no LogAlert.
+/// Full pipeline: echo produces one line, LLM returns "CLEAN" → no alert.
 #[tokio::test]
 async fn test_livelog_handler_clean_response_no_alert() {
     init_test_logging();
@@ -265,14 +228,12 @@ async fn test_livelog_handler_clean_response_no_alert() {
         ),
     );
 
-    let callback = MockCallback::new();
     let op_id = handle_livelog_start(
         "test-op-clean".to_string(),
         &config,
         &serde_json::Map::new(),
         monitor.clone(),
         sandbox,
-        Some(Box::new(callback.clone())),
         Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
@@ -282,7 +243,7 @@ async fn test_livelog_handler_clean_response_no_alert() {
         wait_for_operation_terminal(&monitor, &op_id, ci_default_timeout(), poll_interval()).await;
     assert!(completed, "operation should complete");
 
-    let alerts = callback.captured_alerts();
+    let alerts = completed_alerts(&monitor, &op_id).await;
     assert!(
         alerts.is_empty(),
         "expected no alerts for CLEAN response, got: {alerts:?}"
@@ -291,7 +252,7 @@ async fn test_livelog_handler_clean_response_no_alert() {
 
 /// Pipeline continues after first alert: three chunks, no cooldown → three alerts.
 ///
-/// This validates that the pipeline keeps running and sending notifications after
+/// This validates that the pipeline keeps running and recording alerts after
 /// the first alert is delivered — a subtle regression risk.
 #[cfg(unix)]
 #[tokio::test]
@@ -323,14 +284,12 @@ async fn test_livelog_handler_multiple_alerts_pipeline_continues() {
         ),
     );
 
-    let callback = MockCallback::new();
     let op_id = handle_livelog_start(
         "test-op-multi".to_string(),
         &config,
         &serde_json::Map::new(),
         monitor.clone(),
         sandbox,
-        Some(Box::new(callback.clone())),
         Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
@@ -340,7 +299,7 @@ async fn test_livelog_handler_multiple_alerts_pipeline_continues() {
         wait_for_operation_terminal(&monitor, &op_id, ci_default_timeout(), poll_interval()).await;
     assert!(completed, "operation should complete");
 
-    let alerts = callback.captured_alerts();
+    let alerts = completed_alerts(&monitor, &op_id).await;
     assert_eq!(
         alerts.len(),
         3,
@@ -380,14 +339,12 @@ async fn test_livelog_handler_cooldown_suppresses_second_alert() {
 
     let config = make_tool_config("test-livelog", livelog);
 
-    let callback = MockCallback::new();
     let op_id = handle_livelog_start(
         "test-op-cooldown".to_string(),
         &config,
         &serde_json::Map::new(),
         monitor.clone(),
         sandbox,
-        Some(Box::new(callback.clone())),
         Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
@@ -397,7 +354,7 @@ async fn test_livelog_handler_cooldown_suppresses_second_alert() {
         wait_for_operation_terminal(&monitor, &op_id, ci_default_timeout(), poll_interval()).await;
     assert!(completed, "operation should complete");
 
-    let alerts = callback.captured_alerts();
+    let alerts = completed_alerts(&monitor, &op_id).await;
     assert_eq!(
         alerts.len(),
         1,
@@ -427,14 +384,12 @@ async fn test_livelog_handler_cancel_via_monitor_stops_pipeline() {
         make_livelog_config("sleep", vec!["60".to_string()], &server.uri()),
     );
 
-    let callback = MockCallback::new();
     let op_id = handle_livelog_start(
         "test-op-cancel".to_string(),
         &config,
         &serde_json::Map::new(),
         monitor.clone(),
         sandbox,
-        Some(Box::new(callback.clone())),
         Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
@@ -460,7 +415,7 @@ async fn test_livelog_handler_cancel_via_monitor_stops_pipeline() {
         "pipeline should stop promptly after cancellation, took {elapsed:.2?}"
     );
     assert!(
-        callback.captured_alerts().is_empty(),
+        completed_alerts(&monitor, &op_id).await.is_empty(),
         "no alerts expected after cancellation"
     );
 }
@@ -486,14 +441,12 @@ async fn test_livelog_handler_llm_http_error_graceful() {
         make_livelog_config("echo", vec!["some log output".to_string()], &server.uri()),
     );
 
-    let callback = MockCallback::new();
     let op_id = handle_livelog_start(
         "test-op-llm-err".to_string(),
         &config,
         &serde_json::Map::new(),
         monitor.clone(),
         sandbox,
-        Some(Box::new(callback.clone())),
         Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await
@@ -507,7 +460,7 @@ async fn test_livelog_handler_llm_http_error_graceful() {
         "pipeline should complete even when LLM returns HTTP 500"
     );
     assert!(
-        callback.captured_alerts().is_empty(),
+        completed_alerts(&monitor, &op_id).await.is_empty(),
         "no alerts expected when LLM errors"
     );
 }
@@ -537,7 +490,6 @@ async fn test_livelog_handler_missing_livelog_block_returns_error() {
         &serde_json::Map::new(),
         monitor.clone(),
         sandbox,
-        None,
         Arc::new(ahma_mcp::DefaultLlmCompletionService),
     )
     .await;
@@ -559,9 +511,9 @@ async fn test_livelog_handler_missing_livelog_block_returns_error() {
 
 /// `tools/call` on a livelog tool returns "Live log monitoring started" immediately.
 ///
-/// This verifies the MCP service dispatch path (mcp_service/mod.rs ~line 728) is
-/// wired correctly: `ToolType::Livelog` → `handle_livelog_start` → operation ID
-/// returned as tool content.
+/// This verifies the MCP service dispatch path is wired correctly:
+/// `ToolType::Livelog` → `handle_livelog_start` → operation ID returned as
+/// tool content.
 #[tokio::test]
 async fn test_livelog_mcp_dispatch_returns_operation_id() -> Result<()> {
     init_test_logging();

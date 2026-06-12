@@ -39,6 +39,7 @@
 pub mod bundle_registry;
 mod config_watcher;
 pub mod handlers;
+pub mod progress_push;
 pub mod schema;
 mod sequence;
 mod subcommand;
@@ -71,88 +72,15 @@ use tracing::Instrument as _;
 
 use crate::{
     adapter::Adapter,
-    callback_system::CallbackSender,
     client_type::McpClientType,
     config::ToolConfig,
     file_ops::{DefaultFileOpsProvider, DefaultWebPageFetcher, FileOpsProvider, WebPageFetcher},
     llm_service::{DefaultLlmCompletionService, LlmCompletionService},
-    mcp_callback::McpCallbackSender,
     operation_monitor::{Operation, OperationStatus},
 };
 use serde_json::Value;
 
 pub(crate) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
-struct VaultAuditCallback {
-    inner: Option<Box<dyn CallbackSender>>,
-    audit_log_path: PathBuf,
-    operation_id: String,
-}
-
-impl VaultAuditCallback {
-    fn new(
-        inner: Option<Box<dyn CallbackSender>>,
-        audit_log_path: PathBuf,
-        operation_id: String,
-    ) -> Self {
-        Self {
-            inner,
-            audit_log_path,
-            operation_id,
-        }
-    }
-
-    async fn emit_completion_for_update(&self, update: &crate::callback_system::ProgressUpdate) {
-        let completion = match update {
-            crate::callback_system::ProgressUpdate::FinalResult {
-                success,
-                duration_ms,
-                ..
-            } => Some((*success, *duration_ms)),
-            crate::callback_system::ProgressUpdate::Completed { duration_ms, .. } => {
-                Some((true, *duration_ms))
-            }
-            crate::callback_system::ProgressUpdate::Failed { duration_ms, .. }
-            | crate::callback_system::ProgressUpdate::Cancelled { duration_ms, .. } => {
-                Some((false, *duration_ms))
-            }
-            _ => None,
-        };
-
-        if let Some((success, duration_ms)) = completion {
-            let _ = AhmaMcpService::append_tool_complete_event(
-                &self.audit_log_path,
-                &self.operation_id,
-                success,
-                duration_ms,
-            )
-            .await;
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl CallbackSender for VaultAuditCallback {
-    async fn send_progress(
-        &self,
-        update: crate::callback_system::ProgressUpdate,
-    ) -> Result<(), crate::callback_system::CallbackError> {
-        self.emit_completion_for_update(&update).await;
-        if let Some(inner) = &self.inner {
-            inner.send_progress(update).await
-        } else {
-            Ok(())
-        }
-    }
-
-    async fn should_cancel(&self) -> bool {
-        if let Some(inner) = &self.inner {
-            inner.should_cancel().await
-        } else {
-            false
-        }
-    }
-}
 
 /// `AhmaMcpService` is the server handler for the MCP service.
 #[derive(Clone)]
@@ -198,6 +126,13 @@ pub struct AhmaMcpService {
     pub output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     /// Safety harness guard context.
     pub harness_guard: Arc<tokio::sync::Mutex<crate::harness_guard::HarnessGuard>>,
+    /// Routes unified operation events to the MCP client as progress
+    /// notifications (per-operation peer + progress token registration).
+    pub progress_push: Arc<progress_push::ProgressPushRouter>,
+    /// Operation ids whose `tool_call` was written to the vault audit log;
+    /// the audit subscriber records the matching `tool_complete` on the
+    /// terminal event and removes the id.
+    pub vault_audited_ops: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl AhmaMcpService {
@@ -345,6 +280,12 @@ impl AhmaMcpService {
         let Some(audit_log_path) = self.task_vault_audit_log_path() else {
             return;
         };
+        // Track the id so the vault audit subscriber records the matching
+        // tool_complete when the operation's terminal event arrives.  Sync
+        // paths call emit_vault_tool_complete directly, which removes the id.
+        if let Ok(mut set) = self.vault_audited_ops.lock() {
+            set.insert(operation_id.to_string());
+        }
         if let Err(e) =
             Self::append_tool_call_event(&audit_log_path, operation_id, tool_name, args_summary)
                 .await
@@ -357,6 +298,10 @@ impl AhmaMcpService {
         let Some(audit_log_path) = self.task_vault_audit_log_path() else {
             return;
         };
+        // Sync paths complete directly — drop any pending subscriber tracking.
+        if let Ok(mut set) = self.vault_audited_ops.lock() {
+            set.remove(operation_id);
+        }
         if let Err(e) =
             Self::append_tool_complete_event(&audit_log_path, operation_id, success, duration_ms)
                 .await
@@ -382,21 +327,6 @@ impl AhmaMcpService {
         {
             tracing::warn!("Failed to append vault file_staged audit event: {}", e);
         }
-    }
-
-    fn wrap_callback_with_vault_audit(
-        &self,
-        callback: Option<Box<dyn CallbackSender>>,
-        operation_id: &str,
-    ) -> Option<Box<dyn CallbackSender>> {
-        let Some(audit_log_path) = self.task_vault_audit_log_path() else {
-            return callback;
-        };
-        Some(Box::new(VaultAuditCallback::new(
-            callback,
-            audit_log_path,
-            operation_id.to_string(),
-        )))
     }
 
     async fn maybe_stage_configured_delete(
@@ -466,7 +396,10 @@ impl AhmaMcpService {
             operation_monitor.clone(),
         );
 
-        Ok(Self {
+        let progress_push = progress_push::ProgressPushRouter::new();
+        progress_push.spawn_forwarder(&operation_monitor);
+
+        let service = Self {
             adapter,
             operation_monitor,
             configs: Arc::new(RwLock::new((*configs).clone())),
@@ -496,7 +429,53 @@ impl AhmaMcpService {
             harness_guard: Arc::new(tokio::sync::Mutex::new(
                 crate::harness_guard::HarnessGuard::new(false),
             )),
-        })
+            progress_push,
+            vault_audited_ops: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
+        service.spawn_vault_audit_subscriber();
+        Ok(service)
+    }
+
+    /// Subscribe to the unified event stream and append a `tool_complete`
+    /// vault audit record when an audited operation reaches a terminal state.
+    fn spawn_vault_audit_subscriber(&self) {
+        let service = self.clone();
+        let mut rx = self.operation_monitor.subscribe_events();
+        tokio::spawn(async move {
+            loop {
+                let event = match rx.recv().await {
+                    Ok(ev) => ev,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("vault audit subscriber lagged {n} events");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if !event.is_terminal() {
+                    continue;
+                }
+                let op_id = event.operation_id().to_string();
+                let audited = service
+                    .vault_audited_ops
+                    .lock()
+                    .map(|mut set| set.remove(&op_id))
+                    .unwrap_or(false);
+                if !audited {
+                    continue;
+                }
+                use ahma_common::event_dispatcher::OperationEvent;
+                let (success, duration_ms) = match event.as_ref() {
+                    OperationEvent::Completed { duration_ms, .. } => (true, *duration_ms),
+                    OperationEvent::Failed { duration_ms, .. }
+                    | OperationEvent::Cancelled { duration_ms, .. }
+                    | OperationEvent::TimedOut { duration_ms, .. } => (false, *duration_ms),
+                    _ => (false, 0),
+                };
+                service
+                    .emit_vault_tool_complete(&op_id, success, duration_ms)
+                    .await;
+            }
+        });
     }
 
     /// Sets a custom file operations provider.
@@ -752,49 +731,6 @@ impl AhmaMcpService {
         format!("Execute {} in {}", base_command, working_directory)
     }
 
-    fn sync_started_progress_update(
-        id: &str,
-        base_command: &str,
-        working_directory: &str,
-    ) -> crate::callback_system::ProgressUpdate {
-        crate::callback_system::ProgressUpdate::Started {
-            id: id.to_string(),
-            command: base_command.to_string(),
-            description: Self::sync_tool_progress_description(base_command, working_directory),
-        }
-    }
-
-    fn sync_final_progress_update<E: std::fmt::Display>(
-        id: &str,
-        base_command: &str,
-        working_directory: &str,
-        result: &Result<String, E>,
-    ) -> crate::callback_system::ProgressUpdate {
-        let description = Self::sync_tool_progress_description(base_command, working_directory);
-        let working_directory = working_directory.to_string();
-
-        match result {
-            Ok(output) => crate::callback_system::ProgressUpdate::FinalResult {
-                id: id.to_string(),
-                command: base_command.to_string(),
-                description,
-                working_directory,
-                success: true,
-                duration_ms: 0,
-                full_output: output.clone(),
-            },
-            Err(e) => crate::callback_system::ProgressUpdate::FinalResult {
-                id: id.to_string(),
-                command: base_command.to_string(),
-                description,
-                working_directory,
-                success: false,
-                duration_ms: 0,
-                full_output: format!("Error: {}", e),
-            },
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn call_sync_tool(
         &self,
@@ -812,16 +748,23 @@ impl AhmaMcpService {
         self.emit_vault_tool_call(&id, base_command, &Self::summarize_arguments(&arguments))
             .await;
 
-        if let Some(token) = progress_token.clone() {
-            let callback =
-                McpCallbackSender::new(peer.clone(), id.clone(), Some(token), client_type);
-            let _ = callback
-                .send_progress(Self::sync_started_progress_update(
-                    &id,
-                    base_command,
-                    working_directory,
-                ))
-                .await;
+        // Sync operations never enter the OperationMonitor, so the event
+        // forwarder cannot see them — push start/final progress directly.
+        let push_enabled = progress_token.is_some() && client_type.supports_progress();
+        if let Some(token) = progress_token.clone()
+            && push_enabled
+        {
+            progress_push::push_progress(
+                &peer,
+                token,
+                0.0,
+                format!(
+                    "{base_command}: {}",
+                    Self::sync_tool_progress_description(base_command, working_directory)
+                ),
+                false,
+            )
+            .await;
         }
 
         let result = self
@@ -839,11 +782,23 @@ impl AhmaMcpService {
         self.emit_vault_tool_complete(&id, result.is_ok(), duration_ms)
             .await;
 
-        if let Some(token) = progress_token {
-            let callback = McpCallbackSender::new(peer, id.clone(), Some(token), client_type);
-            let final_update =
-                Self::sync_final_progress_update(&id, base_command, working_directory, &result);
-            let _ = callback.send_progress(final_update).await;
+        if let Some(token) = progress_token
+            && push_enabled
+        {
+            let (success, full_output) = match &result {
+                Ok(output) => (true, output.clone()),
+                Err(e) => (false, format!("Error: {}", e)),
+            };
+            let message = progress_push::sync_final_message(
+                &id,
+                base_command,
+                &Self::sync_tool_progress_description(base_command, working_directory),
+                working_directory,
+                success,
+                duration_ms,
+                &full_output,
+            );
+            progress_push::push_progress(&peer, token, 100.0, message, true).await;
         }
 
         match result {
@@ -874,15 +829,11 @@ impl AhmaMcpService {
         self.emit_vault_tool_call(&id, tool_name, &Self::summarize_arguments(&arguments))
             .await;
 
-        let callback: Option<Box<dyn CallbackSender>> = progress_token.map(|token| {
-            Box::new(McpCallbackSender::new(
-                peer,
-                id.clone(),
-                Some(token),
-                client_type,
-            )) as Box<dyn CallbackSender>
-        });
-        let callback = self.wrap_callback_with_vault_audit(callback, &id);
+        if let Some(token) = progress_token {
+            self.progress_push
+                .register(&id, peer, token, client_type)
+                .await;
+        }
 
         let log_monitor_config = config.monitor_level.as_deref().map(|level_str| {
             let level = level_str
@@ -910,7 +861,6 @@ impl AhmaMcpService {
                     id: Some(id.clone()),
                     args: Some(arguments),
                     timeout,
-                    callback,
                     subcommand_config: Some(subcommand_config),
                     log_monitor_config,
                 },
@@ -932,6 +882,9 @@ impl AhmaMcpService {
                 )))
             }
             Err(e) => {
+                // The operation never started, so no terminal event will
+                // arrive to clean up the push registration.
+                self.progress_push.unregister(&id).await;
                 self.emit_vault_tool_complete(&id, false, 0).await;
                 let error_message = format!("Failed to start asynchronous operation: {}", e);
                 tracing::error!("{}", error_message);
@@ -1570,14 +1523,11 @@ impl AhmaMcpService {
 
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
-        let callback: Option<Box<dyn CallbackSender>> = progress_token.map(|token| {
-            Box::new(McpCallbackSender::new(
-                context.peer.clone(),
-                op_id.clone(),
-                Some(token),
-                client_type,
-            )) as Box<dyn CallbackSender>
-        });
+        if let Some(token) = progress_token {
+            self.progress_push
+                .register(&op_id, context.peer.clone(), token, client_type)
+                .await;
+        }
 
         let op_id_clone = op_id.clone();
         let monitor_clone = monitor.clone();
@@ -1587,17 +1537,12 @@ impl AhmaMcpService {
                 .update_status(&op_id_clone, OperationStatus::InProgress, None)
                 .await;
 
-            let cb_ref: Option<&(dyn CallbackSender + Send + Sync)> = callback
-                .as_ref()
-                .map(|b| b.as_ref() as &(dyn CallbackSender + Send + Sync));
-
             crate::livelog::run_file_monitor_pipeline(
                 &op_id_clone,
                 safe_path,
                 detection_prompt,
                 llm_provider,
                 cancellation_token,
-                cb_ref,
                 monitor_clone.clone(),
                 llm_service_clone,
             )
@@ -1690,6 +1635,7 @@ impl AhmaMcpService {
             return sequence::handle_sequence_tool(
                 &self.adapter,
                 &self.operation_monitor,
+                &self.progress_push,
                 &self.configs,
                 &config,
                 params,
@@ -1821,6 +1767,7 @@ impl AhmaMcpService {
         if subcommand_config.sequence.is_some() {
             return sequence::handle_subcommand_sequence(
                 &self.adapter,
+                &self.progress_push,
                 &config,
                 subcommand_config,
                 params,
@@ -1886,21 +1833,17 @@ impl AhmaMcpService {
         let op_id = format!("livelog_{}", NEXT_ID.fetch_add(1, Ordering::SeqCst));
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
-        let callback: Option<Box<dyn CallbackSender>> = progress_token.map(|token| {
-            Box::new(McpCallbackSender::new(
-                context.peer.clone(),
-                op_id.clone(),
-                Some(token),
-                client_type,
-            )) as Box<dyn CallbackSender>
-        });
+        if let Some(token) = progress_token {
+            self.progress_push
+                .register(&op_id, context.peer.clone(), token, client_type)
+                .await;
+        }
         match handlers::livelog_tool::handle_livelog_start(
             op_id.clone(),
             config,
             &params_map,
             self.operation_monitor.clone(),
             self.adapter.sandbox_arc(),
-            callback,
             self.llm_service.clone(),
         )
         .await
@@ -1910,6 +1853,7 @@ impl AhmaMcpService {
                  Use `status` or `await` to check progress, `cancel` to stop."
             ))),
             Err(e) => {
+                self.progress_push.unregister(&op_id).await;
                 let msg = format!("Failed to start livelog '{}': {}", config.name, e);
                 tracing::error!("{}", msg);
                 Err(handlers::common::mcp_internal(msg))
