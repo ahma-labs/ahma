@@ -158,10 +158,7 @@ mod unix {
                 )
             };
             if rc != 0 {
-                anyhow::bail!(
-                    "openpty failed: {}",
-                    std::io::Error::last_os_error()
-                );
+                anyhow::bail!("openpty failed: {}", std::io::Error::last_os_error());
             }
             // SAFETY: openpty returned valid, owned file descriptors.
             unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
@@ -253,20 +250,20 @@ mod unix {
     ) {
         let start_time = Instant::now();
 
-        let (killer, mut line_rx, mut exit_rx) =
-            match setup_pty(sandbox, command_str, working_dir) {
-                Ok(parts) => parts,
-                Err(e) => {
-                    monitor
-                        .update_status(
-                            op_id,
-                            OperationStatus::Failed,
-                            Some(Value::String(format!("Failed to start PTY command: {e}"))),
-                        )
-                        .await;
-                    return;
-                }
-            };
+        let (killer, mut line_rx, mut exit_rx) = match setup_pty(sandbox, command_str, working_dir)
+        {
+            Ok(parts) => parts,
+            Err(e) => {
+                monitor
+                    .update_status(
+                        op_id,
+                        OperationStatus::Failed,
+                        Some(Value::String(format!("Failed to start PTY command: {e}"))),
+                    )
+                    .await;
+                return;
+            }
+        };
 
         let mut spill_writer = spill::SpillWriter::create(op_id).await;
         let mut collected = crate::adapter::BoundedLineCollector::default();

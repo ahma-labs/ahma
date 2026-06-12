@@ -645,10 +645,7 @@ impl Adapter {
             .await;
             task_handles.lock().await.remove(&op_id_task);
         });
-        self.task_handles
-            .lock()
-            .await
-            .insert(op_id.clone(), handle);
+        self.task_handles.lock().await.insert(op_id.clone(), handle);
 
         Ok(op_id)
     }
@@ -717,10 +714,7 @@ impl Adapter {
             .await;
             task_handles.lock().await.remove(&op_id_task);
         });
-        self.task_handles
-            .lock()
-            .await
-            .insert(op_id.clone(), handle);
+        self.task_handles.lock().await.insert(op_id.clone(), handle);
 
         Ok(op_id)
     }
@@ -1063,7 +1057,9 @@ async fn run_session_operation(
             } else {
                 OperationStatus::Failed
             };
-            monitor.update_status(op_id, status, Some(final_output)).await;
+            monitor
+                .update_status(op_id, status, Some(final_output))
+                .await;
         }
         Err(e) => {
             let timed_out = e.to_string().contains("timed out");

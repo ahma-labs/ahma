@@ -139,7 +139,9 @@ async fn pty_output_reaches_tail_and_spill() {
 
     let op = wait_done(&monitor, &id).await;
     assert!(
-        op.stdout_tail.iter().any(|l| l.contains("pty-spill-marker")),
+        op.stdout_tail
+            .iter()
+            .any(|l| l.contains("pty-spill-marker")),
         "tail: {:?}",
         op.stdout_tail
     );
