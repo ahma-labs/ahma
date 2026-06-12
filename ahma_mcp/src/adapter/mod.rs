@@ -1002,9 +1002,14 @@ async fn run_session_operation(
 
             _ = cancellation_token.cancelled() => {
                 tracing::info!("Session operation {} cancelled", op_id);
-                // The shell may be mid-command — destroy the session so its
-                // next user gets a clean shell.
-                sessions.close_session(session_id).await;
+                // Remove the session from the map WITHOUT acquiring the per-session
+                // lock.  The exec future (pinned above) holds that lock; calling
+                // close_session here would deadlock.  Instead we evict the session
+                // from the map so it won't be reused.  When this function returns,
+                // `exec` is dropped, the MutexGuard is released, and the ShellSession
+                // Arc ref-count reaches zero — at which point kill_on_drop(true) on
+                // the child kills the shell and its children.
+                sessions.remove_session(session_id).await;
                 spill_writer.finish().await;
                 monitor
                     .update_status(

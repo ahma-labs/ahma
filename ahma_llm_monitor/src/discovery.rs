@@ -14,6 +14,7 @@ pub async fn discover_local_providers() -> Result<Vec<LocalProvider>, LlmMonitor
 
     let mut discovered = Vec::new();
     let mut seen_urls = std::collections::HashSet::new();
+    let mut seen_names = std::collections::HashSet::new();
 
     for (name, url) in endpoints {
         if seen_urls.contains(url) {
@@ -23,12 +24,16 @@ pub async fn discover_local_providers() -> Result<Vec<LocalProvider>, LlmMonitor
         let client = LlmClient::new(url, "", None);
         let models = client.list_model().await;
         if !models.is_empty() {
+            if seen_names.contains(name) {
+                continue;
+            }
             discovered.push(LocalProvider {
                 name: name.to_string(),
                 base_url: url.to_string(),
                 models,
             });
             seen_urls.insert(url.to_string());
+            seen_names.insert(name.to_string());
         }
     }
 

@@ -44,6 +44,7 @@
 | Live Log Monitoring (LLM) | tests-pass | `tool_type: livelog` routes to LLM analysis pipeline; `ahma_llm_monitor` crate; OpenAI-compatible providers |
 | TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
 | Local Cluster Scheduler | tests-pass | mDNS discovery and signed task dispatch to remote worker peers |
+| Configuration Standard (R-CFG) | PLANNED | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5) |
 | `ahma cluster remove` | tests-pass | Subcommand to remove worker peers from peers configuration |
 
 ---
@@ -214,7 +215,7 @@ All operation lifecycle data flows through ONE broadcast stream of
 ### R2: Async-First Architecture
 
 - **R2.1**: Operations **must** execute asynchronously by default, returning an `id` immediately.
-- **R2.2**: On completion, the system **must** store results reliably in `OperationMonitor` (pull channel) and **should** push a best-effort MCP progress notification. Clients rely on the `await` tool for guaranteed result delivery; the push notification is an optimistic shortcut to avoid a round-trip` (pull channel) and **should** push a best-effort MCP progress notification. Clients rely on the `await` tool for guaranteed result delivery; the push notification is an optimistic shortcut to avoid a round-trip.
+- **R2.2**: On completion, the system **must** store results reliably in `OperationMonitor` (pull channel) and **should** push a best-effort MCP progress notification. Clients rely on the `await` tool for guaranteed result delivery; the push notification is an optimistic shortcut to avoid a round-trip.
 - **R2.3**: **Static Synchronous Flag (DEPRECATED)**: The static `"synchronous": true/false` configuration in tool and subcommand JSON definitions is deprecated. Code calling tools should not rely on static config.
 - **R2.4**: **Dynamic Resolution**: Execution mode (blocking/synchronous vs non-blocking/asynchronous) is resolved dynamically per-invocation using the `blocking` boolean parameter in the MCP `tools/call` arguments. If not specified, tool execution defaults to asynchronous.
 
@@ -231,6 +232,68 @@ All operation lifecycle data flows through ONE broadcast stream of
 
 ---
 
+## 3.5 Configuration Standard (R-CFG)
+
+Server configuration (everything except MTDF tool definitions) **must** be deterministic, inspectable, and tamper-resistant. Environment variables are ambient, persistent state: they leak across sessions, are settable by any process sharing the user's environment, and are invisible at the invocation site. They are therefore being removed as a configuration source. This section is the single source of truth for configuration resolution; where older sections (R5.3, R21.4, `docs/environment-variables.md`) conflict, R-CFG wins.
+
+### R-CFG1: Configuration Sources and Precedence
+
+- **R-CFG1.1**: There are exactly four configuration sources, resolved highest-precedence first:
+  1. **CLI flags** — including flags passed via the `args` array in an IDE's `mcp.json`. This is the canonical way to configure ahma per-project from an MCP client.
+  2. **Project settings** — `<workspace>/.ahma/settings.toml` (Preference-tier keys only, see R-CFG2).
+  3. **User settings** — `~/.ahma/settings.toml` (or `--settings-path <file>`).
+  4. **Compiled-in defaults**.
+- **R-CFG1.2**: `AHMA_*` environment variables are **not** a configuration source. During the migration window (R-CFG7) a set `AHMA_*` variable produces a startup `warn` naming the replacement flag/key; after the window it is ignored with the same warning. Security-tier variables (R-CFG2.1) are ignored **immediately** — there is no migration honoring for them.
+- **R-CFG1.3**: The only environment variables production code may read are: (a) platform/ecosystem standards (`HOME`, `PATH`, `RUST_LOG`, `NO_COLOR`, `TERM`, `XDG_*`, `APPDATA`, `USERPROFILE`, `OTEL_*`, `TRACEPARENT`), and (b) **internal plumbing** variables used for parent→child process communication (e.g. `AHMA_MCP_ARGS` bridge→subprocess). Internal plumbing variables **must** be listed in a single table in `docs/environment-variables.md` marked `INTERNAL`, **must** be set only by ahma itself, and **must never** widen security scope relative to the parent's resolved configuration.
+- **R-CFG1.4**: Every boolean setting **must** be expressible as on *and* off at every source level (`--x` / `--no-x` flag pairs; `Option<bool>` settings keys). OR-combining sources (where any source can enable but none can disable) is forbidden — a higher-precedence source **must** be able to turn a lower-precedence setting off.
+
+### R-CFG2: Trust Tiers
+
+- **R-CFG2.1**: Every setting is classified into one of two tiers:
+  - **Security tier (S)**: anything that weakens or shapes the security boundary — sandbox disable/defer, sandbox scopes, working dirs, temp access, package-cache write, task vault, auth token and token path, rate limits, TLS directory, session isolation, update signature verification.
+  - **Preference tier (P)**: everything else — timeouts, tool bundles, tools dir, hot reload, logging, token minimization, instance label, transport tuning.
+- **R-CFG2.2**: Security-tier settings **must not** be honored from the project settings file. A cloned repository must not be able to weaken the sandbox that is about to contain it (the `.vscode/tasks.json` attack class). Security-tier keys found in `<workspace>/.ahma/settings.toml` **must** be ignored and reported at `warn` with the key names.
+- **R-CFG2.3**: The two most dangerous switches — disabling the sandbox entirely and skipping update signature verification — **must** be CLI-flag-only (`--no-sandbox`, `--insecure-skip-verify`). They may not be set from any settings file, so that they are always visible at the invocation site (process listing, `mcp.json` args) and never persist invisibly.
+- **R-CFG2.4**: Nested-sandbox auto-detection (R7) remains the only non-CLI path to a disabled internal sandbox, and **must** log why it triggered.
+
+### R-CFG3: Project Settings File
+
+- **R-CFG3.1**: `<workspace>/.ahma/settings.toml` is loaded when the tools directory auto-detection (R1.2.1) or `--tools-dir` identifies a `.ahma` directory. Same schema as user settings; Security-tier keys rejected per R-CFG2.2.
+- **R-CFG3.2**: Merge semantics are per-key scalar override (project over user). List-valued keys replace, never concatenate, so the effective value is always attributable to one source.
+- **R-CFG3.3**: `--no-settings` disables **both** settings files for the invocation.
+
+### R-CFG4: Resolve Once, Then Immutable
+
+- **R-CFG4.1**: All configuration **must** be resolved exactly once at startup into an immutable resolved-config structure passed down by constructor argument (extends R21.4). No production code may read configuration (env, settings files) after startup; runtime re-reads are a tamper channel.
+- **R-CFG4.2**: Only the configuration-resolution module may call `std::env::var*` for `AHMA_*` names. This **must** be enforced by a CI check (grep test or clippy `disallowed-methods`) with an explicit allowlist for R-CFG1.3 reads.
+- **R-CFG4.3**: The sandbox scope derived from resolved configuration remains subject to R5.1: set once, never mutated.
+
+### R-CFG5: Provenance and Observability
+
+- **R-CFG5.1**: `ahma settings show --origin` **must** print every effective setting with its value, source (`cli` / `project` / `user` / `default`), and for file sources the file path.
+- **R-CFG5.2**: At startup the server **must** log one `info` line per setting whose effective value differs from the compiled-in default, including its source. Security-tier deviations **must** log at `warn`.
+- **R-CFG5.3**: The documented precedence and the implemented precedence **must** be the same and **must** be covered by a matrix test (every source pair, at least one Preference and one Security key).
+
+### R-CFG6: Strict Parsing (Fail Closed)
+
+- **R-CFG6.1**: A settings file that exists but fails to parse **must** abort startup with a clear error. Silently falling back to defaults is forbidden — a tampered or corrupted file must not silently change behavior.
+- **R-CFG6.2**: Unknown keys in the `[sandbox]` and `[auth]` tables **must** abort startup (a typo in a security key must not be silently ignored). Unknown keys elsewhere **must** produce a `warn` listing each key (forward compatibility).
+- **R-CFG6.3**: On Unix, a settings file that is group- or world-writable **should** produce a startup `warn`.
+
+### R-CFG7: Migration Schedule
+
+- **R-CFG7.1**: Next minor release: project settings file, trust tiers, `--origin`, strict parsing, flag pairs; Security-tier `AHMA_*` variables (`AHMA_DISABLE_SANDBOX`, `AHMA_SANDBOX_SCOPE`, `AHMA_SANDBOX_DEFER`, `AHMA_WORKING_DIRS`, `AHMA_TMP_ACCESS`, `AHMA_DISABLE_TEMP`, `AHMA_NO_PACKAGE_CACHE_WRITE`, `AHMA_TASK_VAULT`, `AHMA_REQUIRE_TOKEN`, `AHMA_REQUIRE_TOKEN_PATH`, `AHMA_TLS_DIR`, `AHMA_INSECURE_SKIP_VERIFY`) ignored with `warn`. Preference-tier variables demoted below settings files and warned.
+- **R-CFG7.2**: The following minor release: all remaining `AHMA_*` configuration variables ignored. Only R-CFG1.3 allowlisted reads survive.
+- **R-CFG7.3**: `docs/environment-variables.md`, `docs/connection-modes.md` (the Antigravity example currently sets `AHMA_SANDBOX_SCOPE`; it must use `--sandbox-scope` in `args`), `skills/ahma/SKILL.md`, and README **must** be updated in the same PR as each migration step (R-DOC, R-SK6).
+
+### R-CFG8: Required Tests
+
+- **R-CFG8.1**: Red team: with `AHMA_DISABLE_SANDBOX=1` in the environment, the sandbox **must** still be enforced (write outside scope blocked).
+- **R-CFG8.2**: Red team: a project `<workspace>/.ahma/settings.toml` containing `sandbox.disable = true`, widened `sandbox.scopes`, or `auth` keys **must not** affect behavior, and the ignored keys **must** appear in startup warnings.
+- **R-CFG8.3**: Precedence matrix per R-CFG5.3; parse-failure abort per R-CFG6.1; `--no-x` overriding a settings-file `x = true` per R-CFG1.4.
+
+---
+
 ## 4. Security - Kernel-Enforced Sandboxing
 
 The sandbox scope defines the root directory boundary. AI has **full read/write access** within the sandbox but **zero read/write access** outside it. Read access outside the sandbox is strictly limited to necessary system binaries across all platforms (Linux, macOS, Windows) and explicitly granted feature scopes (see `--livelog`).
@@ -241,8 +304,10 @@ The sandbox scope defines the root directory boundary. AI has **full read/write 
 - **R5.2**: **STDIO mode**: Defaults to current working directory (IDE sets `cwd` to `${workspaceFolder}` in `mcp.json`).
 - **R5.3**: **HTTP mode**: Set once at server start via (in order of precedence):
   1. `--sandbox-scope <path>` CLI parameter
-  2. `AHMA_SANDBOX_SCOPE` environment variable
+  2. `sandbox.scopes` in the **user** settings file (`~/.ahma/settings.toml`; never the project settings file — see R-CFG2.2)
   3. Current working directory
+
+  `AHMA_SANDBOX_SCOPE` is no longer honored (R-CFG1.2): sandbox scope **must not** be settable from ambient environment state.
 - **R5.4**: **Write Protection**: The system **must** block any attempt to write to files outside the sandbox scope, including via command arguments (e.g., `touch /outside/file`).
 - **R5.5**: **Explicit Scope Override**: If `--sandbox-scope` is provided via CLI, the system **must** respect it and **must not** attempt to expand or modify it via the MCP `roots/list` protocol (roots requests are skipped). This prevents potential security bypasses where a compromised client could widen the scope, and ensures stability for clients that do not support the roots protocol.
 - **R5.6**: **Lifecycle Notifications**: The system **must** emit JSON-RPC notifications for sandbox lifecycle events:
@@ -842,7 +907,7 @@ started_rx.await.ok();  // Don't return until spawn is live
 - **R21.3**: The following patterns are **FORBIDDEN**:
   - Any different behavior based on automatic "test mode" detection from environment variables like `NEXTEST`, `CARGO_TARGET_DIR`, etc.
   - Any environment variable that bypasses security checks
-- **R21.4**: **Environment Variable Minimization**: The system **must** minimize configuration via environment variables to prevent security side-channel attacks and configuration clutter. Configuration parameters **must** be declared on the command line or in explicit configuration structures (`AppConfig`) and passed down through constructor arguments rather than being queried directly from the environment at execution time.
+- **R21.4**: **Environment Variable Minimization**: The system **must** minimize configuration via environment variables to prevent security side-channel attacks and configuration clutter. Configuration parameters **must** be declared on the command line or in explicit configuration structures (`AppConfig`) and passed down through constructor arguments rather than being queried directly from the environment at execution time. The full resolution standard, trust tiers, and env-var retirement schedule are specified in §3.5 (R-CFG), which supersedes any older text that honors `AHMA_*` variables.
 
 #### R22: Visual Minimalism
 

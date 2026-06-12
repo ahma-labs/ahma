@@ -54,6 +54,22 @@ macro_rules! deprecated_env {
     };
 }
 
+/// Emit a RETIRED warning for a security-tier env var that is now ignored.
+/// The value is NOT read or honored.
+macro_rules! warn_retired_security_env {
+    ($name:expr) => {
+        if std::env::var_os($name).is_some() {
+            tracing::warn!(concat!(
+                "Security env var ",
+                $name,
+                " is set but IGNORED (retired per R-CFG2.3). ",
+                "Use the equivalent CLI flag or ~/.ahma/settings.toml instead. ",
+                "Setting security parameters via environment variables is a tamper risk."
+            ));
+        }
+    };
+}
+
 macro_rules! check_env_flag_with_deprecation {
     ($name:expr) => {
         if std::env::var_os($name).is_some() {
@@ -252,30 +268,6 @@ impl AppConfig {
             })
             .unwrap_or(false)
     }
-
-    /// Parse `AHMA_SANDBOX_SCOPE` using the platform path-list separator.
-    fn env_sandbox_scopes() -> Vec<PathBuf> {
-        std::env::var_os("AHMA_SANDBOX_SCOPE")
-            .map(|paths| {
-                std::env::split_paths(&paths)
-                    .filter(|path| !path.as_os_str().is_empty())
-                    .map(expand_tilde)
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Parse `AHMA_WORKING_DIRS` using the platform path-list separator.
-    fn env_working_dirs() -> Vec<PathBuf> {
-        std::env::var_os("AHMA_WORKING_DIRS")
-            .map(|paths| {
-                std::env::split_paths(&paths)
-                    .filter(|path| !path.as_os_str().is_empty())
-                    .map(expand_tilde)
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
 }
 
 fn expand_tilde(path: PathBuf) -> PathBuf {
@@ -309,7 +301,7 @@ fn resolve_sandbox_policy(cfg: &AppConfig) -> SandboxPolicy {
     let tmp_access = cfg.tmp_access;
 
     let mode = if no_sandbox {
-        tracing::warn!("Ahma sandbox disabled via AHMA_DISABLE_SANDBOX or --serve flag");
+        tracing::warn!("Ahma sandbox disabled via --no-sandbox flag");
         #[cfg(target_os = "linux")]
         if let Err(error) = sandbox::check_sandbox_prerequisites() {
             tracing::warn!(
@@ -2189,13 +2181,31 @@ fn extract_tool_fields(cmd: &Subcommands) -> ToolFields {
 /// Respects `--no-settings` (skip loading entirely) and `--settings-path`
 /// (load from an alternate path instead of `~/.ahma/settings.toml`).
 pub fn load_settings(cli: &Cli) -> ahma_common::config::AhmaSettings {
+    use ahma_common::config::{AhmaSettings, settings_path};
     if cli.no_settings {
         tracing::debug!("--no-settings: using compiled-in defaults");
-        return ahma_common::config::AhmaSettings::default();
+        return AhmaSettings::default();
     }
-    match &cli.settings_path {
-        Some(p) => ahma_common::config::AhmaSettings::load_from(p),
-        None => ahma_common::config::AhmaSettings::load(),
+    // Fail closed at startup (R-CFG6.1): a settings file that exists but does
+    // not parse aborts the launch rather than silently reverting to defaults,
+    // so a tampered or corrupt file cannot quietly change behavior. A missing
+    // file is not an error.
+    let path = match &cli.settings_path {
+        Some(p) => Some(p.clone()),
+        None => settings_path(),
+    };
+    let Some(path) = path else {
+        return AhmaSettings::default();
+    };
+    match AhmaSettings::load_from_result(&path) {
+        Ok(settings) => settings,
+        Err(e) => {
+            eprintln!(
+                "ahma: fatal: {e}\n\
+                 Fix or delete the file, or run `ahma settings init --force` to reset it."
+            );
+            std::process::exit(1);
+        }
     }
 }
 
@@ -2203,25 +2213,34 @@ fn parse_execution_settings(
     cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
 ) -> (u64, bool, bool, bool) {
+    // Preference-tier: CLI > settings > env (lowest precedence during migration).
     let timeout_secs = if let Some(t) = cli.timeout {
         t
-    } else if let Some(val) =
-        get_env_var_with_deprecation!("AHMA_TIMEOUT").and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        val
     } else {
-        s.tools.timeout_secs
+        if let Some(val) = get_env_var_with_deprecation!("AHMA_TIMEOUT")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            if s.tools.timeout_secs != ahma_common::config::ToolSettings::default().timeout_secs {
+                s.tools.timeout_secs
+            } else {
+                val
+            }
+        } else {
+            s.tools.timeout_secs
+        }
     };
 
-    let force_sync =
-        cli.sync || check_env_flag_with_deprecation!("AHMA_SYNC") || s.tools.force_sync;
+    let force_sync = cli.sync
+        || s.tools.force_sync
+        || check_env_flag_with_deprecation!("AHMA_SYNC");
 
-    let hot_reload_tools =
-        cli.hot_reload || check_env_flag_with_deprecation!("AHMA_HOT_RELOAD") || s.tools.hot_reload;
+    let hot_reload_tools = cli.hot_reload
+        || s.tools.hot_reload
+        || check_env_flag_with_deprecation!("AHMA_HOT_RELOAD");
 
     let skip_availability_probes = cli.skip_probes
-        || check_env_flag_with_deprecation!("AHMA_SKIP_PROBES")
-        || s.tools.skip_probes;
+        || s.tools.skip_probes
+        || check_env_flag_with_deprecation!("AHMA_SKIP_PROBES");
 
     (
         timeout_secs,
@@ -2235,39 +2254,46 @@ fn parse_sandbox_settings(
     cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
 ) -> (bool, bool, bool, bool, bool, u64, bool) {
-    let no_sandbox = cli.no_sandbox
-        || check_env_flag_with_deprecation!("AHMA_DISABLE_SANDBOX")
-        || s.sandbox.disable;
+    // Security-tier: AHMA_DISABLE_SANDBOX retired — warn and ignore.
+    warn_retired_security_env!("AHMA_DISABLE_SANDBOX");
+    let no_sandbox = cli.no_sandbox || s.sandbox.disable;
 
-    let defer_sandbox = cli.defer_sandbox
-        || check_env_flag_with_deprecation!("AHMA_SANDBOX_DEFER")
-        || s.sandbox.defer;
+    // Security-tier: AHMA_SANDBOX_DEFER retired — warn and ignore.
+    warn_retired_security_env!("AHMA_SANDBOX_DEFER");
+    let defer_sandbox = cli.defer_sandbox || s.sandbox.defer;
 
-    let tmp_access =
-        cli.tmp || check_env_flag_with_deprecation!("AHMA_TMP_ACCESS") || s.sandbox.tmp_access;
+    // Security-tier: AHMA_TMP_ACCESS retired — warn and ignore.
+    warn_retired_security_env!("AHMA_TMP_ACCESS");
+    let tmp_access = cli.tmp || s.sandbox.tmp_access;
 
-    let no_temp_files = cli.no_temp_files
-        || check_env_flag_with_deprecation!("AHMA_DISABLE_TEMP")
-        || s.sandbox.disable_temp;
+    // Security-tier: AHMA_DISABLE_TEMP retired — warn and ignore.
+    warn_retired_security_env!("AHMA_DISABLE_TEMP");
+    let no_temp_files = cli.no_temp_files || s.sandbox.disable_temp;
 
     let log_monitor = cli.log_monitor
-        || check_env_flag_with_deprecation!("AHMA_LOG_MONITOR")
-        || s.logging.log_monitor;
+        || s.logging.log_monitor
+        || check_env_flag_with_deprecation!("AHMA_LOG_MONITOR");
 
     let monitor_rate_limit_secs = if let Some(r) = cli.monitor_rate_limit {
         r
-    } else if let Some(val) = get_env_var_with_deprecation!("AHMA_MONITOR_RATE_LIMIT")
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        val
     } else {
-        s.logging.monitor_rate_limit_secs
+        // Preference-tier env var checked AFTER settings (lowest precedence).
+        if let Some(val) = get_env_var_with_deprecation!("AHMA_MONITOR_RATE_LIMIT")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            if s.logging.monitor_rate_limit_secs != ahma_common::config::LoggingSettings::default().monitor_rate_limit_secs {
+                s.logging.monitor_rate_limit_secs
+            } else {
+                val
+            }
+        } else {
+            s.logging.monitor_rate_limit_secs
+        }
     };
 
-    // `--no-package-cache-write` negates the default-on feature.
-    let package_cache_write = !cli.no_package_cache_write
-        && !AppConfig::env_flag("AHMA_NO_PACKAGE_CACHE_WRITE")
-        && s.sandbox.package_cache_write;
+    // Security-tier: AHMA_NO_PACKAGE_CACHE_WRITE retired — warn and ignore.
+    warn_retired_security_env!("AHMA_NO_PACKAGE_CACHE_WRITE");
+    let package_cache_write = !cli.no_package_cache_write && s.sandbox.package_cache_write;
 
     (
         no_sandbox,
@@ -2282,21 +2308,27 @@ fn parse_sandbox_settings(
 
 fn parse_http_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> (bool, bool, u64) {
     let no_quic = cli.disable_quic
-        || check_env_flag_with_deprecation!("AHMA_DISABLE_QUIC")
-        || s.http.disable_quic;
+        || s.http.disable_quic
+        || check_env_flag_with_deprecation!("AHMA_DISABLE_QUIC");
 
     let disable_http1_1 = cli.disable_http1_1
-        || check_env_flag_with_deprecation!("AHMA_DISABLE_HTTP1_1")
-        || s.http.disable_http1_1;
+        || s.http.disable_http1_1
+        || check_env_flag_with_deprecation!("AHMA_DISABLE_HTTP1_1");
 
     let handshake_timeout_secs = if let Some(t) = cli.handshake_timeout {
         t
-    } else if let Some(val) = get_env_var_with_deprecation!("AHMA_HANDSHAKE_TIMEOUT")
-        .and_then(|v| v.trim().parse::<u64>().ok())
-    {
-        val
     } else {
-        s.http.handshake_timeout_secs
+        if let Some(val) = get_env_var_with_deprecation!("AHMA_HANDSHAKE_TIMEOUT")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            if s.http.handshake_timeout_secs != ahma_common::config::HttpSettings::default().handshake_timeout_secs {
+                s.http.handshake_timeout_secs
+            } else {
+                val
+            }
+        } else {
+            s.http.handshake_timeout_secs
+        }
     };
 
     (no_quic, disable_http1_1, handshake_timeout_secs)
@@ -2306,18 +2338,18 @@ fn parse_auth_settings(
     cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
 ) -> (Option<String>, Option<PathBuf>, u64, u32, String) {
+    // Security-tier: AHMA_REQUIRE_TOKEN retired — warn and ignore.
+    warn_retired_security_env!("AHMA_REQUIRE_TOKEN");
     let require_token = cli
         .require_token
         .clone()
-        .or_else(|| {
-            get_env_var_with_deprecation!("AHMA_REQUIRE_TOKEN").map(|v| v.trim().to_owned())
-        })
         .or_else(|| s.auth.require_token.clone());
 
+    // Security-tier: AHMA_REQUIRE_TOKEN_PATH retired — warn and ignore.
+    warn_retired_security_env!("AHMA_REQUIRE_TOKEN_PATH");
     let require_token_path = cli
         .require_token_path
         .clone()
-        .or_else(|| get_env_var_with_deprecation!("AHMA_REQUIRE_TOKEN_PATH").map(PathBuf::from))
         .or_else(|| {
             if s.auth.require_token_path.is_empty() {
                 None
@@ -2326,29 +2358,21 @@ fn parse_auth_settings(
             }
         });
 
-    let rate_limit_rps = cli
-        .rate_limit_rps
-        .or_else(|| {
-            get_env_var_with_deprecation!("AHMA_RATE_LIMIT_RPS")
-                .and_then(|v| v.trim().parse::<u64>().ok())
-        })
-        .unwrap_or(s.auth.rate_limit_rps);
+    // Security-tier: AHMA_RATE_LIMIT_RPS and AHMA_RATE_LIMIT_BURST retired — warn and ignore.
+    warn_retired_security_env!("AHMA_RATE_LIMIT_RPS");
+    let rate_limit_rps = cli.rate_limit_rps.unwrap_or(s.auth.rate_limit_rps);
 
-    let rate_limit_burst = cli
-        .rate_limit_burst
-        .or_else(|| {
-            get_env_var_with_deprecation!("AHMA_RATE_LIMIT_BURST")
-                .and_then(|v| v.trim().parse::<u32>().ok())
-        })
-        .unwrap_or(s.auth.rate_limit_burst);
+    warn_retired_security_env!("AHMA_RATE_LIMIT_BURST");
+    let rate_limit_burst = cli.rate_limit_burst.unwrap_or(s.auth.rate_limit_burst);
 
+    // Preference-tier: CLI > settings > env (lowest precedence during migration).
     let instance_label = cli
         .instance_label
         .clone()
-        .or_else(|| {
-            get_env_var_with_deprecation!("AHMA_INSTANCE_LABEL").map(|v| v.trim().to_owned())
-        })
         .unwrap_or_else(|| s.instance.label.clone());
+    if std::env::var_os("AHMA_INSTANCE_LABEL").is_some() && cli.instance_label.is_none() {
+        get_env_var_with_deprecation!("AHMA_INSTANCE_LABEL");
+    }
 
     (
         require_token,
@@ -2372,48 +2396,36 @@ fn resolve_tool_bundles(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> Vec
 }
 
 fn resolve_sandbox_scopes_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> Vec<PathBuf> {
-    if std::env::var_os("AHMA_SANDBOX_SCOPE").is_some() {
-        deprecated_env!("AHMA_SANDBOX_SCOPE");
-    }
+    // Security-tier: AHMA_SANDBOX_SCOPE retired — warn and ignore.
+    warn_retired_security_env!("AHMA_SANDBOX_SCOPE");
     if !cli.sandbox_scopes.is_empty() {
         cli.sandbox_scopes
             .iter()
             .map(|p| expand_tilde(p.clone()))
             .collect()
     } else {
-        let env_scopes = AppConfig::env_sandbox_scopes();
-        if !env_scopes.is_empty() {
-            env_scopes
-        } else {
-            s.sandbox
-                .scopes
-                .iter()
-                .map(|p| expand_tilde(p.clone()))
-                .collect()
-        }
+        s.sandbox
+            .scopes
+            .iter()
+            .map(|p| expand_tilde(p.clone()))
+            .collect()
     }
 }
 
 fn resolve_working_dirs_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> Vec<PathBuf> {
-    if std::env::var_os("AHMA_WORKING_DIRS").is_some() {
-        deprecated_env!("AHMA_WORKING_DIRS");
-    }
+    // Security-tier: AHMA_WORKING_DIRS retired — warn and ignore.
+    warn_retired_security_env!("AHMA_WORKING_DIRS");
     if !cli.working_dirs.is_empty() {
         cli.working_dirs
             .iter()
             .map(|p| expand_tilde(p.clone()))
             .collect()
     } else {
-        let env_dirs = AppConfig::env_working_dirs();
-        if !env_dirs.is_empty() {
-            env_dirs
-        } else {
-            s.sandbox
-                .working_dirs
-                .iter()
-                .map(|p| expand_tilde(p.clone()))
-                .collect()
-        }
+        s.sandbox
+            .working_dirs
+            .iter()
+            .map(|p| expand_tilde(p.clone()))
+            .collect()
     }
 }
 
@@ -2441,13 +2453,14 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     let s = load_settings(cli);
 
     // ── Tool loading ────────────────────────────────────────────────────────
-    let explicit_tools_dir =
-        cli.tools_dir.is_some() || std::env::var_os("AHMA_TOOLS_DIR").is_some();
+    let explicit_tools_dir = cli.tools_dir.is_some()
+        || std::env::var_os("AHMA_TOOLS_DIR").is_some();
+    // Preference-tier: CLI > settings > env (lowest precedence).
     let raw_tools_dir = cli
         .tools_dir
         .clone()
-        .or_else(|| get_env_var_with_deprecation!("AHMA_TOOLS_DIR").map(PathBuf::from))
-        .or_else(|| s.tools.tools_dir.clone());
+        .or_else(|| s.tools.tools_dir.clone())
+        .or_else(|| get_env_var_with_deprecation!("AHMA_TOOLS_DIR").map(PathBuf::from));
     let tools_dir = resolution::normalize_tools_dir(raw_tools_dir);
 
     // Flatten and deduplicate tool bundles
@@ -2522,12 +2535,10 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         run_tool: tool.run_tool,
         run_tool_args: tool.run_tool_args,
         task_vault: {
-            if std::env::var_os("AHMA_TASK_VAULT").is_some() {
-                deprecated_env!("AHMA_TASK_VAULT");
-            }
+            // Security-tier: AHMA_TASK_VAULT retired — warn and ignore.
+            warn_retired_security_env!("AHMA_TASK_VAULT");
             cli.task_vault
                 .clone()
-                .or_else(|| std::env::var("AHMA_TASK_VAULT").ok().map(PathBuf::from))
                 .map(expand_tilde)
                 .or_else(|| s.sandbox.task_vault.clone().map(expand_tilde))
         },
@@ -2900,57 +2911,38 @@ mod tests {
         }
     }
 
+    // ─── R-CFG8.1: security-tier env vars are retired (warn + ignore) ────────
+
+    /// Red-team (R-CFG8.1): a process that sets `AHMA_DISABLE_SANDBOX=1` in the
+    /// environment must NOT disable the sandbox. Only the `--no-sandbox` flag
+    /// (or nested-sandbox auto-detection) may do that. The resolved
+    /// `no_sandbox` must stay `false` when the flag is absent.
     #[test]
-    fn test_env_sandbox_scopes_single_path() {
+    fn disable_sandbox_env_var_is_ignored() {
         let _guard = ENV_MUTEX.lock().unwrap();
-        let temp = tempdir().expect("Failed to create temp dir");
-        unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", temp.path()) };
-        let scopes = AppConfig::env_sandbox_scopes();
-        unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
-
-        assert_eq!(scopes, vec![temp.path().to_path_buf()]);
-    }
-
-    #[test]
-    fn test_env_sandbox_scopes_tilde() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", "~") };
-        let scopes = AppConfig::env_sandbox_scopes();
-        unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
-
-        if let Some(home) = dirs::home_dir() {
-            assert_eq!(scopes, vec![home]);
-        }
-    }
-
-    #[test]
-    fn test_env_sandbox_scopes_tilde_slash() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::set_var("AHMA_SANDBOX_SCOPE", "~/test_sandbox") };
-        let scopes = AppConfig::env_sandbox_scopes();
-        unsafe { std::env::remove_var("AHMA_SANDBOX_SCOPE") };
-
-        if let Some(home) = dirs::home_dir() {
-            assert_eq!(scopes, vec![home.join("test_sandbox")]);
-        }
-    }
-
-    #[test]
-    fn test_env_working_dirs_multiple_paths() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        let temp_a = tempdir().expect("Failed to create first temp dir");
-        let temp_b = tempdir().expect("Failed to create second temp dir");
-        let joined =
-            std::env::join_paths([temp_a.path(), temp_b.path()]).expect("Failed to join path list");
-
-        unsafe { std::env::set_var("AHMA_WORKING_DIRS", joined) };
-        let dirs = AppConfig::env_working_dirs();
-        unsafe { std::env::remove_var("AHMA_WORKING_DIRS") };
-
-        assert_eq!(
-            dirs,
-            vec![temp_a.path().to_path_buf(), temp_b.path().to_path_buf()]
+        init_test();
+        unsafe { std::env::set_var("AHMA_DISABLE_SANDBOX", "1") };
+        // A default invocation with no --no-sandbox flag and default settings.
+        let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
+        let settings = ahma_common::config::AhmaSettings::default();
+        let resolved = parse_sandbox_settings(&cli, &settings);
+        unsafe { std::env::remove_var("AHMA_DISABLE_SANDBOX") };
+        assert!(
+            !resolved.0,
+            "AHMA_DISABLE_SANDBOX=1 must be ignored; no_sandbox should remain false without --no-sandbox"
         );
+    }
+
+    /// The `--no-sandbox` flag is still honored (the supported override).
+    #[test]
+    fn no_sandbox_flag_is_honored() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        init_test();
+        unsafe { std::env::remove_var("AHMA_DISABLE_SANDBOX") };
+        let cli = Cli::parse_from(["ahma", "--no-sandbox", "serve", "stdio"]);
+        let settings = ahma_common::config::AhmaSettings::default();
+        let resolved = parse_sandbox_settings(&cli, &settings);
+        assert!(resolved.0, "--no-sandbox must set no_sandbox = true");
     }
 
     // ─── resolve_sandbox_policy ──────────────────────────────────────────────

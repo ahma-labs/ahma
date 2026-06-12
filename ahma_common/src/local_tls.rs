@@ -66,22 +66,26 @@ impl LocalTlsConfig {
         let _ = TLS_DIR_OVERRIDE.set(dir);
     }
 
-    /// Construct a `LocalTlsConfig`: `--tls-dir` flag override first, then the
-    /// deprecated `AHMA_TLS_DIR` environment variable, then `~/.ahma/tls`.
+    /// Construct a `LocalTlsConfig`: `--tls-dir` flag override first, then
+    /// `~/.ahma/tls`.
+    ///
+    /// `AHMA_TLS_DIR` is security-tier and **retired** (R-CFG2.3): the TLS
+    /// material directory must not be redirectable via ambient environment
+    /// state. If the variable is set it is warned-about and ignored; use the
+    /// `--tls-dir` flag instead.
     pub fn from_env() -> Self {
+        if std::env::var_os("AHMA_TLS_DIR").is_some() {
+            warn!(
+                "Security env var AHMA_TLS_DIR is set but IGNORED (retired per R-CFG2.3). \
+                 Use the --tls-dir flag instead; redirecting TLS material via the environment is a tamper risk."
+            );
+        }
         if let Some(dir) = TLS_DIR_OVERRIDE.get() {
             return Self { dir: dir.clone() };
         }
-        let dir = match std::env::var("AHMA_TLS_DIR") {
-            Ok(v) => {
-                warn!(
-                    "Deprecated: AHMA_TLS_DIR environment variable is set. Use the --tls-dir flag instead."
-                );
-                PathBuf::from(v)
-            }
-            Err(_) => Self::default_dir(),
-        };
-        Self { dir }
+        Self {
+            dir: Self::default_dir(),
+        }
     }
 
     /// Path to the DER-encoded certificate file.

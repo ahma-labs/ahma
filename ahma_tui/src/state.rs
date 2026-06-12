@@ -37,7 +37,11 @@ pub enum Mode {
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
     /// A message submitted by the user.
-    User(String),
+    User {
+        text: String,
+        started_at: Option<std::time::Instant>,
+        duration_ms: Option<u64>,
+    },
     /// A response from the LLM, potentially still streaming.
     Assistant {
         content: String,
@@ -98,6 +102,20 @@ impl ChatHistory {
     pub fn finish_stream(&mut self) {
         if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.back_mut() {
             *streaming = false;
+        }
+    }
+
+    /// Locate the latest `User` entry and set its `duration_ms` based on `started_at` elapsed time.
+    pub fn finish_user_timing(&mut self) {
+        for entry in self.entries.iter_mut().rev() {
+            if let ChatEntry::User { started_at, duration_ms, .. } = entry {
+                if duration_ms.is_none() {
+                    if let Some(start) = started_at {
+                        *duration_ms = Some(start.elapsed().as_millis() as u64);
+                    }
+                }
+                break;
+            }
         }
     }
 
@@ -280,10 +298,6 @@ pub fn builtin_commands() -> Vec<NavCommand> {
             command: "/quit".into(),
             description: "quit the application",
         },
-        NavCommand {
-            command: "/q".into(),
-            description: "quit the application (alias)",
-        },
         // /exit intentionally omitted — still handled, just not advertised
     ]
 }
@@ -330,11 +344,13 @@ impl CommandNavigator {
             self.completions = cmds;
         } else {
             let q = self.input.to_lowercase();
+            let q_clean = q.trim_start_matches('/');
             self.completions = cmds
                 .into_iter()
                 .filter(|c| {
                     c.command.to_lowercase().contains(&q)
                         || c.description.to_lowercase().contains(&q)
+                        || (c.command == "/quit" && !q_clean.is_empty() && "exit".starts_with(q_clean))
                 })
                 .collect();
         }
@@ -658,18 +674,28 @@ impl Operation {
 
     pub fn elapsed_display(&self) -> String {
         if let Some(ms) = self.duration_ms {
-            return format!("{}s", ms / 1000);
-        }
-        let secs = if let (Some(start), Some(end)) = (self.started_at, self.completed_at) {
-            if end >= start {
-                end.duration_since(start).as_secs()
+            if ms < 1000 {
+                return format!("{ms}ms");
             } else {
-                0
+                return format!("{}s", ms / 1000);
+            }
+        }
+        if let (Some(start), Some(end)) = (self.started_at, self.completed_at) {
+            let d = if end >= start {
+                end.duration_since(start)
+            } else {
+                std::time::Duration::ZERO
+            };
+            let ms = d.as_millis();
+            if ms < 1000 {
+                format!("{ms}ms")
+            } else {
+                format!("{}s", d.as_secs())
             }
         } else {
-            self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
-        };
-        format!("{secs}s")
+            let secs = self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            format!("{secs}s")
+        }
     }
 
     pub fn display_name(&self) -> String {
@@ -1490,20 +1516,28 @@ mod tests {
     #[test]
     fn test_chat_history_compact() {
         let mut hist = ChatHistory::default();
-        hist.push(ChatEntry::User("Hello!".into()));
+        hist.push(ChatEntry::User {
+            text: "Hello!".into(),
+            started_at: None,
+            duration_ms: None,
+        });
         hist.start_tool_call("call_1".into(), "test_tool".into(), "{}".into());
         hist.append_token("I ran the tool.");
         hist.finish_stream();
-        hist.push(ChatEntry::User("Thanks.".into()));
+        hist.push(ChatEntry::User {
+            text: "Thanks.".into(),
+            started_at: None,
+            duration_ms: None,
+        });
 
         assert_eq!(hist.entries.len(), 4);
         hist.compact(1); // Keep the last 1 item ("Thanks.") intact
 
         // The tool call (at index 1) should be dropped, but user and assistant messages kept.
         assert_eq!(hist.entries.len(), 3);
-        assert!(matches!(hist.entries[0], ChatEntry::User(_)));
+        assert!(matches!(hist.entries[0], ChatEntry::User { .. }));
         assert!(matches!(hist.entries[1], ChatEntry::Assistant { .. }));
-        assert!(matches!(hist.entries[2], ChatEntry::User(_)));
+        assert!(matches!(hist.entries[2], ChatEntry::User { .. }));
     }
 
     #[test]
@@ -1573,5 +1607,54 @@ mod tests {
 
         let op4 = Operation::new("a8f9c2d3", "run_terminal_command", OpStatus::Running);
         assert_eq!(op4.clean_id(), "a8f9c2");
+    }
+
+    #[test]
+    fn test_navigator_completions_filtering() {
+        let mut nav = CommandNavigator::default();
+        let tools = vec!["cargo_build".to_string()];
+
+        // When input is empty, should return all builtins (including /quit, but NOT /q) plus dynamic tools
+        nav.open(&tools);
+        assert!(nav.completions.iter().any(|c| c.command == "/quit"));
+        assert!(!nav.completions.iter().any(|c| c.command == "/q"));
+        assert!(nav.completions.iter().any(|c| c.command == "/run cargo_build"));
+
+        // When input is "quit", should match /quit
+        nav.input = "quit".to_string();
+        nav.refresh_completions(&tools);
+        assert_eq!(nav.completions.len(), 1);
+        assert_eq!(nav.completions[0].command, "/quit");
+
+        // When input is "/quit", should match /quit
+        nav.input = "/quit".to_string();
+        nav.refresh_completions(&tools);
+        assert_eq!(nav.completions.len(), 1);
+        assert_eq!(nav.completions[0].command, "/quit");
+
+        // When input is "exit", should match /quit (via the "exit" starts_with alias check)
+        nav.input = "exit".to_string();
+        nav.refresh_completions(&tools);
+        assert_eq!(nav.completions.len(), 1);
+        assert_eq!(nav.completions[0].command, "/quit");
+
+        // When input is "ex", should match /quit (via alias) and /export markdown (via prefix)
+        nav.input = "ex".to_string();
+        nav.refresh_completions(&tools);
+        assert_eq!(nav.completions.len(), 2);
+        assert!(nav.completions.iter().any(|c| c.command == "/quit"));
+        assert!(nav.completions.iter().any(|c| c.command == "/export markdown"));
+
+        // When input is "/exi", should match /quit
+        nav.input = "/exi".to_string();
+        nav.refresh_completions(&tools);
+        assert_eq!(nav.completions.len(), 1);
+        assert_eq!(nav.completions[0].command, "/quit");
+
+        // When input is "q", should match /quit and potentially other commands containing 'q', but not /q
+        nav.input = "q".to_string();
+        nav.refresh_completions(&tools);
+        assert!(!nav.completions.iter().any(|c| c.command == "/q"));
+        assert!(nav.completions.iter().any(|c| c.command == "/quit"));
     }
 }

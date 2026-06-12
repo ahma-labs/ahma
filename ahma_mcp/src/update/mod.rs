@@ -164,11 +164,17 @@ async fn run_release_update(
     install_dir: &Path,
     mode: &UpdateMode,
 ) -> Result<UpdateOutcome> {
-    let insecure_skip_verify = args.insecure_skip_verify
-        || std::env::var("AHMA_INSECURE_SKIP_VERIFY")
-            .or_else(|_| std::env::var("AHMA_INSECURE_SKIP_SIGNATURE"))
-            .map(|val| matches!(val.trim(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
+    // Security-tier: AHMA_INSECURE_SKIP_VERIFY and AHMA_INSECURE_SKIP_SIGNATURE are retired.
+    // Use the --insecure-skip-verify CLI flag instead (R-CFG2.3).
+    if std::env::var_os("AHMA_INSECURE_SKIP_VERIFY").is_some()
+        || std::env::var_os("AHMA_INSECURE_SKIP_SIGNATURE").is_some()
+    {
+        tracing::warn!(
+            "AHMA_INSECURE_SKIP_VERIFY / AHMA_INSECURE_SKIP_SIGNATURE are retired and IGNORED. \
+             Use --insecure-skip-verify on the command line (R-CFG2.3)."
+        );
+    }
+    let insecure_skip_verify = args.insecure_skip_verify;
 
     let client = reqwest::Client::builder()
         .user_agent("ahma-updater")

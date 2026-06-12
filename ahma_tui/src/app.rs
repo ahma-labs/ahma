@@ -1000,7 +1000,11 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
         return;
     }
 
-    state.chat.push(ChatEntry::User(text));
+    state.chat.push(ChatEntry::User {
+        text,
+        started_at: Some(std::time::Instant::now()),
+        duration_ms: None,
+    });
     state.chat.push(ChatEntry::Assistant {
         content: String::new(),
         streaming: true,
@@ -1163,7 +1167,7 @@ fn collect_chat_history(state: &crate::state::AppState) -> Vec<ahma_llm_monitor:
         .entries()
         .iter()
         .filter_map(|entry| match entry {
-            ChatEntry::User(content) => Some(ChatMessage::user(content.clone())),
+            ChatEntry::User { text, .. } => Some(ChatMessage::user(text.clone())),
             ChatEntry::Assistant {
                 content,
                 streaming: false,
@@ -1464,7 +1468,7 @@ fn textarea_input_from_key_event(key: crossterm::event::KeyEvent) -> tui_textare
 
 #[cfg(feature = "tui")]
 fn handle_window_nav_commands(cmd: &str, state: &mut crate::state::AppState) -> bool {
-    if cmd == "/exit" || cmd == "/q" || cmd == "/quit" {
+    if cmd == "/exit" || cmd == "/quit" {
         state.should_quit = true;
         return true;
     }
@@ -1862,9 +1866,9 @@ fn handle_export_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
     let mut md = String::from("# ahma chat export\n\n");
     for entry in state.chat.entries() {
         match entry {
-            crate::state::ChatEntry::User(content) => {
+            crate::state::ChatEntry::User { text, .. } => {
                 md.push_str("## User\n\n");
-                md.push_str(content);
+                md.push_str(text);
                 md.push_str("\n\n");
             }
             crate::state::ChatEntry::Assistant { content, .. } => {
@@ -1968,7 +1972,10 @@ fn open_model_picker(state: &mut crate::state::AppState) {
     let mut items = Vec::new();
     for provider in &state.available_providers {
         for model in &provider.models {
-            items.push(format!("{} / {}", provider.name, model));
+            let item = format!("{} / {}", provider.name, model);
+            if !items.contains(&item) {
+                items.push(item);
+            }
         }
     }
 
@@ -2469,6 +2476,7 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
         }
         BridgeEvent::Done => {
             state.chat.finish_stream();
+            state.chat.finish_user_timing();
             if let Some(profile) = &state.active_profile
                 && let Ok(cwd) = std::env::current_dir()
             {
@@ -2486,6 +2494,7 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
         }
         BridgeEvent::Error(msg) => {
             state.chat.finish_stream();
+            state.chat.finish_user_timing();
             state.chat.push(ChatEntry::Assistant {
                 content: format!("Error: {msg}"),
                 streaming: false,
@@ -3174,10 +3183,11 @@ fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
         id, tool_name, status, args, alerts_str, stdout_str
     );
 
-    state.chat.push(crate::state::ChatEntry::User(format!(
-        "Analyze operation {}",
-        id
-    )));
+    state.chat.push(crate::state::ChatEntry::User {
+        text: format!("Analyze operation {}", id),
+        started_at: Some(std::time::Instant::now()),
+        duration_ms: None,
+    });
     state.chat.push(crate::state::ChatEntry::Assistant {
         content: String::new(),
         streaming: true,
@@ -3578,12 +3588,7 @@ mod tests {
         assert!(handled_quit);
         assert!(state_quit.should_quit);
 
-        // Test /q (alias) and /exit (unadvertised alias) also quit
-        let mut state_q = AppState::new("http://localhost:3000", "HTTP", true);
-        let handled_q = super::handle_window_nav_commands("/q", &mut state_q);
-        assert!(handled_q);
-        assert!(state_q.should_quit);
-
+        // Test /exit (unadvertised alias) also quit
         let handled_exit = super::handle_window_nav_commands("/exit", &mut state);
         assert!(handled_exit);
         assert!(state.should_quit);

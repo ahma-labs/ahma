@@ -136,10 +136,28 @@ fn draw_collapsed_window(
     theme: &Theme,
     status_style: Style,
 ) {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let f = (ms / 150) as usize;
+    let status_str = if w.status == "Running" {
+        let spinner = if theme.unicode {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            frames[f % frames.len()]
+        } else {
+            let frames = ["-", "\\", "|", "/"];
+            frames[f % frames.len()]
+        };
+        format!("Running {}", spinner)
+    } else {
+        w.status.clone()
+    };
+
     let mut spans = vec![
         Span::styled(" [+] ", theme.dim()),
         Span::styled(format!("{} ", w.id), theme.normal()),
-        Span::styled(format!("[{}] ", w.status), status_style),
+        Span::styled(format!("[{}] ", status_str), status_style),
         Span::styled(w.label.clone(), theme.normal()),
     ];
     let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
@@ -164,7 +182,26 @@ fn draw_expanded_window(
 ) {
     let border_width = 2;
     let title_space = (area.width as usize).saturating_sub(border_width);
-    let title_left = format!(" [-] {} {}", w.id, w.label);
+
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let f = (ms / 150) as usize;
+    let status_str = if w.status == "Running" {
+        let spinner = if theme.unicode {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            frames[f % frames.len()]
+        } else {
+            let frames = ["-", "\\", "|", "/"];
+            frames[f % frames.len()]
+        };
+        format!("[Running {}]", spinner)
+    } else {
+        format!("[{}]", w.status)
+    };
+
+    let title_left = format!(" [-] {} {} {}", w.id, status_str, w.label);
     let title_right = format!("x{} ", w.id);
     let pad_width = title_space.saturating_sub(title_left.len() + title_right.len());
     let title_combined = if pad_width > 0 {
@@ -450,13 +487,11 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None);
-        // Use wrapped-row counts so the thumb accurately represents position and
-        // range even when long lines fold across multiple terminal rows.
-        let total_wrapped = total_wrapped_rows(&lines, inner.width as usize);
-        let scroll_wrapped = total_wrapped_rows(&lines[..scroll], inner.width as usize);
-        let mut sb_state = ScrollbarState::new(total_wrapped)
+        // Use logical-line units so position, viewport, and content length all
+        // match the scroll offset used for rendering (lines.len() / visible_h / scroll).
+        let mut sb_state = ScrollbarState::new(lines.len())
             .viewport_content_length(visible_h)
-            .position(scroll_wrapped);
+            .position(scroll);
         frame.render_stateful_widget(sb, inner, &mut sb_state);
     }
 }
@@ -495,9 +530,11 @@ fn push_chat_entry_lines(
     width: usize,
 ) {
     match entry {
-        ChatEntry::User(text) => push_user_chat_lines(lines, text, theme),
+        ChatEntry::User { text, started_at, duration_ms } => {
+            push_user_chat_lines(lines, text, *started_at, *duration_ms, theme, width);
+        }
         ChatEntry::Assistant { content, streaming } => {
-            push_assistant_chat_lines(lines, content, *streaming, state, theme)
+            push_assistant_chat_lines(lines, content, *streaming, state, theme);
         }
         ChatEntry::ToolCall {
             id: _,
@@ -519,11 +556,79 @@ fn push_chat_entry_lines(
 }
 
 #[cfg(feature = "tui")]
-fn push_user_chat_lines(lines: &mut Vec<Line<'static>>, text: &str, theme: &Theme) {
-    for (index, line_str) in text.lines().enumerate() {
-        let prefix = if index == 0 { " you  " } else { "      " };
+fn push_user_chat_lines(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    started_at: Option<std::time::Instant>,
+    duration_ms: Option<u64>,
+    theme: &Theme,
+    width: usize,
+) {
+    let mut dur_str = String::new();
+    if let Some(ms) = duration_ms {
+        if ms < 1000 {
+            dur_str = format!("{}ms", ms);
+        } else {
+            dur_str = format!("{}s", ms / 1000);
+        }
+    } else if let Some(start) = started_at {
+        let elapsed = start.elapsed();
+        let ms = elapsed.as_millis();
+        if ms < 1000 {
+            dur_str = format!("{}ms", ms);
+        } else {
+            dur_str = format!("{}s", elapsed.as_secs());
+        }
+    }
+
+    let raw_lines: Vec<&str> = text.lines().collect();
+    if raw_lines.is_empty() {
+        return;
+    }
+
+    let first_line = raw_lines[0];
+    let prefix = "you  ";
+
+    if !dur_str.is_empty() && width > 10 {
+        let prefix_len = prefix.chars().count();
+        let dur_len = dur_str.chars().count();
+        let max_text_len = width.saturating_sub(prefix_len + dur_len + 2); // leave margin
+        
+        if first_line.chars().count() <= max_text_len {
+            let padding = width.saturating_sub(prefix_len + first_line.chars().count() + dur_len);
+            lines.push(Line::from(vec![
+                Span::styled(prefix, theme.dim()),
+                Span::styled(first_line.to_string(), theme.normal()),
+                Span::styled(" ".repeat(padding), theme.normal()),
+                Span::styled(dur_str, theme.dim()),
+            ]));
+        } else {
+            let first_part: String = first_line.chars().take(max_text_len).collect();
+            let second_part: String = first_line.chars().skip(max_text_len).collect();
+            
+            let padding = width.saturating_sub(prefix_len + first_part.chars().count() + dur_len);
+            lines.push(Line::from(vec![
+                Span::styled(prefix, theme.dim()),
+                Span::styled(first_part, theme.normal()),
+                Span::styled(" ".repeat(padding), theme.normal()),
+                Span::styled(dur_str, theme.dim()),
+            ]));
+            
+            lines.push(Line::from(vec![
+                Span::styled("     ", theme.dim()),
+                Span::styled(second_part, theme.normal()),
+            ]));
+        }
+    } else {
         lines.push(Line::from(vec![
             Span::styled(prefix, theme.dim()),
+            Span::styled(first_line.to_string(), theme.normal()),
+        ]));
+    }
+
+    for line_str in raw_lines.iter().skip(1) {
+        lines.push(Line::from(vec![
+            Span::styled("     ", theme.dim()),
             Span::styled(line_str.to_string(), theme.normal()),
         ]));
     }
@@ -538,165 +643,6 @@ fn assistant_stream_cursor(streaming: bool, unicode: bool) -> &'static str {
     }
 }
 
-#[cfg(feature = "tui")]
-fn grid_to_braille(grid: [[bool; 3]; 3]) -> String {
-    let mut s = String::with_capacity(9);
-    for col_data in &grid {
-        let mask = (col_data[0] as u32) | ((col_data[1] as u32) << 1) | ((col_data[2] as u32) << 2);
-        if let Some(c) = std::char::from_u32(0x2800 + mask) {
-            s.push(c);
-        }
-    }
-    s
-}
-
-fn get_unicode_indicator(frame: usize, has_content: bool, tool_running: bool) -> String {
-    if tool_running {
-        let f0 = [[true, true, true], [true, false, true], [true, true, true]];
-        let f1 = [
-            [false, true, true],
-            [false, true, false],
-            [false, true, true],
-        ];
-        let f2 = [[true, true, true], [false, true, false], [true, true, true]];
-        let f3 = [
-            [false, true, true],
-            [true, false, true],
-            [false, true, true],
-        ];
-        let list = [f0, f1, f2, f3];
-        grid_to_braille(list[frame % 4])
-    } else if !has_content {
-        let frames = [
-            [
-                [true, true, false],
-                [false, false, false],
-                [false, false, false],
-            ],
-            [
-                [true, false, false],
-                [true, false, false],
-                [false, false, false],
-            ],
-            [
-                [false, false, false],
-                [true, false, false],
-                [true, false, false],
-            ],
-            [
-                [false, false, false],
-                [false, false, false],
-                [true, true, false],
-            ],
-            [
-                [false, false, false],
-                [false, false, false],
-                [false, true, true],
-            ],
-            [
-                [false, false, false],
-                [false, false, true],
-                [false, false, true],
-            ],
-            [
-                [false, false, true],
-                [false, false, true],
-                [false, false, false],
-            ],
-            [
-                [false, true, true],
-                [false, false, false],
-                [false, false, false],
-            ],
-        ];
-        grid_to_braille(frames[frame % 8])
-    } else {
-        let frames = [
-            [
-                [false, true, false],
-                [false, false, false],
-                [false, false, false],
-            ],
-            [
-                [true, true, false],
-                [false, true, false],
-                [false, false, false],
-            ],
-            [
-                [true, true, true],
-                [true, true, false],
-                [false, true, false],
-            ],
-            [[false, true, true], [true, true, true], [true, true, false]],
-            [
-                [false, false, true],
-                [false, true, true],
-                [true, true, true],
-            ],
-            [
-                [false, false, false],
-                [false, false, true],
-                [false, true, true],
-            ],
-        ];
-        grid_to_braille(frames[frame % 6])
-    }
-}
-
-fn get_ascii_indicator(frame: usize, has_content: bool, tool_running: bool) -> String {
-    if tool_running {
-        let ascii_frames = ["- -", "= =", "o o", "* *", "o o", "= ="];
-        ascii_frames[frame % ascii_frames.len()].to_string()
-    } else if !has_content {
-        let ascii_frames = [".  ", ".. ", " ..", "  .", " ..", ".. "];
-        ascii_frames[frame % ascii_frames.len()].to_string()
-    } else {
-        let ascii_frames = [".  ", "o. ", "o  ", ".o ", "  o", "  ."];
-        ascii_frames[frame % ascii_frames.len()].to_string()
-    }
-}
-
-#[cfg(feature = "tui")]
-fn get_animated_indicator(
-    state: &AppState,
-    frame: usize,
-    active: bool,
-    has_content: bool,
-    tool_running: bool,
-) -> String {
-    if !active {
-        if state.unicode {
-            "⠂⠂⠂".to_string()
-        } else {
-            "...".to_string()
-        }
-    } else if state.unicode {
-        get_unicode_indicator(frame, has_content, tool_running)
-    } else {
-        get_ascii_indicator(frame, has_content, tool_running)
-    }
-}
-
-#[cfg(feature = "tui")]
-fn get_animated_indicator_style(
-    theme: &Theme,
-    active: bool,
-    has_content: bool,
-    tool_running: bool,
-) -> Style {
-    if !active {
-        theme.dim()
-    } else if tool_running {
-        Style::default()
-            .fg(Color::LightRed)
-            .add_modifier(Modifier::BOLD)
-    } else if !has_content {
-        theme.pending()
-    } else {
-        theme.success()
-    }
-}
-
 fn push_assistant_chat_lines(
     lines: &mut Vec<Line<'static>>,
     content: &str,
@@ -707,35 +653,14 @@ fn push_assistant_chat_lines(
     let cursor = assistant_stream_cursor(streaming, state.unicode);
     let display = format!("{content}{cursor}");
 
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let frame = (ms / 150) as usize;
-
-    let tool_running = state
-        .chat
-        .entries()
-        .iter()
-        .any(|entry| matches!(entry, ChatEntry::ToolCall { result: None, .. }));
-
-    let indicator =
-        get_animated_indicator(state, frame, streaming, !content.is_empty(), tool_running);
-    let indicator_style =
-        get_animated_indicator_style(theme, streaming, !content.is_empty(), tool_running);
-    let indicator_prefix = format!("{indicator} ");
-    let indicator_len = indicator_prefix.chars().count();
-
     for (index, line_str) in display.lines().enumerate() {
         if index == 0 {
             lines.push(Line::from(vec![
-                Span::styled(indicator_prefix.clone(), indicator_style),
                 Span::styled("ahma ", theme.running()),
                 Span::styled(line_str.to_string(), theme.normal()),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled(" ".repeat(indicator_len), Style::default()),
                 Span::styled("     ", theme.running()),
                 Span::styled(line_str.to_string(), theme.normal()),
             ]));
@@ -744,7 +669,6 @@ fn push_assistant_chat_lines(
 
     if display.is_empty() && streaming {
         lines.push(Line::from(vec![
-            Span::styled(indicator_prefix, indicator_style),
             Span::styled("ahma ", theme.running()),
             Span::styled(assistant_stream_cursor(true, state.unicode), theme.dim()),
         ]));
@@ -1383,7 +1307,14 @@ fn draw_ai_activity(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
             let ts = e.timestamp.format("%H:%M:%S").to_string();
             let elapsed = e
                 .elapsed
-                .map(|d| format!(" {:.1}s", d.as_secs_f64()))
+                .map(|d| {
+                    let ms = d.as_millis();
+                    if ms < 1000 {
+                        format!(" {ms}ms")
+                    } else {
+                        format!(" {}s", d.as_secs())
+                    }
+                })
                 .unwrap_or_default();
             let summary = e
                 .summary
@@ -2379,7 +2310,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("WINDOW ACTIONS", ""),
         ("/n", "Restore/expand window n"),
         ("/xn", "Close/cancel window n"),
-        ("/quit, /q", "Quit the application"),
+        ("/quit", "Quit the application"),
         ("Mouse Click on Xn", "Close/cancel window"),
         ("Mouse Click on Window", "Toggle expand/collapse"),
         ("", ""),
@@ -2460,7 +2391,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("WINDOW ACTIONS", ""),
         ("/n", "Restore/expand window n (e.g. /3)"),
         ("/xn", "Close/cancel window n (e.g. /x3)"),
-        ("/quit, /q", "Quit the application"),
+        ("/quit", "Quit the application"),
         ("Mouse Click on Xn", "Close/cancel window"),
         ("Mouse Click on Window", "Toggle expand/collapse"),
     ];
