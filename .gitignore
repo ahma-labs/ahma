@@ -37,8 +37,8 @@ analysis_results/
 CODE_SIMPLICITY.*
 
 # Local Ahma Logs and temporary files during development
-logs/
-temp/
+**/logs/
+**/temp/
 .sccache/
 .cache/
 
