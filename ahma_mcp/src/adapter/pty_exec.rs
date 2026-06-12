@@ -333,21 +333,12 @@ mod unix {
                             monitor.append_output_line(op_id, safe, false).await;
                         }
                         None => {
-                            // PTY closed — wait for the exit code.
+                            // Reader thread finished (PTY master returned
+                            // EOF/EIO after child exit) — all output has been
+                            // captured. Now collect the exit code.
                             break exit_rx.recv().await.flatten();
                         }
                     }
-                }
-
-                status = exit_rx.recv() => {
-                    // Child exited; drain remaining buffered lines.
-                    while let Ok(line) = line_rx.try_recv() {
-                        let safe = crate::log_monitor::redact_sensitive_line(&line);
-                        spill_writer.write_line(&safe, false).await;
-                        collected.push(safe.clone());
-                        monitor.append_output_line(op_id, safe, false).await;
-                    }
-                    break status.flatten();
                 }
             }
         };
