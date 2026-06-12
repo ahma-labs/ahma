@@ -643,6 +643,12 @@ mod ahma_list_tools_mode_tests {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("not included in this build") {
+            // `cluster` is an incubating feature behind a non-default cargo
+            // feature gate; the default binary intentionally excludes it.
+            eprintln!("SKIP: ahma binary built without the `cluster` feature");
+            return;
+        }
         assert!(
             output.status.success(),
             "add-peer failed. stdout: {}, stderr: {}",

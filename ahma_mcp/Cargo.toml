@@ -83,6 +83,9 @@ wiremock = "0.6"
 
 [features]
 android = []
+# Incubating features are quarantined behind non-default gates so the default
+# build stays a lean MCP execution core.  Enable explicitly (or via the
+# passthrough features in ahma_bin) when needed.
 simplify = [
 	"dep:opener",
 	"dep:pulldown-cmark",
@@ -90,7 +93,16 @@ simplify = [
 	"dep:rust-code-analysis",
 	"dep:walkdir",
 ]
-default = ["android", "simplify"]
+# HTML+WASM artifact channel (interactive output with embedded LLM chat). Incubating.
+artifact = []
+# Per-task egress HTTP proxy with domain allowlist. Incubating.
+egress = []
+default = ["android"]
+
+# Integration tests that require non-default features
+[[test]]
+name = "simplify_report_integration_test"
+required-features = ["simplify"]
 
 # Tool configuration examples
 [[example]]

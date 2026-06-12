@@ -854,6 +854,10 @@ pub struct AppState {
     pub session_id: Option<String>,
     pub sandbox_status: String,
     pub workspace: String,
+    /// Token/context preferences resolved from CLI flags (`--minimize-tokens`,
+    /// `--small-model-harness`, `--context-length`).  Flag values override
+    /// settings.toml and the deprecated env vars.
+    pub token_prefs: crate::TokenPrefs,
 
     // ── Panel data ──
     pub ai_activity: VecDeque<AiActivityEntry>,
@@ -1021,6 +1025,7 @@ impl AppState {
             session_id: None,
             sandbox_status: "UNKNOWN".to_string(),
             workspace,
+            token_prefs: crate::TokenPrefs::default(),
             ai_activity: VecDeque::with_capacity(ACTIVITY_RING_CAP),
             operations: vec![],
             log: VecDeque::with_capacity(LOG_RING_CAP),
@@ -1280,6 +1285,31 @@ impl AppState {
         self.operations.get(self.ops_selected)
     }
 
+    /// Compute which lines of `incoming` are genuinely new relative to
+    /// `existing`: the largest k where `incoming[..k]` equals the suffix of
+    /// `existing` marks already-seen content; everything after k is appended.
+    /// With no overlap the whole incoming tail is considered new.
+    fn tail_suffix_to_append(
+        existing: &std::collections::VecDeque<String>,
+        incoming: &std::collections::VecDeque<String>,
+    ) -> Vec<String> {
+        if existing.is_empty() || incoming.is_empty() {
+            return incoming.iter().cloned().collect();
+        }
+        let max_k = existing.len().min(incoming.len());
+        for k in (1..=max_k).rev() {
+            let suffix_matches = existing
+                .iter()
+                .skip(existing.len() - k)
+                .zip(incoming.iter().take(k))
+                .all(|(a, b)| a == b);
+            if suffix_matches {
+                return incoming.iter().skip(k).cloned().collect();
+            }
+        }
+        incoming.iter().cloned().collect()
+    }
+
     pub fn upsert_operation(&mut self, op: Operation) {
         if let Some(existing) = self
             .operations
@@ -1322,8 +1352,13 @@ impl AppState {
                 existing.duration_ms = op.duration_ms;
             }
 
-            // Append stdout lines rather than replacing so neither source loses output.
-            for line in op.stdout_tail {
+            // Merge stdout tails without duplicating: the poll path re-sends the
+            // operation's FULL current tail on every cycle, and the hub path
+            // streams the same lines incrementally.  Find the largest overlap
+            // between the existing tail's suffix and the incoming tail's prefix,
+            // then append only the genuinely new remainder.
+            let new_lines = Self::tail_suffix_to_append(&existing.stdout_tail, &op.stdout_tail);
+            for line in new_lines {
                 if existing.stdout_tail.len() >= STDOUT_TAIL_CAP {
                     existing.stdout_tail.pop_front();
                 }
@@ -1415,6 +1450,41 @@ mod tests {
         s.upsert_operation(op2);
 
         assert_eq!(s.operations.len(), 2);
+    }
+
+    #[test]
+    fn upsert_merges_tails_without_duplication() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        let mut op = Operation::new("op1", "cargo_build", OpStatus::Running);
+        op.stdout_tail = vec!["a".to_string(), "b".to_string()].into();
+        s.upsert_operation(op);
+
+        // Poll re-sends the full tail plus one new line — only "c" must append.
+        let mut update = Operation::new("op1", "cargo_build", OpStatus::Running);
+        update.stdout_tail = vec!["a".to_string(), "b".to_string(), "c".to_string()].into();
+        s.upsert_operation(update);
+        assert_eq!(
+            s.operations[0].stdout_tail,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+
+        // Identical re-send appends nothing.
+        let mut same = Operation::new("op1", "cargo_build", OpStatus::Running);
+        same.stdout_tail = vec!["a".to_string(), "b".to_string(), "c".to_string()].into();
+        s.upsert_operation(same);
+        assert_eq!(s.operations[0].stdout_tail.len(), 3);
+    }
+
+    #[test]
+    fn tail_suffix_to_append_no_overlap_appends_all() {
+        let existing: std::collections::VecDeque<String> =
+            vec!["x".to_string(), "y".to_string()].into();
+        let incoming: std::collections::VecDeque<String> =
+            vec!["p".to_string(), "q".to_string()].into();
+        assert_eq!(
+            AppState::tail_suffix_to_append(&existing, &incoming),
+            vec!["p".to_string(), "q".to_string()]
+        );
     }
 
     #[test]

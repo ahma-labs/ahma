@@ -1,9 +1,10 @@
 //! Handler for `tool_type: livelog` tools.
 //!
 //! A livelog tool spawns a long-running source command (e.g. `adb logcat`),
-//! pipes its output through an LLM for issue detection, and pushes
-//! [`ProgressUpdate::LogAlert`] notifications to the MCP client whenever the
-//! LLM finds problems matching the `detection_prompt`.
+//! pipes its output through an LLM for issue detection, and records `Alert`
+//! events on the operation whenever the LLM finds problems matching the
+//! `detection_prompt`.  The unified event stream forwards each alert to all
+//! subscribers, including the MCP progress push.
 
 use std::{sync::Arc, time::Duration};
 
@@ -12,7 +13,6 @@ use serde_json::{Map, Value};
 use tracing::info;
 
 use crate::{
-    callback_system::CallbackSender,
     config::ToolConfig,
     livelog::run_livelog_pipeline,
     operation_monitor::{Operation, OperationMonitor, OperationStatus},
@@ -21,25 +21,23 @@ use crate::{
 
 /// Start a live-log monitoring session and return the operation ID immediately.
 ///
-/// The source process is spawned inside a background `tokio` task.  Log chunks are
-/// forwarded to the configured LLM; when issues are detected a
-/// [`ProgressUpdate::LogAlert`] notification is pushed to the MCP client.
+/// The source process is spawned inside a background `tokio` task.  Log chunks
+/// are forwarded to the configured LLM; detected issues are recorded as
+/// `Alert` events on the operation.
 ///
 /// # Arguments
 ///
-/// * `op_id`    — Pre-generated operation ID (should match the ID in the callback).
+/// * `op_id`    — Pre-generated operation ID.
 /// * `config`   — Tool configuration (must have `livelog` field populated).
 /// * `params`   — MCP call params (used for optional `working_directory` override).
 /// * `monitor`  — Operation monitor for lifecycle tracking.
 /// * `sandbox`  — Sandbox used to spawn the source process.
-/// * `callback` — Optional progress callback; pass `None` if no MCP peer is attached.
 pub async fn handle_livelog_start(
     op_id: String,
     config: &ToolConfig,
     params: &Map<String, Value>,
     monitor: Arc<OperationMonitor>,
     sandbox: Arc<Sandbox>,
-    callback: Option<Box<dyn CallbackSender>>,
     llm_service: Arc<dyn crate::llm_service::LlmCompletionService>,
 ) -> Result<String> {
     let livelog = config.livelog.as_ref().ok_or_else(|| {
@@ -110,19 +108,12 @@ pub async fn handle_livelog_start(
             .update_status(&op_id_task, OperationStatus::InProgress, None)
             .await;
 
-        // The callback is an Option<Box<dyn CallbackSender + Send + Sync>>.
-        // We borrow it as Option<&dyn CallbackSender> for the pipeline.
-        let cb_ref: Option<&(dyn CallbackSender + Send + Sync)> = callback
-            .as_ref()
-            .map(|b| b.as_ref() as &(dyn CallbackSender + Send + Sync));
-
         run_livelog_pipeline(
             &op_id_task,
             &livelog_config,
             &sandbox_task,
             &safe_wd,
             cancellation_token,
-            cb_ref,
             monitor_task.clone(),
             llm_service_task,
         )

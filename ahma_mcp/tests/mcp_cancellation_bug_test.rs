@@ -131,7 +131,6 @@ async fn test_mcp_cancellation_does_not_trigger_canceled_canceled_message() {
             }),
             temp_dir.path().to_str().unwrap(),
             Some(10), // 10 second timeout
-            None,
         )
         .await
         .expect("Failed to start background operation");

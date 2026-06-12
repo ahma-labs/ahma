@@ -78,6 +78,11 @@ pub struct UpdateArgs {
     /// Equivalent to setting `AHMA_INSECURE_SKIP_VERIFY=1`.
     #[arg(long, alias = "insecure-skip-signature")]
     pub insecure_skip_verify: bool,
+
+    /// Prefer musl builds on Linux (static binaries, glibc-free).
+    /// Replaces the deprecated AHMA_PREFER_MUSL environment variable.
+    #[arg(long)]
+    pub prefer_musl: bool,
 }
 
 struct UpdateOutcome {
@@ -111,6 +116,10 @@ pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result
         .clone()
         .or_else(|| std::env::var("AHMA_INSTALL_DIR").ok().map(PathBuf::from))
         .unwrap_or_else(|| default_install_dir().expect("home directory"));
+
+    if args.prefer_musl {
+        platform::set_prefer_musl_override();
+    }
 
     let mode = classify_ref(args.reference.as_deref());
     let platform = detect_platform().ok();

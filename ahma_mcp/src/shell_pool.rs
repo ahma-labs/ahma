@@ -373,6 +373,10 @@ pub struct PrewarmedShell {
     is_healthy: bool,
     /// Lock to ensure only one command runs at a time
     command_lock: Mutex<()>,
+    /// Capacity permit held while this shell is checked out of the pool.
+    /// Dropping the shell (on any path, including panics) releases the permit,
+    /// so pool capacity can never leak.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl std::fmt::Debug for PrewarmedShell {
@@ -458,6 +462,7 @@ impl PrewarmedShell {
                 last_used: Instant::now(),
                 is_healthy: true,
                 command_lock: Mutex::new(()),
+                permit: None,
             };
 
             // Initialize the shell with our command protocol handler
@@ -659,9 +664,23 @@ impl PrewarmedShell {
     }
 }
 
+impl PrewarmedShell {
+    /// Attach the pool-capacity permit to this shell while it is checked out.
+    pub(crate) fn attach_permit(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
+        self.permit = Some(permit);
+    }
+
+    /// Detach the pool-capacity permit (returning the shell to the pool
+    /// releases capacity; idle pooled shells do not hold permits).
+    pub(crate) fn take_permit(&mut self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.permit.take()
+    }
+}
+
 impl Drop for PrewarmedShell {
     fn drop(&mut self) {
-        // Attempt to kill the process on drop
+        // Attempt to kill the process on drop. The capacity permit (if any)
+        // is released automatically when `self.permit` drops.
         let _ = self.process.start_kill();
     }
 }
@@ -781,7 +800,7 @@ impl ShellPool {
 pub struct ShellPoolManager {
     pools: RwLock<HashMap<PathBuf, Arc<ShellPool>>>,
     config: ShellPoolConfig,
-    shell_semaphore: Semaphore,
+    shell_semaphore: Arc<Semaphore>,
 }
 
 impl ShellPoolManager {
@@ -791,7 +810,7 @@ impl ShellPoolManager {
 
         Self {
             pools: RwLock::new(HashMap::new()),
-            shell_semaphore: Semaphore::new(config.max_total_shells),
+            shell_semaphore: Arc::new(Semaphore::new(config.max_total_shells)),
             config,
         }
     }
@@ -812,17 +831,10 @@ impl ShellPoolManager {
 
         let working_dir = working_dir.as_ref().to_path_buf();
 
-        // Check if we're at capacity first
-        if self.shell_semaphore.available_permits() == 0 {
-            tracing::debug!(
-                "Shell pool at capacity ({} shells), skipping",
-                self.config.max_total_shells
-            );
-            return None;
-        }
-
-        // Acquire a permit from the semaphore
-        let _permit = match self.shell_semaphore.try_acquire() {
+        // Acquire an owned capacity permit. The permit travels inside the
+        // checked-out shell, so dropping the shell on any path (return,
+        // error, panic) releases capacity automatically.
+        let permit = match Arc::clone(&self.shell_semaphore).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 tracing::debug!(
@@ -845,27 +857,29 @@ impl ShellPoolManager {
 
         // Get shell from pool
         match pool.get_shell().await {
-            Ok(shell) => {
+            Ok(mut shell) => {
+                shell.attach_permit(permit);
                 tracing::debug!(
                     "Got shell from pool, available permits: {}",
                     self.shell_semaphore.available_permits()
                 );
-                // Keep the permit active until the shell is returned
-                std::mem::forget(_permit);
                 Some(shell)
             }
             Err(e) => {
                 tracing::warn!("Failed to get shell from pool for {:?}: {}", working_dir, e);
-                // Release the permit since we didn't use it
-                drop(_permit);
+                // `permit` drops here, releasing capacity
                 None
             }
         }
     }
 
     /// Return a shell to its appropriate pool
-    pub async fn return_shell(&self, shell: PrewarmedShell) {
+    pub async fn return_shell(&self, mut shell: PrewarmedShell) {
         let working_dir = shell.working_dir().to_path_buf();
+
+        // Idle pooled shells do not hold capacity permits; dropping the
+        // permit here releases capacity for new checkouts.
+        let _permit = shell.take_permit();
 
         // Find the pool for this working directory
         let pools = self.pools.read().await;
@@ -874,17 +888,13 @@ impl ShellPoolManager {
             drop(pools);
 
             pool.return_shell(shell).await;
-
-            // Release one permit back to the semaphore
-            self.shell_semaphore.add_permits(1);
             tracing::debug!(
                 "Returned shell to pool, available permits: {}",
                 self.shell_semaphore.available_permits()
             );
         } else {
             tracing::warn!("No pool found for working directory: {:?}", working_dir);
-            // Shell will be dropped, also release permit
-            self.shell_semaphore.add_permits(1);
+            // Shell will be dropped here
         }
     }
 
@@ -943,12 +953,8 @@ impl ShellPoolManager {
             pool.shutdown().await;
         }
 
-        self.shell_semaphore.add_permits(
-            self.config
-                .max_total_shells
-                .saturating_sub(self.shell_semaphore.available_permits()),
-        );
-
+        // Capacity permits are held inside checked-out shells and release
+        // automatically when those shells drop — no manual refill needed.
         tracing::info!("Shut down {} shell pools", pool_count);
     }
 

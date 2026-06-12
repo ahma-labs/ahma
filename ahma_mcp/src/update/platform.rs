@@ -2,6 +2,16 @@
 
 use anyhow::{Result, bail};
 
+/// Process-wide musl preference set from the `--prefer-musl` CLI flag.
+/// Cross-platform: defined everywhere, consumed by the Linux detection branch.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+static PREFER_MUSL_OVERRIDE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Prefer musl builds on Linux (set from the `--prefer-musl` CLI flag).
+pub fn set_prefer_musl_override() {
+    let _ = PREFER_MUSL_OVERRIDE.set(());
+}
+
 /// GitHub release asset platform identifier (matches CI packaging).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Platform {
@@ -78,10 +88,16 @@ pub fn detect_platform() -> Result<Platform> {
             other => bail!("Unsupported Linux architecture: {other}"),
         };
 
-        let prefer_musl = std::env::var("AHMA_PREFER_MUSL")
+        let env_prefer_musl = std::env::var("AHMA_PREFER_MUSL")
             .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
-            || detect_linux_musl();
+            .unwrap_or(false);
+        if env_prefer_musl {
+            tracing::warn!(
+                "Deprecated: AHMA_PREFER_MUSL environment variable is set. Use the --prefer-musl flag instead."
+            );
+        }
+        let prefer_musl =
+            PREFER_MUSL_OVERRIDE.get().is_some() || env_prefer_musl || detect_linux_musl();
 
         let id = if arch == "armv7" {
             "linux-armv7".to_string()
@@ -91,10 +107,10 @@ pub fn detect_platform() -> Result<Platform> {
             format!("linux-{arch}")
         };
 
-        return Ok(Platform {
+        Ok(Platform {
             id,
             archive_ext: ArchiveFormat::TarGz,
-        });
+        })
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]

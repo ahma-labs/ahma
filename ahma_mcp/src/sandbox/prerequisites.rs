@@ -29,46 +29,25 @@ pub fn check_sandbox_prerequisites() -> Result<(), SandboxError> {
 
 #[cfg(target_os = "linux")]
 fn check_landlock_available() -> Result<(), SandboxError> {
-    use std::fs;
-    let landlock_abi_path = "/sys/kernel/security/lsm";
-    match fs::read_to_string(landlock_abi_path) {
-        Ok(content) => {
-            if content.contains("landlock") {
-                Ok(())
-            } else {
-                Err(SandboxError::LandlockNotAvailable)
-            }
-        }
-        Err(_) => check_kernel_version_for_landlock(),
+    // Probe the syscall directly. Kernel version and the LSM list can both
+    // lie: containers may block the syscall via seccomp, securityfs may be
+    // unmounted, or Landlock may be compiled out / not enabled at boot — all
+    // on kernels whose version implies support. The only authoritative answer
+    // is asking the kernel for the Landlock ABI version.
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1 << 0;
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if abi >= 1 {
+        Ok(())
+    } else {
+        Err(SandboxError::LandlockNotAvailable)
     }
-}
-
-#[cfg(target_os = "linux")]
-fn check_kernel_version_for_landlock() -> Result<(), SandboxError> {
-    use std::process::Command;
-    let output = Command::new("uname").arg("-r").output().map_err(|_| {
-        SandboxError::PrerequisiteFailed("Failed to check kernel version".to_string())
-    })?;
-    let version_str = String::from_utf8_lossy(&output.stdout);
-    let parts: Vec<&str> = version_str.trim().split('.').collect();
-    if parts.len() >= 2 {
-        let major: u32 = parts[0].parse().unwrap_or(0);
-        let minor: u32 = parts[1]
-            .split('-')
-            .next()
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0);
-        if major > 5 || (major == 5 && minor >= 13) {
-            return Ok(());
-        }
-    }
-    Err(SandboxError::PrerequisiteFailed(format!(
-        "Landlock requires Linux kernel 5.13 or newer. Current: {}. \
-         To run without sandboxing, add the --disable-sandbox parameter to your mcp.json tool definition. \
-         Example: \"args\": [\"--mode\", \"http\", \"--disable-sandbox\"]",
-        version_str.trim()
-    )))
 }
 
 #[cfg(target_os = "macos")]

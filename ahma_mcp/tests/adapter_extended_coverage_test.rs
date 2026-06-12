@@ -268,7 +268,6 @@ async fn test_execute_async_returns_id() {
             None,
             temp.path().to_str().unwrap(),
             Some(30),
-            None,
         )
         .await;
 
@@ -297,7 +296,6 @@ async fn test_execute_async_with_options() {
                 id: Some("custom_op_id".to_string()),
                 args: Some(args),
                 timeout: Some(30),
-                callback: None,
                 subcommand_config: None,
                 log_monitor_config: None,
             },
@@ -516,7 +514,6 @@ async fn test_adapter_shutdown() {
             }),
             temp.path().to_str().unwrap(),
             Some(30),
-            None,
         )
         .await
         .unwrap();
@@ -704,7 +701,6 @@ async fn test_async_cancellation_before_execution() {
             None,
             temp.path().to_str().unwrap(),
             Some(60),
-            None::<Box<dyn ahma_mcp::callback_system::CallbackSender>>,
         )
         .await
         .unwrap();
@@ -775,7 +771,6 @@ async fn test_async_with_callback_none() {
             None,
             temp.path().to_str().unwrap(),
             Some(30),
-            None::<Box<dyn ahma_mcp::callback_system::CallbackSender>>, // No callback - tests the None branch
         )
         .await
         .unwrap();
@@ -837,7 +832,6 @@ async fn test_async_timeout_path() {
             None,
             temp.path().to_str().unwrap(),
             Some(1), // Very short timeout (1 second)
-            None::<Box<dyn ahma_mcp::callback_system::CallbackSender>>,
         )
         .await
         .unwrap();

@@ -1,9 +1,8 @@
 use super::super::NEXT_ID;
 use super::common;
 use crate::AhmaMcpService;
-use crate::callback_system::CallbackSender;
 use crate::client_type::McpClientType;
-use crate::mcp_callback::McpCallbackSender;
+use crate::mcp_service::progress_push;
 use crate::mcp_service::schema;
 use crate::shell_pool::platform_shell_program;
 use rmcp::{
@@ -107,6 +106,18 @@ impl AhmaMcpService {
                 "stderr",
             ),
         );
+        properties.insert(
+            "session_id".to_string(),
+            schema::string_property(
+                "Run the command in a persistent shell session with this id. Commands sharing a session_id run sequentially in the SAME shell, so `cd`, exported variables, and sourced environments (e.g. virtualenvs) persist between calls. The session is created on first use.",
+            ),
+        );
+        properties.insert(
+            "pty".to_string(),
+            schema::boolean_property(
+                "Run the command attached to a pseudo-terminal (Unix only). Use for tools that require a TTY or change behaviour without one (colours, progress bars, interactive prompts). stdout and stderr are merged.",
+            ),
+        );
         schema::object_input_schema(properties, &["command"])
     }
 
@@ -151,6 +162,22 @@ impl AhmaMcpService {
             .await?
         {
             return Ok(staged);
+        }
+
+        // Dedicated execution paths: persistent shell session / PTY.
+        let session_id = common::opt_str(&args, "session_id");
+        let use_pty = args.get("pty").and_then(|v| v.as_bool()).unwrap_or(false);
+        if session_id.is_some() || use_pty {
+            return self
+                .execute_shell_special(
+                    &command,
+                    &working_directory,
+                    timeout,
+                    session_id.as_deref(),
+                    use_pty,
+                    &context,
+                )
+                .await;
         }
 
         // Extract optional log monitoring parameters
@@ -306,16 +333,20 @@ impl AhmaMcpService {
             working_directory
         );
 
-        if let Some(token) = progress_token.clone() {
-            let callback =
-                McpCallbackSender::new(context.peer.clone(), id.clone(), Some(token), client_type);
-            let _ = callback
-                .send_progress(crate::callback_system::ProgressUpdate::Started {
-                    id: id.clone(),
-                    command: platform_shell_program().to_string(),
-                    description: description.clone(),
-                })
-                .await;
+        // Sync operations never enter the OperationMonitor, so the event
+        // forwarder cannot see them — push start/final progress directly.
+        let push_enabled = progress_token.is_some() && client_type.supports_progress();
+        if let Some(token) = progress_token.clone()
+            && push_enabled
+        {
+            progress_push::push_progress(
+                &context.peer,
+                token,
+                0.0,
+                format!("{}: {}", platform_shell_program(), description),
+                false,
+            )
+            .await;
         }
 
         let result = self
@@ -333,30 +364,119 @@ impl AhmaMcpService {
         self.emit_vault_tool_complete(&id, result.is_ok(), duration_ms)
             .await;
 
-        if let Some(token) = progress_token {
-            let callback =
-                McpCallbackSender::new(context.peer.clone(), id.clone(), Some(token), client_type);
+        if let Some(token) = progress_token
+            && push_enabled
+        {
             let (success, full_output) = match &result {
                 Ok(output) => (true, output.clone()),
                 Err(e) => (false, format!("Error: {}", e)),
             };
-            let _ = callback
-                .send_progress(crate::callback_system::ProgressUpdate::FinalResult {
-                    id: id.clone(),
-                    command: platform_shell_program().to_string(),
-                    description,
-                    working_directory: working_directory.to_string(),
-                    success,
-                    duration_ms: 0,
-                    full_output,
-                })
-                .await;
+            let message = progress_push::sync_final_message(
+                &id,
+                platform_shell_program(),
+                &description,
+                working_directory,
+                success,
+                duration_ms,
+                &full_output,
+            );
+            progress_push::push_progress(&context.peer, token, 100.0, message, true).await;
         }
 
         match result {
             Ok(output) => Ok(common::text_result(output)),
             Err(e) => {
                 let error_message = format!("Synchronous execution failed: {}", e);
+                tracing::error!("{}", error_message);
+                Err(common::mcp_internal(error_message))
+            }
+        }
+    }
+
+    /// Execute `run_terminal_command` with a `session_id` and/or `pty: true`.
+    ///
+    /// Both paths run asynchronously through the standard operation lifecycle
+    /// (operation id returned immediately; results via `await`/`status` and
+    /// the unified event stream).  When both are requested, the session wins:
+    /// PTY-in-session is not supported yet.
+    async fn execute_shell_special(
+        &self,
+        command: &str,
+        working_directory: &str,
+        timeout: Option<u64>,
+        session_id: Option<&str>,
+        use_pty: bool,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let id = crate::utils::operation::generate_id_with_details(
+            counter_val,
+            "run_terminal_command",
+            command,
+        );
+        self.emit_vault_tool_call(
+            &id,
+            "run_terminal_command",
+            &format!(
+                "{{\"working_directory\":\"{}\",\"command\":\"{}\",\"session_id\":{:?},\"pty\":{}}}",
+                working_directory, command, session_id, use_pty
+            ),
+        )
+        .await;
+
+        let progress_token = context.meta.get_progress_token();
+        let client_type = McpClientType::from_peer(&context.peer);
+        if let Some(token) = progress_token {
+            self.progress_push
+                .register(&id, context.peer.clone(), token, client_type)
+                .await;
+        }
+
+        let started = match session_id {
+            Some(session) => {
+                if use_pty {
+                    tracing::warn!(
+                        "run_terminal_command: pty=true ignored — PTY inside a session is not supported"
+                    );
+                }
+                self.adapter
+                    .execute_session_async(
+                        "run_terminal_command",
+                        session,
+                        command,
+                        working_directory,
+                        timeout,
+                        Some(id.clone()),
+                    )
+                    .await
+            }
+            None => {
+                self.adapter
+                    .execute_pty_async(
+                        "run_terminal_command",
+                        command,
+                        working_directory,
+                        timeout,
+                        Some(id.clone()),
+                    )
+                    .await
+            }
+        };
+
+        match started {
+            Ok(op_id) => {
+                if let Some(result) =
+                    common::try_automatic_async_completion(&self.operation_monitor, &op_id).await
+                {
+                    return Ok(result);
+                }
+                let hint = crate::tool_hints::preview(&op_id, "run_terminal_command");
+                Ok(common::text_result(format!("AHMA ID: {}{}", op_id, hint)))
+            }
+            Err(e) => {
+                self.progress_push.unregister(&id).await;
+                self.emit_vault_tool_complete(&id, false, 0).await;
+                let error_message = format!("Execution failed: {}", e);
                 tracing::error!("{}", error_message);
                 Err(common::mcp_internal(error_message))
             }
@@ -398,15 +518,11 @@ impl AhmaMcpService {
 
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
-        let callback: Option<Box<dyn CallbackSender>> = progress_token.map(|token| {
-            Box::new(McpCallbackSender::new(
-                context.peer.clone(),
-                id.clone(),
-                Some(token),
-                client_type,
-            )) as Box<dyn CallbackSender>
-        });
-        let callback = self.wrap_callback_with_vault_audit(callback, &id);
+        if let Some(token) = progress_token {
+            self.progress_push
+                .register(&id, context.peer.clone(), token, client_type)
+                .await;
+        }
 
         let job_id = self
             .adapter
@@ -418,7 +534,6 @@ impl AhmaMcpService {
                     id: Some(id.clone()),
                     args: Some(adapter_args),
                     timeout,
-                    callback,
                     subcommand_config: Some(subcommand_config),
                     log_monitor_config,
                 },
@@ -439,6 +554,9 @@ impl AhmaMcpService {
                 Ok(common::text_result(message))
             }
             Err(e) => {
+                // The operation never started, so no terminal event will
+                // arrive to clean up the push registration.
+                self.progress_push.unregister(&id).await;
                 self.emit_vault_tool_complete(&id, false, 0).await;
                 let error_message = format!("Async execution failed: {}", e);
                 tracing::error!("{}", error_message);

@@ -3,13 +3,13 @@
 //! Tests `run_livelog_pipeline()` end-to-end using:
 //! - A real mock source command (`echo` / `printf`) that produces known output.
 //! - A wiremock server standing in for the LLM endpoint.
-//! - A `MockCallbackSender` that captures `ProgressUpdate::LogAlert` notifications.
+//! - The `OperationMonitor` as the store of record: detected issues are
+//!   appended to `Operation::alerts` (and emitted as `Alert` events).
 
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use serde_json::json;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
@@ -18,47 +18,13 @@ use wiremock::{
     matchers::{method, path},
 };
 
-use ahma_mcp::callback_system::{CallbackError, CallbackSender, ProgressUpdate};
 use ahma_mcp::config::{LivelogConfig, LlmProviderConfig};
 use ahma_mcp::livelog::run_livelog_pipeline;
-use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
+use ahma_mcp::operation_monitor::{MonitorConfig, Operation, OperationMonitor};
 use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 
 // ---------------------------------------------------------------------------
-// Mock callback sender
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Default)]
-struct MockCallback {
-    alerts: Arc<Mutex<Vec<ProgressUpdate>>>,
-}
-
-impl MockCallback {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn captured_alerts(&self) -> Vec<ProgressUpdate> {
-        self.alerts.lock().unwrap().clone()
-    }
-}
-
-#[async_trait]
-impl CallbackSender for MockCallback {
-    async fn send_progress(&self, update: ProgressUpdate) -> Result<(), CallbackError> {
-        if matches!(update, ProgressUpdate::LogAlert { .. }) {
-            self.alerts.lock().unwrap().push(update);
-        }
-        Ok(())
-    }
-
-    async fn should_cancel(&self) -> bool {
-        false
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helper: build a minimal LivelogConfig pointing at a wiremock LLM server
+// Helpers
 // ---------------------------------------------------------------------------
 
 fn make_config(
@@ -90,11 +56,52 @@ fn make_llm_response(content: &str) -> serde_json::Value {
     })
 }
 
+fn make_monitor() -> Arc<OperationMonitor> {
+    Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+        TestTimeouts::get(TimeoutCategory::ToolCall),
+    )))
+}
+
+/// Register the livelog operation so `append_alert` has a target — mirrors
+/// what `handle_livelog_start` does in production.
+async fn register_op(monitor: &OperationMonitor, op_id: &str) {
+    monitor
+        .add_operation(Operation::new_with_timeout(
+            op_id.to_string(),
+            "livelog".to_string(),
+            format!("livelog test op {op_id}"),
+            None,
+            None,
+        ))
+        .await;
+}
+
+async fn alerts_for(monitor: &OperationMonitor, op_id: &str) -> Vec<String> {
+    monitor
+        .get_operation(op_id)
+        .await
+        .map(|op| op.alerts)
+        .unwrap_or_default()
+}
+
+fn make_sandbox(temp_dir: &std::path::Path) -> Arc<Sandbox> {
+    Arc::new(
+        Sandbox::new(
+            vec![temp_dir.to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-/// When the LLM returns "CLEAN", no LogAlert should be sent.
+/// When the LLM returns "CLEAN", no alert should be recorded.
 #[tokio::test]
 async fn test_livelog_pipeline_clean_response_no_alert() {
     let server = MockServer::start().await;
@@ -105,16 +112,7 @@ async fn test_livelog_pipeline_clean_response_no_alert() {
         .await;
 
     let temp_dir = tempdir().unwrap();
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp_dir.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
+    let sandbox = make_sandbox(temp_dir.path());
 
     let config = make_config(
         "echo",
@@ -123,11 +121,9 @@ async fn test_livelog_pipeline_clean_response_no_alert() {
         "look for crashes",
     );
 
-    let callback = MockCallback::new();
     let token = CancellationToken::new();
-    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-    )));
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-clean").await;
 
     run_livelog_pipeline(
         "test-op-clean",
@@ -135,13 +131,12 @@ async fn test_livelog_pipeline_clean_response_no_alert() {
         &sandbox,
         temp_dir.path(),
         token,
-        Some(&callback),
-        monitor,
+        monitor.clone(),
         Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
-    let alerts = callback.captured_alerts();
+    let alerts = alerts_for(&monitor, "test-op-clean").await;
     assert!(
         alerts.is_empty(),
         "expected no alerts for CLEAN response, got: {:?}",
@@ -149,7 +144,8 @@ async fn test_livelog_pipeline_clean_response_no_alert() {
     );
 }
 
-/// When the LLM returns an issue summary, a LogAlert is delivered.
+/// When the LLM returns an issue summary, an alert is recorded with both the
+/// summary and the raw log context.
 #[tokio::test]
 async fn test_livelog_pipeline_issue_detected_sends_alert() {
     let server = MockServer::start().await;
@@ -162,16 +158,7 @@ async fn test_livelog_pipeline_issue_detected_sends_alert() {
         .await;
 
     let temp_dir = tempdir().unwrap();
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp_dir.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
+    let sandbox = make_sandbox(temp_dir.path());
 
     let config = make_config(
         "echo",
@@ -180,11 +167,9 @@ async fn test_livelog_pipeline_issue_detected_sends_alert() {
         "look for crashes",
     );
 
-    let callback = MockCallback::new();
     let token = CancellationToken::new();
-    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-    )));
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-issue").await;
 
     run_livelog_pipeline(
         "test-op-issue",
@@ -192,32 +177,22 @@ async fn test_livelog_pipeline_issue_detected_sends_alert() {
         &sandbox,
         temp_dir.path(),
         token,
-        Some(&callback),
-        monitor,
+        monitor.clone(),
         Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
-    let alerts = callback.captured_alerts();
-    assert_eq!(alerts.len(), 1, "expected exactly one alert");
-
-    match &alerts[0] {
-        ProgressUpdate::LogAlert {
-            id,
-            llm_summary,
-            trigger_lines,
-            ..
-        } => {
-            assert_eq!(id, "test-op-issue");
-            let summary = llm_summary.as_deref().unwrap_or("");
-            assert!(
-                summary.contains("NullPointerException"),
-                "summary should mention the exception: {summary}"
-            );
-            assert!(trigger_lines.is_some(), "trigger_lines should be populated");
-        }
-        other => panic!("expected LogAlert, got: {:?}", other),
-    }
+    let alerts = alerts_for(&monitor, "test-op-issue").await;
+    assert_eq!(alerts.len(), 1, "expected exactly one alert: {:?}", alerts);
+    let alert = &alerts[0];
+    assert!(
+        alert.contains("NullPointerException at MainActivity line 42"),
+        "alert should contain the LLM summary: {alert}"
+    );
+    assert!(
+        alert.contains("FATAL EXCEPTION"),
+        "alert should contain the raw log context: {alert}"
+    );
 }
 
 /// The cooldown window suppresses a second alert fired within cooldown_seconds.
@@ -234,19 +209,9 @@ async fn test_livelog_pipeline_cooldown_suppresses_second_alert() {
         .await;
 
     let temp_dir = tempdir().unwrap();
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp_dir.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
+    let sandbox = make_sandbox(temp_dir.path());
 
     // Two lines = two chunks (chunk_max_lines = 1), but cooldown = 300s.
-    // On a real source that only exits after producing two lines we use printf.
     let mut config = make_config(
         "printf",
         vec!["line1\\nline2\\n".to_string()],
@@ -255,11 +220,9 @@ async fn test_livelog_pipeline_cooldown_suppresses_second_alert() {
     );
     config.cooldown_seconds = 300; // very long cooldown
 
-    let callback = MockCallback::new();
     let token = CancellationToken::new();
-    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-    )));
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-cooldown").await;
 
     run_livelog_pipeline(
         "test-op-cooldown",
@@ -267,13 +230,12 @@ async fn test_livelog_pipeline_cooldown_suppresses_second_alert() {
         &sandbox,
         temp_dir.path(),
         token,
-        Some(&callback),
-        monitor,
+        monitor.clone(),
         Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
-    let alerts = callback.captured_alerts();
+    let alerts = alerts_for(&monitor, "test-op-cooldown").await;
     // First chunk triggers alert; second chunk should be silenced by cooldown.
     assert_eq!(
         alerts.len(),
@@ -292,16 +254,7 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
     // LLM is never reached because we cancel before any chunk is produced.
 
     let temp_dir = tempdir().unwrap();
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp_dir.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
+    let sandbox = make_sandbox(temp_dir.path());
 
     let config = make_config(
         "sleep",
@@ -310,11 +263,9 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
         "look for crashes",
     );
 
-    let callback = MockCallback::new();
     let token = CancellationToken::new();
-    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-    )));
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-cancel").await;
 
     // Cancel after a short delay so the pipeline can actually start.
     let token_clone = token.clone();
@@ -330,8 +281,7 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
         &sandbox,
         temp_dir.path(),
         token,
-        Some(&callback),
-        monitor,
+        monitor.clone(),
         Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
@@ -344,7 +294,7 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
         elapsed
     );
     assert!(
-        callback.captured_alerts().is_empty(),
+        alerts_for(&monitor, "test-op-cancel").await.is_empty(),
         "no alerts expected after immediate cancellation"
     );
 }
@@ -361,16 +311,7 @@ async fn test_livelog_pipeline_llm_http_500_graceful() {
         .await;
 
     let temp_dir = tempdir().unwrap();
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp_dir.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
+    let sandbox = make_sandbox(temp_dir.path());
 
     let config = make_config(
         "echo",
@@ -379,11 +320,9 @@ async fn test_livelog_pipeline_llm_http_500_graceful() {
         "look for errors",
     );
 
-    let callback = MockCallback::new();
     let token = CancellationToken::new();
-    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-    )));
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-500").await;
 
     // Pipeline should complete without panic/hang despite LLM 500.
     run_livelog_pipeline(
@@ -392,15 +331,14 @@ async fn test_livelog_pipeline_llm_http_500_graceful() {
         &sandbox,
         temp_dir.path(),
         token,
-        Some(&callback),
-        monitor,
+        monitor.clone(),
         Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
     // The LLM error means no alert is generated (the error is logged, not propagated).
     assert!(
-        callback.captured_alerts().is_empty(),
+        alerts_for(&monitor, "test-op-500").await.is_empty(),
         "LLM 500 should not produce an alert"
     );
 }
@@ -416,16 +354,7 @@ async fn test_livelog_pipeline_llm_malformed_json_graceful() {
         .await;
 
     let temp_dir = tempdir().unwrap();
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp_dir.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
+    let sandbox = make_sandbox(temp_dir.path());
 
     let config = make_config(
         "echo",
@@ -434,11 +363,9 @@ async fn test_livelog_pipeline_llm_malformed_json_graceful() {
         "look for warnings",
     );
 
-    let callback = MockCallback::new();
     let token = CancellationToken::new();
-    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-    )));
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-bad-json").await;
 
     run_livelog_pipeline(
         "test-op-bad-json",
@@ -446,14 +373,13 @@ async fn test_livelog_pipeline_llm_malformed_json_graceful() {
         &sandbox,
         temp_dir.path(),
         token,
-        Some(&callback),
-        monitor,
+        monitor.clone(),
         Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
     assert!(
-        callback.captured_alerts().is_empty(),
+        alerts_for(&monitor, "test-op-bad-json").await.is_empty(),
         "malformed LLM JSON should not produce an alert"
     );
 }
@@ -470,16 +396,7 @@ async fn test_livelog_pipeline_zero_cooldown_fires_all_alerts() {
         .await;
 
     let temp_dir = tempdir().unwrap();
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp_dir.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
+    let sandbox = make_sandbox(temp_dir.path());
 
     // Two lines with chunk_max_lines=1 → two chunks.
     let mut config = make_config(
@@ -490,11 +407,9 @@ async fn test_livelog_pipeline_zero_cooldown_fires_all_alerts() {
     );
     config.cooldown_seconds = 0; // no suppression
 
-    let callback = MockCallback::new();
     let token = CancellationToken::new();
-    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-    )));
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-zero-cd").await;
 
     run_livelog_pipeline(
         "test-op-zero-cd",
@@ -502,13 +417,12 @@ async fn test_livelog_pipeline_zero_cooldown_fires_all_alerts() {
         &sandbox,
         temp_dir.path(),
         token,
-        Some(&callback),
-        monitor,
+        monitor.clone(),
         Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
-    let alerts = callback.captured_alerts();
+    let alerts = alerts_for(&monitor, "test-op-zero-cd").await;
     assert_eq!(
         alerts.len(),
         2,
@@ -524,16 +438,7 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
     // LLM mock is set up but should never be reached.
 
     let temp_dir = tempdir().unwrap();
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp_dir.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
+    let sandbox = make_sandbox(temp_dir.path());
 
     let config = make_config(
         "this_command_definitely_does_not_exist_12345",
@@ -542,11 +447,9 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
         "unused",
     );
 
-    let callback = MockCallback::new();
     let token = CancellationToken::new();
-    let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-    )));
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-not-found").await;
 
     // Should complete without panicking.
     run_livelog_pipeline(
@@ -555,14 +458,13 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
         &sandbox,
         temp_dir.path(),
         token,
-        Some(&callback),
-        monitor,
+        monitor.clone(),
         Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
     )
     .await;
 
     assert!(
-        callback.captured_alerts().is_empty(),
+        alerts_for(&monitor, "test-op-not-found").await.is_empty(),
         "no alerts expected when source command not found"
     );
 }

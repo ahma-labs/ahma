@@ -8,9 +8,11 @@
 //! logic to a standalone worker process or companion MCP server to achieve a cleaner
 //! segregation of duties and allow better sandboxing boundaries.
 //!
-//! When the LLM reports an issue, a [`ProgressUpdate::LogAlert`] notification is pushed
-//! to the MCP client via the registered callback.  A cooldown window prevents alert
-//! storms when many problematic lines arrive in rapid succession.
+//! When the LLM reports an issue, an `Alert` event is recorded on the
+//! operation (via `OperationMonitor::append_alert`), which the unified event
+//! stream forwards to all subscribers — including the MCP progress push.  A
+//! cooldown window prevents alert storms when many problematic lines arrive
+//! in rapid succession.
 //!
 //! The pipeline runs inside a `tokio::spawn` task and can be stopped at any time by calling
 //! [`tokio_util::sync::CancellationToken::cancel`] on the token that was obtained from the
@@ -26,7 +28,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
-    callback_system::{CallbackSender, ProgressUpdate},
     config::{LivelogConfig, LlmProviderConfig},
     sandbox::Sandbox,
 };
@@ -42,7 +43,6 @@ use crate::operation_monitor::OperationMonitor;
 /// * `sandbox`            — Validated sandbox used to spawn the source process.
 /// * `working_dir`        — Working directory for the source process.
 /// * `cancellation_token` — Token to stop the pipeline on demand.
-/// * `callback`           — Optional MCP progress callback for pushing alerts.
 /// * `monitor`            — Operation monitor to update logs and alerts.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_livelog_pipeline(
@@ -51,7 +51,6 @@ pub async fn run_livelog_pipeline(
     sandbox: &Arc<Sandbox>,
     working_dir: &std::path::Path,
     cancellation_token: CancellationToken,
-    callback: Option<&(dyn CallbackSender + Send + Sync)>,
     monitor: Arc<OperationMonitor>,
     llm_service: Arc<dyn crate::llm_service::LlmCompletionService>,
 ) {
@@ -124,7 +123,7 @@ pub async fn run_livelog_pipeline(
                 op_id
             );
             if !chunk.is_empty() {
-                maybe_analyze(op_id, &ctx, &mut chunk, &mut last_alert, callback).await;
+                maybe_analyze(op_id, &ctx, &mut chunk, &mut last_alert).await;
             }
             break;
         }
@@ -190,7 +189,7 @@ pub async fn run_livelog_pipeline(
         let chunk_timed_out = chunk_start.elapsed() >= chunk_max_duration;
 
         if (chunk_full || chunk_timed_out) && !chunk.is_empty() {
-            maybe_analyze(op_id, &ctx, &mut chunk, &mut last_alert, callback).await;
+            maybe_analyze(op_id, &ctx, &mut chunk, &mut last_alert).await;
             chunk_start = Instant::now();
         }
     }
@@ -211,7 +210,7 @@ struct AnalysisCtx<'a> {
     monitor: &'a Arc<OperationMonitor>,
 }
 
-/// Send `chunk` to the LLM for analysis; fire a `LogAlert` if issues are found.
+/// Send `chunk` to the LLM for analysis; record an `Alert` if issues are found.
 ///
 /// Respects the cooldown window — if an alert was sent recently the chunk is
 /// discarded without calling the LLM.
@@ -220,7 +219,6 @@ async fn maybe_analyze(
     ctx: &AnalysisCtx<'_>,
     chunk: &mut Vec<String>,
     last_alert: &mut Option<Instant>,
-    callback: Option<&(dyn CallbackSender + Send + Sync)>,
 ) {
     let (detection_prompt, llm_timeout, cooldown) =
         (ctx.detection_prompt, ctx.llm_timeout, ctx.cooldown);
@@ -238,7 +236,7 @@ async fn maybe_analyze(
     }
 
     let chunk_text = chunk.join("\n");
-    let trigger_lines: Vec<String> = std::mem::take(chunk); // ownership + clears in one step
+    chunk.clear();
 
     match ctx
         .llm_service
@@ -256,20 +254,15 @@ async fn maybe_analyze(
             info!("livelog[{}]: LLM detected issue: {}", op_id, summary);
             *last_alert = Some(Instant::now());
 
-            ctx.monitor.append_alert(op_id, summary.clone()).await;
-
-            if let Some(cb) = callback {
-                let alert = ProgressUpdate::LogAlert {
-                    id: op_id.to_string(),
-                    trigger_level: "error".to_string(),
-                    context_snapshot: chunk_text,
-                    llm_summary: Some(summary),
-                    trigger_lines: Some(trigger_lines),
-                };
-                if let Err(e) = cb.send_progress(alert).await {
-                    warn!("livelog[{}]: failed to send alert: {:?}", op_id, e);
-                }
-            }
+            // One rich alert: human-readable diagnosis first, raw context
+            // after.  Recorded on the operation and emitted as an `Alert`
+            // event, which the progress push forwards to the MCP client.
+            ctx.monitor
+                .append_alert(
+                    op_id,
+                    format!("**Issue detected**: {summary}\n\n---\n\n{chunk_text}"),
+                )
+                .await;
         }
         Ok(None) => {
             debug!("livelog[{}]: LLM response: clean", op_id);
@@ -312,7 +305,6 @@ pub async fn run_file_monitor_pipeline(
     detection_prompt: String,
     llm_provider: LlmProviderConfig,
     cancellation_token: CancellationToken,
-    callback: Option<&(dyn CallbackSender + Send + Sync)>,
     monitor: Arc<OperationMonitor>,
     llm_service: Arc<dyn crate::llm_service::LlmCompletionService>,
 ) {
@@ -391,7 +383,7 @@ pub async fn run_file_monitor_pipeline(
         // Flush chunk if time window expires
         let chunk_timed_out = chunk_start.elapsed() >= chunk_max_duration;
         if chunk_timed_out && !chunk.is_empty() {
-            maybe_analyze(op_id, &ctx, &mut chunk, &mut last_alert, callback).await;
+            maybe_analyze(op_id, &ctx, &mut chunk, &mut last_alert).await;
             chunk_start = Instant::now();
         }
 
@@ -428,7 +420,7 @@ pub async fn run_file_monitor_pipeline(
                         chunk.push(line_clean);
 
                         if chunk.len() >= chunk_max_lines {
-                            maybe_analyze(op_id, &ctx, &mut chunk, &mut last_alert, callback).await;
+                            maybe_analyze(op_id, &ctx, &mut chunk, &mut last_alert).await;
                             chunk_start = Instant::now();
                         }
                     }

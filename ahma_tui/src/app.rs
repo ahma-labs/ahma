@@ -17,12 +17,16 @@ pub async fn run(
     connection: &ResolvedConnection,
     profile: Option<String>,
     path: Option<std::path::PathBuf>,
+    token_prefs: crate::TokenPrefs,
 ) -> Result<()> {
     #[cfg(feature = "tui")]
-    return run_ratatui(connection, profile, path).await;
+    return run_ratatui(connection, profile, path, token_prefs).await;
 
     #[cfg(not(feature = "tui"))]
-    return run_text_stub(connection).await;
+    {
+        let _ = token_prefs;
+        return run_text_stub(connection).await;
+    }
 }
 
 // ─── Ratatui implementation (feature = "tui") ─────────────────────────────────
@@ -32,6 +36,7 @@ async fn run_ratatui(
     connection: &ResolvedConnection,
     profile_override: Option<String>,
     workspace_path: Option<std::path::PathBuf>,
+    token_prefs: crate::TokenPrefs,
 ) -> Result<()> {
     use std::io;
     use std::time::Duration;
@@ -62,6 +67,7 @@ async fn run_ratatui(
         unicode,
     );
     state.mcp_http_base_url = http_base_url(connection);
+    state.token_prefs = token_prefs;
 
     if let Some(profile_name) = profile_override
         && let Ok(cwd) = std::env::current_dir()
@@ -299,13 +305,7 @@ fn approve_symlink(state: &mut crate::state::AppState) {
     {
         let tx = tx.clone();
         let file_to_approve = active_file.clone();
-        let settings = ahma_common::config::AhmaSettings::load();
-        let minimize_tokens = std::env::var("AHMA_MINIMIZE_TOKENS")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(settings.tools.minimize_tokens);
-        let small_model_harness = std::env::var("AHMA_SMALL_MODEL_HARNESS")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(settings.tools.small_model_harness);
+        let (minimize_tokens, small_model_harness, context_length) = resolve_token_prefs(state);
 
         let mcp = crate::llm_bridge::McpChatConfig {
             base_url: state.server_url.clone(),
@@ -317,6 +317,7 @@ fn approve_symlink(state: &mut crate::state::AppState) {
             mcp_connections: state.mcp_connections.clone(),
             minimize_tokens,
             small_model_harness,
+            context_length,
         };
         tokio::spawn(async move {
             crate::llm_bridge::spawn_tool_call_task(
@@ -1184,6 +1185,38 @@ where
         .unwrap_or(default)
 }
 
+/// Resolve token/context preferences: CLI flag > deprecated env var > settings.
+/// Returns `(minimize_tokens, small_model_harness, context_length)`.
+#[cfg(feature = "tui")]
+fn resolve_token_prefs(state: &crate::state::AppState) -> (bool, bool, Option<u32>) {
+    let settings = ahma_common::config::AhmaSettings::load();
+
+    fn env_bool(name: &str) -> Option<bool> {
+        std::env::var(name).ok().map(|v| {
+            tracing::warn!(
+                "Deprecated: {name} environment variable is set. Use the corresponding CLI flag instead."
+            );
+            v == "1" || v.to_lowercase() == "true"
+        })
+    }
+
+    let minimize_tokens = state
+        .token_prefs
+        .minimize_tokens
+        .or_else(|| env_bool("AHMA_MINIMIZE_TOKENS"))
+        .unwrap_or(settings.tools.minimize_tokens);
+    let small_model_harness = state
+        .token_prefs
+        .small_model_harness
+        .or_else(|| env_bool("AHMA_SMALL_MODEL_HARNESS"))
+        .unwrap_or(settings.tools.small_model_harness);
+    (
+        minimize_tokens,
+        small_model_harness,
+        state.token_prefs.context_length,
+    )
+}
+
 #[cfg(feature = "tui")]
 fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChatConfig {
     let external_http_servers = state
@@ -1201,13 +1234,7 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
     let max_turns = profile_field(state, |p| p.max_turns, 8);
     let tool_approval = profile_field(state, |p| p.tool_approval, false);
 
-    let settings = ahma_common::config::AhmaSettings::load();
-    let minimize_tokens = std::env::var("AHMA_MINIMIZE_TOKENS")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(settings.tools.minimize_tokens);
-    let small_model_harness = std::env::var("AHMA_SMALL_MODEL_HARNESS")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(settings.tools.small_model_harness);
+    let (minimize_tokens, small_model_harness, context_length) = resolve_token_prefs(state);
 
     crate::llm_bridge::McpChatConfig {
         base_url: state.mcp_http_base_url.clone(),
@@ -1219,6 +1246,7 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
         mcp_connections: state.mcp_connections.clone(),
         minimize_tokens,
         small_model_harness,
+        context_length,
     }
 }
 
@@ -2606,20 +2634,61 @@ fn format_friendly_end(op: &crate::state::Operation) -> String {
     end_text
 }
 
+/// Build the full window content for an operation: friendly start line,
+/// live output tail (streamed as the command runs), and — once terminal —
+/// a separator plus a friendly result line.
 #[cfg(feature = "tui")]
-fn update_existing_window(
-    w: &mut crate::state::TuiWindow,
-    op: &crate::state::Operation,
-    unicode: bool,
-) {
-    w.status = match op.status {
+fn window_content_for(op: &crate::state::Operation, unicode: bool) -> Vec<String> {
+    let is_live = matches!(
+        op.status,
+        crate::state::OpStatus::Running
+            | crate::state::OpStatus::Pending
+            | crate::state::OpStatus::Waiting
+    );
+
+    let mut content = Vec::with_capacity(op.stdout_tail.len() + 3);
+    content.push(format_friendly_start(
+        &op.tool_name,
+        &op.description,
+        op.started_time,
+    ));
+
+    // Live output tail — the command's stdout/stderr as it streams in.
+    content.extend(op.stdout_tail.iter().cloned());
+
+    if is_live {
+        content.push("____".to_string());
+    } else {
+        let sep = if unicode {
+            "────────────────────────────────────────".to_string()
+        } else {
+            "----------------------------------------".to_string()
+        };
+        content.push(sep);
+        content.push(format_friendly_end(op));
+    }
+    content
+}
+
+#[cfg(feature = "tui")]
+fn window_status_for(op: &crate::state::Operation) -> String {
+    match op.status {
         crate::state::OpStatus::Running => "Running".to_string(),
         crate::state::OpStatus::Pending => "Pending".to_string(),
         crate::state::OpStatus::Succeeded => "Finished".to_string(),
         crate::state::OpStatus::Failed => "Error".to_string(),
         crate::state::OpStatus::Cancelled => "Cancelled".to_string(),
         crate::state::OpStatus::Waiting => "Pending".to_string(),
-    };
+    }
+}
+
+#[cfg(feature = "tui")]
+fn update_existing_window(
+    w: &mut crate::state::TuiWindow,
+    op: &crate::state::Operation,
+    unicode: bool,
+) {
+    w.status = window_status_for(op);
 
     if op.status != crate::state::OpStatus::Running
         && op.status != crate::state::OpStatus::Pending
@@ -2629,26 +2698,7 @@ fn update_existing_window(
         w.finished_at = Some(std::time::Instant::now());
     }
 
-    let mut content = vec![];
-    let start_text = format_friendly_start(&op.tool_name, &op.description, op.started_time);
-    content.push(start_text);
-
-    if op.status != crate::state::OpStatus::Running
-        && op.status != crate::state::OpStatus::Pending
-        && op.status != crate::state::OpStatus::Waiting
-    {
-        let sep = if unicode {
-            "────────────────────────────────────────".to_string()
-        } else {
-            "----------------------------------------".to_string()
-        };
-        content.push(sep);
-        content.push(format_friendly_end(op));
-    } else {
-        content.push("____".to_string());
-    }
-
-    w.content = content;
+    w.content = window_content_for(op, unicode);
 }
 
 #[cfg(feature = "tui")]
@@ -2665,33 +2715,8 @@ fn build_new_window(
         op.instance_label.as_deref().unwrap_or("local")
     );
 
-    let status = match op.status {
-        crate::state::OpStatus::Running => "Running".to_string(),
-        crate::state::OpStatus::Pending => "Pending".to_string(),
-        crate::state::OpStatus::Succeeded => "Finished".to_string(),
-        crate::state::OpStatus::Failed => "Error".to_string(),
-        crate::state::OpStatus::Cancelled => "Cancelled".to_string(),
-        crate::state::OpStatus::Waiting => "Pending".to_string(),
-    };
-
-    let mut content = vec![];
-    let start_text = format_friendly_start(&op.tool_name, &op.description, op.started_time);
-    content.push(start_text);
-
-    if op.status != crate::state::OpStatus::Running
-        && op.status != crate::state::OpStatus::Pending
-        && op.status != crate::state::OpStatus::Waiting
-    {
-        let sep = if state.unicode {
-            "────────────────────────────────────────".to_string()
-        } else {
-            "----------------------------------------".to_string()
-        };
-        content.push(sep);
-        content.push(format_friendly_end(op));
-    } else {
-        content.push("____".to_string());
-    }
+    let status = window_status_for(op);
+    let content = window_content_for(op, state.unicode);
 
     let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
     let op_id = op.id.clone();
@@ -2837,6 +2862,14 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             }
             sync_operations_to_windows(state);
         }
+        SourceEvent::OperationOutput {
+            instance_id,
+            op_id,
+            line,
+            is_stderr: _,
+        } => {
+            handle_operation_output(state, instance_id, &op_id, line);
+        }
         SourceEvent::AiActivity(entry) => state.push_activity(entry),
         SourceEvent::LogLine(entry) => state.push_log(entry),
         SourceEvent::ToolsListUpdated { tools } => {
@@ -2859,6 +2892,48 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         SourceEvent::InstancesUpdated { instances } => {
             handle_instances_updated(instances, state);
         }
+    }
+}
+
+/// Append one live output line to an operation's tail buffer and refresh the
+/// matching window incrementally — no full window rebuild, no polling delay.
+#[cfg(feature = "tui")]
+fn handle_operation_output(
+    state: &mut crate::state::AppState,
+    instance_id: Option<String>,
+    op_id: &str,
+    line: String,
+) {
+    // Prefer an exact (id, instance) match; fall back to id-only so output
+    // still lands when the op was first seen via the poll path (instance None).
+    let op_idx = state
+        .operations
+        .iter()
+        .position(|o| o.id == op_id && o.instance_id == instance_id)
+        .or_else(|| state.operations.iter().position(|o| o.id == op_id));
+
+    let Some(idx) = op_idx else {
+        // Output for an operation we have not seen yet — the OpStarted event
+        // (or the next reconciliation poll) will create it; drop the line.
+        return;
+    };
+
+    {
+        let op = &mut state.operations[idx];
+        if op.stdout_tail.len() >= crate::state::STDOUT_TAIL_CAP {
+            op.stdout_tail.pop_front();
+        }
+        op.stdout_tail.push_back(line);
+    }
+
+    let op = state.operations[idx].clone();
+    let unicode = state.unicode;
+    if let Some(w) = state
+        .windows
+        .iter_mut()
+        .find(|w| w.op_id.as_deref() == Some(op_id))
+    {
+        update_existing_window(w, &op, unicode);
     }
 }
 

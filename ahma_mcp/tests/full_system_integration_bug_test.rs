@@ -1,70 +1,35 @@
 #[cfg(test)]
 mod tests {
+    use ahma_common::event_dispatcher::OperationEvent;
     use ahma_mcp::adapter::Adapter;
-    use ahma_mcp::callback_system::{CallbackSender, ProgressUpdate};
     use ahma_mcp::config::load_tool_configs;
     use ahma_mcp::mcp_service::AhmaMcpService;
     use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
     use ahma_mcp::sandbox::{Sandbox, SandboxMode};
     use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
 
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
-    /// A mock callback that tracks all notifications sent
-    #[derive(Debug, Clone)]
-    struct TrackingCallback {
-        notifications: Arc<Mutex<Vec<ProgressUpdate>>>,
-    }
-
-    impl TrackingCallback {
-        fn new() -> Self {
-            Self {
-                notifications: Arc::new(Mutex::new(Vec::new())),
+    /// Drain all immediately-available events from a subscription, counting
+    /// terminal events (Completed/Failed/Cancelled/TimedOut) for the given
+    /// operation id.
+    fn drain_terminal_count(
+        rx: &mut tokio::sync::broadcast::Receiver<Arc<OperationEvent>>,
+        id: &str,
+    ) -> usize {
+        let mut count = 0;
+        while let Ok(event) = rx.try_recv() {
+            if event.is_terminal() && event.operation_id() == id {
+                count += 1;
             }
         }
-
-        #[allow(dead_code)]
-        fn get_notifications(&self) -> Vec<ProgressUpdate> {
-            self.notifications.lock().unwrap().clone()
-        }
-
-        fn count_completed_notifications(&self, id: &str) -> usize {
-            self.notifications
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|update| {
-                    matches!(
-                        update,
-                        ProgressUpdate::Completed {
-                            id: update_id,
-                            ..
-                        } if update_id == id
-                    )
-                })
-                .count()
-        }
+        count
     }
 
-    #[async_trait::async_trait]
-    impl CallbackSender for TrackingCallback {
-        async fn send_progress(
-            &self,
-            update: ProgressUpdate,
-        ) -> Result<(), ahma_mcp::callback_system::CallbackError> {
-            println!("📨 TRACKED NOTIFICATION: {}", update);
-            self.notifications.lock().unwrap().push(update);
-            Ok(())
-        }
-
-        async fn should_cancel(&self) -> bool {
-            false
-        }
-    }
-
-    /// This test simulates the full system to ensure that with the new `completion_history`
-    /// architecture, operations result in exactly one notification.
+    /// This test simulates the full system to ensure that with the
+    /// `completion_history` architecture and the unified event stream,
+    /// operations result in exactly one terminal `Completed` event.
     #[tokio::test]
     async fn test_full_system_integration_single_notification() {
         println!("🔍 Testing full system integration for single notification guarantee...");
@@ -105,15 +70,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let tracking_callback = Arc::new(TrackingCallback::new());
         println!("OK Full system initialized");
+
+        // Subscribe BEFORE starting the operation so no events are missed.
+        let mut events = operation_monitor.subscribe_events();
 
         let current_dir = std::env::current_dir().unwrap();
         let current_dir_str = current_dir.to_str().unwrap();
 
         // Start an operation
         let id = adapter
-            .execute_async_in_dir("cargo", "version", None, current_dir_str, Some(30), None)
+            .execute_async_in_dir("cargo", "version", None, current_dir_str, Some(30))
             .await
             .expect("Failed to execute async operation");
         println!("🚀 Started operation: {}", id);
@@ -126,9 +93,20 @@ mod tests {
         );
         println!("OK Operation completed and is in history.");
 
-        // Simulate a notification loop that runs multiple times
+        // The unified event stream must carry exactly one terminal event for
+        // the operation — the single emission point guarantee.
+        let terminal_events = drain_terminal_count(&mut events, &id);
+        assert_eq!(
+            terminal_events, 1,
+            "BUG: Expected exactly 1 terminal event on the unified stream, got {}",
+            terminal_events
+        );
+
+        // Simulate a notification loop that runs multiple times over the
+        // history snapshot — dedup by id must yield exactly one notification.
         println!("🔄 Simulating notification loop...");
         let mut notified_operations = std::collections::HashSet::new();
+        let mut notifications_sent = 0usize;
         for iteration in 1..=10 {
             let completed_ops = operation_monitor.get_completed_operations().await;
             if !completed_ops.is_empty() {
@@ -138,34 +116,17 @@ mod tests {
                     completed_ops.len()
                 );
                 for op in completed_ops {
-                    // A real notification system would check if a notification has already been sent.
-                    if notified_operations.insert(op.id.clone()) {
-                        let update = ProgressUpdate::Completed {
-                            id: op.id.clone(),
-                            message: "Operation finished".to_string(),
-                            duration_ms: 1000,
-                        };
-                        tracking_callback.send_progress(update).await.unwrap();
+                    if op.id == id && notified_operations.insert(op.id.clone()) {
+                        notifications_sent += 1;
                     }
                 }
             }
-            // The sleep is removed as the test's correctness relies on the logic
-            // of checking `notified_operations`, not on timing.
         }
 
-        // --- Analysis ---
-        let completed_notifications = tracking_callback.count_completed_notifications(&id);
-        println!("📈 Notification analysis for operation {}:", id);
-        println!(
-            "   Total 'Completed' notifications sent: {}",
-            completed_notifications
-        );
-
-        // There should be exactly one "Completed" notification for the operation.
         assert_eq!(
-            completed_notifications, 1,
+            notifications_sent, 1,
             "BUG: Expected exactly 1 completed notification, but got {}. The notification logic is flawed.",
-            completed_notifications
+            notifications_sent
         );
 
         println!("OK Full system integration test passed - operation was notified exactly once.");
@@ -201,11 +162,11 @@ mod tests {
         // Start multiple operations
         let op_ids = vec![
             adapter
-                .execute_async_in_dir("cargo", "version", None, current_dir_str, Some(30), None)
+                .execute_async_in_dir("cargo", "version", None, current_dir_str, Some(30))
                 .await
                 .expect("Failed to execute first async operation"),
             adapter
-                .execute_async_in_dir("cargo", "--version", None, current_dir_str, Some(30), None)
+                .execute_async_in_dir("cargo", "--version", None, current_dir_str, Some(30))
                 .await
                 .expect("Failed to execute second async operation"),
         ];
@@ -242,8 +203,6 @@ mod tests {
                     println!("   - Sending notification for new operation {}", op.id);
                 }
             }
-            // The sleep is removed as the test's correctness relies on the logic
-            // of checking `all_notified_operations`, not on timing.
         }
 
         // --- Analysis ---

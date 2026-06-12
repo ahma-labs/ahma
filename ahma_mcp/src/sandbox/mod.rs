@@ -22,8 +22,10 @@
 //! While the mechanisms differ by OS, they all provide the same functional guarantee
 //! of read/write isolation for the AI:
 //!
-//! - **Linux (Landlock)**: Uses the Landlock LSM (available in kernel 5.13+) to restrict
-//!   filesystem access for the current process and all its future children.
+//! - **Linux (Landlock)**: Uses the Landlock LSM (available in kernel 5.13+). Because
+//!   `landlock_restrict_self(2)` only restricts the calling thread, each spawned command
+//!   gets the ruleset applied in `pre_exec` (between fork and exec), guaranteeing
+//!   kernel-level containment regardless of which runtime thread spawns it.
 //! - **macOS (Seatbelt)**: Uses the system's `sandbox-exec` utility with a dynamically
 //!   generated SBPL (Sandbox Binary Policy Language) profile.
 //! - **Windows (Job Objects)**: Uses Job Objects to ensure child process cleanup and (in
@@ -53,7 +55,9 @@ pub use core::Sandbox;
 pub use core::{is_target_allowed, load_exceptions};
 pub use error::SandboxError;
 #[cfg(target_os = "linux")]
-pub use landlock::enforce_landlock_sandbox;
+pub use landlock::{
+    apply_landlock_ruleset_in_child, enforce_landlock_sandbox, landlock_ruleset_fd,
+};
 pub use prerequisites::{
     check_sandbox_prerequisites, exit_with_sandbox_error, test_sandbox_exec_available,
 };

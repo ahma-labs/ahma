@@ -256,6 +256,10 @@ impl ClientBuilder {
             cmd.env_remove("AHMA_SANDBOX_DEFER");
             cmd.env_remove("AHMA_SANDBOX_SCOPE");
             cmd.env_remove("AHMA_WORKING_DIRS");
+            // SECURITY: also clear the global disable flag — if a parent process (e.g. Cursor,
+            // an outer ahma session) has AHMA_DISABLE_SANDBOX=1 set, the child would inherit
+            // it and silently run without Landlock, causing red-team tests to leak data.
+            cmd.env_remove("AHMA_DISABLE_SANDBOX");
 
             configure_sandbox_args(cmd, force_no_sandbox, working_dir, livelog);
 

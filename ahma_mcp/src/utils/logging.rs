@@ -82,11 +82,28 @@ pub fn detect_log_role_from_startup() -> &'static str {
     }
 }
 
-/// Project log directory: `<cwd>/logs`, falling back to `~/.ahma/logs` if CWD is unwriteable or is root.
+/// Process-wide log directory override set from the `--log-dir` CLI flag.
+static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set the log directory from the `--log-dir` CLI flag.
+/// Call once, early in startup, before any logging is initialised.
+pub fn set_log_dir_override(dir: PathBuf) {
+    let _ = LOG_DIR_OVERRIDE.set(dir);
+}
+
+/// Project log directory: `--log-dir` flag, then `<cwd>/logs`, falling back to
+/// `~/.ahma/logs` if CWD is unwriteable or is root.
 pub fn project_log_dir() -> PathBuf {
+    if let Some(dir) = LOG_DIR_OVERRIDE.get() {
+        return dir.clone();
+    }
+
     if let Ok(val) = std::env::var("AHMA_LOG_DIR")
         && !val.is_empty()
     {
+        tracing::warn!(
+            "Deprecated: AHMA_LOG_DIR environment variable is set. Use the --log-dir flag instead."
+        );
         return PathBuf::from(val);
     }
 
@@ -415,8 +432,8 @@ mod tests {
 
     #[test]
     fn test_log_retention_threshold() {
-        assert!(LOG_RETENTION_SECS > 23 * 60 * 60);
-        assert!(LOG_RETENTION_SECS < 25 * 60 * 60);
+        const _: () = assert!(LOG_RETENTION_SECS > 23 * 60 * 60);
+        const _: () = assert!(LOG_RETENTION_SECS < 25 * 60 * 60);
     }
 
     #[test]

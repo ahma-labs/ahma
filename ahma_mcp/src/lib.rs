@@ -96,8 +96,6 @@
 // Public modules
 /// Core adapter for tool execution.
 pub mod adapter;
-/// Progress callback system for async operations.
-pub mod callback_system;
 mod check_service_ext;
 /// Client helpers for talking to Ahma.
 pub mod client;
@@ -121,8 +119,6 @@ pub mod llm_service;
 pub mod log_monitor;
 /// Logging helpers for the core crate.
 pub mod logging;
-/// MCP callback sender integration.
-pub mod mcp_callback;
 /// MCP server implementation.
 pub mod mcp_service;
 /// Operation monitor for async tasks.
@@ -143,6 +139,8 @@ pub mod setup;
 pub mod shell;
 /// Shell pooling and execution.
 pub mod shell_pool;
+/// Persistent stateful shell sessions (`session_id`).
+pub mod shell_session;
 /// Code complexity analysis and simplification tooling.
 #[cfg(feature = "simplify")]
 pub mod simplify;
@@ -178,9 +176,13 @@ pub mod validation;
 // they must NOT be depended on from this crate.
 
 /// Egress sandbox: per-task HTTP proxy with domain allowlist.
+/// Incubating — enable with the `egress` feature.
+#[cfg(feature = "egress")]
 pub mod egress;
 
 /// HTML+WASM artifact channel: interactive output with embedded LLM chat.
+/// Incubating — enable with the `artifact` feature.
+#[cfg(feature = "artifact")]
 pub mod artifact;
 
 /// Bundle signing and supply-chain auditor.

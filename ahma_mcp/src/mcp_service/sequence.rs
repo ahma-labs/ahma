@@ -12,11 +12,10 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::adapter::Adapter;
-use crate::callback_system::CallbackSender;
 use crate::client_type::McpClientType;
 use crate::config::{SequenceStep, SubcommandConfig, ToolConfig};
 use crate::constants::SEQUENCE_STEP_DELAY_MS;
-use crate::mcp_callback::McpCallbackSender;
+use crate::mcp_service::progress_push::ProgressPushRouter;
 use crate::operation_monitor::OperationMonitor;
 
 use super::handlers::common;
@@ -99,19 +98,20 @@ fn next_id(tool_name: &str, subcommand: Option<&str>) -> String {
     crate::utils::operation::generate_id_with_details(counter_val, tool_name, command)
 }
 
-/// Creates a callback sender if a progress token is available.
-fn create_callback(
+/// Registers the request's progress destination for a step operation id, if
+/// the client provided a progress token.
+async fn register_progress_target(
+    progress_push: &ProgressPushRouter,
     context: &RequestContext<RoleServer>,
     id: &str,
-) -> Option<Box<dyn CallbackSender>> {
-    let progress_token = context.meta.get_progress_token()?;
+) {
+    let Some(progress_token) = context.meta.get_progress_token() else {
+        return;
+    };
     let client_type = McpClientType::from_peer(&context.peer);
-    Some(Box::new(McpCallbackSender::new(
-        context.peer.clone(),
-        id.to_string(),
-        Some(progress_token),
-        client_type,
-    )) as Box<dyn CallbackSender>)
+    progress_push
+        .register(id, context.peer.clone(), progress_token, client_type)
+        .await;
 }
 
 /// Applies inter-step delay if configured and not the last step.
@@ -122,9 +122,11 @@ async fn apply_step_delay(step_delay_ms: u64, current_index: usize, total_steps:
 }
 
 /// Handles execution of sequence tools - tools that invoke multiple other tools in order.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_sequence_tool(
     adapter: &Adapter,
     _operation_monitor: &OperationMonitor,
+    progress_push: &ProgressPushRouter,
     configs: &Arc<RwLock<HashMap<String, ToolConfig>>>,
     config: &ToolConfig,
     params: CallToolRequestParams,
@@ -146,7 +148,16 @@ pub async fn handle_sequence_tool(
     if run_synchronously {
         handle_sequence_tool_sync(adapter, configs, config, params, sequence, step_delay_ms).await
     } else {
-        handle_sequence_tool_async(adapter, configs, params, context, sequence, step_delay_ms).await
+        handle_sequence_tool_async(
+            adapter,
+            progress_push,
+            configs,
+            params,
+            context,
+            sequence,
+            step_delay_ms,
+        )
+        .await
     }
 }
 
@@ -247,8 +258,10 @@ async fn handle_sequence_tool_sync(
 }
 
 /// Handles asynchronous sequence execution - starts all steps and returns immediately
+#[allow(clippy::too_many_arguments)]
 async fn handle_sequence_tool_async(
     adapter: &Adapter,
+    progress_push: &ProgressPushRouter,
     configs: &Arc<RwLock<HashMap<String, ToolConfig>>>,
     params: CallToolRequestParams,
     context: RequestContext<RoleServer>,
@@ -279,7 +292,7 @@ async fn handle_sequence_tool_async(
             find_step_subcommand(&step_tool_config, &step.subcommand, &step.tool)?;
 
         let id = next_id(&step.tool, Some(&step.subcommand));
-        let callback = create_callback(&context, &id);
+        register_progress_target(progress_push, &context, &id).await;
 
         let step_result = adapter
             .execute_async_in_dir_with_options(
@@ -290,7 +303,6 @@ async fn handle_sequence_tool_async(
                     id: Some(id),
                     args: Some(merged_args),
                     timeout: None,
-                    callback,
                     subcommand_config: Some(subcommand_config),
                     log_monitor_config: None,
                 },
@@ -322,6 +334,7 @@ async fn handle_sequence_tool_async(
 /// Handles execution of subcommand sequences - subcommands that invoke multiple cargo commands in order.
 pub async fn handle_subcommand_sequence(
     adapter: &Adapter,
+    progress_push: &ProgressPushRouter,
     config: &ToolConfig,
     subcommand_config: &SubcommandConfig,
     params: CallToolRequestParams,
@@ -351,7 +364,7 @@ pub async fn handle_subcommand_sequence(
             )?;
 
         let id = next_id(&config.name, Some(&step.subcommand));
-        let callback = create_callback(&context, &id);
+        register_progress_target(progress_push, &context, &id).await;
 
         let step_result = adapter
             .execute_async_in_dir_with_options(
@@ -362,7 +375,6 @@ pub async fn handle_subcommand_sequence(
                     id: Some(id),
                     args: params.arguments.clone(),
                     timeout: None,
-                    callback,
                     subcommand_config: Some(step_config),
                     log_monitor_config: None,
                 },

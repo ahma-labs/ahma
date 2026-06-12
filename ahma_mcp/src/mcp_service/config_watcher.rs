@@ -228,7 +228,11 @@ impl AhmaMcpService {
             }
         }
 
-        // On Linux, apply Landlock kernel-level restrictions now that we have scopes.
+        // On Linux, apply process-level Landlock now that we have scopes. This
+        // restricts only the calling thread (defense-in-depth) and, more
+        // importantly, fails fast if the scopes are not enforceable. The actual
+        // containment of executed commands happens at spawn time: every child
+        // gets the current ruleset applied in pre_exec (see Sandbox::create_command).
         // SECURITY: exit if Landlock enforcement fails — cannot guarantee security without it.
         #[cfg(target_os = "linux")]
         if !self.adapter.sandbox().is_test_mode() {

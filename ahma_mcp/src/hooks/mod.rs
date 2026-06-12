@@ -420,8 +420,28 @@ fn is_ahma_hooks_active() -> bool {
     is_ahma_hooks_active_with_configs(&detect_active_mcp_configs())
 }
 
+/// Process-wide hooks-mode override set from the `--hooks` CLI flag.
+/// `Some(true)` = forced on, `Some(false)` = forced off, `None` = auto.
+static HOOKS_MODE_OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+
+/// Set hooks behaviour from the `--hooks on|off|auto` CLI flag.
+/// Call once, early in startup. Takes precedence over `AHMA_HOOKS` /
+/// `AHMA_DISABLE_HOOKS` (which remain supported because hook subprocesses
+/// can only be configured through the environment).
+pub fn set_hooks_mode_override(mode: &str) {
+    let parsed = match mode.to_lowercase().as_str() {
+        "off" | "0" | "false" | "no" => Some(false),
+        "on" | "1" | "true" | "yes" => Some(true),
+        _ => None, // "auto" and anything else
+    };
+    let _ = HOOKS_MODE_OVERRIDE.set(parsed);
+}
+
 /// Testable core of [`is_ahma_hooks_active`].
 fn is_ahma_hooks_active_with_configs(active_mcps: &[PathBuf]) -> bool {
+    if let Some(Some(forced)) = HOOKS_MODE_OVERRIDE.get() {
+        return *forced;
+    }
     if let Ok(val) = std::env::var("AHMA_HOOKS") {
         match val.to_lowercase().as_str() {
             "off" | "0" | "false" | "no" => return false,
@@ -1854,12 +1874,17 @@ mod tests {
 
     #[test]
     fn test_is_ahma_hooks_active_with_configs_empty_returns_false() {
+        // Neutralise ambient AHMA_HOOKS (e.g. from a developer shell running
+        // the suite with AHMA_HOOKS=off) — nextest gives each test its own
+        // process, so env mutation here cannot race other tests.
+        unsafe { std::env::remove_var("AHMA_HOOKS") };
         // auto mode with no MCP configs → inactive (passthrough)
         assert!(!is_ahma_hooks_active_with_configs(&[]));
     }
 
     #[test]
     fn test_is_ahma_hooks_active_with_configs_nonempty_returns_true() {
+        unsafe { std::env::remove_var("AHMA_HOOKS") };
         let fake_path = std::path::PathBuf::from("/fake/mcp.json");
         assert!(is_ahma_hooks_active_with_configs(&[fake_path]));
     }

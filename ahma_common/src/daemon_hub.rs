@@ -99,6 +99,14 @@ pub enum DaemonEvent {
         result_summary: Option<String>,
         duration_ms: u64,
     },
+    /// A single line of live output from a running operation.
+    /// Streamed as the child process produces it, so subscribers (TUI) can
+    /// render output in real time instead of waiting for completion.
+    OpOutput {
+        id: String,
+        line: String,
+        is_stderr: bool,
+    },
     LogLine {
         level: String,
         message: String,
@@ -154,12 +162,27 @@ pub enum DaemonMsg {
 // Socket path
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Process-wide socket path override set from the `--daemon-socket` CLI flag.
+static SOCKET_PATH_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Set the daemon socket path from the `--daemon-socket` CLI flag.
+/// Call once, early in startup. Takes precedence over `AHMA_DAEMON_SOCK`.
+pub fn set_socket_path_override(path: PathBuf) {
+    let _ = SOCKET_PATH_OVERRIDE.set(path);
+}
+
 /// Return the platform-default socket path for the hub daemon.
 ///
-/// Override with `AHMA_DAEMON_SOCK` (set to a path on Unix or `host:port` on
-/// Windows — though Windows currently always uses `127.0.0.1:7395`).
+/// Resolution order: `--daemon-socket` flag, then the deprecated
+/// `AHMA_DAEMON_SOCK` environment variable, then the platform default.
 pub fn default_socket_path() -> PathBuf {
+    if let Some(p) = SOCKET_PATH_OVERRIDE.get() {
+        return p.clone();
+    }
     if let Ok(v) = std::env::var("AHMA_DAEMON_SOCK") {
+        warn!(
+            "Deprecated: AHMA_DAEMON_SOCK environment variable is set. Use the --daemon-socket flag instead."
+        );
         return PathBuf::from(v);
     }
 

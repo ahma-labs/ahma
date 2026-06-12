@@ -28,6 +28,20 @@ pub use connection::{ResolvedConnection, ResolvedTransport};
 
 use anyhow::Result;
 
+/// CLI-resolved token/context preferences for the local-LLM chat agent.
+///
+/// `Some(true)` / `Some(false)` are explicit on/off from the
+/// `--minimize-tokens` / `--no-minimize-tokens` (and small-model-harness)
+/// flags; `None` falls back to settings.toml, then the deprecated env vars.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokenPrefs {
+    pub minimize_tokens: Option<bool>,
+    pub small_model_harness: Option<bool>,
+    /// Model context window in tokens (`--context-length`).  Sizes the
+    /// conversation and tool-result budgets for small local models.
+    pub context_length: Option<u32>,
+}
+
 /// Run the TUI event loop, blocking until the user quits.
 ///
 /// * `connect` — explicit `--connect` URL, or `None` to auto-probe local
@@ -36,6 +50,7 @@ pub async fn run_tui(
     connect: Option<&str>,
     profile: Option<String>,
     path: Option<std::path::PathBuf>,
+    token_prefs: TokenPrefs,
 ) -> Result<()> {
     if connect.is_none()
         && let Err(e) = connection::ensure_server_running(path.as_deref()).await
@@ -43,5 +58,5 @@ pub async fn run_tui(
         tracing::warn!("Could not ensure server is running: {}", e);
     }
     let connection = connection::resolve_connection(connect).await?;
-    app::run(&connection, profile, path).await
+    app::run(&connection, profile, path, token_prefs).await
 }

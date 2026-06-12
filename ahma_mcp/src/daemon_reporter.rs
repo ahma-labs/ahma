@@ -164,39 +164,14 @@ async fn run_reporter_loop(
             continue;
         }
 
-        // ── Event loop: listen for OperationMonitor events ────────────────────
+        // ── Event loop: forward the unified operation event stream ───────────
         loop {
             match event_rx.recv().await {
                 Ok(event) => {
-                    let client_msg = match event {
-                        crate::operation_monitor::OperationEvent::Started(op) => ClientMsg::Event {
-                            payload: DaemonEvent::OpStarted {
-                                id: op.id,
-                                tool_name: op.tool_name,
-                                description: op.description,
-                                scope: scope.clone(),
-                            },
-                        },
-                        crate::operation_monitor::OperationEvent::Updated(op) => {
-                            if !op.state.is_terminal() {
-                                continue;
-                            }
-                            let duration_ms = op
-                                .end_time
-                                .and_then(|end| end.duration_since(op.start_time).ok())
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0);
-                            let result_summary = result_summary_from(&op);
-                            ClientMsg::Event {
-                                payload: DaemonEvent::OpFinished {
-                                    id: op.id.clone(),
-                                    status: status_label(op.state),
-                                    result_summary,
-                                    duration_ms,
-                                },
-                            }
-                        }
+                    let Some(payload) = daemon_event_for(&event, &scope) else {
+                        continue;
                     };
+                    let client_msg = ClientMsg::Event { payload };
 
                     if let Err(e) = send_msg(&mut writer, &client_msg).await {
                         debug!("daemon_reporter: send failed ({e}), reconnecting");
@@ -204,6 +179,8 @@ async fn run_reporter_loop(
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Live feed only — subscribers reconcile from monitor state
+                    // on reconnect, so dropped events are non-fatal.
                     warn!("daemon_reporter event queue lagged by {n} messages; continuing");
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -219,6 +196,116 @@ async fn run_reporter_loop(
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Map a unified [`OperationEvent`] to the hub wire event, or `None` for
+/// events the hub does not carry (Progress, McpNotification).
+fn daemon_event_for(
+    event: &ahma_common::event_dispatcher::OperationEvent,
+    scope: &str,
+) -> Option<DaemonEvent> {
+    use ahma_common::event_dispatcher::OperationEvent as Ev;
+    Some(match event {
+        Ev::Started {
+            operation_id,
+            tool_name,
+            description,
+        } => DaemonEvent::OpStarted {
+            id: operation_id.clone(),
+            tool_name: tool_name.clone(),
+            description: description.clone(),
+            scope: scope.to_string(),
+        },
+        Ev::OutputLine {
+            operation_id,
+            line,
+            is_stderr,
+        } => DaemonEvent::OpOutput {
+            id: operation_id.clone(),
+            line: line.clone(),
+            is_stderr: *is_stderr,
+        },
+        Ev::Alert {
+            operation_id,
+            message,
+        } => DaemonEvent::LogLine {
+            level: "alert".to_string(),
+            message: format!("{operation_id}: {message}"),
+        },
+        Ev::Completed {
+            operation_id,
+            result,
+            duration_ms,
+        } => DaemonEvent::OpFinished {
+            id: operation_id.clone(),
+            status: "Completed".to_string(),
+            result_summary: summary_from_value(result),
+            duration_ms: *duration_ms,
+        },
+        Ev::Failed {
+            operation_id,
+            error,
+            duration_ms,
+        } => DaemonEvent::OpFinished {
+            id: operation_id.clone(),
+            status: "Failed".to_string(),
+            result_summary: Some(clip_summary(error.clone())),
+            duration_ms: *duration_ms,
+        },
+        Ev::Cancelled {
+            operation_id,
+            reason,
+            duration_ms,
+        } => DaemonEvent::OpFinished {
+            id: operation_id.clone(),
+            status: "Cancelled".to_string(),
+            result_summary: Some(clip_summary(reason.clone())),
+            duration_ms: *duration_ms,
+        },
+        Ev::TimedOut {
+            operation_id,
+            duration_ms,
+        } => DaemonEvent::OpFinished {
+            id: operation_id.clone(),
+            status: "TimedOut".to_string(),
+            result_summary: Some("operation timed out".to_string()),
+            duration_ms: *duration_ms,
+        },
+        _ => return None,
+    })
+}
+
+/// Extract a short human-readable summary from a result JSON value.
+fn summary_from_value(result: &serde_json::Value) -> Option<String> {
+    let summary = if let Some(msg) = result.get("message").and_then(|v| v.as_str()) {
+        msg.to_string()
+    } else if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+        err.to_string()
+    } else if let Some(err_obj) = result
+        .get("error")
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.as_str())
+    {
+        err_obj.to_string()
+    } else {
+        serde_json::to_string(result).unwrap_or_default()
+    };
+    Some(clip_summary(summary))
+}
+
+/// Clip a summary string to a wire-friendly length.
+fn clip_summary(summary: String) -> String {
+    if summary.len() > 200 {
+        let cut = summary
+            .char_indices()
+            .take_while(|(i, _)| *i <= 197)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        format!("{}...", &summary[..cut])
+    } else {
+        summary
+    }
+}
 
 fn status_label(s: OperationStatus) -> String {
     match s {

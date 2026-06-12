@@ -28,6 +28,9 @@ use tracing::{info, warn};
 /// Rotation warning window: warn when the cert is older than this many days.
 const ROTATION_WARNING_DAYS: u64 = 30;
 
+/// Process-wide TLS directory override set from the `--tls-dir` CLI flag.
+static TLS_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,11 +60,27 @@ impl LocalTlsConfig {
             .join("tls")
     }
 
-    /// Construct a `LocalTlsConfig`, honouring the `AHMA_TLS_DIR` environment variable.
+    /// Set the TLS directory from the `--tls-dir` CLI flag.
+    /// Call once, early in startup. Takes precedence over `AHMA_TLS_DIR`.
+    pub fn set_dir_override(dir: PathBuf) {
+        let _ = TLS_DIR_OVERRIDE.set(dir);
+    }
+
+    /// Construct a `LocalTlsConfig`: `--tls-dir` flag override first, then the
+    /// deprecated `AHMA_TLS_DIR` environment variable, then `~/.ahma/tls`.
     pub fn from_env() -> Self {
-        let dir = std::env::var("AHMA_TLS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| Self::default_dir());
+        if let Some(dir) = TLS_DIR_OVERRIDE.get() {
+            return Self { dir: dir.clone() };
+        }
+        let dir = match std::env::var("AHMA_TLS_DIR") {
+            Ok(v) => {
+                warn!(
+                    "Deprecated: AHMA_TLS_DIR environment variable is set. Use the --tls-dir flag instead."
+                );
+                PathBuf::from(v)
+            }
+            Err(_) => Self::default_dir(),
+        };
         Self { dir }
     }
 

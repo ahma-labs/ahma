@@ -52,8 +52,24 @@ impl Sandbox {
     ) -> Result<tokio::process::Command> {
         #[cfg(target_os = "linux")]
         {
-            // On Linux, Landlock is applied at process level, so commands run directly
-            Ok(self.base_command(program, args, working_dir))
+            // Landlock restricts only the calling thread, so the process-level
+            // enforcement at startup does not cover children spawned from tokio
+            // worker threads. Restrict each child at spawn time instead: build a
+            // ruleset fd from the current scopes and apply it between fork and
+            // exec, where the child is still single-threaded.
+            let mut cmd = self.base_command(program, args, working_dir);
+            if let Some(fd) = self.spawn_landlock_ruleset_fd()? {
+                use std::os::fd::AsRawFd;
+                // SAFETY: the closure only performs async-signal-safe syscalls
+                // (prctl + landlock_restrict_self); the OwnedFd moved into it
+                // stays open across fork so the raw fd remains valid in the child.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        super::landlock::apply_landlock_ruleset_in_child(fd.as_raw_fd())
+                    });
+                }
+            }
+            Ok(cmd)
         }
 
         #[cfg(target_os = "macos")]
@@ -92,6 +108,34 @@ impl Sandbox {
             #[cfg(not(target_os = "windows"))]
             Ok(self.base_command(program, args, working_dir))
         }
+    }
+
+    /// Build a Landlock ruleset fd from the sandbox's *current* scopes for
+    /// restricting one child process at spawn time (via `pre_exec`).
+    ///
+    /// Returns `Ok(None)` in Test mode, and on kernels without Landlock
+    /// support — strict-mode servers already fail closed at startup via
+    /// `check_sandbox_prerequisites`, so `None` here only occurs for
+    /// in-process embedders, which fall back to application-level path checks.
+    #[cfg(target_os = "linux")]
+    pub fn spawn_landlock_ruleset_fd(&self) -> Result<Option<std::os::fd::OwnedFd>> {
+        if self.mode == SandboxMode::Test {
+            return Ok(None);
+        }
+        let scopes = self.scopes().to_vec();
+        let fd = super::landlock::landlock_ruleset_fd(
+            &scopes,
+            &self.read_scopes(),
+            self.is_no_temp_files(),
+            self.package_cache_write(),
+        )?;
+        if fd.is_none() {
+            tracing::warn!(
+                "Landlock unavailable on this kernel — child process spawned without \
+                 kernel-level restrictions (application-level path checks still apply)"
+            );
+        }
+        Ok(fd)
     }
 
     /// Create a sandboxed shell command (e.g. `bash -c "..."` on Unix,

@@ -75,6 +75,12 @@ cargo build --release
 # Build specific crate
 cargo build -p ahma_core
 cargo build -p ahma-http-bridge
+
+# Incubating features are quarantined behind non-default cargo features.
+# The default build excludes vault/cluster/simplify (and the decompose/
+# worker/renewal crates are not in workspace default-members).
+cargo build -p ahma_bin --features cluster   # or: vault, simplify, full
+cargo nextest run -p ahma_vault -p ahma_cluster   # test quarantined crates directly
 ```
 
 ### Testing
