@@ -385,7 +385,6 @@ async fn red_team_global_read_access_blocked() {
         .tools_dir(&tools_dir)
         .working_dir(temp_dir.path())
         .no_sandbox(false)
-        .arg("--disable-temp-files") // tighten sandbox: no broad /tmp access grant
         .build()
         .await
         .unwrap();
@@ -459,7 +458,6 @@ async fn red_team_livelog_symlink_read_allowed() {
         .working_dir(temp_dir.path())
         .no_sandbox(false)
         .livelog(true) // Enable the feature we are testing
-        .arg("--disable-temp-files") // tighten sandbox: no broad /tmp access grant
         .build()
         .await
         .unwrap();
@@ -516,11 +514,15 @@ async fn red_team_livelog_symlink_read_allowed() {
         .unwrap(),
     );
     let result3 = client.call_tool(params3).await;
-    // On Linux, Landlock scopes writes precisely: outside_target is NOT in scope
-    // -> shell exits non-zero -> Err here.
-    assert!(
-        result3.is_err(),
-        "SECURITY: Livelog target should be strictly read-only; write should be blocked"
+    // Landlock scopes writes precisely: outside_target has only read access in read_scopes,
+    // not write access.  When bash tries to open the file for writing, the kernel returns
+    // EACCES and bash exits non-zero.  The MCP tool call itself returns Ok (the process
+    // started successfully), so we cannot use result3.is_err() here — we must check the
+    // command-level exit code via assert_blocked_shell_result.
+    assert_blocked_shell_result(
+        result3,
+        "hax",
+        "SECURITY: Livelog target should be strictly read-only; write should be blocked",
     );
 
     client.cancel().await.unwrap();
