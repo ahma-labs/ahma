@@ -385,6 +385,7 @@ async fn red_team_global_read_access_blocked() {
         .tools_dir(&tools_dir)
         .working_dir(temp_dir.path())
         .no_sandbox(false)
+        .arg("--disable-temp-files") // tighten sandbox: no broad /tmp access grant
         .build()
         .await
         .unwrap();
@@ -458,6 +459,7 @@ async fn red_team_livelog_symlink_read_allowed() {
         .working_dir(temp_dir.path())
         .no_sandbox(false)
         .livelog(true) // Enable the feature we are testing
+        .arg("--disable-temp-files") // tighten sandbox: no broad /tmp access grant
         .build()
         .await
         .unwrap();
