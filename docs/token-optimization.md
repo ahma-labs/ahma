@@ -1,7 +1,20 @@
 # Token Optimization & Small-Model Harness for Ahma
 
-Last updated: 2026-06-09
-Status: Design document / Research report
+Last updated: 2026-06-12
+Status: Design document / Research report — core features implemented
+
+## Implementation Status
+
+| Capability | Status | Where |
+|------------|--------|-------|
+| `--minimize-tokens` / `--no-minimize-tokens` flags | implemented | `ahma_bin` → `ahma tui`; flag > deprecated env > settings |
+| `--small-model-harness` / `--no-small-model-harness` flags | implemented | same precedence chain |
+| `--context-length <tokens>` | implemented | drives per-tool-result and conversation character budgets (~4 chars/token) |
+| Per-tool-result truncation (head+tail with elision marker) | implemented | `ahma_tui/src/llm_bridge.rs` (`truncate_middle`, `tool_result_char_cap`) |
+| Conversation trimming (system prompt + latest messages preserved) | implemented | `ahma_tui/src/llm_bridge.rs` (`trim_conversation`) |
+| Streaming line minimisation (server side) | implemented | `OutputOptimizer::process_streaming_line` in the adapter streaming path |
+| Full-output spill file (escape hatch from truncation) | implemented | `adapter::spill`; `output_file` advertised in results |
+| Remaining proposals in this document | design only | see sections below |
 
 ## Executive Summary
 

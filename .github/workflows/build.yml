@@ -191,6 +191,15 @@ jobs:
             -p ahma_vault -p ahma_decompose -p ahma_worker -p ahma_renewal -p ahma_cluster \
             -E 'not (test(kotlin) or test(android))'
 
+      - name: Cargo Nextest (Landlock red-team, Linux only)
+        if: matrix.test_mode == 'full' && runner.os == 'Linux'
+        timeout-minutes: 10
+        run: |
+          echo "--- Running ignored Landlock red-team tests (they self-skip when Landlock is unavailable)"
+          cargo nextest run --profile ci --locked --no-default-features --run-ignored only \
+            -p ahma_mcp \
+            -E 'test(red_team_global_read_access_blocked) or test(red_team_livelog_symlink_read_allowed)'
+
       - name: ARM64 smoke validation (compile-only)
         if: matrix.test_mode == 'smoke'
         timeout-minutes: 25

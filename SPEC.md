@@ -8,7 +8,12 @@
 |-----------|--------|-------|
 | Core Tool Execution | tests-pass | `ahma` adapter executes CLI tools via MTDF JSON |
 | Async-First Operations | tests-pass | Operations return `id`, push results via MCP notifications |
-| Shell Pool | tests-pass | Pre-warmed bash/PowerShell shells for 5-20ms command startup latency |
+| Shell Pool | in-progress | Pool prewarms shells but is NOT wired into the async hot path — commands spawn directly (~6ms median measured by `latency_guard_test`); decide: wire in or remove |
+| Unified Operation Event Stream | tests-pass | Single `OperationEvent` stream (`ahma_common::event_dispatcher`); `OperationMonitor` is the sole lifecycle emitter; subscribers: MCP progress push, daemon hub, vault audit, TUI |
+| Output Spill Files | tests-pass | Complete per-operation output at `<log dir>/operations/<id>.log`; advertised as `output_file` in results; retention-cleaned |
+| Small-Model Context Harness | tests-pass | `ahma tui` budgets tool results + trims conversation for limited-context local models; `--context-length`, `--small-model-harness`/`--no-small-model-harness` |
+| Feature-Gated Incubating Crates | tests-pass | vault/cluster/simplify/decompose/worker/renewal behind non-default cargo features; graceful `feature_not_compiled` CLI errors |
+| Latency Regression Guards | tests-pass | Ignored benchmarks guard end-to-end dispatch latency and per-line streaming cost (`latency_guard_test`) |
 | Linux Sandbox (Landlock) | tests-pass | Kernel-level FS sandboxing on Linux 5.13+ |
 | macOS Sandbox (Seatbelt) | tests-pass | Kernel-level FS sandboxing via `sandbox-exec` |
 | Nested Sandbox Detection | tests-pass | Detects Cursor/VS Code/Docker outer sandboxes |
@@ -28,7 +33,7 @@
 | MTDF Schema Validation | tests-pass | JSON schema validation at startup |
 | Sequence Tools | tests-pass | Chain multiple commands into workflows |
 | Tool Hot-Reload | tests-pass | Opt-in `--hot-reload-tools` watches `tools/` directory and reloads on changes |
-| MCP Callback Notifications | tests-pass | Push async results via `notifications/progress` |
+| MCP Progress Push | tests-pass | Event-stream subscriber pushes `notifications/progress` per registered operation (replaces legacy callback chain) |
 | HTTP MCP Client | tests-pass | Connect to external HTTP MCP servers |
 | OAuth 2.0 + PKCE | tests-pass | Authentication for HTTP MCP servers |
 | `ahma --validate` | tests-pass | Validate tool configs against MTDF schema |
@@ -91,7 +96,9 @@ _"Create agents from your command line tools with one JSON file, then watch them
 | `shell_pool` | Pre-warmed bash/PowerShell (5.1+) shells for 5-20ms command startup latency |
 | `sandbox` | Kernel-level sandboxing (Landlock on Linux, Seatbelt on macOS) |
 | `config` | MTDF (Multi-Tool Definition Format) configuration models |
-| `callback_system` | Event notification system for async operations |
+| `ahma_common::event_dispatcher` | Unified `OperationEvent` broadcast stream (Started/OutputLine/Progress/Alert/terminal) |
+| `mcp_service::progress_push` | Event-stream subscriber that pushes `notifications/progress` to the registered MCP client |
+| `adapter::spill` | Complete per-operation output spill files (queryable with file tools) |
 | `path_security` | Path validation for sandbox enforcement |
 
 ### 2.2 Built-in Internal Tools
@@ -129,9 +136,38 @@ These tools are always available regardless of JSON configuration:
 **Workflow:**
 
 1. AI invokes tool → Server immediately returns `id`
-2. Command executes in background via shell pool
-3. On completion, result pushed via MCP `notifications/progress`
-4. AI processes notification when it arrives (non-blocking)
+2. Command executes in background (direct sandboxed spawn; output streamed line-by-line)
+3. Every state transition is emitted on the unified operation event stream; the
+   MCP progress-push subscriber forwards events for registered operations as
+   `notifications/progress`
+4. AI processes the notification when it arrives, or retrieves the stored
+   result via `await`/`status` (the store of record)
+
+### 2.3.1 Unified Operation Event Stream
+
+All operation lifecycle data flows through ONE broadcast stream of
+`ahma_common::event_dispatcher::OperationEvent` values
+(`Started` / `OutputLine` / `Progress` / `Alert` /
+`Completed` / `Failed` / `Cancelled` / `TimedOut`):
+
+- **Single emission point**: the `OperationMonitor` emits events at each state
+  transition (`add_operation` → `Started`, `append_output_line` →
+  `OutputLine`, `append_alert` → `Alert`, terminal `update_status` → exactly
+  one terminal event). No other component emits lifecycle events.
+- **Ordering invariant**: on terminal transitions the monitor writes
+  completion history, signals the completion watch, then emits the terminal
+  event — readers woken by the watch always observe complete history.
+- **Lagged subscribers**: the broadcast is a live feed, not the store of
+  record. A subscriber that lags reconciles from monitor state
+  (`status`/`await`); awaiting a result never depends on the broadcast.
+- **Subscribers**: MCP progress push (`mcp_service::progress_push`), the
+  daemon hub reporter (feeds `ahma tui` and remote dashboards), the vault
+  audit subscriber, and tests.
+- **Full output**: the bounded `stdout_tail` (100 lines) and result window are
+  for token economy; the complete redacted output of every async operation is
+  spilled to `<project log dir>/operations/<operation_id>.log` and advertised
+  as `output_file` in results, so agents query big outputs with file tools
+  instead of re-running commands.
 
 ### 2.4 Synchronous Setting Inheritance
 

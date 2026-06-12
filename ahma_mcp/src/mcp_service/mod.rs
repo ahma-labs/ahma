@@ -910,6 +910,11 @@ impl ServerHandler for AhmaMcpService {
                   (3) the command's output should be watched for errors — set `monitor_level` and ahma \
                   streams alerts when matching lines appear; \
                   (4) multiple commands should run concurrently — each call gets its own operation_id. \
+                  Workflow: start operations, do other useful work, then `await` the ids you need — \
+                  completion is also pushed via notifications, so avoid polling `status` in a loop. \
+                  Results include a bounded stdout/stderr window plus an `output_file` path holding the \
+                  COMPLETE output of the operation; when the inline output is marked truncated, read or \
+                  grep that file instead of re-running the command. \
                   For read-only file inspection (read, grep, glob, replace) keep using the IDE's native \
                   file tools — that is what they are for.".to_string();
 
