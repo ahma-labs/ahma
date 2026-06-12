@@ -105,6 +105,22 @@ fn create_non_tmp_tempdir() -> TempDir {
         .expect("failed to create non-/tmp temporary directory")
 }
 
+/// Create a non-/tmp temp directory to use as the sandbox scope.
+///
+/// Using a non-tmp scope is required when `--disable-temp-files` is passed: with
+/// that flag the sandbox rejects any working directory under `/tmp`.  We place the
+/// scope alongside the "outside" dir in the test process's current directory so
+/// that both dirs are siblings in the same workspace tree — only the scope dir is
+/// added to the Landlock ruleset; the sibling is therefore OS-blocked.
+#[cfg(target_os = "linux")]
+fn create_non_tmp_scope_dir() -> TempDir {
+    let base = std::env::current_dir().expect("failed to get current directory");
+    tempfile::Builder::new()
+        .prefix("ahma-redteam-scope-")
+        .tempdir_in(base)
+        .expect("failed to create non-/tmp scope directory")
+}
+
 #[cfg(target_os = "linux")]
 fn landlock_enforcement_available() -> bool {
     static LANDLOCK_AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -371,7 +387,19 @@ fn red_team_no_temp_files_flag_setting() {
 // =============================================================================
 
 /// Linux-only: reading a file outside the sandbox is blocked when Landlock is enforced.
-/// Marked as ignored due to CI environment compatibility issues with Landlock enforcement.
+///
+/// Design notes:
+/// - Both `scope_dir` (the sandbox root) and `outside_dir` are placed in the
+///   test-process CWD (workspace, not /tmp) so they are siblings in the same
+///   parent directory.
+/// - Only `scope_dir` is added to the Landlock ruleset; `outside_dir` has no
+///   Landlock rule covering it and is therefore OS-blocked.
+/// - `--disable-temp-files` is passed so Landlock does NOT add a blanket
+///   `/tmp` read+write rule.  Without this flag the entire /tmp hierarchy
+///   becomes accessible and TempDir-based scopes become meaningless for
+///   "outside scope" checks.
+/// - The sandbox scope (working_dir) is `scope_dir`, which is non-tmp, so
+///   the --disable-temp-files check in validate_path does not reject it.
 #[tokio::test]
 #[cfg(target_os = "linux")]
 #[ignore]
@@ -379,16 +407,22 @@ async fn red_team_global_read_access_blocked() {
     init_test_logging();
     skip_if_landlock_unavailable!();
 
-    let temp_dir = TempDir::new().unwrap();
+    // Use a non-tmp scope so --disable-temp-files does not reject the working dir.
+    let scope_dir = create_non_tmp_scope_dir();
     let tools_dir = get_workspace_tools_dir();
     let client = ClientBuilder::new()
         .tools_dir(&tools_dir)
-        .working_dir(temp_dir.path())
+        .working_dir(scope_dir.path())
         .no_sandbox(false)
+        // Prevent Landlock from adding a blanket /tmp rule — without this flag
+        // a /tmp-based working_dir would make the entire /tmp accessible and
+        // our separate TempDir::new() outside dir would also be readable.
+        .arg("--disable-temp-files")
         .build()
         .await
         .unwrap();
 
+    // Place the "secret" file in a sibling dir that is NOT the Landlock scope.
     let outside_dir = create_non_tmp_tempdir();
     let outside_file = outside_dir.path().join("secret.txt");
     std::fs::write(&outside_file, "secret content").unwrap();
@@ -416,7 +450,18 @@ async fn red_team_global_read_access_blocked() {
 // =============================================================================
 
 /// Test that --livelog grants precise read-only access to a target symlink, but blocks writes and blocks neighboring files.
-/// Marked as ignored due to CI environment compatibility issues with Landlock enforcement.
+///
+/// Design notes (see red_team_global_read_access_blocked for the full rationale):
+/// - Scope dir is non-tmp (created via create_non_tmp_scope_dir) so
+///   --disable-temp-files does not reject the working directory.
+/// - Outside files are in a sibling non-tmp dir — not covered by any Landlock rule
+///   except the explicit livelog read-scope grant for `outside_target`.
+/// - --disable-temp-files prevents a blanket /tmp Landlock grant that would
+///   otherwise make all temp dirs accessible.
+/// - An `exceptions.json` is written into the scope dir so livelog's
+///   `is_target_allowed` check approves the out-of-scope symlink target.
+///   Without this the symlink would be silently blocked by `resolve_log_symlink`
+///   and never added to Landlock read_scopes.
 #[tokio::test]
 #[cfg(target_os = "linux")]
 #[ignore]
@@ -429,8 +474,9 @@ async fn red_team_livelog_symlink_read_allowed() {
     #[cfg(windows)]
     use std::os::windows::fs::symlink_dir as symlink;
 
-    let temp_dir = TempDir::new().unwrap(); // sandbox scope
-    let log_dir = temp_dir.path().join("logs");
+    // Use a non-tmp scope so --disable-temp-files does not reject the working dir.
+    let scope_dir = create_non_tmp_scope_dir(); // sandbox scope
+    let log_dir = scope_dir.path().join("logs");
     std::fs::create_dir_all(&log_dir).unwrap();
 
     let outside_dir = create_non_tmp_tempdir();
@@ -439,6 +485,23 @@ async fn red_team_livelog_symlink_read_allowed() {
 
     let outside_forbidden = outside_dir.path().join("forbidden.log");
     std::fs::write(&outside_forbidden, "forbidden content").unwrap();
+
+    // Set up exceptions.json so that livelog's is_target_allowed() approves
+    // the outside target, allowing it to be added to Landlock read_scopes.
+    // Without this, the out-of-scope symlink target would be silently blocked
+    // by resolve_log_symlink and never added to read_scopes.
+    let ahma_dir = scope_dir.path().join(".ahma");
+    std::fs::create_dir_all(&ahma_dir).unwrap();
+    let exceptions_json = serde_json::json!({
+        "approved_log_symlinks": [
+            {"target_path": outside_target.to_str().expect("non-UTF-8 path")}
+        ]
+    });
+    std::fs::write(
+        ahma_dir.join("exceptions.json"),
+        serde_json::to_string(&exceptions_json).unwrap(),
+    )
+    .unwrap();
 
     let malicious_link = log_dir.join("live.log");
     match symlink(&outside_target, &malicious_link) {
@@ -455,8 +518,10 @@ async fn red_team_livelog_symlink_read_allowed() {
     let tools_dir = get_workspace_tools_dir();
     let client = ClientBuilder::new()
         .tools_dir(&tools_dir)
-        .working_dir(temp_dir.path())
+        .working_dir(scope_dir.path())
         .no_sandbox(false)
+        // Prevent Landlock from adding a blanket /tmp rule.
+        .arg("--disable-temp-files")
         .livelog(true) // Enable the feature we are testing
         .build()
         .await
