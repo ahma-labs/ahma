@@ -1874,12 +1874,17 @@ mod tests {
 
     #[test]
     fn test_is_ahma_hooks_active_with_configs_empty_returns_false() {
+        // Neutralise ambient AHMA_HOOKS (e.g. from a developer shell running
+        // the suite with AHMA_HOOKS=off) — nextest gives each test its own
+        // process, so env mutation here cannot race other tests.
+        unsafe { std::env::remove_var("AHMA_HOOKS") };
         // auto mode with no MCP configs → inactive (passthrough)
         assert!(!is_ahma_hooks_active_with_configs(&[]));
     }
 
     #[test]
     fn test_is_ahma_hooks_active_with_configs_nonempty_returns_true() {
+        unsafe { std::env::remove_var("AHMA_HOOKS") };
         let fake_path = std::path::PathBuf::from("/fake/mcp.json");
         assert!(is_ahma_hooks_active_with_configs(&[fake_path]));
     }

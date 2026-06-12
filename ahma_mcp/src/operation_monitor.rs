@@ -86,6 +86,11 @@ pub struct Operation {
     /// Any warnings/errors detected for this operation
     #[serde(default)]
     pub alerts: Vec<String>,
+    /// Path of the full-output spill file for this operation, when spilling
+    /// is active.  `stdout_tail` is a bounded window; the spill file holds the
+    /// complete output and can be queried with the file tools (tail/grep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_file: Option<std::path::PathBuf>,
 }
 
 /// Default factory for `completion_watch` used during serde deserialisation.
@@ -110,6 +115,7 @@ impl Operation {
             completion_watch: Arc::new(watch::channel(false).0),
             stdout_tail: Vec::new(),
             alerts: Vec::new(),
+            output_file: None,
         }
     }
 
@@ -135,6 +141,7 @@ impl Operation {
             completion_watch: Arc::new(watch::channel(false).0),
             stdout_tail: Vec::new(),
             alerts: Vec::new(),
+            output_file: None,
         }
     }
 

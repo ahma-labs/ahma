@@ -432,8 +432,8 @@ mod tests {
 
     #[test]
     fn test_log_retention_threshold() {
-        assert!(LOG_RETENTION_SECS > 23 * 60 * 60);
-        assert!(LOG_RETENTION_SECS < 25 * 60 * 60);
+        const _: () = assert!(LOG_RETENTION_SECS > 23 * 60 * 60);
+        const _: () = assert!(LOG_RETENTION_SECS < 25 * 60 * 60);
     }
 
     #[test]

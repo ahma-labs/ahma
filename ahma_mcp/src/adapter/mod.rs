@@ -44,6 +44,7 @@
 
 pub mod executor;
 mod preparer;
+pub mod spill;
 mod types;
 
 pub use preparer::{
@@ -534,13 +535,17 @@ impl Adapter {
 
         let timeout_duration = timeout.map(Duration::from_secs);
 
-        let operation = Operation::new_with_timeout(
+        let mut operation = Operation::new_with_timeout(
             op_id.clone(),
             tool_name.to_string(),
             format!("{} {:?}", command, args),
             None,
             timeout_duration,
         );
+        // Advertise the full-output spill file from the start so `status`
+        // callers know where the complete output lives (stdout_tail is a
+        // bounded window).  The file is created lazily by the streaming task.
+        operation.output_file = Some(spill::operation_spill_path(&op_id));
         self.monitor.add_operation(operation).await;
 
         let monitor = self.monitor.clone();
@@ -1020,6 +1025,10 @@ async fn execute_with_streaming(
 
     let mut log_monitor = monitor_config.map(crate::log_monitor::LogMonitor::new);
 
+    // Full-output spill file: the complete record of this operation's output,
+    // queryable with file tools long after the bounded tail has rolled over.
+    let mut spill = spill::SpillWriter::create(op_id).await;
+
     // Collected output for the final result (bounded to prevent unbounded memory growth).
     let mut collected_stdout = BoundedLineCollector::default();
     let mut collected_stderr = BoundedLineCollector::default();
@@ -1041,6 +1050,7 @@ async fn execute_with_streaming(
             _ = cancellation_token.cancelled() => {
                 tracing::info!("Operation {} cancelled during streaming", op_id);
                 let _ = child.kill().await;
+                spill.finish().await;
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 handle_cancellation(op_monitor, callback, op_id, duration_ms).await;
                 return;
@@ -1050,6 +1060,7 @@ async fn execute_with_streaming(
             _ = tokio::time::sleep_until(timeout_deadline) => {
                 tracing::warn!("Operation {} timed out during streaming", op_id);
                 let _ = child.kill().await;
+                spill.finish().await;
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 cancel_operation_timed_out(op_monitor, callback, op_id, duration_ms).await;
                 return;
@@ -1071,12 +1082,12 @@ async fn execute_with_streaming(
 
             // Read stderr line
             result = stderr_reader.next_line() => {
-                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, callback, op_id, op_monitor, output_optimizer).await;
+                handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, callback, op_id, op_monitor, output_optimizer, &mut spill).await;
             }
 
             // Read stdout line
             result = stdout_reader.next_line() => {
-                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, callback, op_id, op_monitor, output_optimizer).await;
+                handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, callback, op_id, op_monitor, output_optimizer, &mut spill).await;
             }
         }
 
@@ -1095,6 +1106,7 @@ async fn execute_with_streaming(
                     op_id,
                     op_monitor,
                     output_optimizer,
+                    &mut spill,
                 )
                 .await;
                 break;
@@ -1108,6 +1120,8 @@ async fn execute_with_streaming(
             }
         }
     }
+
+    spill.finish().await;
 
     finalize_streaming_operation(
         &mut child,
@@ -1137,6 +1151,7 @@ async fn drain_remaining_stream_lines(
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
     output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
+    spill: &mut spill::SpillWriter,
 ) {
     while let Ok(Some(line)) = stderr_reader.next_line().await {
         process_streaming_line(
@@ -1148,6 +1163,7 @@ async fn drain_remaining_stream_lines(
             op_id,
             op_monitor,
             output_optimizer,
+            spill,
         )
         .await;
     }
@@ -1161,6 +1177,7 @@ async fn drain_remaining_stream_lines(
             op_id,
             op_monitor,
             output_optimizer,
+            spill,
         )
         .await;
     }
@@ -1208,6 +1225,9 @@ async fn finalize_streaming_operation(
         "stderr_truncated_lines": collected_stderr.dropped_lines(),
         "stdout_truncated_bytes": collected_stdout.dropped_bytes(),
         "stderr_truncated_bytes": collected_stderr.dropped_bytes(),
+        // Complete output record — query with file tools (tail/grep) when the
+        // inline stdout/stderr above was truncated.
+        "output_file": spill::operation_spill_path(op_id).to_string_lossy(),
     });
 
     let status = if success {
@@ -1280,6 +1300,7 @@ async fn handle_stream_line(
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
     output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
+    spill: &mut spill::SpillWriter,
 ) {
     match result {
         Ok(Some(line)) => {
@@ -1292,6 +1313,7 @@ async fn handle_stream_line(
                 op_id,
                 op_monitor,
                 output_optimizer,
+                spill,
             )
             .await;
         }
@@ -1318,8 +1340,13 @@ async fn process_streaming_line(
     op_id: &str,
     op_monitor: &Arc<OperationMonitor>,
     output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
+    spill: &mut spill::SpillWriter,
 ) {
     let safe_line = crate::log_monitor::redact_sensitive_line(line);
+
+    // The spill file records the redacted-but-unminimised line — the faithful
+    // full record, independent of the bounded tail and token optimisation.
+    spill.write_line(&safe_line, is_stderr).await;
 
     let opt_lines = if let Ok(mut opt) = output_optimizer.try_lock() {
         opt.process_streaming_line(&safe_line)
