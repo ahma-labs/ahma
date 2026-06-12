@@ -1033,37 +1033,11 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     }
 }
 
-/// Build the system prompt sent with every LLM request.
-///
-/// Combines (in priority order):
-/// 1. The active agent profile's `system_prompt` (if any).
-/// 2. A concise snapshot of live workspace context: scope, sandbox status,
-///    recent operations with their status, and recent failures.
-///
-/// The context block is intentionally short (<500 tokens) so it does not eat
-/// into the user's context window.
 #[cfg(feature = "tui")]
-fn build_system_prompt(state: &crate::state::AppState) -> String {
+fn format_recent_ops(operations: &[crate::state::Operation]) -> String {
     use crate::state::OpStatus;
-
-    // 1. Profile system prompt (may override defaults).
-    let profile_prompt = profile_field(state, |p| p.system_prompt, String::new());
-
-    // 2. Live context block.
     let mut ctx = String::new();
-
-    // Workspace / scope.
-    if !state.workspace.is_empty() {
-        ctx.push_str(&format!("Workspace: {}\n", state.workspace));
-    }
-
-    // Sandbox / server status.
-    if !state.sandbox_status.is_empty() && state.sandbox_status != "unknown" {
-        ctx.push_str(&format!("Sandbox: {}\n", state.sandbox_status));
-    }
-
-    // Recent operations (last 5, most recent first).
-    let recent_ops: Vec<&crate::state::Operation> = state.operations.iter().rev().take(5).collect();
+    let recent_ops: Vec<&crate::state::Operation> = operations.iter().rev().take(5).collect();
 
     if !recent_ops.is_empty() {
         ctx.push_str("\nRecent operations:\n");
@@ -1087,10 +1061,14 @@ fn build_system_prompt(state: &crate::state::AppState) -> String {
             ctx.push_str(&format!("  [{status_label}] {name} ({elapsed}){summary}\n"));
         }
     }
+    ctx
+}
 
-    // Recent failures — include a brief stdout tail to help with "why did it fail?" queries.
-    let failures: Vec<&crate::state::Operation> = state
-        .operations
+#[cfg(feature = "tui")]
+fn format_recent_failures(operations: &[crate::state::Operation]) -> String {
+    use crate::state::OpStatus;
+    let mut ctx = String::new();
+    let failures: Vec<&crate::state::Operation> = operations
         .iter()
         .rev()
         .filter(|o| o.status == OpStatus::Failed)
@@ -1120,6 +1098,41 @@ fn build_system_prompt(state: &crate::state::AppState) -> String {
             }
         }
     }
+    ctx
+}
+
+/// Build the system prompt sent with every LLM request.
+///
+/// Combines (in priority order):
+/// 1. The active agent profile's `system_prompt` (if any).
+/// 2. A concise snapshot of live workspace context: scope, sandbox status,
+///    recent operations with their status, and recent failures.
+///
+/// The context block is intentionally short (<500 tokens) so it does not eat
+/// into the user's context window.
+#[cfg(feature = "tui")]
+fn build_system_prompt(state: &crate::state::AppState) -> String {
+    // 1. Profile system prompt (may override defaults).
+    let profile_prompt = profile_field(state, |p| p.system_prompt, String::new());
+
+    // 2. Live context block.
+    let mut ctx = String::new();
+
+    // Workspace / scope.
+    if !state.workspace.is_empty() {
+        ctx.push_str(&format!("Workspace: {}\n", state.workspace));
+    }
+
+    // Sandbox / server status.
+    if !state.sandbox_status.is_empty() && state.sandbox_status != "unknown" {
+        ctx.push_str(&format!("Sandbox: {}\n", state.sandbox_status));
+    }
+
+    // Recent operations (last 5, most recent first).
+    ctx.push_str(&format_recent_ops(&state.operations));
+
+    // Recent failures — include a brief stdout tail to help with "why did it fail?" queries.
+    ctx.push_str(&format_recent_failures(&state.operations));
 
     // 3. Assemble final prompt.
     let base = if state.mcp_enabled {
