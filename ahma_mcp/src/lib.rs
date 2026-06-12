@@ -121,6 +121,8 @@ pub mod log_monitor;
 pub mod logging;
 /// MCP server implementation.
 pub mod mcp_service;
+/// Persistent stateful shell sessions (`session_id`).
+pub mod shell_session;
 /// Operation monitor for async tasks.
 pub mod operation_monitor;
 /// Path security checks for sandbox enforcement.

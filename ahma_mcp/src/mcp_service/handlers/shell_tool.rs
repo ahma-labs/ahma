@@ -106,6 +106,18 @@ impl AhmaMcpService {
                 "stderr",
             ),
         );
+        properties.insert(
+            "session_id".to_string(),
+            schema::string_property(
+                "Run the command in a persistent shell session with this id. Commands sharing a session_id run sequentially in the SAME shell, so `cd`, exported variables, and sourced environments (e.g. virtualenvs) persist between calls. The session is created on first use.",
+            ),
+        );
+        properties.insert(
+            "pty".to_string(),
+            schema::boolean_property(
+                "Run the command attached to a pseudo-terminal (Unix only). Use for tools that require a TTY or change behaviour without one (colours, progress bars, interactive prompts). stdout and stderr are merged.",
+            ),
+        );
         schema::object_input_schema(properties, &["command"])
     }
 
@@ -150,6 +162,22 @@ impl AhmaMcpService {
             .await?
         {
             return Ok(staged);
+        }
+
+        // Dedicated execution paths: persistent shell session / PTY.
+        let session_id = common::opt_str(&args, "session_id");
+        let use_pty = args.get("pty").and_then(|v| v.as_bool()).unwrap_or(false);
+        if session_id.is_some() || use_pty {
+            return self
+                .execute_shell_special(
+                    &command,
+                    &working_directory,
+                    timeout,
+                    session_id.as_deref(),
+                    use_pty,
+                    &context,
+                )
+                .await;
         }
 
         // Extract optional log monitoring parameters
@@ -359,6 +387,96 @@ impl AhmaMcpService {
             Ok(output) => Ok(common::text_result(output)),
             Err(e) => {
                 let error_message = format!("Synchronous execution failed: {}", e);
+                tracing::error!("{}", error_message);
+                Err(common::mcp_internal(error_message))
+            }
+        }
+    }
+
+    /// Execute `run_terminal_command` with a `session_id` and/or `pty: true`.
+    ///
+    /// Both paths run asynchronously through the standard operation lifecycle
+    /// (operation id returned immediately; results via `await`/`status` and
+    /// the unified event stream).  When both are requested, the session wins:
+    /// PTY-in-session is not supported yet.
+    async fn execute_shell_special(
+        &self,
+        command: &str,
+        working_directory: &str,
+        timeout: Option<u64>,
+        session_id: Option<&str>,
+        use_pty: bool,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let counter_val = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let id = crate::utils::operation::generate_id_with_details(
+            counter_val,
+            "run_terminal_command",
+            command,
+        );
+        self.emit_vault_tool_call(
+            &id,
+            "run_terminal_command",
+            &format!(
+                "{{\"working_directory\":\"{}\",\"command\":\"{}\",\"session_id\":{:?},\"pty\":{}}}",
+                working_directory, command, session_id, use_pty
+            ),
+        )
+        .await;
+
+        let progress_token = context.meta.get_progress_token();
+        let client_type = McpClientType::from_peer(&context.peer);
+        if let Some(token) = progress_token {
+            self.progress_push
+                .register(&id, context.peer.clone(), token, client_type)
+                .await;
+        }
+
+        let started = match session_id {
+            Some(session) => {
+                if use_pty {
+                    tracing::warn!(
+                        "run_terminal_command: pty=true ignored — PTY inside a session is not supported"
+                    );
+                }
+                self.adapter
+                    .execute_session_async(
+                        "run_terminal_command",
+                        session,
+                        command,
+                        working_directory,
+                        timeout,
+                        Some(id.clone()),
+                    )
+                    .await
+            }
+            None => {
+                self.adapter
+                    .execute_pty_async(
+                        "run_terminal_command",
+                        command,
+                        working_directory,
+                        timeout,
+                        Some(id.clone()),
+                    )
+                    .await
+            }
+        };
+
+        match started {
+            Ok(op_id) => {
+                if let Some(result) =
+                    common::try_automatic_async_completion(&self.operation_monitor, &op_id).await
+                {
+                    return Ok(result);
+                }
+                let hint = crate::tool_hints::preview(&op_id, "run_terminal_command");
+                Ok(common::text_result(format!("AHMA ID: {}{}", op_id, hint)))
+            }
+            Err(e) => {
+                self.progress_push.unregister(&id).await;
+                self.emit_vault_tool_complete(&id, false, 0).await;
+                let error_message = format!("Execution failed: {}", e);
                 tracing::error!("{}", error_message);
                 Err(common::mcp_internal(error_message))
             }

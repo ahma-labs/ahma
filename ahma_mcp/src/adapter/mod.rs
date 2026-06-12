@@ -44,6 +44,7 @@
 
 pub mod executor;
 mod preparer;
+mod pty_exec;
 pub mod spill;
 mod types;
 
@@ -51,6 +52,7 @@ pub use preparer::{
     TempFileManager, escape_shell_argument, format_option_flag, needs_file_handling,
     prepare_command_and_args,
 };
+pub use pty_exec::pty_available;
 pub use types::{AsyncExecOptions, ExecutionMode};
 
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
@@ -215,6 +217,8 @@ pub struct Adapter {
     pub event_dispatcher: EventDispatcher,
     /// Token minimization and output optimizer context.
     pub output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
+    /// Persistent stateful shell sessions (`session_id` parameter).
+    pub shell_sessions: Arc<crate::shell_session::ShellSessionManager>,
 }
 
 impl Adapter {
@@ -249,6 +253,7 @@ impl Adapter {
             output_optimizer: Arc::new(tokio::sync::Mutex::new(
                 crate::output_optimizer::OutputOptimizer::new(false, None),
             )),
+            shell_sessions: crate::shell_session::ShellSessionManager::new(),
         })
     }
 
@@ -313,6 +318,9 @@ impl Adapter {
         // 3) Shut down all shell pools (kills any lingering shell processes)
         tracing::info!("Shutting down shell pools");
         self.shell_pool.shutdown_all().await;
+
+        // 4) Kill persistent session shells
+        self.shell_sessions.shutdown_all().await;
 
         tracing::info!("Adapter shutdown complete");
     }
@@ -578,6 +586,145 @@ impl Adapter {
         Ok(op_id_clone)
     }
 
+    /// Start `command_str` asynchronously inside a pseudo-terminal (PTY).
+    ///
+    /// For tools that change behaviour when stdout is not a TTY (colours,
+    /// progress bars, interactive prompts).  The PTY merges stderr into the
+    /// terminal stream; lifecycle, streaming, spill, and events are identical
+    /// to the piped path.
+    pub async fn execute_pty_async(
+        &self,
+        tool_name: &str,
+        command_str: &str,
+        working_dir: &str,
+        timeout: Option<u64>,
+        id: Option<String>,
+    ) -> Result<String> {
+        let safe_wd = self
+            .sandbox
+            .validate_path(std::path::Path::new(working_dir))?;
+        let op_id = id.unwrap_or_else(|| generate_id(tool_name, command_str));
+
+        let mut operation = Operation::new_with_timeout(
+            op_id.clone(),
+            tool_name.to_string(),
+            format!("[pty] {command_str}"),
+            None,
+            timeout.map(Duration::from_secs),
+        );
+        operation.output_file = Some(spill::operation_spill_path(&op_id));
+        self.monitor.add_operation(operation).await;
+
+        let cancellation_token = match self.monitor.get_operation(&op_id).await {
+            Some(op) => op.cancellation_token.clone(),
+            None => anyhow::bail!("operation {op_id} vanished before start"),
+        };
+        self.monitor
+            .update_status(&op_id, OperationStatus::InProgress, None)
+            .await;
+
+        let timeout_ms = timeout
+            .map(|t| t * 1000)
+            .unwrap_or_else(|| self.shell_pool.config().command_timeout.as_millis() as u64);
+        let monitor = self.monitor.clone();
+        let sandbox = self.sandbox.clone();
+        let command_str = command_str.to_string();
+        let task_handles = self.task_handles.clone();
+        let op_id_task = op_id.clone();
+
+        let handle = tokio::spawn(async move {
+            pty_exec::run_pty_operation(
+                &sandbox,
+                &command_str,
+                &safe_wd,
+                timeout_ms,
+                &cancellation_token,
+                &op_id_task,
+                &monitor,
+            )
+            .await;
+            task_handles.lock().await.remove(&op_id_task);
+        });
+        self.task_handles
+            .lock()
+            .await
+            .insert(op_id.clone(), handle);
+
+        Ok(op_id)
+    }
+
+    /// Start `command_str` asynchronously in the persistent shell session
+    /// named `session_id` (created on first use, rooted at `working_dir`).
+    ///
+    /// Commands with the same `session_id` run sequentially in the SAME
+    /// shell, so `cd`, exported variables, and sourced environments persist
+    /// between tool calls.
+    pub async fn execute_session_async(
+        &self,
+        tool_name: &str,
+        session_id: &str,
+        command_str: &str,
+        working_dir: &str,
+        timeout: Option<u64>,
+        id: Option<String>,
+    ) -> Result<String> {
+        let safe_wd = self
+            .sandbox
+            .validate_path(std::path::Path::new(working_dir))?;
+        let op_id = id.unwrap_or_else(|| generate_id(tool_name, command_str));
+
+        let mut operation = Operation::new_with_timeout(
+            op_id.clone(),
+            tool_name.to_string(),
+            format!("[session {session_id}] {command_str}"),
+            None,
+            timeout.map(Duration::from_secs),
+        );
+        operation.output_file = Some(spill::operation_spill_path(&op_id));
+        self.monitor.add_operation(operation).await;
+
+        let cancellation_token = match self.monitor.get_operation(&op_id).await {
+            Some(op) => op.cancellation_token.clone(),
+            None => anyhow::bail!("operation {op_id} vanished before start"),
+        };
+        self.monitor
+            .update_status(&op_id, OperationStatus::InProgress, None)
+            .await;
+
+        let timeout_duration = timeout
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| self.shell_pool.config().command_timeout);
+        let monitor = self.monitor.clone();
+        let sandbox = self.sandbox.clone();
+        let sessions = self.shell_sessions.clone();
+        let session_id = session_id.to_string();
+        let command_str = command_str.to_string();
+        let task_handles = self.task_handles.clone();
+        let op_id_task = op_id.clone();
+
+        let handle = tokio::spawn(async move {
+            run_session_operation(
+                &sessions,
+                &sandbox,
+                &session_id,
+                &command_str,
+                &safe_wd,
+                timeout_duration,
+                &cancellation_token,
+                &op_id_task,
+                &monitor,
+            )
+            .await;
+            task_handles.lock().await.remove(&op_id_task);
+        });
+        self.task_handles
+            .lock()
+            .await
+            .insert(op_id.clone(), handle);
+
+        Ok(op_id)
+    }
+
     /// Parses the command string and arguments into a program and argument list.
     ///
     /// This helper handles complications such as:
@@ -819,6 +966,116 @@ fn combine_stdout_stderr(stdout: String, stderr: String) -> String {
         (true, false) => stderr,
         (false, false) => format!("{stdout}\n{stderr}"),
         _ => stdout,
+    }
+}
+
+/// Run one command in a persistent shell session through the standard
+/// operation lifecycle (streamed lines, spill file, single terminal event).
+#[allow(clippy::too_many_arguments)]
+async fn run_session_operation(
+    sessions: &crate::shell_session::ShellSessionManager,
+    sandbox: &sandbox::Sandbox,
+    session_id: &str,
+    command_str: &str,
+    working_dir: &std::path::Path,
+    timeout: Duration,
+    cancellation_token: &tokio_util::sync::CancellationToken,
+    op_id: &str,
+    monitor: &Arc<OperationMonitor>,
+) {
+    let mut spill_writer = spill::SpillWriter::create(op_id).await;
+    let mut collected = BoundedLineCollector::default();
+
+    // The session protocol streams lines through a sync callback; forward
+    // them over a channel so the async side can append/spill as they arrive.
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut forward = move |line: String| {
+        let _ = line_tx.send(line);
+    };
+    let exec = sessions.execute_streaming(
+        sandbox,
+        session_id,
+        working_dir,
+        command_str,
+        timeout,
+        &mut forward,
+    );
+    tokio::pin!(exec);
+
+    let exec_result = loop {
+        tokio::select! {
+            biased;
+
+            _ = cancellation_token.cancelled() => {
+                tracing::info!("Session operation {} cancelled", op_id);
+                // The shell may be mid-command — destroy the session so its
+                // next user gets a clean shell.
+                sessions.close_session(session_id).await;
+                spill_writer.finish().await;
+                monitor
+                    .update_status(
+                        op_id,
+                        OperationStatus::Cancelled,
+                        Some(Value::String("Operation was cancelled".to_string())),
+                    )
+                    .await;
+                return;
+            }
+
+            line = line_rx.recv() => {
+                if let Some(line) = line {
+                    let safe = crate::log_monitor::redact_sensitive_line(&line);
+                    spill_writer.write_line(&safe, false).await;
+                    collected.push(safe.clone());
+                    monitor.append_output_line(op_id, safe, false).await;
+                }
+                // None can only happen after exec completes (sender dropped);
+                // the exec branch below handles termination.
+            }
+
+            result = &mut exec => break result,
+        }
+    };
+
+    // Drain any lines still buffered in the channel.
+    while let Ok(line) = line_rx.try_recv() {
+        let safe = crate::log_monitor::redact_sensitive_line(&line);
+        spill_writer.write_line(&safe, false).await;
+        collected.push(safe.clone());
+        monitor.append_output_line(op_id, safe, false).await;
+    }
+    spill_writer.finish().await;
+
+    match exec_result {
+        Ok(exit_code) => {
+            let final_output = json!({
+                // Session output is a single merged stream (per-command 2>&1).
+                "stdout": collected.rendered_output(),
+                "stderr": "",
+                "exit_code": exit_code,
+                "session_id": session_id,
+                "stdout_truncated_lines": collected.dropped_lines(),
+                "stdout_truncated_bytes": collected.dropped_bytes(),
+                "output_file": spill::operation_spill_path(op_id).to_string_lossy(),
+            });
+            let status = if exit_code == 0 {
+                OperationStatus::Completed
+            } else {
+                OperationStatus::Failed
+            };
+            monitor.update_status(op_id, status, Some(final_output)).await;
+        }
+        Err(e) => {
+            let timed_out = e.to_string().contains("timed out");
+            let status = if timed_out {
+                OperationStatus::TimedOut
+            } else {
+                OperationStatus::Failed
+            };
+            monitor
+                .update_status(op_id, status, Some(Value::String(e.to_string())))
+                .await;
+        }
     }
 }
 

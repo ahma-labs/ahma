@@ -29,6 +29,14 @@ pub fn string_property(description: &str) -> Value {
     })
 }
 
+/// Builds a common boolean property schema with a description.
+pub fn boolean_property(description: &str) -> Value {
+    json!({
+        "type": "boolean",
+        "description": description
+    })
+}
+
 /// Builds a string property schema with `format: path`.
 pub fn path_property(description: &str) -> Value {
     json!({
