@@ -594,6 +594,84 @@ async fn red_team_livelog_symlink_read_allowed() {
 }
 
 // =============================================================================
+// RED TEAM TEST 9: Spawn-Time Landlock (worker-thread regression)
+// =============================================================================
+
+/// Children built via `Sandbox::create_command` must be kernel-restricted even
+/// when spawned from a tokio worker thread.
+///
+/// Regression test: `landlock_restrict_self(2)` only restricts the calling
+/// thread, so process-level enforcement performed inside an already-running
+/// async runtime never covered commands spawned from pre-existing worker
+/// threads — they ran fully unsandboxed. The fix applies the ruleset per child
+/// in `pre_exec` (the forked child is single-threaded), which this test
+/// exercises by spawning from an explicitly multi-threaded runtime task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(target_os = "linux")]
+async fn red_team_spawned_child_landlock_enforced_from_worker_thread() {
+    init_test_logging();
+    skip_if_landlock_unavailable!();
+
+    // Both dirs live in the workspace (not /tmp) so the blanket /tmp grant is
+    // irrelevant; only scope_dir is covered by a Landlock rule.
+    let scope_dir = create_non_tmp_scope_dir();
+    let outside_dir = create_non_tmp_tempdir();
+    let outside_file = outside_dir.path().join("secret.txt");
+    std::fs::write(&outside_file, "secret content").unwrap();
+    let inside_file = scope_dir.path().join("inside.txt");
+    std::fs::write(&inside_file, "inside content").unwrap();
+
+    let sandbox = Sandbox::new(
+        vec![scope_dir.path().to_path_buf()],
+        SandboxMode::Strict,
+        true, // no_temp_files: avoid the blanket /tmp read+write rule
+        false,
+        false,
+    )
+    .unwrap();
+
+    let scope = scope_dir.path().to_path_buf();
+    let outside = outside_file.clone();
+    let inside = inside_file.clone();
+    // tokio::spawn moves execution to a worker thread — the exact path that
+    // process-level restrict_self() never covered.
+    let (outside_output, inside_output) = tokio::spawn(async move {
+        let outside_output = sandbox
+            .create_shell_command("bash", &format!("cat {}", outside.display()), &scope)
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        let inside_output = sandbox
+            .create_shell_command("bash", &format!("cat {}", inside.display()), &scope)
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        (outside_output, inside_output)
+    })
+    .await
+    .unwrap();
+
+    let outside_stdout = String::from_utf8_lossy(&outside_output.stdout);
+    assert!(
+        !outside_stdout.contains("secret content"),
+        "SECURITY: child spawned from worker thread read a file outside the sandbox scope"
+    );
+    assert!(
+        !outside_output.status.success(),
+        "SECURITY: out-of-scope read should fail with a kernel-level error, got exit 0"
+    );
+
+    let inside_stdout = String::from_utf8_lossy(&inside_output.stdout);
+    assert!(
+        inside_output.status.success() && inside_stdout.contains("inside content"),
+        "In-scope read must still succeed under spawn-time Landlock. stdout: {inside_stdout}, stderr: {}",
+        String::from_utf8_lossy(&inside_output.stderr)
+    );
+}
+
+// =============================================================================
 // RED TEAM TEST 5: Command Argument Escape (Write)
 // =============================================================================
 

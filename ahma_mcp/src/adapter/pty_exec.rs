@@ -191,6 +191,26 @@ mod unix {
             });
         }
 
+        // Rebuilding as a std Command above drops the pre_exec hooks that
+        // `create_shell_command` attached, so re-apply spawn-time Landlock
+        // here. Landlock restricts only the calling thread; restricting the
+        // single-threaded forked child is the only placement that reliably
+        // covers commands spawned from tokio worker threads.
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = sandbox
+            .spawn_landlock_ruleset_fd()
+            .context("failed to build Landlock ruleset for PTY command")?
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the closure only performs async-signal-safe syscalls; the
+            // OwnedFd moved into it stays open across fork.
+            unsafe {
+                cmd.pre_exec(move || {
+                    crate::sandbox::apply_landlock_ruleset_in_child(fd.as_raw_fd())
+                });
+            }
+        }
+
         let mut child = cmd.spawn().context("failed to spawn PTY command")?;
         let killer = PtyChildKiller {
             pid: child.id() as i32,

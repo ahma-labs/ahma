@@ -1,14 +1,17 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-/// Apply Landlock sandbox restrictions to the current process.
+/// Build the Landlock ruleset for the given scopes without applying it.
+///
+/// Shared by [`enforce_landlock_sandbox`] (process-level, `restrict_self`) and
+/// [`landlock_ruleset_fd`] (spawn-time, applied in the child via `pre_exec`).
 #[cfg(target_os = "linux")]
-pub fn enforce_landlock_sandbox(
+fn build_landlock_ruleset(
     scopes: &[PathBuf],
     read_scopes: &[PathBuf],
     no_temp_files: bool,
     package_cache_write: bool,
-) -> Result<()> {
+) -> Result<landlock::RulesetCreated> {
     use anyhow::Context;
     use landlock::{
         ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
@@ -22,8 +25,6 @@ pub fn enforce_landlock_sandbox(
     let abi = ABI::V1;
     let access_all = AccessFs::from_all(abi);
     let access_read = AccessFs::from_read(abi);
-
-    tracing::info!("Enforcing Landlock sandbox using ABI: {:?}", abi);
 
     let mut ruleset = Ruleset::default()
         .handle_access(access_all)
@@ -56,6 +57,31 @@ pub fn enforce_landlock_sandbox(
     if !no_temp_files {
         add_landlock_temp_rules(&mut ruleset, access_all)?;
     }
+
+    Ok(ruleset)
+}
+
+/// Apply Landlock sandbox restrictions to the current thread.
+///
+/// SECURITY NOTE: `landlock_restrict_self(2)` restricts only the **calling
+/// thread** and threads/processes created after it. Threads that already exist
+/// (e.g. tokio runtime workers spawned by `#[tokio::main]` before this call)
+/// remain unrestricted, and so do processes they spawn. Kernel-level
+/// containment of executed commands therefore relies on the spawn-time
+/// enforcement in [`landlock_ruleset_fd`] / [`apply_landlock_ruleset_in_child`];
+/// this process-level call is defense-in-depth for the server itself.
+#[cfg(target_os = "linux")]
+pub fn enforce_landlock_sandbox(
+    scopes: &[PathBuf],
+    read_scopes: &[PathBuf],
+    no_temp_files: bool,
+    package_cache_write: bool,
+) -> Result<()> {
+    use anyhow::Context;
+
+    tracing::info!("Enforcing Landlock sandbox (process level)");
+
+    let ruleset = build_landlock_ruleset(scopes, read_scopes, no_temp_files, package_cache_write)?;
 
     let status = ruleset
         .restrict_self()
@@ -90,6 +116,49 @@ pub fn enforce_landlock_sandbox(
     Ok(())
 }
 
+/// Build a Landlock ruleset for the given scopes and return its file
+/// descriptor, for spawn-time enforcement in a child process.
+///
+/// Because `landlock_restrict_self(2)` only restricts the calling thread,
+/// process-level enforcement from inside an async runtime does not cover
+/// commands spawned from pre-existing worker threads. The reliable pattern is
+/// to build the ruleset in the parent (allocations are safe here) and apply it
+/// in the child between `fork` and `exec` via
+/// [`apply_landlock_ruleset_in_child`] — the freshly forked child is
+/// single-threaded, so the restriction always covers it and everything it runs.
+///
+/// Returns `Ok(None)` when the kernel does not support Landlock (best-effort
+/// ruleset creation yields no fd). Strict-mode server startup independently
+/// fails closed via `check_sandbox_prerequisites`.
+#[cfg(target_os = "linux")]
+pub fn landlock_ruleset_fd(
+    scopes: &[PathBuf],
+    read_scopes: &[PathBuf],
+    no_temp_files: bool,
+    package_cache_write: bool,
+) -> Result<Option<std::os::fd::OwnedFd>> {
+    let ruleset = build_landlock_ruleset(scopes, read_scopes, no_temp_files, package_cache_write)?;
+    Ok(ruleset.into())
+}
+
+/// Apply a previously built Landlock ruleset fd to the current (child) process.
+///
+/// Intended to be called from a `pre_exec` closure, after `fork` and before
+/// `exec`. Only raw syscalls are used — `prctl(PR_SET_NO_NEW_PRIVS)` and
+/// `landlock_restrict_self(2)` — because allocation between `fork` and `exec`
+/// in a multithreaded parent is not async-signal-safe.
+#[cfg(target_os = "linux")]
+pub fn apply_landlock_ruleset_in_child(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: prctl and the landlock syscall are async-signal-safe.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, fd, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn add_landlock_system_rules(
     ruleset: &mut landlock::RulesetCreated,
@@ -118,16 +187,20 @@ fn add_landlock_home_tool_rules(
     access_all: landlock::BitFlags<landlock::AccessFs>,
     package_cache_write: bool,
 ) -> Result<()> {
-    use landlock::{PathBeneath, PathFd, RulesetCreatedAttr};
+    use landlock::{AccessFs, PathBeneath, PathFd, RulesetCreatedAttr};
     if let Ok(home) = std::env::var("HOME") {
         let home_path = std::path::Path::new(&home);
         let tool_paths = [".cargo", ".rustup", ".nvm", ".npm", ".go", ".cache"];
+        // Toolchain dirs hold the actual binaries (~/.cargo/bin/cargo,
+        // ~/.rustup/toolchains/*/bin/rustc, ~/.nvm/versions/node/*/bin/node):
+        // they need Execute in addition to read, but never write.
+        let access_read_execute = access_read | AccessFs::Execute;
         for tool in &tool_paths {
             let path = home_path.join(tool);
             if path.exists()
                 && let Ok(fd) = PathFd::new(&path)
             {
-                let _ = ruleset.add_rule(PathBeneath::new(fd, access_read));
+                let _ = ruleset.add_rule(PathBeneath::new(fd, access_read_execute));
             }
         }
     }

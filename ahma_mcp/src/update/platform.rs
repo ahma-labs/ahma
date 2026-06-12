@@ -107,10 +107,10 @@ pub fn detect_platform() -> Result<Platform> {
             format!("linux-{arch}")
         };
 
-        return Ok(Platform {
+        Ok(Platform {
             id,
             archive_ext: ArchiveFormat::TarGz,
-        });
+        })
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]

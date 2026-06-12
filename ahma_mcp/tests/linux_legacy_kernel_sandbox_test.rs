@@ -29,6 +29,8 @@ fn test_no_sandbox_warns_and_runs_on_legacy_kernel() {
         .args([
             "--no-sandbox",
             "--log-to-stderr",
+            "tool",
+            "run",
             "run_terminal_command",
             "--",
             "echo legacy-kernel-fallback",
