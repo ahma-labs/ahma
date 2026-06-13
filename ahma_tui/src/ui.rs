@@ -530,7 +530,11 @@ fn push_chat_entry_lines(
     width: usize,
 ) {
     match entry {
-        ChatEntry::User { text, started_at, duration_ms } => {
+        ChatEntry::User {
+            text,
+            started_at,
+            duration_ms,
+        } => {
             push_user_chat_lines(lines, text, *started_at, *duration_ms, theme, width);
         }
         ChatEntry::Assistant { content, streaming } => {
@@ -593,7 +597,7 @@ fn push_user_chat_lines(
         let prefix_len = prefix.chars().count();
         let dur_len = dur_str.chars().count();
         let max_text_len = width.saturating_sub(prefix_len + dur_len + 2); // leave margin
-        
+
         if first_line.chars().count() <= max_text_len {
             let padding = width.saturating_sub(prefix_len + first_line.chars().count() + dur_len);
             lines.push(Line::from(vec![
@@ -605,7 +609,7 @@ fn push_user_chat_lines(
         } else {
             let first_part: String = first_line.chars().take(max_text_len).collect();
             let second_part: String = first_line.chars().skip(max_text_len).collect();
-            
+
             let padding = width.saturating_sub(prefix_len + first_part.chars().count() + dur_len);
             lines.push(Line::from(vec![
                 Span::styled(prefix, theme.dim()),
@@ -613,7 +617,7 @@ fn push_user_chat_lines(
                 Span::styled(" ".repeat(padding), theme.normal()),
                 Span::styled(dur_str, theme.dim()),
             ]));
-            
+
             lines.push(Line::from(vec![
                 Span::styled("     ", theme.dim()),
                 Span::styled(second_part, theme.normal()),

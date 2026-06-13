@@ -409,11 +409,10 @@ fn build_antigravity_servers_entry(transport: &str, home: &Path) -> serde_json::
             "--tools",
             "simplify",
             "--tmp",
-            "--log-monitor"
-        ],
-        "env": {
-            "AHMA_SANDBOX_SCOPE": home.to_string_lossy().to_string()
-        }
+            "--log-monitor",
+            "--sandbox-scope",
+            home.to_string_lossy().to_string()
+        ]
     })
 }
 
