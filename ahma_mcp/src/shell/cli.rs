@@ -413,6 +413,32 @@ fn resolve_sandbox_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
 
     let cwd = std::env::current_dir()
         .context("Failed to get current working directory for sandbox scope")?;
+    if crate::sandbox::is_filesystem_root(&cwd) {
+        let home = dirs::home_dir();
+        let settings_path_str = home
+            .as_ref()
+            .map(|h| {
+                h.join(".ahma")
+                    .join("settings.toml")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| "~/.ahma/settings.toml".to_string());
+
+        let config_command = if cfg!(target_os = "windows") {
+            "New-Item -ItemType Directory -Force -Path ~\\.ahma; Add-Content -Path ~\\.ahma\\settings.toml -Value \"`n[sandbox]`nscopes = [`\"~/sandbox`\"]\""
+        } else {
+            "mkdir -p ~/.ahma && echo '[sandbox]' >> ~/.ahma/settings.toml && echo 'scopes = [\"~/sandbox\"]' >> ~/.ahma/settings.toml"
+        };
+
+        return Err(anyhow!(
+            "Failed to initialize sandbox: current working directory {:?} is a filesystem root, which is not a valid sandbox scope.\n\n\
+             To fix this, define a manual sandbox scope in your user settings file ({settings_path_str}).\n\
+             Run the following command in your terminal to create and add the scope ~/sandbox:\n\n\
+             {config_command}\n",
+            cwd
+        ));
+    }
     Ok(Some(vec![cwd]))
 }
 
@@ -2217,8 +2243,8 @@ fn parse_execution_settings(
     let timeout_secs = if let Some(t) = cli.timeout {
         t
     } else {
-        if let Some(val) = get_env_var_with_deprecation!("AHMA_TIMEOUT")
-            .and_then(|v| v.trim().parse::<u64>().ok())
+        if let Some(val) =
+            get_env_var_with_deprecation!("AHMA_TIMEOUT").and_then(|v| v.trim().parse::<u64>().ok())
         {
             if s.tools.timeout_secs != ahma_common::config::ToolSettings::default().timeout_secs {
                 s.tools.timeout_secs
@@ -2230,13 +2256,11 @@ fn parse_execution_settings(
         }
     };
 
-    let force_sync = cli.sync
-        || s.tools.force_sync
-        || check_env_flag_with_deprecation!("AHMA_SYNC");
+    let force_sync =
+        cli.sync || s.tools.force_sync || check_env_flag_with_deprecation!("AHMA_SYNC");
 
-    let hot_reload_tools = cli.hot_reload
-        || s.tools.hot_reload
-        || check_env_flag_with_deprecation!("AHMA_HOT_RELOAD");
+    let hot_reload_tools =
+        cli.hot_reload || s.tools.hot_reload || check_env_flag_with_deprecation!("AHMA_HOT_RELOAD");
 
     let skip_availability_probes = cli.skip_probes
         || s.tools.skip_probes
@@ -2281,7 +2305,9 @@ fn parse_sandbox_settings(
         if let Some(val) = get_env_var_with_deprecation!("AHMA_MONITOR_RATE_LIMIT")
             .and_then(|v| v.trim().parse::<u64>().ok())
         {
-            if s.logging.monitor_rate_limit_secs != ahma_common::config::LoggingSettings::default().monitor_rate_limit_secs {
+            if s.logging.monitor_rate_limit_secs
+                != ahma_common::config::LoggingSettings::default().monitor_rate_limit_secs
+            {
                 s.logging.monitor_rate_limit_secs
             } else {
                 val
@@ -2321,7 +2347,9 @@ fn parse_http_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> (boo
         if let Some(val) = get_env_var_with_deprecation!("AHMA_HANDSHAKE_TIMEOUT")
             .and_then(|v| v.trim().parse::<u64>().ok())
         {
-            if s.http.handshake_timeout_secs != ahma_common::config::HttpSettings::default().handshake_timeout_secs {
+            if s.http.handshake_timeout_secs
+                != ahma_common::config::HttpSettings::default().handshake_timeout_secs
+            {
                 s.http.handshake_timeout_secs
             } else {
                 val
@@ -2347,16 +2375,13 @@ fn parse_auth_settings(
 
     // Security-tier: AHMA_REQUIRE_TOKEN_PATH retired — warn and ignore.
     warn_retired_security_env!("AHMA_REQUIRE_TOKEN_PATH");
-    let require_token_path = cli
-        .require_token_path
-        .clone()
-        .or_else(|| {
-            if s.auth.require_token_path.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(&s.auth.require_token_path))
-            }
-        });
+    let require_token_path = cli.require_token_path.clone().or_else(|| {
+        if s.auth.require_token_path.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(&s.auth.require_token_path))
+        }
+    });
 
     // Security-tier: AHMA_RATE_LIMIT_RPS and AHMA_RATE_LIMIT_BURST retired — warn and ignore.
     warn_retired_security_env!("AHMA_RATE_LIMIT_RPS");
@@ -2453,8 +2478,8 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     let s = load_settings(cli);
 
     // ── Tool loading ────────────────────────────────────────────────────────
-    let explicit_tools_dir = cli.tools_dir.is_some()
-        || std::env::var_os("AHMA_TOOLS_DIR").is_some();
+    let explicit_tools_dir =
+        cli.tools_dir.is_some() || std::env::var_os("AHMA_TOOLS_DIR").is_some();
     // Preference-tier: CLI > settings > env (lowest precedence).
     let raw_tools_dir = cli
         .tools_dir

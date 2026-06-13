@@ -108,11 +108,16 @@ impl ChatHistory {
     /// Locate the latest `User` entry and set its `duration_ms` based on `started_at` elapsed time.
     pub fn finish_user_timing(&mut self) {
         for entry in self.entries.iter_mut().rev() {
-            if let ChatEntry::User { started_at, duration_ms, .. } = entry {
-                if duration_ms.is_none() {
-                    if let Some(start) = started_at {
-                        *duration_ms = Some(start.elapsed().as_millis() as u64);
-                    }
+            if let ChatEntry::User {
+                started_at,
+                duration_ms,
+                ..
+            } = entry
+            {
+                if duration_ms.is_none()
+                    && let Some(start) = started_at
+                {
+                    *duration_ms = Some(start.elapsed().as_millis() as u64);
                 }
                 break;
             }
@@ -350,7 +355,9 @@ impl CommandNavigator {
                 .filter(|c| {
                     c.command.to_lowercase().contains(&q)
                         || c.description.to_lowercase().contains(&q)
-                        || (c.command == "/quit" && !q_clean.is_empty() && "exit".starts_with(q_clean))
+                        || (c.command == "/quit"
+                            && !q_clean.is_empty()
+                            && "exit".starts_with(q_clean))
                 })
                 .collect();
         }
@@ -1618,7 +1625,11 @@ mod tests {
         nav.open(&tools);
         assert!(nav.completions.iter().any(|c| c.command == "/quit"));
         assert!(!nav.completions.iter().any(|c| c.command == "/q"));
-        assert!(nav.completions.iter().any(|c| c.command == "/run cargo_build"));
+        assert!(
+            nav.completions
+                .iter()
+                .any(|c| c.command == "/run cargo_build")
+        );
 
         // When input is "quit", should match /quit
         nav.input = "quit".to_string();
@@ -1643,7 +1654,11 @@ mod tests {
         nav.refresh_completions(&tools);
         assert_eq!(nav.completions.len(), 2);
         assert!(nav.completions.iter().any(|c| c.command == "/quit"));
-        assert!(nav.completions.iter().any(|c| c.command == "/export markdown"));
+        assert!(
+            nav.completions
+                .iter()
+                .any(|c| c.command == "/export markdown")
+        );
 
         // When input is "/exi", should match /quit
         nav.input = "/exi".to_string();

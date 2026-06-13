@@ -12,7 +12,7 @@ use super::types::SandboxMode;
 /// |----------|---------------------------------------|
 /// | Unix     | `/`                                   |
 /// | Windows  | `C:\`, `D:\`, `\\server\share` (UNC)  |
-fn is_filesystem_root(path: &Path) -> bool {
+pub(crate) fn is_filesystem_root(path: &Path) -> bool {
     use std::path::Component;
     let mut it = path.components();
     match it.next() {

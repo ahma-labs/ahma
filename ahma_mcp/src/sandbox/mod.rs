@@ -61,6 +61,7 @@ pub use landlock::{
 pub use prerequisites::{
     check_sandbox_prerequisites, exit_with_sandbox_error, test_sandbox_exec_available,
 };
+pub(crate) use scopes::is_filesystem_root;
 pub use scopes::normalize_path_lexically;
 pub use types::{SandboxMode, ScopesGuard};
 #[cfg(target_os = "windows")]
