@@ -35,11 +35,14 @@ impl Sandbox {
 
         // Cargo can be configured (via config or env) to write its target dir outside
         // the session sandbox. Force it back inside the working directory.
+        // Also clear RUSTC_WRAPPER so external wrappers like sccache do not attempt
+        // to write to directories outside the secure sandbox scope.
         if std::path::Path::new(program)
             .file_name()
             .is_some_and(|n| n == "cargo")
         {
             cmd.env("CARGO_TARGET_DIR", working_dir.join("target"));
+            cmd.env("RUSTC_WRAPPER", "");
         }
         cmd
     }
@@ -180,7 +183,7 @@ mod tests {
         assert!(result.is_ok(), "create_command in Test mode should succeed");
     }
 
-    /// create_command recognizes "cargo" and sets CARGO_TARGET_DIR env var.
+    /// create_command recognizes "cargo" and sets CARGO_TARGET_DIR and RUSTC_WRAPPER env vars.
     #[test]
     fn test_create_command_cargo_sets_target_dir() {
         let td = tempdir().unwrap();
@@ -192,10 +195,24 @@ mod tests {
             false,
         )
         .unwrap();
-        // We can only observe the resulting Command via Debug since the env is private,
-        // but at minimum this should not panic and return a valid Command.
         let result = sandbox.create_command("cargo", &["build".to_string()], td.path());
         assert!(result.is_ok(), "create_command for cargo should succeed");
+        let cmd = result.unwrap();
+
+        let std_cmd = cmd.as_std();
+        let envs: std::collections::HashMap<_, _> = std_cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
+            .collect();
+
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CARGO_TARGET_DIR")),
+            Some(&Some(td.path().join("target").into_os_string()))
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("RUSTC_WRAPPER")),
+            Some(&Some(std::ffi::OsString::from("")))
+        );
     }
 
     /// create_shell_command in Test mode produces a valid command.

@@ -58,7 +58,8 @@ impl ShellSession {
             .context("failed to build sandboxed session shell command")?;
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
 
         let mut child = cmd.spawn().context("failed to spawn session shell")?;
         let stdin = child
@@ -224,6 +225,22 @@ impl ShellSessionManager {
             session.lock().await.kill().await;
             tracing::info!("shell session '{}' closed", session_id);
         }
+    }
+
+    /// Remove a session from the map WITHOUT acquiring the per-session lock.
+    ///
+    /// Safe to call from a cancel branch where the per-session mutex may be held
+    /// by a suspended `execute_streaming` future.  When all Arc references drop
+    /// (including the exec future's internal reference), `kill_on_drop(true)` on
+    /// the child process ensures the shell and its children are killed.
+    ///
+    /// Returns `true` if the session existed.
+    pub async fn remove_session(&self, session_id: &str) -> bool {
+        let removed = self.sessions.lock().await.remove(session_id);
+        if removed.is_some() {
+            tracing::info!("shell session '{}' removed (cancel path)", session_id);
+        }
+        removed.is_some()
     }
 
     /// Kill all session shells (graceful shutdown).

@@ -170,15 +170,17 @@ fn test_no_sandbox_flag_allows_nested_execution() {
 
     let outer_sandbox_profile = "(version 1)(allow default)";
 
-    // Run ahma_mcp inside sandbox-exec with AHMA_DISABLE_SANDBOX=1 using run subcommand
+    // Run ahma_mcp inside sandbox-exec with the --no-sandbox flag (the supported
+    // explicit override; the AHMA_DISABLE_SANDBOX env var is retired per R-CFG2.3).
     let output = Command::new("sandbox-exec")
         .current_dir(&workspace_dir)
-        .env("AHMA_DISABLE_SANDBOX", "1")
-        .env("AHMA_TOOLS_DIR", ".ahma")
         .args([
             "-p",
             outer_sandbox_profile,
             binary.to_str().unwrap(),
+            "--no-sandbox",
+            "--tools-dir",
+            ".ahma",
             "tool",
             "run",
             // run subcommand: execute run_terminal_command with echo (command as single arg)
@@ -187,7 +189,7 @@ fn test_no_sandbox_flag_allows_nested_execution() {
             "echo nested_sandbox_test_success",
         ])
         .output()
-        .expect("Failed to spawn ahma_mcp inside sandbox with --disable-sandbox");
+        .expect("Failed to spawn ahma_mcp inside sandbox with --no-sandbox");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -212,46 +214,10 @@ fn test_no_sandbox_flag_allows_nested_execution() {
     );
 }
 
-/// Test that AHMA_DISABLE_SANDBOX=1 env var allows nested execution (R7.6)
-#[test]
-fn test_no_sandbox_env_var_allows_nested_execution() {
-    skip_if_sandboxed!();
-    let binary = get_ahma_mcp_binary();
-    let workspace_dir = get_workspace_dir();
-
-    let outer_sandbox_profile = "(version 1)(allow default)";
-
-    // Run ahma_mcp inside sandbox-exec with AHMA_DISABLE_SANDBOX=1 using run subcommand
-    let output = Command::new("sandbox-exec")
-        .current_dir(&workspace_dir)
-        .env("AHMA_DISABLE_SANDBOX", "1")
-        .env("AHMA_TOOLS_DIR", ".ahma")
-        .args([
-            "-p",
-            outer_sandbox_profile,
-            binary.to_str().unwrap(),
-            "tool",
-            "run",
-            // run subcommand: execute run_terminal_command with echo (command as single arg)
-            "run_terminal_command",
-            "--",
-            "echo env_var_test_success",
-        ])
-        .output()
-        .expect("Failed to spawn ahma_mcp inside sandbox with AHMA_DISABLE_SANDBOX=1");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Debug output for test failures
-    eprintln!("Exit code: {:?}", output.status.code());
-    eprintln!("stderr:\n{}", stderr);
-    eprintln!("stdout:\n{}", stdout);
-
-    // With AHMA_DISABLE_SANDBOX=1, the process should succeed
-    assert!(
-        output.status.success(),
-        "ahma_mcp should succeed with AHMA_DISABLE_SANDBOX=1 even inside another sandbox. stderr:\n{}",
-        stderr
-    );
-}
+// NOTE: the former `test_no_sandbox_env_var_allows_nested_execution` was
+// removed. It asserted that `AHMA_DISABLE_SANDBOX=1` enabled nested execution,
+// but that env var is retired (R-CFG2.3): it is now warned-about and IGNORED.
+// The explicit override is covered by `test_no_sandbox_flag_allows_nested_execution`
+// (the --no-sandbox flag) above, and that the env var no longer bypasses the
+// sandbox is covered by the unit test `disable_sandbox_env_var_is_ignored` in
+// `ahma_mcp/src/shell/cli.rs`.

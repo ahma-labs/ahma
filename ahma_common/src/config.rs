@@ -461,7 +461,7 @@ impl Default for ToolSettings {
 
 /// Sandbox and filesystem security settings.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SandboxSettings {
     /// Disable the kernel sandbox entirely.
     /// **UNSAFE** — the AI can read and write anywhere on the filesystem.
@@ -563,7 +563,7 @@ impl Default for HttpSettings {
 
 /// HTTP authentication and rate limiting settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuthSettings {
     /// Path to a file containing the required bearer token for HTTP access.
     /// The token is read from this file at startup so it never appears in the
@@ -664,32 +664,33 @@ impl AhmaSettings {
     }
 
     /// Load from an explicit path — useful for tests and alternate locations.
+    ///
+    /// This is the **runtime-safe** loader: a parse error is logged and the
+    /// compiled-in defaults are returned, so a settings file corrupted while a
+    /// long-running process (TUI, daemon) is live cannot hard-kill it. The
+    /// **fail-closed** behavior required at startup (R-CFG6.1) is implemented by
+    /// the startup resolution path via [`load_from_result`], which surfaces the
+    /// error so the launcher can abort before the sandbox is built.
     pub fn load_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => match toml::from_str(&contents) {
-                Ok(cfg) => {
-                    debug!("Loaded AhmaSettings from {}", path.display());
-                    cfg
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to parse {}: {e}; using default AhmaSettings",
-                        path.display()
-                    );
-                    Self::default()
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                debug!("{} not found; using default AhmaSettings", path.display());
-                Self::default()
-            }
+        match Self::load_from_result(path) {
+            Ok(cfg) => cfg,
             Err(e) => {
-                warn!(
-                    "Failed to read {}: {e}; using default AhmaSettings",
-                    path.display()
-                );
+                warn!("{e}; using default AhmaSettings");
                 Self::default()
             }
+        }
+    }
+
+    /// Strict loader: returns `Err(message)` on a read or parse failure instead
+    /// of falling back to defaults. A missing file is **not** an error (returns
+    /// defaults). This is the primitive the startup path uses to fail closed
+    /// (R-CFG6.1) and that tests use to verify bad-config rejection.
+    pub fn load_from_result(path: &Path) -> Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => toml::from_str(&contents)
+                .map_err(|e| format!("failed to parse settings file {}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("failed to read {}: {e}", path.display())),
         }
     }
 
@@ -1199,5 +1200,44 @@ timeout_secs = 600
                 "path should contain settings.toml: {s}"
             );
         }
+    }
+
+    #[test]
+    fn sandbox_unknown_key_rejected() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "[sandbox]\nunknown_typo_key = true").unwrap();
+        assert!(
+            AhmaSettings::load_from_result(&path).is_err(),
+            "unknown key in [sandbox] should be rejected"
+        );
+    }
+
+    #[test]
+    fn auth_unknown_key_rejected() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "[auth]\nbogus_setting = \"yes\"").unwrap();
+        assert!(
+            AhmaSettings::load_from_result(&path).is_err(),
+            "unknown key in [auth] should be rejected"
+        );
+    }
+
+    #[test]
+    fn tools_unknown_key_allowed_for_forward_compat() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "[tools]\nfuture_feature = true").unwrap();
+        assert!(
+            AhmaSettings::load_from_result(&path).is_ok(),
+            "unknown key in [tools] should be tolerated"
+        );
     }
 }

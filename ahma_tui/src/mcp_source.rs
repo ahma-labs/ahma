@@ -715,6 +715,58 @@ async fn call_status(
 
 // ─── Parsing helpers ──────────────────────────────────────────────────────────
 
+fn parse_op_status(op_val: &Value) -> OpStatus {
+    let status_str = op_val
+        .get("status")
+        .or_else(|| op_val.get("state"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Running");
+
+    match status_str.to_lowercase().as_str() {
+        "running" | "inprogress" | "in_progress" => OpStatus::Running,
+        "pending" => OpStatus::Pending,
+        "succeeded" | "success" | "completed" | "done" => OpStatus::Succeeded,
+        "failed" | "error" => OpStatus::Failed,
+        "cancelled" | "canceled" => OpStatus::Cancelled,
+        "waiting" | "waiting_dependency" => OpStatus::Waiting,
+        _ => OpStatus::Running,
+    }
+}
+
+fn parse_op_times(op_val: &Value, op: &mut Operation) {
+    let mut started_dt = None;
+    if let Some(st_str) = op_val.get("start_time").and_then(|v| v.as_str())
+        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(st_str)
+    {
+        let s_dt = dt.with_timezone(&chrono::Local);
+        started_dt = Some(s_dt);
+        op.started_time = s_dt;
+
+        let now_local = chrono::Local::now();
+        if now_local >= s_dt {
+            let diff = now_local.signed_duration_since(s_dt);
+            let diff_secs = diff.num_seconds().max(0) as u64;
+            op.started_at = Some(std::time::Instant::now() - Duration::from_secs(diff_secs));
+        }
+    }
+
+    if let Some(et_str) = op_val.get("end_time").and_then(|v| v.as_str())
+        && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(et_str)
+    {
+        let e_dt = dt.with_timezone(&chrono::Local);
+        if let Some(s_dt) = started_dt
+            && e_dt >= s_dt
+        {
+            let duration = e_dt.signed_duration_since(s_dt);
+            let duration_ms = duration.num_milliseconds().max(0) as u64;
+            op.duration_ms = Some(duration_ms);
+            if let Some(start_inst) = op.started_at {
+                op.completed_at = Some(start_inst + Duration::from_millis(duration_ms));
+            }
+        }
+    }
+}
+
 fn parse_operations(val: &Value) -> Vec<Operation> {
     // The `status` tool returns content items; each is a JSON object
     // describing one operation.  We tolerate many shapes gracefully.
@@ -750,21 +802,7 @@ fn parse_operations(val: &Value) -> Vec<Operation> {
                 .unwrap_or("unknown")
                 .to_string();
 
-            let status_str = op_val
-                .get("status")
-                .or_else(|| op_val.get("state"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("Running");
-
-            let status = match status_str.to_lowercase().as_str() {
-                "running" | "inprogress" | "in_progress" => OpStatus::Running,
-                "pending" => OpStatus::Pending,
-                "succeeded" | "success" | "completed" | "done" => OpStatus::Succeeded,
-                "failed" | "error" => OpStatus::Failed,
-                "cancelled" | "canceled" => OpStatus::Cancelled,
-                "waiting" | "waiting_dependency" => OpStatus::Waiting,
-                _ => OpStatus::Running,
-            };
+            let status = parse_op_status(&op_val);
 
             let mut op = Operation::new(id, tool, status);
             op.started_at = None; // fallback
@@ -775,38 +813,8 @@ fn parse_operations(val: &Value) -> Vec<Operation> {
                 op.description = desc.to_string();
             }
 
-            let mut started_dt = None;
-            if let Some(st_str) = op_val.get("start_time").and_then(|v| v.as_str())
-                && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(st_str)
-            {
-                let s_dt = dt.with_timezone(&chrono::Local);
-                started_dt = Some(s_dt);
-                op.started_time = s_dt;
+            parse_op_times(&op_val, &mut op);
 
-                let now_local = chrono::Local::now();
-                if now_local >= s_dt {
-                    let diff = now_local.signed_duration_since(s_dt);
-                    let diff_secs = diff.num_seconds().max(0) as u64;
-                    op.started_at =
-                        Some(std::time::Instant::now() - Duration::from_secs(diff_secs));
-                }
-            }
-
-            if let Some(et_str) = op_val.get("end_time").and_then(|v| v.as_str())
-                && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(et_str)
-            {
-                let e_dt = dt.with_timezone(&chrono::Local);
-                if let Some(s_dt) = started_dt
-                    && e_dt >= s_dt
-                {
-                    let duration = e_dt.signed_duration_since(s_dt);
-                    let duration_ms = duration.num_milliseconds().max(0) as u64;
-                    op.duration_ms = Some(duration_ms);
-                    if let Some(start_inst) = op.started_at {
-                        op.completed_at = Some(start_inst + Duration::from_millis(duration_ms));
-                    }
-                }
-            }
             if let Some(arr) = op_val.get("stdout_tail").and_then(|v| v.as_array()) {
                 op.stdout_tail = arr
                     .iter()

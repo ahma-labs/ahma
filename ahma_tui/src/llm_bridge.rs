@@ -1242,22 +1242,22 @@ pub fn spawn_window_cli_task(
         let mut stderr_reader = tokio::io::BufReader::new(stderr).lines();
 
         let tx_clone = tx.clone();
-        let stdout_loop = async {
+        let stdout_handle = tokio::spawn(async move {
             while let Ok(Some(line)) = stdout_reader.next_line().await {
                 let _ = tx_clone
                     .send(BridgeEvent::WindowOutput { window_id, line })
                     .await;
             }
-        };
+        });
 
         let tx_clone2 = tx.clone();
-        let stderr_loop = async {
+        let stderr_handle = tokio::spawn(async move {
             while let Ok(Some(line)) = stderr_reader.next_line().await {
                 let _ = tx_clone2
                     .send(BridgeEvent::WindowOutput { window_id, line })
                     .await;
             }
-        };
+        });
 
         let wait_loop = child.wait();
 
@@ -1265,6 +1265,8 @@ pub fn spawn_window_cli_task(
             biased;
             _ = &mut abort_rx => {
                 let _ = child.kill().await;
+                let _ = stdout_handle.await;
+                let _ = stderr_handle.await;
                 let _ = tx.send(BridgeEvent::WindowFinished {
                     window_id,
                     success: false,
@@ -1272,7 +1274,8 @@ pub fn spawn_window_cli_task(
                 }).await;
             }
             res = wait_loop => {
-                let _ = tokio::join!(stdout_loop, stderr_loop);
+                let _ = stdout_handle.await;
+                let _ = stderr_handle.await;
                 match res {
                     Ok(status) => {
                         let success = status.success();

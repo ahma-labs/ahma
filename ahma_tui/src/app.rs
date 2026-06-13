@@ -1000,7 +1000,11 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
         return;
     }
 
-    state.chat.push(ChatEntry::User(text));
+    state.chat.push(ChatEntry::User {
+        text,
+        started_at: Some(std::time::Instant::now()),
+        duration_ms: None,
+    });
     state.chat.push(ChatEntry::Assistant {
         content: String::new(),
         streaming: true,
@@ -1033,37 +1037,11 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     }
 }
 
-/// Build the system prompt sent with every LLM request.
-///
-/// Combines (in priority order):
-/// 1. The active agent profile's `system_prompt` (if any).
-/// 2. A concise snapshot of live workspace context: scope, sandbox status,
-///    recent operations with their status, and recent failures.
-///
-/// The context block is intentionally short (<500 tokens) so it does not eat
-/// into the user's context window.
 #[cfg(feature = "tui")]
-fn build_system_prompt(state: &crate::state::AppState) -> String {
+fn format_recent_ops(operations: &[crate::state::Operation]) -> String {
     use crate::state::OpStatus;
-
-    // 1. Profile system prompt (may override defaults).
-    let profile_prompt = profile_field(state, |p| p.system_prompt, String::new());
-
-    // 2. Live context block.
     let mut ctx = String::new();
-
-    // Workspace / scope.
-    if !state.workspace.is_empty() {
-        ctx.push_str(&format!("Workspace: {}\n", state.workspace));
-    }
-
-    // Sandbox / server status.
-    if !state.sandbox_status.is_empty() && state.sandbox_status != "unknown" {
-        ctx.push_str(&format!("Sandbox: {}\n", state.sandbox_status));
-    }
-
-    // Recent operations (last 5, most recent first).
-    let recent_ops: Vec<&crate::state::Operation> = state.operations.iter().rev().take(5).collect();
+    let recent_ops: Vec<&crate::state::Operation> = operations.iter().rev().take(5).collect();
 
     if !recent_ops.is_empty() {
         ctx.push_str("\nRecent operations:\n");
@@ -1087,10 +1065,14 @@ fn build_system_prompt(state: &crate::state::AppState) -> String {
             ctx.push_str(&format!("  [{status_label}] {name} ({elapsed}){summary}\n"));
         }
     }
+    ctx
+}
 
-    // Recent failures — include a brief stdout tail to help with "why did it fail?" queries.
-    let failures: Vec<&crate::state::Operation> = state
-        .operations
+#[cfg(feature = "tui")]
+fn format_recent_failures(operations: &[crate::state::Operation]) -> String {
+    use crate::state::OpStatus;
+    let mut ctx = String::new();
+    let failures: Vec<&crate::state::Operation> = operations
         .iter()
         .rev()
         .filter(|o| o.status == OpStatus::Failed)
@@ -1120,6 +1102,41 @@ fn build_system_prompt(state: &crate::state::AppState) -> String {
             }
         }
     }
+    ctx
+}
+
+/// Build the system prompt sent with every LLM request.
+///
+/// Combines (in priority order):
+/// 1. The active agent profile's `system_prompt` (if any).
+/// 2. A concise snapshot of live workspace context: scope, sandbox status,
+///    recent operations with their status, and recent failures.
+///
+/// The context block is intentionally short (<500 tokens) so it does not eat
+/// into the user's context window.
+#[cfg(feature = "tui")]
+fn build_system_prompt(state: &crate::state::AppState) -> String {
+    // 1. Profile system prompt (may override defaults).
+    let profile_prompt = profile_field(state, |p| p.system_prompt, String::new());
+
+    // 2. Live context block.
+    let mut ctx = String::new();
+
+    // Workspace / scope.
+    if !state.workspace.is_empty() {
+        ctx.push_str(&format!("Workspace: {}\n", state.workspace));
+    }
+
+    // Sandbox / server status.
+    if !state.sandbox_status.is_empty() && state.sandbox_status != "unknown" {
+        ctx.push_str(&format!("Sandbox: {}\n", state.sandbox_status));
+    }
+
+    // Recent operations (last 5, most recent first).
+    ctx.push_str(&format_recent_ops(&state.operations));
+
+    // Recent failures — include a brief stdout tail to help with "why did it fail?" queries.
+    ctx.push_str(&format_recent_failures(&state.operations));
 
     // 3. Assemble final prompt.
     let base = if state.mcp_enabled {
@@ -1150,7 +1167,7 @@ fn collect_chat_history(state: &crate::state::AppState) -> Vec<ahma_llm_monitor:
         .entries()
         .iter()
         .filter_map(|entry| match entry {
-            ChatEntry::User(content) => Some(ChatMessage::user(content.clone())),
+            ChatEntry::User { text, .. } => Some(ChatMessage::user(text.clone())),
             ChatEntry::Assistant {
                 content,
                 streaming: false,
@@ -1451,7 +1468,7 @@ fn textarea_input_from_key_event(key: crossterm::event::KeyEvent) -> tui_textare
 
 #[cfg(feature = "tui")]
 fn handle_window_nav_commands(cmd: &str, state: &mut crate::state::AppState) -> bool {
-    if cmd == "/exit" || cmd == "/q" || cmd == "/quit" {
+    if cmd == "/exit" || cmd == "/quit" {
         state.should_quit = true;
         return true;
     }
@@ -1849,9 +1866,9 @@ fn handle_export_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
     let mut md = String::from("# ahma chat export\n\n");
     for entry in state.chat.entries() {
         match entry {
-            crate::state::ChatEntry::User(content) => {
+            crate::state::ChatEntry::User { text, .. } => {
                 md.push_str("## User\n\n");
-                md.push_str(content);
+                md.push_str(text);
                 md.push_str("\n\n");
             }
             crate::state::ChatEntry::Assistant { content, .. } => {
@@ -1955,7 +1972,10 @@ fn open_model_picker(state: &mut crate::state::AppState) {
     let mut items = Vec::new();
     for provider in &state.available_providers {
         for model in &provider.models {
-            items.push(format!("{} / {}", provider.name, model));
+            let item = format!("{} / {}", provider.name, model);
+            if !items.contains(&item) {
+                items.push(item);
+            }
         }
     }
 
@@ -2456,6 +2476,7 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
         }
         BridgeEvent::Done => {
             state.chat.finish_stream();
+            state.chat.finish_user_timing();
             if let Some(profile) = &state.active_profile
                 && let Ok(cwd) = std::env::current_dir()
             {
@@ -2473,6 +2494,7 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
         }
         BridgeEvent::Error(msg) => {
             state.chat.finish_stream();
+            state.chat.finish_user_timing();
             state.chat.push(ChatEntry::Assistant {
                 content: format!("Error: {msg}"),
                 streaming: false,
@@ -3161,10 +3183,11 @@ fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
         id, tool_name, status, args, alerts_str, stdout_str
     );
 
-    state.chat.push(crate::state::ChatEntry::User(format!(
-        "Analyze operation {}",
-        id
-    )));
+    state.chat.push(crate::state::ChatEntry::User {
+        text: format!("Analyze operation {}", id),
+        started_at: Some(std::time::Instant::now()),
+        duration_ms: None,
+    });
     state.chat.push(crate::state::ChatEntry::Assistant {
         content: String::new(),
         streaming: true,
@@ -3565,12 +3588,7 @@ mod tests {
         assert!(handled_quit);
         assert!(state_quit.should_quit);
 
-        // Test /q (alias) and /exit (unadvertised alias) also quit
-        let mut state_q = AppState::new("http://localhost:3000", "HTTP", true);
-        let handled_q = super::handle_window_nav_commands("/q", &mut state_q);
-        assert!(handled_q);
-        assert!(state_q.should_quit);
-
+        // Test /exit (unadvertised alias) also quit
         let handled_exit = super::handle_window_nav_commands("/exit", &mut state);
         assert!(handled_exit);
         assert!(state.should_quit);
