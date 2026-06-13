@@ -12,7 +12,8 @@
 //! | Unix / macOS    | Unix domain socket (`~/.ahma/daemon.sock`) |
 //! | Windows         | TCP loopback `127.0.0.1:7395`            |
 //!
-//! Override the path/address with the `AHMA_DAEMON_SOCK` environment variable.
+//! Override the path/address with the `--daemon-socket` CLI flag or the `AHMA_DAEMON_SOCK`
+//! internal environment variable (set only by `init_test_daemon_isolation()` in test builds).
 //!
 //! ## Protocol
 //!
@@ -61,11 +62,12 @@ use tracing::{debug, info, warn};
 /// TCP port used on Windows (unix sockets not supported there).
 pub const WINDOWS_DAEMON_PORT: u16 = 7395;
 
-/// Get the daemon port (dynamically overridden in tests via AHMA_DAEMON_PORT).
+/// Get the daemon port.
+///
+/// In test builds, `AHMA_DAEMON_PORT` can be set by `init_test_daemon_isolation()` to
+/// isolate concurrent test processes. In production this always returns `WINDOWS_DAEMON_PORT`
+/// unless `set_socket_path_override` was used (the Windows equivalent of `--daemon-socket`).
 pub fn daemon_port() -> u16 {
-    if is_test_env() {
-        init_test_daemon_isolation();
-    }
     if let Some(p) = std::env::var("AHMA_DAEMON_PORT")
         .ok()
         .and_then(|p_str| p_str.parse::<u16>().ok())
@@ -185,15 +187,17 @@ pub fn set_socket_path_override(path: PathBuf) {
     let _ = SOCKET_PATH_OVERRIDE.set(path);
 }
 
-fn is_test_env() -> bool {
-    std::env::var_os("NEXTEST").is_some() || std::env::var_os("CARGO_LLVM_COV").is_some()
-}
-
+#[cfg(test)]
 static DAEMON_ISOLATION_INIT: std::sync::Once = std::sync::Once::new();
+#[cfg(test)]
 static DAEMON_SOCK_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Automatically configures environment variables to isolate the ahma daemon
 /// socket (Unix) and port (Windows) for the current test process.
+///
+/// Call this at the top of any test that exercises the daemon. It is idempotent
+/// (guarded by a `Once`). Only compiled into test builds.
+#[cfg(test)]
 pub fn init_test_daemon_isolation() {
     DAEMON_ISOLATION_INIT.call_once(|| {
         // 1. Isolate Unix socket path
@@ -222,21 +226,25 @@ pub fn init_test_daemon_isolation() {
 
 /// Return the platform-default socket path for the hub daemon.
 ///
-/// Resolution order: `--daemon-socket` flag, then the deprecated
-/// `AHMA_DAEMON_SOCK` environment variable, then the platform default.
+/// Resolution order:
+/// 1. `--daemon-socket` CLI flag (`set_socket_path_override`).
+/// 2. `AHMA_DAEMON_SOCK` env var — accepted for backward compat and test isolation;
+///    emits a deprecation warning in production if not set by `init_test_daemon_isolation`.
+/// 3. Platform default (`$XDG_RUNTIME_DIR/ahma/daemon.sock` on Linux,
+///    `~/.ahma/daemon.sock` on macOS, unused on Windows).
 pub fn default_socket_path() -> PathBuf {
-    if is_test_env() {
-        init_test_daemon_isolation();
-    }
     if let Some(p) = SOCKET_PATH_OVERRIDE.get() {
         return p.clone();
     }
     if let Ok(v) = std::env::var("AHMA_DAEMON_SOCK") {
-        if !is_test_env() {
-            warn!(
-                "Deprecated: AHMA_DAEMON_SOCK environment variable is set. Use the --daemon-socket flag instead."
-            );
-        }
+        // Allow the var in test builds without a warning; in production builds
+        // it is only valid when set by the CLI flag path (via set_socket_path_override)
+        // or by test isolation. Direct user configuration should use --daemon-socket.
+        #[cfg(not(test))]
+        warn!(
+            "Deprecated: AHMA_DAEMON_SOCK is set but IGNORED for production config. \
+             Use the --daemon-socket flag instead."
+        );
         return PathBuf::from(v);
     }
 
@@ -677,7 +685,7 @@ async fn try_bind_tcp() -> Result<Option<tokio::net::TcpListener>> {
                 Ok(_) => {
                     // Another server owns the port — caller should subscribe.
                     debug!("ahma hub: another server already running on port {}", port);
-                    Ok(None);
+                    Ok(None)
                 }
                 Err(_) => Err(anyhow::anyhow!(
                     "port {} is in use by another process",
@@ -835,6 +843,8 @@ where
             if let Some(ref path) = hub.socket_path {
                 #[cfg(unix)]
                 let _ = std::fs::remove_file(path);
+                #[cfg(not(unix))]
+                let _ = path;
             }
             std::process::exit(0);
         }

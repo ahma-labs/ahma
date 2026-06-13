@@ -216,7 +216,7 @@ cancel(operation_id="op_abc123")
 
 **Force synchronous** for state-modifying commands (e.g., `cargo add`):
 - Set `"synchronous": true` in the tool's MTDF JSON, or
-- Start server with `--sync` flag, or set `AHMA_SYNC=1`
+- Start server with `--sync` flag
 
 ---
 
@@ -227,18 +227,18 @@ Ahma enforces **kernel-level** filesystem boundaries set once at startup.
 ### Scope Rules
 - **STDIO mode**: Scope = `cwd` from mcp.json (usually `${workspaceFolder}`)
 - **HTTP mode**: Scope = workspace roots from MCP `roots/list` response
-- **Override**: `AHMA_SANDBOX_SCOPE=/path/a:/path/b` (colon-separated on Unix)
+- **Override**: `--sandbox-scope /path/a` CLI flag (repeat for multiple paths)
 
 ### Temp Directory
 ```json
-"args": ["serve", "stdio", "--tmp"]   # or AHMA_TMP_ACCESS=1
+"args": ["serve", "stdio", "--tmp"]
 ```
 Adds `/tmp` (or `%TEMP%` on Windows) to the scope. Required for compilers, build tools.
 
 ### Nested Sandbox Detection
 If running inside Cursor, VS Code, or Docker, Ahma auto-disables its internal sandbox
-(outer sandbox already provides protection). Override: `AHMA_DISABLE_SANDBOX=1` to
-suppress the warning message.
+(outer sandbox already provides protection). Use `--no-sandbox` flag to suppress
+the warning message.
 
 ### Platform Enforcement
 - **Linux**: Landlock LSM (requires kernel 5.13+)
@@ -349,7 +349,7 @@ Built-in examples (activate with `--tools`): `android-logcat`.
 ## Custom Tools — `.ahma/` Directory
 
 Place `*.json` files in `.ahma/` at the project root to define project-local tools.
-Ahma auto-detects and loads them at startup. Override path: `AHMA_TOOLS_DIR=/path/to/dir`.
+Ahma auto-detects and loads them at startup. Override path via `--tools-dir /path/to/dir`.
 
 ### Minimal MTDF tool definition
 
@@ -406,28 +406,31 @@ Ahma auto-detects and loads them at startup. Override path: `AHMA_TOOLS_DIR=/pat
 
 Validate tool configs: `ahma tool validate .ahma/`
 
-Hot-reload while authoring (dev only): `AHMA_HOT_RELOAD=1 ahma serve stdio`
+Hot-reload while authoring (dev only): `ahma serve stdio --hot-reload`
 
 ---
 
-## Key Environment Variables
+## Key CLI Flags and Settings
 
-| Variable | Default | Purpose |
+> [!IMPORTANT]
+> All `AHMA_*` environment variables are **retired** (R-CFG1.2) and ignored.
+> Use CLI flags (in `mcp.json` `args`) or `~/.ahma/settings.toml` instead.
+
+| CLI flag / Settings key | Default | Purpose |
 |----------|---------|---------|
-| `AHMA_TOOLS_DIR` | `.ahma/` | Custom tools directory path |
-| `AHMA_TIMEOUT` | `360` | Default tool timeout (seconds) |
-| `AHMA_SYNC` | off | Force all tools synchronous |
-| `AHMA_HOT_RELOAD` | off | Reload tool JSON on file change (dev only) |
-| `AHMA_DISABLE_SANDBOX` | off | Disable kernel sandbox (UNSAFE) |
-| `AHMA_SANDBOX_SCOPE` | cwd | Colon-separated scope paths |
-| `AHMA_TMP_ACCESS` | off | Add temp dir to sandbox scope |
-| `AHMA_DISABLE_TEMP` | off | Block all temp dir access |
-| `AHMA_NO_PACKAGE_CACHE_WRITE` | off | Disable cargo cache writes (strictest isolation) |
-| `AHMA_LOG_TARGET` | file | Set `stderr` to log to stderr |
-| `AHMA_LOG_MONITOR` | off | Enable live log monitoring |
-| `AHMA_MONITOR_RATE_LIMIT` | `60` | Min seconds between log alerts |
-| `AHMA_PROGRESSIVE_DISCLOSURE` | off | Enable progressive disclosure (DEPRECATED) |
-| `RUST_LOG` | `info` | Log verbosity (e.g., `ahma_mcp=debug`) |
+| `--tools-dir` / `tools.tools_dir` | `.ahma/` | Custom tools directory path |
+| `--timeout` / `tools.timeout_secs` | `360` | Default tool timeout (seconds) |
+| `--sync` / `tools.force_sync` | off | Force all tools synchronous |
+| `--hot-reload` / `tools.hot_reload` | off | Reload tool JSON on file change (dev only) |
+| `--no-sandbox` / `sandbox.disable` | off | Disable kernel sandbox (UNSAFE) |
+| `--sandbox-scope` / `sandbox.scopes` | cwd | Sandbox scope paths |
+| `--tmp` / `sandbox.tmp_access` | off | Add temp dir to sandbox scope |
+| `--disable-temp-files` / `sandbox.disable_temp` | off | Block all temp dir access |
+| `--no-package-cache-write` | off | Disable cargo cache writes (strictest isolation) |
+| `--log-to-stderr` / `logging.target` | file | Log to stderr |
+| `--log-monitor` / `logging.log_monitor` | off | Enable live log monitoring |
+| `--monitor-rate-limit` / `logging.monitor_rate_limit_secs` | `60` | Min seconds between log alerts |
+| `RUST_LOG` (env, PLATFORM) | `info` | Log verbosity (e.g., `ahma_mcp=debug`) |
 
 Full reference: [environment-variables.md](https://github.com/paulirotta/ahma/blob/main/docs/environment-variables.md)
 
@@ -494,19 +497,19 @@ android_logcat(...)   # if defined in .ahma/android-logcat.json
 
 **Tool not found**: Make sure the bundle is specified in the `--tools` parameter at startup (e.g., `--tools git,fileutils`).
 
-**Timeout**: Set `AHMA_TIMEOUT=600` in mcp.json env, or pass `timeout_seconds` per tool call.
+**Timeout**: Increase via `--timeout 600` in mcp.json args, or set `tools.timeout_secs = 600` in `~/.ahma/settings.toml`.
 
 **Permission denied / sandbox error**: The file is outside the sandbox scope.
-Check `AHMA_SANDBOX_SCOPE` or add `--tmp` if needed for temp files.
+Check `--sandbox-scope` CLI flag or add `--tmp` if needed for temp files.
 
 > **Cargo dependency errors**: If `cargo add` or `cargo update` fail with permission errors, do **not** add `--sandbox-scope ~/.cargo` to your `mcp.json` — that grants write to the entire cargo home including binaries and credentials.  Instead, the built-in `package_cache_write` feature (on by default) handles this correctly, granting write only to `registry/`, `git/`, and the cargo lock files.  If you previously had `--sandbox-scope ~/.cargo` in your config, remove it — it is no longer needed.
 
 **Nested sandbox warning**: Ahma detected an outer sandbox (Cursor, VS Code, Docker).
-Internal sandbox auto-disabled. Set `AHMA_DISABLE_SANDBOX=1` to suppress the warning.
+Internal sandbox auto-disabled. Use `--no-sandbox` flag to suppress the warning.
 
 **Tool still running**: Use `status(operation_id)` to check, or `cancel(operation_id)`.
 
-**Linux old kernel**: Landlock requires kernel 5.13+. Set `AHMA_DISABLE_SANDBOX=1` on
+**Linux old kernel**: Landlock requires kernel 5.13+. Use `--no-sandbox` on
 older systems (Raspberry Pi OS bullseye, etc.).
 
 ---

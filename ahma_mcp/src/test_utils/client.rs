@@ -273,7 +273,11 @@ impl ClientBuilder {
                 cmd.env(k, v);
             }
 
-            cmd.env("NEXTEST", "1");
+            // Signal to the spawned subprocess that it is running as a server-child
+            // (started by a test parent process) so it skips the background bridge spawn.
+            // AHMA_SERVER_CHILD is the canonical INTERNAL var for this purpose (R-CFG1.3).
+            // Do NOT use NEXTEST here — that env var is retired from production detection.
+            cmd.env("AHMA_SERVER_CHILD", "1");
 
             configure_tools_dir_args(cmd, tools_dir, working_dir);
 

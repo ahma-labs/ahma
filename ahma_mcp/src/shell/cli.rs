@@ -37,58 +37,29 @@ use std::{
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Deprecation warning macro
+// Retirement warning macros (R-CFG1.2 / R-CFG2.3)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Emit a deprecation warning when an `AHMA_*` environment variable is set
-/// and used as a fallback.  This guides users toward `~/.ahma/settings.toml`.
-macro_rules! deprecated_env {
-    ($name:expr) => {
-        tracing::warn!(concat!(
-            "Deprecated: the ",
-            $name,
-            " environment variable is set. ",
-            "Move this setting to ~/.ahma/settings.toml and run `ahma settings init` ",
-            "to create the file with all options documented."
-        ))
-    };
-}
-
-/// Emit a RETIRED warning for a security-tier env var that is now ignored.
-/// The value is NOT read or honored.
-macro_rules! warn_retired_security_env {
+/// Emit a startup `WARN` when any `AHMA_*` env var is set.
+/// The value is **NOT** read or honored — all `AHMA_*` vars are retired.
+/// Users should migrate to CLI flags or `~/.ahma/settings.toml`.
+macro_rules! warn_retired_env {
     ($name:expr) => {
         if std::env::var_os($name).is_some() {
             tracing::warn!(concat!(
-                "Security env var ",
+                "AHMA env var ",
                 $name,
-                " is set but IGNORED (retired per R-CFG2.3). ",
-                "Use the equivalent CLI flag or ~/.ahma/settings.toml instead. ",
-                "Setting security parameters via environment variables is a tamper risk."
+                " is set but IGNORED (retired per R-CFG1.2). ",
+                "Use the equivalent CLI flag or ~/.ahma/settings.toml instead."
             ));
         }
     };
 }
 
-macro_rules! check_env_flag_with_deprecation {
+// Alias kept for call sites that previously used the security-specific name.
+macro_rules! warn_retired_security_env {
     ($name:expr) => {
-        if std::env::var_os($name).is_some() {
-            deprecated_env!($name);
-            AppConfig::env_flag($name)
-        } else {
-            false
-        }
-    };
-}
-
-macro_rules! get_env_var_with_deprecation {
-    ($name:expr) => {
-        if std::env::var_os($name).is_some() {
-            deprecated_env!($name);
-            std::env::var($name).ok()
-        } else {
-            None
-        }
+        warn_retired_env!($name);
     };
 }
 
@@ -2082,14 +2053,10 @@ pub struct ClusterRemoveArgs {
 
 #[cfg(unix)]
 fn unix_socket_path_from_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> String {
-    if std::env::var_os("AHMA_UNIX_SOCKET").is_some() {
-        deprecated_env!("AHMA_UNIX_SOCKET");
-    }
+    // R-CFG1.2: AHMA_UNIX_SOCKET is RETIRED — warn and ignore.
+    warn_retired_env!("AHMA_UNIX_SOCKET");
     if let Some(path) = &cli.unix_socket_path {
         return path.clone();
-    }
-    if let Ok(path) = std::env::var("AHMA_UNIX_SOCKET") {
-        return path;
     }
     match &cli.command {
         Subcommands::Serve(serve_args) => match &serve_args.transport {
@@ -2123,19 +2090,16 @@ struct ServeFields {
 }
 
 fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
-    let env_port = std::env::var("AHMA_HTTP_PORT")
-        .ok()
-        .and_then(|val| val.parse::<u16>().ok());
+    // R-CFG1.2: AHMA_HTTP_PORT is RETIRED — warn and ignore.
+    warn_retired_env!("AHMA_HTTP_PORT");
 
     if let Subcommands::Serve(s) = cmd {
         let (host, port) = match &s.transport {
-            Some(ServeTransport::Http(h)) => (h.host.clone(), env_port.unwrap_or(h.port)),
-            Some(ServeTransport::Stdio(_)) => {
-                ("127.0.0.1".to_string(), env_port.unwrap_or(3000u16))
-            }
+            Some(ServeTransport::Http(h)) => (h.host.clone(), h.port),
+            Some(ServeTransport::Stdio(_)) => ("127.0.0.1".to_string(), 3000u16),
             #[cfg(unix)]
-            Some(ServeTransport::Unix(_)) => ("127.0.0.1".to_string(), env_port.unwrap_or(3000u16)),
-            None => ("127.0.0.1".to_string(), env_port.unwrap_or(3000u16)),
+            Some(ServeTransport::Unix(_)) => ("127.0.0.1".to_string(), 3000u16),
+            None => ("127.0.0.1".to_string(), 3000u16),
         };
         ServeFields {
             http_host: host,
@@ -2144,7 +2108,7 @@ fn extract_serve_fields(cmd: &Subcommands) -> ServeFields {
     } else {
         ServeFields {
             http_host: "127.0.0.1".to_string(),
-            http_port: env_port.unwrap_or(3000u16),
+            http_port: 3000u16,
         }
     }
 }
@@ -2239,32 +2203,17 @@ fn parse_execution_settings(
     cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
 ) -> (u64, bool, bool, bool) {
-    // Preference-tier: CLI > settings > env (lowest precedence during migration).
-    let timeout_secs = if let Some(t) = cli.timeout {
-        t
-    } else {
-        if let Some(val) =
-            get_env_var_with_deprecation!("AHMA_TIMEOUT").and_then(|v| v.trim().parse::<u64>().ok())
-        {
-            if s.tools.timeout_secs != ahma_common::config::ToolSettings::default().timeout_secs {
-                s.tools.timeout_secs
-            } else {
-                val
-            }
-        } else {
-            s.tools.timeout_secs
-        }
-    };
+    // R-CFG1.2: preference-tier env vars are RETIRED — warn and ignore.
+    warn_retired_env!("AHMA_TIMEOUT");
+    warn_retired_env!("AHMA_SYNC");
+    warn_retired_env!("AHMA_HOT_RELOAD");
+    warn_retired_env!("AHMA_SKIP_PROBES");
 
-    let force_sync =
-        cli.sync || s.tools.force_sync || check_env_flag_with_deprecation!("AHMA_SYNC");
-
-    let hot_reload_tools =
-        cli.hot_reload || s.tools.hot_reload || check_env_flag_with_deprecation!("AHMA_HOT_RELOAD");
-
-    let skip_availability_probes = cli.skip_probes
-        || s.tools.skip_probes
-        || check_env_flag_with_deprecation!("AHMA_SKIP_PROBES");
+    // CLI > settings > compiled-in default.
+    let timeout_secs = cli.timeout.unwrap_or(s.tools.timeout_secs);
+    let force_sync = cli.sync || s.tools.force_sync;
+    let hot_reload_tools = cli.hot_reload || s.tools.hot_reload;
+    let skip_availability_probes = cli.skip_probes || s.tools.skip_probes;
 
     (
         timeout_secs,
@@ -2294,28 +2243,13 @@ fn parse_sandbox_settings(
     warn_retired_security_env!("AHMA_DISABLE_TEMP");
     let no_temp_files = cli.no_temp_files || s.sandbox.disable_temp;
 
-    let log_monitor = cli.log_monitor
-        || s.logging.log_monitor
-        || check_env_flag_with_deprecation!("AHMA_LOG_MONITOR");
-
-    let monitor_rate_limit_secs = if let Some(r) = cli.monitor_rate_limit {
-        r
-    } else {
-        // Preference-tier env var checked AFTER settings (lowest precedence).
-        if let Some(val) = get_env_var_with_deprecation!("AHMA_MONITOR_RATE_LIMIT")
-            .and_then(|v| v.trim().parse::<u64>().ok())
-        {
-            if s.logging.monitor_rate_limit_secs
-                != ahma_common::config::LoggingSettings::default().monitor_rate_limit_secs
-            {
-                s.logging.monitor_rate_limit_secs
-            } else {
-                val
-            }
-        } else {
-            s.logging.monitor_rate_limit_secs
-        }
-    };
+    // R-CFG1.2: preference-tier env vars are RETIRED — warn and ignore.
+    warn_retired_env!("AHMA_LOG_MONITOR");
+    warn_retired_env!("AHMA_MONITOR_RATE_LIMIT");
+    let log_monitor = cli.log_monitor || s.logging.log_monitor;
+    let monitor_rate_limit_secs = cli
+        .monitor_rate_limit
+        .unwrap_or(s.logging.monitor_rate_limit_secs);
 
     // Security-tier: AHMA_NO_PACKAGE_CACHE_WRITE retired — warn and ignore.
     warn_retired_security_env!("AHMA_NO_PACKAGE_CACHE_WRITE");
@@ -2333,31 +2267,16 @@ fn parse_sandbox_settings(
 }
 
 fn parse_http_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> (bool, bool, u64) {
-    let no_quic = cli.disable_quic
-        || s.http.disable_quic
-        || check_env_flag_with_deprecation!("AHMA_DISABLE_QUIC");
+    // R-CFG1.2: preference-tier env vars are RETIRED — warn and ignore.
+    warn_retired_env!("AHMA_DISABLE_QUIC");
+    warn_retired_env!("AHMA_DISABLE_HTTP1_1");
+    warn_retired_env!("AHMA_HANDSHAKE_TIMEOUT");
 
-    let disable_http1_1 = cli.disable_http1_1
-        || s.http.disable_http1_1
-        || check_env_flag_with_deprecation!("AHMA_DISABLE_HTTP1_1");
-
-    let handshake_timeout_secs = if let Some(t) = cli.handshake_timeout {
-        t
-    } else {
-        if let Some(val) = get_env_var_with_deprecation!("AHMA_HANDSHAKE_TIMEOUT")
-            .and_then(|v| v.trim().parse::<u64>().ok())
-        {
-            if s.http.handshake_timeout_secs
-                != ahma_common::config::HttpSettings::default().handshake_timeout_secs
-            {
-                s.http.handshake_timeout_secs
-            } else {
-                val
-            }
-        } else {
-            s.http.handshake_timeout_secs
-        }
-    };
+    let no_quic = cli.disable_quic || s.http.disable_quic;
+    let disable_http1_1 = cli.disable_http1_1 || s.http.disable_http1_1;
+    let handshake_timeout_secs = cli
+        .handshake_timeout
+        .unwrap_or(s.http.handshake_timeout_secs);
 
     (no_quic, disable_http1_1, handshake_timeout_secs)
 }
@@ -2390,14 +2309,12 @@ fn parse_auth_settings(
     warn_retired_security_env!("AHMA_RATE_LIMIT_BURST");
     let rate_limit_burst = cli.rate_limit_burst.unwrap_or(s.auth.rate_limit_burst);
 
-    // Preference-tier: CLI > settings > env (lowest precedence during migration).
+    // R-CFG1.2: AHMA_INSTANCE_LABEL is RETIRED — warn and ignore.
+    warn_retired_env!("AHMA_INSTANCE_LABEL");
     let instance_label = cli
         .instance_label
         .clone()
         .unwrap_or_else(|| s.instance.label.clone());
-    if std::env::var_os("AHMA_INSTANCE_LABEL").is_some() && cli.instance_label.is_none() {
-        get_env_var_with_deprecation!("AHMA_INSTANCE_LABEL");
-    }
 
     (
         require_token,
@@ -2478,14 +2395,11 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     let s = load_settings(cli);
 
     // ── Tool loading ────────────────────────────────────────────────────────
-    let explicit_tools_dir =
-        cli.tools_dir.is_some() || std::env::var_os("AHMA_TOOLS_DIR").is_some();
-    // Preference-tier: CLI > settings > env (lowest precedence).
-    let raw_tools_dir = cli
-        .tools_dir
-        .clone()
-        .or_else(|| s.tools.tools_dir.clone())
-        .or_else(|| get_env_var_with_deprecation!("AHMA_TOOLS_DIR").map(PathBuf::from));
+    // R-CFG1.2: AHMA_TOOLS_DIR is RETIRED — warn and ignore.
+    warn_retired_env!("AHMA_TOOLS_DIR");
+    let explicit_tools_dir = cli.tools_dir.is_some();
+    // CLI > settings > compiled-in default.
+    let raw_tools_dir = cli.tools_dir.clone().or_else(|| s.tools.tools_dir.clone());
     let tools_dir = resolution::normalize_tools_dir(raw_tools_dir);
 
     // Flatten and deduplicate tool bundles
@@ -2517,13 +2431,11 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     let (require_token, require_token_path, rate_limit_rps, rate_limit_burst, instance_label) =
         parse_auth_settings(cli, &s);
 
-    let minimize_tokens = cli.minimize_tokens
-        || check_env_flag_with_deprecation!("AHMA_MINIMIZE_TOKENS")
-        || s.tools.minimize_tokens;
-
-    let small_model_harness = cli.small_model_harness
-        || check_env_flag_with_deprecation!("AHMA_SMALL_MODEL_HARNESS")
-        || s.tools.small_model_harness;
+    // R-CFG1.2: AHMA_MINIMIZE_TOKENS / AHMA_SMALL_MODEL_HARNESS are RETIRED — warn and ignore.
+    warn_retired_env!("AHMA_MINIMIZE_TOKENS");
+    warn_retired_env!("AHMA_SMALL_MODEL_HARNESS");
+    let minimize_tokens = cli.minimize_tokens || s.tools.minimize_tokens;
+    let small_model_harness = cli.small_model_harness || s.tools.small_model_harness;
 
     AppConfig {
         tools_dir,
@@ -2589,19 +2501,15 @@ pub async fn run() -> Result<()> {
     // a deprecation-friendly approach: settings file wins, env var is a fallback.
     let cli = Cli::parse();
 
-    // Settings-first log target: settings.toml > AHMA_LOG_TARGET (deprecated) > "file"
+    // R-CFG1.2: AHMA_LOG_TARGET is RETIRED — warn and ignore.
+    if std::env::var_os("AHMA_LOG_TARGET").is_some() {
+        tracing::warn!(
+            "AHMA env var AHMA_LOG_TARGET is set but IGNORED (retired per R-CFG1.2). \
+             Use `logging.target = \"stderr\"` in ~/.ahma/settings.toml instead."
+        );
+    }
     let settings_for_log = load_settings(&cli);
-    let log_to_stderr = if settings_for_log.log_to_stderr() {
-        true
-    } else if std::env::var("AHMA_LOG_TARGET")
-        .map(|v| v.trim().eq_ignore_ascii_case("stderr"))
-        .unwrap_or(false)
-    {
-        // AHMA_LOG_TARGET is still accepted but should be migrated to settings.toml
-        true
-    } else {
-        false
-    };
+    let log_to_stderr = settings_for_log.log_to_stderr() || cli.log_to_stderr;
 
     set_log_role(detect_log_role_from_startup());
 
@@ -2648,10 +2556,9 @@ fn run_validation_mode(target: &str) -> Result<()> {
 async fn run_tool_info_mode(args: InfoArgs) -> Result<()> {
     use crate::config;
 
-    // Build a minimal AppConfig with the requested bundles + tools_dir
-    let env_tools_dir = std::env::var("AHMA_TOOLS_DIR").ok().map(PathBuf::from);
-    let raw_tools_dir = args.tools_dir.or(env_tools_dir);
-    let tools_dir = resolution::normalize_tools_dir(raw_tools_dir);
+    // Build a minimal AppConfig with the requested bundles + tools_dir.
+    // AHMA_TOOLS_DIR is retired (R-CFG1.2); only use the CLI arg.
+    let tools_dir = resolution::normalize_tools_dir(args.tools_dir);
 
     let mini_cfg = AppConfig {
         tool_bundles: args.tool_bundles,
@@ -3053,15 +2960,14 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_sandbox_policy_ahma_tmp_access_env() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+    fn test_resolve_sandbox_policy_tmp_access_flag() {
+        // AHMA_TMP_ACCESS is retired; tmp_access is set via CLI flag or settings.toml.
+        // Verify that AppConfig.tmp_access = true is honored by resolve_sandbox_policy.
         init_test();
-        unsafe { std::env::set_var("AHMA_TMP_ACCESS", "1") };
         let cfg = AppConfig {
-            tmp_access: AppConfig::env_flag("AHMA_TMP_ACCESS"),
+            tmp_access: true,
             ..make_cfg()
         };
-        unsafe { std::env::remove_var("AHMA_TMP_ACCESS") };
         let policy = resolve_sandbox_policy(&cfg);
         assert!(policy.tmp_access);
     }
