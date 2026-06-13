@@ -1,6 +1,6 @@
 # TUI Control Plane
 
-> **Experimental** — introduced in v0.7. The full ratatui rendering layer is planned; the current release ships a text-mode fallback.
+> **Experimental** — introduced in v0.7. The full `ratatui`-based rendering layer is implemented as the default user interface, with a text-mode fallback available if the library features are omitted at compile-time.
 
 `ahma tui` opens a terminal dashboard for monitoring and controlling active tasks. It works over SSH, requires no graphical runtime, and is the primary interface for reviewing approval gates raised by the [renewal contract](renewal-contract.md).
 
@@ -14,9 +14,9 @@ ahma tui
 ahma tui --connect http://localhost:8080
 ```
 
-The TUI polls the server every two seconds and prints a live status table until you press Ctrl-C.
+The TUI polls the server every two seconds and renders the live dashboard interface until you press Ctrl-C.
 
-## Panels (planned full TUI)
+## Panels
 
 ```
 ┌──────────────────────────────────────────────────────┐

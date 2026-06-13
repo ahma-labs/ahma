@@ -26,19 +26,19 @@ You need `ahma` on PATH before `ahma update` works.
 **Latest (build from GitHub main via Cargo — requires [Rust](https://rustup.rs/)):**
 
 ```bash
-cargo install --git https://github.com/paulirotta/ahma ahma_mcp --bin ahma --root ~/.local --locked --force
+cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked --force
 ```
 
 **Specific branch:**
 
 ```bash
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root ~/.local --locked --force
+cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_bin --bin ahma --root ~/.local --locked --force
 ```
 
 **Unpushed local checkout:**
 
 ```bash
-cargo install --path ahma_mcp --bin ahma --root ~/.local --locked --force
+cargo install --path ahma_bin --bin ahma --root ~/.local --locked --force
 ```
 
 Ensure `~/.local/bin` is on your PATH:
@@ -65,7 +65,7 @@ irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 |
 Or invoke Cargo directly:
 
 ```powershell
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_mcp --bin ahma --root $HOME\.local --locked --force
+cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_bin --bin ahma --root $HOME\.local --locked --force
 ```
 
 Ensure `$HOME\.local\bin` is on your PATH.
@@ -77,7 +77,7 @@ Ensure `$HOME\.local\bin` is on your PATH.
 ```bash
 git clone https://github.com/paulirotta/ahma.git
 cd ahma
-cargo build --release -p ahma_mcp
+cargo build --release -p ahma_bin
 mv target/release/ahma ~/.local/bin/
 ```
 
@@ -86,7 +86,7 @@ mv target/release/ahma ~/.local/bin/
 ```powershell
 git clone https://github.com/paulirotta/ahma.git
 cd ahma
-cargo build --release -p ahma_mcp
+cargo build --release -p ahma_bin
 Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 ```
 
@@ -130,16 +130,8 @@ gh attestation verify ahma-release-linux-x86_64.tar.gz --repo paulirotta/ahma
 
 See [docs/release-signing.md](release-signing.md) for the full trust model.
 
-### Release signing and key rotation
-
-Release binaries are signed with an RSA-2048 key held exclusively inside GitHub Actions
-secrets — it never exists on any developer machine. All key generation and rotation
-happens via a `workflow_dispatch` action in the CI pipeline.
-
 See **[docs/release-signing.md](release-signing.md)** for:
 
-- Full signing architecture and AGPL supply chain defence rationale
-- How to verify a release signature manually
-- Key rotation procedure (triggered from the GitHub Actions UI — no local machine required)
-- Emergency rotation SOP for suspected compromises
-- Key rotation log
+- Keyless Sigstore trust model architecture and AGPL supply chain defense rationale
+- Step-by-step instructions for out-of-band manual verification of release signatures
+- Details on Sigstore OIDC issuing identities and transparency logging properties

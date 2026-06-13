@@ -1,6 +1,6 @@
 # Local Cluster Scheduler
 
-> **Experimental** — introduced in v0.7. mDNS peer discovery is a stub; static peer configuration is functional.
+> **Experimental** — introduced in v0.7. mDNS peer discovery and static peer configuration are both functional.
 
 The cluster scheduler routes decompose sub-tasks to `ahma worker` peers on your local network or Tailscale mesh. Each peer runs its own local LLM (e.g. Ollama with `gemma4`) and its own kernel sandbox. The coordinator picks the least-loaded peer that has the requested model available.
 

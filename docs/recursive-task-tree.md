@@ -292,14 +292,14 @@ The architecture is designed for incremental delivery. Each phase is independent
 **Why this first**: It exercises the core orchestration loop (plan → execute → observe → next step) without the complexity of recursion or parallelism. It immediately provides value over the existing `decompose` (which cannot call tools) and `sequence` (which cannot reason).
 
 **Deliverables**:
-- [ ] `ahma_task_tree` crate with `TaskTreeOrchestrator`
-- [ ] `TaskNode` enum: `ShellCommand | LlmCall | Planning`
-- [ ] Single-level planning prompt and response parser
-- [ ] Output summarisation for tool results exceeding threshold
-- [ ] Integration with `OperationMonitor` for async result delivery
-- [ ] MCP tool registration (`task_tree` tool type in MTDF)
-- [ ] Unit tests with mock LLM and mock shell
-- [ ] Integration test with real Ollama (gated on `AHMA_TEST_LLM=1`)
+- [x] `ahma_task_tree` crate with `TaskTreeOrchestrator`
+- [x] `TaskNode` enum: `ShellCommand | LlmCall | Planning`
+- [x] Single-level planning prompt and response parser
+- [x] Output summarisation for tool results exceeding threshold
+- [x] Integration with `OperationMonitor` for async result delivery
+- [x] MCP tool registration (`task_tree` tool type in MTDF)
+- [x] Unit tests with mock LLM and mock shell
+- [x] Integration test with real Ollama (gated on `AHMA_TEST_LLM=1`)
 
 ### Phase 2: Recursive Decomposition
 
@@ -313,11 +313,11 @@ The architecture is designed for incremental delivery. Each phase is independent
 - Add the "is this atomic?" LLM prompt that decides whether to decompose further.
 
 **Deliverables**:
-- [ ] Recursive `execute_node` implementation
-- [ ] Branch context builder (root goal + ancestor summaries + sibling results)
-- [ ] `max_depth` enforcement
-- [ ] Atomicity check prompt and parsing
-- [ ] Tests for 3-level decomposition with mock LLM
+- [x] Recursive `execute_node` implementation
+- [x] Branch context builder (root goal + ancestor summaries + sibling results)
+- [x] `max_depth` enforcement
+- [x] Atomicity check prompt and parsing
+- [x] Tests for 3-level decomposition with mock LLM
 
 ### Phase 3: Backtracking and Recovery
 
@@ -330,11 +330,11 @@ The architecture is designed for incremental delivery. Each phase is independent
 - Persist failed attempts in audit log for debugging.
 
 **Deliverables**:
-- [ ] Failure handler in `execute_node`
-- [ ] Recovery decision prompt and parser
-- [ ] Re-plan support (discard remaining children, generate new plan)
-- [ ] Escalation propagation up the tree
-- [ ] Tests for failure-and-recovery scenarios
+- [x] Failure handler in `execute_node`
+- [x] Recovery decision prompt and parser
+- [x] Re-plan support (discard remaining children, generate new plan)
+- [x] Escalation propagation up the tree
+- [x] Tests for failure-and-recovery scenarios
 
 ### Phase 4: Controlled Parallelism
 
@@ -347,10 +347,10 @@ The architecture is designed for incremental delivery. Each phase is independent
 - Results from parallel groups are collected before proceeding to the next group.
 
 **Deliverables**:
-- [ ] Parallel group parsing from planner output
-- [ ] Concurrent execution with bounded parallelism
-- [ ] Result aggregation for parallel groups
-- [ ] Tests verifying independence (parallel tasks do not interfere)
+- [x] Parallel group parsing from planner output
+- [x] Concurrent execution with bounded parallelism
+- [x] Result aggregation for parallel groups
+- [x] Tests verifying independence (parallel tasks do not interfere)
 
 ### Phase 5: TUI Visualisation
 
@@ -362,9 +362,9 @@ The architecture is designed for incremental delivery. Each phase is independent
 - User can expand/collapse branches, inspect node details, cancel subtrees.
 
 **Deliverables**:
-- [ ] Tree widget in `ahma_tui`
-- [ ] Real-time node state updates
-- [ ] Interactive controls (cancel, inspect, retry)
+- [x] Tree widget in `ahma_tui`
+- [x] Real-time node state updates
+- [x] Interactive controls (cancel, inspect, retry)
 
 ### Phase 6: Cluster Distribution (Future)
 

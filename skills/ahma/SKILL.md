@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.12.1
+version: 0.12.2
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -18,7 +18,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.12.1 | author: Paul Houghton -->
+<!-- version: 0.12.2 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -564,8 +564,9 @@ Also mention the key flags for configure, e.g., `--tools`, `--tmp`, `--log-monit
 When the user runs `/ahma tool list` or `/ahma tools`, the agent lists all configured tools (both built-in bundles and local `.ahma/` configurations).
 
 To list them, the agent:
-1. Loads the tool configurations using `ahma tool info`.
+1. Loads the tool configurations using `ahma tool info`. (Note: Do NOT run `ahma tool list` directly on the CLI as it expects a connection to a running server and will fail. Always use `ahma tool info` to list local configurations).
 2. Presents them in a clean markdown table, showing the tool name, description, and available subcommands.
+
 
 ---
 
@@ -778,6 +779,7 @@ The output contains:
 Parse the ranked file list to determine how many issues exist. Set `N` to
 `min(requested_count, total_issues)` — default `requested_count` is 10.
 
+
 Tell the user: "Analyzing codebase... Found N complexity issues. Spawning N
 concurrent subagents to fix them."
 
@@ -797,7 +799,11 @@ and edits a different file, so there are no file conflicts.
 > [!IMPORTANT]
 > **Antigravity Environment**: In Antigravity, there is no general-purpose code subagent spawning tool (the only subagent tool is `browser_subagent` which is for browser tasks only).
 > Therefore, you **MUST** run the N issues **sequentially, one at a time** yourself.
-> When running sequentially, do **not** stop after Phase 1 to ask the user for permission or confirmation. Proceed immediately to edit the first target file, run verification (`ahma simplify --verify <file>`), and then move on to the next worst file, until you have refactored all requested files. Only output the final results table once all sequential edits and verifications are complete.
+> 
+> To ensure reliability and prevent token exhaustion:
+> 1. **Default to N = 1** (the single worst file). Only proceed to N > 1 if the user explicitly requested it (e.g., `/ahma simplify top 3`).
+> 2. **Implement one file at a time**. Edit the target file, verify the improvement using `ahma simplify <project-root> --verify <file>`, and check/test compilation.
+> 3. **Obtain user approval before proceeding to the next file**. Do NOT attempt to refactor multiple files in a single turn without stopping. Always pause, report progress, run tests, and ask the user before editing subsequent files.
 
 **Each subagent receives this prompt** (fill in the template for each issue number):
 
