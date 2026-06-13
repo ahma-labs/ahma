@@ -81,10 +81,10 @@ async fn test_client_start_process_with_tools_dir() -> Result<()> {
 async fn test_client_start_process_with_sync_flag() -> Result<()> {
     init_test_logging();
 
-    // Enable synchronous tool execution via env var (--sync flag removed in new CLI)
+    // Enable synchronous tool execution via --sync flag
     let client = ClientBuilder::new()
         .tools_dir(".ahma")
-        .env("AHMA_SYNC", "1")
+        .arg("--sync")
         .build()
         .await?;
 

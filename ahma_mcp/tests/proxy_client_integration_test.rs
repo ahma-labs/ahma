@@ -21,22 +21,11 @@ async fn test_proxy_client_autostart_and_shutdown() {
     // Clean up if a stale file exists
     let _ = std::fs::remove_file(&socket_path);
 
-    // Find a free TCP port to avoid conflicts.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind free port")
-        .local_addr()
-        .expect("local_addr")
-        .port();
-
     // 1. Spawning the server using `serve stdio` command.
     // Since it's the first instance, it should start the background bridge Unix socket at socket_str.
     let mut child = tokio::process::Command::new(&binary)
         .current_dir(&workspace)
         .env("RUST_LOG", "debug")
-        .env("AHMA_HTTP_PORT", port.to_string())
-        .env("AHMA_UNIX_SOCKET", &socket_str)
-        .env_remove("NEXTEST")
-        .env_remove("CARGO_MANIFEST_DIR")
         .args([
             "--no-sandbox",
             "--unix-socket-path",
@@ -116,10 +105,6 @@ async fn test_proxy_client_autostart_and_shutdown() {
     // Since the Unix socket is already running, it should run as a proxy client.
     let mut child_proxy = tokio::process::Command::new(&binary)
         .current_dir(&workspace)
-        .env("AHMA_HTTP_PORT", port.to_string())
-        .env("AHMA_UNIX_SOCKET", &socket_str)
-        .env_remove("NEXTEST")
-        .env_remove("CARGO_MANIFEST_DIR")
         .args([
             "--no-sandbox",
             "--unix-socket-path",

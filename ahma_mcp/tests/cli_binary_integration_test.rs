@@ -128,8 +128,8 @@ mod ahma_mcp_tests {
         // Check if file_tools exists (a simple tool to test with)
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .env("AHMA_TOOLS_DIR", tools_dir.to_str().unwrap())
-            .args(["run", "file-tools_pwd"])
+            .args(["run", "file-tools_pwd", "--tools-dir"])
+            .arg(&tools_dir)
             .output()
             .expect("Failed to execute ahma_mcp with file_tools_pwd");
 
@@ -167,11 +167,8 @@ mod ahma_mcp_tests {
         // Note: This test behavior depends on the test runner's TTY state
         let binary = build_binary_cached("ahma_bin", "ahma");
         let workspace = get_workspace_dir();
-        let tools_dir = workspace.join(".ahma");
-
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .env("AHMA_TOOLS_DIR", tools_dir.to_str().unwrap())
             .args(["serve", "stdio"])
             .output()
             .expect("Failed to execute ahma_mcp in stdio mode");
@@ -599,8 +596,9 @@ mod ahma_list_tools_mode_tests {
         // Execute the tool via CLI run subcommand
         // ahma tool run <tool_name> -- [RAW_ARGS]
         let output = test_command(&binary)
-            .env("AHMA_TOOLS_DIR", &tools_dir)
-            .args(["tool", "run", "test_echo", "--", "hello-cli-mode"])
+            .args(["tool", "run", "test_echo", "--tools-dir"])
+            .arg(&tools_dir)
+            .args(["--", "hello-cli-mode"])
             .output()
             .expect("Failed to execute ahma_mcp in CLI mode");
 
