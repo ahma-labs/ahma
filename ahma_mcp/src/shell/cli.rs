@@ -1283,7 +1283,7 @@ pub struct Cli {
     /// `auto` (default) activates when an ahma MCP server is configured in an
     /// editor. Takes precedence over the AHMA_HOOKS environment variable
     /// (which remains supported for hook subprocesses).
-    #[arg(long = "hooks", value_name = "on|off|auto", global = true)]
+    #[arg(long = "hooks-mode", value_name = "on|off|auto", global = true)]
     pub hooks_mode: Option<String>,
 
     /// Directory for local TLS certificates (default: `~/.ahma/tls`).

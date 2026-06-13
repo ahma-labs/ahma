@@ -94,11 +94,8 @@ mod ahma_mcp_tests {
 
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .args([
-                "--tools-dir",
-                tools_dir.to_str().unwrap(),
-                "nonexistent_tool",
-            ])
+            .args(["--tools-dir", tools_dir.to_str().unwrap()])
+            .args(["tool", "run", "nonexistent_tool"])
             .output()
             .expect("Failed to execute ahma_mcp with invalid tool");
 
@@ -128,8 +125,9 @@ mod ahma_mcp_tests {
         // Check if file_tools exists (a simple tool to test with)
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .args(["run", "file-tools_pwd", "--tools-dir"])
+            .args(["--tools-dir"])
             .arg(&tools_dir)
+            .args(["tool", "run", "file-tools_pwd"])
             .output()
             .expect("Failed to execute ahma_mcp with file_tools_pwd");
 
@@ -464,9 +462,9 @@ mod ahma_list_tools_mode_tests {
     fn test_ahma_mcp_list_tools_no_connection_method() {
         let binary = build_binary_cached("ahma_bin", "ahma");
 
-        // Running --list-tools without any connection method should fail gracefully
+        // Running tool list without any connection method should fail gracefully
         let output = test_command(&binary)
-            .arg("--list-tools")
+            .args(["tool", "list"])
             .output()
             .expect("Failed to execute ahma_mcp --list-tools");
 
@@ -493,15 +491,11 @@ mod ahma_list_tools_mode_tests {
 
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .args([
-                "--list-tools",
-                "--server",
-                &format!(
-                    "{} --tools-dir {}",
-                    binary.to_str().unwrap(),
-                    tools_dir.to_str().unwrap()
-                ),
-            ])
+            .args(["tool", "list", "--"])
+            .arg(&binary)
+            .args(["--tools-dir"])
+            .arg(&tools_dir)
+            .args(["serve", "stdio"])
             .output()
             .expect("Failed to execute ahma_mcp --list-tools with stdio server");
 
@@ -533,17 +527,11 @@ mod ahma_list_tools_mode_tests {
 
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .args([
-                "--list-tools",
-                "--format",
-                "json",
-                "--server",
-                &format!(
-                    "{} --tools-dir {}",
-                    binary.to_str().unwrap(),
-                    tools_dir.to_str().unwrap()
-                ),
-            ])
+            .args(["tool", "list", "--format", "json", "--"])
+            .arg(&binary)
+            .args(["--tools-dir"])
+            .arg(&tools_dir)
+            .args(["serve", "stdio"])
             .output()
             .expect("Failed to execute ahma_mcp --list-tools --format json");
 
@@ -596,9 +584,9 @@ mod ahma_list_tools_mode_tests {
         // Execute the tool via CLI run subcommand
         // ahma tool run <tool_name> -- [RAW_ARGS]
         let output = test_command(&binary)
-            .args(["tool", "run", "test_echo", "--tools-dir"])
+            .args(["--tools-dir"])
             .arg(&tools_dir)
-            .args(["--", "hello-cli-mode"])
+            .args(["tool", "run", "test_echo", "--", "hello-cli-mode"])
             .output()
             .expect("Failed to execute ahma_mcp in CLI mode");
 
