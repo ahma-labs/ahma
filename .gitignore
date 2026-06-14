@@ -39,8 +39,6 @@ CODE_SIMPLICITY.*
 # Local Ahma Logs and temporary files during development
 **/logs/
 **/temp/
-.sccache/
-.cache/
 
 # Release signing private keys — NEVER commit
 # Keys are generated and stored exclusively inside GitHub Actions secrets.

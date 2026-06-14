@@ -352,11 +352,10 @@ impl Adapter {
         timeout_seconds: Option<u64>,
         subcommand_config: Option<&crate::config::SubcommandConfig>,
     ) -> Result<String, anyhow::Error> {
-        tracing::error!(
-            "execute_sync_in_dir START: command='{}', working_dir='{}', args={:?}",
+        tracing::debug!(
+            "execute_sync_in_dir: command='{}', working_dir='{}'",
             command,
             working_dir,
-            args
         );
 
         // Validate working directory against sandbox scope.
