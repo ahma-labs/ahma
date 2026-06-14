@@ -148,3 +148,62 @@ fn default_scope_for_tools_dir(tools_dir: &Path) -> Result<PathBuf> {
 
     Ok(std::env::current_dir()?)
 }
+
+// ─── Convenience factories for unit tests ────────────────────────────────────
+
+/// Build a bare [`AhmaMcpService`] in a fresh `TempDir` for unit tests.
+///
+/// This is the canonical factory for tests that need direct access to an
+/// `AhmaMcpService` without the MCP wire protocol.  The sandbox is set to
+/// `SandboxMode::Test` (no OS-level enforcement) so the test can run inside
+/// nested sandboxes (Cursor, VS Code, Docker) without special setup.
+///
+/// The returned `TempDir` **must** be kept alive for the duration of the test;
+/// dropping it removes the sandbox scope directory which the service still
+/// references.
+///
+/// For tests that require the full in-process MCP wire protocol (initialize /
+/// initialized handshake + tool calls), use [`create_in_process_mcp_empty`]
+/// instead.
+pub async fn build_test_service() -> Result<(AhmaMcpService, tempfile::TempDir)> {
+    build_test_service_with_configs(HashMap::new()).await
+}
+
+/// Like [`build_test_service`] but pre-loads `configs` into the service.
+///
+/// Use this when a test specifically needs tools to be registered in the
+/// service (e.g., to assert on `service.configs` or exercise tool-dispatch
+/// logic in unit tests).
+pub async fn build_test_service_with_configs(
+    configs: HashMap<String, ToolConfig>,
+) -> Result<(AhmaMcpService, tempfile::TempDir)> {
+    let temp_dir = tempfile::tempdir()?;
+
+    let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));
+    let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
+    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
+    let sandbox = Arc::new(Sandbox::new(
+        vec![temp_dir.path().to_path_buf()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )?);
+    let adapter = Arc::new(Adapter::new(
+        Arc::clone(&operation_monitor),
+        shell_pool,
+        sandbox,
+    )?);
+
+    let service = AhmaMcpService::new(
+        adapter,
+        operation_monitor,
+        Arc::new(configs),
+        Arc::new(None::<GuidanceConfig>),
+        false, // force_synchronous
+        false, // defer_sandbox
+    )
+    .await?;
+
+    Ok((service, temp_dir))
+}

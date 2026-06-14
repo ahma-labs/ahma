@@ -22,13 +22,13 @@ pub use sandbox_env::{SANDBOX_BYPASS_ENV_VARS, SandboxTestEnv};
 #[allow(unused_imports)]
 pub use server::{
     InProcessServerInstance, ServerGuard, TestServerInstance, spawn_in_process_server,
-    spawn_server_guard_with_config, spawn_server_guard_with_config_extra_env, spawn_test_server,
-    spawn_test_server_with_timeout,
+    spawn_server_guard_with_config, spawn_server_guard_with_config_extra_env,
+    spawn_server_guard_with_deferred_sandbox, spawn_test_server, spawn_test_server_with_timeout,
 };
 #[allow(unused_imports)]
 pub use uri::{
     create_pwd_tool_config, encode_file_uri, malformed_uris, normalize_path_for_comparison,
-    parse_file_uri, paths_equivalent,
+    parse_file_uri, paths_equivalent, write_pwd_tool_config,
 };
 
 /// Create an HTTP/2-only reqwest client for use against the bridge server.

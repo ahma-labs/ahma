@@ -70,6 +70,15 @@ pub fn create_pwd_tool_config(tools_dir: &Path) -> PathBuf {
     path
 }
 
+/// Create `tools_dir` (if needed) and write a minimal `pwd` tool config into it.
+///
+/// Convenience wrapper around [`create_pwd_tool_config`] that also creates the
+/// directory, matching the pattern used by many integration tests.
+pub fn write_pwd_tool_config(tools_dir: &Path) {
+    std::fs::create_dir_all(tools_dir).expect("Failed to create tools dir");
+    create_pwd_tool_config(tools_dir);
+}
+
 /// Parse a file:// URI to a filesystem path.
 pub fn parse_file_uri(uri: &str) -> Option<PathBuf> {
     if !uri.starts_with("file://") {
