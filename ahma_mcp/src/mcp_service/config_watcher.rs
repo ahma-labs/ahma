@@ -451,6 +451,7 @@ mod tests {
     // ── parse_root_uri_to_scope ──────────────────────────────────────────────
 
     #[test]
+    #[cfg(unix)]
     fn parse_valid_file_uri_returns_path() {
         let result = parse_root_uri_to_scope("file:///tmp/workspace");
         assert!(
@@ -459,6 +460,19 @@ mod tests {
         );
         let path = result.unwrap();
         assert_eq!(path, std::path::PathBuf::from("/tmp/workspace"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parse_valid_file_uri_returns_path() {
+        // On Windows, file:// URIs must reference a drive-rooted path.
+        let result = parse_root_uri_to_scope("file:///C:/Users/workspace");
+        assert!(
+            result.is_some(),
+            "valid file URI should parse to Some(path)"
+        );
+        let path = result.unwrap();
+        assert_eq!(path, std::path::PathBuf::from("C:\\Users\\workspace"));
     }
 
     #[test]
@@ -479,12 +493,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn parse_file_uri_with_spaces_encoded() {
-        // %20 = space
+        // %20 = space; test on Unix where /tmp/... is a valid absolute path
         let result = parse_root_uri_to_scope("file:///tmp/my%20workspace");
         assert!(result.is_some());
         let path = result.unwrap();
         assert_eq!(path, std::path::PathBuf::from("/tmp/my workspace"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parse_file_uri_with_spaces_encoded() {
+        // %20 = space; on Windows, use a drive-rooted path
+        let result = parse_root_uri_to_scope("file:///C:/Users/my%20workspace");
+        assert!(result.is_some());
+        let path = result.unwrap();
+        assert_eq!(path, std::path::PathBuf::from("C:\\Users\\my workspace"));
     }
 
     // ── snapshot_json_files ─────────────────────────────────────────────────
