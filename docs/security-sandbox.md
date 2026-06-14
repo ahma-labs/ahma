@@ -16,9 +16,18 @@ The sandbox scope is the root directory boundary for all filesystem operations:
 
 - **STDIO mode**: Defaults to the current working directory (`--cwd` set by the IDE). In `mcp.json`, set `"cwd": "${workspaceFolder}"` and the sandbox "just works".
 - **HTTP mode**: Set once when the server starts. Configure via:
-  1. `--sandbox-scope <path>` (highest priority)
-  2. `AHMA_SANDBOX_SCOPE` environment variable
-  3. Current working directory (default)
+  1. `--sandbox-scope <path>` CLI flag (highest priority)
+  2. `scopes = [...]` in `~/.ahma/settings.toml`
+  3. MCP client `roots/list` (when `--defer-sandbox` is used)
+  4. Current working directory (when not filesystem root)
+  5. Default `sandbox_directory` from settings (auto-created `~/sandbox`)
+
+The default `sandbox_directory` (`~/sandbox`) is auto-created on first use. This ensures that MCP clients that don't send `roots/list` (e.g., Antigravity) have a working sandbox scope without manual configuration. Configure it in `~/.ahma/settings.toml`:
+
+```toml
+[sandbox]
+sandbox_directory = "~/sandbox"  # default; set to "" to disable
+```
 
 **Security invariant**: Once the sandbox scope is set, it cannot be changed for the lifetime of the server process. Any attempt to change it after lock terminates the session.
 

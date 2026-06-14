@@ -27,6 +27,7 @@ use crate::{
     sandbox,
     utils::logging::{detect_log_role_from_startup, init_logging_with_observability, set_log_role},
 };
+use ahma_common::config::MutexGroupConfig;
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use dunce;
@@ -98,16 +99,27 @@ pub struct AppConfig {
     pub minimize_tokens: bool,
     /// Enable small-model harness adaptations (AHMA_SMALL_MODEL_HARNESS=1).
     pub small_model_harness: bool,
+    /// Command serialisation mutex groups (from settings.toml `[tools].mutex_groups`).
+    /// Each group gates commands whose first token matches one of `prefixes`,
+    /// serialising them per working directory.
+    pub mutex_groups: Vec<MutexGroupConfig>,
+    /// Use `target/ahma/` instead of `target/` for ahma-spawned cargo builds.
+    /// Eliminates cross-process contention with the IDE's background `cargo check`.
+    pub separate_cargo_target: bool,
 
     // ── Sandbox ─────────────────────────────────────────────────────────────
     /// Disable the kernel sandbox entirely (AHMA_DISABLE_SANDBOX=1).
     pub no_sandbox: bool,
-    /// Explicit sandbox scope directories (from AHMA_SANDBOX_SCOPE).
+    /// Explicit sandbox scope directories (from --sandbox-scope).
     pub sandbox_scopes: Vec<PathBuf>,
     /// Defer sandbox lock until client provides roots/list (AHMA_SANDBOX_DEFER=1).
     pub defer_sandbox: bool,
-    /// Working directories seeded when defer mode lacks client roots (AHMA_WORKING_DIRS).
+    /// Working directories seeded when defer mode lacks client roots.
     pub working_dirs: Vec<PathBuf>,
+    /// Default scratch directory for sandbox scope fallback.
+    /// Auto-created if it does not exist.  Used when no explicit scopes are
+    /// provided and the cwd is a filesystem root.
+    pub sandbox_directory: Option<PathBuf>,
     /// Add system temp dir to sandbox scopes (AHMA_TMP_ACCESS=1).
     pub tmp_access: bool,
     /// Block writes to temp directories (AHMA_DISABLE_TEMP=1).
@@ -193,11 +205,14 @@ impl Default for AppConfig {
             skip_availability_probes: false,
             minimize_tokens: false,
             small_model_harness: false,
+            mutex_groups: ahma_common::config::default_mutex_groups(),
+            separate_cargo_target: false,
 
             no_sandbox: false,
             sandbox_scopes: vec![],
             defer_sandbox: false,
             working_dirs: vec![],
+            sandbox_directory: Some(PathBuf::from("~/sandbox")),
             tmp_access: false,
             no_temp_files: false,
             log_monitor: false,
@@ -385,29 +400,27 @@ fn resolve_sandbox_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     let cwd = std::env::current_dir()
         .context("Failed to get current working directory for sandbox scope")?;
     if crate::sandbox::is_filesystem_root(&cwd) {
-        let home = dirs::home_dir();
-        let settings_path_str = home
-            .as_ref()
-            .map(|h| {
-                h.join(".ahma")
-                    .join("settings.toml")
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .unwrap_or_else(|| "~/.ahma/settings.toml".to_string());
+        // CWD is filesystem root — use sandbox_directory fallback.
+        if let Some(sandbox_dir) = &cfg.sandbox_directory {
+            let canonical = ahma_common::config::ensure_sandbox_directory(sandbox_dir)
+                .context("Failed to initialize default sandbox directory")?;
+            tracing::info!(
+                "Using default sandbox directory (cwd is filesystem root): {}",
+                canonical.display()
+            );
+            return Ok(Some(vec![canonical]));
+        }
 
-        let config_command = if cfg!(target_os = "windows") {
-            "New-Item -ItemType Directory -Force -Path ~\\.ahma; Add-Content -Path ~\\.ahma\\settings.toml -Value \"`n[sandbox]`nscopes = [`\"~/sandbox`\"]\""
-        } else {
-            "mkdir -p ~/.ahma && echo '[sandbox]' >> ~/.ahma/settings.toml && echo 'scopes = [\"~/sandbox\"]' >> ~/.ahma/settings.toml"
-        };
-
+        // No sandbox_directory configured — error with helpful instructions.
         return Err(anyhow!(
-            "Failed to initialize sandbox: current working directory {:?} is a filesystem root, which is not a valid sandbox scope.\n\n\
-             To fix this, define a manual sandbox scope in your user settings file ({settings_path_str}).\n\
-             Run the following command in your terminal to create and add the scope ~/sandbox:\n\n\
-             {config_command}\n",
-            cwd
+            "Filesystem root or empty path is not a valid sandbox scope (path: {:?}, OS: {}).\n\n\
+             Fix: add a sandbox_directory to ~/.ahma/settings.toml:\n\n\
+             [sandbox]\n\
+             sandbox_directory = \"~/sandbox\"\n\n\
+             Or specify explicit directories with --sandbox-scope or --working-directories.\n\
+             Example: --sandbox-scope ~/projects",
+            cwd,
+            std::env::consts::OS
         ));
     }
     Ok(Some(vec![cwd]))
@@ -472,7 +485,8 @@ fn create_sandbox_instance(
         policy.tmp_access,
     )
     .context("Failed to initialize sandbox")?
-    .with_package_cache_write(cfg.package_cache_write);
+    .with_package_cache_write(cfg.package_cache_write)
+    .with_separate_cargo_target(cfg.separate_cargo_target);
 
     tracing::info!("Sandbox scopes initialized: {:?}", scopes);
 
@@ -756,6 +770,11 @@ fn run_settings_command(args: SettingsArgs) -> Result<()> {
                 d.sandbox.disable_temp
             );
             show_field!("defer", s.sandbox.defer, d.sandbox.defer);
+            show_field!(
+                "sandbox_directory",
+                &s.sandbox.sandbox_directory,
+                &d.sandbox.sandbox_directory
+            );
             println!();
             println!("[logging]");
             show_field!("target", &s.logging.target, &d.logging.target);
@@ -2436,6 +2455,8 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     warn_retired_env!("AHMA_SMALL_MODEL_HARNESS");
     let minimize_tokens = cli.minimize_tokens || s.tools.minimize_tokens;
     let small_model_harness = cli.small_model_harness || s.tools.small_model_harness;
+    let mutex_groups = s.tools.mutex_groups.clone();
+    let separate_cargo_target = s.tools.separate_cargo_target;
 
     AppConfig {
         tools_dir,
@@ -2447,11 +2468,14 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         skip_availability_probes,
         minimize_tokens,
         small_model_harness,
+        mutex_groups,
+        separate_cargo_target,
 
         no_sandbox,
         sandbox_scopes,
         defer_sandbox,
         working_dirs,
+        sandbox_directory: s.sandbox.sandbox_directory.clone(),
         tmp_access,
         no_temp_files,
         log_monitor,
@@ -2890,11 +2914,14 @@ mod tests {
             skip_availability_probes: false,
             minimize_tokens: false,
             small_model_harness: false,
+            mutex_groups: ahma_common::config::default_mutex_groups(),
+            separate_cargo_target: false,
 
             no_sandbox: false,
             sandbox_scopes: vec![],
             defer_sandbox: false,
             working_dirs: vec![],
+            sandbox_directory: None,
             tmp_access: false,
             no_temp_files: false,
             log_monitor: false,

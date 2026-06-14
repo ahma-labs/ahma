@@ -49,8 +49,10 @@
 //!     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
 //!     let sandbox = Arc::new(Sandbox::new(Vec::new(), SandboxMode::Strict, false, false, false)?);
 //!
-//!     // 2. Create the execution adapter
-//!     let adapter = Arc::new(Adapter::new(monitor.clone(), shell_pool, sandbox)?);
+//!     // 2. Create the execution adapter (with default cargo mutex group)
+//!     let mutex_groups = ahma_common::config::default_mutex_groups();
+//!     let mutex_registry = Arc::new(Adapter::mutex_registry_from(&mutex_groups));
+//!     let adapter = Arc::new(Adapter::new(monitor.clone(), shell_pool, sandbox, mutex_registry)?);
 //!
 //!     // 3. Initialize the MCP service with your tool configurations
 //!     let configs = Arc::new(HashMap::<String, ToolConfig>::new());

@@ -52,6 +52,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use dunce;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -374,6 +375,46 @@ pub fn settings_path() -> Option<PathBuf> {
 // AhmaSettings — user-editable settings.toml
 // ---------------------------------------------------------------------------
 
+/// Configuration for a command serialisation (mutex) group.
+///
+/// Commands whose first whitespace-separated token matches any entry in
+/// `prefixes` are serialised within the same working directory: at most one
+/// such command runs at a time per directory.  This prevents file-lock
+/// contention (e.g. `cargo` commands competing for `target/`) without
+/// blocking unrelated commands.
+///
+/// Commands with the same full normalised command string that queue while the
+/// group is busy are **coalesced**: only one instance runs and all waiters
+/// receive the same result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MutexGroupConfig {
+    /// Human-readable group name shown in progress messages and logs.
+    pub name: String,
+    /// Command prefixes (first whitespace token) that belong to this group.
+    /// Example: `["cargo"]` gates any command starting with `cargo`.
+    pub prefixes: Vec<String>,
+    /// How long (in seconds) a queued command waits for the group to become
+    /// available before failing with a timeout error.
+    /// Default: `600` (10 minutes).
+    #[serde(default = "default_mutex_wait_secs")]
+    pub max_wait_secs: u64,
+}
+
+fn default_mutex_wait_secs() -> u64 {
+    600
+}
+
+/// The built-in default mutex group: serialises all `cargo` subcommands
+/// per working directory to avoid `target/` file-lock contention.
+pub fn default_mutex_groups() -> Vec<MutexGroupConfig> {
+    vec![MutexGroupConfig {
+        name: "cargo".to_string(),
+        prefixes: vec!["cargo".to_string()],
+        max_wait_secs: default_mutex_wait_secs(),
+    }]
+}
+
 /// oMLX / mlx_lm.server provider defaults.
 ///
 /// `mlx_lm.server` exposes an OpenAI-compatible API on localhost.  The default
@@ -442,6 +483,20 @@ pub struct ToolSettings {
     /// Enable small-model harness adaptations.
     /// Default: `false`
     pub small_model_harness: bool,
+    /// Command serialisation groups.  Commands matching a group's prefix are
+    /// serialised per working directory (at most one runs at a time within
+    /// that directory).  Defaults to a single `cargo` group so that
+    /// `cargo build`, `cargo test`, `cargo clippy`, etc. do not contend on
+    /// the shared `target/` directory.
+    /// Default: `[{ name = "cargo", prefixes = ["cargo"], max_wait_secs = 600 }]`
+    #[serde(default = "default_mutex_groups")]
+    pub mutex_groups: Vec<MutexGroupConfig>,
+    /// Use a dedicated `target/ahma` subdirectory for cargo builds spawned by
+    /// ahma, completely isolating them from the IDE's background `cargo check`.
+    /// Eliminates cross-process file-lock contention at the cost of a cold
+    /// build cache on the first run after a restart.
+    /// Default: `false`
+    pub separate_cargo_target: bool,
 }
 
 impl Default for ToolSettings {
@@ -455,12 +510,14 @@ impl Default for ToolSettings {
             tool_bundles: Vec::new(),
             minimize_tokens: false,
             small_model_harness: false,
+            mutex_groups: default_mutex_groups(),
+            separate_cargo_target: false,
         }
     }
 }
 
 /// Sandbox and filesystem security settings.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SandboxSettings {
     /// Disable the kernel sandbox entirely.
@@ -497,6 +554,74 @@ pub struct SandboxSettings {
     /// Default: `true`
     #[serde(default = "default_true")]
     pub package_cache_write: bool,
+    /// Default scratch directory for sandbox scope fallback.
+    ///
+    /// When no explicit `--sandbox-scope` is provided, no `scopes` are defined in
+    /// settings, and the current working directory is a filesystem root (e.g., MCP
+    /// clients like Antigravity that don't send `roots/list`), ahma uses this
+    /// directory as the sandbox scope.  It is auto-created if it does not exist.
+    ///
+    /// Set to `None` to disable the auto-fallback (ahma will error instead).
+    /// Default: `"~/sandbox"`
+    #[serde(default = "default_sandbox_directory")]
+    pub sandbox_directory: Option<PathBuf>,
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        Self {
+            disable: false,
+            tmp_access: false,
+            disable_temp: false,
+            defer: false,
+            task_vault: None,
+            scopes: Vec::new(),
+            working_dirs: Vec::new(),
+            package_cache_write: true,
+            sandbox_directory: default_sandbox_directory(),
+        }
+    }
+}
+
+fn default_sandbox_directory() -> Option<PathBuf> {
+    Some(PathBuf::from("~/sandbox"))
+}
+
+/// Expand `~` or `~/…` to the user's home directory.
+fn expand_home(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if (s.starts_with("~/") || s.starts_with("~\\"))
+        && let Some(home) = dirs::home_dir()
+    {
+        let mut expanded = home;
+        expanded.push(&s[2..]);
+        return expanded;
+    }
+    path.to_path_buf()
+}
+
+/// Ensure the sandbox directory exists, creating it if necessary.
+///
+/// Expands `~` to the home directory, creates the directory if it does not
+/// exist, and returns the canonicalized absolute path.
+pub fn ensure_sandbox_directory(path: &Path) -> Result<PathBuf> {
+    let expanded = expand_home(path);
+    if !expanded.exists() {
+        std::fs::create_dir_all(&expanded).with_context(|| {
+            format!("Failed to create sandbox directory: {}", expanded.display())
+        })?;
+        tracing::info!("Created sandbox directory: {}", expanded.display());
+    }
+    dunce::canonicalize(&expanded).with_context(|| {
+        format!(
+            "Failed to canonicalize sandbox directory: {}",
+            expanded.display()
+        )
+    })
 }
 
 /// Logging and log-monitoring settings.
@@ -749,6 +874,18 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # tool_bundles = []       # tool bundles to enable (e.g. ["rust", "git"])
 # minimize_tokens     = false # enable output compression and token minimization
 # small_model_harness = false # enable small-model harness adaptations
+#
+# Command serialisation: commands matching a group's prefix are serialised per
+# working directory so they don't contend on shared resources (e.g. cargo's target/).
+# The cargo group is enabled by default.  Set mutex_groups = [] to disable.
+# mutex_groups = [
+#   { name = "cargo", prefixes = ["cargo"], max_wait_secs = 600 }
+# ]
+# Add more groups for other slow exclusive tools, e.g.:
+#   { name = "gradle", prefixes = ["gradle", "./gradlew"], max_wait_secs = 600 }
+#
+# separate_cargo_target = false  # use target/ahma/ instead of target/ for ahma's cargo builds,
+#                                # eliminating cross-process file-lock contention with IDE background checks
 
 # ── Sandbox & filesystem security ────────────────────────────────────────────
 # [sandbox]
@@ -759,7 +896,8 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # task_vault           = ""       # run this server session inside an existing task vault
 # scopes               = []       # paths allowed for read/write access under the sandbox
 # package_cache_write  = true     # allow package-manager caches (cargo registry/git) to be written
-# working_dirs = []       # directories containing allowed working directories
+# working_dirs         = []       # directories containing allowed working directories
+# sandbox_directory    = "~/sandbox"  # default scratch directory, auto-created when needed
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # [logging]
