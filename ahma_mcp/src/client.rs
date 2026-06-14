@@ -83,6 +83,7 @@ impl Client {
 
         let client = ()
             .serve(TokioChildProcess::new(command.configure(|cmd| {
+                cmd.env("AHMA_SERVER_CHILD", "1");
                 cmd.args(["serve", "stdio", "--no-sandbox", "--skip-probes"]);
                 if let Some(dir) = tools_dir {
                     cmd.arg("--tools-dir").arg(dir);

@@ -35,11 +35,18 @@ impl Sandbox {
 
         // Cargo can be configured (via config or env) to write its target dir outside
         // the session sandbox. Force it back inside the working directory.
+        // When `separate_cargo_target` is set, use a dedicated subdirectory so ahma's
+        // builds are isolated from the IDE's background `cargo check`.
         if std::path::Path::new(program)
             .file_name()
             .is_some_and(|n| n == "cargo")
         {
-            cmd.env("CARGO_TARGET_DIR", working_dir.join("target"));
+            let target_dir = if self.separate_cargo_target {
+                working_dir.join("target/ahma")
+            } else {
+                working_dir.join("target")
+            };
+            cmd.env("CARGO_TARGET_DIR", target_dir);
         }
         cmd
     }
@@ -205,6 +212,36 @@ mod tests {
         assert_eq!(
             envs.get(std::ffi::OsStr::new("CARGO_TARGET_DIR")),
             Some(&Some(td.path().join("target").into_os_string()))
+        );
+    }
+
+    /// When `separate_cargo_target` is set, CARGO_TARGET_DIR uses `target/ahma/`.
+    #[test]
+    fn test_create_command_cargo_separate_target_dir() {
+        let td = tempdir().unwrap();
+        let sandbox = Sandbox::new(
+            vec![td.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap()
+        .with_separate_cargo_target(true);
+        let result = sandbox.create_command("cargo", &["build".to_string()], td.path());
+        assert!(result.is_ok(), "create_command for cargo should succeed");
+        let cmd = result.unwrap();
+
+        let std_cmd = cmd.as_std();
+        let envs: std::collections::HashMap<_, _> = std_cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
+            .collect();
+
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CARGO_TARGET_DIR")),
+            Some(&Some(td.path().join("target/ahma").into_os_string())),
+            "separate_cargo_target should use target/ahma/"
         );
     }
 

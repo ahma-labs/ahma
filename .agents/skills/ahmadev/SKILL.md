@@ -87,11 +87,13 @@ Only deviate from this rule when the user explicitly specifies a different versi
    ```
    *Note: This command updates `Cargo.toml`, `skills/ahma/SKILL.md`, `scripts/install.sh`, and `scripts/install.ps1` automatically. Running this command first prevents build panics/errors caused by version mismatches between files.*
 4. **Build and Verify the workspace**:
-   Build the debug binary and check the workspace to verify everything compiles:
+   Verify the workspace compiles, tests pass, and code is clean in a single pipeline
+   (`nextest run` already compiles the full workspace — do NOT run `cargo build` or
+   `cargo check` separately, as that causes triple-compilation and file-lock contention):
    ```bash
-   cargo build
-   cargo check --workspace
+   cargo fmt --all --check
    cargo nextest run
+   cargo clippy --all-targets
    ```
 5. **Review git diff** to confirm version-bearing files are correctly modified:
    ```bash

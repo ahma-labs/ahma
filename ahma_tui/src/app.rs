@@ -66,6 +66,9 @@ async fn run_ratatui(
         connection.transport_label(),
         unicode,
     );
+    if let Some(ref path) = workspace_path {
+        state.workspace = path.to_string_lossy().into_owned();
+    }
     state.mcp_http_base_url = http_base_url(connection);
     state.token_prefs = token_prefs;
 

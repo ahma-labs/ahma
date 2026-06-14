@@ -206,6 +206,7 @@ async fn mcp_source_task(
                     if !healthy {
                         mcp_state = None;
                         prev_status_ok = true;
+                        send(&tx, SourceEvent::SandboxStatus { status: "UNKNOWN".to_string() }).await;
                     } else {
                         // Fresh connection — allow immediate init attempt.
                         init_fail_count = 0;
@@ -223,7 +224,7 @@ async fn mcp_source_task(
                         // Still in backoff window — skip this tick.
                         continue;
                     }
-                    match init_mcp_session(&client, &sse_client, &request_base_url, workspace_path.clone()).await {
+                    match init_mcp_session(&client, &sse_client, &request_base_url, workspace_path.clone(), tx.clone()).await {
                         Ok(session) => {
                             init_fail_count = 0;
                             send(&tx, SourceEvent::SessionId { id: session.id.clone() }).await;
@@ -234,6 +235,7 @@ async fn mcp_source_task(
                             mcp_state = Some(session);
                         }
                         Err(e) => {
+                            send(&tx, SourceEvent::SandboxStatus { status: "FAILED".to_string() }).await;
                             init_fail_count = init_fail_count.saturating_add(1);
                             // Exponential backoff capped at 60 s: 1 → 3 → 8 → 20 → 60
                             let backoff_secs: u64 = match init_fail_count {
@@ -366,7 +368,15 @@ async fn init_mcp_session(
     sse_client: &reqwest::Client,
     base_url: &str,
     workspace_path: Option<std::path::PathBuf>,
+    tx: mpsc::Sender<SourceEvent>,
 ) -> Result<McpSession> {
+    send(
+        &tx,
+        SourceEvent::SandboxStatus {
+            status: "INITIALIZING".to_string(),
+        },
+    )
+    .await;
     let url = format!("{base_url}/mcp");
 
     // Step 1: initialize
@@ -401,6 +411,7 @@ async fn init_mcp_session(
     let sse_url_clone = url.clone();
     let session_id_clone = session_id.clone();
     let workspace_path_clone = workspace_path.clone();
+    let tx_clone = tx.clone();
 
     tokio::spawn(async move {
         if let Err(e) = run_sse_listener(
@@ -409,6 +420,7 @@ async fn init_mcp_session(
             sse_url_clone,
             session_id_clone,
             workspace_path_clone,
+            tx_clone,
         )
         .await
         {
@@ -514,6 +526,7 @@ async fn handle_sse_event(
     value: &Value,
     session_id: &str,
     workspace_path: Option<&std::path::Path>,
+    tx: &mpsc::Sender<SourceEvent>,
 ) -> Result<()> {
     let method = value.get("method").and_then(|m| m.as_str());
 
@@ -524,10 +537,24 @@ async fn handle_sse_event(
             .and_then(|e| e.as_str())
             .unwrap_or("unknown");
         warn!("Sandbox configuration failed: {}", error);
+        send(
+            tx,
+            SourceEvent::SandboxStatus {
+                status: "FAILED".to_string(),
+            },
+        )
+        .await;
     }
 
     if method == Some("notifications/sandbox/configured") {
         debug!("Sandbox configured successfully!");
+        send(
+            tx,
+            SourceEvent::SandboxStatus {
+                status: "LOCKED".to_string(),
+            },
+        )
+        .await;
     }
 
     if method == Some("roots/list") {
@@ -573,6 +600,7 @@ async fn run_sse_listener(
     sse_url: String,
     session_id: String,
     workspace_path: Option<std::path::PathBuf>,
+    tx: mpsc::Sender<SourceEvent>,
 ) -> Result<()> {
     let response = sse_client
         .get(&sse_url)
@@ -602,6 +630,7 @@ async fn run_sse_listener(
                         &json_val,
                         &session_id,
                         workspace_path.as_deref(),
+                        &tx,
                     )
                     .await
                 {

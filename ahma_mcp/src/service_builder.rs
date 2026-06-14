@@ -143,10 +143,15 @@ impl<'a> ServiceBuilder<'a> {
         let shell_pool_manager = Arc::new(ShellPoolManager::new(shell_pool_config));
         shell_pool_manager.clone().start_background_tasks();
 
-        let adapter = Arc::new(Adapter::new(
+        let mutex_registry = Arc::new(crate::adapter::CommandMutexRegistry::from_config(
+            &config.mutex_groups,
+        ));
+
+        let adapter = Arc::new(Adapter::new_with_registry(
             operation_monitor.clone(),
             shell_pool_manager.clone(),
             sandbox.clone(),
+            mutex_registry,
         )?);
 
         let raw_configs = load_tool_configs(config, config.tools_dir.as_deref())

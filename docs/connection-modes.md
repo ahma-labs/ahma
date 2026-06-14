@@ -90,11 +90,11 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
         "serve",
         "stdio",
         "--tools",
-        "rust,simplify",
+        "simplify",
         "--tmp",
         "--log-monitor",
         "--sandbox-scope",
-        "/Users/username"
+        "~/sandbox"
       ]
     }
   }
@@ -102,7 +102,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
 ```
 
 > [!NOTE]
-> Replace `/Users/username` with your actual absolute home or project directory. Tilde expansion may not be supported depending on your MCP client's execution environment.
+> The `~/sandbox` directory is auto-created by ahma on first startup. To use a different directory, change the `--sandbox-scope` path above or set `sandbox_directory` in `~/.ahma/settings.toml`.
 
 ## 2. HTTP Mode (EXPERIMENTAL)
 

@@ -406,11 +406,41 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         String::new()
     };
 
+    let max_path_len = if area.width > 120 {
+        35
+    } else if area.width > 100 {
+        25
+    } else {
+        15
+    };
+    let workspace_short = shorten_path(&state.workspace, max_path_len);
+    let sandbox_style = match state.sandbox_status.as_str() {
+        "LOCKED" => theme.success(),
+        "INITIALIZING" => theme.pending(),
+        "FAILED" => theme.failed(),
+        _ => theme.unknown_health(),
+    };
+    let sandbox_part = if !state.workspace.is_empty() {
+        format!(" · sandbox: {workspace_short}")
+    } else {
+        String::new()
+    };
+    let sandbox_status_part = if !state.sandbox_status.is_empty() {
+        format!(" [{}]", state.sandbox_status)
+    } else {
+        String::new()
+    };
+
     let line = Line::from(vec![
         Span::styled(" ahma chat", theme.title()),
-        Span::styled(format!("  {}", state.llm_label), theme.normal()),
+        Span::styled(
+            format!("  {}", shorten_llm_label(&state.llm_label)),
+            theme.normal(),
+        ),
         Span::styled(mcp_label, theme.dim()),
         Span::styled(external_part, theme.dim()),
+        Span::styled(sandbox_part, theme.dim()),
+        Span::styled(sandbox_status_part, sandbox_style),
         health_span,
         Span::styled(" · ", theme.dim()),
         daemon_span,
@@ -1231,7 +1261,14 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         .map(|id| format!(" · session {}", &id[..id.len().min(8)]))
         .unwrap_or_default();
 
-    let workspace_short = shorten_path(&state.workspace, 30);
+    let max_path_len = if area.width > 120 {
+        35
+    } else if area.width > 100 {
+        25
+    } else {
+        15
+    };
+    let workspace_short = shorten_path(&state.workspace, max_path_len);
     let external_part = format_external_part(state);
     let tokens_part = format_tokens_part(state);
 
@@ -1248,16 +1285,24 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     };
     let daemon_span = Span::styled(daemon_char, daemon_style);
 
+    let sandbox_part = if !state.workspace.is_empty() {
+        format!(" · sandbox: {workspace_short}")
+    } else {
+        String::new()
+    };
+    let sandbox_status_part = if !state.sandbox_status.is_empty() {
+        format!(" [{}]", state.sandbox_status)
+    } else {
+        String::new()
+    };
+
     let line = Line::from(vec![
         Span::styled(" ahma", theme.title()),
         Span::styled(session_part, theme.dim()),
-        Span::styled(
-            format!(" · sandbox {}", state.sandbox_status),
-            sandbox_style,
-        ),
+        Span::styled(sandbox_part, theme.dim()),
+        Span::styled(sandbox_status_part, sandbox_style),
         Span::styled(external_part, theme.dim()),
         Span::styled(tokens_part, theme.pending()),
-        Span::styled(format!(" · {workspace_short}"), theme.dim()),
         Span::styled(format!(" · {}", state.transport_label), theme.dim()),
         health_span,
         daemon_span,
@@ -2523,6 +2568,17 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+pub(crate) fn shorten_llm_label(label: &str) -> String {
+    if let Some((provider, model)) = label.split_once(" / ") {
+        let provider = provider.trim();
+        let model = model.trim();
+        let model_clean = model.split(':').next().unwrap_or(model).trim();
+        format!("{}/{}", provider, model_clean)
+    } else {
+        label.to_string()
+    }
+}
+
 pub(crate) fn shorten_path(path: &str, max_chars: usize) -> String {
     if path.len() <= max_chars {
         return path.to_string();
@@ -2564,6 +2620,23 @@ mod tests {
 
     fn make_line(text: &str) -> Line<'static> {
         Line::from(Span::raw(text.to_string()))
+    }
+
+    #[test]
+    fn test_shorten_llm_label() {
+        assert_eq!(shorten_llm_label("no LLM"), "no LLM");
+        assert_eq!(
+            shorten_llm_label("Ollama / qwen3.6:27b-mlx"),
+            "Ollama/qwen3.6"
+        );
+        assert_eq!(
+            shorten_llm_label("profile:my-profile / gemma2:latest"),
+            "profile:my-profile/gemma2"
+        );
+        assert_eq!(
+            shorten_llm_label("http://localhost:11434 / deepseek-coder:6.7b"),
+            "http://localhost:11434/deepseek-coder"
+        );
     }
 
     #[test]

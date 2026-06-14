@@ -43,11 +43,13 @@
 //!   an operation times out or is cancelled.
 
 pub mod executor;
+pub mod mutex_groups;
 mod preparer;
 mod pty_exec;
 pub mod spill;
 mod types;
 
+pub use mutex_groups::CommandMutexRegistry;
 pub use preparer::{
     TempFileManager, escape_shell_argument, format_option_flag, needs_file_handling,
     prepare_command_and_args,
@@ -73,44 +75,6 @@ use std::{
 use tokio::{sync::Mutex, task::JoinHandle};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-// ─── Exclusive-tool gate ───────────────────────────────────────────────────────
-//
-// Some tool families (cargo build/test/clippy/check/nextest) use a shared file
-// lock (Cargo.lock) and a shared compilation cache (target/).  Running them
-// concurrently does not cause correctness issues — cargo itself serialises
-// internal steps — but it does cause heavy I/O contention and duplicated work.
-// We gate them behind a single-permit semaphore so at most one such command
-// runs at a time per process.  The gate is opt-in: tools that are NOT in the
-// exclusive list run freely in parallel.
-//
-// Timeout: if the gate cannot be acquired within 5 minutes the operation fails
-// with a clear message rather than hanging indefinitely.
-
-static EXCLUSIVE_CARGO_GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
-    std::sync::OnceLock::new();
-
-fn exclusive_cargo_gate() -> Arc<tokio::sync::Semaphore> {
-    EXCLUSIVE_CARGO_GATE
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
-        .clone()
-}
-
-/// Returns `true` when `command` is a cargo subcommand that contends on the
-/// shared target directory and should therefore be serialised.
-fn is_exclusive_cargo_command(command: &str) -> bool {
-    let low = command.to_ascii_lowercase();
-    let words: Vec<&str> = low.split_whitespace().collect();
-    if words.first() != Some(&"cargo") {
-        return false;
-    }
-    const EXCLUSIVE_SUBCOMMANDS: &[&str] = &[
-        "build", "b", "test", "t", "clippy", "check", "c", "nextest", "bench",
-    ];
-    words
-        .get(1)
-        .is_some_and(|sub| EXCLUSIVE_SUBCOMMANDS.contains(sub))
-}
 
 fn generate_id(tool_name: &str, command: &str) -> String {
     let id = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -219,6 +183,8 @@ pub struct Adapter {
     pub output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     /// Persistent stateful shell sessions (`session_id` parameter).
     pub shell_sessions: Arc<crate::shell_session::ShellSessionManager>,
+    /// Configurable per-(group, directory) command serialisation registry.
+    pub mutex_registry: Arc<CommandMutexRegistry>,
 }
 
 impl Adapter {
@@ -237,6 +203,21 @@ impl Adapter {
         shell_pool: Arc<ShellPoolManager>,
         sandbox: Arc<sandbox::Sandbox>,
     ) -> Result<Self> {
+        // Default to an empty (no-op) registry; use `with_mutex_registry` to enable gating.
+        let registry = Arc::new(CommandMutexRegistry::from_config(&[]));
+        Self::new_with_registry(monitor, shell_pool, sandbox, registry)
+    }
+
+    /// Create an adapter with a configured command-mutex registry.
+    ///
+    /// Use this instead of [`Self::new`] when you have a [`CommandMutexRegistry`]
+    /// built from settings (i.e. in `service_builder.rs`).
+    pub fn new_with_registry(
+        monitor: Arc<OperationMonitor>,
+        shell_pool: Arc<ShellPoolManager>,
+        sandbox: Arc<sandbox::Sandbox>,
+        mutex_registry: Arc<CommandMutexRegistry>,
+    ) -> Result<Self> {
         // Share the monitor's dispatcher so every component emits into ONE
         // unified event stream (SPEC R15) — the monitor owns lifecycle events,
         // the adapter only adds supplementary ones.
@@ -254,7 +235,17 @@ impl Adapter {
                 crate::output_optimizer::OutputOptimizer::new(false, None),
             )),
             shell_sessions: crate::shell_session::ShellSessionManager::new(),
+            mutex_registry,
         })
+    }
+
+    /// Convenience factory: build a [`CommandMutexRegistry`] from a slice of group configs.
+    ///
+    /// This is the same as calling `CommandMutexRegistry::from_config(groups)` directly.
+    pub fn mutex_registry_from(
+        groups: &[ahma_common::config::MutexGroupConfig],
+    ) -> CommandMutexRegistry {
+        CommandMutexRegistry::from_config(groups)
     }
 
     /// Subscribe to the unified operation event stream.
@@ -575,6 +566,7 @@ impl Adapter {
             task_handles,
             command_executor: self.command_executor.clone(),
             output_optimizer: self.output_optimizer.clone(),
+            mutex_registry: self.mutex_registry.clone(),
         }));
 
         // Store the handle for graceful shutdown
@@ -792,6 +784,7 @@ struct AsyncOperationRun {
     task_handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     command_executor: Arc<dyn executor::CommandExecutor>,
     output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
+    mutex_registry: Arc<CommandMutexRegistry>,
 }
 
 async fn run_async_operation(ctx: AsyncOperationRun) {
@@ -809,6 +802,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         task_handles,
         command_executor,
         output_optimizer,
+        mutex_registry,
     } = ctx;
 
     let cancellation_token = match monitor.get_operation(&op_id).await {
@@ -834,39 +828,39 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         return;
     }
 
-    // ── Exclusive-cargo gate ──────────────────────────────────────────────────
-    // Serialise cargo build / test / clippy / check / nextest so they don't
-    // contend on the shared target directory.  The permit is held for the
-    // entire execution and dropped automatically when this function returns.
-    let _exclusive_permit = if is_exclusive_cargo_command(&command) {
-        const GATE_TIMEOUT_SECS: u64 = 300; // 5 min
+    // ── Command mutex group gate ────────────────────────────────────────────────────
+    // Serialise commands in the same mutex group within the same working
+    // directory.  The permit is held for the entire execution and released
+    // automatically when it drops at the end of this function.
+    let _exclusive_permit = if let Some(group) = mutex_registry.find_group(&command) {
+        let group_name = group.name.clone();
         monitor.note_progress(
             &op_id,
-            "Waiting for cargo exclusive lock (another build is running)".to_string(),
+            format!(
+                "Queued: waiting for '{group_name}' mutex \
+                 (another {group_name} command is running in this directory)"
+            ),
         );
-        match tokio::time::timeout(
-            Duration::from_secs(GATE_TIMEOUT_SECS),
-            exclusive_cargo_gate().acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(permit)) => {
-                tracing::debug!(op_id = %op_id, "Acquired cargo exclusive gate");
+        let wd_path = std::path::Path::new(&working_dir);
+        match mutex_registry.acquire(group, wd_path).await {
+            Ok(permit) => {
+                tracing::debug!(op_id = %op_id, group = %group_name, "Acquired mutex group gate");
                 Some(permit)
             }
-            Ok(Err(_)) => {
-                // Semaphore was closed — should never happen; proceed without gate.
-                tracing::warn!("cargo exclusive semaphore unexpectedly closed");
-                None
-            }
-            Err(_) => {
+            Err(mutex_groups::MutexGroupError::Timeout { secs, .. }) => {
                 let err = format!(
-                    "Timed out waiting for exclusive cargo lock after {GATE_TIMEOUT_SECS}s. \
-                     Another cargo operation is still running. Try again after it completes."
+                    "Timed out waiting for '{group_name}' exclusive lock after {secs}s. \
+                     Another {group_name} command is still running in this directory. \
+                     Try again after it completes."
                 );
                 fail_operation_with_error(&monitor, &op_id, err).await;
                 task_handles.lock().await.remove(&op_id);
                 return;
+            }
+            Err(mutex_groups::MutexGroupError::Closed { .. }) => {
+                // Semaphore was closed — should never happen; proceed without gate.
+                tracing::warn!("mutex group '{group_name}' semaphore unexpectedly closed");
+                None
             }
         }
     } else {

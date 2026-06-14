@@ -397,10 +397,13 @@ fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
     })
 }
 
-fn build_antigravity_servers_entry(transport: &str, home: &Path) -> serde_json::Value {
+fn build_antigravity_servers_entry(transport: &str, _home: &Path) -> serde_json::Value {
     if let Some(url) = mcp_shared_transport_url(transport) {
         return json!({ "url": url });
     }
+    // Antigravity doesn't send MCP roots/list, so we must specify a sandbox
+    // scope explicitly.  ~/sandbox is auto-created by ahma at startup.
+    // Tilde expansion is handled by ahma's CLI parser (expand_tilde).
     json!({
         "command": "ahma",
         "args": [
@@ -411,7 +414,7 @@ fn build_antigravity_servers_entry(transport: &str, home: &Path) -> serde_json::
             "--tmp",
             "--log-monitor",
             "--sandbox-scope",
-            home.to_string_lossy().to_string()
+            "~/sandbox"
         ]
     })
 }

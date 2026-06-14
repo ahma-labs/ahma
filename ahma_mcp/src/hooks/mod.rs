@@ -644,10 +644,14 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     let shell_pool_manager =
         std::sync::Arc::new(crate::shell_pool::ShellPoolManager::new(shell_pool_config));
 
-    let adapter = std::sync::Arc::new(crate::adapter::Adapter::new(
+    let mutex_registry = std::sync::Arc::new(crate::adapter::CommandMutexRegistry::from_config(
+        &cfg.mutex_groups,
+    ));
+    let adapter = std::sync::Arc::new(crate::adapter::Adapter::new_with_registry(
         operation_monitor,
         shell_pool_manager,
         sandbox,
+        mutex_registry,
     )?);
 
     let mut adapter_args = serde_json::Map::new();
