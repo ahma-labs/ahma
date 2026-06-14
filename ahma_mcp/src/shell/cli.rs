@@ -385,7 +385,11 @@ fn resolve_sandbox_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
             task_vault_root.display(),
             workdir.display()
         );
-        return Ok(Some(vec![workdir]));
+        let trash = task_vault_root.join("trash");
+        let audit = task_vault_root.join("audit.jsonl");
+        let trash_canonical = dunce::canonicalize(&trash).unwrap_or(trash);
+        let audit_canonical = dunce::canonicalize(&audit).unwrap_or(audit);
+        return Ok(Some(vec![workdir, trash_canonical, audit_canonical]));
     }
 
     if cfg.defer_sandbox {

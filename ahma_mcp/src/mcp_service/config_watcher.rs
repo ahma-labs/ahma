@@ -442,3 +442,130 @@ impl AhmaMcpService {
         tracing::debug!("Sent notifications/sandbox/configured");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ── parse_root_uri_to_scope ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_valid_file_uri_returns_path() {
+        let result = parse_root_uri_to_scope("file:///tmp/workspace");
+        assert!(result.is_some(), "valid file URI should parse to Some(path)");
+        let path = result.unwrap();
+        assert_eq!(path, std::path::PathBuf::from("/tmp/workspace"));
+    }
+
+    #[test]
+    fn parse_non_file_uri_returns_none() {
+        let result = parse_root_uri_to_scope("https://github.com/user/repo");
+        assert!(result.is_none(), "https URI should be rejected");
+    }
+
+    #[test]
+    fn parse_invalid_uri_returns_none() {
+        let result = parse_root_uri_to_scope("not a uri at all !!!");
+        assert!(result.is_none(), "garbage input should return None");
+    }
+
+    #[test]
+    fn parse_empty_string_returns_none() {
+        assert!(parse_root_uri_to_scope("").is_none());
+    }
+
+    #[test]
+    fn parse_file_uri_with_spaces_encoded() {
+        // %20 = space
+        let result = parse_root_uri_to_scope("file:///tmp/my%20workspace");
+        assert!(result.is_some());
+        let path = result.unwrap();
+        assert_eq!(path, std::path::PathBuf::from("/tmp/my workspace"));
+    }
+
+    // ── snapshot_json_files ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn snapshot_empty_directory_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let snap = snapshot_json_files(tmp.path()).await;
+        assert!(snap.is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_counts_only_json_files() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("tool.json"), b"{}").unwrap();
+        std::fs::write(tmp.path().join("readme.md"), b"# hi").unwrap();
+        std::fs::write(tmp.path().join("config.toml"), b"[x]").unwrap();
+
+        let snap = snapshot_json_files(tmp.path()).await;
+        assert_eq!(snap.len(), 1, "only the .json file should appear in snapshot");
+        assert_eq!(snap[0].0, "tool.json");
+    }
+
+    #[tokio::test]
+    async fn snapshot_multiple_json_files_sorted() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("zebra.json"), b"{}").unwrap();
+        std::fs::write(tmp.path().join("alpha.json"), b"{}").unwrap();
+        std::fs::write(tmp.path().join("middle.json"), b"{}").unwrap();
+
+        let snap = snapshot_json_files(tmp.path()).await;
+        let names: Vec<&str> = snap.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["alpha.json", "middle.json", "zebra.json"]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reflects_file_sizes() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("small.json"), b"{}").unwrap();
+        std::fs::write(tmp.path().join("large.json"), b"{ \"key\": \"value\" }").unwrap();
+
+        let snap = snapshot_json_files(tmp.path()).await;
+        // alpha sort: large first
+        assert_eq!(snap[0].0, "large.json");
+        assert_eq!(snap[1].0, "small.json");
+        assert!(
+            snap[0].1 > snap[1].1,
+            "large.json should report a bigger size"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_detects_content_change() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("tool.json");
+        std::fs::write(&path, b"{}").unwrap();
+
+        let snap1 = snapshot_json_files(tmp.path()).await;
+        // Overwrite with longer content
+        std::fs::write(&path, b"{ \"key\": \"value\" }").unwrap();
+        let snap2 = snapshot_json_files(tmp.path()).await;
+
+        assert_ne!(snap1, snap2, "snapshot must differ after content change");
+    }
+
+    #[tokio::test]
+    async fn snapshot_nonexistent_dir_returns_empty() {
+        let path = std::path::Path::new("/this/path/does/not/exist/ever/12345");
+        let snap = snapshot_json_files(path).await;
+        assert!(snap.is_empty(), "nonexistent directory should yield empty snapshot");
+    }
+
+    // ── emit_sandbox_notification ────────────────────────────────────────────
+
+    #[test]
+    fn emit_sandbox_notification_no_error_does_not_panic() {
+        // We can't assert stdout content in a test (it's a process-level pipe),
+        // but we can verify the function completes without panicking.
+        emit_sandbox_notification("notifications/sandbox/configured", None);
+    }
+
+    #[test]
+    fn emit_sandbox_notification_with_error_does_not_panic() {
+        emit_sandbox_notification("notifications/sandbox/failed", Some("something went wrong"));
+    }
+}
+
