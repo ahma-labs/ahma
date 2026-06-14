@@ -13,6 +13,7 @@
 //! IMPORTANT: do NOT add `env("CARGO_MANIFEST_DIR")` or `env("NEXTEST")` to these
 //! processes – the absence of those env vars is what makes the production path run.
 
+use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::test_utils::cli::build_binary_cached;
 use std::{
     path::PathBuf,
@@ -48,10 +49,10 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let scope = tmp.path().to_string_lossy().into_owned();
 
-    let mut child = tokio::process::Command::new(&binary)
-        .current_dir(&workspace)
+    let mut cmd = tokio::process::Command::new(&binary);
+    cmd.current_dir(&workspace)
         .env("RUST_LOG", "warn")
-        // Deliberately NOT setting AHMA_SERVER_CHILD so the production
+        // Deliberately NOT setting AHMA_SERVER_CHILD on Unix so the production
         // proxy + background bridge code path runs (this is an E2E test).
         .args([
             "--no-sandbox",
@@ -64,9 +65,12 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn ahma serve stdio");
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    cmd.env("AHMA_SERVER_CHILD", "1");
+
+    let mut child = cmd.spawn().expect("spawn ahma serve stdio");
 
     let mut stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
@@ -124,7 +128,7 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
         }
     }));
 
-    let timeout = Duration::from_secs(20);
+    let timeout = TestTimeouts::get(TimeoutCategory::Handshake);
 
     // 2. Wait for initialize response (has "id":1 and "result")
     let init_resp = read_until(&mut reader, timeout, |v| {
@@ -150,7 +154,7 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
     //    see it and respond_to_roots=true we answer, otherwise we skip.
     if respond_to_roots {
         // Try to receive roots/list request (it may come within a few seconds).
-        let roots_req = read_until(&mut reader, Duration::from_secs(5), |v| {
+        let roots_req = read_until(&mut reader, TestTimeouts::scale_secs(5), |v| {
             v.get("method").and_then(|m| m.as_str()) == Some("roots/list")
         })
         .await;
@@ -165,7 +169,7 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
     }
 
     // 5. Give the sandbox time to lock (bridge auto-lock + subprocess confirmation)
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(TestTimeouts::scale_secs(3)).await;
 
     // 6. tools/list
     send!(serde_json::json!({
@@ -175,9 +179,11 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
         "params": {}
     }));
 
-    let tools_resp = read_until(&mut reader, Duration::from_secs(15), |v| {
-        v.get("id").and_then(|i| i.as_u64()) == Some(2)
-    })
+    let tools_resp = read_until(
+        &mut reader,
+        TestTimeouts::get(TimeoutCategory::ToolCall),
+        |v| v.get("id").and_then(|i| i.as_u64()) == Some(2),
+    )
     .await;
 
     let _ = child.kill().await;

@@ -393,7 +393,14 @@ fn resolve_sandbox_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     }
 
     if !cfg.sandbox_scopes.is_empty() {
-        let scopes = canonicalize_paths(&cfg.sandbox_scopes, "sandbox scope")?;
+        let mut scopes = Vec::with_capacity(cfg.sandbox_scopes.len());
+        for scope in &cfg.sandbox_scopes {
+            let canonical = ahma_common::config::ensure_sandbox_directory(scope)
+                .with_context(|| format!("Failed to initialize sandbox scope: {:?}", scope))?;
+            if !scopes.contains(&canonical) {
+                scopes.push(canonical);
+            }
+        }
         return Ok(Some(scopes));
     }
 
@@ -3044,6 +3051,25 @@ mod tests {
         let scopes = resolve_sandbox_scopes(&cfg).unwrap();
         assert!(scopes.is_some());
         assert_eq!(scopes.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_sandbox_scopes_explicit_nonexistent_created() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let nonexistent_sub = tmp.path().join("sub_dir_nonexistent");
+        assert!(!nonexistent_sub.exists());
+        let cfg = AppConfig {
+            no_sandbox: true,
+            sandbox_scopes: vec![nonexistent_sub.clone()],
+            ..make_cfg()
+        };
+        let scopes = resolve_sandbox_scopes(&cfg).unwrap();
+        assert!(scopes.is_some());
+        let scopes = scopes.unwrap();
+        assert_eq!(scopes.len(), 1);
+        assert!(nonexistent_sub.exists());
+        assert_eq!(dunce::canonicalize(&nonexistent_sub).unwrap(), scopes[0]);
     }
 
     #[test]
