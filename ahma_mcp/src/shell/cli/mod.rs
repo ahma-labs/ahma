@@ -2460,9 +2460,16 @@ mod tests {
     #[test]
     fn test_canonicalize_paths_invalid_fails() {
         init_test();
+        // Use a platform-appropriate path that `create_dir_all` cannot create:
+        // - Unix: /nonexistent/... fails (no root perms)
+        // - Windows: Z:\nonexistent\... fails (non-existent drive)
+        #[cfg(unix)]
+        let bad_path = PathBuf::from("/nonexistent/path/that/does/not/exist");
+        #[cfg(windows)]
+        let bad_path = PathBuf::from("Z:\\nonexistent\\path\\that\\does\\not\\exist");
         let cfg = AppConfig {
             no_sandbox: true,
-            sandbox_scopes: vec![PathBuf::from("/nonexistent/path/that/does/not/exist")],
+            sandbox_scopes: vec![bad_path],
             ..make_cfg()
         };
         let result = resolve_sandbox_scopes(&cfg);
