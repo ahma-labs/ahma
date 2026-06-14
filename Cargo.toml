@@ -85,7 +85,7 @@ opentelemetry-otlp = { version = "0.32.0", features = [
     "http-proto",
     "reqwest-rustls",
 ] }
-opentelemetry_sdk = { version = "0.32.0", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
 regex = "1.12"
 reqwest = { version = "0.13.4", default-features = false }
 rmcp = { version = "1.7", features = [

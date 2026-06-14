@@ -369,8 +369,8 @@ mod tests {
             f2.to_string_lossy().to_string(),
         ];
 
-        let staged = RmInterceptor::stage_paths_into_vault_trash(&trash_dir, &work, &targets)
-            .unwrap();
+        let staged =
+            RmInterceptor::stage_paths_into_vault_trash(&trash_dir, &work, &targets).unwrap();
 
         assert_eq!(staged.len(), 2, "both files should be staged");
         assert!(!f1.exists());

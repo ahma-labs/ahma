@@ -453,7 +453,10 @@ mod tests {
     #[test]
     fn parse_valid_file_uri_returns_path() {
         let result = parse_root_uri_to_scope("file:///tmp/workspace");
-        assert!(result.is_some(), "valid file URI should parse to Some(path)");
+        assert!(
+            result.is_some(),
+            "valid file URI should parse to Some(path)"
+        );
         let path = result.unwrap();
         assert_eq!(path, std::path::PathBuf::from("/tmp/workspace"));
     }
@@ -501,7 +504,11 @@ mod tests {
         std::fs::write(tmp.path().join("config.toml"), b"[x]").unwrap();
 
         let snap = snapshot_json_files(tmp.path()).await;
-        assert_eq!(snap.len(), 1, "only the .json file should appear in snapshot");
+        assert_eq!(
+            snap.len(),
+            1,
+            "only the .json file should appear in snapshot"
+        );
         assert_eq!(snap[0].0, "tool.json");
     }
 
@@ -551,7 +558,10 @@ mod tests {
     async fn snapshot_nonexistent_dir_returns_empty() {
         let path = std::path::Path::new("/this/path/does/not/exist/ever/12345");
         let snap = snapshot_json_files(path).await;
-        assert!(snap.is_empty(), "nonexistent directory should yield empty snapshot");
+        assert!(
+            snap.is_empty(),
+            "nonexistent directory should yield empty snapshot"
+        );
     }
 
     // ── emit_sandbox_notification ────────────────────────────────────────────
@@ -568,4 +578,3 @@ mod tests {
         emit_sandbox_notification("notifications/sandbox/failed", Some("something went wrong"));
     }
 }
-

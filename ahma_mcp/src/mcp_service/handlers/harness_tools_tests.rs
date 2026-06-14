@@ -199,9 +199,8 @@ async fn make_service_with(
         false,
     )
     .unwrap();
-    let adapter = Arc::new(
-        Adapter::new(Arc::clone(&monitor), shell_pool, Arc::new(sandbox)).unwrap(),
-    );
+    let adapter =
+        Arc::new(Adapter::new(Arc::clone(&monitor), shell_pool, Arc::new(sandbox)).unwrap());
     let service = AhmaMcpService::new(
         adapter,
         monitor,
@@ -212,7 +211,9 @@ async fn make_service_with(
     )
     .await
     .unwrap();
-    service.with_file_ops_provider(file_ops).with_web_page_fetcher(web)
+    service
+        .with_file_ops_provider(file_ops)
+        .with_web_page_fetcher(web)
 }
 
 fn make_args(pairs: &[(&str, Value)]) -> Map<String, Value> {
@@ -337,8 +338,10 @@ async fn file_search_missing_pattern_returns_error() {
 
 #[tokio::test]
 async fn file_search_success() {
-    let mut mock = MockFileOpsProvider::default();
-    mock.search_matches = vec!["src/main.rs".to_string(), "src/lib.rs".to_string()];
+    let mock = MockFileOpsProvider {
+        search_matches: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
+        ..Default::default()
+    };
     let svc = make_service_with(Arc::new(mock), Arc::new(MockWebPageFetcher::default())).await;
     let args = make_args(&[("pattern", json!("**/*.rs"))]);
     let result = svc.handle_file_search(args).await.unwrap();
@@ -453,7 +456,9 @@ async fn fetch_webpage_success() {
     let args = make_args(&[("url", json!("https://example.com"))]);
     let result = svc.handle_fetch_webpage(args).await.unwrap();
     let text = result.content[0].as_text().unwrap().text.as_str();
-    assert!(text.contains("page content") || text.contains("example.com") || text.contains("Example"));
+    assert!(
+        text.contains("page content") || text.contains("example.com") || text.contains("Example")
+    );
 }
 
 #[tokio::test]
@@ -549,10 +554,7 @@ async fn replace_in_file_missing_path_returns_error() {
         Arc::new(MockWebPageFetcher::default()),
     )
     .await;
-    let args = make_args(&[
-        ("old_str", json!("old")),
-        ("new_str", json!("new")),
-    ]);
+    let args = make_args(&[("old_str", json!("old")), ("new_str", json!("new"))]);
     let err = svc.handle_replace_in_file(args).await.unwrap_err();
     assert_eq!(err.code.0, -32602);
 }
@@ -564,10 +566,7 @@ async fn replace_in_file_missing_old_str_returns_error() {
         Arc::new(MockWebPageFetcher::default()),
     )
     .await;
-    let args = make_args(&[
-        ("path", json!("/tmp/test.txt")),
-        ("new_str", json!("new")),
-    ]);
+    let args = make_args(&[("path", json!("/tmp/test.txt")), ("new_str", json!("new"))]);
     let err = svc.handle_replace_in_file(args).await.unwrap_err();
     assert_eq!(err.code.0, -32602);
 }
@@ -579,10 +578,7 @@ async fn replace_in_file_missing_new_str_returns_error() {
         Arc::new(MockWebPageFetcher::default()),
     )
     .await;
-    let args = make_args(&[
-        ("path", json!("/tmp/test.txt")),
-        ("old_str", json!("old")),
-    ]);
+    let args = make_args(&[("path", json!("/tmp/test.txt")), ("old_str", json!("old"))]);
     let err = svc.handle_replace_in_file(args).await.unwrap_err();
     assert_eq!(err.code.0, -32602);
 }
@@ -625,10 +621,7 @@ async fn replace_in_file_provider_error_becomes_mcp_error() {
 #[test]
 fn read_file_schema_has_required_path() {
     let schema = super::read_file_schema();
-    let required = schema
-        .get("required")
-        .and_then(|v| v.as_array())
-        .unwrap();
+    let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
     assert!(required.iter().any(|v| v.as_str() == Some("path")));
 }
 
@@ -647,40 +640,28 @@ fn list_dir_schema_has_no_required_fields() {
 #[test]
 fn file_search_schema_requires_pattern() {
     let schema = super::file_search_schema();
-    let required = schema
-        .get("required")
-        .and_then(|v| v.as_array())
-        .unwrap();
+    let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
     assert!(required.iter().any(|v| v.as_str() == Some("pattern")));
 }
 
 #[test]
 fn grep_search_schema_requires_query() {
     let schema = super::grep_search_schema();
-    let required = schema
-        .get("required")
-        .and_then(|v| v.as_array())
-        .unwrap();
+    let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
     assert!(required.iter().any(|v| v.as_str() == Some("query")));
 }
 
 #[test]
 fn fetch_webpage_schema_requires_url() {
     let schema = super::fetch_webpage_schema();
-    let required = schema
-        .get("required")
-        .and_then(|v| v.as_array())
-        .unwrap();
+    let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
     assert!(required.iter().any(|v| v.as_str() == Some("url")));
 }
 
 #[test]
 fn write_file_schema_requires_path_and_content() {
     let schema = super::write_file_schema();
-    let required = schema
-        .get("required")
-        .and_then(|v| v.as_array())
-        .unwrap();
+    let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
     assert!(required.iter().any(|v| v.as_str() == Some("path")));
     assert!(required.iter().any(|v| v.as_str() == Some("content")));
 }
@@ -688,10 +669,7 @@ fn write_file_schema_requires_path_and_content() {
 #[test]
 fn replace_in_file_schema_requires_all_three() {
     let schema = super::replace_in_file_schema();
-    let required = schema
-        .get("required")
-        .and_then(|v| v.as_array())
-        .unwrap();
+    let required = schema.get("required").and_then(|v| v.as_array()).unwrap();
     let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
     assert!(required_strs.contains(&"path"));
     assert!(required_strs.contains(&"old_str"));
