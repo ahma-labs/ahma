@@ -3089,10 +3089,14 @@ mod tests {
         };
 
         let scopes = resolve_sandbox_scopes(&cfg).unwrap().unwrap();
-        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes.len(), 3);
 
         let expected_workdir = dunce::canonicalize(vault_root.join("workdir")).unwrap();
+        let expected_trash = dunce::canonicalize(vault_root.join("trash")).unwrap();
+        let expected_audit = dunce::canonicalize(vault_root.join("audit.jsonl")).unwrap();
         assert_eq!(scopes[0], expected_workdir);
+        assert_eq!(scopes[1], expected_trash);
+        assert_eq!(scopes[2], expected_audit);
         assert!(vault_root.join("inputs").is_dir());
         assert!(vault_root.join("workdir").is_dir());
         assert!(vault_root.join("outputs").is_dir());
