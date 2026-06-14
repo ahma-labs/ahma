@@ -1,193 +1,193 @@
 # Ahma Environment Variables
 
-> [!NOTE]
-> Most `AHMA_*` variables are **deprecated** in favour of `~/.ahma/settings.toml`.
-> When a deprecated variable is set, Ahma emits a `WARN` log entry pointing you to the settings file.
-> See [docs/settings.md](settings.md) for the migration table and the full settings reference.
-> The variables listed here remain accepted as fallbacks for backward compatibility.
+> [!IMPORTANT]
+> **`AHMA_*` configuration variables are RETIRED** (R-CFG1.2).
+> All `AHMA_*` variables listed below produce a `WARN` log at startup and their values are **ignored**.
+> Configure Ahma via `~/.ahma/settings.toml` or CLI flags instead.
+> Run `ahma settings init` to create a pre-documented settings file, or `ahma settings show` to inspect effective values.
 
-## Boolean flags
+## Variable classification
 
-Set to `1`, `true`, `yes`, or `on` to enable. Any other value (or absence) means disabled.
-
-## Path lists
-
-On Unix, multiple paths are colon-separated (e.g. `AHMA_SANDBOX_SCOPE=/a:/b`).  
-On Windows, use semicolons (`;`) as separators.
-
----
-
-## Tool Management
-
-| Variable | CLI equivalent | Default | Description |
-|---|---|---|---|
-| `AHMA_TOOLS_DIR` | `--tools-dir` | auto-detect `.ahma/` | Path to the directory containing JSON tool definitions. Takes precedence over the `--tools-dir` CLI flag when both are set. |
-| `AHMA_TIMEOUT` | `--timeout` | `360` | Default tool execution timeout in seconds. Individual tools can override this via the `timeout_seconds` field in their JSON definition. |
-| `AHMA_SYNC` | `--sync` | off | Force all tools to run synchronously. By default tools are async-first: if a result arrives within 5 seconds it is returned inline; otherwise an operation ID is returned and the result is pushed as a notification. |
-| `AHMA_HOT_RELOAD` | — | off | Watch the tools directory for JSON changes and reload tool definitions at runtime. **Security warning**: enabling this allows future writes to the tools directory to add or replace tools mid-session. Enable only while authoring tool definitions. |
-| `AHMA_SKIP_PROBES` | — | off | Skip tool availability probes at startup. Probes detect whether required executables (e.g. `cargo`, `git`) are installed and hide tools whose prerequisites are missing. Skip to reduce startup latency when you know all tools are available. |
-
-```bash
-# Use a shared tools directory
-AHMA_TOOLS_DIR=/shared/ahma-tools ahma serve stdio
-
-# Extend the default timeout for slow builds (env var or CLI flag)
-AHMA_TIMEOUT=600 ahma serve stdio
-ahma serve stdio --timeout 600
-
-# Force synchronous execution (env var or CLI flag)
-AHMA_SYNC=1 ahma serve stdio
-ahma serve stdio --sync
-```
+| Class | Meaning |
+|-------|---------|
+| **RETIRED** | Set by user, **ignored** with a startup `WARN`. Use the CLI flag or `~/.ahma/settings.toml` instead. |
+| **INTERNAL** | Set only by Ahma itself for parent→child process communication. Never set these manually. |
+| **PLATFORM** | Standard OS/ecosystem variables read by Ahma (e.g. `RUST_LOG`, `HOME`). Not `AHMA_*` prefixed. |
+| **INTERNAL/TEST** | Set only by test harness code (`#[cfg(test)]`). Never present in production binaries. |
 
 ---
 
-## Sandbox & Security
+## RETIRED — Tool Management
 
-See [docs/security-sandbox.md](security-sandbox.md) for full platform details, nested sandbox
-detection, and example `mcp.json` configurations.
+All previously accepted. Now ignored with a `WARN`. Use `~/.ahma/settings.toml` or CLI flags.
 
-| Variable | CLI equivalent | Default | Description |
-|---|---|---|---|
-| `AHMA_DISABLE_SANDBOX` | `--no-sandbox` | off | Disable the kernel sandbox entirely. **UNSAFE** — the AI can read and write anywhere on the filesystem. Use only in environments that provide their own containment (Docker, CI containers) or on hardware where the kernel sandbox is unsupported (e.g. Raspberry Pi with kernel < 5.13). |
-| `AHMA_SANDBOX_SCOPE` | — | current working directory | Colon-separated list of absolute paths that define the sandbox boundary. The AI can read and write only within these directories. If not set, the sandbox scope is the directory from which `ahma` was launched. |
-| `AHMA_SANDBOX_DEFER` | — | off | Defer sandbox lock until the MCP client sends a `roots/list` response. Use when the client supplies workspace roots at connection time and you want those roots to become the sandbox scope automatically. |
-| `AHMA_WORKING_DIRS` | — | — | Colon-separated fallback working directories used when `AHMA_SANDBOX_DEFER=1` is set but the client does not provide roots. Has no effect when `AHMA_SANDBOX_DEFER` is off. |
-| `AHMA_TMP_ACCESS` | `--tmp` | off | Add the system temp directory (`/tmp` or equivalent) to the sandbox scope. Useful for workflows that need scratch space (compilers, build systems). See [security-sandbox.md](security-sandbox.md) for security trade-offs. |
-| `AHMA_DISABLE_TEMP` | — | off | Block all access to the system temp directory. Takes precedence over `AHMA_TMP_ACCESS`. |
-| `AHMA_NO_PACKAGE_CACHE_WRITE` | `--no-package-cache-write` | off | Disable write access to package-manager caches (`~/.cargo/registry`, `~/.cargo/git`, and cargo lock files). By default these are writable so agents can fetch new dependencies. Set to `1` for strictest isolation. See [security-sandbox.md](security-sandbox.md#package-manager-cache-write---no-package-cache-write). |
+| Variable | Replacement | Default |
+|---|---|---|
+| `AHMA_TOOLS_DIR` | `--tools-dir` CLI flag or `tools.tools_dir` in settings.toml | auto-detect `.ahma/` |
+| `AHMA_TIMEOUT` | `--timeout` flag or `tools.timeout_secs` in settings.toml | `360` |
+| `AHMA_SYNC` | `--sync` flag or `tools.force_sync = true` in settings.toml | `false` |
+| `AHMA_HOT_RELOAD` | `--hot-reload` flag or `tools.hot_reload = true` in settings.toml | `false` |
+| `AHMA_SKIP_PROBES` | `--skip-probes` flag or `tools.skip_probes = true` in settings.toml | `false` |
+| `AHMA_MINIMIZE_TOKENS` | `--minimize-tokens` flag or `tools.minimize_tokens = true` in settings.toml | `false` |
+| `AHMA_SMALL_MODEL_HARNESS` | `--small-model-harness` flag or `tools.small_model_harness = true` in settings.toml | `false` |
+
+---
+
+## RETIRED — Sandbox & Security
+
+> [!WARNING]
+> Security-tier variables were immediately ignored (never honored) per R-CFG2.3. Preference-tier variables were honored during the migration window and are now also ignored.
+
+| Variable | Replacement |
+|---|---|
+| `AHMA_DISABLE_SANDBOX` | `--no-sandbox` CLI flag (**CLI-only** per R-CFG2.3) |
+| `AHMA_SANDBOX_SCOPE` | `--sandbox-scope` CLI flag or `sandbox.scopes` in user settings.toml |
+| `AHMA_SANDBOX_DEFER` | `--defer-sandbox` CLI flag or `sandbox.defer = true` in settings.toml |
+| `AHMA_WORKING_DIRS` | `--working-dir` CLI flag or `sandbox.working_dirs` in settings.toml |
+| `AHMA_TMP_ACCESS` | `--tmp` CLI flag or `sandbox.tmp_access = true` in settings.toml |
+| `AHMA_DISABLE_TEMP` | `--disable-temp-files` CLI flag or `sandbox.disable_temp = true` in settings.toml |
+| `AHMA_NO_PACKAGE_CACHE_WRITE` | `--no-package-cache-write` flag or `sandbox.package_cache_write = false` in settings.toml |
+| `AHMA_TASK_VAULT` | `--task-vault` CLI flag |
+
+---
+
+## RETIRED — Authentication
+
+| Variable | Replacement |
+|---|---|
+| `AHMA_REQUIRE_TOKEN` | `--require-token` CLI flag or `auth.require_token` in settings.toml |
+| `AHMA_REQUIRE_TOKEN_PATH` | `--require-token-path` CLI flag or `auth.require_token_path` in settings.toml |
+| `AHMA_RATE_LIMIT_RPS` | `--rate-limit-rps` CLI flag or `auth.rate_limit_rps` in settings.toml |
+| `AHMA_RATE_LIMIT_BURST` | `--rate-limit-burst` flag or `auth.rate_limit_burst` in settings.toml |
+
+---
+
+## RETIRED — Logging
+
+| Variable | Replacement |
+|---|---|
+| `AHMA_LOG_TARGET` | `logging.target = "stderr"` in settings.toml or `--log-to-stderr` CLI flag |
+| `AHMA_LOG_MONITOR` | `--log-monitor` CLI flag or `logging.log_monitor = true` in settings.toml |
+| `AHMA_MONITOR_RATE_LIMIT` | `--monitor-rate-limit` flag or `logging.monitor_rate_limit_secs` in settings.toml |
+
+---
+
+## RETIRED — HTTP Transport
+
+| Variable | Replacement |
+|---|---|
+| `AHMA_HTTP_PORT` | `--port` CLI flag on `serve http` subcommand |
+| `AHMA_UNIX_SOCKET` | `--unix-socket-path` CLI flag or `http.unix_socket_path` in settings.toml |
+| `AHMA_DISABLE_QUIC` | `--disable-quic` CLI flag or `http.disable_quic = true` in settings.toml |
+| `AHMA_DISABLE_HTTP1_1` | `--disable-http1-1` CLI flag or `http.disable_http1_1 = true` in settings.toml |
+| `AHMA_HANDSHAKE_TIMEOUT` | `--handshake-timeout` CLI flag or `http.handshake_timeout_secs` in settings.toml |
+
+---
+
+## RETIRED — TLS / Update
+
+| Variable | Replacement |
+|---|---|
+| `AHMA_TLS_DIR` | `--tls-dir` CLI flag |
+| `AHMA_INSECURE_SKIP_VERIFY` | `--insecure-skip-verify` CLI flag (**CLI-only** per R-CFG2.3) |
+| `AHMA_INSECURE_SKIP_SIGNATURE` | `--insecure-skip-signature` CLI flag (**CLI-only** per R-CFG2.3) |
+| `AHMA_PREFER_MUSL` | `--prefer-musl` CLI flag on `update` subcommand |
+| `AHMA_INSTALL_DIR` | `--install-dir` CLI flag on `update` subcommand |
+| `AHMA_INSTANCE_LABEL` | `--instance-label` CLI flag or `instance.label` in settings.toml |
 
 ---
 
 ## Terminal Hooks
 
-These variables control the behaviour of `ahma hooks exec` — the hook process that Cursor,
-Claude Code, and other supported agents invoke before running shell commands.
+These variables are used by hook subprocesses spawned by editors. They are set **before** the hook
+binary runs (by the editor or the user's shell profile) and cannot be replaced by CLI flags since
+hooks are invoked directly by the editor, not by ahma. They remain supported.
 
 | Variable | Default | Description |
 |---|---|---|
-| `AHMA_HOOKS` | `auto` | Controls whether the hook routes commands through ahma's sandbox. Values: `on` (always sandbox), `off` (always pass through to default terminal), `auto` (sandbox when an ahma MCP server is detected in editor config files). **`off` is the safe escape hatch** — set this to let commands run in the default terminal without uninstalling the hook. |
-| `AHMA_DISABLE_HOOKS` | off | Alias for `AHMA_HOOKS=off`. Set to `1` or `true` to disable hook routing. Takes effect immediately without requiring a Cursor restart. |
+| `AHMA_HOOKS` | `auto` | `on` = always sandbox, `off` = pass through, `auto` = sandbox when MCP server detected |
+| `AHMA_DISABLE_HOOKS` | off | Alias for `AHMA_HOOKS=off`. Set to `1` to disable hook routing. |
 
 ```bash
-# Temporarily disable sandbox routing while keeping the hook installed
-AHMA_HOOKS=off ahma serve stdio   # or just export in your shell
-
-# Always route through sandbox regardless of MCP config state
-AHMA_HOOKS=on
-
-# Auto mode (default): route when ahma MCP is configured, pass through when it's not
-AHMA_HOOKS=auto   # or unset
-```
-
-**Security note**: `AHMA_HOOKS` is read from the OS environment by the `ahma` binary, which the editor spawns for each hook invocation. An attacker-controlled command string cannot change this variable — it's set only by the shell before `ahma` is invoked. The three safe ways to turn off sandbox routing are:
-1. Set `AHMA_HOOKS=off` (or `AHMA_DISABLE_HOOKS=1`) in your shell profile
-2. Remove the `ahma` entry from `~/.cursor/mcp.json` (auto-mode sees no MCP → passes through)
-3. Run `ahma hooks uninstall` to remove the hook entries entirely
-
-```bash
-# Sandbox scoped to two project directories
-AHMA_SANDBOX_SCOPE=/projects/backend:/projects/frontend ahma serve stdio
-
-# Defer sandbox scope to whatever the IDE declares as the workspace root
-AHMA_SANDBOX_DEFER=1 ahma serve stdio
-
-# Defer with a fallback if the client doesn't provide roots
-AHMA_SANDBOX_DEFER=1 AHMA_WORKING_DIRS=/home/user/projects ahma serve stdio
-
-# Disable sandbox in a Docker container that provides its own isolation (env var or CLI flag)
-AHMA_DISABLE_SANDBOX=1 ahma serve stdio
-ahma serve stdio --no-sandbox
-
-# Allow build tools to write to the temp directory (env var or CLI flag)
-AHMA_TMP_ACCESS=1 ahma serve stdio
-ahma serve stdio --tmp
+# Temporarily disable hook routing without uninstalling
+AHMA_HOOKS=off
+# or
+AHMA_DISABLE_HOOKS=1
 ```
 
 ---
 
-## Logging
+## INTERNAL — Process Communication
 
-| Variable | CLI equivalent | Default | Description |
-|---|---|---|---|
-| `RUST_LOG` | — | `info` | Standard Rust log filter. Controls verbosity for all crates. Common values: `debug`, `info`, `warn`, `error`. Crate-specific filters (e.g. `ahma_mcp=debug,rmcp=warn`) are also supported. |
-| `AHMA_LOG_TARGET` | — | file (rolling) | Set to `stderr` to route all log output to stderr instead of the default rotating log file under `./logs/`. Useful for Docker, CI, or any environment where stdout/stderr is captured. |
-| `AHMA_LOG_MONITOR` | `--log-monitor` | off | Enable live log monitoring. Ahma tails the configured log stream through an LLM to detect issues in real time and push alerts as MCP progress notifications. See [docs/live-log-monitoring.md](live-log-monitoring.md) for setup. |
-| `AHMA_MONITOR_RATE_LIMIT` | `--monitor-rate-limit` | `60` | Minimum seconds between successive log-monitor alerts. Prevents alert storms when a persistent issue triggers repeated pattern matches. |
+> [!CAUTION]
+> These variables are set **only by Ahma itself** for parent→child subprocess communication.
+> Never set them manually — doing so may confuse the subprocess and produce unpredictable behavior.
 
-```bash
-# Debug logging to stderr (ideal for development)
-RUST_LOG=debug AHMA_LOG_TARGET=stderr ahma serve stdio
-
-# Enable live log monitoring with reduced rate limiting (env var or CLI flags)
-AHMA_LOG_MONITOR=1 AHMA_MONITOR_RATE_LIMIT=30 ahma serve stdio
-ahma serve stdio --log-monitor --monitor-rate-limit 30
-```
+| Variable | Set by | Purpose |
+|---|---|---|
+| `AHMA_SERVER_CHILD` | Parent bridge process | Tells a child subprocess it was spawned by a parent bridge. Equivalent to `--server-child` flag. |
+| `AHMA_MCP_ARGS` | HTTP bridge | Passes resolved tool configuration to the per-session subprocess. |
+| `AHMA_RESTARTED` | `re_exec_current_process()` | Prevents infinite re-exec loops during version-mismatch auto-restart. |
 
 ---
 
-## HTTP Transport
+## INTERNAL/TEST — Test Isolation
 
-These variables apply only when running `ahma serve http`. Most have equivalent CLI flags
-on the `serve http` subcommand; the environment variable and CLI flag can be used together
-(either enables the feature).
+> [!CAUTION]
+> These are set only by `init_test_daemon_isolation()` inside `#[cfg(test)]` code.
+> They are never present in production builds. Do not set these manually.
 
-See [docs/connection-modes.md](connection-modes.md) for full HTTP bridge setup, `mcp.json`
-examples, and streaming transport details.
-
-| Variable | CLI equivalent | Default | Description |
-|---|---|---|---|
-| `AHMA_DISABLE_QUIC` | `--disable-quic` | off | Disable HTTP/3 over QUIC. The bridge defaults to serving HTTP/2 (TCP) and HTTP/3 (QUIC) concurrently and advertising QUIC via the `Alt-Svc` header. Set this when UDP is blocked or QUIC causes connectivity issues. |
-| `AHMA_DISABLE_HTTP1_1` | `--disable-http1-1` | off | Require HTTP/2 or better; reject HTTP/1.1 connections. |
-| `AHMA_HANDSHAKE_TIMEOUT` | — | `45` | MCP handshake timeout in seconds. The server closes a session that does not complete the MCP initialize/notifications/initialized exchange within this window. |
-
-```bash
-# HTTP bridge on port 8080, TCP only, strict HTTP/2+
-AHMA_DISABLE_QUIC=1 AHMA_DISABLE_HTTP1_1=1 ahma serve http --port 8080
-
-# Extend handshake timeout for slow clients
-AHMA_HANDSHAKE_TIMEOUT=120 ahma serve http
-```
-
----
-
-## Update / Install
-
-These variables apply to `ahma update` and the Windows bootstrap script (`scripts/install.ps1`).
-
-| Variable | Description |
+| Variable | Purpose |
 |---|---|
-| `AHMA_INSTALL_DIR` | Install directory (default: `~/.local/bin` or `%USERPROFILE%\.local\bin`) |
-| `AHMA_PREFER_MUSL` | Set to `1` to prefer musl-linked Linux release binaries (auto-detected on Alpine) |
+| `AHMA_DAEMON_SOCK` | Isolates each test process's daemon to a unique Unix socket path |
+| `AHMA_DAEMON_PORT` | Isolates each test process's daemon to a unique TCP port (Windows) |
+| `AHMA_TEST_BINARY` | Locates the compiled test binary for in-process test helpers |
 
 ---
 
-## Quick reference
+## PLATFORM — Standard OS Variables
 
+These are standard ecosystem variables that Ahma reads but does not define:
+
+| Variable | Purpose |
+|---|---|
+| `RUST_LOG` | Log verbosity: `debug`, `info`, `warn`, `error`, or crate-specific filters |
+| `HOME` / `USERPROFILE` | Home directory for `~` expansion and `~/.ahma/` paths |
+| `XDG_RUNTIME_DIR` | Linux: per-user runtime directory for daemon socket |
+| `CARGO_HOME` | Cargo home override; affects package cache scope |
+| `PATH` | Executable search path |
+| `NO_COLOR` | Disables color output if set |
+| `OTEL_*` / `TRACEPARENT` | OpenTelemetry distributed tracing |
+
+---
+
+## Migration guide
+
+To migrate from environment variables to settings.toml:
+
+```bash
+# 1. Create the settings file with all options documented
+ahma settings init
+
+# 2. Edit it to set your preferences (e.g. timeout, log_monitor, etc.)
+# File location: ~/.ahma/settings.toml
+
+# 3. Verify the effective configuration
+ahma settings show
+
+# 4. Remove AHMA_* variables from your shell profile
 ```
-AHMA_TOOLS_DIR             Path to .ahma/ JSON tool definitions
-AHMA_TIMEOUT               Tool execution timeout (seconds, default 360)
-AHMA_SYNC                  Force synchronous execution (1=yes)
-AHMA_HOT_RELOAD            Reload tools on file change (1=yes)
-AHMA_SKIP_PROBES           Skip tool availability probes (1=yes)
 
-AHMA_DISABLE_SANDBOX       Disable kernel sandbox — UNSAFE (1=yes)
-AHMA_SANDBOX_SCOPE         Colon-separated sandbox scope dirs
-AHMA_SANDBOX_DEFER         Defer sandbox until client provides roots (1=yes)
-AHMA_WORKING_DIRS          Fallback dirs for deferred sandbox
-AHMA_TMP_ACCESS            Add temp dir to sandbox scope (1=yes)
-AHMA_DISABLE_TEMP          Block all temp dir access (1=yes)
-AHMA_NO_PACKAGE_CACHE_WRITE Disable package cache writes, e.g. cargo fetch (1=yes)
+For options that **must** be CLI flags (security-tier, R-CFG2.3), add them to the `args` array
+in your IDE's `mcp.json`:
 
-AHMA_HOOKS                 Hook routing: on | off | auto (default auto)
-AHMA_DISABLE_HOOKS         Alias for AHMA_HOOKS=off (1=yes)
-
-RUST_LOG                   Log verbosity (debug | info | warn | error)
-AHMA_LOG_TARGET            Log destination (stderr | file)
-AHMA_LOG_MONITOR           Enable live log monitoring (1=yes)
-AHMA_MONITOR_RATE_LIMIT    Min seconds between log alerts (default 60)
-
-AHMA_DISABLE_QUIC          Disable HTTP/3 QUIC (1=yes; also --disable-quic)
-AHMA_DISABLE_HTTP1_1       Require HTTP/2+ (1=yes; also --disable-http1-1)
-AHMA_HANDSHAKE_TIMEOUT     MCP handshake timeout seconds (default 45)
+```json
+{
+  "mcpServers": {
+    "ahma": {
+      "command": "ahma",
+      "args": ["serve", "stdio", "--timeout", "600", "--sandbox-scope", "/home/user/projects"]
+    }
+  }
+}
 ```

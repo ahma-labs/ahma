@@ -79,7 +79,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
 }
 ```
 
-**Antigravity** (sets `AHMA_SANDBOX_SCOPE` explicitly — Antigravity doesn't send `roots/list`):
+**Antigravity** (uses `--sandbox-scope` since Antigravity doesn't send `roots/list`):
 
 ```json
 {
@@ -92,18 +92,17 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
         "--tools",
         "rust,simplify",
         "--tmp",
-        "--log-monitor"
-      ],
-      "env": {
-        "AHMA_SANDBOX_SCOPE": "/Users/username"
-      }
+        "--log-monitor",
+        "--sandbox-scope",
+        "/Users/username"
+      ]
     }
   }
 }
+```
 
 > [!NOTE]
 > Replace `/Users/username` with your actual absolute home or project directory. Tilde expansion may not be supported depending on your MCP client's execution environment.
-```
 
 ## 2. HTTP Mode (EXPERIMENTAL)
 
@@ -151,10 +150,6 @@ ahma serve http
 
 # Explicit sandbox scope (for clients that don't send roots/list)
 ahma serve http --sandbox-scope /path/to/your/project
-
-# Via environment variable
-export AHMA_SANDBOX_SCOPE=/path/to/your/project
-ahma serve http
 
 # Custom port and host
 ahma serve http --http-port 8080 --http-host 127.0.0.1
@@ -255,7 +250,7 @@ For this local HTTP bridge endpoint, clients should expect HTTP/2 or HTTP/1.1.
 
 `ahma tui` upgrades to HTTP/3 (QUIC) when:
 1. The server returns an `Alt-Svc: h3=…` header, **and**
-2. Local TLS material exists at `~/.ahma/tls/` (or `$AHMA_TLS_DIR`).
+2. Local TLS material exists at `~/.ahma/tls/` (or via `--tls-dir`).
 
 Manage the local TLS certificate with the `ahma tls` subcommands:
 
@@ -272,4 +267,4 @@ ahma tls status
 
 The private key (`~/.ahma/tls/key.der`) is stored with mode `0600` (Unix). The certificate is self-signed and used only for local loopback QUIC sessions — it is not exposed to the network.
 
-Set `AHMA_DISABLE_QUIC=1` to prevent the HTTP/3 upgrade globally.
+Use `--disable-quic` flag to prevent the HTTP/3 upgrade.

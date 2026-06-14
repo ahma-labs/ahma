@@ -1,7 +1,6 @@
 use std::process::Command;
 
 pub const SANDBOX_BYPASS_ENV_VARS: &[&str] = &[
-    "NEXTEST",
     "NEXTEST_EXECUTION_MODE",
     "CARGO_TARGET_DIR",
     "RUST_TEST_THREADS",
@@ -27,9 +26,9 @@ impl SandboxTestEnv {
     /// When the *current* test process is running inside a nested sandbox
     /// (e.g., `mcp_ahma_run_terminal_command`, Cursor, VS Code, Docker), the child
     /// `ahma_mcp` binary would detect the nesting and exit before serving any
-    /// requests.  This helper adds `AHMA_DISABLE_SANDBOX=1` to the command so the
-    /// binary can start; application-level path security (path_security.rs) is
-    /// still active in that mode.
+    /// requests.  This helper adds `--no-sandbox` to the command so the binary
+    /// can start; application-level path security (path_security.rs) is still
+    /// active in that mode. (`AHMA_DISABLE_SANDBOX` env var is retired per R-CFG2.3.)
     ///
     /// Call this **after** `configure()` on every direct binary spawn.
     pub fn apply_nested_sandbox_override(cmd: &mut Command) -> &mut Command {

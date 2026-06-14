@@ -334,29 +334,29 @@ that define the shipped product surface and security-relevant runtime behavior.
 That includes the shipped `ahma` binary and the crates that define vaults,
 worker execution, renewal gates, cluster scheduling, and the user-facing TUI.
 
-### AGPL + Cryptographic Signing: Supply Chain Defense
+### AGPL + Build Verification: Supply Chain Defense
 
-AGPL and binary signing work together as a two-layer supply chain defense:
+AGPL and build verification work together as a two-layer supply chain defense:
 
 - **AGPL requires source disclosure**: anyone distributing a modified `ahma` binary or
   running a modified version over a network must publish the corresponding source.
   Closed-source backdoored forks cannot be legally distributed as "ahma".
 
-- **Binary signing closes the gap AGPL cannot**: source transparency is only useful if
+- **Build verification closes the gap AGPL cannot**: source transparency is only useful if
   you can verify the binary you installed actually came from that source.
-  Every prebuilt release is signed with an RSA-2048 key held exclusively inside
-  GitHub Actions secrets — never on any developer machine. The installer verifies
-  this signature before writing anything to disk.
+  Every prebuilt release is verified using GitHub Build Provenance Attestations (SLSA Level 3)
+  backed by Sigstore, ensuring the binary was built directly from the official repository
+  by the CI pipeline. The installer verifies this attestation before writing anything to disk.
 
 Together they protect against:
 
-| Attack | AGPL | Signing |
-|--------|------|---------|
-| Backdoored binary from unofficial mirror | — | ✓ Signature fails |
-| Closed-source fork distributed as "ahma" | ✓ AGPL violation | ✓ Signature fails |
+| Attack | AGPL | Verification |
+|--------|------|--------------|
+| Backdoored binary from unofficial mirror | — | ✓ Verification fails |
+| Closed-source fork distributed as "ahma" | ✓ AGPL violation | ✓ Verification fails |
 | DNS/CDN hijack serving a tampered binary | — | ✓ Hash mismatch |
-| Compromised GitHub release assets | — | ✓ Signature fails (key in Actions secret, not assets) |
-| Modified binary without modified source | ✓ AGPL violation | ✓ Signature fails |
+| Compromised GitHub release assets | — | ✓ Verification fails (cannot attest outside build workflow) |
+| Modified binary without modified source | ✓ AGPL violation | ✓ Verification fails |
 
 Building from source is always an option. AGPL means the source is always
 public and auditable:
@@ -364,8 +364,8 @@ public and auditable:
 cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked
 ```
 
-See [docs/release-signing.md](docs/release-signing.md) for the full signing
-architecture, verification commands, and key rotation procedure.
+See [docs/release-signing.md](docs/release-signing.md) for the release verification
+architecture, manual verification commands, and trust model details.
 
 ### Common uses
 

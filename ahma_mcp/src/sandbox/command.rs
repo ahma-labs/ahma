@@ -35,14 +35,11 @@ impl Sandbox {
 
         // Cargo can be configured (via config or env) to write its target dir outside
         // the session sandbox. Force it back inside the working directory.
-        // Also clear RUSTC_WRAPPER so external wrappers like sccache do not attempt
-        // to write to directories outside the secure sandbox scope.
         if std::path::Path::new(program)
             .file_name()
             .is_some_and(|n| n == "cargo")
         {
             cmd.env("CARGO_TARGET_DIR", working_dir.join("target"));
-            cmd.env("RUSTC_WRAPPER", "");
         }
         cmd
     }
@@ -183,7 +180,7 @@ mod tests {
         assert!(result.is_ok(), "create_command in Test mode should succeed");
     }
 
-    /// create_command recognizes "cargo" and sets CARGO_TARGET_DIR and RUSTC_WRAPPER env vars.
+    /// create_command recognizes "cargo" and sets CARGO_TARGET_DIR env var.
     #[test]
     fn test_create_command_cargo_sets_target_dir() {
         let td = tempdir().unwrap();
@@ -208,10 +205,6 @@ mod tests {
         assert_eq!(
             envs.get(std::ffi::OsStr::new("CARGO_TARGET_DIR")),
             Some(&Some(td.path().join("target").into_os_string()))
-        );
-        assert_eq!(
-            envs.get(std::ffi::OsStr::new("RUSTC_WRAPPER")),
-            Some(&Some(std::ffi::OsString::from("")))
         );
     }
 

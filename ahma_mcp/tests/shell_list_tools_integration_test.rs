@@ -76,7 +76,7 @@ fn test_list_tools_from_stdio_server() {
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let mcp_config_path = temp_dir.path().join("mcp.json");
     let mcp_config = format!(
-        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
+        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--server-child","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
         cmd = ahma_binary.to_str().unwrap().replace('\\', "/"),
         tools = tools_dir.to_str().unwrap().replace('\\', "/")
     );
@@ -137,7 +137,7 @@ fn test_list_tools_json_format() {
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let mcp_config_path = temp_dir.path().join("mcp.json");
     let mcp_config = format!(
-        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
+        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--server-child","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
         cmd = ahma_binary.to_str().unwrap().replace('\\', "/"),
         tools = tools_dir.to_str().unwrap().replace('\\', "/")
     );
@@ -200,7 +200,7 @@ fn test_list_tools_output_format() {
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let mcp_config_path = temp_dir.path().join("mcp.json");
     let mcp_config = format!(
-        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
+        r#"{{"mcpServers":{{"test":{{"command":"{cmd}","args":["--no-sandbox","--skip-probes","--server-child","--tools-dir","{tools}","serve","stdio"]}}}}}}"#,
         cmd = ahma_binary.to_str().unwrap().replace('\\', "/"),
         tools = tools_dir.to_str().unwrap().replace('\\', "/")
     );
@@ -264,6 +264,7 @@ fn test_list_tools_trailing_args() {
             ahma_binary.to_str().unwrap(),
             "--no-sandbox",
             "--skip-probes",
+            "--server-child",
             "--tools-dir",
             tools_dir.to_str().unwrap(),
             "serve",

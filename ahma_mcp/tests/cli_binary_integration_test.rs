@@ -94,11 +94,8 @@ mod ahma_mcp_tests {
 
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .args([
-                "--tools-dir",
-                tools_dir.to_str().unwrap(),
-                "nonexistent_tool",
-            ])
+            .args(["--tools-dir", tools_dir.to_str().unwrap()])
+            .args(["tool", "run", "nonexistent_tool"])
             .output()
             .expect("Failed to execute ahma_mcp with invalid tool");
 
@@ -128,8 +125,9 @@ mod ahma_mcp_tests {
         // Check if file_tools exists (a simple tool to test with)
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .env("AHMA_TOOLS_DIR", tools_dir.to_str().unwrap())
-            .args(["run", "file-tools_pwd"])
+            .args(["--tools-dir"])
+            .arg(&tools_dir)
+            .args(["tool", "run", "file-tools_pwd"])
             .output()
             .expect("Failed to execute ahma_mcp with file_tools_pwd");
 
@@ -167,11 +165,8 @@ mod ahma_mcp_tests {
         // Note: This test behavior depends on the test runner's TTY state
         let binary = build_binary_cached("ahma_bin", "ahma");
         let workspace = get_workspace_dir();
-        let tools_dir = workspace.join(".ahma");
-
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .env("AHMA_TOOLS_DIR", tools_dir.to_str().unwrap())
             .args(["serve", "stdio"])
             .output()
             .expect("Failed to execute ahma_mcp in stdio mode");
@@ -467,9 +462,9 @@ mod ahma_list_tools_mode_tests {
     fn test_ahma_mcp_list_tools_no_connection_method() {
         let binary = build_binary_cached("ahma_bin", "ahma");
 
-        // Running --list-tools without any connection method should fail gracefully
+        // Running tool list without any connection method should fail gracefully
         let output = test_command(&binary)
-            .arg("--list-tools")
+            .args(["tool", "list"])
             .output()
             .expect("Failed to execute ahma_mcp --list-tools");
 
@@ -496,15 +491,11 @@ mod ahma_list_tools_mode_tests {
 
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .args([
-                "--list-tools",
-                "--server",
-                &format!(
-                    "{} --tools-dir {}",
-                    binary.to_str().unwrap(),
-                    tools_dir.to_str().unwrap()
-                ),
-            ])
+            .args(["tool", "list", "--"])
+            .arg(&binary)
+            .args(["--server-child", "--tools-dir"])
+            .arg(&tools_dir)
+            .args(["serve", "stdio"])
             .output()
             .expect("Failed to execute ahma_mcp --list-tools with stdio server");
 
@@ -536,17 +527,11 @@ mod ahma_list_tools_mode_tests {
 
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .args([
-                "--list-tools",
-                "--format",
-                "json",
-                "--server",
-                &format!(
-                    "{} --tools-dir {}",
-                    binary.to_str().unwrap(),
-                    tools_dir.to_str().unwrap()
-                ),
-            ])
+            .args(["tool", "list", "--format", "json", "--"])
+            .arg(&binary)
+            .args(["--server-child", "--tools-dir"])
+            .arg(&tools_dir)
+            .args(["serve", "stdio"])
             .output()
             .expect("Failed to execute ahma_mcp --list-tools --format json");
 
@@ -599,7 +584,8 @@ mod ahma_list_tools_mode_tests {
         // Execute the tool via CLI run subcommand
         // ahma tool run <tool_name> -- [RAW_ARGS]
         let output = test_command(&binary)
-            .env("AHMA_TOOLS_DIR", &tools_dir)
+            .args(["--tools-dir"])
+            .arg(&tools_dir)
             .args(["tool", "run", "test_echo", "--", "hello-cli-mode"])
             .output()
             .expect("Failed to execute ahma_mcp in CLI mode");

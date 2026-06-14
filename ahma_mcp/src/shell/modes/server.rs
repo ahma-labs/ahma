@@ -664,25 +664,25 @@ async fn spawn_background_bridge(
     Ok(())
 }
 
-/// Returns true when the process is running inside a test harness or as a server-child.
-/// In these modes we skip the background bridge spawn and run the service directly.
+/// Returns true when the process is running as a server-child subprocess.
+/// In this mode we skip the background bridge spawn and run the service directly.
+/// Detection is via the `--server-child` CLI flag or the `AHMA_SERVER_CHILD`
+/// internal plumbing variable (set only by the parent ahma process).
 fn is_test_or_server_child(config: &AppConfig) -> bool {
-    std::env::var("NEXTEST").is_ok()
-        || std::env::var("CARGO_MANIFEST_DIR").is_ok()
-        || std::env::var("AHMA_SERVER_CHILD").is_ok()
-        || config.is_server_child
+    std::env::var("AHMA_SERVER_CHILD").is_ok() || config.is_server_child
 }
 
 /// Resolve the Unix socket path and HTTP URL used to communicate with the background bridge.
 /// Returns `(socket_path_string, http_url_string)`.
 fn resolve_bridge_endpoints(config: &AppConfig) -> (String, String) {
-    let socket_path = std::env::var("AHMA_UNIX_SOCKET").unwrap_or_else(|_| {
-        if config.unix_socket_path.is_empty() {
-            "/tmp/ahma.sock".to_string()
-        } else {
-            config.unix_socket_path.clone()
-        }
-    });
+    // AHMA_UNIX_SOCKET is retired per R-CFG1.2. Use --unix-socket-path CLI flag or
+    // settings.toml instead. The value comes from AppConfig.unix_socket_path which
+    // was already resolved at startup.
+    let socket_path = if config.unix_socket_path.is_empty() {
+        "/tmp/ahma.sock".to_string()
+    } else {
+        config.unix_socket_path.clone()
+    };
     let http_url = format!("http://{}:{}", config.http_host, config.http_port);
     (socket_path, http_url)
 }
@@ -754,7 +754,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         match config.tools_dir.clone() {
             Some(tools_dir) => service_handler.start_config_watcher(tools_dir, config.clone()),
             None => tracing::warn!(
-                "AHMA_HOT_RELOAD=1 but no tools directory is configured; hot-reload is disabled"
+                "--hot-reload is set but no tools directory is configured; hot-reload is disabled"
             ),
         }
     }

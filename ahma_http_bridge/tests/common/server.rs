@@ -514,7 +514,18 @@ pub async fn spawn_server_guard_with_config_extra_env(
     })?;
     let workspace = workspace_dir();
     let mut spec = build_server_spec(tools_dir, sandbox_scope, handshake_timeout_secs);
-    spec.env.extend_from_slice(extra_env);
+    let mut filtered_env = Vec::new();
+    for (k, v) in extra_env {
+        if k == "AHMA_TASK_VAULT" {
+            if let Some(pos) = spec.args.iter().position(|arg| arg == "serve") {
+                spec.args.insert(pos, v.clone());
+                spec.args.insert(pos, "--task-vault".to_string());
+            }
+        } else {
+            filtered_env.push((k.clone(), v.clone()));
+        }
+    }
+    spec.env.extend(filtered_env);
 
     eprintln!(
         "[TestServer] Starting custom server with scope {}",

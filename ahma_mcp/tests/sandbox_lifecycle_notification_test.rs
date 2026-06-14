@@ -21,17 +21,22 @@ impl Drop for ChildGuard {
 }
 
 fn spawn_mcp_server(binary: &Path, temp_dir: &Path, tools_dir: &Path) -> Child {
-    // AHMA_DISABLE_SANDBOX=1: this test verifies lifecycle notification emission,
-    // not sandbox enforcement. Disabling avoids Landlock/seatbelt interactions and
-    // makes the test identical across all CI platforms.
-    // AHMA_SKIP_PROBES=1: no tools need availability probing; skip the startup delay.
+    // Use CLI flags instead of retired AHMA_* env vars (R-CFG1.2).
+    // AHMA_SERVER_CHILD=1: tells the subprocess it's a server-child, skipping the
+    //   background HTTP bridge spawn (the INTERNAL plumbing var for this purpose).
+    // --no-sandbox: this test verifies lifecycle notification emission, not sandbox
+    //   enforcement. Avoids Landlock/seatbelt interactions across CI platforms.
+    // --skip-probes: no tools need availability probing; skip the startup delay.
     Command::new(binary)
         .args(["serve", "stdio"])
+        .arg("--no-sandbox")
+        .arg("--skip-probes")
+        .arg("--tools-dir")
+        .arg(tools_dir)
+        .arg("--sandbox-scope")
+        .arg(temp_dir)
         .current_dir(temp_dir)
-        .env("AHMA_SANDBOX_SCOPE", temp_dir)
-        .env("AHMA_TOOLS_DIR", tools_dir)
-        .env("AHMA_DISABLE_SANDBOX", "1")
-        .env("AHMA_SKIP_PROBES", "1")
+        .env("AHMA_SERVER_CHILD", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

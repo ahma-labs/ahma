@@ -88,11 +88,11 @@ mod mode_flags {
 
         let mut child = std::process::Command::new(&binary)
             .current_dir(&workspace)
-            .env("AHMA_DISABLE_SANDBOX", "1")
             .args([
                 "serve",
                 "--tools-dir",
                 tools_dir.to_str().unwrap(),
+                "--no-sandbox",
                 "http",
                 "--port",
                 "0", // OS assigns a free port; sentinel carries the actual value
@@ -251,15 +251,21 @@ mod no_sandbox_flag {
         }"#;
         std::fs::write(tools_dir.join("no_sandbox_test.json"), tool).unwrap();
 
-        // Run with env vars replacing removed CLI flags
+        // Run with CLI flags instead of retired env vars
         let output = Command::new(&binary)
-            .env("AHMA_DISABLE_SANDBOX", "1")
             .env("AHMA_LOG_TARGET", "stderr")
-            .env("AHMA_TOOLS_DIR", tools_dir.to_str().unwrap())
-            .env("AHMA_SANDBOX_SCOPE", temp.path().to_str().unwrap())
-            .args(["tool", "run", "no_sandbox_test"])
+            .args([
+                "--no-sandbox",
+                "--tools-dir",
+                tools_dir.to_str().unwrap(),
+                "--sandbox-scope",
+                temp.path().to_str().unwrap(),
+                "tool",
+                "run",
+                "no_sandbox_test",
+            ])
             .output()
-            .expect("Failed to execute with AHMA_DISABLE_SANDBOX");
+            .expect("Failed to execute with --no-sandbox");
 
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -282,16 +288,12 @@ mod no_sandbox_flag {
 
         let output = Command::new(&binary)
             .current_dir(&workspace)
-            .env("AHMA_DISABLE_SANDBOX", "1")
             .args(["--help"])
             .output()
-            .expect("Failed to execute with AHMA_DISABLE_SANDBOX env");
+            .expect("Failed to execute --help");
 
-        // --help should still work regardless of sandbox setting
-        assert!(
-            output.status.success(),
-            "Help should work with AHMA_DISABLE_SANDBOX set"
-        );
+        // --help should still work
+        assert!(output.status.success(), "Help should work");
     }
 }
 
@@ -467,9 +469,11 @@ mod sandbox_scope {
         }"#;
         std::fs::write(tools_dir.join("env_scope_test.json"), tool).unwrap();
 
+        // test_sandbox_scope_cli_flag: verify --sandbox-scope works via CLI flag
         let output = Command::new(&binary)
-            .env("AHMA_SANDBOX_SCOPE", temp.path().to_str().unwrap())
             .args([
+                "--sandbox-scope",
+                temp.path().to_str().unwrap(),
                 "--tools-dir",
                 tools_dir.to_str().unwrap(),
                 "env_scope_test",
@@ -477,14 +481,14 @@ mod sandbox_scope {
                 temp.path().to_str().unwrap(),
             ])
             .output()
-            .expect("Failed to execute with AHMA_SANDBOX_SCOPE");
+            .expect("Failed to execute with --sandbox-scope");
 
-        // Should accept the env var sandbox scope
+        // Should accept the --sandbox-scope CLI flag
         // (either succeed or fail for unrelated reason)
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success() || !stderr.contains("sandbox scope"),
-            "Should accept AHMA_SANDBOX_SCOPE env var. Got: {}",
+            "Should accept --sandbox-scope flag. Got: {}",
             stderr
         );
     }
@@ -773,16 +777,22 @@ mod combined_flags {
         }"#;
         std::fs::write(tools_dir.join("combined_test.json"), tool).unwrap();
 
-        // Combine multiple env vars (replacing removed flags) with run subcommand
+        // Combine multiple flags with run subcommand
         let output = test_command(&binary)
             .env("RUST_LOG", "debug")
-            .env("AHMA_SYNC", "1")
-            .env("AHMA_LOG_TARGET", "stderr")
-            .env("AHMA_TOOLS_DIR", tools_dir.to_str().unwrap())
-            .env("AHMA_SANDBOX_SCOPE", temp.path().to_str().unwrap())
-            .args(["tool", "run", "combined_test"])
+            .args([
+                "--sync",
+                "--log-to-stderr",
+                "--sandbox-scope",
+                temp.path().to_str().unwrap(),
+                "tool",
+                "run",
+                "--tools-dir",
+                tools_dir.to_str().unwrap(),
+                "combined_test",
+            ])
             .output()
-            .expect("Failed to execute with combined env vars");
+            .expect("Failed to execute with combined flags");
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         let _stdout = String::from_utf8_lossy(&output.stdout);

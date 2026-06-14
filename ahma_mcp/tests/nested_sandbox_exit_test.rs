@@ -110,11 +110,12 @@ fn test_nested_sandbox_detection_exits_with_error() {
     // run subcommand triggers sandbox checks and exits after command completion
     let output = Command::new("sandbox-exec")
         .current_dir(&workspace_dir)
-        .env("AHMA_TOOLS_DIR", ".ahma")
         .args([
             "-p",
             outer_sandbox_profile,
             binary.to_str().unwrap(),
+            "--tools-dir",
+            ".ahma",
             "tool",
             "run",
             // run subcommand: execute run_terminal_command with echo (command as single arg)

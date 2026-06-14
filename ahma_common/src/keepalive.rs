@@ -108,3 +108,291 @@ pub fn spawn_keepalive_task<T: KeepAlive + Send + Sync + 'static>(
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    struct MockKeepAlive {
+        pings_sent: Arc<AtomicU64>,
+        heartbeats_sent: Arc<Mutex<Vec<HeartbeatPayload>>>,
+        time_since_last_received: Arc<Mutex<Duration>>,
+        heartbeat_timeout: Duration,
+        is_ahma_peer: bool,
+        supports_active_pings: bool,
+        timeout_tx: mpsc::Sender<()>,
+        fail_sends: bool,
+    }
+
+    impl KeepAlive for MockKeepAlive {
+        async fn send_standard_ping(&self) -> anyhow::Result<()> {
+            if self.fail_sends {
+                return Err(anyhow::anyhow!("send failed"));
+            }
+            self.pings_sent.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn send_enhanced_heartbeat(&self, payload: HeartbeatPayload) -> anyhow::Result<()> {
+            if self.fail_sends {
+                return Err(anyhow::anyhow!("send failed"));
+            }
+            self.heartbeats_sent.lock().unwrap().push(payload);
+            Ok(())
+        }
+
+        fn time_since_last_received(&self) -> Duration {
+            *self.time_since_last_received.lock().unwrap()
+        }
+
+        fn heartbeat_timeout(&self) -> Duration {
+            self.heartbeat_timeout
+        }
+
+        fn is_ahma_peer(&self) -> bool {
+            self.is_ahma_peer
+        }
+
+        fn supports_active_pings(&self) -> bool {
+            self.supports_active_pings
+        }
+
+        async fn on_timeout(&self) {
+            let _ = self.timeout_tx.send(()).await;
+        }
+    }
+
+    #[test]
+    fn test_current_timestamp_ms() {
+        let ts1 = current_timestamp_ms();
+        std::thread::sleep(Duration::from_millis(2));
+        let ts2 = current_timestamp_ms();
+        assert!(ts2 >= ts1);
+        assert!(ts1 > 0);
+    }
+
+    #[tokio::test]
+    async fn test_enhanced_heartbeat_sent() {
+        let pings_sent = Arc::new(AtomicU64::new(0));
+        let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
+        let time_since_last_received = Arc::new(Mutex::new(Duration::ZERO));
+        let (timeout_tx, _timeout_rx) = mpsc::channel(1);
+
+        let conn = Arc::new(MockKeepAlive {
+            pings_sent: pings_sent.clone(),
+            heartbeats_sent: heartbeats_sent.clone(),
+            time_since_last_received: time_since_last_received.clone(),
+            heartbeat_timeout: Duration::from_millis(30),
+            is_ahma_peer: true,
+            supports_active_pings: true,
+            timeout_tx,
+            fail_sends: false,
+        });
+
+        let last_sent_signal = Arc::new(AtomicU64::new(0));
+        spawn_keepalive_task(
+            conn.clone(),
+            last_sent_signal.clone(),
+            "1.2.3".to_string(),
+            "abc".to_string(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let heartbeats = heartbeats_sent.lock().unwrap();
+        assert!(
+            !heartbeats.is_empty(),
+            "enhanced heartbeat should have been sent"
+        );
+        assert_eq!(heartbeats[0].version, "1.2.3");
+        assert_eq!(heartbeats[0].hash, "abc");
+        assert!(heartbeats[0].timestamp > 0);
+        assert_eq!(pings_sent.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_standard_ping_sent() {
+        let pings_sent = Arc::new(AtomicU64::new(0));
+        let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
+        let time_since_last_received = Arc::new(Mutex::new(Duration::ZERO));
+        let (timeout_tx, _timeout_rx) = mpsc::channel(1);
+
+        let conn = Arc::new(MockKeepAlive {
+            pings_sent: pings_sent.clone(),
+            heartbeats_sent: heartbeats_sent.clone(),
+            time_since_last_received: time_since_last_received.clone(),
+            heartbeat_timeout: Duration::from_millis(30),
+            is_ahma_peer: false,
+            supports_active_pings: true,
+            timeout_tx,
+            fail_sends: false,
+        });
+
+        let last_sent_signal = Arc::new(AtomicU64::new(0));
+        spawn_keepalive_task(
+            conn.clone(),
+            last_sent_signal.clone(),
+            "1.2.3".to_string(),
+            "abc".to_string(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        assert!(
+            pings_sent.load(Ordering::Relaxed) > 0,
+            "standard ping should have been sent"
+        );
+        assert!(
+            heartbeats_sent.lock().unwrap().is_empty(),
+            "no enhanced heartbeat should be sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_passive_monitoring() {
+        let pings_sent = Arc::new(AtomicU64::new(0));
+        let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
+        let time_since_last_received = Arc::new(Mutex::new(Duration::ZERO));
+        let (timeout_tx, _timeout_rx) = mpsc::channel(1);
+
+        let conn = Arc::new(MockKeepAlive {
+            pings_sent: pings_sent.clone(),
+            heartbeats_sent: heartbeats_sent.clone(),
+            time_since_last_received: time_since_last_received.clone(),
+            heartbeat_timeout: Duration::from_millis(30),
+            is_ahma_peer: false,
+            supports_active_pings: false,
+            timeout_tx,
+            fail_sends: false,
+        });
+
+        let last_sent_signal = Arc::new(AtomicU64::new(0));
+        spawn_keepalive_task(
+            conn.clone(),
+            last_sent_signal.clone(),
+            "1.2.3".to_string(),
+            "abc".to_string(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        assert_eq!(
+            pings_sent.load(Ordering::Relaxed),
+            0,
+            "no standard ping should be sent"
+        );
+        assert!(
+            heartbeats_sent.lock().unwrap().is_empty(),
+            "no enhanced heartbeat should be sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_termination() {
+        let pings_sent = Arc::new(AtomicU64::new(0));
+        let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
+        let time_since_last_received = Arc::new(Mutex::new(Duration::ZERO));
+        let (timeout_tx, mut timeout_rx) = mpsc::channel(1);
+
+        let conn = Arc::new(MockKeepAlive {
+            pings_sent: pings_sent.clone(),
+            heartbeats_sent: heartbeats_sent.clone(),
+            time_since_last_received: time_since_last_received.clone(),
+            heartbeat_timeout: Duration::from_millis(15),
+            is_ahma_peer: true,
+            supports_active_pings: true,
+            timeout_tx,
+            fail_sends: false,
+        });
+
+        *time_since_last_received.lock().unwrap() = Duration::from_millis(20);
+
+        let last_sent_signal = Arc::new(AtomicU64::new(0));
+        spawn_keepalive_task(
+            conn.clone(),
+            last_sent_signal.clone(),
+            "1.2.3".to_string(),
+            "abc".to_string(),
+        );
+
+        let rx_timeout = tokio::time::timeout(Duration::from_millis(50), timeout_rx.recv()).await;
+        assert!(
+            rx_timeout.is_ok(),
+            "on_timeout should be called and terminate the task"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_error_termination() {
+        let pings_sent = Arc::new(AtomicU64::new(0));
+        let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
+        let time_since_last_received = Arc::new(Mutex::new(Duration::ZERO));
+        let (timeout_tx, mut timeout_rx) = mpsc::channel(1);
+
+        let conn = Arc::new(MockKeepAlive {
+            pings_sent: pings_sent.clone(),
+            heartbeats_sent: heartbeats_sent.clone(),
+            time_since_last_received: time_since_last_received.clone(),
+            heartbeat_timeout: Duration::from_millis(15),
+            is_ahma_peer: true,
+            supports_active_pings: true,
+            timeout_tx,
+            fail_sends: true,
+        });
+
+        let last_sent_signal = Arc::new(AtomicU64::new(0));
+        spawn_keepalive_task(
+            conn.clone(),
+            last_sent_signal.clone(),
+            "1.2.3".to_string(),
+            "abc".to_string(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let rx_timeout = tokio::time::timeout(Duration::from_millis(20), timeout_rx.recv()).await;
+        assert!(
+            rx_timeout.is_err(),
+            "on_timeout should not be called because task terminated early on send error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiting() {
+        let pings_sent = Arc::new(AtomicU64::new(0));
+        let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
+        let time_since_last_received = Arc::new(Mutex::new(Duration::ZERO));
+        let (timeout_tx, _timeout_rx) = mpsc::channel(1);
+
+        let conn = Arc::new(MockKeepAlive {
+            pings_sent: pings_sent.clone(),
+            heartbeats_sent: heartbeats_sent.clone(),
+            time_since_last_received: time_since_last_received.clone(),
+            heartbeat_timeout: Duration::from_millis(60),
+            is_ahma_peer: true,
+            supports_active_pings: true,
+            timeout_tx,
+            fail_sends: false,
+        });
+
+        let last_sent_signal = Arc::new(AtomicU64::new(current_timestamp_ms()));
+
+        spawn_keepalive_task(
+            conn.clone(),
+            last_sent_signal.clone(),
+            "1.2.3".to_string(),
+            "abc".to_string(),
+        );
+
+        last_sent_signal.store(current_timestamp_ms() + 10000, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let heartbeats = heartbeats_sent.lock().unwrap();
+        assert!(
+            heartbeats.is_empty(),
+            "heartbeat should be skipped because of rate limiting"
+        );
+    }
+}

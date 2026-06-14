@@ -44,13 +44,6 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
     let _ = std::fs::remove_file(&socket_path);
     let socket_str = socket_path.to_string_lossy().into_owned();
 
-    // Find a free TCP port to avoid conflicts.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind free port")
-        .local_addr()
-        .expect("local_addr")
-        .port();
-
     // Use a tmp dir as the sandbox scope so the bridge can lock without real roots.
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let scope = tmp.path().to_string_lossy().into_owned();
@@ -58,12 +51,8 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
     let mut child = tokio::process::Command::new(&binary)
         .current_dir(&workspace)
         .env("RUST_LOG", "warn")
-        .env("AHMA_UNIX_SOCKET", &socket_str)
-        .env("AHMA_HTTP_PORT", port.to_string())
-        // Deliberately DO NOT set CARGO_MANIFEST_DIR or NEXTEST so the
-        // production proxy + background bridge path runs.
-        .env_remove("NEXTEST")
-        .env_remove("CARGO_MANIFEST_DIR")
+        // Deliberately NOT setting AHMA_SERVER_CHILD so the production
+        // proxy + background bridge code path runs (this is an E2E test).
         .args([
             "--no-sandbox",
             "--unix-socket-path",
