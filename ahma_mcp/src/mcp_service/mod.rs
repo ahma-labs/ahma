@@ -907,10 +907,6 @@ impl AhmaMcpService {
 }
 
 #[async_trait::async_trait]
-#[expect(
-    clippy::manual_async_fn,
-    reason = "async-trait desugars to manual Future returns; required by rmcp ServerHandler trait contract"
-)]
 impl ServerHandler for AhmaMcpService {
     fn get_info(&self) -> ServerInfo {
         let instructions = "Ahma exposes shell, build, test, and log-monitoring tools that run inside a \
@@ -949,6 +945,10 @@ impl ServerHandler for AhmaMcpService {
         &self,
         context: NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.last_received_signal.store(
+            ahma_common::keepalive::current_timestamp_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         async move {
             tracing::info!("Client connected: {context:?}");
 
@@ -1002,6 +1002,10 @@ impl ServerHandler for AhmaMcpService {
         &self,
         context: NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.last_received_signal.store(
+            ahma_common::keepalive::current_timestamp_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         async move {
             tracing::info!("Received roots/list_changed notification");
 
@@ -1021,6 +1025,10 @@ impl ServerHandler for AhmaMcpService {
         notification: CancelledNotificationParam,
         _context: NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.last_received_signal.store(
+            ahma_common::keepalive::current_timestamp_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         async move {
             let request_id = format!("{:?}", notification.request_id);
             let reason = notification
@@ -1086,6 +1094,10 @@ impl ServerHandler for AhmaMcpService {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        self.last_received_signal.store(
+            ahma_common::keepalive::current_timestamp_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         async move {
             let mut tools = vec![
                 // Hard-wired await command - always available
@@ -1997,7 +2009,7 @@ impl ahma_common::keepalive::KeepAlive for AhmaMcpService {
     }
 
     fn heartbeat_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(60)
+        ahma_common::timeouts::TestTimeouts::scale(std::time::Duration::from_secs(60))
     }
 
     fn is_ahma_peer(&self) -> bool {

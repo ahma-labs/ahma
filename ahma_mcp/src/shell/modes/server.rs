@@ -656,7 +656,7 @@ async fn spawn_background_bridge(
         }
         return Err(anyhow::anyhow!(
             "Background bridge server failed to become healthy within {timeout:?}. \
-             Check {} and logs/ahma_mcp.log for details.",
+             Check {} and logs/ahma.log for details.",
             stderr_path.display()
         ));
     }

@@ -1989,12 +1989,22 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 #[cfg(feature = "tui")]
 fn draw_blocked_symlink_banner(
     frame: &mut Frame,
-    file: &str,
+    _file: &str,
     info: &crate::state::LogFileInfo,
     theme: &Theme,
     area: Rect,
 ) {
     let target_str = info.symlink_target.as_deref().unwrap_or("unknown");
+    let path_buf = std::path::PathBuf::from(&info.path);
+    let parent = path_buf.parent().unwrap_or(std::path::Path::new(""));
+    let target_path = std::path::PathBuf::from(target_str);
+    let full_target = if target_path.is_absolute() {
+        target_path
+    } else {
+        parent.join(target_path)
+    };
+    let full_target_str = full_target.to_string_lossy();
+
     let text = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -2004,10 +2014,13 @@ fn draw_blocked_symlink_banner(
         Line::from(""),
         Line::from(vec![
             Span::raw("  Log file "),
-            Span::styled(file, theme.normal().bold()),
+            Span::styled(&info.path, theme.normal().bold()),
             Span::raw(" is a symbolic link pointing to:"),
         ]),
-        Line::from(Span::styled(format!("    {}", target_str), theme.failed())),
+        Line::from(Span::styled(
+            format!("    {}", full_target_str),
+            theme.failed(),
+        )),
         Line::from(""),
         Line::from("  This destination lies outside your configured workspace sandbox scopes."),
         Line::from("  For security, reading out-of-scope files is blocked by default."),

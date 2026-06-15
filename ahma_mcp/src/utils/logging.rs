@@ -1,7 +1,7 @@
 //! # Logging Initialization
 //!
 //! Centralized logging for ahma processes. Every line is prefixed with `pid=` and
-//! `role=` so interleaved multi-process logs in `./logs/ahma_mcp.log` remain attributable.
+//! `role=` so interleaved multi-process logs in `./logs/ahma.log` remain attributable.
 
 use ahma_common::observability::{ObservabilityConfig, TelemetryGuard};
 use anyhow::{Context, Result};
@@ -28,15 +28,15 @@ static PENDING_GUARD: Mutex<Option<TelemetryGuard>> = Mutex::new(None);
 static LOG_ROLE: OnceLock<&'static str> = OnceLock::new();
 
 /// Rolling structured log basename (daily rotation appends `.YYYY-MM-DD`).
-pub const MCP_LOG_BASENAME: &str = "ahma_mcp.log";
+pub const MCP_LOG_BASENAME: &str = "ahma.log";
 
-/// Background bridge raw stdout/stderr capture files (see `ahma_mcp.log` for structured logs).
+/// Background bridge raw stdout/stderr capture files (see `ahma.log` for structured logs).
 pub const BRIDGE_STDOUT_NAME: &str = "ahma_bridge.out.log";
 pub const BRIDGE_STDERR_NAME: &str = "ahma_bridge.err.log";
 
 /// One-line header written when bridge capture files are first created.
 pub const BRIDGE_CAPTURE_HEADER: &str =
-    "# ahma background bridge stdout/stderr capture — see ahma_mcp.log for structured logs\n";
+    "# ahma background bridge stdout/stderr capture — see ahma.log for structured logs\n";
 
 /// Delete managed log files older than this many seconds (24 hours).
 pub const LOG_RETENTION_SECS: u64 = 24 * 60 * 60;
@@ -85,14 +85,33 @@ pub fn detect_log_role_from_startup() -> &'static str {
 /// Process-wide log directory override set from the `--log-dir` CLI flag.
 static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
+/// Log directory derived from the primary sandbox scope after `roots/list`.
+/// Lower priority than `--log-dir` / `AHMA_LOG_DIR`, higher than CWD fallback.
+static LOG_DIR_FROM_SCOPE: OnceLock<PathBuf> = OnceLock::new();
+
 /// Set the log directory from the `--log-dir` CLI flag.
 /// Call once, early in startup, before any logging is initialised.
 pub fn set_log_dir_override(dir: PathBuf) {
     let _ = LOG_DIR_OVERRIDE.set(dir);
 }
 
-/// Project log directory: `--log-dir` flag, then `<cwd>/logs`, falling back to
-/// `~/.ahma/logs` if CWD is unwriteable or is root.
+/// Derive the default log directory from the primary sandbox scope.
+///
+/// Called once when the sandbox scope is established (after `roots/list`).
+/// Has no effect if `--log-dir` was already set, or if already called.
+/// Note: the tracing file appender opened at startup continues to write to
+/// whichever path was used at init time; this affects `logs_list` display
+/// and operation spill files created after the scope is locked.
+pub fn set_log_dir_from_scope(dir: PathBuf) {
+    let _ = LOG_DIR_FROM_SCOPE.set(dir);
+}
+
+/// Project log directory, checked in priority order:
+/// 1. `--log-dir` CLI flag
+/// 2. `AHMA_LOG_DIR` env var (deprecated)
+/// 3. Primary sandbox scope `<scope>/logs` (set after `roots/list`)
+/// 4. `<cwd>/logs` if writable
+/// 5. `~/.ahma/logs`
 pub fn project_log_dir() -> PathBuf {
     if let Some(dir) = LOG_DIR_OVERRIDE.get() {
         return dir.clone();
@@ -105,6 +124,10 @@ pub fn project_log_dir() -> PathBuf {
             "Deprecated: AHMA_LOG_DIR environment variable is set. Use the --log-dir flag instead."
         );
         return PathBuf::from(val);
+    }
+
+    if let Some(dir) = LOG_DIR_FROM_SCOPE.get() {
+        return dir.clone();
     }
 
     if let Ok(cwd) = std::env::current_dir()
@@ -409,8 +432,8 @@ mod tests {
 
     #[test]
     fn test_is_managed_log_file_matches() {
-        assert!(is_managed_log_file("ahma_mcp.log"));
-        assert!(is_managed_log_file("ahma_mcp.log.2026-06-10"));
+        assert!(is_managed_log_file("ahma.log"));
+        assert!(is_managed_log_file("ahma.log.2026-06-10"));
         assert!(is_managed_log_file("ahma_bridge.out.log"));
         assert!(is_managed_log_file("ahma_bridge.err.log"));
         assert!(!is_managed_log_file("other.log"));

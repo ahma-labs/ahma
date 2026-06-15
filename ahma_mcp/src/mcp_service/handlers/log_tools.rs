@@ -207,7 +207,7 @@ pub fn logs_read_schema() -> Arc<Map<String, Value>> {
         "file".to_string(),
         json!({
             "type": "string",
-            "description": "Name of the log file to read (relative to the project log directory, e.g. 'ahma_mcp.log' or 'ahma_mcp.log.2026-05-24'). Use logs_list to discover available files."
+            "description": "Name of the log file to read (relative to the project log directory, e.g. 'ahma.log' or 'ahma.log.2026-05-24'). Use logs_list to discover available files."
         }),
     );
     props.insert(
@@ -376,6 +376,12 @@ fn collect_log_sources(
         return Ok(vec![]);
     }
 
+    // Canonical log dir used to recognise ahma's own rolling-log symlinks
+    // (e.g. ahma.log → ahma.log.2026-06-15). A symlink whose resolved target
+    // stays inside this directory is always safe regardless of sandbox scope —
+    // it was created by ahma's own rotation code, not an external actor.
+    let canonical_log_dir = dunce::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf());
+
     let mut sources: Vec<LogFileInfo> = std::fs::read_dir(log_dir)?
         .flatten()
         .filter_map(|entry| {
@@ -390,11 +396,17 @@ fn collect_log_sources(
                 if let Ok(target) = std::fs::read_link(&path) {
                     symlink_target = Some(target.display().to_string());
                     if let Ok(canonical_target) = dunce::canonicalize(log_dir.join(&target)) {
-                        is_approved = crate::sandbox::is_target_allowed(
-                            &canonical_target,
-                            scopes,
-                            exceptions,
-                        );
+                        // Symlink pointing within the managed log directory is always
+                        // approved — apply the sandbox check only for targets that escape it.
+                        if canonical_target.starts_with(&canonical_log_dir) {
+                            is_approved = true;
+                        } else {
+                            is_approved = crate::sandbox::is_target_allowed(
+                                &canonical_target,
+                                scopes,
+                                exceptions,
+                            );
+                        }
                     } else {
                         is_approved = false;
                     }
@@ -544,6 +556,59 @@ mod tests {
         let names: Vec<String> = sources.iter().map(|s| s.name.clone()).collect();
         assert!(names.contains(&"a.log".to_string()));
         assert!(names.contains(&"b.log".to_string()));
+    }
+
+    /// Ahma's own rolling-log symlink (e.g. `ahma.log → ahma.log.2026-06-15`) must
+    /// be approved even when no sandbox scopes are configured.  Its target stays
+    /// inside the same managed log directory, so it cannot be an exfil vector.
+    #[cfg(unix)]
+    #[test]
+    fn managed_symlink_within_log_dir_is_always_approved() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let dated = dir.path().join("ahma.log.2026-06-15");
+        std::fs::write(&dated, "log content").unwrap();
+        // Create ahma.log → ahma.log.2026-06-15 (relative, as the real code does)
+        symlink("ahma.log.2026-06-15", dir.path().join("ahma.log")).unwrap();
+
+        // Empty scopes: without fix A this would set is_approved=false.
+        let sources = collect_log_sources(dir.path(), &[], &[]).unwrap();
+        let symlink_entry = sources.iter().find(|s| s.name == "ahma.log").unwrap();
+        assert!(
+            symlink_entry.is_symlink,
+            "ahma.log should be detected as a symlink"
+        );
+        assert!(
+            symlink_entry.is_approved,
+            "symlink pointing within the log dir must be approved without scope check"
+        );
+    }
+
+    /// A symlink in the log directory whose target escapes to an external path must
+    /// still require scope/exception approval (the security check is preserved).
+    #[cfg(unix)]
+    #[test]
+    fn symlink_escaping_log_dir_requires_scope_approval() {
+        use std::os::unix::fs::symlink;
+        let log_dir = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let external_file = external.path().join("sensitive.log");
+        std::fs::write(&external_file, "sensitive").unwrap();
+
+        // Use an absolute target so canonicalization works on all platforms.
+        symlink(&external_file, log_dir.path().join("escape.log")).unwrap();
+
+        // No scopes, no exceptions → must be blocked.
+        let sources = collect_log_sources(log_dir.path(), &[], &[]).unwrap();
+        let entry = sources.iter().find(|s| s.name == "escape.log");
+        if let Some(entry) = entry {
+            assert!(
+                !entry.is_approved,
+                "symlink escaping log dir must not be auto-approved"
+            );
+        }
+        // If the symlink target didn't canonicalize the entry may be absent —
+        // that is also a safe outcome.
     }
 
     #[test]

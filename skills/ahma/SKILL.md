@@ -318,7 +318,7 @@ Two flavors of log monitoring:
 "args": ["serve", "stdio", "--log-monitor"]
 ```
 
-Tails Ahma's rolling log files (`./logs/ahma_mcp.log.*`), analyzes chunks with an LLM, and
+Tails Ahma's rolling log files (`./logs/ahma.log.*`), analyzes chunks with an LLM, and
 pushes `LogAlert` MCP progress notifications when errors or anomalies are detected.
 
 Configure minimum seconds between alerts: `--monitor-rate-limit 60` (default 60).
