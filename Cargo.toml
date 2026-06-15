@@ -16,9 +16,15 @@ default-members = [
     "ahma_test_support",
     "ahma_harness_tools",
     # AGPL-3.0-or-later crates (end-user product surface)
+    "ahma_vault",
+    "ahma_decompose",
     "ahma_task_tree",
+    "ahma_worker",
+    "ahma_renewal",
     "ahma_tui",
     "ahma_bin",
+    # AGPL-3.0-or-later (network-facing cluster scheduler)
+    "ahma_cluster",
 ]
 
 members = [
@@ -54,7 +60,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 rust-version = "1.95.0"
-version = "0.12.3"
+version = "0.12.4"
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -128,3 +134,5 @@ url = "2.5"
 
 [profile.release]
 lto = "thin"
+codegen-units = 1
+opt-level = 3

@@ -46,6 +46,9 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     if state.log_files_modal_open {
         draw_log_files_modal(frame, state, theme, full);
     }
+    if state.settings_editor.open {
+        draw_settings_panel(frame, state, theme, full);
+    }
 }
 
 // ─── Chat layout ──────────────────────────────────────────────────────────────
@@ -2603,6 +2606,124 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width.min(area.width), height.min(area.height))
+}
+
+#[cfg(feature = "tui")]
+fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let popup = centered_rect(90, 22, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled(" Settings (edit & persist) ", theme.title()))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Split inner area into sidebar (left) and content (right)
+    let chunks = Layout::horizontal([Constraint::Length(20), Constraint::Min(20)]).split(inner);
+
+    let sidebar_area = chunks[0];
+    let content_area = chunks[1];
+
+    // 1. Draw sidebar (categories list)
+    let mut sidebar_items = vec![];
+    use crate::settings_editor::SettingsCategory;
+    for (i, cat) in SettingsCategory::ALL.iter().enumerate() {
+        let is_selected = state.settings_editor.selected_category == i;
+        let style = if is_selected {
+            theme.title().bg(Color::DarkGray)
+        } else {
+            theme.normal()
+        };
+        let label = format!(" {} {}", cat.icon(), cat.label());
+        sidebar_items.push(ListItem::new(Line::from(vec![Span::styled(label, style)])));
+    }
+    let sidebar_list = List::new(sidebar_items).block(
+        Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(theme.dim()),
+    );
+    frame.render_widget(sidebar_list, sidebar_area);
+
+    // 2. Draw content pane (settings items for selected category)
+    let selected_cat = SettingsCategory::ALL[state.settings_editor.selected_category];
+    let items = state.settings_editor.items_for_category(selected_cat);
+
+    let mut content_items = vec![];
+    for (i, item) in items.iter().enumerate() {
+        let is_selected = state.settings_editor.selected_item == i;
+        let item_style = if is_selected {
+            theme.selected_item()
+        } else {
+            theme.normal()
+        };
+
+        // Render value indicator
+        let val_string = match &item.value {
+            crate::settings_editor::SettingValue::Bool(v) => {
+                if *v {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            }
+            crate::settings_editor::SettingValue::String(v) => v.clone(),
+            crate::settings_editor::SettingValue::U64(v) => format!("{}", v),
+            crate::settings_editor::SettingValue::U32(v) => format!("{}", v),
+            crate::settings_editor::SettingValue::Usize(v) => format!("{}", v),
+            crate::settings_editor::SettingValue::StringList(v) => format!("[{}]", v.join(", ")),
+        };
+
+        let sec_indicator = if item.security_tier {
+            Span::styled(" [locked]", theme.dim())
+        } else {
+            Span::raw("")
+        };
+
+        let label_style = if is_selected {
+            theme.title()
+        } else {
+            theme.normal()
+        };
+
+        let line = Line::from(vec![
+            Span::styled(format!("  {: <25}", item.label), label_style),
+            Span::styled(format!("  {: <15}", val_string), theme.success()),
+            sec_indicator,
+            Span::styled(format!("  — {}", item.description), theme.dim()),
+        ]);
+
+        content_items.push(ListItem::new(line).style(item_style));
+    }
+
+    // Split content area into items list (top) and footer/hints (bottom)
+    let content_chunks =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(content_area);
+
+    let list_area = content_chunks[0];
+    let footer_area = content_chunks[1];
+
+    let content_list = List::new(content_items);
+    frame.render_widget(content_list, list_area);
+
+    // Draw status message and action hints
+    let status_str = if let Some((msg, _)) = &state.settings_editor.status_message {
+        msg.clone()
+    } else if state.settings_editor.dirty {
+        "● Unsaved changes".to_string()
+    } else {
+        "".to_string()
+    };
+
+    let footer_line = Line::from(vec![
+        Span::styled(format!("  {}", status_str), theme.pending()),
+        Span::styled(
+            "  [Space] Toggle  [r] Reset  [s] Save  [Esc/q] Close ",
+            theme.dim(),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(footer_line), footer_area);
 }
 
 // ─── Stub when `tui` feature is disabled ─────────────────────────────────────

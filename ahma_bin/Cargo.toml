@@ -17,16 +17,16 @@ name = "ahma"
 path = "src/main.rs"
 
 [features]
-# Lean default: MCP server, sandbox, shell pool, TUI, task planning.
-# Incubating features are opt-in; `full` enables everything.
-default = []
-# Local cluster scheduler (`ahma cluster ...`): mDNS discovery, signed dispatch. Incubating.
+# Batteries-included default: all features compiled in.
+# Users building a lean binary can use --no-default-features.
+default = ["cluster", "vault", "simplify"]
+# Local cluster scheduler (`ahma cluster ...`): mDNS discovery, signed dispatch.
 cluster = ["dep:ahma_cluster"]
-# Task vault storage (`ahma vault ...`). Incubating.
+# Task vault storage (`ahma vault ...`).
 vault = ["dep:ahma_vault"]
 # Code complexity analysis (`ahma simplify ...`).
 simplify = ["ahma_mcp/simplify"]
-# Everything, including incubating features.
+# Everything, including incubating features (now same as default).
 full = ["cluster", "vault", "simplify"]
 
 [dependencies]
