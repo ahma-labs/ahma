@@ -207,7 +207,7 @@ pub fn logs_read_schema() -> Arc<Map<String, Value>> {
         "file".to_string(),
         json!({
             "type": "string",
-            "description": "Name of the log file to read (relative to the project log directory, e.g. 'ahma_mcp.log' or 'ahma_mcp.log.2026-05-24'). Use logs_list to discover available files."
+            "description": "Name of the log file to read (relative to the project log directory, e.g. 'ahma.log' or 'ahma.log.2026-05-24'). Use logs_list to discover available files."
         }),
     );
     props.insert(

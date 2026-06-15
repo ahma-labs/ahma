@@ -1,7 +1,7 @@
 //! # Logging Initialization
 //!
 //! Centralized logging for ahma processes. Every line is prefixed with `pid=` and
-//! `role=` so interleaved multi-process logs in `./logs/ahma_mcp.log` remain attributable.
+//! `role=` so interleaved multi-process logs in `./logs/ahma.log` remain attributable.
 
 use ahma_common::observability::{ObservabilityConfig, TelemetryGuard};
 use anyhow::{Context, Result};
@@ -28,15 +28,15 @@ static PENDING_GUARD: Mutex<Option<TelemetryGuard>> = Mutex::new(None);
 static LOG_ROLE: OnceLock<&'static str> = OnceLock::new();
 
 /// Rolling structured log basename (daily rotation appends `.YYYY-MM-DD`).
-pub const MCP_LOG_BASENAME: &str = "ahma_mcp.log";
+pub const MCP_LOG_BASENAME: &str = "ahma.log";
 
-/// Background bridge raw stdout/stderr capture files (see `ahma_mcp.log` for structured logs).
+/// Background bridge raw stdout/stderr capture files (see `ahma.log` for structured logs).
 pub const BRIDGE_STDOUT_NAME: &str = "ahma_bridge.out.log";
 pub const BRIDGE_STDERR_NAME: &str = "ahma_bridge.err.log";
 
 /// One-line header written when bridge capture files are first created.
 pub const BRIDGE_CAPTURE_HEADER: &str =
-    "# ahma background bridge stdout/stderr capture — see ahma_mcp.log for structured logs\n";
+    "# ahma background bridge stdout/stderr capture — see ahma.log for structured logs\n";
 
 /// Delete managed log files older than this many seconds (24 hours).
 pub const LOG_RETENTION_SECS: u64 = 24 * 60 * 60;
@@ -409,8 +409,8 @@ mod tests {
 
     #[test]
     fn test_is_managed_log_file_matches() {
-        assert!(is_managed_log_file("ahma_mcp.log"));
-        assert!(is_managed_log_file("ahma_mcp.log.2026-06-10"));
+        assert!(is_managed_log_file("ahma.log"));
+        assert!(is_managed_log_file("ahma.log.2026-06-10"));
         assert!(is_managed_log_file("ahma_bridge.out.log"));
         assert!(is_managed_log_file("ahma_bridge.err.log"));
         assert!(!is_managed_log_file("other.log"));
