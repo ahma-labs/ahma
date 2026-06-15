@@ -7,13 +7,15 @@
 //! Also provides streaming chat (`LlmClient::chat_stream`) and local-provider
 //! auto-discovery (`discover_local_providers`) for the TUI chat interface.
 
+pub mod anthropic;
 pub mod client;
 pub mod discovery;
 pub mod error;
 pub mod prompt;
 
 pub use client::{
-    ChatCompletionResponse, ChatMessage, ChatRole, ChatToolCall, LlmClient, LocalProvider,
+    ApiFlavor, ChatCompletionResponse, ChatMessage, ChatRole, ChatToolCall, LlmClient,
+    LocalProvider,
 };
 pub use discovery::discover_local_providers;
 pub use error::LlmMonitorError;

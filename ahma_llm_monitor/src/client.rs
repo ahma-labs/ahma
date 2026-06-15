@@ -8,6 +8,7 @@ use tracing::{debug, warn};
 
 use ahma_common::config::warn_if_looks_like_literal_secret;
 
+use crate::anthropic;
 use crate::error::LlmMonitorError;
 use crate::prompt::build_messages;
 
@@ -114,13 +115,34 @@ pub struct LocalProvider {
     pub models: Vec<String>,
 }
 
-/// An OpenAI-compatible LLM client for issue detection in log chunks.
+/// Which provider wire format an [`LlmClient`] speaks.
+///
+/// ahma's internal message shape is OpenAI-compatible; the Anthropic flavor
+/// translates to/from the native Messages API at the HTTP boundary (see
+/// [`crate::anthropic`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApiFlavor {
+    /// OpenAI-compatible `/chat/completions` (Ollama, llama.cpp, oMLX, OpenAI…).
+    #[default]
+    OpenAi,
+    /// Anthropic native Messages API (`/messages`, `x-api-key`).
+    Anthropic,
+}
+
+/// An LLM client for issue detection and chat.
+///
+/// Speaks either the OpenAI-compatible API or the native Anthropic Messages
+/// API depending on [`ApiFlavor`]; the public methods are identical across
+/// flavors so callers need not branch.
 #[derive(Debug, Clone)]
 pub struct LlmClient {
     http: Client,
     base_url: String,
     model: String,
     api_key: Option<String>,
+    flavor: ApiFlavor,
+    /// Anthropic only: send `thinking: {type: "adaptive"}` on chat/tool turns.
+    thinking: bool,
 }
 
 impl LlmClient {
@@ -137,17 +159,98 @@ impl LlmClient {
         if let Some(key) = &api_key {
             warn_if_looks_like_literal_secret(key);
         }
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        // Auto-select the Anthropic flavor for the canonical host so existing
+        // call sites that only thread a base_url light up with no extra
+        // plumbing. Explicit configuration overrides via `with_flavor`.
+        let flavor = if anthropic::looks_like_anthropic(&base_url) {
+            ApiFlavor::Anthropic
+        } else {
+            ApiFlavor::OpenAi
+        };
+        // For Anthropic, fall back to ANTHROPIC_API_KEY when no key was passed
+        // (the interactive TUI constructs clients without an explicit key).
+        let api_key = match (flavor, api_key) {
+            (ApiFlavor::Anthropic, None) => std::env::var("ANTHROPIC_API_KEY").ok(),
+            (_, key) => key,
+        };
         Self {
             http: Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            base_url,
             model: model.into(),
             api_key,
+            flavor,
+            // Adaptive thinking is on by default for Anthropic chat/tool turns.
+            thinking: flavor == ApiFlavor::Anthropic,
         }
+    }
+
+    /// Override the wire-format flavor (e.g. when a `kind = "anthropic"`
+    /// provider points at a proxy whose URL doesn't carry the Anthropic host).
+    ///
+    /// Resets `thinking` to the flavor default (on for Anthropic); call
+    /// [`Self::with_thinking`] *after* this to override.
+    pub fn with_flavor(mut self, flavor: ApiFlavor) -> Self {
+        self.flavor = flavor;
+        if flavor == ApiFlavor::Anthropic && self.api_key.is_none() {
+            self.api_key = std::env::var("ANTHROPIC_API_KEY").ok();
+        }
+        self.thinking = flavor == ApiFlavor::Anthropic;
+        self
+    }
+
+    /// Enable or disable adaptive thinking on Anthropic chat/tool turns.
+    pub fn with_thinking(mut self, thinking: bool) -> Self {
+        self.thinking = thinking;
+        self
+    }
+
+    /// Build a client from a resolved named provider, honoring its `kind`.
+    ///
+    /// Unlike [`Self::new`]'s URL heuristic, this uses the explicit
+    /// `kind = "anthropic"` from `~/.ahma/config.toml`, so it works for proxies
+    /// and gateways whose `base_url` doesn't carry the Anthropic host.
+    pub fn for_provider(provider: &ahma_common::config::ResolvedProvider) -> Self {
+        let flavor = match provider.kind {
+            ahma_common::config::ProviderKind::OpenAi => ApiFlavor::OpenAi,
+            ahma_common::config::ProviderKind::Anthropic => ApiFlavor::Anthropic,
+        };
+        Self::new(
+            provider.base_url.clone(),
+            provider.default_model.clone(),
+            provider.api_key.clone(),
+        )
+        .with_flavor(flavor)
+    }
+
+    /// The wire-format flavor this client speaks.
+    pub fn flavor(&self) -> ApiFlavor {
+        self.flavor
     }
 
     /// Get the base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Apply flavor-appropriate auth/version headers to a request.
+    ///
+    /// OpenAI uses `Authorization: Bearer`; Anthropic uses `x-api-key` plus the
+    /// required `anthropic-version` header.
+    fn apply_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.flavor {
+            ApiFlavor::OpenAi => match &self.api_key {
+                Some(key) => request.bearer_auth(key),
+                None => request,
+            },
+            ApiFlavor::Anthropic => {
+                let request = request.header("anthropic-version", anthropic::ANTHROPIC_VERSION);
+                match &self.api_key {
+                    Some(key) => request.header("x-api-key", key),
+                    None => request,
+                }
+            }
+        }
     }
 
     /// Analyse a chunk of log lines against the detection prompt.
@@ -162,12 +265,34 @@ impl LlmClient {
     ) -> Result<Option<String>, LlmMonitorError> {
         let messages = build_messages(detection_prompt, chunk);
 
-        let body = json!({
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": 256,
-            "temperature": 0.0,
-        });
+        // Terse classification: no adaptive thinking (the 256-token cap leaves
+        // no room for a thinking budget, and CLEAN/summary needs none).
+        let (url, body) = match self.flavor {
+            ApiFlavor::OpenAi => (
+                format!("{}/chat/completions", self.base_url),
+                json!({
+                    "model": self.model,
+                    "messages": messages,
+                    "max_tokens": 256,
+                    "temperature": 0.0,
+                }),
+            ),
+            ApiFlavor::Anthropic => {
+                let (system, amsgs) = anthropic::openai_to_anthropic(&messages);
+                (
+                    format!("{}/messages", self.base_url),
+                    anthropic::build_messages_body(
+                        &self.model,
+                        system,
+                        amsgs,
+                        &[],
+                        false,
+                        256,
+                        false,
+                    ),
+                )
+            }
+        };
 
         debug!(
             "Sending chunk ({} chars) to LLM at {} for analysis",
@@ -175,15 +300,7 @@ impl LlmClient {
             self.base_url
         );
 
-        let mut request = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .json(&body)
-            .timeout(timeout);
-
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
+        let request = self.apply_auth(self.http.post(url).json(&body).timeout(timeout));
 
         let response = tokio::time::timeout(timeout, request.send())
             .await
@@ -201,10 +318,14 @@ impl LlmClient {
 
         let json: Value = response.json().await.map_err(LlmMonitorError::Http)?;
 
+        let pointer = match self.flavor {
+            ApiFlavor::OpenAi => "/choices/0/message/content",
+            ApiFlavor::Anthropic => "/content/0/text",
+        };
         let text = json
-            .pointer("/choices/0/message/content")
+            .pointer(pointer)
             .and_then(Value::as_str)
-            .ok_or_else(|| LlmMonitorError::Parse("missing choices[0].message.content".into()))?
+            .ok_or_else(|| LlmMonitorError::Parse(format!("missing {pointer}")))?
             .trim()
             .to_string();
 
@@ -233,10 +354,37 @@ impl LlmClient {
         use futures::StreamExt as _;
         use futures::stream;
 
-        let body = build_chat_stream_body(&self.model, &messages, system_prompt);
+        let (url, body) = match self.flavor {
+            ApiFlavor::OpenAi => (
+                format!("{}/chat/completions", self.base_url),
+                build_chat_stream_body(&self.model, &messages, system_prompt),
+            ),
+            ApiFlavor::Anthropic => {
+                let mut openai_msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
+                if let Some(sys) = system_prompt {
+                    openai_msgs.push(json!({"role": "system", "content": sys}));
+                }
+                for message in &messages {
+                    openai_msgs.push(message.as_openai_message());
+                }
+                let (system, amsgs) = anthropic::openai_to_anthropic(&openai_msgs);
+                (
+                    format!("{}/messages", self.base_url),
+                    anthropic::build_messages_body(
+                        &self.model,
+                        system,
+                        amsgs,
+                        &[],
+                        true,
+                        anthropic::DEFAULT_MAX_TOKENS,
+                        self.thinking,
+                    ),
+                )
+            }
+        };
         let http = self.http.clone();
-        let url = format!("{}/chat/completions", self.base_url);
         let api_key = self.api_key.clone();
+        let flavor = self.flavor;
 
         stream::unfold(
             ChatStreamState::Starting {
@@ -244,6 +392,7 @@ impl LlmClient {
                 url,
                 api_key,
                 body,
+                flavor,
             },
             |state| async move {
                 match state {
@@ -252,10 +401,13 @@ impl LlmClient {
                         url,
                         api_key,
                         body,
-                    } => chat_stream_start(http, url, api_key, body).await,
-                    ChatStreamState::Streaming { stream, buffer } => {
-                        chat_stream_poll(stream, buffer).await
-                    }
+                        flavor,
+                    } => chat_stream_start(http, url, api_key, body, flavor).await,
+                    ChatStreamState::Streaming {
+                        stream,
+                        buffer,
+                        flavor,
+                    } => chat_stream_poll(stream, buffer, flavor).await,
                     ChatStreamState::Done => None,
                 }
             },
@@ -276,26 +428,44 @@ impl LlmClient {
         messages: Vec<Value>,
         tools: &[Value],
     ) -> Result<ChatCompletionResponse, LlmMonitorError> {
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages,
-            "temperature": 0.2,
-            "stream": false,
-        });
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools.to_vec());
-            body["tool_choice"] = json!("auto");
-        }
+        let (url, body) = match self.flavor {
+            ApiFlavor::OpenAi => {
+                let mut body = json!({
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "stream": false,
+                });
+                if !tools.is_empty() {
+                    body["tools"] = Value::Array(tools.to_vec());
+                    body["tool_choice"] = json!("auto");
+                }
+                (format!("{}/chat/completions", self.base_url), body)
+            }
+            ApiFlavor::Anthropic => {
+                let (system, amsgs) = anthropic::openai_to_anthropic(&messages);
+                let atools = anthropic::openai_tools_to_anthropic(tools);
+                (
+                    format!("{}/messages", self.base_url),
+                    anthropic::build_messages_body(
+                        &self.model,
+                        system,
+                        amsgs,
+                        &atools,
+                        false,
+                        anthropic::DEFAULT_MAX_TOKENS,
+                        self.thinking,
+                    ),
+                )
+            }
+        };
 
-        let mut request = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .json(&body)
-            .timeout(Duration::from_secs(120));
-
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
+        let request = self.apply_auth(
+            self.http
+                .post(url)
+                .json(&body)
+                .timeout(Duration::from_secs(120)),
+        );
 
         let response = request.send().await.map_err(LlmMonitorError::Http)?;
         if !response.status().is_success() {
@@ -310,7 +480,10 @@ impl LlmClient {
             .json::<Value>()
             .await
             .map_err(LlmMonitorError::Http)?;
-        parse_chat_completion_response(json)
+        match self.flavor {
+            ApiFlavor::OpenAi => parse_chat_completion_response(json),
+            ApiFlavor::Anthropic => anthropic::parse_messages_response(json),
+        }
     }
 
     // ─── Model discovery ──────────────────────────────────────────────────────
@@ -322,10 +495,9 @@ impl LlmClient {
     /// "no models available right now".
     pub async fn list_model(&self) -> Vec<String> {
         let url = format!("{}/models", self.base_url);
-        let mut req = self.http.get(&url).timeout(Duration::from_secs(3));
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
+        // Anthropic's GET /v1/models returns the same `{data:[{id}]}` shape as
+        // OpenAI; only the auth headers differ.
+        let req = self.apply_auth(self.http.get(&url).timeout(Duration::from_secs(3)));
         let Ok(resp) = req.send().await else {
             return vec![];
         };
@@ -358,10 +530,12 @@ enum ChatStreamState {
         url: String,
         api_key: Option<String>,
         body: Value,
+        flavor: ApiFlavor,
     },
     Streaming {
         stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, LlmMonitorError>> + Send>>,
         buffer: String,
+        flavor: ApiFlavor,
     },
     Done,
 }
@@ -391,14 +565,25 @@ async fn chat_stream_start(
     url: String,
     api_key: Option<String>,
     body: Value,
+    flavor: ApiFlavor,
 ) -> Option<(Result<String, LlmMonitorError>, ChatStreamState)> {
     let mut req = http
         .post(&url)
         .json(&body)
         .header("Accept", "text/event-stream");
-    if let Some(key) = &api_key {
-        req = req.bearer_auth(key);
-    }
+    req = match flavor {
+        ApiFlavor::OpenAi => match &api_key {
+            Some(key) => req.bearer_auth(key),
+            None => req,
+        },
+        ApiFlavor::Anthropic => {
+            let req = req.header("anthropic-version", anthropic::ANTHROPIC_VERSION);
+            match &api_key {
+                Some(key) => req.header("x-api-key", key),
+                None => req,
+            }
+        }
+    };
 
     let resp = match req.send().await {
         Err(e) => return Some((Err(LlmMonitorError::Http(e)), ChatStreamState::Done)),
@@ -421,6 +606,7 @@ async fn chat_stream_start(
         ChatStreamState::Streaming {
             stream: Box::pin(byte_stream),
             buffer: String::new(),
+            flavor,
         },
     ))
 }
@@ -435,15 +621,27 @@ fn take_sse_line(buffer: &mut String) -> Option<String> {
 async fn chat_stream_poll(
     mut stream: std::pin::Pin<Box<dyn Stream<Item = Result<bytes::Bytes, LlmMonitorError>> + Send>>,
     mut buffer: String,
+    flavor: ApiFlavor,
 ) -> Option<(Result<String, LlmMonitorError>, ChatStreamState)> {
     use futures::StreamExt as _;
     loop {
         if let Some(line) = take_sse_line(&mut buffer) {
-            if let Some(token) = parse_sse_line(&line) {
+            let parsed = match flavor {
+                ApiFlavor::OpenAi => parse_sse_line(&line),
+                ApiFlavor::Anthropic => anthropic::parse_sse_line(&line),
+            };
+            if let Some(token) = parsed {
                 if token == "__DONE__" {
                     return Some((Ok(String::new()), ChatStreamState::Done));
                 }
-                return Some((Ok(token), ChatStreamState::Streaming { stream, buffer }));
+                return Some((
+                    Ok(token),
+                    ChatStreamState::Streaming {
+                        stream,
+                        buffer,
+                        flavor,
+                    },
+                ));
             }
             continue;
         }

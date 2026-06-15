@@ -289,6 +289,14 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
                 ahma_common::config::warn_if_looks_like_literal_secret(key);
             }
 
+            let kind = match add_args.kind.to_ascii_lowercase().as_str() {
+                "anthropic" => ahma_common::config::ProviderKind::Anthropic,
+                "openai" | "" => ahma_common::config::ProviderKind::OpenAi,
+                other => {
+                    anyhow::bail!("Unknown provider kind '{other}'. Use 'openai' or 'anthropic'.")
+                }
+            };
+
             let mut cfg = AhmaConfig::load();
 
             // Reject duplicate names
@@ -302,6 +310,7 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
 
             cfg.providers.push(ProviderEntry {
                 name: add_args.name.clone(),
+                kind,
                 base_url: add_args.base_url.clone(),
                 default_model: add_args.model.clone(),
                 api_key: add_args.api_key.clone(),
