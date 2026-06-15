@@ -300,6 +300,10 @@ pub fn builtin_commands() -> Vec<NavCommand> {
             description: "export chat transcript to markdown",
         },
         NavCommand {
+            command: "/settings".into(),
+            description: "open settings panel (edit & persist)",
+        },
+        NavCommand {
             command: "/quit".into(),
             description: "quit the application",
         },
@@ -996,6 +1000,9 @@ pub struct AppState {
     pub ops_list_state: std::cell::RefCell<()>,
     pub show_help: bool,
 
+    // ── Settings editor ──
+    pub settings_editor: crate::settings_editor::SettingsEditor,
+
     // ── Config ──
     pub unicode: bool,
     pub should_quit: bool,
@@ -1139,6 +1146,8 @@ impl AppState {
             #[cfg(not(feature = "tui"))]
             ops_list_state: std::cell::RefCell::new(()),
             show_help: false,
+
+            settings_editor: crate::settings_editor::SettingsEditor::default(),
 
             windows: vec![],
             next_window_id: 0,

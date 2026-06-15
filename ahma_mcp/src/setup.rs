@@ -397,13 +397,22 @@ fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
     })
 }
 
-fn build_antigravity_servers_entry(transport: &str, _home: &Path) -> serde_json::Value {
+fn build_antigravity_servers_entry(transport: &str, home: &Path) -> serde_json::Value {
     if let Some(url) = mcp_shared_transport_url(transport) {
         return json!({ "url": url });
     }
     // Antigravity doesn't send MCP roots/list, so we must specify a sandbox
-    // scope explicitly.  ~/sandbox is auto-created by ahma at startup.
-    // Tilde expansion is handled by ahma's CLI parser (expand_tilde).
+    // scope explicitly.  Use the canonical path (not ~/sandbox) because MCP
+    // clients launch processes without shell tilde expansion, and the sandbox
+    // directory must exist for canonicalization.
+    let sandbox_dir = home.join("sandbox");
+    if let Err(e) = std::fs::create_dir_all(&sandbox_dir) {
+        tracing::warn!(
+            "Could not pre-create sandbox directory {}: {e}",
+            sandbox_dir.display()
+        );
+    }
+    let scope_str = sandbox_dir.to_string_lossy().to_string();
     json!({
         "command": "ahma",
         "args": [
@@ -414,7 +423,7 @@ fn build_antigravity_servers_entry(transport: &str, _home: &Path) -> serde_json:
             "--tmp",
             "--log-monitor",
             "--sandbox-scope",
-            "~/sandbox"
+            scope_str
         ]
     })
 }
@@ -964,6 +973,43 @@ mod tests {
             Some("http://localhost:3000/mcp")
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_antigravity_servers_entry_uses_canonical_path_and_creates_dir() {
+        let tmp = tempdir().unwrap();
+        let fake_home = tmp.path();
+        let entry = build_antigravity_servers_entry("stdio", fake_home);
+
+        // The sandbox scope must be a canonical path, not ~/sandbox.
+        let args = entry["args"].as_array().expect("args must be an array");
+        let scope_idx = args
+            .iter()
+            .position(|a| a.as_str() == Some("--sandbox-scope"))
+            .expect("must contain --sandbox-scope");
+        let scope_value = args[scope_idx + 1].as_str().unwrap();
+
+        // Must NOT start with ~
+        assert!(
+            !scope_value.starts_with('~'),
+            "sandbox scope must be canonical, not tilde: {scope_value}"
+        );
+        // Must be under the fake home
+        let home_str = fake_home.to_string_lossy().to_string();
+        assert!(
+            scope_value.starts_with(&home_str),
+            "scope must be under home dir: {scope_value}"
+        );
+        // Must end with /sandbox
+        assert!(
+            scope_value.ends_with("/sandbox") || scope_value.ends_with("\\sandbox"),
+            "scope must end with /sandbox: {scope_value}"
+        );
+        // The directory must have been created
+        assert!(
+            fake_home.join("sandbox").exists(),
+            "sandbox directory must be pre-created by setup"
+        );
     }
 
     #[test]

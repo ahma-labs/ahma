@@ -734,6 +734,56 @@ impl Default for InstanceSettings {
     }
 }
 
+/// Runtime feature toggles.
+///
+/// Controls which optional capabilities are active at runtime.  Features
+/// default to the most useful "batteries-included" configuration: everything
+/// that works without additional setup is enabled, while features that require
+/// external infrastructure (cluster peers, etc.) start disabled.
+///
+/// Toggle in `~/.ahma/settings.toml` or via `ahma tui` → `/settings`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FeatureSettings {
+    /// Code complexity analysis (`ahma simplify`).
+    /// Analyzes source code and generates simplicity reports.
+    /// Default: `true`
+    pub simplify: bool,
+    /// Task vault isolation (`ahma vault create/list`).
+    /// Per-question isolated working directories with audit log and trash.
+    /// Default: `false` (enable to auto-create vaults per TUI session)
+    pub vault: bool,
+    /// Distributed cluster scheduling (`ahma cluster`).
+    /// mDNS peer discovery and signed task dispatch to worker nodes.
+    /// Default: `false` (requires peer configuration first)
+    pub cluster: bool,
+    /// Network egress proxy for sandboxed tasks.
+    /// Per-task HTTP proxy with domain allowlist for controlled outbound access.
+    /// Default: `true`
+    pub egress: bool,
+    /// HTML artifact output channel.
+    /// Tools can emit interactive HTML artifacts with embedded LLM chat.
+    /// Default: `true`
+    pub artifact: bool,
+    /// LLM-powered task decomposition.
+    /// Split complex questions into sub-tasks, dispatch concurrently, aggregate.
+    /// Default: `true`
+    pub decompose: bool,
+}
+
+impl Default for FeatureSettings {
+    fn default() -> Self {
+        Self {
+            simplify: true,
+            vault: false,
+            cluster: false,
+            egress: true,
+            artifact: true,
+            decompose: true,
+        }
+    }
+}
+
 /// Top-level user settings loaded from `~/.ahma/settings.toml`.
 ///
 /// All fields have sensible defaults — an empty file (or no file at all) is
@@ -756,6 +806,8 @@ impl Default for InstanceSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AhmaSettings {
+    /// Runtime feature toggles (simplify, vault, cluster, etc.).
+    pub features: FeatureSettings,
     /// oMLX / mlx_lm.server provider configuration.
     pub omlx: OmlxSettings,
     /// Tool execution settings.
@@ -843,6 +895,44 @@ impl AhmaSettings {
         std::fs::write(path, SETTINGS_TEMPLATE)
             .with_context(|| format!("Failed to write {}", path.display()))
     }
+
+    /// Save the current settings to `~/.ahma/settings.toml`.
+    ///
+    /// Serializes the full settings struct to TOML and writes atomically
+    /// (write to temp file, then rename).  Creates parent directories as needed.
+    pub fn save(&self) -> Result<()> {
+        match settings_path() {
+            Some(p) => self.save_to(&p),
+            None => anyhow::bail!("Cannot determine home directory for ~/.ahma/settings.toml"),
+        }
+    }
+
+    /// Save to an explicit path — useful for tests and alternate locations.
+    ///
+    /// The write is atomic: contents are written to a temporary sibling file
+    /// and then renamed into place, so a crash mid-write never corrupts the
+    /// settings file.
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+        }
+        let toml_text =
+            toml::to_string_pretty(self).context("Failed to serialize settings to TOML")?;
+
+        // Atomic write: temp file → rename
+        let tmp_path = path.with_extension("toml.tmp");
+        std::fs::write(&tmp_path, toml_text)
+            .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "Failed to rename {} → {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
+        Ok(())
+    }
 }
 
 /// The commented-out defaults template written by `ahma settings init`.
@@ -855,14 +945,19 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # Generate (or regenerate) this file with:   ahma settings init
 # Show effective settings with:              ahma settings show
 # Ignore this file for one invocation with:  ahma --no-settings <command>
+# Edit interactively with:                   ahma tui → /settings
 
-# ── oMLX (Apple Silicon mlx_lm.server) ──────────────────────────────────────
-# Start the server with:
-#   mlx_lm.server --model mlx-community/gemma-4-12B-it-8bit
+# ── Features ─────────────────────────────────────────────────────────────────
+# Toggle optional capabilities on/off.  Features that work without additional
+# setup are enabled by default; features requiring infrastructure are off.
 #
-# [omlx]
-# base_url = "http://localhost:8080/v1"          # default: 8080 (mlx_lm.server)
-# model    = "mlx-community/gemma-4-12B-it-8bit" # default model
+# [features]
+# simplify  = true    # code complexity analysis (ahma simplify)
+# vault     = false   # task vault isolation (per-session working directories)
+# cluster   = false   # distributed cluster scheduling (requires peer setup)
+# egress    = true    # network egress proxy for sandboxed tasks
+# artifact  = true    # HTML artifact output channel
+# decompose = true    # LLM-powered task decomposition
 
 # ── Tool execution ───────────────────────────────────────────────────────────
 # [tools]
@@ -887,6 +982,14 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # separate_cargo_target = false  # use target/ahma/ instead of target/ for ahma's cargo builds,
 #                                # eliminating cross-process file-lock contention with IDE background checks
 
+# ── oMLX (Apple Silicon mlx_lm.server) ──────────────────────────────────────
+# Start the server with:
+#   mlx_lm.server --model mlx-community/gemma-4-12B-it-8bit
+#
+# [omlx]
+# base_url = "http://localhost:8080/v1"          # default: 8080 (mlx_lm.server)
+# model    = "mlx-community/gemma-4-12B-it-8bit" # default model
+
 # ── Sandbox & filesystem security ────────────────────────────────────────────
 # [sandbox]
 # disable              = false    # UNSAFE: disable kernel sandbox entirely
@@ -904,7 +1007,6 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # target                 = "file"   # "file" (rolling) or "stderr"
 # log_monitor            = false    # enable live log monitoring via LLM
 # monitor_rate_limit_secs = 60      # min seconds between log-monitor alerts
-
 
 # ── HTTP server (ahma serve http only) ───────────────────────────────────────
 # [http]

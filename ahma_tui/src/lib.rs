@@ -20,6 +20,7 @@ pub mod llm_bridge;
 pub mod mcp_connections;
 pub mod mcp_source;
 pub mod session_config;
+pub mod settings_editor;
 pub mod state;
 pub mod theme;
 pub mod ui;

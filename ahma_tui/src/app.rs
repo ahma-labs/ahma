@@ -148,7 +148,8 @@ async fn run_ratatui(
                                 && !state.log_files_modal_open
                             {
                                 handle_page_up_down(key.code == crossterm::event::KeyCode::PageUp, &mut state);
-                            } else if handle_help_key(key, &mut state)
+                            } else if handle_settings_key(key, &mut state)
+                                || handle_help_key(key, &mut state)
                                 || handle_picker_key(key, &mut state)
                                 || handle_chat_input_key(key, &mut state)
                             {
@@ -1318,6 +1319,34 @@ fn submit_navigator_command(state: &mut crate::state::AppState) {
 }
 
 #[cfg(feature = "tui")]
+fn handle_settings_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut crate::state::AppState,
+) -> bool {
+    use crossterm::event::KeyCode;
+
+    if !state.settings_editor.open {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => state.settings_editor.close(),
+        KeyCode::Up | KeyCode::Char('k') => state.settings_editor.item_up(),
+        KeyCode::Down | KeyCode::Char('j') => state.settings_editor.item_down(),
+        KeyCode::Left | KeyCode::Char('h') => state.settings_editor.category_up(),
+        KeyCode::Right | KeyCode::Char('l') => state.settings_editor.category_down(),
+        KeyCode::Char(' ') | KeyCode::Enter => state.settings_editor.toggle_current(),
+        KeyCode::Char('r') => state.settings_editor.reset_current(),
+        KeyCode::Char('s') => state.settings_editor.save(),
+        KeyCode::Tab => state.settings_editor.category_down(),
+        KeyCode::BackTab => state.settings_editor.category_up(),
+        _ => {}
+    }
+
+    true
+}
+
+#[cfg(feature = "tui")]
 fn handle_help_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
     use crossterm::event::KeyCode;
 
@@ -1502,6 +1531,7 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
         || handle_mcp_nav_command(cmd, state)
         || handle_agent_nav_command(cmd, state)
         || handle_export_nav_command(cmd, state)
+        || handle_settings_nav_command(cmd, state)
         || handle_tools_nav_command(cmd, state)
         || handle_approval_nav_command(cmd, state)
         || handle_picker_nav_command(cmd, state)
@@ -1536,6 +1566,15 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
         _ => return false,
     }
 
+    true
+}
+
+#[cfg(feature = "tui")]
+fn handle_settings_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    if cmd != "/settings" {
+        return false;
+    }
+    state.settings_editor.open();
     true
 }
 

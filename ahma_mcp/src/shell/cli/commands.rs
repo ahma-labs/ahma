@@ -49,6 +49,14 @@ pub(crate) fn run_settings_command(args: SettingsArgs) -> Result<()> {
                 };
             }
 
+            println!("[features]");
+            show_field!("simplify", s.features.simplify, d.features.simplify);
+            show_field!("vault", s.features.vault, d.features.vault);
+            show_field!("cluster", s.features.cluster, d.features.cluster);
+            show_field!("egress", s.features.egress, d.features.egress);
+            show_field!("artifact", s.features.artifact, d.features.artifact);
+            show_field!("decompose", s.features.decompose, d.features.decompose);
+            println!();
             println!("[omlx]");
             show_field!("base_url", &s.omlx.base_url, &d.omlx.base_url);
             show_field!("model", &s.omlx.model, &d.omlx.model);

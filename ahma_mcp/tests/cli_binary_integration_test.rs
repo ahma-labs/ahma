@@ -161,13 +161,16 @@ mod ahma_mcp_tests {
 
     #[test]
     fn test_ahma_mcp_stdio_mode_rejects_tty() {
-        // When run from a terminal (TTY), stdio mode should be rejected
-        // Note: This test behavior depends on the test runner's TTY state
+        // When run from a terminal (TTY), stdio mode should be rejected.
+        // Use --server-child to skip background bridge spawning (which would hang
+        // waiting for the bridge to become healthy, then proxy to it forever).
+        // Set stdin to null so the MCP server sees EOF immediately and exits.
         let binary = build_binary_cached("ahma_bin", "ahma");
         let workspace = get_workspace_dir();
         let output = test_command(&binary)
             .current_dir(&workspace)
-            .args(["serve", "stdio"])
+            .args(["--server-child", "serve", "stdio"])
+            .stdin(std::process::Stdio::null())
             .output()
             .expect("Failed to execute ahma_mcp in stdio mode");
 
@@ -609,6 +612,17 @@ mod ahma_list_tools_mode_tests {
     fn test_ahma_cluster_add_and_remove_peer() {
         let binary = build_binary_cached("ahma_bin", "ahma");
         let temp = tempfile::tempdir().unwrap();
+
+        // `cluster` is gated at runtime by `[features] cluster` in settings.toml
+        // (default off). When the feature is compiled in, enable it for this
+        // isolated HOME so the CLI is exercised rather than refused.
+        let ahma_dir = temp.path().join(".ahma");
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+        std::fs::write(
+            ahma_dir.join("settings.toml"),
+            "[features]\ncluster = true\n",
+        )
+        .unwrap();
 
         // Add peer
         let output = test_command(&binary)
