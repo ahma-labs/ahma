@@ -563,6 +563,90 @@ pub async fn spawn_server_guard_with_config_extra_env(
     Ok(ServerGuard::new(child, startup_info.bound_port))
 }
 
+// ─── Deferred-sandbox helper ──────────────────────────────────────────────────
+
+/// Spawn a server in **deferred-sandbox** mode for roots/handshake tests.
+///
+/// This variant:
+/// - Passes `--defer-sandbox` so the sandbox is initialized from `roots/list`
+///   rather than at startup (required for `sandbox_roots_handshake_test`).
+/// - Applies [`SandboxTestEnv::apply_nested_sandbox_override`] so the binary
+///   can start when the test runner is already inside a nested OS sandbox.
+/// - Clears `AHMA_SANDBOX_SCOPE` and `AHMA_TMP_ACCESS` to prevent the test
+///   process's own sandbox env from leaking into the spawned server.
+///
+/// The caller is responsible for supplying a `tools_dir` that contains the
+/// tool configs needed by the test.
+///
+/// Returns a [`ServerGuard`] whose `port()` / `base_url()` can be used to
+/// connect.  Panics if the server fails to bind within the startup timeout.
+pub async fn spawn_server_guard_with_deferred_sandbox(
+    tools_dir: &Path,
+) -> Result<ServerGuard, String> {
+    let binary = resolve_binary_path().map_err(|e| {
+        eprintln!("WARNING  {e}");
+        e
+    })?;
+    let workspace = workspace_dir();
+    let sandbox_scope = workspace.clone(); // deferred — real scope comes from roots/list
+    let mut spec = build_server_spec(tools_dir, &sandbox_scope, None);
+
+    // Insert --defer-sandbox before the `serve` subcommand.
+    if let Some(pos) = spec.args.iter().position(|a| a == "serve") {
+        spec.args.insert(pos, "--defer-sandbox".to_string());
+    }
+
+    eprintln!(
+        "[TestServer] Starting deferred-sandbox server (tools: {})",
+        tools_dir.display()
+    );
+
+    let mut cmd = Command::new(&binary);
+    cmd.args(&spec.args)
+        .current_dir(&workspace)
+        .env_remove("AHMA_HANDSHAKE_TIMEOUT_SECS")
+        .env_remove("AHMA_SANDBOX_SCOPE")
+        .env_remove("AHMA_TMP_ACCESS")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+
+    // Remove sandbox-bypass env vars, then allow nested-sandbox override.
+    super::sandbox_env::SandboxTestEnv::configure(&mut cmd);
+    super::sandbox_env::SandboxTestEnv::apply_nested_sandbox_override(&mut cmd);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn deferred-sandbox server: {e}"))?;
+    let line_rx = attach_output_readers(&mut child);
+
+    let startup_info = wait_for_startup_or_cleanup(
+        &mut child,
+        &line_rx,
+        TestTimeouts::get(TimeoutCategory::ProcessSpawn),
+        "Timeout waiting for deferred-sandbox server to start",
+    )?;
+
+    wait_for_health_or_cleanup(
+        &mut child,
+        startup_info.bound_port,
+        "Deferred-sandbox server failed to respond to health check within timeout",
+    )
+    .await?;
+
+    // Forward server logs to stderr so CI captures them on failure.
+    std::thread::spawn(move || {
+        while let Ok(line) = line_rx.recv() {
+            eprintln!("[Server] {}", line);
+        }
+    });
+
+    Ok(ServerGuard::new(child, startup_info.bound_port))
+}
+
 // ─── In-process bridge helpers (P5) ─────────────────────────────────────────
 
 /// A running in-process bridge server (no subprocess spawned).

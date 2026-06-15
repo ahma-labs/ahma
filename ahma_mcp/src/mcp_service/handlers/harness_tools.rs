@@ -316,3 +316,7 @@ pub fn replace_in_file_schema() -> Arc<Map<String, Value>> {
     );
     schema::object_input_schema(props, &["path", "old_str", "new_str"])
 }
+
+#[cfg(test)]
+#[path = "harness_tools_tests.rs"]
+mod tests;

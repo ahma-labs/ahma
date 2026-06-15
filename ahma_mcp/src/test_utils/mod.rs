@@ -22,6 +22,11 @@ pub mod path_helpers;
 pub mod project;
 pub mod stdio;
 
+/// Canonical factory: build a bare [`crate::mcp_service::AhmaMcpService`] scoped
+/// to a fresh temp dir, with empty tool configs and `SandboxMode::Test`.
+/// See [`in_process::build_test_service`] for full documentation.
+pub use in_process::{build_test_service, build_test_service_with_configs};
+
 // Helper function to check if a tool is disabled (used by macros)
 pub fn is_tool_disabled(tool_name: &str) -> bool {
     // Check environment variable first (e.g., AHMA_DISABLE_TOOL_GH=true)

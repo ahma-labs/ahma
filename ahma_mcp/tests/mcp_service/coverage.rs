@@ -206,30 +206,9 @@ fn test_tool_hints_creation() {
 #[tokio::test]
 async fn test_service_creation_and_basic_functionality() {
     init_test_logging();
-    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
-    let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
-    let shell_config = ShellPoolConfig::default();
-    let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-
-    let _temp = tempdir().unwrap();
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![_temp.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
-    let adapter =
-        Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
-    let configs = Arc::new(HashMap::new());
-    let guidance = Arc::new(None);
-
-    let service = AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
+    let (service, _temp) = ahma_mcp::test_utils::build_test_service()
         .await
-        .unwrap();
+        .expect("Failed to create test service");
 
     // Test get_info
     let info = service.get_info();

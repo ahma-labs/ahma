@@ -27,14 +27,14 @@ mod common;
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use common::{
     SANDBOX_BYPASS_ENV_VARS, SandboxTestEnv, ServerGuard, encode_file_uri, malformed_uris,
-    parse_file_uri,
+    parse_file_uri, spawn_server_guard_with_deferred_sandbox, write_pwd_tool_config,
 };
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
@@ -43,156 +43,14 @@ fn roots_handshake_timeout() -> Duration {
     TestTimeouts::get(TimeoutCategory::SseStream)
 }
 
-fn parse_bound_port_line(line: &str) -> Option<u16> {
-    let (_, port_str) = line.split_once("AHMA_BOUND_PORT=")?;
-    port_str.trim().parse().ok()
-}
-
-// =============================================================================
-// Test Infrastructure
-// =============================================================================
-
-/// Build and get the ahma_mcp binary path
-fn get_ahma_mcp_binary() -> PathBuf {
-    ahma_mcp::test_utils::cli::build_binary_cached("ahma_bin", "ahma")
-}
-
-/// Build the server Command with all required env vars for deferred-sandbox mode.
-fn build_deferred_sandbox_command(
-    binary: &std::path::Path,
-    workspace: &std::path::Path,
-    tools_dir: &std::path::Path,
-) -> Command {
-    let mut cmd = Command::new(binary);
-    cmd.args([
-        "--sync",
-        "--tools-dir",
-        &*tools_dir.to_string_lossy(),
-        "--defer-sandbox",
-        "--log-to-stderr",
-        "--handshake-timeout",
-        &TestTimeouts::get(TimeoutCategory::Handshake)
-            .as_secs()
-            .to_string(),
-        "serve",
-        "http",
-        "--port",
-        "0",
-    ])
-    .current_dir(workspace);
-    // CRITICAL: Remove bypass env vars for real sandbox testing
-    SandboxTestEnv::configure(&mut cmd);
-    // Allow start inside nested sandboxes (app-level path security still active)
-    SandboxTestEnv::apply_nested_sandbox_override(&mut cmd);
-    // Ensure we do not inherit a fallback scope or temp access from the parent test process
-    cmd.env_remove("AHMA_SANDBOX_SCOPE");
-    cmd.env_remove("AHMA_TMP_ACCESS");
-    cmd
-}
-
-/// Consume the port-announcement channel and return the bound port.
-/// Panics on timeout or unexpected process death.
-fn wait_for_bound_port(
-    rx: &std::sync::mpsc::Receiver<String>,
-    child: &mut std::process::Child,
-) -> u16 {
-    let start = std::time::Instant::now();
-    let timeout = TestTimeouts::get(TimeoutCategory::ProcessSpawn);
-    let poll_interval = TestTimeouts::poll_interval();
-
-    while start.elapsed() < timeout {
-        if let Ok(line) = rx.recv_timeout(poll_interval)
-            && let Some(port) = parse_bound_port_line(&line)
-        {
-            return port;
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("Child process exited unexpectedly with status: {}", status);
-        }
-    }
-    let _ = child.kill();
-    panic!("Timed out waiting for server to bind port");
-}
-
-async fn poll_until_healthy(client: &Client, health_url: &str) -> bool {
-    let timeout = TestTimeouts::get(TimeoutCategory::HealthCheck);
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        sleep(TestTimeouts::poll_interval()).await;
-        if let Ok(resp) = client.get(health_url).send().await
-            && resp.status().is_success()
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Start an HTTP bridge server with deferred sandbox (for roots/list testing)
-async fn start_deferred_sandbox_server(tools_dir: &std::path::Path) -> ServerGuard {
-    let binary = get_ahma_mcp_binary();
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("Failed to get workspace dir")
-        .to_path_buf();
-
-    let mut cmd = build_deferred_sandbox_command(&binary, &workspace, tools_dir);
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to start HTTP bridge");
-
-    // Capture stderr to find the bound port
-    let stderr = child.stderr.take().expect("Failed to capture stderr");
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader};
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            eprintln!("{}", line);
-            if line.contains("AHMA_BOUND_PORT=") {
-                let _ = tx.send(line);
-            }
-        }
-    });
-
-    let port = wait_for_bound_port(&rx, &mut child);
-
-    let client = common::make_h2_client();
-    let health_url = format!("http://127.0.0.1:{}/health", port);
-    if poll_until_healthy(&client, &health_url).await {
-        return ServerGuard::new(child, port);
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-    panic!("HTTP bridge failed to start within timeout");
-}
-
 fn server_base_url(server: &ServerGuard) -> String {
     format!("http://127.0.0.1:{}", server.port())
 }
 
-fn write_pwd_tool_config(tools_dir: &Path) {
-    std::fs::create_dir_all(tools_dir).expect("Failed to create tools dir");
-
-    let tool_config = json!({
-        "name": "pwd",
-        "description": "Print working directory",
-        "command": "pwd",
-        "enabled": true,
-        "subcommand": [{"name": "default", "description": "pwd"}]
-    });
-    std::fs::write(
-        tools_dir.join("pwd.json"),
-        serde_json::to_string_pretty(&tool_config).unwrap(),
-    )
-    .expect("Failed to write tool config");
-}
-
 async fn start_initialized_session(tools_dir: &Path) -> (ServerGuard, String, Client, String) {
-    let server = start_deferred_sandbox_server(tools_dir).await;
+    let server = spawn_server_guard_with_deferred_sandbox(tools_dir)
+        .await
+        .expect("Failed to start deferred-sandbox server");
     let base_url = server_base_url(&server);
     let client = common::make_h2_client();
     let session_id = initialize_session(&client, &base_url)
@@ -1040,7 +898,9 @@ async fn test_handshake_ordering_sse_first() {
     let tools_dir = temp_dir.path().join("tools");
     write_pwd_tool_config(&tools_dir);
 
-    let _server = start_deferred_sandbox_server(&tools_dir).await;
+    let _server = spawn_server_guard_with_deferred_sandbox(&tools_dir)
+        .await
+        .expect("Failed to start deferred-sandbox server");
     let base_url = server_base_url(&_server);
     let client = common::make_h2_client();
 

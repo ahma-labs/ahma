@@ -23,7 +23,12 @@ use tracing::info;
 
 /// Try to wire up an HTTP MCP client proxy if `mcp.json` specifies one.
 /// Missing or non-ahma configs (e.g. Cursor/VS Code) are silently ignored.
+///
+/// The transport is stored in a process-lifetime `OnceLock` so the connection
+/// stays alive without resorting to `Box::leak`.
 async fn try_setup_mcp_client(config: &AppConfig) -> Result<()> {
+    static MCP_TRANSPORT: std::sync::OnceLock<HttpMcpTransport> = std::sync::OnceLock::new();
+
     if !fs::try_exists(&config.mcp_config).await.unwrap_or(false) {
         return Ok(());
     }
@@ -46,7 +51,7 @@ async fn try_setup_mcp_client(config: &AppConfig) -> Result<()> {
                     "Remote tools are not yet proxied to the client - this is a partial integration"
                 );
                 // Keep the transport alive for the duration of the process
-                Box::leak(Box::new(transport));
+                let _ = MCP_TRANSPORT.set(transport);
             }
         }
         Err(e) => {

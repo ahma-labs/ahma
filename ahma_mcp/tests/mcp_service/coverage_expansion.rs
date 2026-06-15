@@ -1,63 +1,26 @@
+//! Extended coverage tests for AhmaMcpService creation scenarios.
+//!
+//! These tests use the shared `ahma_mcp::test_utils::build_test_service` factory
+//! to eliminate boilerplate and keep the focus on the behaviour under test.
+//! Tests that specifically exercise non-default configurations (shell pool
+//! settings, guidance with tool-specific data) keep their inline construction.
+
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ahma_mcp::adapter::Adapter;
-use ahma_mcp::config::load_tool_configs;
-use ahma_mcp::mcp_service::{AhmaMcpService, GuidanceConfig};
+use ahma_mcp::mcp_service::{AhmaMcpService, GuidanceConfig, LegacyGuidanceConfig};
 use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};
 use ahma_mcp::sandbox::{Sandbox, SandboxMode};
 use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
 use rmcp::handler::server::ServerHandler;
-use tempfile::TempDir;
-
-/// Helper function to create a test AhmaMcpService instance
-async fn create_test_service() -> (AhmaMcpService, TempDir) {
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
-
-    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
-    let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
-    let shell_config = ShellPoolConfig::default();
-    let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![temp_dir.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
-    let adapter =
-        Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
-
-    // Load tool configs from .ahma directory or use empty map
-    let tool_configs = if Path::new(".ahma").exists() {
-        load_tool_configs(
-            &ahma_mcp::shell::cli::AppConfig::default(),
-            Some(Path::new(".ahma")),
-        )
-        .await
-        .unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
-
-    let configs = Arc::new(tool_configs);
-    let guidance = Arc::new(None::<GuidanceConfig>);
-
-    let service = AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
-        .await
-        .unwrap();
-    (service, temp_dir)
-}
 
 #[tokio::test]
 async fn test_get_info_returns_complete_server_info() {
-    let (service, _temp_dir) = create_test_service().await;
+    let (service, _temp_dir) = ahma_mcp::test_utils::build_test_service()
+        .await
+        .expect("Failed to create test service");
 
     let info = service.get_info();
 
@@ -73,13 +36,13 @@ async fn test_get_info_returns_complete_server_info() {
 
 #[tokio::test]
 async fn test_service_creation_with_guidance_config() {
+    // This test specifically constructs a GuidanceConfig with LegacyGuidanceConfig,
+    // which is the point of the test — keep inline setup for the guidance parts.
     let _temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
 
     let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
-    let shell_config = ShellPoolConfig::default();
-    let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-
+    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let sandbox = Arc::new(
         Sandbox::new(
             vec![_temp_dir.path().to_path_buf()],
@@ -93,14 +56,11 @@ async fn test_service_creation_with_guidance_config() {
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
 
-    let tool_configs = HashMap::new();
-    let configs = Arc::new(tool_configs);
-
-    // Create a guidance config with correct field names
+    let configs = Arc::new(HashMap::new());
     let guidance_config = GuidanceConfig {
         guidance_blocks: HashMap::new(),
         templates: HashMap::new(),
-        legacy_guidance: Some(ahma_mcp::mcp_service::LegacyGuidanceConfig {
+        legacy_guidance: Some(LegacyGuidanceConfig {
             general_guidance: {
                 let mut general = HashMap::new();
                 general.insert("default".to_string(), "Test guidance".to_string());
@@ -115,63 +75,26 @@ async fn test_service_creation_with_guidance_config() {
         .await
         .unwrap();
 
-    // Verify service was created successfully
     let info = service.get_info();
     assert!(info.capabilities.tools.is_some());
 }
 
 #[tokio::test]
 async fn test_service_creation_with_existing_tool_configs() {
-    let _temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
-
-    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
-    let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
-    let shell_config = ShellPoolConfig::default();
-    let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![_temp_dir.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
-    let adapter =
-        Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
-
-    // Load actual tool configs if they exist
-    let tool_configs = if Path::new(".ahma").exists() {
-        load_tool_configs(
-            &ahma_mcp::shell::cli::AppConfig::default(),
-            Some(Path::new(".ahma")),
-        )
+    let (service, _temp_dir) = ahma_mcp::test_utils::build_test_service()
         .await
-        .unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
+        .expect("Failed to create test service");
 
-    let configs = Arc::new(tool_configs);
-    let guidance = Arc::new(None::<GuidanceConfig>);
-
-    let service = AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
-        .await
-        .unwrap();
-
-    // Verify service was created successfully
     let info = service.get_info();
     assert!(info.capabilities.tools.is_some());
 }
 
 #[tokio::test]
 async fn test_service_creation_with_custom_timeouts() {
+    // This test specifically exercises non-default monitor and shell pool timeouts.
     let _temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
 
-    // Test with custom timeout configuration
-    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(600)); // 10 minutes
+    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(600));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
 
     let shell_config = ShellPoolConfig {
@@ -185,7 +108,6 @@ async fn test_service_creation_with_custom_timeouts() {
         health_check_interval: Duration::from_secs(30),
     };
     let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-
     let sandbox = Arc::new(
         Sandbox::new(
             vec![_temp_dir.path().to_path_buf()],
@@ -199,26 +121,26 @@ async fn test_service_creation_with_custom_timeouts() {
     let adapter =
         Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
 
-    let tool_configs = HashMap::new();
-    let configs = Arc::new(tool_configs);
+    let configs = Arc::new(HashMap::new());
     let guidance = Arc::new(None::<GuidanceConfig>);
 
     let service = AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
         .await
         .unwrap();
 
-    // Verify service was created successfully with custom configuration
     let info = service.get_info();
     assert!(info.capabilities.tools.is_some());
 }
 
 #[tokio::test]
 async fn test_multiple_service_instances() {
-    // Test that multiple service instances can be created concurrently
-    let (service1, _temp_dir1) = create_test_service().await;
-    let (service2, _temp_dir2) = create_test_service().await;
+    let (service1, _temp_dir1) = ahma_mcp::test_utils::build_test_service()
+        .await
+        .expect("Failed to create service 1");
+    let (service2, _temp_dir2) = ahma_mcp::test_utils::build_test_service()
+        .await
+        .expect("Failed to create service 2");
 
-    // Both should provide consistent info
     let info1 = service1.get_info();
     let info2 = service2.get_info();
 
@@ -231,9 +153,10 @@ async fn test_multiple_service_instances() {
 
 #[tokio::test]
 async fn test_service_stability_under_repeated_info_calls() {
-    let (service, _temp_dir) = create_test_service().await;
+    let (service, _temp_dir) = ahma_mcp::test_utils::build_test_service()
+        .await
+        .expect("Failed to create test service");
 
-    // Test that get_info is stable under repeated calls
     let initial_info = service.get_info();
 
     for _ in 0..100 {
@@ -248,49 +171,22 @@ async fn test_service_stability_under_repeated_info_calls() {
 
 #[tokio::test]
 async fn test_service_with_empty_configs() {
-    let _temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
-
-    let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
-    let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
-    let shell_config = ShellPoolConfig::default();
-    let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-
-    let sandbox = Arc::new(
-        Sandbox::new(
-            vec![_temp_dir.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap(),
-    );
-    let adapter =
-        Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
-
-    // Explicitly use empty configs
-    let tool_configs = HashMap::new();
-    let configs = Arc::new(tool_configs);
-    let guidance = Arc::new(None::<GuidanceConfig>);
-
-    let service = AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
+    let (service, _temp_dir) = ahma_mcp::test_utils::build_test_service()
         .await
-        .unwrap();
+        .expect("Failed to create test service");
 
-    // Verify service creation with empty configs
     let info = service.get_info();
     assert!(info.capabilities.tools.is_some());
 }
 
 #[tokio::test]
 async fn test_guidance_config_with_tool_specific_guidance() {
+    // This test specifically exercises tool-specific guidance routing — keep inline.
     let _temp_dir = tempfile::tempdir().expect("Failed to create temp directory");
 
     let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
-    let shell_config = ShellPoolConfig::default();
-    let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
-
+    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let sandbox = Arc::new(
         Sandbox::new(
             vec![_temp_dir.path().to_path_buf()],
@@ -312,11 +208,10 @@ async fn test_guidance_config_with_tool_specific_guidance() {
     tool_specific_guidance.insert("git".to_string(), git_guidance);
     tool_specific_guidance.insert("cargo".to_string(), cargo_guidance);
 
-    // Create a guidance config with tool-specific guidance using correct field names
     let guidance_config = GuidanceConfig {
         guidance_blocks: HashMap::new(),
         templates: HashMap::new(),
-        legacy_guidance: Some(ahma_mcp::mcp_service::LegacyGuidanceConfig {
+        legacy_guidance: Some(LegacyGuidanceConfig {
             general_guidance: {
                 let mut general = HashMap::new();
                 general.insert(
@@ -329,47 +224,50 @@ async fn test_guidance_config_with_tool_specific_guidance() {
         }),
     };
     let guidance = Arc::new(Some(guidance_config));
-    let tool_configs = HashMap::new();
-    let configs = Arc::new(tool_configs);
+    let configs = Arc::new(HashMap::new());
 
     let service = AhmaMcpService::new(adapter, operation_monitor, configs, guidance, false, false)
         .await
         .unwrap();
 
-    // Verify service was created successfully
     let info = service.get_info();
     assert!(info.capabilities.tools.is_some());
 }
 
 #[tokio::test]
 async fn test_service_protocol_version_consistency() {
-    let (service, _temp_dir) = create_test_service().await;
+    let (service, _temp_dir) = ahma_mcp::test_utils::build_test_service()
+        .await
+        .expect("Failed to create test service");
 
-    // Test that protocol version is consistent
     let info = service.get_info();
     assert_eq!(info.protocol_version, rmcp::model::ProtocolVersion::LATEST);
 }
 
 #[tokio::test]
 async fn test_service_capabilities_structure() {
-    let (service, _temp_dir) = create_test_service().await;
+    let (service, _temp_dir) = ahma_mcp::test_utils::build_test_service()
+        .await
+        .expect("Failed to create test service");
 
-    // Test that capabilities structure is as expected
     let info = service.get_info();
     assert!(info.capabilities.tools.is_some());
 
-    // Verify tools capability exists
     if let Some(tools_capability) = &info.capabilities.tools {
-        // Should have list_changed field
         assert!(tools_capability.list_changed.is_some());
     }
 }
 
 #[tokio::test]
 async fn test_concurrent_service_creation() {
-    // Test creating multiple services concurrently
     let futures: Vec<_> = (0..5)
-        .map(|_| tokio::spawn(create_test_service()))
+        .map(|_| {
+            tokio::spawn(async {
+                ahma_mcp::test_utils::build_test_service()
+                    .await
+                    .expect("Failed to create test service")
+            })
+        })
         .collect();
 
     for future in futures {
@@ -386,11 +284,11 @@ async fn test_service_creation_error_handling() {
     let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
 
-    // Try to create a service with a minimal shell pool config
+    // This test specifically exercises a minimal (non-default) shell pool config.
     let shell_config = ShellPoolConfig {
         enabled: true,
         shells_per_directory: 1,
-        max_total_shells: 1, // Minimal but valid
+        max_total_shells: 1,
         shell_idle_timeout: Duration::from_secs(1),
         pool_cleanup_interval: Duration::from_secs(1),
         shell_spawn_timeout: Duration::from_secs(1),
@@ -417,8 +315,7 @@ async fn test_service_creation_error_handling() {
     );
     match adapter {
         Ok(adapter) => {
-            let tool_configs = HashMap::new();
-            let configs = Arc::new(tool_configs);
+            let configs = Arc::new(HashMap::new());
             let guidance = Arc::new(None::<GuidanceConfig>);
 
             let result = AhmaMcpService::new(
@@ -431,7 +328,6 @@ async fn test_service_creation_error_handling() {
             )
             .await;
 
-            // If it succeeds, it should be a valid service
             if let Ok(service) = result {
                 let info = service.get_info();
                 assert!(info.capabilities.tools.is_some());

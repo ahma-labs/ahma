@@ -939,8 +939,20 @@ fn is_vulnerable(
 fn fetch_crate_publish_age_days(name: &str, version: &str) -> Result<i64, String> {
     let url = format!("https://crates.io/api/v1/crates/{name}/{version}");
 
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    let agent = AGENT.get_or_init(|| {
+        let config = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(10)))
+            .build();
+        ureq::Agent::new_with_config(config)
+    });
+
+    // Add a small delay to respect crates.io rate limits
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
     // crates.io requires a User-Agent
-    let response = ureq::get(&url)
+    let response = agent
+        .get(&url)
         .header(
             "User-Agent",
             "ahma-xtask/safe-update (https://github.com/paulirotta/ahma)",
