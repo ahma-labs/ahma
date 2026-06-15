@@ -5,7 +5,9 @@
 use anyhow::{Context, Result};
 use clap::Parser as _;
 
+#[cfg(feature = "cluster")]
 use ahma_mcp::shell::cli::ClusterCommand;
+#[cfg(feature = "vault")]
 use ahma_mcp::shell::cli::VaultCommand;
 use ahma_mcp::shell::cli::{
     Cli, LlmCommand, Subcommands, TlsCommand, build_app_config, dispatch_subcommand, load_settings,
@@ -177,7 +179,11 @@ fn feature_disabled_at_runtime(subcommand: &str, setting: &str) -> Result<()> {
     )
 }
 
-fn dispatch_vault(args: ahma_mcp::shell::VaultArgs) -> Result<()> {
+fn dispatch_vault(#[allow(unused_variables)] args: ahma_mcp::shell::VaultArgs) -> Result<()> {
+    #[cfg(not(feature = "vault"))]
+    return feature_disabled_at_runtime("vault", "vault");
+
+    #[cfg(feature = "vault")]
     match args.command {
         VaultCommand::Create(create_args) => {
             let vault = ahma_vault::TaskVault::create(&create_args.slug)
@@ -359,6 +365,7 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Path to the static peers file.
+#[cfg(feature = "cluster")]
 fn peers_path() -> Result<std::path::PathBuf> {
     dirs::home_dir()
         .context("Cannot determine home directory for ~/.ahma/cluster/peers.json")
@@ -366,6 +373,7 @@ fn peers_path() -> Result<std::path::PathBuf> {
 }
 
 /// Read the peers list from disk, returning an empty vec if the file is absent.
+#[cfg(feature = "cluster")]
 fn read_peers() -> Result<Vec<ahma_cluster::PeerInfo>> {
     let path = peers_path()?;
     if !path.exists() {
@@ -377,6 +385,7 @@ fn read_peers() -> Result<Vec<ahma_cluster::PeerInfo>> {
 }
 
 /// Write the peers list to disk (creates directory if needed).
+#[cfg(feature = "cluster")]
 fn write_peers(peers: &[ahma_cluster::PeerInfo]) -> Result<()> {
     let path = peers_path()?;
     if let Some(parent) = path.parent() {
@@ -386,7 +395,11 @@ fn write_peers(peers: &[ahma_cluster::PeerInfo]) -> Result<()> {
     std::fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))
 }
 
-async fn dispatch_cluster(args: ahma_mcp::shell::ClusterArgs) -> Result<()> {
+async fn dispatch_cluster(#[allow(unused_variables)] args: ahma_mcp::shell::ClusterArgs) -> Result<()> {
+    #[cfg(not(feature = "cluster"))]
+    return feature_disabled_at_runtime("cluster", "cluster");
+
+    #[cfg(feature = "cluster")]
     match args.command {
         ClusterCommand::List => {
             let peers = read_peers()?;
@@ -583,6 +596,7 @@ async fn dispatch_cluster(args: ahma_mcp::shell::ClusterArgs) -> Result<()> {
     }
 }
 
+#[cfg(feature = "cluster")]
 fn dispatch_cert(cmd: ahma_mcp::shell::CertCommand) -> Result<()> {
     use ahma_mcp::shell::CertCommand;
     match cmd {
