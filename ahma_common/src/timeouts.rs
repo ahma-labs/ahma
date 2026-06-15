@@ -139,6 +139,18 @@ fn is_coverage_mode() -> bool {
     std::env::var_os("LLVM_PROFILE_FILE").is_some() || std::env::var_os("CARGO_LLVM_COV").is_some()
 }
 
+/// Default idle-timeout (seconds) for **auto-spawned** bridges.
+///
+/// An auto-spawned bridge is one started implicitly by `ahma serve stdio` (proxy mode) or
+/// `ahma tui` when no bridge is running.  The bridge exits this many seconds after the last
+/// MCP session closes, so orphaned processes cannot accumulate after Cursor or the TUI quit.
+///
+/// Explicitly-started bridges (`ahma serve http`, `ahma serve unix`) default to no timeout
+/// and remain running until stopped — they are user-managed servers.
+///
+/// Both spawn sites reference this constant so they always agree on the default.
+pub const AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS: u64 = 10;
+
 #[cfg(test)]
 mod tests {
     use super::*;

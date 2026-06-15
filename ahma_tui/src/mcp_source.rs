@@ -173,6 +173,19 @@ async fn mcp_source_task(
                         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     }
                     None => {
+                        // The TUI is shutting down.  Delete the MCP session so the bridge
+                        // decrements active_sessions immediately rather than waiting for the
+                        // 5-second SSE-drop grace period, allowing the auto-spawned bridge to
+                        // idle-exit promptly once no client is connected.
+                        if let Some(ref session) = mcp_state {
+                            let mcp_url = format!("{request_base_url}/mcp");
+                            let _ = client
+                                .delete(&mcp_url)
+                                .header("mcp-session-id", session.id())
+                                .timeout(Duration::from_secs(2))
+                                .send()
+                                .await;
+                        }
                         break;
                     }
                 }
@@ -353,6 +366,10 @@ impl McpSession {
             id: id.into(),
             next_id: std::sync::atomic::AtomicU64::new(10),
         }
+    }
+
+    fn id(&self) -> &str {
+        &self.id
     }
 
     fn next_req_id(&self) -> u64 {

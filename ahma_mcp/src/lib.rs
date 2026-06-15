@@ -137,6 +137,8 @@ pub mod schema_validation;
 pub mod service_builder;
 /// Setup wizard for MCP, hooks, TLS, and skills.
 pub mod setup;
+/// Uninstall wizard (symmetric teardown of `ahma setup`).
+pub mod uninstall;
 /// CLI shell entry points.
 pub mod shell;
 /// Shell pooling and execution.

@@ -96,6 +96,12 @@ where
             }
         }
     }
+    // Notify the bridge that this session is terminating.  For HTTP-backed transports
+    // this sends DELETE /mcp so the bridge decrements active_sessions immediately rather
+    // than waiting for the 5-second SSE-drop grace period.
+    if let Err(e) = client.close().await {
+        tracing::debug!(transport, error = ?e, "Proxy close error (non-fatal)");
+    }
     Ok(())
 }
 

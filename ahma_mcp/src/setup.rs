@@ -540,7 +540,7 @@ async fn setup_mcp_config(
     Ok(())
 }
 
-fn merge_mcp_json(path: &Path, servers_key: &str, value: serde_json::Value) -> Result<()> {
+pub(crate) fn merge_mcp_json(path: &Path, servers_key: &str, value: serde_json::Value) -> Result<()> {
     let mut config = if path.exists() {
         let content = std::fs::read_to_string(path)?;
         serde_json::from_str(&content)

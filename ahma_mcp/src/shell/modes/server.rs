@@ -10,6 +10,7 @@ use crate::{
     utils::logging::{BRIDGE_CAPTURE_HEADER, prepare_bridge_capture_files, read_log_tail},
     utils::stdio::emit_stdout_notification,
 };
+use ahma_common::timeouts::AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS;
 use ahma_http_mcp_client::client::HttpMcpTransport;
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
@@ -480,7 +481,7 @@ fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf])
         push_val(&mut args, "--tools", bundle.clone());
     }
 
-    let timeout = config.idle_timeout_secs.or(Some(10));
+    let timeout = config.idle_timeout_secs.or(Some(AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS));
     if let Some(t) = timeout
         && t > 0
     {

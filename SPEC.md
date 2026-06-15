@@ -46,6 +46,8 @@
 | Local Cluster Scheduler | tests-pass | mDNS discovery and signed task dispatch to remote worker peers |
 | Configuration Standard (R-CFG) | PLANNED | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5) |
 | `ahma cluster remove` | tests-pass | Subcommand to remove worker peers from peers configuration |
+| `ahma setup` / `ahma uninstall` | tests-pass | Interactive wizard installs / removes MCP entries, hooks, skills, binary; symmetric teardown leaves other user config intact |
+| Auto-spawned Bridge Lifecycle | tests-pass | Bridges started by `ahma serve stdio` or `ahma tui` self-terminate after `--idle-timeout` seconds with no connected client; explicitly-started `ahma serve http/unix` remain persistent by default |
 
 ---
 
@@ -715,6 +717,35 @@ ahma --tool_name cargo --tool_args '{"subcommand": "build"}'
 ahma --list-tools -- /path/to/ahma --tools-dir ./tools
 ahma --list-tools --http http://localhost:3000
 ```
+
+---
+
+## 6.5 Installation, Setup, and Uninstall
+
+### R-SETUP: `ahma setup` Wizard
+
+`ahma setup` installs all integrations (MCP server entries, terminal hooks, agent skills, TLS certificates) into the user's AI tool configurations.  Without flags it runs an interactive wizard; with `--auto` it installs everything silently.
+
+### R-UNINSTALL: `ahma uninstall` (Symmetric Teardown)
+
+`ahma uninstall` **mirrors `ahma setup`**: same interactive "what / which platforms" prompt sequence (default: all), same flag surface (`--auto`, `--mcp`, `--hooks`, `--skills`, `--binary`, `--platform`, `--purge`, `--dry-run`).
+
+**Invariants:**
+- Only Ahma-managed keys and files are removed; other user content in the same config files is always preserved.
+- `~/.ahma` data directory (TLS, prompts, settings, logs) is **never** removed unless `--purge` is explicitly passed.
+- On Unix, the binary can self-delete; on Windows, manual instructions are printed instead.
+- After uninstall, restart instructions are printed for all affected platforms.
+
+### R-LIFECYCLE: Auto-Spawned Bridge Self-Termination
+
+Bridges **auto-spawned** by `ahma serve stdio` (proxy mode) or `ahma tui` automatically self-terminate once no MCP client remains connected:
+
+1. Each auto-spawned bridge is started with `--idle-timeout <N>` (default: `AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS = 10`).
+2. The idle-timeout checker polls `active_sessions` every second; when the counter is zero for `N` seconds, the bridge calls `terminate_all` and `process::exit(0)`.
+3. The bridge also installs a SIGINT/SIGTERM handler that runs `terminate_all`, removes the Unix socket, and exits cleanly.
+4. The TUI sends `DELETE /mcp` for its session on quit; the Unix stdio proxy calls `transport.close()` on EOF — both signal the bridge promptly rather than waiting for SSE-drop detection.
+
+**Explicitly-started bridges** (`ahma serve http`, `ahma serve unix`) have no idle timeout by default and remain running until stopped by the user.
 
 ---
 

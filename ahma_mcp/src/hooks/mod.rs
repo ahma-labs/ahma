@@ -354,7 +354,7 @@ pub fn run_install(args: HooksInstallArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_uninstall(args: HooksUninstallArgs) -> Result<()> {
+pub fn run_uninstall(args: HooksUninstallArgs) -> Result<()> {
     let env = HookEnvironment::detect()?;
 
     for platform in selected_platforms(&args.platforms) {

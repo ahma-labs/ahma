@@ -84,7 +84,6 @@ pub fn detect_platform() -> Result<Platform> {
         let arch = match std::env::consts::ARCH {
             "x86_64" => "x86_64",
             "aarch64" => "arm64",
-            "arm" | "armv7" => "armv7",
             other => bail!("Unsupported Linux architecture: {other}"),
         };
 
@@ -99,9 +98,7 @@ pub fn detect_platform() -> Result<Platform> {
         let prefer_musl =
             PREFER_MUSL_OVERRIDE.get().is_some() || env_prefer_musl || detect_linux_musl();
 
-        let id = if arch == "armv7" {
-            "linux-armv7".to_string()
-        } else if prefer_musl {
+        let id = if prefer_musl {
             format!("linux-{arch}-musl")
         } else {
             format!("linux-{arch}")

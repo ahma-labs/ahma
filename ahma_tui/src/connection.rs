@@ -17,6 +17,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use ahma_common::timeouts::AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS;
 use anyhow::{Result, bail};
 use tracing::debug;
 
@@ -658,6 +659,11 @@ pub async fn ensure_server_running(scope_path: Option<&std::path::Path>) -> Resu
         args.push("--sandbox-scope".to_string());
         args.push(path.to_string_lossy().into_owned());
     }
+
+    // Apply the same default idle-timeout as the stdio-proxy spawn path so this
+    // bridge also self-terminates when the TUI disconnects.
+    args.push("--idle-timeout".to_string());
+    args.push(AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS.to_string());
 
     let args_slices: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
