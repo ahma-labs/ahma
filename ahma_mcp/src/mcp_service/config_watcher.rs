@@ -424,14 +424,23 @@ impl AhmaMcpService {
             return;
         }
 
+        // Anchor the default log directory to the primary workspace scope so that
+        // logs_list and operation spill files land inside the project.  Best-effort:
+        // silently ignored if --log-dir was already set or scope was already recorded.
+        // The tracing file appender opened at startup keeps its existing file handle;
+        // only subsequent project_log_dir() callers (spill files, logs_list) are affected.
+        let primary_scope = self
+            .adapter
+            .sandbox()
+            .scopes()
+            .first()
+            .map(|p| p.to_path_buf());
+        if let Some(ref scope) = primary_scope {
+            crate::utils::logging::set_log_dir_from_scope(scope.join("logs"));
+        }
+
         // Per-client tool discovery: load tools from `<root>/.ahma/` if present.
-        let discovery_root = client_root.or_else(|| {
-            self.adapter
-                .sandbox()
-                .scopes()
-                .first()
-                .map(|p| p.to_path_buf())
-        });
+        let discovery_root = client_root.or(primary_scope);
         self.maybe_load_per_client_tools(discovery_root).await;
 
         // Notify bridge that sandbox has been configured so it can safely

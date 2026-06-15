@@ -86,16 +86,16 @@ fn test_log_directory_already_exists() {
 
 #[test]
 fn test_log_file_name_format() {
-    // The log file uses daily rotation with format "ahma_mcp.log"
-    let log_file_name = "ahma_mcp.log";
+    // The log file uses daily rotation with format "ahma.log"
+    let log_file_name = "ahma.log";
     assert!(log_file_name.ends_with(".log"));
-    assert!(log_file_name.starts_with("ahma_mcp"));
+    assert!(log_file_name.starts_with("ahma"));
 }
 
 #[test]
 fn test_log_file_can_be_created_in_temp_dir() {
     let temp_dir = tempdir().unwrap();
-    let log_file = temp_dir.path().join("ahma_mcp.log");
+    let log_file = temp_dir.path().join("ahma.log");
 
     // Write to log file
     fs::write(&log_file, "test log entry\n").unwrap();
