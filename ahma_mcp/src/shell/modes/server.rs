@@ -481,7 +481,9 @@ fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf])
         push_val(&mut args, "--tools", bundle.clone());
     }
 
-    let timeout = config.idle_timeout_secs.or(Some(AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS));
+    let timeout = config
+        .idle_timeout_secs
+        .or(Some(AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS));
     if let Some(t) = timeout
         && t > 0
     {

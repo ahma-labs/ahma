@@ -28,7 +28,7 @@ use crate::shell::cli::UninstallArgs;
 // ── Action / platform enum mirrors (private) ─────────────────────────────────
 
 /// An action that the wizard can remove.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum UninstallAction {
     Skills,
     Mcp,
@@ -227,9 +227,9 @@ fn select_platforms(
         return relevant
             .into_iter()
             .filter(|p| {
-                platform_filter
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case(p.cli_name()) || f.eq_ignore_ascii_case(p.label()))
+                platform_filter.iter().any(|f| {
+                    f.eq_ignore_ascii_case(p.cli_name()) || f.eq_ignore_ascii_case(p.label())
+                })
             })
             .collect();
     }
@@ -321,15 +321,12 @@ fn uninstall_mcp_config(platforms: &[Platform], dry_run: bool) -> Result<Vec<&'s
             Platform::Antigravity => {
                 let path = home.join(".gemini").join("config").join("mcp_config.json");
                 remove_mcp_entry(&path, "mcpServers", dry_run)
-                    .with_context(|| {
-                        format!("Antigravity MCP config at {}", path.display())
-                    })?;
+                    .with_context(|| format!("Antigravity MCP config at {}", path.display()))?;
                 Some("Antigravity")
             }
             Platform::Codex => {
                 let path = home.join(".codex").join("config.toml");
-                remove_codex_mcp(&path, dry_run)
-                    .context("Codex config (~/.codex/config.toml)")?;
+                remove_codex_mcp(&path, dry_run).context("Codex config (~/.codex/config.toml)")?;
                 Some("Codex CLI")
             }
             Platform::Copilot => None,
@@ -357,8 +354,8 @@ pub fn remove_mcp_entry(path: &Path, servers_key: &str, dry_run: bool) -> Result
 
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut config: Value = serde_json::from_str(&content)
-        .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+    let mut config: Value =
+        serde_json::from_str(&content).unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
 
     if !config.is_object() {
         return Ok(());
@@ -404,8 +401,8 @@ pub fn remove_codex_mcp(path: &Path, dry_run: bool) -> Result<()> {
 
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut config: toml::Value = toml::from_str(&content)
-        .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    let mut config: toml::Value =
+        toml::from_str(&content).unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
 
     if !config.is_table() {
         return Ok(());
@@ -429,8 +426,7 @@ pub fn remove_codex_mcp(path: &Path, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    let serialized =
-        toml::to_string_pretty(&config).context("Failed to serialize Codex config")?;
+    let serialized = toml::to_string_pretty(&config).context("Failed to serialize Codex config")?;
     std::fs::write(path, serialized)
         .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
@@ -521,7 +517,10 @@ pub fn remove_claude_plugin(home: &Path, dry_run: bool, interactive: bool) -> Re
             std::fs::remove_dir_all(&plugins_dir)
                 .with_context(|| format!("Failed to remove {}", plugins_dir.display()))?;
             if interactive {
-                println!("✓ Removed Claude Code plugin cache {}", plugins_dir.display());
+                println!(
+                    "✓ Removed Claude Code plugin cache {}",
+                    plugins_dir.display()
+                );
             }
         }
     }
@@ -548,8 +547,8 @@ fn remove_installed_plugin_entry(path: &Path, plugin_key: &str, dry_run: bool) -
 
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut config: Value =
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({"version": 2, "plugins": {}}));
+    let mut config: Value = serde_json::from_str(&content)
+        .unwrap_or_else(|_| serde_json::json!({"version": 2, "plugins": {}}));
 
     let plugins = config
         .as_object_mut()
@@ -565,7 +564,11 @@ fn remove_installed_plugin_entry(path: &Path, plugin_key: &str, dry_run: bool) -
     }
 
     if dry_run {
-        println!("[dry-run] Would remove {} from {}", plugin_key, path.display());
+        println!(
+            "[dry-run] Would remove {} from {}",
+            plugin_key,
+            path.display()
+        );
         return Ok(());
     }
 
@@ -620,7 +623,11 @@ fn uninstall_binary(dry_run: bool) -> Result<()> {
     let install_dir = resolve_install_dir()?;
     let binary_name = if cfg!(windows) { "ahma.exe" } else { "ahma" };
     let binary_path = install_dir.join(binary_name);
-    let old_path = install_dir.join(if cfg!(windows) { "ahma.old.exe" } else { "ahma.old" });
+    let old_path = install_dir.join(if cfg!(windows) {
+        "ahma.old.exe"
+    } else {
+        "ahma.old"
+    });
 
     if dry_run {
         if binary_path.exists() {
@@ -642,7 +649,10 @@ fn uninstall_binary(dry_run: bool) -> Result<()> {
                 .with_context(|| format!("Failed to remove {}", binary_path.display()))?;
             println!("✓ Removed {}", binary_path.display());
         } else {
-            println!("  Binary not found at {} — nothing to remove.", binary_path.display());
+            println!(
+                "  Binary not found at {} — nothing to remove.",
+                binary_path.display()
+            );
         }
     }
 
@@ -658,7 +668,10 @@ fn uninstall_binary(dry_run: bool) -> Result<()> {
                 println!("    Remove-Item -Force \"{}\"", old_path.display());
             }
         } else {
-            println!("  Binary not found at {} — nothing to remove.", binary_path.display());
+            println!(
+                "  Binary not found at {} — nothing to remove.",
+                binary_path.display()
+            );
         }
     }
 
@@ -669,10 +682,10 @@ fn uninstall_binary(dry_run: bool) -> Result<()> {
 ///
 /// Respects `AHMA_INSTALL_DIR` environment variable, falling back to `~/.local/bin`.
 fn resolve_install_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("AHMA_INSTALL_DIR") {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir));
-        }
+    if let Ok(dir) = std::env::var("AHMA_INSTALL_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir));
     }
     crate::update::default_install_dir()
 }
@@ -713,7 +726,10 @@ fn purge_ahma_dir(dry_run: bool) -> Result<()> {
             .unwrap_or_default();
         if entries.is_empty() {
             let _ = std::fs::remove_dir(&sandbox_dir);
-            println!("✓ Removed empty Antigravity sandbox dir {}", sandbox_dir.display());
+            println!(
+                "✓ Removed empty Antigravity sandbox dir {}",
+                sandbox_dir.display()
+            );
         } else {
             println!(
                 "  Skipping non-empty {} — remove manually if desired.",
@@ -735,14 +751,14 @@ fn print_restart_hints(interactive: bool, affected_platforms: &[&str], dry_run: 
     if !interactive || affected_platforms.is_empty() {
         return;
     }
-    println!("\n✓ Uninstall complete! Restart (fully quit and reopen) these tools to apply changes:");
+    println!(
+        "\n✓ Uninstall complete! Restart (fully quit and reopen) these tools to apply changes:"
+    );
     for name in affected_platforms {
         println!("    - {}", name);
     }
     println!();
-    println!(
-        "  If an `ahma tui` is open, close it; any background ahma servers will shut down"
-    );
+    println!("  If an `ahma tui` is open, close it; any background ahma servers will shut down");
     println!("  automatically once no client is connected.");
     println!();
 }
@@ -795,7 +811,11 @@ fn parse_selection_string(input: &str, max_val: usize) -> Vec<usize> {
 
 fn parse_digit_sequence(input: &str, max_val: usize) -> Vec<usize> {
     let mut out = Vec::new();
-    for d in input.chars().filter_map(|c| c.to_digit(10)).map(|d| d as usize) {
+    for d in input
+        .chars()
+        .filter_map(|c| c.to_digit(10))
+        .map(|d| d as usize)
+    {
         if d >= 1 && d <= max_val && !out.contains(&(d - 1)) {
             out.push(d - 1);
         }
@@ -876,8 +896,14 @@ mod tests {
 
         let content = std::fs::read_to_string(&path)?;
         let parsed: Value = serde_json::from_str(&content)?;
-        assert!(parsed["mcpServers"]["Ahma"].is_null(), "Ahma key should be gone");
-        assert_eq!(parsed["mcpServers"]["Other"]["type"], "stdio", "Other key preserved");
+        assert!(
+            parsed["mcpServers"]["Ahma"].is_null(),
+            "Ahma key should be gone"
+        );
+        assert_eq!(
+            parsed["mcpServers"]["Other"]["type"], "stdio",
+            "Other key preserved"
+        );
         Ok(())
     }
 
@@ -885,7 +911,10 @@ mod tests {
     fn remove_mcp_entry_prunes_empty_servers_object() -> Result<()> {
         let tmp = tempdir()?;
         let path = tmp.path().join("mcp.json");
-        std::fs::write(&path, r#"{"mcpServers":{"Ahma":{"type":"stdio"}},"other":"val"}"#)?;
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"Ahma":{"type":"stdio"}},"other":"val"}"#,
+        )?;
 
         remove_mcp_entry(&path, "mcpServers", false)?;
 
@@ -919,7 +948,10 @@ mod tests {
 
         let content = std::fs::read_to_string(&path)?;
         let parsed: Value = serde_json::from_str(&content)?;
-        assert!(!parsed["mcpServers"]["Other"].is_null(), "Other key preserved");
+        assert!(
+            !parsed["mcpServers"]["Other"].is_null(),
+            "Other key preserved"
+        );
         Ok(())
     }
 
@@ -945,17 +977,25 @@ mod tests {
         std::fs::write(&path, prior)?;
 
         // Install Ahma (same logic as setup.rs merge_mcp_json)
-        crate::setup::merge_mcp_json(&path, "mcpServers", json!({"type":"stdio","command":"ahma"}))?;
-        let after_install: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        crate::setup::merge_mcp_json(
+            &path,
+            "mcpServers",
+            json!({"type":"stdio","command":"ahma"}),
+        )?;
+        let after_install: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
         assert!(!after_install["mcpServers"]["Ahma"].is_null());
 
         // Remove Ahma
         remove_mcp_entry(&path, "mcpServers", false)?;
-        let after_remove: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-        assert!(after_remove["mcpServers"]["Ahma"].is_null(), "Ahma gone after remove");
-        assert!(!after_remove["mcpServers"]["Other"].is_null(), "Other preserved");
+        let after_remove: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert!(
+            after_remove["mcpServers"]["Ahma"].is_null(),
+            "Ahma gone after remove"
+        );
+        assert!(
+            !after_remove["mcpServers"]["Other"].is_null(),
+            "Other preserved"
+        );
         assert_eq!(after_remove["extra"], "kept", "extra preserved");
         Ok(())
     }
@@ -976,10 +1016,17 @@ mod tests {
         let content = std::fs::read_to_string(&path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
         assert!(
-            parsed.get("mcp_servers").and_then(|s| s.get("Ahma")).is_none(),
+            parsed
+                .get("mcp_servers")
+                .and_then(|s| s.get("Ahma"))
+                .is_none(),
             "Ahma section removed"
         );
-        assert_eq!(parsed["other"]["key"].as_str(), Some("val"), "other preserved");
+        assert_eq!(
+            parsed["other"]["key"].as_str(),
+            Some("val"),
+            "other preserved"
+        );
         Ok(())
     }
 
@@ -993,7 +1040,10 @@ mod tests {
 
         let content = std::fs::read_to_string(&path)?;
         let parsed: toml::Value = toml::from_str(&content)?;
-        assert!(parsed.get("mcp_servers").is_none(), "empty mcp_servers pruned");
+        assert!(
+            parsed.get("mcp_servers").is_none(),
+            "empty mcp_servers pruned"
+        );
         Ok(())
     }
 
@@ -1054,8 +1104,7 @@ mod tests {
             "ahma@local disabled"
         );
         assert_eq!(
-            parsed["enabledPlugins"]["other@local"],
-            true,
+            parsed["enabledPlugins"]["other@local"], true,
             "other plugin preserved"
         );
         // hooks key untouched

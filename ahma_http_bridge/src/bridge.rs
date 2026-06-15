@@ -620,8 +620,8 @@ async fn await_shutdown_signal() {
 
     let ctrl_c = async {
         signal::ctrl_c()
-            .expect("failed to install Ctrl-C handler")
-            .await;
+            .await
+            .expect("failed to install Ctrl-C handler");
     };
 
     #[cfg(unix)]
@@ -939,6 +939,8 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
     };
 
     // Build the axum router; when QUIC is active Alt-Svc is injected automatically.
+    // Clone state for the shutdown handler *before* moving it into build_mcp_router.
+    let shutdown_state = state.clone();
     let app = build_mcp_router(
         state,
         cors,
@@ -978,8 +980,7 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
         );
     }
 
-    // Capture a clone of state for the shutdown handler before entering the accept loop.
-    let shutdown_state = state.clone();
+    // Spawn graceful shutdown handler (SIGINT/SIGTERM).
     tokio::spawn(async move {
         await_shutdown_signal().await;
         info!("Bridge (TCP) received shutdown signal — terminating all sessions.");
@@ -1035,6 +1036,8 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
     let cors = build_cors_layer(&dummy_addr);
 
     // Reuse build_mcp_router so auth and rate-limiting are consistent across transports.
+    // Clone state for the shutdown handler *before* moving it into build_mcp_router.
+    let shutdown_state = state.clone();
     let app = build_mcp_router(
         state,
         cors,
@@ -1062,7 +1065,6 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
     eprintln!("AHMA_UNIX_SOCKET_PATH={}", raw_socket_path);
 
     // Graceful shutdown: on SIGINT/SIGTERM, terminate all sessions, remove the socket, exit.
-    let shutdown_state = state.clone();
     let socket_path_for_shutdown = socket_path.clone();
     let raw_socket_path_for_shutdown = raw_socket_path.clone();
     tokio::spawn(async move {
@@ -2318,7 +2320,10 @@ for line in sys.stdin:
 
         // Simulate session being deleted (DELETE /mcp or natural teardown)
         let prev = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(prev, 1, "previous value should have been 1 before decrement");
+        assert_eq!(
+            prev, 1,
+            "previous value should have been 1 before decrement"
+        );
         assert_eq!(
             counter.load(std::sync::atomic::Ordering::Relaxed),
             0,
