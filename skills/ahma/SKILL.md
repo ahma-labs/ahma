@@ -287,7 +287,7 @@ Supported Hook Platforms:
 - **GitHub Copilot / Copilot CLI**: Configures `${HOME}/.copilot/hooks/ahma.json` (user) and `.github/hooks/ahma.json` (project)
 
 > [!NOTE]
-> **Cursor hooks use `failClosed: true`**: if the `ahma` binary is missing or crashes before it can emit JSON, Cursor blocks the command rather than letting it run unsandboxed. Fix by reinstalling ahma or running `ahma hooks uninstall --platform cursor`.
+> **Hooks fail open**: if the `ahma` binary is missing, crashes, times out, or its sandbox cannot initialize, the command runs in the default terminal **without** ahma sandboxing rather than being blocked — accompanied by a loud warning to the user and the agent (Cursor hooks use `failClosed: false`). To restore sandboxing, reinstall/fix ahma; to stop attempting to sandbox, run `ahma hooks uninstall` or set `AHMA_HOOKS=off`.
 
 > [!IMPORTANT]
 > **Turning off ahma without breaking your terminal**: When you intentionally disable ahma (remove it from `mcp.json`, set `AHMA_HOOKS=off`, or run `ahma hooks uninstall`), the hook automatically passes commands to the default terminal. It never bricks your workflow. The three safe off-switches:

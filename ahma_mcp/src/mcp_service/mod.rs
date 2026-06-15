@@ -173,9 +173,21 @@ impl AhmaMcpService {
     }
 
     fn should_skip_client_roots_sandbox_setup(&self) -> bool {
-        if !self.adapter.sandbox().scopes().is_empty() {
+        // SPEC R5.5: only EXPLICIT user-provided scopes (--sandbox-scope,
+        // --working-directories, task vault) suppress the roots/list request.
+        // Implicitly-derived scopes (the CWD fallback, the --tmp temp scope) are
+        // provisional: we still ask the client for its workspace roots and prefer
+        // them. This is what lets shared-process clients like Cursor — whose
+        // subprocess CWD is unrelated to the open workspace (often the system
+        // temp dir) — get sandboxed to the correct workspace root instead of
+        // being locked to a bogus implicit scope. If the client never answers
+        // (e.g. Antigravity), `configure_sandbox_from_roots` falls back to the
+        // provisional scopes, preserving prior behavior.
+        if self.adapter.sandbox().has_explicit_scopes()
+            && !self.adapter.sandbox().scopes().is_empty()
+        {
             tracing::info!(
-                "Sandbox scopes already configured via CLI/Env ({:?}), skipping roots/list request",
+                "Sandbox scopes explicitly configured ({:?}), skipping roots/list request (SPEC R5.5)",
                 self.adapter.sandbox().scopes()
             );
             return true;

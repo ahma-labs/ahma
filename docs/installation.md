@@ -99,7 +99,7 @@ Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 	- `ahma hooks install --scope project` writes portable project hooks that call `ahma` from `PATH`.
 	- `ahma hooks status` shows both user and project hook status.
 	- `ahma hooks uninstall` removes managed hooks again if you no longer want shell-tool wrapping.
-	- **Cursor hooks use `failClosed: true`** — a missing/crashing binary blocks rather than silently bypassing the sandbox. Fix with `ahma hooks uninstall --platform cursor` or reinstall ahma.
+	- **Hooks fail open** — if the `ahma` binary is missing, crashes, times out, or its sandbox cannot initialize, the command runs in the default terminal **without** ahma sandboxing rather than being blocked. A loud warning is surfaced to the user and the agent each time this happens (Cursor hooks ship with `failClosed: false`). To restore sandboxing, fix the ahma installation; to stop attempting to sandbox entirely, run `ahma hooks uninstall` or set `AHMA_HOOKS=off`.
 	- **Off-switch**: set `AHMA_HOOKS=off` (or `AHMA_DISABLE_HOOKS=1`) in your shell environment to pass all commands through to the default terminal without uninstalling. The hook also auto-detects when ahma is removed from `mcp.json` and passes through.
 - Optional agent skill — see [agent-skills.md](agent-skills.md).
 - Restart MCP clients or reload your IDE after updating the binary.

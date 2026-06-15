@@ -313,7 +313,7 @@ The sandbox scope defines the root directory boundary. AI has **full read/write 
 ### R5: Sandbox Scope
 
 - **R5.1**: Sandbox scope is set once at initialization and **cannot** be changed during the session.
-- **R5.2**: **STDIO mode**: Defaults to current working directory (IDE sets `cwd` to `${workspaceFolder}` in `mcp.json`).
+- **R5.2**: **STDIO mode**: Defaults to current working directory (IDE sets `cwd` to `${workspaceFolder}` in `mcp.json`). When the scope is derived *implicitly* (CWD fallback, or the `--tmp` temp scope) rather than from an explicit `--sandbox-scope`/`--working-directories`, the server **must** still request `roots/list` from the client and prefer the client-provided workspace roots. This is required for shared-process clients (e.g. Cursor) whose single MCP subprocess is launched with a `cwd` unrelated to the open workspace — often the system temp directory — so the implicit CWD scope would otherwise lock the sandbox to the wrong root. Implicit scopes serve only as a fallback when the client does not answer `roots/list`.
 - **R5.3**: **HTTP mode**: Set once at server start via (in order of precedence):
   1. `--sandbox-scope <path>` CLI parameter
   2. `sandbox.scopes` in the **user** settings file (`~/.ahma/settings.toml`; never the project settings file — see R-CFG2.2)
@@ -321,7 +321,7 @@ The sandbox scope defines the root directory boundary. AI has **full read/write 
 
   `AHMA_SANDBOX_SCOPE` is no longer honored (R-CFG1.2): sandbox scope **must not** be settable from ambient environment state.
 - **R5.4**: **Write Protection**: The system **must** block any attempt to write to files outside the sandbox scope, including via command arguments (e.g., `touch /outside/file`).
-- **R5.5**: **Explicit Scope Override**: If `--sandbox-scope` is provided via CLI, the system **must** respect it and **must not** attempt to expand or modify it via the MCP `roots/list` protocol (roots requests are skipped). This prevents potential security bypasses where a compromised client could widen the scope, and ensures stability for clients that do not support the roots protocol.
+- **R5.5**: **Explicit Scope Override**: If scopes are provided *explicitly* — `--sandbox-scope`/`--working-directories` via CLI, the user settings file, or a task vault — the system **must** respect them and **must not** attempt to expand or modify them via the MCP `roots/list` protocol (roots requests are skipped). This prevents potential security bypasses where a compromised client could widen the scope, and ensures stability for clients that do not support the roots protocol. The skip applies **only** to explicit scopes: an implicitly-derived scope (CWD fallback or `--tmp`) does **not** suppress the `roots/list` request (see R5.2).
 - **R5.6**: **Lifecycle Notifications**: The system **must** emit JSON-RPC notifications for sandbox lifecycle events:
   - `notifications/sandbox/configured`: When sandbox is successfully initialized from roots.
   - `notifications/sandbox/failed`: When sandbox initialization fails (payload: `{"error": "message"}`).

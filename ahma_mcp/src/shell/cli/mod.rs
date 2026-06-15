@@ -464,6 +464,20 @@ fn add_temp_scope_if_requested(
 
     let mut scopes = scopes?;
 
+    // The temp scope is auxiliary: it must only ever *augment* a real workspace
+    // scope, never stand in as the sole sandbox root. If the scope set is empty
+    // (deferred sandbox, or awaiting client `roots/list`), do NOT seed it with
+    // the temp dir — doing so would make the sandbox appear "already configured"
+    // and lock it to the temp directory, rejecting the actual workspace. The
+    // temp dir is re-added by `Sandbox::update_scopes` once real roots arrive.
+    if scopes.is_empty() {
+        tracing::debug!(
+            "Skipping temp scope: no workspace scope yet (temp is re-added once \
+             client roots/list resolves)"
+        );
+        return Some(scopes);
+    }
+
     let temp_dir = std::env::temp_dir();
     match dunce::canonicalize(&temp_dir) {
         Ok(canonical_temp) if !scopes.contains(&canonical_temp) => {
@@ -494,6 +508,13 @@ fn create_sandbox_instance(
         return Ok(None);
     };
 
+    // SPEC R5.5: scopes are "explicit" when the user named them directly via
+    // --sandbox-scope, --working-directories, or a task vault. Those must never
+    // be widened/replaced via roots/list. Scopes derived implicitly (CWD
+    // fallback, --tmp) are provisional and yield to client-provided roots.
+    let explicit_scopes =
+        cfg.task_vault.is_some() || !cfg.sandbox_scopes.is_empty() || !cfg.working_dirs.is_empty();
+
     let s = sandbox::Sandbox::new(
         scopes.clone(),
         policy.mode,
@@ -502,6 +523,7 @@ fn create_sandbox_instance(
         policy.tmp_access,
     )
     .context("Failed to initialize sandbox")?
+    .with_explicit_scopes(explicit_scopes)
     .with_package_cache_write(cfg.package_cache_write)
     .with_separate_cargo_target(cfg.separate_cargo_target);
 
@@ -2663,6 +2685,22 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[test]
+    fn test_add_temp_scope_does_not_seed_empty_scopes() {
+        init_test();
+        // Regression: with --tmp and a deferred/empty scope set, the temp dir must
+        // NOT become the sole sandbox root. Seeding it would make the sandbox look
+        // "already configured" and lock it to the temp directory, rejecting the
+        // real workspace (the Cursor shared-process failure mode). The temp dir is
+        // re-added by Sandbox::update_scopes once client roots arrive.
+        let result = add_temp_scope_if_requested(Some(Vec::new()), true);
+        assert_eq!(
+            result,
+            Some(Vec::new()),
+            "empty scope set must stay empty so the sandbox waits for client roots"
+        );
+    }
+
     // ─── create_sandbox_instance & log_sandbox_mode ──────────────────────────
 
     #[test]
@@ -2689,6 +2727,48 @@ mod tests {
         let policy = resolve_sandbox_policy(&cfg);
         let sandbox = create_sandbox_instance(scopes, &policy, &cfg).unwrap();
         assert!(sandbox.is_some());
+    }
+
+    #[test]
+    fn test_create_sandbox_instance_implicit_scopes_not_explicit() {
+        init_test();
+        // No explicit scope config => sandbox derived from CWD fallback.
+        // It must NOT be marked explicit, so the service still requests
+        // roots/list (the Cursor shared-process fix, SPEC R5.5).
+        let tmp = tempdir().unwrap();
+        let scopes = Some(vec![tmp.path().to_path_buf()]);
+        let cfg = AppConfig {
+            no_sandbox: true,
+            ..make_cfg()
+        };
+        let policy = resolve_sandbox_policy(&cfg);
+        let sandbox = create_sandbox_instance(scopes, &policy, &cfg)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !sandbox.has_explicit_scopes(),
+            "CWD-derived scopes must be implicit so roots/list is still requested"
+        );
+    }
+
+    #[test]
+    fn test_create_sandbox_instance_explicit_scopes_marked() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let scopes = Some(vec![tmp.path().to_path_buf()]);
+        let cfg = AppConfig {
+            no_sandbox: true,
+            sandbox_scopes: vec![tmp.path().to_path_buf()],
+            ..make_cfg()
+        };
+        let policy = resolve_sandbox_policy(&cfg);
+        let sandbox = create_sandbox_instance(scopes, &policy, &cfg)
+            .unwrap()
+            .unwrap();
+        assert!(
+            sandbox.has_explicit_scopes(),
+            "--sandbox-scope must mark scopes explicit so roots/list is skipped (R5.5)"
+        );
     }
 
     #[test]
