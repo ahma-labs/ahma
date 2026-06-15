@@ -65,12 +65,13 @@ impl SetupAction {
 
 /// An AI tool the wizard can target. Listed in alphabetical order (by label)
 /// for uniform, simple presentation. Not every platform supports every action:
-/// GitHub Copilot has no MCP config target here, and VS Code is configured via
-/// MCP only (no terminal hook wrapper).
+/// GitHub Copilot has no MCP config target here; VS Code and Claude Desktop are
+/// configured via MCP only (no terminal hook wrapper).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Platform {
     Antigravity,
     ClaudeCode,
+    ClaudeDesktop,
     Codex,
     Cursor,
     Copilot,
@@ -80,6 +81,7 @@ enum Platform {
 const PLATFORMS: &[Platform] = &[
     Platform::Antigravity,
     Platform::ClaudeCode,
+    Platform::ClaudeDesktop,
     Platform::Codex,
     Platform::Cursor,
     Platform::Copilot,
@@ -91,6 +93,7 @@ impl Platform {
         match self {
             Platform::Antigravity => "Antigravity",
             Platform::ClaudeCode => "Claude Code",
+            Platform::ClaudeDesktop => "Claude Desktop",
             Platform::Codex => "Codex",
             Platform::Cursor => "Cursor",
             Platform::Copilot => "GitHub Copilot CLI",
@@ -103,13 +106,14 @@ impl Platform {
     }
 
     fn supports_hooks(self) -> bool {
-        !matches!(self, Platform::VsCode)
+        !matches!(self, Platform::VsCode | Platform::ClaudeDesktop)
     }
 
     fn hook_platform(self) -> Option<HookPlatform> {
         match self {
             Platform::Antigravity => Some(HookPlatform::Antigravity),
             Platform::ClaudeCode => Some(HookPlatform::Claude),
+            Platform::ClaudeDesktop => None,
             Platform::Codex => Some(HookPlatform::Codex),
             Platform::Cursor => Some(HookPlatform::Cursor),
             Platform::Copilot => Some(HookPlatform::Copilot),
@@ -137,6 +141,13 @@ impl Platform {
                 let path = home.join(".claude.json");
                 merge_mcp_json(&path, "mcpServers", servers_entry.clone())?;
                 return Ok(Some("Claude Code"));
+            }
+            Platform::ClaudeDesktop => {
+                if let Some(path) = claude_desktop_config_path() {
+                    let entry = build_claude_desktop_mcp_entry(transport, home);
+                    merge_mcp_json(&path, "mcpServers", entry)?;
+                    return Ok(Some("Claude Desktop"));
+                }
             }
             Platform::Cursor => {
                 let path = home.join(".cursor").join("mcp.json");
@@ -424,6 +435,46 @@ fn build_antigravity_servers_entry(transport: &str, home: &Path) -> serde_json::
             "--log-monitor",
             "--sandbox-scope",
             scope_str
+        ]
+    })
+}
+
+fn claude_desktop_config_path() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    #[cfg(target_os = "macos")]
+    {
+        Some(home.join("Library/Application Support/Claude/claude_desktop_config.json"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Some(home.join("AppData/Roaming/Claude/claude_desktop_config.json"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Some(home.join(".config/Claude/claude_desktop_config.json"))
+    }
+}
+
+/// Build the MCP entry for Claude Desktop.
+///
+/// Claude Desktop's `claude_desktop_config.json` uses `mcpServers` with the
+/// same `command`/`args` shape as Claude Code but without a `"type"` wrapper
+/// field — omitting it ensures compatibility with all Desktop versions.
+/// HTTP and Unix transports are passed through as-is for users running a
+/// shared ahma server.
+fn build_claude_desktop_mcp_entry(transport: &str, _home: &Path) -> serde_json::Value {
+    if let Some(url) = mcp_shared_transport_url(transport) {
+        return json!({ "type": "http", "url": url });
+    }
+    json!({
+        "command": "ahma",
+        "args": [
+            "serve",
+            "stdio",
+            "--tools",
+            "simplify",
+            "--tmp",
+            "--log-monitor"
         ]
     })
 }
