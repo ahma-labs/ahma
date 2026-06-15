@@ -85,14 +85,33 @@ pub fn detect_log_role_from_startup() -> &'static str {
 /// Process-wide log directory override set from the `--log-dir` CLI flag.
 static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
+/// Log directory derived from the primary sandbox scope after `roots/list`.
+/// Lower priority than `--log-dir` / `AHMA_LOG_DIR`, higher than CWD fallback.
+static LOG_DIR_FROM_SCOPE: OnceLock<PathBuf> = OnceLock::new();
+
 /// Set the log directory from the `--log-dir` CLI flag.
 /// Call once, early in startup, before any logging is initialised.
 pub fn set_log_dir_override(dir: PathBuf) {
     let _ = LOG_DIR_OVERRIDE.set(dir);
 }
 
-/// Project log directory: `--log-dir` flag, then `<cwd>/logs`, falling back to
-/// `~/.ahma/logs` if CWD is unwriteable or is root.
+/// Derive the default log directory from the primary sandbox scope.
+///
+/// Called once when the sandbox scope is established (after `roots/list`).
+/// Has no effect if `--log-dir` was already set, or if already called.
+/// Note: the tracing file appender opened at startup continues to write to
+/// whichever path was used at init time; this affects `logs_list` display
+/// and operation spill files created after the scope is locked.
+pub fn set_log_dir_from_scope(dir: PathBuf) {
+    let _ = LOG_DIR_FROM_SCOPE.set(dir);
+}
+
+/// Project log directory, checked in priority order:
+/// 1. `--log-dir` CLI flag
+/// 2. `AHMA_LOG_DIR` env var (deprecated)
+/// 3. Primary sandbox scope `<scope>/logs` (set after `roots/list`)
+/// 4. `<cwd>/logs` if writable
+/// 5. `~/.ahma/logs`
 pub fn project_log_dir() -> PathBuf {
     if let Some(dir) = LOG_DIR_OVERRIDE.get() {
         return dir.clone();
@@ -105,6 +124,10 @@ pub fn project_log_dir() -> PathBuf {
             "Deprecated: AHMA_LOG_DIR environment variable is set. Use the --log-dir flag instead."
         );
         return PathBuf::from(val);
+    }
+
+    if let Some(dir) = LOG_DIR_FROM_SCOPE.get() {
+        return dir.clone();
     }
 
     if let Ok(cwd) = std::env::current_dir()
