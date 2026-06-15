@@ -162,6 +162,17 @@ pub struct Sandbox {
     pub(super) no_temp_files: bool,
     /// When true, the canonical temp directory is preserved across scope updates.
     pub(super) tmp_access: bool,
+    /// When true, the scopes were explicitly provided by the user (via
+    /// `--sandbox-scope`, `--working-directories`, or a task vault) and MUST NOT
+    /// be widened or replaced via the MCP `roots/list` protocol (SPEC R5.5).
+    ///
+    /// When false, the scopes were implicitly derived (e.g. from the current
+    /// working directory or the `--tmp` temp scope). Implicit scopes are only a
+    /// fallback: the server still requests `roots/list` from the client and
+    /// prefers the client's workspace roots when provided. This is what lets
+    /// shared-process clients like Cursor — whose subprocess CWD is unrelated to
+    /// the open workspace — get sandboxed to the correct workspace root.
+    pub(super) explicit_scopes: bool,
     pub(super) livelog: bool,
     /// Allow package-manager caches (cargo registry/git) to be written.
     /// Default `true`; disable with `--no-package-cache-write`.
@@ -181,6 +192,7 @@ impl Clone for Sandbox {
             mode: self.mode,
             no_temp_files: self.no_temp_files,
             tmp_access: self.tmp_access,
+            explicit_scopes: self.explicit_scopes,
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
             separate_cargo_target: self.separate_cargo_target,
@@ -196,6 +208,7 @@ impl std::fmt::Debug for Sandbox {
             .field("mode", &self.mode)
             .field("no_temp_files", &self.no_temp_files)
             .field("tmp_access", &self.tmp_access)
+            .field("explicit_scopes", &self.explicit_scopes)
             .field("livelog", &self.livelog)
             .field("package_cache_write", &self.package_cache_write)
             .field("separate_cargo_target", &self.separate_cargo_target)
@@ -231,6 +244,7 @@ impl Sandbox {
             mode,
             no_temp_files,
             tmp_access,
+            explicit_scopes: false,
             livelog,
             package_cache_write: true,
             separate_cargo_target: false,
@@ -263,6 +277,23 @@ impl Sandbox {
     /// Returns `true` when ahma uses `target/ahma/` for cargo builds.
     pub fn is_separate_cargo_target(&self) -> bool {
         self.separate_cargo_target
+    }
+
+    /// Mark whether the initial scopes were explicitly provided by the user.
+    ///
+    /// Explicit scopes (`--sandbox-scope`, `--working-directories`, task vault)
+    /// must not be widened or replaced via `roots/list` (SPEC R5.5). Implicit
+    /// scopes (CWD fallback, `--tmp`) are provisional and yield to client roots.
+    #[must_use]
+    pub fn with_explicit_scopes(mut self, explicit: bool) -> Self {
+        self.explicit_scopes = explicit;
+        self
+    }
+
+    /// Returns `true` when the scopes were explicitly provided by the user and
+    /// must not be modified via the MCP `roots/list` protocol (SPEC R5.5).
+    pub fn has_explicit_scopes(&self) -> bool {
+        self.explicit_scopes
     }
 
     /// Update the sandbox scopes, preserving the temp directory if `--tmp` was set.

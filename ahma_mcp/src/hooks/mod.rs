@@ -17,14 +17,24 @@ const HOOK_TIMEOUT_SECS: u64 = 30;
 const PATH_LOOKUP_BINARY: &str = "ahma";
 
 /// The decision `compute_exec_decision` makes for each tool invocation.
+///
+/// Every variant begins with `Allow` on purpose: the hook is **fail-open** and
+/// never blocks a command. It either passes it through, rewrites it to route
+/// through the sandbox, or (when ahma is unavailable) allows it unsandboxed with
+/// a loud warning.
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 enum HooksDecision {
     /// Allow the command through without modification (passthrough to default terminal).
     AllowUnchanged,
     /// Allow with a rewritten command that routes through ahma's kernel sandbox.
     AllowRewrite(Value),
-    /// Deny the command with messages for the user and agent.
-    Deny {
+    /// **Fail open**: ahma could not set up sandboxing, so allow the original
+    /// command to run UNSANDBOXED, but surface a loud warning to the user and
+    /// agent. Used whenever ahma itself fails (env detection, cwd resolution,
+    /// wrapper construction). The command is *not* blocked — the user explicitly
+    /// chose fail-open behavior so that a broken ahma never wedges their terminal.
+    AllowWithWarning {
         user_message: String,
         agent_message: String,
     },
@@ -583,29 +593,49 @@ fn run_exec(args: HooksExecArgs) -> Result<()> {
         }
     };
 
-    // Detect the runtime environment. On failure, check whether ahma is intended to be
-    // active: if yes, deny with an actionable message; if no, allow through.
+    // Detect the runtime environment. On failure we FAIL OPEN: the command runs
+    // unsandboxed via the default terminal, accompanied by a loud warning. We
+    // must never block the user's terminal just because ahma broke.
     let env = match HookEnvironment::detect() {
         Ok(e) => e,
         Err(e) => {
             let decision = if is_ahma_hooks_active() {
-                HooksDecision::Deny {
-                    user_message: format!("ahma hook setup failed: {e}"),
-                    agent_message: format!(
-                        "The ahma sandbox hook could not initialize ({e}). \
-                        Set AHMA_HOOKS=off or run `ahma hooks uninstall` to use the default terminal."
-                    ),
-                }
+                fail_open_warning(&format!("ahma hook setup failed: {e}"))
             } else {
                 HooksDecision::AllowUnchanged
             };
-            let output = build_exec_output(decision, args.platform);
-            return write_exec_output(&output);
+            return emit_decision(decision, args.platform);
         }
     };
 
     let decision = compute_exec_decision(&stdin, args.scope, &env);
-    let output = build_exec_output(decision, args.platform);
+    emit_decision(decision, args.platform)
+}
+
+/// Build a fail-open decision: allow the command unsandboxed, with a loud
+/// warning for both the user and the agent.
+fn fail_open_warning(reason: &str) -> HooksDecision {
+    HooksDecision::AllowWithWarning {
+        user_message: format!(
+            "⚠️  ahma sandbox bypassed — {reason}. The command will run WITHOUT \
+             ahma's kernel sandbox. Run `ahma hooks uninstall` or set AHMA_HOOKS=off \
+             to stop attempting to sandbox, or fix the ahma installation to restore it."
+        ),
+        agent_message: format!(
+            "WARNING: ahma sandboxing is unavailable ({reason}). This command is \
+             running in the default terminal WITHOUT kernel-level sandboxing. \
+             File writes are NOT confined to the workspace. Proceed with caution."
+        ),
+    }
+}
+
+/// Write the decision to stdout for the IDE, and mirror any fail-open warning to
+/// stderr so it is visible even when the IDE does not surface allow-time messages.
+fn emit_decision(decision: HooksDecision, platform: HookPlatform) -> Result<()> {
+    if let HooksDecision::AllowWithWarning { user_message, .. } = &decision {
+        eprintln!("{user_message}");
+    }
+    let output = build_exec_output(decision, platform);
     write_exec_output(&output)
 }
 
@@ -628,8 +658,25 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         skip_availability_probes: true,
         ..cfg
     };
-    let sandbox = crate::shell::cli::initialize_sandbox(&cfg)?
-        .ok_or_else(|| anyhow!("Sandbox scopes must be initialized for run-shell mode"))?;
+
+    // FAIL OPEN: if the sandbox cannot be initialized (missing kernel support,
+    // bad scope, etc.) we must not wedge the user's terminal. Run the command
+    // unsandboxed with a loud warning instead of bubbling up an error.
+    let sandbox = match crate::shell::cli::initialize_sandbox(&cfg) {
+        Ok(Some(sandbox)) => sandbox,
+        Ok(None) => {
+            return run_command_unsandboxed(&payload.cwd, &payload.command, "sandbox is disabled")
+                .await;
+        }
+        Err(e) => {
+            return run_command_unsandboxed(
+                &payload.cwd,
+                &payload.command,
+                &format!("sandbox initialization failed: {e}"),
+            )
+            .await;
+        }
+    };
 
     let monitor_config = crate::operation_monitor::MonitorConfig::with_timeout(
         std::time::Duration::from_secs(cfg.timeout_secs),
@@ -658,7 +705,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     let mut adapter_args = serde_json::Map::new();
     adapter_args.insert(
         "command".to_string(),
-        serde_json::Value::String(payload.command),
+        serde_json::Value::String(payload.command.clone()),
     );
     adapter_args.insert("c_flag".to_string(), serde_json::Value::Bool(true));
 
@@ -683,13 +730,59 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
             println!("{}", output);
             Ok(())
         }
+        // FAIL OPEN: ahma could not execute the command through the sandbox.
+        // Fall back to the default shell (unsandboxed) with a loud warning rather
+        // than failing the command outright.
         Err(e) => {
-            eprintln!("ahma: sandbox execution failed: {e}");
-            eprintln!(
-                "To use the default terminal without sandboxing, set AHMA_HOOKS=off or run `ahma hooks uninstall`."
-            );
-            Err(anyhow::anyhow!("ahma sandbox execution failed: {e}"))
+            run_command_unsandboxed(
+                &payload.cwd,
+                &payload.command,
+                &format!("sandbox execution failed: {e}"),
+            )
+            .await
         }
+    }
+}
+
+/// Fail-open fallback: run `command` directly in the platform shell, in `cwd`,
+/// without ahma's sandbox. Emits a loud warning explaining that sandboxing was
+/// bypassed, then forwards the command's stdout/stderr and exit status.
+async fn run_command_unsandboxed(cwd: &str, command: &str, reason: &str) -> Result<()> {
+    eprintln!(
+        "\n⚠️  ahma sandbox bypassed — {reason}.\n\
+         ⚠️  Running this command in the DEFAULT terminal WITHOUT kernel sandboxing.\n\
+         ⚠️  File writes are NOT confined to the workspace. To stop attempting to\n\
+         ⚠️  sandbox, run `ahma hooks uninstall` or set AHMA_HOOKS=off; otherwise\n\
+         ⚠️  fix the ahma installation to restore sandboxing.\n"
+    );
+
+    let shell = crate::shell_pool::platform_shell_program();
+    let mut cmd = tokio::process::Command::new(shell);
+    cmd.current_dir(cwd).kill_on_drop(true);
+
+    #[cfg(target_os = "windows")]
+    {
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        cmd.args(["-c", command]);
+    }
+
+    let status = cmd
+        .status()
+        .await
+        .with_context(|| format!("Failed to spawn fallback shell '{shell}'"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        // Mirror the command's failure so the agent sees a non-zero exit, but do
+        // not wrap it as an ahma error — the command ran, it just failed.
+        Err(anyhow!(
+            "command exited with status {} (ran unsandboxed: {reason})",
+            status.code().unwrap_or(-1)
+        ))
     }
 }
 
@@ -770,7 +863,8 @@ fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
 /// 2. Already-wrapped commands → allow unchanged (prevent double-wrap).
 /// 3. `AHMA_HOOKS=off` or auto with no MCP configured → allow unchanged (passthrough).
 /// 4. Shell command + ahma active → rewrite to `ahma hooks run-shell` (sandbox path).
-/// 5. Active but rewrite fails → deny with actionable message.
+/// 5. Active but ahma setup/rewrite fails → **fail open**: allow the original
+///    command to run unsandboxed, with a loud warning (never block).
 fn compute_exec_decision(input: &Value, scope: HookScope, env: &HookEnvironment) -> HooksDecision {
     compute_exec_decision_internal(input, scope, env, is_ahma_hooks_active())
 }
@@ -794,16 +888,13 @@ fn compute_exec_decision_internal(
         return HooksDecision::AllowUnchanged;
     }
 
+    // FAIL OPEN: if ahma cannot determine the working directory it cannot
+    // sandbox the command. Rather than block the user's terminal, run it
+    // unsandboxed with a loud warning.
     let cwd = match extract_command_cwd(input, &args.tool_input) {
         Ok(cwd) => cwd,
         Err(e) => {
-            return HooksDecision::Deny {
-                user_message: format!("ahma: could not determine working directory: {e}"),
-                agent_message: format!(
-                    "The ahma sandbox hook failed to determine the working directory ({e}). \
-                    Set AHMA_HOOKS=off or run `ahma hooks uninstall` to use the default terminal."
-                ),
-            };
+            return fail_open_warning(&format!("could not determine working directory: {e}"));
         }
     };
 
@@ -812,13 +903,9 @@ fn compute_exec_decision_internal(
             let updated = updated_tool_input(&args.tool_input, wrapped, &args.arg_key);
             HooksDecision::AllowRewrite(updated)
         }
-        Err(e) => HooksDecision::Deny {
-            user_message: format!("ahma: sandbox hook failed to build wrapper: {e}"),
-            agent_message: format!(
-                "The ahma sandbox hook could not build the command wrapper ({e}). \
-                Set AHMA_HOOKS=off or run `ahma hooks uninstall` to use the default terminal."
-            ),
-        },
+        // FAIL OPEN: wrapper construction failed — run unsandboxed with a warning
+        // rather than denying the command.
+        Err(e) => fail_open_warning(&format!("failed to build sandbox wrapper: {e}")),
     }
 }
 
@@ -858,11 +945,13 @@ fn build_cursor_hook_output(decision: HooksDecision) -> Value {
             "permission": "allow",
             "updated_input": updated_input,
         }),
-        HooksDecision::Deny {
+        // Fail open: allow the original (unsandboxed) command but attach warnings.
+        // Cursor ignores unknown fields, so the messages surface where supported.
+        HooksDecision::AllowWithWarning {
             user_message,
             agent_message,
         } => json!({
-            "permission": "deny",
+            "permission": "allow",
             "user_message": user_message,
             "agent_message": agent_message,
         }),
@@ -881,14 +970,16 @@ fn build_structured_hook_output(decision: HooksDecision) -> Value {
             "updatedInput": updated_input.clone(),
             "modifiedArgs": updated_input,
         }),
-        HooksDecision::Deny {
+        // Fail open: allow the original (unsandboxed) command, but surface the
+        // warning to the agent (and a system message where the client shows it).
+        HooksDecision::AllowWithWarning {
             user_message,
             agent_message,
         } => json!({
             "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": user_message,
+            "permissionDecision": "allow",
             "agentMessage": agent_message,
+            "systemMessage": user_message,
         }),
     };
     json!({"hookSpecificOutput": hook_specific})
@@ -979,7 +1070,10 @@ fn install_cursor_hook(
         "matcher": "Shell",
         "command": build_exec_command(HookPlatform::Cursor, scope, env),
         "timeout": HOOK_TIMEOUT_SECS,
-        "failClosed": true,
+        // Fail OPEN: if the ahma hook binary is missing, crashes, or times out,
+        // Cursor runs the command anyway (unsandboxed) instead of blocking the
+        // user's terminal. ahma's own exec path emits a loud warning in that case.
+        "failClosed": false,
     }));
 
     Ok(())
@@ -1518,8 +1612,8 @@ mod tests {
         assert!(command.contains(MANAGED_ID_DEFAULT_SHELL_V1));
         assert!(command.contains("bin space"));
         assert!(
-            entry["failClosed"].as_bool().unwrap_or(false),
-            "Cursor hook must have failClosed:true so a binary crash blocks rather than silently running unsandboxed"
+            !entry["failClosed"].as_bool().unwrap_or(true),
+            "Cursor hook must have failClosed:false so a binary crash/timeout fails OPEN (runs unsandboxed) rather than blocking the user's terminal"
         );
     }
 
@@ -1852,29 +1946,47 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_cursor_deny_has_correct_fields() {
-        // Manually construct a Deny decision and verify the Cursor output shape
-        let decision = HooksDecision::Deny {
-            user_message: "ahma failed".to_string(),
-            agent_message: "set AHMA_HOOKS=off".to_string(),
-        };
-        let output = build_exec_output(decision, HookPlatform::Cursor);
-        assert_eq!(output["permission"].as_str(), Some("deny"));
-        assert_eq!(output["user_message"].as_str(), Some("ahma failed"));
-        assert_eq!(output["agent_message"].as_str(), Some("set AHMA_HOOKS=off"));
+    fn test_fail_open_warning_allows_with_messages() {
+        // fail_open_warning must produce an AllowWithWarning (not Deny) so the
+        // command runs unsandboxed.
+        match fail_open_warning("test reason") {
+            HooksDecision::AllowWithWarning {
+                user_message,
+                agent_message,
+            } => {
+                assert!(user_message.contains("test reason"));
+                assert!(user_message.contains("bypassed"));
+                assert!(agent_message.contains("WITHOUT"));
+            }
+            other => panic!("expected AllowWithWarning, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_exec_structured_deny_has_correct_fields() {
-        let decision = HooksDecision::Deny {
-            user_message: "ahma failed".to_string(),
-            agent_message: "set AHMA_HOOKS=off".to_string(),
-        };
-        let output = build_exec_output(decision, HookPlatform::Claude);
+    fn test_exec_cursor_fail_open_allows_with_warning() {
+        // Cursor fail-open: permission is "allow" (NOT deny) so the command runs,
+        // but warning fields are attached.
+        let output = build_exec_output(fail_open_warning("boom"), HookPlatform::Cursor);
+        assert_eq!(
+            output["permission"].as_str(),
+            Some("allow"),
+            "fail-open must allow the command, never deny it"
+        );
+        assert!(output["user_message"].as_str().unwrap().contains("boom"));
+        assert!(output["agent_message"].is_string());
+    }
+
+    #[test]
+    fn test_exec_structured_fail_open_allows_with_warning() {
+        let output = build_exec_output(fail_open_warning("boom"), HookPlatform::Claude);
         let hs = &output["hookSpecificOutput"];
-        assert_eq!(hs["permissionDecision"].as_str(), Some("deny"));
-        assert_eq!(hs["permissionDecisionReason"].as_str(), Some("ahma failed"));
-        assert_eq!(hs["agentMessage"].as_str(), Some("set AHMA_HOOKS=off"));
+        assert_eq!(
+            hs["permissionDecision"].as_str(),
+            Some("allow"),
+            "fail-open must allow the command, never deny it"
+        );
+        assert!(hs["agentMessage"].as_str().unwrap().contains("WITHOUT"));
+        assert!(hs["systemMessage"].as_str().unwrap().contains("boom"));
     }
 
     #[test]
