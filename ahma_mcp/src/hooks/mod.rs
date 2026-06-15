@@ -472,6 +472,7 @@ fn detect_active_mcp_configs() -> Vec<PathBuf> {
         home.join(".config/Code/User/mcp.json"),
         home.join("Library/Application Support/Claude/claude_desktop_config.json"),
         home.join(".config/Claude/claude_desktop_config.json"),
+        home.join("AppData/Roaming/Claude/claude_desktop_config.json"),
     ];
 
     if let Ok(project_root) = detect_project_root() {
