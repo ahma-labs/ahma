@@ -54,4 +54,15 @@ Alternatively, you can set the `AHMA_SESSION_ISOLATION=1` environment variable.
 
 - **Strict Sandbox Derivation**: The sandbox scope is derived *strictly* from the client's first `roots/list` response.
 - **Zero Scope Widening**: Once locked, any subsequent attempt by the client to alter or expand the roots list will be rejected, and the HTTP bridge will terminate the session immediately (HTTP 403 Forbidden).
-- **Process Cleanup**: The HTTP bridge implements auto-restart and strict subprocess tracking. If a subprocess crashes, it is automatically restarted with the same credentials and sandbox constraints. If the session expires, the process is forcefully killed (`kill_on_drop`).
+- **Process Cleanup**: When a subprocess crashes, the bridge terminates the associated session and marks it for cleanup. If the session expires or is closed via `DELETE /mcp`, the subprocess is forcefully killed (`kill_on_drop`).
+
+## Bridge Lifecycle
+
+An HTTP/Unix bridge auto-spawned by `ahma serve stdio` (proxy mode) or `ahma tui` self-terminates when no MCP client remains connected:
+
+- The bridge runs with `--idle-timeout N` (default: 10 seconds).
+- Once `active_sessions` drops to zero and stays there for N seconds, the bridge calls `terminate_all` and exits cleanly.
+- The bridge also handles SIGINT/SIGTERM gracefully: it terminates all sessions, removes the Unix socket file (if applicable), and exits.
+- Clients that disconnect send `DELETE /mcp` (HTTP proxy) or call `transport.close()` (Unix proxy, TUI) to decrement `active_sessions` immediately.
+
+Bridges started explicitly with `ahma serve http` or `ahma serve unix` do **not** have an idle timeout by default and remain running until stopped by the user.

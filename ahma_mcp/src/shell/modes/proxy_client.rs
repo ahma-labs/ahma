@@ -57,6 +57,12 @@ where
     S::Error: std::fmt::Debug + Send,
     C::Error: std::fmt::Debug + Send,
 {
+    // Track whether we ever forwarded a message to the bridge.  Until the client sends
+    // `initialize`, the bridge never creates a session for this proxy (and the underlying
+    // rmcp worker is parked awaiting the first message without observing its cancellation
+    // token).  In that state `client.close()` would block forever, so we must only attempt
+    // the teardown when a session could actually exist.
+    let mut forwarded_any = false;
     loop {
         tokio::select! {
             stdio_msg = stdio.receive() => {
@@ -74,6 +80,7 @@ where
                     );
                     break;
                 }
+                forwarded_any = true;
             }
             client_msg = client.receive() => {
                 let Some(msg) = client_msg else {
@@ -93,6 +100,26 @@ where
                     );
                     break;
                 }
+            }
+        }
+    }
+    // Notify the bridge that this session is terminating.  For HTTP-backed transports
+    // this sends DELETE /mcp so the bridge decrements active_sessions immediately rather
+    // than waiting for the 5-second SSE-drop grace period.
+    //
+    // Only attempt this when at least one message was forwarded: otherwise no session was
+    // ever established and `client.close()` would block indefinitely (the rmcp worker is
+    // parked before its cancellation-aware main loop).  Even then we bound the call with a
+    // timeout as a backstop in case the worker is mid-handshake; the bridge's SSE-drop
+    // grace period guarantees eventual cleanup regardless.
+    if forwarded_any {
+        match tokio::time::timeout(Duration::from_secs(6), client.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(transport, error = ?e, "Proxy close error (non-fatal)")
+            }
+            Err(_) => {
+                tracing::debug!(transport, "Proxy close timed out (non-fatal)")
             }
         }
     }

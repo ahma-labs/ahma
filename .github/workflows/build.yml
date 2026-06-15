@@ -534,11 +534,6 @@ jobs:
             target: aarch64-unknown-linux-musl
             platform: linux-arm64-musl
             use_cross: true
-          # Cross-compiled ARM 32-bit (Raspberry Pi 2/3)
-          - os: ubuntu-latest
-            target: armv7-unknown-linux-gnueabihf
-            platform: linux-armv7
-            use_cross: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6

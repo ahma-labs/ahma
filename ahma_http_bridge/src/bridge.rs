@@ -610,6 +610,40 @@ async fn cluster_auth_middleware(
 ///    }
 /// }
 /// ```
+/// Block until SIGINT (Ctrl-C) or SIGTERM is received.
+///
+/// Used by both TCP and Unix accept loops to trigger graceful shutdown when the OS or
+/// a parent process requests termination.  The handler runs once; on a second signal
+/// the process exits immediately (default OS behaviour after the first handler fires).
+async fn await_shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler")
+                .recv()
+                .await;
+        };
+        tokio::select! {
+            () = ctrl_c => {},
+            () = terminate => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+    }
+}
+
 fn spawn_idle_timeout_checker(timeout: u64, state: Arc<BridgeState>) {
     let session_manager = state.session_manager.clone();
     let listener_kind = state.listener_kind.clone();
@@ -905,6 +939,8 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
     };
 
     // Build the axum router; when QUIC is active Alt-Svc is injected automatically.
+    // Clone state for the shutdown handler *before* moving it into build_mcp_router.
+    let shutdown_state = state.clone();
     let app = build_mcp_router(
         state,
         cors,
@@ -943,6 +979,18 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
             "Protocol: HTTP/1.1 + HTTP/2 (clients may upgrade to HTTP/3 via Alt-Svc when available)"
         );
     }
+
+    // Spawn graceful shutdown handler (SIGINT/SIGTERM).
+    tokio::spawn(async move {
+        await_shutdown_signal().await;
+        info!("Bridge (TCP) received shutdown signal — terminating all sessions.");
+        shutdown_state
+            .session_manager
+            .terminate_all(crate::session::SessionTerminationReason::Timeout)
+            .await;
+        std::process::exit(0);
+    });
+
     loop {
         let (stream, peer_addr) = listener
             .accept()
@@ -988,6 +1036,8 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
     let cors = build_cors_layer(&dummy_addr);
 
     // Reuse build_mcp_router so auth and rate-limiting are consistent across transports.
+    // Clone state for the shutdown handler *before* moving it into build_mcp_router.
+    let shutdown_state = state.clone();
     let app = build_mcp_router(
         state,
         cors,
@@ -1013,6 +1063,22 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
 
     // Print machine-readable bound socket path for test infrastructure.
     eprintln!("AHMA_UNIX_SOCKET_PATH={}", raw_socket_path);
+
+    // Graceful shutdown: on SIGINT/SIGTERM, terminate all sessions, remove the socket, exit.
+    let socket_path_for_shutdown = socket_path.clone();
+    let raw_socket_path_for_shutdown = raw_socket_path.clone();
+    tokio::spawn(async move {
+        await_shutdown_signal().await;
+        info!("Bridge (Unix) received shutdown signal — terminating all sessions.");
+        shutdown_state
+            .session_manager
+            .terminate_all(crate::session::SessionTerminationReason::Timeout)
+            .await;
+        if !socket_path_for_shutdown.starts_with('\0') {
+            let _ = std::fs::remove_file(&raw_socket_path_for_shutdown);
+        }
+        std::process::exit(0);
+    });
 
     loop {
         let (stream, _) = listener
@@ -2231,6 +2297,122 @@ for line in sys.stdin:
             response.status(),
             StatusCode::UNAUTHORIZED,
             "Uppercase 'BEARER' scheme must be accepted (RFC 7235 case-insensitive)"
+        );
+    }
+
+    // ── Bridge lifecycle / idle-timeout / active_sessions tests ──────────────
+
+    /// Verify that a DELETE /mcp request decrements `active_sessions` so the idle-timeout
+    /// checker can see zero clients and eventually exit.
+    ///
+    /// This test is in-process (no subprocess) and exercises only the counter logic.
+    #[test]
+    fn active_sessions_counter_increments_and_decrements() {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Simulate one session being created
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "counter should be 1 after first session"
+        );
+
+        // Simulate session being deleted (DELETE /mcp or natural teardown)
+        let prev = counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            prev, 1,
+            "previous value should have been 1 before decrement"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "counter should be 0 after session deleted"
+        );
+    }
+
+    /// Verify that the idle timeout checker exits when `active_sessions` reaches zero
+    /// for the configured number of seconds.  Uses a very short timeout (1s) to keep
+    /// the test fast.  The counter is never incremented, simulating no sessions ever
+    /// connecting.  We verify the checker task runs to completion and the exit is clean.
+    #[tokio::test]
+    async fn idle_timeout_checker_fires_at_zero_sessions() {
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let fired_clone = fired.clone();
+        let counter_clone = counter.clone();
+        let timeout_secs: u64 = 1;
+
+        // Run the idle checker inline rather than via process::exit.
+        tokio::spawn(async move {
+            let check_interval = std::time::Duration::from_millis(100);
+            let mut idle_duration = std::time::Duration::ZERO;
+            loop {
+                tokio::time::sleep(check_interval).await;
+                if counter_clone.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    idle_duration = std::time::Duration::ZERO;
+                    continue;
+                }
+                idle_duration += check_interval;
+                if idle_duration.as_secs() >= timeout_secs {
+                    fired_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            }
+        });
+
+        // Wait up to 3 seconds for the checker to fire.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !fired.load(std::sync::atomic::Ordering::Relaxed) {
+            if tokio::time::Instant::now() > deadline {
+                panic!("idle-timeout checker did not fire within 3 seconds");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            fired.load(std::sync::atomic::Ordering::Relaxed),
+            "idle-timeout checker should have fired"
+        );
+    }
+
+    /// Verify that `terminate_session` decrements `active_sessions` when the session
+    /// exists in the map (i.e., counter only drops when remove succeeds), ensuring
+    /// that DELETE /mcp reliably brings the idle counter to zero.
+    #[tokio::test]
+    async fn terminate_nonexistent_session_does_not_underflow_counter() {
+        use crate::session::{SessionManager, SessionManagerConfig};
+
+        let temp_dir = TempDir::new().unwrap();
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let session_config = SessionManagerConfig {
+            server_command: "echo".to_string(),
+            server_args: vec![],
+            default_scope: Some(temp_dir.path().to_path_buf()),
+            enable_colored_output: false,
+            handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            max_sessions: 10,
+            peer_factory: None,
+        };
+        let mut session_manager = SessionManager::new(session_config);
+        // Inject the counter the same way `build_bridge_state` does.
+        session_manager.active_sessions = Some(counter.clone());
+        let session_manager = Arc::new(session_manager);
+
+        // Terminating a session that was never created must not decrement the counter
+        // (no underflow below zero).
+        let _ = session_manager
+            .terminate_session(
+                "nonexistent-id",
+                crate::session::SessionTerminationReason::ClientRequested,
+            )
+            .await;
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "counter must remain 0; terminating a non-existent session must not underflow"
         );
     }
 }

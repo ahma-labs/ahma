@@ -81,10 +81,13 @@ detect_libc() {
 case "$ARCH" in
     x86_64) ARCH="x86_64" ;;
     arm64|aarch64) ARCH="arm64" ;;
-    armv7l|armv7) ARCH="armv7" ;;
+    armv7l|armv7)
+        echo "Error: ARMv7 (32-bit ARM) is no longer supported. Use a 64-bit ARM (aarch64) build instead."
+        exit 1
+        ;;
     *)
         echo "Error: Unsupported architecture: $ARCH"
-        echo "Supported: x86_64, arm64/aarch64, armv7"
+        echo "Supported: x86_64, arm64/aarch64"
         exit 1
         ;;
 esac
@@ -113,19 +116,9 @@ esac
 if [ "$OS" = "linux" ]; then
     # Use musl if detected or explicitly requested
     if [ "${AHMA_PREFER_MUSL:-}" = "1" ] || [ "$LIBC" = "musl" ]; then
-        if [ "$ARCH" = "armv7" ]; then
-            # armv7 only has glibc build
-            PLATFORM="linux-armv7"
-            echo "Note: ARMv7 only has glibc build available"
-        else
-            PLATFORM="linux-${ARCH}-musl"
-        fi
+        PLATFORM="linux-${ARCH}-musl"
     else
-        if [ "$ARCH" = "armv7" ]; then
-            PLATFORM="linux-armv7"
-        else
-            PLATFORM="linux-${ARCH}"
-        fi
+        PLATFORM="linux-${ARCH}"
     fi
 else
     PLATFORM="${OS}-${ARCH}"

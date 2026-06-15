@@ -739,6 +739,10 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in setup mode");
             crate::setup::run(args).await
         }
+        Subcommands::Uninstall(args) => {
+            tracing::info!("Running in uninstall mode");
+            crate::uninstall::run(args).await
+        }
         Subcommands::Daemon(_) => {
             anyhow::bail!(
                 "daemon is provided by the ahma_bin crate. \
@@ -1053,6 +1057,10 @@ pub enum Subcommands {
     Verify(crate::update::verify::VerifyArgs),
     /// Run the interactive or automated setup wizard.
     Setup(SetupArgs),
+    /// Remove integrations installed by `ahma setup` (MCP server entries, terminal hooks,
+    /// agent skills, and optionally the ahma binary). Mirrors `ahma setup` with the same
+    /// "what / which platforms" prompts when no flags are given.
+    Uninstall(UninstallArgs),
     /// Start the TUI hub daemon for multi-instance aggregation. The daemon collects
     /// operation events from running ahma instances (including stdio processes spawned
     /// by IDEs) and fans them to TUI subscribers. Starts automatically on first use.
@@ -1087,6 +1095,65 @@ pub struct SetupArgs {
     /// Only initialize TLS certificate.
     #[arg(long = "tls")]
     pub tls: bool,
+}
+
+/// Arguments for `ahma uninstall`.
+#[derive(clap::Args, Debug, Clone)]
+#[command(
+    about = "Remove integrations installed by ahma setup",
+    long_about = "Remove MCP server entries, terminal hooks, agent skills, and/or the ahma \
+binary that were installed by `ahma setup` or `scripts/install.sh`.\n\n\
+Without flags, runs an interactive wizard (same question flow as `ahma setup`).\n\
+With `--auto`, removes everything from all platforms without prompting.",
+    after_help = "EXAMPLES:
+  # Interactive: pick what to remove and from which platforms
+  ahma uninstall
+
+  # Non-interactive: remove everything (MCP, hooks, skills, binary)
+  ahma uninstall --auto
+
+  # Remove only MCP server entries from Cursor and Claude Code
+  ahma uninstall --mcp --platform cursor,claude
+
+  # Preview changes without writing files
+  ahma uninstall --auto --dry-run
+
+  # Full cleanup including ~/.ahma data directory
+  ahma uninstall --auto --purge"
+)]
+pub struct UninstallArgs {
+    /// Skip prompts and remove everything automatically.
+    #[arg(short = 'y', long = "auto")]
+    pub auto: bool,
+
+    /// Remove only MCP server entries.
+    #[arg(long = "mcp")]
+    pub mcp: bool,
+
+    /// Remove only terminal hooks.
+    #[arg(long = "hooks")]
+    pub hooks: bool,
+
+    /// Remove only agent skills (and Claude Code plugin).
+    #[arg(long = "skills")]
+    pub skills: bool,
+
+    /// Remove the ahma binary from the install directory.
+    #[arg(long = "binary")]
+    pub binary: bool,
+
+    /// Platform(s) to target (comma-separated). Defaults to all supported platforms.
+    #[arg(long = "platform", value_delimiter = ',')]
+    pub platforms: Vec<String>,
+
+    /// Also purge the `~/.ahma` data directory (settings, logs, TLS, prompts).
+    /// Implies removal of the Antigravity `~/sandbox` directory if it was created by setup.
+    #[arg(long = "purge")]
+    pub purge: bool,
+
+    /// Show planned changes without writing files.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 }
 
 /// Arguments for `ahma daemon`.

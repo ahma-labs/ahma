@@ -529,6 +529,7 @@ The `/ahma` skill supports these user-invocable subcommands in chat:
 | `/ahma simplify N` | — | Get fix instructions for issue #N only (manual mode) |
 | `/ahma tui` | — | Start the terminal user interface (TUI) control plane |
 | `/ahma update` | — | Update ahma to the latest version |
+| `/ahma uninstall` | — | Remove integrations installed by `ahma setup` (MCP entries, hooks, skills, binary) |
 
 ---
 
@@ -547,6 +548,7 @@ user-invocable subcommands and a one-line description of each:
 /ahma simplify rust     — Auto-fix top 10 Rust issues concurrently
 /ahma tui               — Start the terminal user interface (TUI) control plane
 /ahma update            — Update ahma to the latest version
+/ahma uninstall         — Remove integrations installed by ahma setup
 ```
 
 Also mention the key flags for configure, e.g., `--tools`, `--tmp`, `--log-monitor`.
@@ -687,6 +689,40 @@ RUSTFLAGS='--cfg reqwest_unstable' \
   expected value before declaring success.
 - **Do NOT forget to reload the IDE.** An updated binary is not picked up by a running
   MCP session until the client restarts.
+
+---
+
+## `/ahma uninstall` — Remove Installed Integrations
+
+Symmetrically reverses `ahma setup`: removes MCP server entries, terminal hooks, agent skills
+and/or the ahma binary.  Only Ahma-managed keys and files are touched; other user config is
+preserved.
+
+### Syntax
+
+```
+/ahma uninstall                  # Interactive wizard (prompts for what and which platforms)
+/ahma uninstall --auto           # Non-interactive: remove everything from all platforms
+/ahma uninstall --mcp --platform cursor,claude  # Remove only Cursor + Claude Code MCP entries
+/ahma uninstall --auto --dry-run  # Preview removals without writing files
+/ahma uninstall --auto --purge    # Also delete ~/.ahma data directory (TLS, prompts, logs)
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `-y` / `--auto` | Skip prompts, remove everything |
+| `--mcp` | Remove only MCP server entries |
+| `--hooks` | Remove only terminal hooks |
+| `--skills` | Remove only agent skills and Claude Code plugin |
+| `--binary` | Remove the ahma binary from the install dir |
+| `--platform <list>` | Comma-separated platforms to target |
+| `--purge` | Also remove `~/.ahma` data dir (TLS, settings, logs) |
+| `--dry-run` | Print planned changes without modifying files |
+
+After uninstall, the wizard prints a list of tools to restart.  Background ahma servers
+will self-terminate once no IDE or TUI client is connected.
 
 ---
 

@@ -154,6 +154,8 @@ pub mod tool_availability;
 pub mod tool_hints;
 /// Transport patching for stdio MCP.
 pub mod transport_patch;
+/// Uninstall wizard (symmetric teardown of `ahma setup`).
+pub mod uninstall;
 /// Self-update: release downloads and Git branch installs.
 pub mod update;
 /// Shared utilities.
