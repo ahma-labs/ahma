@@ -613,6 +613,17 @@ mod ahma_list_tools_mode_tests {
         let binary = build_binary_cached("ahma_bin", "ahma");
         let temp = tempfile::tempdir().unwrap();
 
+        // `cluster` is gated at runtime by `[features] cluster` in settings.toml
+        // (default off). When the feature is compiled in, enable it for this
+        // isolated HOME so the CLI is exercised rather than refused.
+        let ahma_dir = temp.path().join(".ahma");
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+        std::fs::write(
+            ahma_dir.join("settings.toml"),
+            "[features]\ncluster = true\n",
+        )
+        .unwrap();
+
         // Add peer
         let output = test_command(&binary)
             .env("HOME", temp.path())

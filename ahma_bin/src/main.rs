@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
     match subcommand {
         Subcommands::Vault(vault_args) => {
             tracing::info!("Dispatching vault subcommand");
-            dispatch_vault(vault_args)
+            dispatch_vault(vault_args, &settings_for_log)
         }
         Subcommands::Tui(tui_args) => {
             tracing::info!("Starting TUI control plane");
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
         }
         Subcommands::Cluster(cluster_args) => {
             tracing::info!("Dispatching cluster subcommand");
-            dispatch_cluster(cluster_args).await
+            dispatch_cluster(cluster_args, &settings_for_log).await
         }
         Subcommands::Daemon(_) => {
             tracing::info!("Starting TUI hub daemon");
@@ -168,7 +168,23 @@ fn dispatch_tls(args: ahma_mcp::shell::TlsArgs) -> Result<()> {
     Ok(())
 }
 
-/// Graceful message when a feature is disabled at runtime via settings.
+/// Graceful degradation when an incubating feature is compiled out: the
+/// subcommand still parses, but explains how to get a build that includes it.
+///
+/// This is distinct from [`feature_disabled_at_runtime`]: editing
+/// `settings.toml` cannot enable a feature that was never compiled in, so the
+/// message must point at the build flags instead.
+#[allow(dead_code)]
+fn feature_not_compiled(subcommand: &str, feature: &str) -> Result<()> {
+    anyhow::bail!(
+        "`ahma {subcommand}` is not included in this build.\n\
+         It is an incubating feature, compiled in with:\n\
+         \n    cargo install --path ahma_bin --features {feature}\n\
+         \n(or `--features full` for all incubating features)"
+    )
+}
+
+/// Graceful message when a compiled-in feature is turned off via settings.
 #[allow(dead_code)]
 fn feature_disabled_at_runtime(subcommand: &str, setting: &str) -> Result<()> {
     anyhow::bail!(
@@ -179,9 +195,17 @@ fn feature_disabled_at_runtime(subcommand: &str, setting: &str) -> Result<()> {
     )
 }
 
-fn dispatch_vault(#[allow(unused_variables)] args: ahma_mcp::shell::VaultArgs) -> Result<()> {
+fn dispatch_vault(
+    #[allow(unused_variables)] args: ahma_mcp::shell::VaultArgs,
+    #[allow(unused_variables)] settings: &ahma_common::config::AhmaSettings,
+) -> Result<()> {
     #[cfg(not(feature = "vault"))]
-    return feature_disabled_at_runtime("vault", "vault");
+    return feature_not_compiled("vault", "vault");
+
+    #[cfg(feature = "vault")]
+    if !settings.features.vault {
+        return feature_disabled_at_runtime("vault", "vault");
+    }
 
     #[cfg(feature = "vault")]
     match args.command {
@@ -395,9 +419,17 @@ fn write_peers(peers: &[ahma_cluster::PeerInfo]) -> Result<()> {
     std::fs::write(&path, text).with_context(|| format!("Failed to write {}", path.display()))
 }
 
-async fn dispatch_cluster(#[allow(unused_variables)] args: ahma_mcp::shell::ClusterArgs) -> Result<()> {
+async fn dispatch_cluster(
+    #[allow(unused_variables)] args: ahma_mcp::shell::ClusterArgs,
+    #[allow(unused_variables)] settings: &ahma_common::config::AhmaSettings,
+) -> Result<()> {
     #[cfg(not(feature = "cluster"))]
-    return feature_disabled_at_runtime("cluster", "cluster");
+    return feature_not_compiled("cluster", "cluster");
+
+    #[cfg(feature = "cluster")]
+    if !settings.features.cluster {
+        return feature_disabled_at_runtime("cluster", "cluster");
+    }
 
     #[cfg(feature = "cluster")]
     match args.command {
