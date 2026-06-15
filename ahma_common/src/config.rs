@@ -24,6 +24,13 @@
 //! default_model = "gpt-4o-mini"
 //! api_key       = "${OPENAI_API_KEY}"
 //!
+//! [[providers]]
+//! name          = "claude"
+//! kind          = "anthropic"   # native Messages API (not OpenAI-compatible)
+//! base_url      = "https://api.anthropic.com/v1"
+//! default_model = "claude-opus-4-8"
+//! api_key       = "${ANTHROPIC_API_KEY}"
+//!
 //! # ── Cluster ─────────────────────────────────────────────────────────────────
 //! [cluster]
 //! # Path to the file containing the shared HMAC-SHA256 cluster key.
@@ -125,14 +132,45 @@ pub fn warn_if_looks_like_literal_secret(value: &str) -> bool {
 // Named provider registry (loaded from ~/.ahma/config.toml)
 // ---------------------------------------------------------------------------
 
+/// Wire-format family of a named provider.
+///
+/// Selects how the LLM client talks to the endpoint. `openai` (the default)
+/// covers any OpenAI-compatible `/chat/completions` server (Ollama, llama.cpp,
+/// oMLX, OpenAI itself). `anthropic` selects the native Anthropic Messages API
+/// (`/v1/messages`, `x-api-key`), which is **not** OpenAI-compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    /// OpenAI-compatible chat-completions API.
+    #[default]
+    OpenAi,
+    /// Anthropic native Messages API.
+    Anthropic,
+}
+
 /// An entry in the `[[providers]]` array in `~/.ahma/config.toml`.
+///
+/// Example Anthropic provider:
+///
+/// ```toml
+/// [[providers]]
+/// name          = "claude"
+/// kind          = "anthropic"
+/// base_url      = "https://api.anthropic.com/v1"
+/// default_model = "claude-opus-4-8"
+/// api_key       = "${ANTHROPIC_API_KEY}"
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderEntry {
     /// Unique name used to reference this provider (e.g. `"ollama-local"`).
     pub name: String,
-    /// Base URL of the OpenAI-compatible API (e.g. `http://localhost:11434/v1`).
+    /// Wire-format family. Defaults to `openai` for backward compatibility.
+    #[serde(default)]
+    pub kind: ProviderKind,
+    /// Base URL of the API. For `openai`, the OpenAI-compatible root (e.g.
+    /// `http://localhost:11434/v1`); for `anthropic`, `https://api.anthropic.com/v1`.
     pub base_url: String,
-    /// Default model for this provider (e.g. `"llama3.2"`).
+    /// Default model for this provider (e.g. `"llama3.2"`, `"claude-opus-4-8"`).
     pub default_model: String,
     /// Optional bearer token. Supports `${ENV_VAR}` interpolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +189,7 @@ impl ProviderEntry {
             .transpose()?;
         Ok(ResolvedProvider {
             name: self.name.clone(),
+            kind: self.kind,
             base_url: self.base_url.clone(),
             default_model: self.default_model.clone(),
             api_key,
@@ -162,6 +201,7 @@ impl ProviderEntry {
 #[derive(Debug, Clone)]
 pub struct ResolvedProvider {
     pub name: String,
+    pub kind: ProviderKind,
     pub base_url: String,
     pub default_model: String,
     pub api_key: Option<String>,
@@ -332,6 +372,7 @@ impl AhmaConfig {
         if !cfg.providers.iter().any(|p| p.name == "omlx") {
             cfg.providers.push(ProviderEntry {
                 name: "omlx".to_string(),
+                kind: ProviderKind::OpenAi,
                 base_url: settings.omlx.base_url.clone(),
                 default_model: settings.omlx.model.clone(),
                 api_key: None,
@@ -1190,6 +1231,7 @@ api_key = "${AHMA_TEST_PROVIDER_KEY}"
         let mut cfg = AhmaConfig::default();
         cfg.providers.push(ProviderEntry {
             name: "roundtrip-test".into(),
+            kind: ProviderKind::OpenAi,
             base_url: "http://localhost:11434/v1".into(),
             default_model: "llama3.2".into(),
             api_key: None,
@@ -1220,15 +1262,17 @@ api_key = "${AHMA_TEST_PROVIDER_KEY}"
         let mut cfg = AhmaConfig::default();
         cfg.providers.push(ProviderEntry {
             name: "keep-me".into(),
+            kind: ProviderKind::OpenAi,
             base_url: "http://localhost:11434/v1".into(),
             default_model: "gemma3n".into(),
             api_key: None,
         });
         cfg.providers.push(ProviderEntry {
             name: "remove-me".into(),
-            base_url: "https://api.openai.com/v1".into(),
-            default_model: "gpt-4o-mini".into(),
-            api_key: Some("sk-placeholder".into()),
+            kind: ProviderKind::Anthropic,
+            base_url: "https://api.anthropic.com/v1".into(),
+            default_model: "claude-opus-4-8".into(),
+            api_key: Some("${ANTHROPIC_API_KEY}".into()),
         });
 
         let toml_text = toml::to_string_pretty(&cfg).unwrap();

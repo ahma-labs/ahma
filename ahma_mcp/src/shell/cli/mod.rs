@@ -1600,10 +1600,14 @@ pub struct LlmAddArgs {
     /// Unique name for this provider (e.g. "ollama-local").
     #[arg(long)]
     pub name: String,
-    /// Base URL of the OpenAI-compatible API (e.g. http://localhost:11434/v1).
+    /// Wire-format family: "openai" (default, OpenAI-compatible) or "anthropic"
+    /// (native Messages API).
+    #[arg(long, default_value = "openai")]
+    pub kind: String,
+    /// Base URL of the API (OpenAI-compatible root, or https://api.anthropic.com/v1).
     #[arg(long)]
     pub base_url: String,
-    /// Default model to use with this provider (e.g. "llama3.2").
+    /// Default model to use with this provider (e.g. "llama3.2", "claude-opus-4-8").
     #[arg(long)]
     pub model: String,
     /// Optional API key. Use \${ENV_VAR} notation to reference an environment variable.
