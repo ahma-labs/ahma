@@ -22,6 +22,8 @@ tui = ["dep:ratatui", "dep:crossterm", "dep:futures", "dep:tui-textarea"]
 ahma_common = { path = "../ahma_common" }
 ahma_llm_monitor = { path = "../ahma_llm_monitor" }
 ahma_task_tree = { path = "../ahma_task_tree" }
+ahma_mcp = { path = "../ahma_mcp" }
+ahma_core = { path = "../ahma_core" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono = { workspace = true }

@@ -446,6 +446,8 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
             DaemonEvent::LogLine { .. } => Applied::None, // not yet surfaced in TUI
         },
         DaemonMsg::Ping { .. } => Applied::None, // hub-to-instance ping; no state change for subscribers
+        DaemonMsg::ChatToken { .. } => Applied::None,
+        DaemonMsg::ApprovalRequested { .. } => Applied::None,
     }
 }
 

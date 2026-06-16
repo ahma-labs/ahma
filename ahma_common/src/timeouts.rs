@@ -269,8 +269,8 @@ mod tests {
     /// repurposes it as a loop deadline is caught in review against a real number.
     #[test]
     fn sse_stream_is_the_known_backstop_exception() {
-        let windows_scaled = TestTimeouts::base_secs(TimeoutCategory::SseStream)
-            * WINDOWS_CI_MULTIPLIER;
+        let windows_scaled =
+            TestTimeouts::base_secs(TimeoutCategory::SseStream) * WINDOWS_CI_MULTIPLIER;
         assert!(
             windows_scaled >= NEXTEST_CI_HARD_KILL_SECS,
             "If SseStream now fits under the backstop, fold it into the bounded set above"

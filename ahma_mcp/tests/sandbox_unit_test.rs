@@ -232,8 +232,16 @@ fn test_update_scopes_preserves_sandbox_dir_and_tmp() {
     sandbox.update_scopes(vec![workspace.clone()]).unwrap();
 
     let scopes = sandbox.scopes();
-    assert!(scopes.contains(&workspace), "workspace present: {:?}", scopes.to_vec());
-    assert!(scopes.contains(&sandbox_dir), "sandbox_dir present: {:?}", scopes.to_vec());
+    assert!(
+        scopes.contains(&workspace),
+        "workspace present: {:?}",
+        scopes.to_vec()
+    );
+    assert!(
+        scopes.contains(&sandbox_dir),
+        "sandbox_dir present: {:?}",
+        scopes.to_vec()
+    );
     assert!(
         scopes.contains(&canonical_temp),
         "temp dir present when tmp_access=true: {:?}",
@@ -247,25 +255,13 @@ fn test_sandbox_dir_accessor() {
     let tmp = tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
 
-    let sandbox = Sandbox::new(
-        vec![dir.clone()],
-        SandboxMode::Test,
-        false,
-        false,
-        false,
-    )
-    .unwrap()
-    .with_sandbox_dir(Some(dir.clone()));
+    let sandbox = Sandbox::new(vec![dir.clone()], SandboxMode::Test, false, false, false)
+        .unwrap()
+        .with_sandbox_dir(Some(dir.clone()));
 
     assert_eq!(sandbox.sandbox_dir(), Some(&dir));
 
-    let sandbox_no_dir = Sandbox::new(
-        vec![dir.clone()],
-        SandboxMode::Test,
-        false,
-        false,
-        false,
-    )
-    .unwrap();
+    let sandbox_no_dir =
+        Sandbox::new(vec![dir.clone()], SandboxMode::Test, false, false, false).unwrap();
     assert_eq!(sandbox_no_dir.sandbox_dir(), None);
 }

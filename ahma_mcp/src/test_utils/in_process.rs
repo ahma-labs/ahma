@@ -30,8 +30,10 @@ use std::sync::Arc;
 pub struct InProcessMcp {
     /// The MCP client – use this to call `list_all_tools`, `call_tool`, etc.
     pub client: RunningService<RoleClient, ()>,
-    // Keeps the server background tasks alive.
-    _server: RunningService<RoleServer, AhmaMcpService>,
+    /// The inner service implementation on the server side.
+    pub service: AhmaMcpService,
+    /// Keeps the server background tasks alive.
+    pub _server: RunningService<RoleServer, AhmaMcpService>,
 }
 
 /// Create an in-process MCP pair using an empty tool config map.
@@ -58,6 +60,7 @@ pub async fn create_in_process_mcp_from_dir(tools_dir: &Path) -> Result<InProces
         false,
         false,
     )?;
+    sandbox.set_roots_received(true);
     wire_in_process_mcp(configs, sandbox).await
 }
 
@@ -72,6 +75,7 @@ pub async fn create_in_process_mcp(configs: HashMap<String, ToolConfig>) -> Resu
         SandboxMode::Strict
     };
     let sandbox = Sandbox::new(vec![std::env::current_dir()?], mode, false, false, false)?;
+    sandbox.set_roots_received(true);
     wire_in_process_mcp(configs, sandbox).await
 }
 
@@ -107,6 +111,7 @@ pub async fn create_in_process_mcp_with_scope(
     // not application-level validate_path checks.  SandboxMode::Test bypasses
     // validate_path completely, defeating these tests on Windows CI and macOS+Cursor.
     let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, false)?;
+    sandbox.set_roots_received(true);
     wire_in_process_mcp(configs, sandbox).await
 }
 
@@ -125,7 +130,7 @@ async fn wire_in_process_mcp(
     )?);
 
     let service = AhmaMcpService::new(
-        adapter,
+        adapter.clone(),
         operation_monitor,
         Arc::new(configs),
         Arc::new(None::<GuidanceConfig>),
@@ -133,6 +138,11 @@ async fn wire_in_process_mcp(
         false, // defer_sandbox
     )
     .await?;
+
+    // Since this is an in-process mock client/server pair for testing,
+    // we mark roots as received so that path validation behaves strictly
+    // and does not dynamically auto-scope to the test runner's environment.
+    adapter.sandbox().set_roots_received(true);
 
     // Wire client and server through an in-memory duplex channel.
     let (client_stream, server_stream) = tokio::io::duplex(65536);
@@ -144,11 +154,14 @@ async fn wire_in_process_mcp(
 
     // Run both handshakes concurrently; both futures complete once the
     // initialize / initialized exchange is done and both sides are ready.
-    let (client_result, server_result) =
-        tokio::join!(().serve(client_transport), service.serve(server_transport),);
+    let (client_result, server_result) = tokio::join!(
+        ().serve(client_transport),
+        service.clone().serve(server_transport),
+    );
 
     Ok(InProcessMcp {
         client: client_result?,
+        service,
         _server: server_result?,
     })
 }
@@ -196,13 +209,15 @@ pub async fn build_test_service_with_configs(
     let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
-    let sandbox = Arc::new(Sandbox::new(
+    let sandbox = Sandbox::new(
         vec![temp_dir.path().to_path_buf()],
         SandboxMode::Test,
         false,
         false,
         false,
-    )?);
+    )?;
+    sandbox.set_roots_received(true);
+    let sandbox = Arc::new(sandbox);
     let adapter = Arc::new(Adapter::new(
         Arc::clone(&operation_monitor),
         shell_pool,

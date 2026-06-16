@@ -1237,8 +1237,14 @@ mod tests {
         let args = entry["args"].as_array().expect("args must be array");
         let has_sandbox = args.iter().any(|a| a.as_str() == Some("--sandbox"));
         let has_tmp = args.iter().any(|a| a.as_str() == Some("--tmp"));
-        assert!(has_sandbox, "Claude Desktop entry must include --sandbox: {args:?}");
-        assert!(!has_tmp, "Claude Desktop entry must NOT include --tmp: {args:?}");
+        assert!(
+            has_sandbox,
+            "Claude Desktop entry must include --sandbox: {args:?}"
+        );
+        assert!(
+            !has_tmp,
+            "Claude Desktop entry must NOT include --tmp: {args:?}"
+        );
     }
 
     #[test]
@@ -1248,8 +1254,14 @@ mod tests {
         let args = entry["args"].as_array().expect("args must be array");
         let has_sandbox = args.iter().any(|a| a.as_str() == Some("--sandbox"));
         let has_tmp = args.iter().any(|a| a.as_str() == Some("--tmp"));
-        assert!(has_sandbox, "Antigravity entry must include --sandbox: {args:?}");
-        assert!(!has_tmp, "Antigravity entry must NOT include --tmp: {args:?}");
+        assert!(
+            has_sandbox,
+            "Antigravity entry must include --sandbox: {args:?}"
+        );
+        assert!(
+            !has_tmp,
+            "Antigravity entry must NOT include --tmp: {args:?}"
+        );
     }
 
     /// Reinstalling over a stale failClosed:true hook entry migrates it to false.

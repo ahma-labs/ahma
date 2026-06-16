@@ -152,6 +152,10 @@ pub enum ClientMsg {
     Pong { seq: u32 },
     /// Ask the daemon to shut down and exit immediately.
     Shutdown,
+    /// Submit a user prompt to start/resume an agent loop.
+    SubmitPrompt { prompt: String },
+    /// TUI client response containing user's approval decision.
+    SubmitApproval { approved: bool },
 }
 
 /// Message from the daemon to a subscriber (TUI).
@@ -172,6 +176,14 @@ pub enum DaemonMsg {
     /// Liveness probe sent from hub to a connected instance.
     /// The instance should respond with a matching [`ClientMsg::Pong`].
     Ping { seq: u32 },
+    /// Live chat token streamed back to the TUI from the daemon's agent loop.
+    ChatToken { token: String },
+    /// Prompt the TUI to request user approval for tool execution or elevation.
+    ApprovalRequested {
+        id: String,
+        tool: String,
+        args: String,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

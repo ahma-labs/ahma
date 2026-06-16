@@ -1190,11 +1190,7 @@ async fn health_check() -> impl IntoResponse {
     // Include the compile-time build-id so that same-semver dev rebuilds are
     // detectable: "0.12.5+abc1234" differs from "0.12.5+def5678" even though
     // the semver is identical.
-    let version = format!(
-        "{}+{}",
-        env!("CARGO_PKG_VERSION"),
-        ahma_common::BUILD_ID
-    );
+    let version = format!("{}+{}", env!("CARGO_PKG_VERSION"), ahma_common::BUILD_ID);
     (
         StatusCode::OK,
         Json(HealthResponse {

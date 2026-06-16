@@ -121,6 +121,8 @@ pub mod llm_service;
 pub mod log_monitor;
 /// Logging helpers for the core crate.
 pub mod logging;
+/// MCP client connection manager and auto-discovery.
+pub mod mcp_client;
 /// MCP server implementation.
 pub mod mcp_service;
 /// Operation monitor for async tasks.
@@ -209,5 +211,8 @@ pub use file_ops::{
     DefaultFileOpsProvider, DefaultWebPageFetcher, FileOpsProvider, WebPageFetcher,
 };
 pub use llm_service::{DefaultLlmCompletionService, LlmCompletionService};
+pub use mcp_client::{
+    McpClientHandler, McpConnectionManager, McpServerConfig, McpServerKind, ToolInfo,
+};
 pub use mcp_service::AhmaMcpService;
 pub use mcp_service::{ExtensionToolHandler, register_global_extension_handler};
