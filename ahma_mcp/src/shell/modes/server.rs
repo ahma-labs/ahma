@@ -814,6 +814,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         .build()
         .await?;
     let service_handler = service;
+    crate::register_active_service(Arc::new(service_handler.clone()));
 
     // Register this stdio instance with the hub daemon so TUI can see it.
     {

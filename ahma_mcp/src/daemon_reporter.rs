@@ -10,9 +10,10 @@
 //! * **Low overhead**: polls [`OperationMonitor`] every 2 seconds and diffs
 //!   the snapshot — no changes means no wire traffic.
 
+use crate::mcp_service::{ActiveAgentSession, get_global_prompt_runner};
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
 use ahma_common::daemon_hub::{
-    ClientMsg, DaemonEvent, connect_to_daemon, ensure_daemon_running, send_msg,
+    ClientMsg, DaemonEvent, DaemonMsg, connect_to_daemon, ensure_daemon_running, recv_msg, send_msg,
 };
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, warn};
@@ -85,8 +86,8 @@ async fn run_reporter_loop(
         debug!("daemon_reporter: connected to hub daemon");
         backoff_secs = 1; // reset back-off on successful connect
 
-        // Split into half-owned writer — we only send, never receive.
-        let (_, write_half) = tokio::io::split(stream);
+        let (read_half, write_half) = tokio::io::split(stream);
+        let mut reader = tokio::io::BufReader::new(read_half);
         let mut writer = write_half;
 
         // ── Register this instance ────────────────────────────────────────────
@@ -100,6 +101,10 @@ async fn run_reporter_loop(
             debug!("daemon_reporter: register failed ({e})");
             continue;
         }
+
+        // Channels for outbound messages and agent active session
+        let (hub_tx, mut hub_rx) = tokio::sync::mpsc::channel::<ClientMsg>(100);
+        let session = Arc::new(tokio::sync::Mutex::new(ActiveAgentSession::default()));
 
         // Subscribe to events BEFORE replaying so we don't miss anything that starts
         // while we are replaying the initial snapshot.
@@ -165,26 +170,93 @@ async fn run_reporter_loop(
         }
 
         // ── Event loop: forward the unified operation event stream ───────────
-        loop {
-            match event_rx.recv().await {
-                Ok(event) => {
-                    let Some(payload) = daemon_event_for(&event, &scope) else {
-                        continue;
-                    };
-                    let client_msg = ClientMsg::Event { payload };
+        let mut closed = false;
+        while !closed {
+            tokio::select! {
+                biased;
 
-                    if let Err(e) = send_msg(&mut writer, &client_msg).await {
-                        debug!("daemon_reporter: send failed ({e}), reconnecting");
-                        break;
+                // 1. Unified operation events to forward
+                event_res = event_rx.recv() => {
+                    match event_res {
+                        Ok(event) => {
+                            let Some(payload) = daemon_event_for(&event, &scope) else {
+                                continue;
+                            };
+                            let client_msg = ClientMsg::Event { payload };
+
+                            if let Err(e) = send_msg(&mut writer, &client_msg).await {
+                                debug!("daemon_reporter: send failed ({e}), reconnecting");
+                                closed = true;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("daemon_reporter event queue lagged by {n} messages; continuing");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            closed = true;
+                        }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    // Live feed only — subscribers reconcile from monitor state
-                    // on reconnect, so dropped events are non-fatal.
-                    warn!("daemon_reporter event queue lagged by {n} messages; continuing");
+
+                // 2. Outbound client messages from Agent Runner
+                hub_msg = hub_rx.recv() => {
+                    if let Some(msg) = hub_msg {
+                        if let Err(e) = send_msg(&mut writer, &msg).await {
+                            debug!("daemon_reporter: send hub_msg failed ({e}), reconnecting");
+                            closed = true;
+                        }
+                    } else {
+                        closed = true;
+                    }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    break;
+
+                // 3. Incoming messages from daemon hub
+                daemon_msg = recv_msg::<_, DaemonMsg>(&mut reader) => {
+                    match daemon_msg {
+                        Ok(DaemonMsg::Ping { seq }) => {
+                            debug!("daemon_reporter: received ping seq={seq}");
+                            if let Err(e) = send_msg(&mut writer, &ClientMsg::Pong { seq }).await {
+                                debug!("daemon_reporter: pong send failed ({e}), reconnecting");
+                                closed = true;
+                            }
+                        }
+                        Ok(DaemonMsg::RunPrompt { messages, system_prompt, provider, model }) => {
+                            debug!("daemon_reporter: received RunPrompt");
+                            if let Some(runner) = get_global_prompt_runner() {
+                                let runner = runner.clone();
+                                let hub_tx = hub_tx.clone();
+                                let session = session.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = runner.run_prompt(messages, system_prompt, provider, model, hub_tx.clone(), session).await {
+                                        let _ = hub_tx.send(ClientMsg::AgentError { error: e }).await;
+                                    } else {
+                                        let _ = hub_tx.send(ClientMsg::AgentDone).await;
+                                    }
+                                });
+                            } else {
+                                warn!("daemon_reporter: RunPrompt received but no prompt runner is registered");
+                                let _ = hub_tx.send(ClientMsg::AgentError {
+                                    error: "No prompt runner registered on this instance".to_string()
+                                }).await;
+                            }
+                        }
+                        Ok(DaemonMsg::SubmitApproval { approved }) => {
+                            debug!("daemon_reporter: received SubmitApproval approved={approved}");
+                            let mut session_guard = session.lock().await;
+                            if let Some(tx) = session_guard.approval_tx.take() {
+                                let _ = tx.send(approved);
+                            } else {
+                                debug!("daemon_reporter: received SubmitApproval but no approval sender pending");
+                            }
+                        }
+                        Ok(msg) => {
+                            debug!("daemon_reporter: ignored unexpected DaemonMsg: {:?}", msg);
+                        }
+                        Err(e) => {
+                            debug!("daemon_reporter: read error or EOF ({e}), reconnecting");
+                            closed = true;
+                        }
+                    }
                 }
             }
         }

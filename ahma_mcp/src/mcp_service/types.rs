@@ -8,6 +8,41 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
+
+/// Tracks approval sender for the active agent turn.
+#[derive(Default)]
+pub struct ActiveAgentSession {
+    pub approval_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+}
+
+/// A trait for executing prompts via the agent loop (implemented in ahma_core).
+#[async_trait::async_trait]
+pub trait PromptRunner: Send + Sync {
+    async fn run_prompt(
+        &self,
+        messages: Vec<DaemonChatMessage>,
+        system_prompt: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        hub_tx: tokio::sync::mpsc::Sender<ClientMsg>,
+        session: Arc<tokio::sync::Mutex<ActiveAgentSession>>,
+    ) -> Result<(), String>;
+}
+
+static GLOBAL_PROMPT_RUNNER: std::sync::OnceLock<Arc<dyn PromptRunner>> =
+    std::sync::OnceLock::new();
+
+/// Register the global prompt runner.
+pub fn register_global_prompt_runner(runner: Arc<dyn PromptRunner>) {
+    let _ = GLOBAL_PROMPT_RUNNER.set(runner);
+}
+
+/// Retrieve the global prompt runner.
+pub fn get_global_prompt_runner() -> Option<Arc<dyn PromptRunner>> {
+    GLOBAL_PROMPT_RUNNER.get().cloned()
+}
+
 use crate::config::ToolConfig;
 
 /// Distinguishes between top-level sequence tools and subcommand sequences.

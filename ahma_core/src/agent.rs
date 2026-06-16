@@ -966,6 +966,165 @@ pub(crate) fn needs_approval(tool_name: &str, tool_approval_enabled: bool) -> bo
         || tool_name.ends_with("::replace_in_file")
 }
 
+use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
+use ahma_mcp::ActiveAgentSession;
+
+/// A PromptRunner implementation that executes the agent loop inside ahma_core.
+pub struct CorePromptRunner;
+
+#[async_trait]
+impl ahma_mcp::PromptRunner for CorePromptRunner {
+    async fn run_prompt(
+        &self,
+        messages: Vec<DaemonChatMessage>,
+        system_prompt: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        hub_tx: tokio::sync::mpsc::Sender<ClientMsg>,
+        session: Arc<tokio::sync::Mutex<ActiveAgentSession>>,
+    ) -> Result<(), String> {
+        // 1. Get the active MCP service instance
+        let service = ahma_mcp::get_active_service()
+            .ok_or_else(|| "No active AhmaMcpService found in this process".to_string())?;
+
+        // 2. Resolve LLM client connection parameters using provider and model
+        let (base_url, model_name, api_key) = if let Some(p_name) = provider {
+            let config = ahma_common::config::AhmaConfig::load();
+            let resolved = config
+                .resolve_provider(&p_name)
+                .map_err(|e| format!("Failed to resolve provider '{}': {e}", p_name))?;
+            let resolved_model = model.unwrap_or(resolved.default_model);
+            (resolved.base_url, resolved_model, resolved.api_key)
+        } else {
+            let config = ahma_common::config::AhmaConfig::load();
+            if let Some(first_provider) = config.providers.first() {
+                let resolved = first_provider.resolve().map_err(|e| {
+                    format!(
+                        "Failed to resolve default provider '{}': {e}",
+                        first_provider.name
+                    )
+                })?;
+                let resolved_model = model.unwrap_or(resolved.default_model);
+                (resolved.base_url, resolved_model, resolved.api_key)
+            } else {
+                return Err("No LLM providers configured in ~/.ahma/config.toml".to_string());
+            }
+        };
+
+        let client = LlmClient::new(base_url.clone(), model_name, api_key);
+
+        // 3. Get all available tools dynamically from active service
+        let available_tools = service.get_all_available_tools().await;
+
+        // 4. Construct McpChatConfig
+        let workspace_root = service
+            .adapter
+            .sandbox()
+            .scopes()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+        let settings = ahma_common::config::AhmaSettings::load();
+        let mcp_connections = service.mcp_connections.read().await.clone();
+
+        let mcp_config = McpChatConfig {
+            base_url,
+            workspace_root,
+            session_id: None,
+            external_http_servers: BTreeMap::new(),
+            max_turns: 8,
+            tool_approval: true, // Always enable tool approval for hub tasks to prompt TUI
+            mcp_connections,
+            minimize_tokens: settings.tools.minimize_tokens,
+            small_model_harness: settings.tools.small_model_harness,
+            context_length: None,
+        };
+
+        // 5. Convert DaemonChatMessage to ChatMessage
+        let mut chat_messages = Vec::new();
+        for msg in messages {
+            let role = match msg.role.to_lowercase().as_str() {
+                "system" => ahma_llm_monitor::ChatRole::System,
+                "assistant" => ahma_llm_monitor::ChatRole::Assistant,
+                "tool" => ahma_llm_monitor::ChatRole::Tool,
+                _ => ahma_llm_monitor::ChatRole::User,
+            };
+            chat_messages.push(ChatMessage {
+                role,
+                content: msg.content,
+                tool_call_id: None,
+            });
+        }
+
+        // 6. Spawn the agent task with a custom AgentApprovalGate and event channel
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let gate = Arc::new(HubApprovalGate {
+            hub_tx: hub_tx.clone(),
+            session,
+        });
+
+        spawn_agent_task(
+            client,
+            chat_messages,
+            system_prompt,
+            Some(mcp_config),
+            available_tools,
+            tx,
+            gate,
+        );
+
+        // 7. Receive events from the agent loop and forward them to the hub daemon
+        while let Some(evt) = rx.recv().await {
+            let client_msg = match evt {
+                AgentEvent::Token(t) => ClientMsg::ChatToken { token: t },
+                AgentEvent::Done => ClientMsg::AgentDone,
+                AgentEvent::Error(e) => ClientMsg::AgentError { error: e },
+                AgentEvent::ToolCallStarted { id, name, args } => ClientMsg::ApprovalRequested {
+                    id,
+                    tool: name,
+                    args,
+                },
+                AgentEvent::ToolCallFinished { .. } => continue,
+                AgentEvent::Usage(_) => continue,
+            };
+
+            if hub_tx.send(client_msg).await.is_err() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+struct HubApprovalGate {
+    hub_tx: tokio::sync::mpsc::Sender<ClientMsg>,
+    session: Arc<tokio::sync::Mutex<ActiveAgentSession>>,
+}
+
+#[async_trait]
+impl AgentApprovalGate for HubApprovalGate {
+    async fn request_approval(&self, id: &str, tool: &str, args: &str) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut session_guard = self.session.lock().await;
+            session_guard.approval_tx = Some(tx);
+        }
+
+        let msg = ClientMsg::ApprovalRequested {
+            id: id.to_string(),
+            tool: tool.to_string(),
+            args: args.to_string(),
+        };
+        if self.hub_tx.send(msg).await.is_err() {
+            return false;
+        }
+
+        rx.await.unwrap_or(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

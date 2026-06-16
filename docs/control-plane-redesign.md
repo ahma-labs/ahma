@@ -17,21 +17,21 @@ This document tracks the step-by-step execution of turning `ahma tui` into a thi
 - [x] Wire background stdio/HTTP MCP client routing directly into `ahma serve`
 - [x] Add tests for daemon-level tool routing
 
-### [ ] Phase 3: Expand Daemon Hub Protocol
-- [ ] Extend `ClientMsg` and `DaemonMsg` protocol enums in `ahma_common::daemon_hub` to support:
+### [x] Phase 3: Expand Daemon Hub Protocol
+- [x] Extend `ClientMsg` and `DaemonMsg` protocol enums in `ahma_common::daemon_hub` to support:
   - Prompt submission from client
   - Chat tokens streamed from daemon
   - Security approval requests (elevation, renewal) sent to TUI
   - Approval decisions returned to daemon
-- [ ] Update daemon to execute the agent loop asynchronously when a prompt is received
-- [ ] Write integration tests for the new protocol stream
+- [x] Update daemon to execute the agent loop asynchronously when a prompt is received
+- [x] Write integration tests for the new protocol stream
 
-### [ ] Phase 4: Refactor TUI to Thin Client
-- [ ] Strip out LLM/agent code from `ahma_tui`
-- [ ] Strip out direct process management of external MCP stdio servers from `ahma_tui`
-- [ ] Implement event-based UI rendering that subscribes to the daemon event stream
-- [ ] Render tokens dynamically, pop up approval gates, and send user keypresses back
-- [ ] Verify that exiting the TUI does not terminate the background agent loop or external MCP processes
+### [x] Phase 4: Refactor TUI to Thin Client
+- [x] Strip out LLM/agent code from `ahma_tui`
+- [x] Strip out direct process management of external MCP stdio servers from `ahma_tui`
+- [x] Implement event-based UI rendering that subscribes to the daemon event stream
+- [x] Render tokens dynamically, pop up approval gates, and send user keypresses back
+- [x] Verify that exiting the TUI does not terminate the background agent loop or external MCP processes
 
 ---
 

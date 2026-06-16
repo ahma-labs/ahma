@@ -58,6 +58,18 @@ pub enum SourceEvent {
     InstancesUpdated {
         instances: Vec<ahma_common::daemon_hub::InstanceInfo>,
     },
+    ChatToken {
+        token: String,
+    },
+    ApprovalRequested {
+        id: String,
+        tool: String,
+        args: String,
+    },
+    AgentDone,
+    AgentError {
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone)]

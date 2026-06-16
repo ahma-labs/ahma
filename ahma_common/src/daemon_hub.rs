@@ -84,6 +84,13 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 // Protocol types
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A chat message sent over the daemon hub protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
 /// Metadata about a registered ahma instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceInfo {
@@ -153,9 +160,30 @@ pub enum ClientMsg {
     /// Ask the daemon to shut down and exit immediately.
     Shutdown,
     /// Submit a user prompt to start/resume an agent loop.
-    SubmitPrompt { prompt: String },
+    SubmitPrompt {
+        messages: Vec<DaemonChatMessage>,
+        system_prompt: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        target_instance_id: Option<String>,
+    },
     /// TUI client response containing user's approval decision.
-    SubmitApproval { approved: bool },
+    SubmitApproval {
+        approved: bool,
+        target_instance_id: Option<String>,
+    },
+    /// Stream a chat token from the instance to the hub.
+    ChatToken { token: String },
+    /// Request approval from the TUI.
+    ApprovalRequested {
+        id: String,
+        tool: String,
+        args: String,
+    },
+    /// Notify that the agent turn is done.
+    AgentDone,
+    /// Notify that the agent turn encountered an error.
+    AgentError { error: String },
 }
 
 /// Message from the daemon to a subscriber (TUI).
@@ -184,6 +212,19 @@ pub enum DaemonMsg {
         tool: String,
         args: String,
     },
+    /// Forward prompt run command to registered instance.
+    RunPrompt {
+        messages: Vec<DaemonChatMessage>,
+        system_prompt: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+    },
+    /// Forward user approval to registered instance.
+    SubmitApproval { approved: bool },
+    /// Notify TUI that the agent turn is done.
+    AgentDone,
+    /// Notify TUI that the agent turn encountered an error.
+    AgentError { error: String },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -421,6 +462,8 @@ where
 /// Internal shared state for the running daemon.
 struct DaemonHub {
     instances: Arc<Mutex<std::collections::HashMap<String, InstanceInfo>>>,
+    instance_txs:
+        Arc<Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<DaemonMsg>>>>,
     broadcast: broadcast::Sender<DaemonMsg>,
     connection_count: Arc<AtomicUsize>,
     socket_path: Option<PathBuf>,
@@ -432,6 +475,7 @@ impl DaemonHub {
         (
             Self {
                 instances: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                instance_txs: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 broadcast: tx,
                 connection_count: Arc::new(AtomicUsize::new(0)),
                 socket_path,
@@ -727,6 +771,7 @@ async fn accept_loop(listener: tokio::net::TcpListener, hub: Arc<DaemonHub>) -> 
 
 // ── Per-connection handler (generic over stream type) ─────────────────────────
 
+#[allow(clippy::collapsible_if)]
 async fn handle_connection<S>(stream: S, hub: Arc<DaemonHub>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -761,6 +806,10 @@ where
                 label,
             };
             hub.instances.lock().await.insert(id.clone(), info.clone());
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<DaemonMsg>(100);
+            hub.instance_txs.lock().await.insert(id.clone(), tx);
+
             let _ = hub
                 .broadcast
                 .send(DaemonMsg::InstanceRegistered { instance: info });
@@ -790,8 +839,30 @@ where
                                 // Liveness confirmed — nothing else to do for now.
                                 debug!("daemon: pong received from id={id}");
                             }
+                            Ok(ClientMsg::ChatToken { token }) => {
+                                let _ = hub.broadcast.send(DaemonMsg::ChatToken { token });
+                            }
+                            Ok(ClientMsg::ApprovalRequested { id: call_id, tool, args }) => {
+                                let _ = hub.broadcast.send(DaemonMsg::ApprovalRequested { id: call_id, tool, args });
+                            }
+                            Ok(ClientMsg::AgentDone) => {
+                                let _ = hub.broadcast.send(DaemonMsg::AgentDone);
+                            }
+                            Ok(ClientMsg::AgentError { error }) => {
+                                let _ = hub.broadcast.send(DaemonMsg::AgentError { error });
+                            }
                             Ok(ClientMsg::Unregister) | Err(_) => break,
                             Ok(_) => {} // ignore unexpected messages
+                        }
+                    }
+
+                    daemon_msg = rx.recv() => {
+                        if let Some(msg) = daemon_msg {
+                            if send_msg(&mut writer, &msg).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            break;
                         }
                     }
 
@@ -809,6 +880,7 @@ where
             }
 
             hub.instances.lock().await.remove(&id);
+            hub.instance_txs.lock().await.remove(&id);
             let _ = hub
                 .broadcast
                 .send(DaemonMsg::InstanceUnregistered { id: id.clone() });
@@ -861,8 +933,52 @@ where
             std::process::exit(0);
         }
 
+        ClientMsg::SubmitPrompt {
+            messages,
+            system_prompt,
+            provider,
+            model,
+            target_instance_id,
+        } => {
+            let target_id = if let Some(ref tid) = target_instance_id {
+                Some(tid.clone())
+            } else {
+                hub.instances.lock().await.keys().next().cloned()
+            };
+
+            if let Some(tid) = target_id {
+                if let Some(tx) = hub.instance_txs.lock().await.get(&tid) {
+                    let _ = tx
+                        .send(DaemonMsg::RunPrompt {
+                            messages,
+                            system_prompt,
+                            provider,
+                            model,
+                        })
+                        .await;
+                }
+            }
+        }
+
+        ClientMsg::SubmitApproval {
+            approved,
+            target_instance_id,
+        } => {
+            let target_id = if let Some(ref tid) = target_instance_id {
+                Some(tid.clone())
+            } else {
+                hub.instances.lock().await.keys().next().cloned()
+            };
+
+            if let Some(tid) = target_id {
+                if let Some(tx) = hub.instance_txs.lock().await.get(&tid) {
+                    let _ = tx.send(DaemonMsg::SubmitApproval { approved }).await;
+                }
+            }
+        }
+
         _ => {
-            debug!("daemon: unexpected first message, closing connection");
+            debug!("daemon: unexpected message, closing connection");
         }
     }
 

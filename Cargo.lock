@@ -46,6 +46,7 @@ version = "0.12.7"
 dependencies = [
  "ahma_cluster",
  "ahma_common",
+ "ahma_core",
  "ahma_mcp",
  "ahma_task_tree",
  "ahma_tui",
