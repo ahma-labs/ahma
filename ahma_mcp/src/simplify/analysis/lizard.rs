@@ -1,9 +1,11 @@
 //! Lizard universal complexity analyzer integration.
 //!
 //! [Lizard](https://github.com/terryyin/lizard) is a zero-configuration
-//! cyclomatic complexity analyzer that supports many languages that
-//! `rust-code-analysis` does not: Kotlin, Swift, Java, Go, C#, Objective-C,
-//! JavaScript, TypeScript, Ruby, PHP, and more.
+//! cyclomatic complexity analyzer that supports many languages for which
+//! `rust-code-analysis` produces no usable complexity metrics: Kotlin (rca
+//! only stub-parses it, so `conversion::analyze_file` skips it), Swift (rca
+//! does not parse it at all), Go, C#, Objective-C, Ruby, PHP, and more. It also
+//! covers Java/JavaScript/TypeScript as a fallback when rca is unavailable.
 //!
 //! # Installation
 //!

@@ -291,7 +291,7 @@ dependencies = [
  "reqwest 0.13.4",
  "ring",
  "rmcp",
- "rust-code-analysis",
+ "rust-code-analysis-code-split",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -4965,9 +4965,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-code-analysis"
-version = "0.0.25"
-source = "git+https://github.com/paulirotta/rust-code-analysis.git?branch=minimal-submodules#4ee6466148081d0715cfe6f77f0d1e009ddb7776"
+name = "rust-code-analysis-code-split"
+version = "0.0.26-cs.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3b9324bd5110e3d03aa2a301ff9615a802ca8169dd01507e2adf1232e57d341"
 dependencies = [
  "aho-corasick",
  "crossbeam",
@@ -4981,13 +4982,13 @@ dependencies = [
  "serde",
  "termcolor",
  "tree-sitter",
- "tree-sitter-ccomment",
+ "tree-sitter-ccomment-code-split",
  "tree-sitter-java",
  "tree-sitter-javascript",
  "tree-sitter-kotlin-ng",
- "tree-sitter-mozcpp",
- "tree-sitter-mozjs",
- "tree-sitter-preproc",
+ "tree-sitter-mozcpp-code-split",
+ "tree-sitter-mozjs-code-split",
+ "tree-sitter-preproc-code-split",
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
@@ -6472,9 +6473,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter"
-version = "0.25.3"
+version = "0.26.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9ac5ea5e7f2f1700842ec071401010b9c59bf735295f6e9fa079c3dc035b167"
+checksum = "4dab76d0b724ba557954125188cf0633a1ca43199ced82d95c7b9c32cc3de1f3"
 dependencies = [
  "cc",
  "regex",
@@ -6485,9 +6486,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree-sitter-ccomment"
+name = "tree-sitter-ccomment-code-split"
 version = "0.20.3"
-source = "git+https://github.com/paulirotta/rust-code-analysis.git?branch=minimal-submodules#4ee6466148081d0715cfe6f77f0d1e009ddb7776"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83235cd394d3a46206566faf6524b46f2aeb8e8d910ee0d9a1ea5804365c7ca4"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -6515,9 +6517,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-javascript"
-version = "0.23.1"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf40bf599e0416c16c125c3cec10ee5ddc7d1bb8b0c60fa5c4de249ad34dc1b1"
+checksum = "68204f2abc0627a90bdf06e605f5c470aa26fdcb2081ea553a04bdad756693f5"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -6540,9 +6542,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 
 [[package]]
-name = "tree-sitter-mozcpp"
+name = "tree-sitter-mozcpp-code-split"
 version = "0.20.4"
-source = "git+https://github.com/paulirotta/rust-code-analysis.git?branch=minimal-submodules#4ee6466148081d0715cfe6f77f0d1e009ddb7776"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5bfceb330f0fd6327cb2d9647e46c92c193628962dca4186a3c74ee15e01ddf"
 dependencies = [
  "cc",
  "tree-sitter-cpp",
@@ -6550,9 +6553,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree-sitter-mozjs"
+name = "tree-sitter-mozjs-code-split"
 version = "0.20.3"
-source = "git+https://github.com/paulirotta/rust-code-analysis.git?branch=minimal-submodules#4ee6466148081d0715cfe6f77f0d1e009ddb7776"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24f0056e599a6f8a9459a6bf5d83c39c143cb4bec97f3a88ad7dad4b3865d40d"
 dependencies = [
  "cc",
  "tree-sitter-javascript",
@@ -6560,9 +6564,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "tree-sitter-preproc"
+name = "tree-sitter-preproc-code-split"
 version = "0.20.3"
-source = "git+https://github.com/paulirotta/rust-code-analysis.git?branch=minimal-submodules#4ee6466148081d0715cfe6f77f0d1e009ddb7776"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e374ddbdf97fd8910995c6b2e4d50bd15d9741aa078b9e70bc195c723767b9e"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -6570,9 +6575,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-python"
-version = "0.23.6"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d065aaa27f3aaceaf60c1f0e0ac09e1cb9eb8ed28e7bcdaa52129cffc7f4b04"
+checksum = "6bf85fd39652e740bf60f46f4cda9492c3a9ad75880575bf14960f775cb74a1c"
 dependencies = [
  "cc",
  "tree-sitter-language",
