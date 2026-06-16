@@ -80,6 +80,20 @@ pub async fn create_in_process_mcp(configs: HashMap<String, ToolConfig>) -> Resu
 /// Unlike [`create_in_process_mcp_from_dir`], this constructor creates a
 /// `SandboxMode::Strict` sandbox, so path-security tests that assert sandbox
 /// enforcement still work correctly in-process.
+///
+/// # Why `SandboxMode::Strict` is always used here
+///
+/// `is_nested_sandbox_environment()` returns `true` on Windows (and macOS inside
+/// Cursor / VS Code) because those environments can't run the OS-level kernel
+/// sandbox (AppContainer / seatbelt).  But OS-level enforcement is a separate
+/// concern from application-level path validation: `SandboxMode::Test` disables
+/// *both*, which would cause `validate_path` to skip scope checks entirely and
+/// make security tests vacuous.
+///
+/// Using `SandboxMode::Strict` here enforces path validation without requiring
+/// any platform sandbox.  `Sandbox::new` with a real directory never fails on
+/// any platform; `create_command` on Windows falls back to a plain Job-Object
+/// command when AppContainer is not active.
 pub async fn create_in_process_mcp_with_scope(
     tools_dir: &Path,
     scopes: Vec<PathBuf>,
@@ -87,12 +101,12 @@ pub async fn create_in_process_mcp_with_scope(
     let configs = load_tool_configs(&AppConfig::default(), Some(tools_dir))
         .await
         .unwrap_or_default();
-    let mode = if super::client::is_nested_sandbox_environment() {
-        SandboxMode::Test
-    } else {
-        SandboxMode::Strict
-    };
-    let sandbox = Sandbox::new(scopes, mode, false, false, false)?;
+    // Always Strict: this function exists to test scope-based path security.
+    // Do NOT downgrade to SandboxMode::Test based on is_nested_sandbox_environment()
+    // — that check governs OS-level kernel enforcement (seatbelt/landlock/AppContainer),
+    // not application-level validate_path checks.  SandboxMode::Test bypasses
+    // validate_path completely, defeating these tests on Windows CI and macOS+Cursor.
+    let sandbox = Sandbox::new(scopes, SandboxMode::Strict, false, false, false)?;
     wire_in_process_mcp(configs, sandbox).await
 }
 
