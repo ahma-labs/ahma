@@ -678,16 +678,15 @@ async fn handle_client_response(
     )
 }
 
-/// Returns true if the sandbox should be locked based on roots and SSE state.
-fn should_lock_sandbox(
-    mcp_roots: &[McpRoot],
-    session_manager: &SessionManager,
-    session_id: &str,
-) -> bool {
+/// Returns true if the sandbox should be locked based on the roots list.
+///
+/// An empty `mcp_roots` slice must NOT trigger a lock even when SSE is
+/// connected.  Locking on empty roots would silently scope every tool call to
+/// an empty sandbox, causing confusing "path outside sandbox" errors instead of
+/// the observable HTTP 409 / JSON-RPC -32001 that tells the user to open a
+/// workspace folder or supply `--sandbox-scope`.
+fn should_lock_sandbox(mcp_roots: &[McpRoot]) -> bool {
     !mcp_roots.is_empty()
-        || session_manager
-            .get_session(session_id)
-            .is_some_and(|s| s.is_sse_connected())
 }
 
 fn collect_valid_mcp_roots(session_id: &str, roots: &[Value]) -> Vec<McpRoot> {
@@ -734,10 +733,10 @@ async fn try_lock_sandbox_from_roots(
         return;
     };
 
-    if !should_lock_sandbox(&mcp_roots, session_manager, session_id) {
+    if !should_lock_sandbox(&mcp_roots) {
         debug!(
             session_id = %session_id,
-            "Skipping sandbox lock from empty roots/list response (SSE not connected yet)"
+            "Skipping sandbox lock: roots list is empty (client has no workspace folder open)"
         );
         return;
     }

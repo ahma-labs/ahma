@@ -17,6 +17,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(unix)]
 use anyhow::Result;
 use serde_json::Value;
 

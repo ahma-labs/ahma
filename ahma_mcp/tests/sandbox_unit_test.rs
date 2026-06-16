@@ -136,3 +136,136 @@ fn test_path_validation_accepts_symlink_alias_scope_for_nonexistent_nested_path(
     let alias_nested_target = alias_root.join("nested/new_file.txt");
     assert!(sandbox.validate_path(&alias_nested_target).is_ok());
 }
+
+// ============= Persistent sandbox_dir (--sandbox) tests =============
+
+/// update_scopes preserves the sandbox_dir (~/sandbox) when roots/list fires.
+#[test]
+fn test_update_scopes_preserves_sandbox_dir() {
+    let sandbox_dir_tmp = tempdir().unwrap();
+    let workspace_tmp = tempdir().unwrap();
+
+    let sandbox_dir = sandbox_dir_tmp.path().to_path_buf();
+    let workspace = workspace_tmp.path().to_path_buf();
+
+    // Start with sandbox_dir as the initial scope.
+    let sandbox = Sandbox::new(
+        vec![sandbox_dir.clone()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )
+    .unwrap()
+    .with_sandbox_dir(Some(sandbox_dir.clone()));
+
+    // Simulate roots/list arriving with a real workspace root.
+    sandbox.update_scopes(vec![workspace.clone()]).unwrap();
+
+    let scopes = sandbox.scopes();
+    assert!(
+        scopes.contains(&workspace),
+        "workspace must be in scopes after update: {:?}",
+        scopes.to_vec()
+    );
+    assert!(
+        scopes.contains(&sandbox_dir),
+        "sandbox_dir must survive update_scopes: {:?}",
+        scopes.to_vec()
+    );
+}
+
+/// When no sandbox_dir is set, update_scopes replaces scopes normally.
+#[test]
+fn test_update_scopes_no_sandbox_dir_replaces() {
+    let old_tmp = tempdir().unwrap();
+    let new_tmp = tempdir().unwrap();
+
+    let old_scope = old_tmp.path().to_path_buf();
+    let new_scope = new_tmp.path().to_path_buf();
+
+    let sandbox = Sandbox::new(
+        vec![old_scope.clone()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    // No sandbox_dir set.
+
+    sandbox.update_scopes(vec![new_scope.clone()]).unwrap();
+
+    let scopes = sandbox.scopes();
+    assert!(
+        scopes.contains(&new_scope),
+        "new scope must be present: {:?}",
+        scopes.to_vec()
+    );
+    assert!(
+        !scopes.contains(&old_scope),
+        "old scope must be replaced: {:?}",
+        scopes.to_vec()
+    );
+}
+
+/// update_scopes preserves both sandbox_dir AND temp when both are set.
+#[test]
+fn test_update_scopes_preserves_sandbox_dir_and_tmp() {
+    let sandbox_dir_tmp = tempdir().unwrap();
+    let workspace_tmp = tempdir().unwrap();
+
+    let sandbox_dir = sandbox_dir_tmp.path().to_path_buf();
+    let workspace = workspace_tmp.path().to_path_buf();
+    let canonical_temp = dunce::canonicalize(std::env::temp_dir()).unwrap();
+
+    let sandbox = Sandbox::new(
+        vec![sandbox_dir.clone()],
+        SandboxMode::Test,
+        false,
+        false,
+        true, // tmp_access = true
+    )
+    .unwrap()
+    .with_sandbox_dir(Some(sandbox_dir.clone()));
+
+    sandbox.update_scopes(vec![workspace.clone()]).unwrap();
+
+    let scopes = sandbox.scopes();
+    assert!(scopes.contains(&workspace), "workspace present: {:?}", scopes.to_vec());
+    assert!(scopes.contains(&sandbox_dir), "sandbox_dir present: {:?}", scopes.to_vec());
+    assert!(
+        scopes.contains(&canonical_temp),
+        "temp dir present when tmp_access=true: {:?}",
+        scopes.to_vec()
+    );
+}
+
+/// with_sandbox_dir / sandbox_dir accessor roundtrip.
+#[test]
+fn test_sandbox_dir_accessor() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+
+    let sandbox = Sandbox::new(
+        vec![dir.clone()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )
+    .unwrap()
+    .with_sandbox_dir(Some(dir.clone()));
+
+    assert_eq!(sandbox.sandbox_dir(), Some(&dir));
+
+    let sandbox_no_dir = Sandbox::new(
+        vec![dir.clone()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+    assert_eq!(sandbox_no_dir.sandbox_dir(), None);
+}

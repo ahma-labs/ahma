@@ -15,7 +15,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Run the stdio proxy connecting to the running UDS or HTTP server.
-pub async fn run_proxy_client(uds_path: Option<&str>, http_url: Option<&str>) -> Result<()> {
+///
+/// Returns `Ok(true)` when the bridge successfully responded to at least one
+/// message (normal session end).  Returns `Ok(false)` or `Err` when the bridge
+/// closed the connection before sending any response back to the client, which
+/// typically indicates a stale or incompatible bridge daemon.
+pub async fn run_proxy_client(uds_path: Option<&str>, http_url: Option<&str>) -> Result<bool> {
     #[cfg(unix)]
     if let Some(path) = uds_path {
         tracing::info!(socket = path, "Proxying stdio to Unix Domain Socket");
@@ -34,7 +39,7 @@ pub async fn run_proxy_client(uds_path: Option<&str>, http_url: Option<&str>) ->
 }
 
 #[cfg(unix)]
-async fn run_proxy_client_unix(socket_path: &str) -> Result<()> {
+async fn run_proxy_client_unix(socket_path: &str) -> Result<bool> {
     use ahma_http_mcp_client::unix_client::unix_socket_transport;
 
     let client_transport = unix_socket_transport(socket_path, "http://localhost/mcp")
@@ -50,7 +55,7 @@ async fn run_proxy_client_unix(socket_path: &str) -> Result<()> {
 }
 
 #[cfg(unix)]
-async fn run_transport_proxy<S, C>(mut stdio: S, mut client: C, transport: &str) -> Result<()>
+async fn run_transport_proxy<S, C>(mut stdio: S, mut client: C, transport: &str) -> Result<bool>
 where
     S: Transport<RoleServer> + Send + 'static,
     C: Transport<RoleClient> + Send + 'static,
@@ -63,6 +68,10 @@ where
     // token).  In that state `client.close()` would block forever, so we must only attempt
     // the teardown when a session could actually exist.
     let mut forwarded_any = false;
+    // Track whether the bridge ever responded (sent a message back to the client).
+    // This is the signal used by handle_version_checks to detect a stale bridge:
+    // a healthy bridge always replies to `initialize`; a stale one closes silently.
+    let mut bridge_responded = false;
     loop {
         tokio::select! {
             stdio_msg = stdio.receive() => {
@@ -100,6 +109,7 @@ where
                     );
                     break;
                 }
+                bridge_responded = true;
             }
         }
     }
@@ -123,10 +133,10 @@ where
             }
         }
     }
-    Ok(())
+    Ok(bridge_responded)
 }
 
-async fn run_proxy_client_http(base_url: &str) -> Result<()> {
+async fn run_proxy_client_http(base_url: &str) -> Result<bool> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
@@ -185,6 +195,9 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
         .send(resp_msg)
         .await
         .context("Failed to forward initialize response to stdio")?;
+
+    // The bridge successfully responded to initialize — it is alive and communicating.
+    let bridge_responded = true;
 
     tracing::info!(
         url = %mcp_url,
@@ -323,5 +336,5 @@ async fn run_proxy_client_http(base_url: &str) -> Result<()> {
         .send()
         .await;
 
-    Ok(())
+    Ok(bridge_responded)
 }

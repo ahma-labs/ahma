@@ -1,6 +1,6 @@
 ---
 name: ahma
-version: 0.12.5
+version: 0.12.6
 author: Paul Houghton
 description: >
   Comprehensive guide for using Ahma (ahma) as an AI agent. USE THIS SKILL when you need
@@ -18,7 +18,7 @@ description: >
 user-invocable: true
 ---
 
-<!-- version: 0.12.5 | author: Paul Houghton -->
+<!-- version: 0.12.6 | author: Paul Houghton -->
 
 # Ahma Skill — Comprehensive AI Usage Guide
 
@@ -38,8 +38,8 @@ the config in place. There are several approaches, from zero-friction to global:
 **The Ahma project already provides `.vscode/mcp.json` with three configurations to try:**
 
 - `ahma` — stdio mode (recommended, automatic per-client instances)
-- `ahma-http` — shared HTTP server on port 3000 (run `ahma serve http --tools git,fileutils --tmp --log-monitor`)
-- `ahma-unix` — shared HTTP server over Unix socket (run `ahma serve unix --socket-path /tmp/ahma.sock --tools git,fileutils --tmp --log-monitor`)
+- `ahma-http` — shared HTTP server on port 3000 (run `ahma serve http --tools git,fileutils --sandbox --log-monitor`)
+- `ahma-unix` — shared HTTP server over Unix socket (run `ahma serve unix --socket-path /tmp/ahma.sock --tools git,fileutils --sandbox --log-monitor`)
 
 You can copy or customize this for your own projects. Create `.vscode/mcp.json` in your project root and commit it. Every VS Code user
 who opens the project gets Ahma configured automatically (prompted to trust once):
@@ -50,7 +50,7 @@ who opens the project gets Ahma configured automatically (prompted to trust once
     "ahma": {
       "type": "stdio",
       "command": "ahma",
-      "args": ["serve", "stdio", "--tools", "git,fileutils", "--tmp", "--log-monitor"]
+      "args": ["serve", "stdio", "--tools", "git,fileutils", "--sandbox", "--log-monitor"]
     }
   }
 }
@@ -87,7 +87,7 @@ are auto-approved (no confirmation dialogs). Pairs well with Ahma's kernel sandb
     "ahma": {
       "type": "stdio",
       "command": "ahma",
-      "args": ["serve", "stdio", "--tools", "git,fileutils", "--tmp"],
+      "args": ["serve", "stdio", "--tools", "git,fileutils", "--sandbox"],
       "sandboxEnabled": true,
       "sandbox": {
         "filesystem": { "allowWrite": ["${workspaceFolder}"] }
@@ -231,7 +231,7 @@ Ahma enforces **kernel-level** filesystem boundaries set once at startup.
 
 ### Temp Directory
 ```json
-"args": ["serve", "stdio", "--tmp"]
+"args": ["serve", "stdio", "--sandbox"]
 ```
 Adds `/tmp` (or `%TEMP%` on Windows) to the scope. Required for compilers, build tools.
 
@@ -424,7 +424,8 @@ Hot-reload while authoring (dev only): `ahma serve stdio --hot-reload`
 | `--hot-reload` / `tools.hot_reload` | off | Reload tool JSON on file change (dev only) |
 | `--no-sandbox` / `sandbox.disable` | off | Disable kernel sandbox (UNSAFE) |
 | `--sandbox-scope` / `sandbox.scopes` | cwd | Sandbox scope paths |
-| `--tmp` / `sandbox.tmp_access` | off | Add temp dir to sandbox scope |
+| `--sandbox` / `sandbox.use_sandbox_directory` | off | Add ~/sandbox as persistent secondary scope |
+| `--tmp` / `sandbox.tmp_access` | off | Add temp dir to sandbox scope (opt-in) |
 | `--disable-temp-files` / `sandbox.disable_temp` | off | Block all temp dir access |
 | `--no-package-cache-write` | off | Disable cargo cache writes (strictest isolation) |
 | `--log-to-stderr` / `logging.target` | file | Log to stderr |
@@ -440,7 +441,7 @@ Full reference: [environment-variables.md](https://github.com/paulirotta/ahma/bl
 
 ```bash
 # Start MCP server (stdio — for IDE integration)
-ahma serve stdio [--tools git,fileutils] [--tmp] [--log-monitor]
+ahma serve stdio [--tools git,fileutils] [--sandbox] [--log-monitor]
 
 # Start HTTP server (local development, multiple clients)
 ahma serve http [--port 3000] [--host 0.0.0.0] [--disable-quic]
@@ -500,7 +501,7 @@ android_logcat(...)   # if defined in .ahma/android-logcat.json
 **Timeout**: Increase via `--timeout 600` in mcp.json args, or set `tools.timeout_secs = 600` in `~/.ahma/settings.toml`.
 
 **Permission denied / sandbox error**: The file is outside the sandbox scope.
-Check `--sandbox-scope` CLI flag or add `--tmp` if needed for temp files.
+Check `--sandbox-scope` CLI flag or add `--sandbox` to include ~/sandbox as a persistent scratch space, or `--tmp` if temp file access is needed.
 
 > **Cargo dependency errors**: If `cargo add` or `cargo update` fail with permission errors, do **not** add `--sandbox-scope ~/.cargo` to your `mcp.json` — that grants write to the entire cargo home including binaries and credentials.  Instead, the built-in `package_cache_write` feature (on by default) handles this correctly, granting write only to `registry/`, `git/`, and the cargo lock files.  If you previously had `--sandbox-scope ~/.cargo` in your config, remove it — it is no longer needed.
 
@@ -551,7 +552,7 @@ user-invocable subcommands and a one-line description of each:
 /ahma uninstall         — Remove integrations installed by ahma setup
 ```
 
-Also mention the key flags for configure, e.g., `--tools`, `--tmp`, `--log-monitor`.
+Also mention the key flags for configure, e.g., `--tools`, `--sandbox`, `--log-monitor`.
 
 ---
 

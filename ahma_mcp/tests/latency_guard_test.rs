@@ -35,6 +35,7 @@ fn build_adapter(scope: std::path::PathBuf) -> (Arc<Adapter>, Arc<OperationMonit
 fn write_script(dir: &std::path::Path, name: &str, bash: &str, ps1: &str) -> String {
     #[cfg(windows)]
     {
+        let _ = bash;
         let path = dir.join(format!("{name}.ps1"));
         std::fs::write(&path, ps1).unwrap();
         format!(

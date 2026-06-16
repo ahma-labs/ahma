@@ -646,6 +646,7 @@ async fn await_shutdown_signal() {
 
 fn spawn_idle_timeout_checker(timeout: u64, state: Arc<BridgeState>) {
     let session_manager = state.session_manager.clone();
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let listener_kind = state.listener_kind.clone();
     let counter = session_manager
         .active_sessions
@@ -1186,11 +1187,19 @@ pub struct HealthResponse {
 
 /// Health check endpoint
 async fn health_check() -> impl IntoResponse {
+    // Include the compile-time build-id so that same-semver dev rebuilds are
+    // detectable: "0.12.5+abc1234" differs from "0.12.5+def5678" even though
+    // the semver is identical.
+    let version = format!(
+        "{}+{}",
+        env!("CARGO_PKG_VERSION"),
+        ahma_common::BUILD_ID
+    );
     (
         StatusCode::OK,
         Json(HealthResponse {
             status: "OK".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version,
         }),
     )
 }
@@ -1198,6 +1207,7 @@ async fn health_check() -> impl IntoResponse {
 /// Handler for POST /restart
 async fn handle_restart(State(state): State<Arc<BridgeState>>) -> impl IntoResponse {
     info!("Restart requested. Shutting down bridge process...");
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let listener_kind = state.listener_kind.clone();
     let session_manager = state.session_manager.clone();
     tokio::spawn(async move {
@@ -1217,7 +1227,7 @@ async fn handle_restart(State(state): State<Arc<BridgeState>>) -> impl IntoRespo
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "restarting",
-            "version": env!("CARGO_PKG_VERSION")
+            "version": format!("{}+{}", env!("CARGO_PKG_VERSION"), ahma_common::BUILD_ID)
         })),
     )
 }
@@ -1958,9 +1968,11 @@ for line in sys.stdin:
             .unwrap();
         let response_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(response_json.get("status").unwrap().as_str().unwrap(), "OK");
-        assert_eq!(
-            response_json.get("version").unwrap().as_str().unwrap(),
-            env!("CARGO_PKG_VERSION")
+        let version = response_json.get("version").unwrap().as_str().unwrap();
+        // Version now includes build-id suffix: "0.12.6+<hash>" or "0.12.6+t<epoch>".
+        assert!(
+            version.starts_with(env!("CARGO_PKG_VERSION")),
+            "health version must start with semver: got {version}"
         );
     }
 

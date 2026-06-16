@@ -81,9 +81,11 @@ impl TestTimeouts {
         base * coverage_multiplier
     }
 
-    /// Get the timeout for a specific category.
-    pub fn get(category: TimeoutCategory) -> Duration {
-        let base_secs = match category {
+    /// Unscaled base timeout (seconds) for a category, before the platform
+    /// multiplier is applied.  Centralized so the harness-backstop guard test
+    /// can reason about Windows scaling independently of the host platform.
+    pub const fn base_secs(category: TimeoutCategory) -> u64 {
+        match category {
             TimeoutCategory::ProcessSpawn => 30,
             TimeoutCategory::Handshake => 60,
             TimeoutCategory::ToolCall => 30,
@@ -93,9 +95,12 @@ impl TestTimeouts {
             TimeoutCategory::HealthCheck => 15,
             TimeoutCategory::Cleanup => 10,
             TimeoutCategory::Quick => 5,
-        };
+        }
+    }
 
-        Duration::from_secs(base_secs * Self::multiplier())
+    /// Get the timeout for a specific category.
+    pub fn get(category: TimeoutCategory) -> Duration {
+        Duration::from_secs(Self::base_secs(category) * Self::multiplier())
     }
 
     /// Scale a custom duration by the platform multiplier.
@@ -138,6 +143,28 @@ impl TestTimeouts {
 fn is_coverage_mode() -> bool {
     std::env::var_os("LLVM_PROFILE_FILE").is_some() || std::env::var_os("CARGO_LLVM_COV").is_some()
 }
+
+/// The nextest per-test hard-kill backstop (seconds) for the subprocess-heavy
+/// packages under the **CI** profile: `slow-timeout = { period = "180s",
+/// terminate-after = 2 }` ⇒ 360s.  See `.config/nextest.toml`.
+///
+/// # Why this matters — the "opaque hang" failure mode
+///
+/// Any in-test loop deadline (e.g. an SSE handshake wait) MUST fire *before*
+/// this backstop on every platform multiplier.  If an in-test deadline is
+/// larger, nextest force-kills the test process first, and the failure presents
+/// as an unexplained `TIMEOUT [360s]` with no assertion message — exactly the
+/// Windows symptom that sent us in circles.  The Windows CI multiplier is ×4,
+/// so a bounded category must keep `base_secs × 4 < 360` ⇒ `base_secs < 90`.
+///
+/// `SseStream` (120s base ⇒ 480s on Windows) deliberately exceeds this and must
+/// therefore only ever bound *request ceilings* on operations that complete far
+/// sooner in practice — never a handshake/readiness loop deadline.  The guard
+/// test below enforces this for every other category.
+pub const NEXTEST_CI_HARD_KILL_SECS: u64 = 360;
+
+/// Windows CI timeout multiplier (kept in sync with [`TestTimeouts::multiplier`]).
+pub const WINDOWS_CI_MULTIPLIER: u64 = 4;
 
 /// Default idle-timeout (seconds) for **auto-spawned** bridges.
 ///
@@ -203,5 +230,50 @@ mod tests {
         let interval = TestTimeouts::poll_interval();
         assert!(interval.as_millis() >= 100);
         assert!(interval.as_millis() <= 1000);
+    }
+
+    /// Invariant guard: every category used as an *in-test loop deadline* must
+    /// fire before nextest's per-test hard-kill backstop on Windows (×4).  If
+    /// this fails, a Windows test would be force-killed mid-wait and present as
+    /// an opaque `TIMEOUT [360s]` with no diagnostic — the exact whack-a-mole
+    /// failure mode this constant documents.  `SseStream` is intentionally
+    /// excluded: it bounds request ceilings on fast-completing operations, never
+    /// a handshake/readiness loop (enforced by code review + this comment).
+    #[test]
+    fn bounded_categories_fire_before_nextest_backstop() {
+        let bounded = [
+            TimeoutCategory::ProcessSpawn,
+            TimeoutCategory::Handshake,
+            TimeoutCategory::ToolCall,
+            TimeoutCategory::SandboxReady,
+            TimeoutCategory::HttpRequest,
+            TimeoutCategory::HealthCheck,
+            TimeoutCategory::Cleanup,
+            TimeoutCategory::Quick,
+        ];
+        for cat in bounded {
+            let windows_scaled = TestTimeouts::base_secs(cat) * WINDOWS_CI_MULTIPLIER;
+            assert!(
+                windows_scaled < NEXTEST_CI_HARD_KILL_SECS,
+                "{:?} scaled to {}s on Windows (×{}) exceeds the {}s nextest backstop; \
+                 an in-test deadline using it would be force-killed before it can fail cleanly",
+                cat,
+                windows_scaled,
+                WINDOWS_CI_MULTIPLIER,
+                NEXTEST_CI_HARD_KILL_SECS,
+            );
+        }
+    }
+
+    /// Documents *why* `SseStream` is the lone exception, so a future change that
+    /// repurposes it as a loop deadline is caught in review against a real number.
+    #[test]
+    fn sse_stream_is_the_known_backstop_exception() {
+        let windows_scaled = TestTimeouts::base_secs(TimeoutCategory::SseStream)
+            * WINDOWS_CI_MULTIPLIER;
+        assert!(
+            windows_scaled >= NEXTEST_CI_HARD_KILL_SECS,
+            "If SseStream now fits under the backstop, fold it into the bounded set above"
+        );
     }
 }

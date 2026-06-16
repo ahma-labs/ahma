@@ -25,9 +25,10 @@ async fn test_health_check_version_and_restart() {
     println!("DEBUG: /health response text: {:?}", txt);
     let body: Value = serde_json::from_str(&txt).expect("Response should be JSON");
     assert_eq!(body.get("status").unwrap().as_str().unwrap(), "OK");
-    assert_eq!(
-        body.get("version").unwrap().as_str().unwrap(),
-        env!("CARGO_PKG_VERSION")
+    let version = body.get("version").unwrap().as_str().unwrap();
+    assert!(
+        version.starts_with(env!("CARGO_PKG_VERSION")),
+        "/health version must start with semver: got {version}"
     );
 
     // 2. Probe /restart
@@ -40,9 +41,10 @@ async fn test_health_check_version_and_restart() {
 
     let body: Value = resp.json().await.expect("Response should be JSON");
     assert_eq!(body.get("status").unwrap().as_str().unwrap(), "restarting");
-    assert_eq!(
-        body.get("version").unwrap().as_str().unwrap(),
-        env!("CARGO_PKG_VERSION")
+    let restart_version = body.get("version").unwrap().as_str().unwrap();
+    assert!(
+        restart_version.starts_with(env!("CARGO_PKG_VERSION")),
+        "/restart version must start with semver: got {restart_version}"
     );
 
     // 3. Wait/poll to verify server process exited

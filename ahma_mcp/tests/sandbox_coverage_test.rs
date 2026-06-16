@@ -124,6 +124,12 @@ fn test_validate_path_symlink_traversal() {
 
 #[test]
 fn test_sandbox_test_mode_bypass() {
+    // `SandboxMode::Test` is reached only via `--no-sandbox`, which per SPEC
+    // R-CFG2.3 and the CLI contract disables containment entirely ("the AI can
+    // read and write anywhere on the filesystem"). The kernel sandbox is off in
+    // this mode, so `validate_path` must NOT reject out-of-scope paths — it only
+    // resolves them to canonical form. Enforcing scopes here would be a false
+    // sense of security inconsistent with the disabled kernel sandbox.
     let td = tempfile::tempdir().unwrap();
     let sandbox = Sandbox::new(
         vec![td.path().to_path_buf()],
@@ -136,12 +142,14 @@ fn test_sandbox_test_mode_bypass() {
 
     let path = td.path().to_path_buf();
     let res = sandbox.validate_path(&path);
-    assert!(res.is_ok());
+    assert!(res.is_ok(), "in-scope path must validate in test mode");
 
+    // An out-of-scope path is accepted (bypassed) in test mode rather than
+    // rejected, because the kernel sandbox provides no containment here.
     let outside = test_out_of_scope_path();
     let res = sandbox.validate_path(&outside);
     assert!(
-        res.is_err(),
-        "Test sandbox should not bypass validation for out-of-scope paths"
+        res.is_ok(),
+        "Test mode (--no-sandbox) must bypass scope validation: {res:?}"
     );
 }

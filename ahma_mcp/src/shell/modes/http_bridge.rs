@@ -38,6 +38,11 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
             dunce::canonicalize(&config.sandbox_scopes[0])
                 .unwrap_or_else(|_| config.sandbox_scopes[0].clone()),
         )
+    } else if config.use_sandbox_dir {
+        config
+            .sandbox_directory
+            .as_ref()
+            .and_then(|dir| ahma_common::config::ensure_sandbox_directory(dir).ok())
     } else {
         None
     };
@@ -48,6 +53,9 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
     // Pass global options to child process
     if config.no_sandbox {
         server_args.push("--no-sandbox".to_string());
+    }
+    if config.use_sandbox_dir {
+        server_args.push("--sandbox".to_string());
     }
     if config.tmp_access {
         server_args.push("--tmp".to_string());

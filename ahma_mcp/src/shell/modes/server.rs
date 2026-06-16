@@ -383,62 +383,129 @@ async fn handle_version_checks(
     http_url_opt: Option<&str>,
 ) -> Result<Option<()>> {
     let client_version = env!("CARGO_PKG_VERSION");
+    let client_build_id = ahma_common::BUILD_ID;
     let bridge_version_opt = if is_test {
         None
     } else {
         get_bridge_version(socket_path_opt, http_url_opt).await
     };
 
-    let Some(bridge_version) = bridge_version_opt else {
+    let Some(bridge_version_raw) = bridge_version_opt else {
         return Ok(None);
     };
 
+    // Version strings from the health endpoint may carry a build-id suffix:
+    // "0.12.5+abc1234".  Split them out for independent semver and build-id checks.
+    let (bridge_semver, bridge_build_id) = split_version_and_build_id(&bridge_version_raw);
+    let client_semver = client_version;
+
     tracing::info!(
         client_version = client_version,
-        bridge_version = %bridge_version,
-        "Bridge version check: client={client_version} bridge={bridge_version}"
+        client_build_id = client_build_id,
+        bridge_version = %bridge_version_raw,
+        "Bridge version check: client={client_version}+{client_build_id} bridge={bridge_version_raw}"
     );
 
-    if bridge_version == client_version {
+    let same_semver = bridge_semver == client_semver;
+    // When the bridge exposes a build-id, check it too.  Differing build-ids on the
+    // same semver mean a dev rebuild happened without bumping the version — treat the
+    // running bridge as stale.
+    let same_build = bridge_build_id.is_none_or(|bid| bid == client_build_id);
+
+    if same_semver && same_build {
         tracing::info!(
-            "Local bridge server is already running (v{bridge_version}). Forwarding stdio as a proxy client."
+            "Local bridge server is already running (v{bridge_version_raw}). Forwarding stdio as a proxy client."
         );
-        crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt).await?;
-        return Ok(Some(()));
+        let proxy_result =
+            crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
+                .await;
+        return match proxy_result {
+            Ok(true) => {
+                // Bridge responded normally — this was a real MCP session that ended cleanly.
+                Ok(Some(()))
+            }
+            result => {
+                // Proxy failed (Err) OR the bridge closed the connection before sending any
+                // response (Ok(false)).  Both indicate a stale / incompatible bridge daemon
+                // that happens to report the same version string.
+                if let Err(ref e) = result {
+                    tracing::warn!(
+                        bridge_version = %bridge_version_raw,
+                        error = %e,
+                        "Proxy to same-version bridge failed; bridge may be stale"
+                    );
+                } else {
+                    tracing::warn!(
+                        bridge_version = %bridge_version_raw,
+                        "Proxy to same-version bridge exited without forwarding any bridge \
+                         response; bridge may be stale (same semver, incompatible binary)"
+                    );
+                }
+                if std::env::var("AHMA_RESTARTED").is_err() {
+                    tracing::info!(
+                        "Triggering bridge restart and falling back to fresh bridge spawn..."
+                    );
+                    restart_bridge_server(socket_path_opt, http_url_opt).await;
+                    // Return Ok(None) so run_server_mode proceeds to spawn a fresh bridge
+                    // and connect to it.
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Proxy to same-version bridge (v{bridge_version_raw}) failed after \
+                         restart attempt. Please restart ahma manually: \
+                         `pkill -f 'ahma serve'` then restart your IDE."
+                    ))
+                }
+            }
+        };
     }
 
-    let c_ver = parse_version(client_version);
-    let b_ver = parse_version(&bridge_version);
+    let c_ver = parse_version(client_semver);
+    let b_ver = parse_version(bridge_semver);
     let client_is_newer = match (c_ver, b_ver) {
         (Some(c), Some(b)) => c > b,
         _ => true,
     };
 
+    // Same semver but different build-id: the bridge is a dev-rebuild peer on the same
+    // version; treat it as stale (client binary is "newer" in intent).
+    let client_is_newer = client_is_newer || (same_semver && !same_build);
+
     if client_is_newer {
         tracing::info!(
             client_version = client_version,
-            bridge_version = %bridge_version,
-            "Client is newer than bridge; requesting bridge restart"
+            bridge_version = %bridge_version_raw,
+            "Client is newer than bridge (or same version with different build); requesting bridge restart"
         );
         restart_bridge_server(socket_path_opt, http_url_opt).await;
     } else if std::env::var("AHMA_RESTARTED").is_ok() {
         return Err(anyhow::anyhow!(
             "Version mismatch: Client version (v{}) is older than running bridge version (v{}). Please update the client binary.",
             client_version,
-            bridge_version
+            bridge_version_raw
         ));
     } else {
         tracing::info!(
             "Client version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
             client_version,
-            bridge_version
+            bridge_version_raw
         );
         re_exec_current_process()?;
     }
     Ok(None)
 }
 
-fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf]) -> Vec<String> {
+/// Split a version string of the form `"semver+build_id"` into `(semver, Option<build_id>)`.
+/// If there is no `+` separator, the build_id portion is `None`.
+pub(crate) fn split_version_and_build_id(v: &str) -> (&str, Option<&str>) {
+    if let Some(idx) = v.find('+') {
+        (&v[..idx], Some(&v[idx + 1..]))
+    } else {
+        (v, None)
+    }
+}
+
+pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
     let mut args = vec!["serve".to_string(), "--server-child".to_string()];
 
     // Helper closures to reduce push-pair verbosity.
@@ -448,14 +515,23 @@ fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf])
         a.push(val);
     };
 
-    // Forward the resolved sandbox scope(s) so the bridge can use them as a fallback
-    // for clients that don't send roots/list (e.g. Antigravity) and so the bridge
-    // can pass them on to per-session subprocesses.
-    for scope in resolved_scopes {
+    // Forward ONLY genuinely explicit sandbox scopes (from --sandbox-scope,
+    // --working-dir, or task vault) so the bridge is not locked to a
+    // provisional temp/CWD that the stdio parent derived at startup.
+    // --sandbox and --tmp are forwarded as boolean flags below so the bridge
+    // can derive ~/sandbox and temp access independently for each session.
+    for scope in &config.sandbox_scopes {
         push_val(
             &mut args,
             "--sandbox-scope",
             scope.to_string_lossy().to_string(),
+        );
+    }
+    for wd in &config.working_dirs {
+        push_val(
+            &mut args,
+            "--working-dir",
+            wd.to_string_lossy().to_string(),
         );
     }
 
@@ -513,6 +589,9 @@ fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf])
     }
     if config.defer_sandbox {
         push(&mut args, "--defer-sandbox");
+    }
+    if config.use_sandbox_dir {
+        push(&mut args, "--sandbox");
     }
     if config.tmp_access {
         push(&mut args, "--tmp");
@@ -579,7 +658,6 @@ fn open_capture_file(path: &std::path::Path, banner: &str) -> Option<std::fs::Fi
 
 async fn spawn_background_bridge(
     config: &AppConfig,
-    resolved_scopes: &[PathBuf],
     socket_path_opt: Option<&str>,
     http_url_opt: Option<&str>,
 ) -> Result<()> {
@@ -588,7 +666,7 @@ async fn spawn_background_bridge(
         .to_string_lossy()
         .to_string();
 
-    let server_args = build_background_bridge_args(config, resolved_scopes);
+    let server_args = build_background_bridge_args(config);
 
     let mut cmd = tokio::process::Command::new(&server_command);
     cmd.args(&server_args).env("AHMA_SERVER_CHILD", "1");
@@ -786,10 +864,13 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
 
     if !is_test {
         let resolved_scopes: Vec<PathBuf> = sandbox.scopes().to_vec();
-        spawn_background_bridge(&config, &resolved_scopes, socket_path_opt, http_url_opt).await?;
-        // Proceed with proxy setup
+        let _ = resolved_scopes; // kept for startup log below; not forwarded to bridge
+        spawn_background_bridge(&config, socket_path_opt, http_url_opt).await?;
+        // Proceed with proxy setup — map Ok(bool) → Ok(()) since the caller only
+        // cares about success/failure at this final stage.
         return crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
-            .await;
+            .await
+            .map(|_| ());
     }
 
     use crate::transport_patch::PatchedStdioTransport;
@@ -814,4 +895,131 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     result?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn base_cfg() -> AppConfig {
+        AppConfig {
+            no_sandbox: true,
+            sandbox_scopes: vec![],
+            use_sandbox_dir: false,
+            sandbox_directory: Some(std::path::PathBuf::from("~/sandbox")),
+            tmp_access: false,
+            defer_sandbox: false,
+            working_dirs: vec![],
+            explicit_tools_dir: false,
+            tools_dir: None,
+            tool_bundles: vec![],
+            timeout_secs: 360,
+            force_sync: false,
+            hot_reload_tools: false,
+            skip_availability_probes: false,
+            no_temp_files: false,
+            log_monitor: false,
+            monitor_rate_limit_secs: 60,
+            package_cache_write: true,
+            http_host: "127.0.0.1".to_string(),
+            http_port: 3000,
+            no_quic: false,
+            disable_http1_1: false,
+            handshake_timeout_secs: 45,
+            unix_socket_path: String::new(),
+            list_server: None,
+            mcp_config: std::path::PathBuf::from("mcp.json"),
+            list_http: None,
+            list_format: crate::shell::OutputFormat::Text,
+            run_tool: None,
+            run_tool_args: vec![],
+            observability: ahma_common::observability::ObservabilityConfig::default(),
+            task_vault: None,
+            require_token: None,
+            require_token_path: None,
+            rate_limit_rps: 0,
+            rate_limit_burst: 10,
+            instance_label: "ahma".to_string(),
+            idle_timeout_secs: None,
+            max_sessions: 10,
+            is_server_child: false,
+            minimize_tokens: false,
+            small_model_harness: false,
+            mutex_groups: ahma_common::config::default_mutex_groups(),
+            separate_cargo_target: false,
+        }
+    }
+
+    /// --sandbox is forwarded; empty sandbox_scopes do not produce --sandbox-scope.
+    #[test]
+    fn test_bridge_args_sandbox_flag_no_scope_forwarded() {
+        let tmp = tempdir().unwrap();
+        let cfg = AppConfig {
+            use_sandbox_dir: true,
+            sandbox_directory: Some(tmp.path().to_path_buf()),
+            ..base_cfg()
+        };
+
+        let args = build_background_bridge_args(&cfg);
+        let has_sandbox_scope = args.windows(2).any(|w| w[0] == "--sandbox-scope");
+        assert!(
+            !has_sandbox_scope,
+            "empty sandbox_scopes must not produce --sandbox-scope: {args:?}"
+        );
+        assert!(
+            args.contains(&"--sandbox".to_string()),
+            "--sandbox flag must be forwarded: {args:?}"
+        );
+    }
+
+    /// Explicit --sandbox-scope is forwarded; --sandbox not forwarded when not set.
+    #[test]
+    fn test_bridge_args_explicit_scope_forwarded_no_sandbox_flag() {
+        let tmp = tempdir().unwrap();
+        let scope = tmp.path().to_path_buf();
+        let cfg = AppConfig {
+            sandbox_scopes: vec![scope.clone()],
+            use_sandbox_dir: false,
+            ..base_cfg()
+        };
+
+        let args = build_background_bridge_args(&cfg);
+        let scope_idx = args
+            .iter()
+            .position(|a| a == "--sandbox-scope")
+            .expect("explicit scope must appear as --sandbox-scope");
+        let expected = scope.to_string_lossy().into_owned();
+        assert!(
+            args[scope_idx + 1].contains(expected.as_str()),
+            "scope value must follow --sandbox-scope: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--sandbox".to_string()),
+            "--sandbox must not appear when use_sandbox_dir is false: {args:?}"
+        );
+    }
+
+    /// Both --sandbox and explicit --sandbox-scope coexist when both are set.
+    #[test]
+    fn test_bridge_args_both_sandbox_and_scope() {
+        let tmp = tempdir().unwrap();
+        let scope = tmp.path().to_path_buf();
+        let cfg = AppConfig {
+            sandbox_scopes: vec![scope.clone()],
+            use_sandbox_dir: true,
+            sandbox_directory: Some(tmp.path().to_path_buf()),
+            ..base_cfg()
+        };
+
+        let args = build_background_bridge_args(&cfg);
+        assert!(
+            args.contains(&"--sandbox".to_string()),
+            "--sandbox must be present: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--sandbox-scope"),
+            "--sandbox-scope must be present: {args:?}"
+        );
+    }
 }

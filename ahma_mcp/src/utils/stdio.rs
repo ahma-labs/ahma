@@ -38,38 +38,39 @@ use std::io::{self, ErrorKind, Write};
 /// `Ok(())` on success or broken pipe, `Err(io::Error)` on unexpected
 /// write failures.
 pub fn emit_stdout_notification(json: &str) -> io::Result<()> {
+    // Build the whole framed message up front and issue a SINGLE `write_all`.
+    //
+    // `writeln!(stdout, "\n{}", json)` expands to THREE separate `write_all`
+    // calls ("\n", json, "\n").  On a Windows pipe shared with other writers
+    // (the rmcp transport), three calls can interleave with concurrent writes
+    // and corrupt the line.  One `write_all` of a small message is a single
+    // `WriteFile` and cannot be split by another writer, keeping the
+    // notification on a clean line.  (The peer transport is still the preferred
+    // path — see emit_sandbox_notification_via_peer — but several lifecycle
+    // emits run during shutdown when no peer is available and fall back here.)
+    let framed = format!("\n{}\n", json);
+
+    fn write_framed<W: Write>(mut w: W, framed: &str) -> io::Result<()> {
+        match w.write_all(framed.as_bytes()) {
+            Ok(()) => {
+                let _ = w.flush();
+                Ok(())
+            }
+            Err(e) if is_broken_pipe(&e) => {
+                tracing::debug!("stdout pipe closed (broken pipe) — notification not delivered");
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("Unexpected stdout write error: {}", e);
+                Err(e)
+            }
+        }
+    }
+
     if let Some(saved_stdout) = super::stdio_redirect::get_saved_stdout() {
-        let mut stdout = saved_stdout;
-        match writeln!(stdout, "\n{}", json) {
-            Ok(()) => {
-                let _ = stdout.flush();
-                Ok(())
-            }
-            Err(e) if is_broken_pipe(&e) => {
-                tracing::debug!("stdout pipe closed (broken pipe) — notification not delivered");
-                Ok(())
-            }
-            Err(e) => {
-                tracing::warn!("Unexpected stdout write error: {}", e);
-                Err(e)
-            }
-        }
+        write_framed(saved_stdout, &framed)
     } else {
-        let mut stdout = io::stdout().lock();
-        match writeln!(stdout, "\n{}", json) {
-            Ok(()) => {
-                let _ = stdout.flush();
-                Ok(())
-            }
-            Err(e) if is_broken_pipe(&e) => {
-                tracing::debug!("stdout pipe closed (broken pipe) — notification not delivered");
-                Ok(())
-            }
-            Err(e) => {
-                tracing::warn!("Unexpected stdout write error: {}", e);
-                Err(e)
-            }
-        }
+        write_framed(io::stdout().lock(), &framed)
     }
 }
 

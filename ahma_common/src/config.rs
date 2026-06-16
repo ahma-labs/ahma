@@ -606,6 +606,13 @@ pub struct SandboxSettings {
     /// Default: `"~/sandbox"`
     #[serde(default = "default_sandbox_directory")]
     pub sandbox_directory: Option<PathBuf>,
+    /// Add the `sandbox_directory` (default `~/sandbox`) as a persistent secondary
+    /// scope that survives `roots/list` updates.  Equivalent to the `--sandbox` CLI flag.
+    /// This is the recommended default for most MCP server deployments; it gives the AI
+    /// a well-known scratch space that is always writable regardless of which workspace
+    /// is open.
+    /// Default: `false`
+    pub use_sandbox_directory: bool,
 }
 
 impl Default for SandboxSettings {
@@ -620,6 +627,7 @@ impl Default for SandboxSettings {
             working_dirs: Vec::new(),
             package_cache_write: true,
             sandbox_directory: default_sandbox_directory(),
+            use_sandbox_directory: false,
         }
     }
 }

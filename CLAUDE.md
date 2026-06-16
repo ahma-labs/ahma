@@ -445,7 +445,7 @@ must be satisfied (see R6.3 in SPEC.md for the full acceptance criteria):
 - [ ] Write outside scope is OS-blocked at kernel level — **pending**: requires AppContainer spawn isolation and Windows CI proof (R6.3.3)
 - [x] `tools/call` before sandbox lock returns HTTP 409 / JSON-RPC `-32001` — covered by `handshake_timeout_test`
 - [x] Filesystem root scopes (`C:\`, UNC) are rejected by `canonicalize_scopes` — **done**: `is_filesystem_root()` handles all Win/Unix root forms
-- [x] All sandbox gating integration tests pass on `windows-latest` CI runner — **done**: Windows bypass removed from `sandbox_env.rs`; `red_team_command_write_escape_blocked` enabled on Windows (R6.3.7)
+- [x] All sandbox gating integration tests pass on `windows-latest` CI runner — **done**: Windows bypass removed from `sandbox_env.rs`. Note: `red_team_command_write_escape_blocked` is `#[cfg_attr(windows, ignore)]` — it asserts OS-level write blocking that depends on AppContainer spawn isolation (R6.3.3, still pending), so it cannot pass on Windows yet. Linux (Landlock) and macOS (Seatbelt) run and enforce it. Remove the ignore once R6.3.3 lands and Windows CI proves the out-of-scope write is OS-blocked (R6.3.7).
 
 #### Running against Windows CI locally (cross-check)
 

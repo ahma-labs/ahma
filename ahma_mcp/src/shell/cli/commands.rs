@@ -81,6 +81,11 @@ pub(crate) fn run_settings_command(args: SettingsArgs) -> Result<()> {
                 &s.sandbox.sandbox_directory,
                 &d.sandbox.sandbox_directory
             );
+            show_field!(
+                "use_sandbox_directory",
+                s.sandbox.use_sandbox_directory,
+                d.sandbox.use_sandbox_directory
+            );
             println!();
             println!("[logging]");
             show_field!("target", &s.logging.target, &d.logging.target);

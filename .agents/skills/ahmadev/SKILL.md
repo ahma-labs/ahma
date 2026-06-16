@@ -86,19 +86,12 @@ Only deviate from this rule when the user explicitly specifies a different versi
    cargo xtask bump-version <X.Y.Z>
    ```
    *Note: This command updates `Cargo.toml`, `skills/ahma/SKILL.md`, `scripts/install.sh`, and `scripts/install.ps1` automatically. Running this command first prevents build panics/errors caused by version mismatches between files.*
-4. **Build and Verify the workspace**:
-   Verify the workspace compiles, tests pass, and code is clean in a single pipeline
-   (`nextest run` already compiles the full workspace — do NOT run `cargo build` or
-   `cargo check` separately, as that causes triple-compilation and file-lock contention):
-   ```bash
-   cargo fmt --all --check
-   cargo nextest run
-   cargo clippy --all-targets
-   ```
-5. **Review git diff** to confirm version-bearing files are correctly modified:
+4. **Review git diff** to confirm version-bearing files are correctly modified:
    ```bash
    git diff
    ```
+
+> **Why no quality pipeline?** `/ahmadev bump` intentionally skips `cargo fmt`, `cargo nextest run`, and `cargo clippy` because the xtask command only edits version-bearing strings and ensures they are internally consistent. Running the full test suite here would be a poor cost/benefit trade-off — do that in the natural course of testing your other work.
 
 ### Failure recovery
 

@@ -16,6 +16,14 @@
 //! By centralizing these primitives here, we ensure that both the core server and the
 //! bridges behave consistently regardless of the OS they are running on.
 
+/// Compile-time build identifier embedded by `build.rs`.
+///
+/// Equals the short git hash of the commit that built this binary, or a
+/// `t<epoch>` fallback when git is unavailable.  Used by the stdio→bridge
+/// version check to detect same-semver dev rebuilds (where the semver alone
+/// is insufficient to distinguish a fresh binary from a stale bridge daemon).
+pub const BUILD_ID: &str = env!("AHMA_BUILD_ID");
+
 pub mod config;
 pub mod daemon_hub;
 pub mod event_dispatcher;
