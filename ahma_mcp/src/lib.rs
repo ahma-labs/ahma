@@ -215,4 +215,20 @@ pub use mcp_client::{
     McpClientHandler, McpConnectionManager, McpServerConfig, McpServerKind, ToolInfo,
 };
 pub use mcp_service::AhmaMcpService;
-pub use mcp_service::{ExtensionToolHandler, register_global_extension_handler};
+pub use mcp_service::{
+    ActiveAgentSession, ExtensionToolHandler, PromptRunner, get_global_prompt_runner,
+    register_global_extension_handler, register_global_prompt_runner,
+};
+
+static ACTIVE_SERVICE: std::sync::OnceLock<std::sync::Arc<AhmaMcpService>> =
+    std::sync::OnceLock::new();
+
+/// Register the active MCP service instance.
+pub fn register_active_service(service: std::sync::Arc<AhmaMcpService>) {
+    let _ = ACTIVE_SERVICE.set(service);
+}
+
+/// Retrieve the active MCP service instance.
+pub fn get_active_service() -> Option<std::sync::Arc<AhmaMcpService>> {
+    ACTIVE_SERVICE.get().cloned()
+}

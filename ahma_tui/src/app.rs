@@ -622,6 +622,22 @@ fn handle_approval_action(
 }
 
 #[cfg(feature = "tui")]
+fn send_daemon_msg(msg: ahma_common::daemon_hub::ClientMsg) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            if let Ok(mut stream) = ahma_common::daemon_hub::connect_to_daemon().await {
+                let _ = ahma_common::daemon_hub::send_msg(&mut stream, &msg).await;
+            }
+        });
+    } else {
+        tracing::debug!(
+            "send_daemon_msg: no active tokio runtime, skipping message: {:?}",
+            msg
+        );
+    }
+}
+
+#[cfg(feature = "tui")]
 fn resolve_approval(state: &mut crate::state::AppState, approved: bool) {
     use crate::state::{LogEntry, LogLevel};
 
@@ -632,6 +648,11 @@ fn resolve_approval(state: &mut crate::state::AppState, approved: bool) {
     if let Some(tx) = state.approval_tx.take() {
         let _ = tx.send(approved);
     }
+
+    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitApproval {
+        approved,
+        target_instance_id: None,
+    });
 
     let (level, verb) = if approved {
         (LogLevel::Info, "Approved")
@@ -970,9 +991,7 @@ fn maybe_run_cli_command(text: &str, state: &mut crate::state::AppState) -> bool
 
 #[cfg(feature = "tui")]
 fn submit_chat_input(state: &mut crate::state::AppState) {
-    use crate::llm_bridge::{spawn_agent_task, spawn_chat_task};
     use crate::state::ChatEntry;
-    use ahma_llm_monitor::client::LlmClient;
 
     let text = state.chat_input_text().trim().to_string();
     if text.is_empty() {
@@ -1015,30 +1034,32 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     });
     state.chat_scroll = 0;
 
-    let Some(tx) = &state.bridge_tx else {
-        return;
-    };
+    let messages = collect_chat_history(state)
+        .into_iter()
+        .map(|msg| {
+            let role = match msg.role {
+                ahma_llm_monitor::ChatRole::System => "system",
+                ahma_llm_monitor::ChatRole::User => "user",
+                ahma_llm_monitor::ChatRole::Assistant => "assistant",
+                ahma_llm_monitor::ChatRole::Tool => "tool",
+            }
+            .to_string();
+            ahma_common::daemon_hub::DaemonChatMessage {
+                role,
+                content: msg.content,
+            }
+        })
+        .collect();
 
-    let client = LlmClient::new(base_url, model, None);
-    let system = Some(build_system_prompt(state));
-    if state.mcp_enabled {
-        spawn_agent_task(
-            client,
-            collect_chat_history(state),
-            system,
-            optional_mcp_chat_config(state),
-            state.tools_list.clone(),
-            tx.clone(),
-        );
-    } else {
-        spawn_chat_task(
-            client,
-            collect_chat_history(state),
-            system,
-            optional_mcp_chat_config(state),
-            tx.clone(),
-        );
-    }
+    let system_prompt = Some(build_system_prompt(state));
+
+    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitPrompt {
+        messages,
+        system_prompt,
+        provider: Some(base_url),
+        model: Some(model),
+        target_instance_id: None,
+    });
 }
 
 #[cfg(feature = "tui")]
@@ -1179,13 +1200,6 @@ fn collect_chat_history(state: &crate::state::AppState) -> Vec<ahma_llm_monitor:
             _ => None,
         })
         .collect()
-}
-
-#[cfg(feature = "tui")]
-fn optional_mcp_chat_config(
-    state: &crate::state::AppState,
-) -> Option<crate::llm_bridge::McpChatConfig> {
-    (state.mcp_enabled && !state.mcp_http_base_url.is_empty()).then(|| mcp_chat_config(state))
 }
 
 /// Look up a single field from the active agent profile.
@@ -2956,6 +2970,36 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         SourceEvent::InstancesUpdated { instances } => {
             handle_instances_updated(instances, state);
         }
+        SourceEvent::ChatToken { token } => {
+            state.chat.append_token(&token);
+        }
+        SourceEvent::ApprovalRequested { id, tool, args } => {
+            let diff = if tool.contains("replace") || tool == "write_file" {
+                serde_json::from_str::<serde_json::Value>(&args)
+                    .ok()
+                    .and_then(|val| serde_json::to_string_pretty(&val).ok())
+            } else {
+                None
+            };
+            state.approval = Some(crate::state::ApprovalGate {
+                op_id: id,
+                description: format!("Execute tool {tool}"),
+                deadline: None,
+                diff,
+            });
+            state.approval_tx = None;
+        }
+        SourceEvent::AgentDone => {
+            state.chat.finish_stream();
+            state.chat.finish_user_timing();
+        }
+        SourceEvent::AgentError { error } => {
+            state.chat.finish_stream();
+            state.chat.push(crate::state::ChatEntry::Assistant {
+                content: format!("Error: {error}"),
+                streaming: false,
+            });
+        }
     }
 }
 
@@ -3236,45 +3280,45 @@ fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
     });
     state.chat_scroll = 0;
 
-    let Some(tx) = &state.bridge_tx else {
-        return;
-    };
-
     let (base_url, model) = parse_llm_selection(state);
     if base_url.is_empty() {
         push_assistant_message(state, "No LLM configured. Use /provider to select one.");
         return;
     }
 
-    use ahma_llm_monitor::client::LlmClient;
-    let client = LlmClient::new(base_url, model, None);
-    let system = state.mcp_enabled.then(|| {
-        "Use ahma tools when they would materially improve the answer. Prefer direct answers when no tool is needed.".to_string()
-    });
-
     let mut history = collect_chat_history(state);
     if let Some(last_msg) = history.last_mut() {
         last_msg.content = prompt;
     }
 
-    if state.mcp_enabled {
-        crate::llm_bridge::spawn_agent_task(
-            client,
-            history,
-            system,
-            optional_mcp_chat_config(state),
-            state.tools_list.clone(),
-            tx.clone(),
-        );
-    } else {
-        crate::llm_bridge::spawn_chat_task(
-            client,
-            history,
-            system,
-            optional_mcp_chat_config(state),
-            tx.clone(),
-        );
-    }
+    let messages = history
+        .into_iter()
+        .map(|msg| {
+            let role = match msg.role {
+                ahma_llm_monitor::ChatRole::System => "system",
+                ahma_llm_monitor::ChatRole::User => "user",
+                ahma_llm_monitor::ChatRole::Assistant => "assistant",
+                ahma_llm_monitor::ChatRole::Tool => "tool",
+            }
+            .to_string();
+            ahma_common::daemon_hub::DaemonChatMessage {
+                role,
+                content: msg.content,
+            }
+        })
+        .collect();
+
+    let system_prompt = state.mcp_enabled.then(|| {
+        "Use ahma tools when they would materially improve the answer. Prefer direct answers when no tool is needed.".to_string()
+    });
+
+    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitPrompt {
+        messages,
+        system_prompt,
+        provider: Some(base_url),
+        model: Some(model),
+        target_instance_id: None,
+    });
 }
 
 #[cfg(feature = "tui")]

@@ -47,8 +47,9 @@ mod types;
 mod utils;
 
 pub use types::{
-    ExtensionToolHandler, GuidanceConfig, LegacyGuidanceConfig, META_PARAMS, SequenceKind,
-    register_global_extension_handler,
+    ActiveAgentSession, ExtensionToolHandler, GuidanceConfig, LegacyGuidanceConfig, META_PARAMS,
+    PromptRunner, SequenceKind, get_global_prompt_runner, register_global_extension_handler,
+    register_global_prompt_runner,
 };
 
 use chrono::Utc;
@@ -138,6 +139,128 @@ pub struct AhmaMcpService {
 }
 
 impl AhmaMcpService {
+    /// Retrieve a list of all locally and externally registered tools in ToolInfo format.
+    pub async fn get_all_available_tools(&self) -> Vec<crate::mcp_client::ToolInfo> {
+        let mut tools = vec![
+            crate::mcp_client::ToolInfo {
+                name: "await".to_string(),
+                description: Some("Block until a started operation completes and return its final result. Operations notify automatically when they finish, so prefer doing other useful work first; reach for `await` only when the next step truly depends on the result.".to_string()),
+                input_schema: serde_json::Value::Object(self.generate_input_schema_for_wait().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "status".to_string(),
+                description: Some("Return a snapshot of active and completed operations without blocking. Completion is pushed via notifications, so this is for ad-hoc inspection rather than polling.".to_string()),
+                input_schema: serde_json::Value::Object(self.generate_input_schema_for_status().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "run_terminal_command".to_string(),
+                description: Some("Run a shell command inside a kernel-level filesystem sandbox (Landlock on Linux, Seatbelt on macOS, Job Objects on Windows). Returns an operation_id immediately; use `status`, `await`, or `cancel` to manage long-running work. Supports pipes, redirects, environment variables, and full shell syntax. Set `monitor_level` to stream error/warning alerts from stdout or stderr.".to_string()),
+                input_schema: serde_json::Value::Object(self.generate_input_schema_for_run_terminal_command().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "logs_list".to_string(),
+                description: Some("List all log files in the project log directory (`./logs/`). Returns file names, sizes, modification times, and symlink targets. Use this to discover which log files are available before calling logs_read or logs_search.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::log_tools::logs_list_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "logs_approve".to_string(),
+                description: Some("Approve a blocked out-of-scope log symlink target to allow AI read access.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::log_tools::logs_approve_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "logs_read".to_string(),
+                description: Some("Read lines from a project log file with optional pagination. Sensitive values (tokens, passwords, API keys) are redacted by default. Use `raw: true` only when debugging credential issues.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::log_tools::logs_read_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "logs_search".to_string(),
+                description: Some("Search a project log file for lines matching a pattern (case-insensitive substring match by default). Returns matching lines with line numbers. Sensitive values are redacted by default.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::log_tools::logs_search_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "restart".to_string(),
+                description: Some("Force stop and restart the background bridge server, disconnecting all active sessions (including TUI and other IDEs) to apply updates or recover from a bad state.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::restart_tool::restart_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "read_file".to_string(),
+                description: Some("Read UTF-8 text from a scoped file, with optional line slicing.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::harness_tools::read_file_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "list_dir".to_string(),
+                description: Some("List entries in a scoped directory with basic metadata.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::harness_tools::list_dir_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "file_search".to_string(),
+                description: Some("Find files by glob pattern inside the sandbox scope.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::harness_tools::file_search_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "grep_search".to_string(),
+                description: Some("Search file contents by plain text or regex.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::harness_tools::grep_search_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "fetch_webpage".to_string(),
+                description: Some("Fetch and extract readable text from an HTTP/HTTPS webpage.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::harness_tools::fetch_webpage_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "write_file".to_string(),
+                description: Some("Write UTF-8 content to a scoped file (create or overwrite).".to_string()),
+                input_schema: serde_json::Value::Object(handlers::harness_tools::write_file_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "replace_in_file".to_string(),
+                description: Some("Replace exact string occurrences in a scoped UTF-8 file.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::harness_tools::replace_in_file_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "log_monitor".to_string(),
+                description: Some("Start a real-time log monitoring session on a file inside the sandbox. Reads new lines as they are written, runs them through the AI for issue detection, and sends alerts.".to_string()),
+                input_schema: serde_json::Value::Object(
+                    schema::object_input_schema(
+                        {
+                            let mut props = serde_json::Map::new();
+                            props.insert("file_path".to_string(), schema::string_property("Path of the log file to monitor (within sandbox scope)"));
+                            props.insert("detection_prompt".to_string(), schema::string_property("Optional prompt guiding AI issue detection"));
+                            props.insert("llm_base_url".to_string(), schema::string_property("Optional custom LLM base URL"));
+                            props.insert("llm_model".to_string(), schema::string_property("Optional custom LLM model"));
+                            props.insert("llm_api_key".to_string(), schema::string_property("Optional custom LLM API key"));
+                            props
+                        },
+                        &["file_path"],
+                    ).as_ref().clone()
+                ),
+            },
+        ];
+
+        {
+            let configs_lock = self.configs.read().unwrap();
+            for config in configs_lock.values() {
+                if !self.is_config_visible_to_client(config) {
+                    continue;
+                }
+                for t in self.create_tools_from_config(config) {
+                    tools.push(crate::mcp_client::ToolInfo {
+                        name: t.name.to_string(),
+                        description: t.description.map(|d| d.to_string()),
+                        input_schema: serde_json::Value::Object(t.input_schema.as_ref().clone()),
+                    });
+                }
+            }
+        }
+
+        let external_mgr = self.mcp_connections.read().await;
+        for ext_tool in external_mgr.aggregate_tools() {
+            tools.push(ext_tool.clone());
+        }
+
+        tools
+    }
+
     fn task_vault_root(&self) -> Option<PathBuf> {
         let cfg_root = self
             .app_config
@@ -1733,13 +1856,13 @@ impl AhmaMcpService {
                 match mgr.call_tool(&params.name, args_val).await {
                     Ok((output, is_error)) => {
                         if is_error {
-                            return Ok(CallToolResult::error(vec![
-                                rmcp::model::Content::text(output),
-                            ]));
+                            return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
+                                output,
+                            )]));
                         } else {
-                            return Ok(CallToolResult::success(vec![
-                                rmcp::model::Content::text(output),
-                            ]));
+                            return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                                output,
+                            )]));
                         }
                     }
                     Err(e) => {

@@ -109,6 +109,30 @@ pub fn spawn_embedded_hub_source(
                                 return; // TUI channel closed
                             }
                         }
+                        Applied::ChatToken(token) => {
+                            if tx.send(SourceEvent::ChatToken { token }).await.is_err() {
+                                return;
+                            }
+                        }
+                        Applied::ApprovalRequested { id, tool, args } => {
+                            if tx
+                                .send(SourceEvent::ApprovalRequested { id, tool, args })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Applied::AgentDone => {
+                            if tx.send(SourceEvent::AgentDone).await.is_err() {
+                                return;
+                            }
+                        }
+                        Applied::AgentError(error) => {
+                            if tx.send(SourceEvent::AgentError { error }).await.is_err() {
+                                return;
+                            }
+                        }
                         Applied::None => {}
                     }
                 }
@@ -348,6 +372,30 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
                                 return;
                             }
                         }
+                        Applied::ChatToken(token) => {
+                            if tx.send(SourceEvent::ChatToken { token }).await.is_err() {
+                                return;
+                            }
+                        }
+                        Applied::ApprovalRequested { id, tool, args } => {
+                            if tx
+                                .send(SourceEvent::ApprovalRequested { id, tool, args })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Applied::AgentDone => {
+                            if tx.send(SourceEvent::AgentDone).await.is_err() {
+                                return;
+                            }
+                        }
+                        Applied::AgentError(error) => {
+                            if tx.send(SourceEvent::AgentError { error }).await.is_err() {
+                                return;
+                            }
+                        }
                         Applied::None => {}
                     }
                 }
@@ -379,6 +427,14 @@ enum Applied {
         line: String,
         is_stderr: bool,
     },
+    ChatToken(String),
+    ApprovalRequested {
+        id: String,
+        tool: String,
+        args: String,
+    },
+    AgentDone,
+    AgentError(String),
 }
 
 impl Applied {
@@ -446,8 +502,14 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
             DaemonEvent::LogLine { .. } => Applied::None, // not yet surfaced in TUI
         },
         DaemonMsg::Ping { .. } => Applied::None, // hub-to-instance ping; no state change for subscribers
-        DaemonMsg::ChatToken { .. } => Applied::None,
-        DaemonMsg::ApprovalRequested { .. } => Applied::None,
+        DaemonMsg::ChatToken { token } => Applied::ChatToken(token),
+        DaemonMsg::ApprovalRequested { id, tool, args } => {
+            Applied::ApprovalRequested { id, tool, args }
+        }
+        DaemonMsg::AgentDone => Applied::AgentDone,
+        DaemonMsg::AgentError { error } => Applied::AgentError(error),
+        DaemonMsg::RunPrompt { .. } => Applied::None,
+        DaemonMsg::SubmitApproval { .. } => Applied::None,
     }
 }
 

@@ -31,6 +31,7 @@ full = ["cluster", "vault", "simplify"]
 
 [dependencies]
 ahma_mcp = { path = "../ahma_mcp" }
+ahma_core = { path = "../ahma_core" }
 ahma_vault = { path = "../ahma_vault", optional = true }
 ahma_task_tree = { path = "../ahma_task_tree" }
 ahma_cluster = { path = "../ahma_cluster", optional = true }
