@@ -208,6 +208,21 @@ curl -X GET http://localhost:3000/mcp \
 
 In HTTP mode, each MCP session gets its own sandbox scope derived from the `roots/list` response. See [docs/session-isolation.md](session-isolation.md) for details.
 
+### Cursor shared-process and empty roots
+
+Cursor runs all `stdio` MCP servers in a **shared process** context when the IDE window has no workspace folder open (e.g. after a fresh install or when opening a single file rather than a folder). In this case, Cursor's MCP client responds to `roots/list` with an empty array `{"roots":[]}`.
+
+Ahma treats an empty `roots/list` response as "client has no workspace roots yet" and keeps the sandbox in a deferred state. Any `tools/call` request before a real workspace root is provided returns HTTP 409 / JSON-RPC error `-32001` ("Sandbox initializing...") instead of silently scoping every command to an empty or wrong directory.
+
+**Resolutions (pick one):**
+
+1. **Open a workspace folder** — in Cursor: `File → Open Folder...` — so that Cursor advertises the folder as a workspace root in its next `roots/list` response.
+2. **Configure an explicit scope** — pass `--sandbox-scope /path/to/your/project` in your `mcp.json` `args` list:
+   ```json
+   "args": ["serve", "stdio", "--sandbox", "--log-monitor", "--sandbox-scope", "/path/to/project"]
+   ```
+3. **Use `--sandbox`** — starts ahma with a fixed `~/sandbox` scope that never changes, suitable for clients that never provide roots.
+
 ## 3. Unix Socket Mode
 
 Serves MCP Streamable HTTP over a Unix domain socket instead of TCP. Lower latency than HTTP mode, no port conflicts, and access-controlled by filesystem permissions.

@@ -420,7 +420,17 @@ impl AhmaMcpService {
                 self.adapter.sandbox().scopes()
             );
         } else {
-            tracing::warn!("No scopes available from roots or pre-configuration");
+            // Client returned an empty roots list and there are no pre-configured scopes.
+            // Do NOT emit notifications/sandbox/configured here: emitting it would mark the
+            // sandbox as "ready" with zero scope, which causes every tool call to fail with a
+            // misleading "path outside sandbox" error instead of the observable HTTP 409
+            // (-32001) that tells the user to open a workspace folder or pass --sandbox-scope.
+            tracing::warn!(
+                "roots/list response has no valid file:// roots and no pre-configured scopes \
+                 are available. Sandbox configuration deferred. \
+                 Fix: open a workspace folder so the client can provide workspace roots, \
+                 or pass --sandbox-scope <path> / --sandbox to ahma."
+            );
             return;
         }
 

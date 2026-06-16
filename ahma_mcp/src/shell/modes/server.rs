@@ -383,59 +383,126 @@ async fn handle_version_checks(
     http_url_opt: Option<&str>,
 ) -> Result<Option<()>> {
     let client_version = env!("CARGO_PKG_VERSION");
+    let client_build_id = ahma_common::BUILD_ID;
     let bridge_version_opt = if is_test {
         None
     } else {
         get_bridge_version(socket_path_opt, http_url_opt).await
     };
 
-    let Some(bridge_version) = bridge_version_opt else {
+    let Some(bridge_version_raw) = bridge_version_opt else {
         return Ok(None);
     };
 
+    // Version strings from the health endpoint may carry a build-id suffix:
+    // "0.12.5+abc1234".  Split them out for independent semver and build-id checks.
+    let (bridge_semver, bridge_build_id) = split_version_and_build_id(&bridge_version_raw);
+    let client_semver = client_version;
+
     tracing::info!(
         client_version = client_version,
-        bridge_version = %bridge_version,
-        "Bridge version check: client={client_version} bridge={bridge_version}"
+        client_build_id = client_build_id,
+        bridge_version = %bridge_version_raw,
+        "Bridge version check: client={client_version}+{client_build_id} bridge={bridge_version_raw}"
     );
 
-    if bridge_version == client_version {
+    let same_semver = bridge_semver == client_semver;
+    // When the bridge exposes a build-id, check it too.  Differing build-ids on the
+    // same semver mean a dev rebuild happened without bumping the version — treat the
+    // running bridge as stale.
+    let same_build = bridge_build_id.is_none_or(|bid| bid == client_build_id);
+
+    if same_semver && same_build {
         tracing::info!(
-            "Local bridge server is already running (v{bridge_version}). Forwarding stdio as a proxy client."
+            "Local bridge server is already running (v{bridge_version_raw}). Forwarding stdio as a proxy client."
         );
-        crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt).await?;
-        return Ok(Some(()));
+        let proxy_result =
+            crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
+                .await;
+        return match proxy_result {
+            Ok(true) => {
+                // Bridge responded normally — this was a real MCP session that ended cleanly.
+                Ok(Some(()))
+            }
+            result => {
+                // Proxy failed (Err) OR the bridge closed the connection before sending any
+                // response (Ok(false)).  Both indicate a stale / incompatible bridge daemon
+                // that happens to report the same version string.
+                if let Err(ref e) = result {
+                    tracing::warn!(
+                        bridge_version = %bridge_version_raw,
+                        error = %e,
+                        "Proxy to same-version bridge failed; bridge may be stale"
+                    );
+                } else {
+                    tracing::warn!(
+                        bridge_version = %bridge_version_raw,
+                        "Proxy to same-version bridge exited without forwarding any bridge \
+                         response; bridge may be stale (same semver, incompatible binary)"
+                    );
+                }
+                if std::env::var("AHMA_RESTARTED").is_err() {
+                    tracing::info!(
+                        "Triggering bridge restart and falling back to fresh bridge spawn..."
+                    );
+                    restart_bridge_server(socket_path_opt, http_url_opt).await;
+                    // Return Ok(None) so run_server_mode proceeds to spawn a fresh bridge
+                    // and connect to it.
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Proxy to same-version bridge (v{bridge_version_raw}) failed after \
+                         restart attempt. Please restart ahma manually: \
+                         `pkill -f 'ahma serve'` then restart your IDE."
+                    ))
+                }
+            }
+        };
     }
 
-    let c_ver = parse_version(client_version);
-    let b_ver = parse_version(&bridge_version);
+    let c_ver = parse_version(client_semver);
+    let b_ver = parse_version(bridge_semver);
     let client_is_newer = match (c_ver, b_ver) {
         (Some(c), Some(b)) => c > b,
         _ => true,
     };
 
+    // Same semver but different build-id: the bridge is a dev-rebuild peer on the same
+    // version; treat it as stale (client binary is "newer" in intent).
+    let client_is_newer = client_is_newer || (same_semver && !same_build);
+
     if client_is_newer {
         tracing::info!(
             client_version = client_version,
-            bridge_version = %bridge_version,
-            "Client is newer than bridge; requesting bridge restart"
+            bridge_version = %bridge_version_raw,
+            "Client is newer than bridge (or same version with different build); requesting bridge restart"
         );
         restart_bridge_server(socket_path_opt, http_url_opt).await;
     } else if std::env::var("AHMA_RESTARTED").is_ok() {
         return Err(anyhow::anyhow!(
             "Version mismatch: Client version (v{}) is older than running bridge version (v{}). Please update the client binary.",
             client_version,
-            bridge_version
+            bridge_version_raw
         ));
     } else {
         tracing::info!(
             "Client version (v{}) is older than running bridge version (v{}). Attempting self-restart (re-exec)...",
             client_version,
-            bridge_version
+            bridge_version_raw
         );
         re_exec_current_process()?;
     }
     Ok(None)
+}
+
+/// Split a version string of the form `"semver+build_id"` into `(semver, Option<build_id>)`.
+/// If there is no `+` separator, the build_id portion is `None`.
+pub(crate) fn split_version_and_build_id(v: &str) -> (&str, Option<&str>) {
+    if let Some(idx) = v.find('+') {
+        (&v[..idx], Some(&v[idx + 1..]))
+    } else {
+        (v, None)
+    }
 }
 
 pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
@@ -799,9 +866,11 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         let resolved_scopes: Vec<PathBuf> = sandbox.scopes().to_vec();
         let _ = resolved_scopes; // kept for startup log below; not forwarded to bridge
         spawn_background_bridge(&config, socket_path_opt, http_url_opt).await?;
-        // Proceed with proxy setup
+        // Proceed with proxy setup — map Ok(bool) → Ok(()) since the caller only
+        // cares about success/failure at this final stage.
         return crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
-            .await;
+            .await
+            .map(|_| ());
     }
 
     use crate::transport_patch::PatchedStdioTransport;
