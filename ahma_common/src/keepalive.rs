@@ -173,7 +173,18 @@ mod tests {
         assert!(ts1 > 0);
     }
 
-    #[tokio::test]
+    // Use start_paused=true + advance() instead of real sleep for deterministic
+    // timing on all platforms (Windows timer resolution is ~15ms, which makes
+    // small real sleeps unreliable in CI).
+    //
+    // Pattern: yield_now() once after spawn so the task creates its first
+    // sleep(), THEN advance() past it — otherwise the sleep is registered
+    // after the clock already moved and won't fire until the next interval.
+    //
+    // Note: current_timestamp_ms() uses SystemTime::now() (real wall-clock),
+    // unaffected by tokio time pause — so rate-limit arithmetic still works.
+
+    #[tokio::test(start_paused = true)]
     async fn test_enhanced_heartbeat_sent() {
         let pings_sent = Arc::new(AtomicU64::new(0));
         let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
@@ -199,7 +210,11 @@ mod tests {
             "abc".to_string(),
         );
 
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Let the spawned task run its first poll so it registers its sleep(),
+        // then advance past the first tick interval.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(11)).await;
+        tokio::task::yield_now().await;
 
         let heartbeats = heartbeats_sent.lock().unwrap();
         assert!(
@@ -212,7 +227,7 @@ mod tests {
         assert_eq!(pings_sent.load(Ordering::Relaxed), 0);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_standard_ping_sent() {
         let pings_sent = Arc::new(AtomicU64::new(0));
         let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
@@ -238,7 +253,10 @@ mod tests {
             "abc".to_string(),
         );
 
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Let the spawned task register its sleep(), then advance past first tick.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(11)).await;
+        tokio::task::yield_now().await;
 
         assert!(
             pings_sent.load(Ordering::Relaxed) > 0,
@@ -250,7 +268,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_passive_monitoring() {
         let pings_sent = Arc::new(AtomicU64::new(0));
         let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
@@ -276,7 +294,10 @@ mod tests {
             "abc".to_string(),
         );
 
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Let the spawned task register its sleep(), then advance past first tick.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(11)).await;
+        tokio::task::yield_now().await;
 
         assert_eq!(
             pings_sent.load(Ordering::Relaxed),
@@ -289,7 +310,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_timeout_termination() {
         let pings_sent = Arc::new(AtomicU64::new(0));
         let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
@@ -317,14 +338,19 @@ mod tests {
             "abc".to_string(),
         );
 
-        let rx_timeout = tokio::time::timeout(Duration::from_millis(50), timeout_rx.recv()).await;
+        // Let the spawned task register its sleep(), then advance past first tick.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(6)).await;
+        tokio::task::yield_now().await;
+
+        let r = timeout_rx.try_recv();
         assert!(
-            rx_timeout.is_ok(),
+            r.is_ok(),
             "on_timeout should be called and terminate the task"
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_send_error_termination() {
         let pings_sent = Arc::new(AtomicU64::new(0));
         let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
@@ -350,16 +376,20 @@ mod tests {
             "abc".to_string(),
         );
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Let the spawned task register its sleep(), then advance past first tick.
+        tokio::task::yield_now().await;
+        // tickle_interval = 15ms / 3 = 5ms; advance past first tick — send fails, task breaks
+        tokio::time::advance(Duration::from_millis(6)).await;
+        tokio::task::yield_now().await;
 
-        let rx_timeout = tokio::time::timeout(Duration::from_millis(20), timeout_rx.recv()).await;
+        let r = timeout_rx.try_recv();
         assert!(
-            rx_timeout.is_err(),
+            r.is_err(),
             "on_timeout should not be called because task terminated early on send error"
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_rate_limiting() {
         let pings_sent = Arc::new(AtomicU64::new(0));
         let heartbeats_sent = Arc::new(Mutex::new(Vec::new()));
@@ -386,8 +416,14 @@ mod tests {
             "abc".to_string(),
         );
 
+        // Set last_sent 10 seconds into the future (real time) so rate limit suppresses send
         last_sent_signal.store(current_timestamp_ms() + 10000, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // Let the spawned task register its sleep(), then advance past first tick.
+        tokio::task::yield_now().await;
+        // tickle_interval = 60ms / 3 = 20ms; advance past first tick
+        tokio::time::advance(Duration::from_millis(21)).await;
+        tokio::task::yield_now().await;
 
         let heartbeats = heartbeats_sent.lock().unwrap();
         assert!(

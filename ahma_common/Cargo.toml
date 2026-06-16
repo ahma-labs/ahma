@@ -39,4 +39,4 @@ required-features = ["coverage"]
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros", "test-util"] }
