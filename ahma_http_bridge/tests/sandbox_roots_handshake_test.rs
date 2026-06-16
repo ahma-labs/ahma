@@ -40,7 +40,12 @@ use tempfile::TempDir;
 use tokio::time::sleep;
 
 fn roots_handshake_timeout() -> Duration {
-    TestTimeouts::get(TimeoutCategory::SseStream)
+    // SandboxReady (60s base ⇒ 240s on Windows ×4), NOT SseStream (120s base ⇒
+    // 480s): this bounds an in-test handshake/readiness loop and must fire before
+    // the 360s nextest backstop, else a slow Windows subprocess presents as an
+    // opaque TIMEOUT[360s] instead of a clean failure.  See
+    // ahma_common::timeouts::NEXTEST_CI_HARD_KILL_SECS.
+    TestTimeouts::get(TimeoutCategory::SandboxReady)
 }
 
 fn server_base_url(server: &ServerGuard) -> String {

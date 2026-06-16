@@ -149,7 +149,12 @@ impl McpTestClient {
     }
 
     fn roots_handshake_timeout() -> Duration {
-        TestTimeouts::get(TimeoutCategory::SseStream)
+        // SandboxReady (60s base ⇒ 240s on Windows ×4), NOT SseStream (120s base
+        // ⇒ 480s) — this is an in-test loop deadline waiting for the roots
+        // exchange + notifications/sandbox/configured, and 480s would exceed the
+        // 360s nextest backstop, force-killing the test as an opaque hang instead
+        // of failing cleanly.  See ahma_common::timeouts::NEXTEST_CI_HARD_KILL_SECS.
+        TestTimeouts::get(TimeoutCategory::SandboxReady)
     }
 
     fn first_sse_event_boundary(buffer: &str) -> Option<(usize, usize)> {

@@ -180,7 +180,11 @@ jobs:
           echo "--- cargo --version" && cargo --version
           echo "--- cargo nextest --version" && cargo nextest --version
           echo "--- Running cargo nextest run --profile ci"
-          cargo nextest run --profile ci --locked --no-default-features -E 'not (test(kotlin) or test(android))'
+          # --no-fail-fast: surface EVERY failing test in a single run instead of
+          # cancelling at the first failure.  Without it, a platform with several
+          # independent failures (notably Windows) only reveals one per CI round,
+          # turning stabilization into a slow whack-a-mole across many pushes.
+          cargo nextest run --profile ci --locked --no-default-features --no-fail-fast -E 'not (test(kotlin) or test(android))'
 
       - name: Cargo Nextest (incubating crates, non-default feature gates)
         if: matrix.test_mode == 'full'
