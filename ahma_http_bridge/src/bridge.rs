@@ -646,6 +646,7 @@ async fn await_shutdown_signal() {
 
 fn spawn_idle_timeout_checker(timeout: u64, state: Arc<BridgeState>) {
     let session_manager = state.session_manager.clone();
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let listener_kind = state.listener_kind.clone();
     let counter = session_manager
         .active_sessions
@@ -1206,6 +1207,7 @@ async fn health_check() -> impl IntoResponse {
 /// Handler for POST /restart
 async fn handle_restart(State(state): State<Arc<BridgeState>>) -> impl IntoResponse {
     info!("Restart requested. Shutting down bridge process...");
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let listener_kind = state.listener_kind.clone();
     let session_manager = state.session_manager.clone();
     tokio::spawn(async move {

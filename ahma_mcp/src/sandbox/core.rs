@@ -143,13 +143,18 @@ fn is_in_temp_dir(path: &Path) -> bool {
 }
 
 fn canonicalize_with_fallback(full_path: &Path) -> PathBuf {
+    // Only use the parent-canonicalize shortcut when the last component is a
+    // real name (not `..`).  If `file_name()` returns `None` the path ends in
+    // a `ParentDir` component; on Windows `dunce::canonicalize` can resolve the
+    // parent (which has one fewer `..`) to a path *inside* the sandbox scope
+    // even though the full path with one more `..` would escape it.  Falling
+    // through to `normalize_path_lexically` handles `..` components correctly
+    // on every platform without filesystem access.
     if let Some(parent) = full_path.parent()
         && let Ok(parent_canonical) = dunce::canonicalize(parent)
+        && let Some(name) = full_path.file_name()
     {
-        return full_path
-            .file_name()
-            .map(|name| parent_canonical.join(name))
-            .unwrap_or(parent_canonical);
+        return parent_canonical.join(name);
     }
     scopes::normalize_path_lexically(full_path)
 }

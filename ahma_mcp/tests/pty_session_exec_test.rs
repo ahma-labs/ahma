@@ -39,6 +39,7 @@ fn stdout_of(op: &Operation) -> String {
         .to_string()
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn exit_code_of(op: &Operation) -> i64 {
     op.result
         .as_ref()

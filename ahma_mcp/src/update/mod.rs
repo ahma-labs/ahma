@@ -322,7 +322,7 @@ async fn maybe_run_setup_wizard(args: &UpdateArgs, binary_path: &Path) -> Result
         "Optional: run the setup wizard to configure MCP servers, terminal hooks, TLS, and agent skills."
     );
 
-    if !prompt_yes_no("Run the setup wizard now? [y/N]: ").await? {
+    if !prompt_yes_no("Run the setup wizard now? [Y/n]: ", true).await? {
         println!("Tip: run `ahma setup` later to configure your environment.");
         return Ok(());
     }
@@ -339,7 +339,7 @@ fn can_prompt_for_setup() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 
-async fn prompt_yes_no(prompt: &str) -> Result<bool> {
+async fn prompt_yes_no(prompt: &str, default: bool) -> Result<bool> {
     let prompt = prompt.to_string();
     tokio::task::spawn_blocking(move || {
         print!("{prompt}");
@@ -350,7 +350,11 @@ async fn prompt_yes_no(prompt: &str) -> Result<bool> {
             .read_line(&mut input)
             .context("Failed to read prompt response")?;
 
-        Ok(matches!(input.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(default);
+        }
+        Ok(matches!(trimmed, "y" | "Y" | "yes" | "Yes" | "YES"))
     })
     .await
     .context("Setup prompt task failed")?
