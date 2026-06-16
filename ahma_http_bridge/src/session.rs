@@ -193,6 +193,8 @@ pub struct Session {
     pub session_manager: Mutex<Option<std::sync::Weak<SessionManager>>>,
     /// Map of pending routed request IDs to response channels
     pub routed_requests: Arc<DashMap<String, oneshot::Sender<Value>>>,
+    /// Map of pending server-to-client request IDs to their method name (e.g. roots/list)
+    pub pending_client_requests: Arc<DashMap<String, String>>,
     /// Semaphore limiting concurrent routed sampling requests to the client (default: 3).
     /// A bounded semaphore replaces the old 1-at-a-time Mutex so that up to N sampling
     /// requests can be in-flight simultaneously, preventing head-of-line blocking when
@@ -735,6 +737,13 @@ fn dispatch_subprocess_line(session: &Arc<Session>, line: &str, colored_output: 
             let _ = sender.send(value);
             return;
         }
+
+        // Store server-to-client request method name to validate response routing
+        if let Some(method) = value.get("method").and_then(|m| m.as_str()) {
+            session
+                .pending_client_requests
+                .insert(id_str, method.to_string());
+        }
     }
 
     // Drive sandbox state machine for lifecycle notifications
@@ -905,6 +914,7 @@ impl SessionManager {
             capabilities: Mutex::new(None),
             session_manager: Mutex::new(None),
             routed_requests: Arc::new(DashMap::new()),
+            pending_client_requests: Arc::new(DashMap::new()),
             sampling_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
         });
 

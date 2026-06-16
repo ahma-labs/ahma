@@ -152,3 +152,71 @@ async fn test_proxy_client_autostart_and_shutdown() {
         "Host server should exit cleanly within 15 seconds after stdin closes and 0 active sessions remain"
     );
 }
+
+/// Regression guard for the orphaned-`serve stdio` storm: a frontend that is
+/// spawned but never sent an MCP handshake (no `initialize`), with its stdin
+/// held OPEN (so the stdin-EOF exit path can NOT fire), must still terminate on
+/// its own via the handshake deadline. Without this, an editor that repeatedly
+/// spawns and abandons MCP servers piles up thousands of live processes.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_frontend_exits_when_handshake_never_arrives() {
+    let binary = build_binary();
+    let workspace = workspace_dir();
+
+    let rand_id = rand::random::<u32>();
+    let socket_path = workspace
+        .join("target")
+        .join(format!("ahma_test_nohs_{}.sock", rand_id));
+    let socket_str = socket_path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Spawn the frontend with a short handshake deadline. stdin is piped and we
+    // keep the handle (never write, never close), so ONLY the handshake deadline
+    // can terminate it.
+    let mut child = tokio::process::Command::new(&binary)
+        .current_dir(&workspace)
+        .env("AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS", "2")
+        .args([
+            "--no-sandbox",
+            "--unix-socket-path",
+            &socket_str,
+            "--log-to-stderr",
+            "serve",
+            "stdio",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn frontend");
+
+    // Hold stdin open for the whole test: dropping it would deliver EOF and let
+    // the test pass for the wrong reason.
+    let _stdin = child.stdin.take().expect("stdin piped");
+
+    // The frontend must exit on its own: deadline (2s) + background-bridge
+    // startup + margin. Generous upper bound, but well under any EOF/idle path
+    // (stdin is still open, so EOF can't be why it exited).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut exit_status = None;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            exit_status = Some(status);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    if exit_status.is_none() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let _ = std::fs::remove_file(&socket_path);
+
+    assert!(
+        exit_status.is_some(),
+        "Frontend must self-terminate via the handshake deadline when no \
+         handshake arrives, even with stdin held open"
+    );
+}

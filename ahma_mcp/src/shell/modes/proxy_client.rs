@@ -14,6 +14,18 @@ use rmcp::transport::Transport;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// Resolve the frontend handshake deadline: the internal
+/// `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS` override if set (testing), otherwise
+/// [`FRONTEND_HANDSHAKE_DEADLINE_SECS`]. A value of `0` disables the deadline
+/// (returns `None`).
+fn frontend_handshake_deadline() -> Option<Duration> {
+    let secs = std::env::var("AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(ahma_common::timeouts::FRONTEND_HANDSHAKE_DEADLINE_SECS);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 /// Run the stdio proxy connecting to the running UDS or HTTP server.
 ///
 /// Returns `Ok(true)` when the bridge successfully responded to at least one
@@ -21,15 +33,17 @@ use tokio::sync::mpsc;
 /// closed the connection before sending any response back to the client, which
 /// typically indicates a stale or incompatible bridge daemon.
 pub async fn run_proxy_client(uds_path: Option<&str>, http_url: Option<&str>) -> Result<bool> {
+    let handshake_deadline = frontend_handshake_deadline();
+
     #[cfg(unix)]
     if let Some(path) = uds_path {
         tracing::info!(socket = path, "Proxying stdio to Unix Domain Socket");
-        return run_proxy_client_unix(path).await;
+        return run_proxy_client_unix(path, handshake_deadline).await;
     }
 
     if let Some(url) = http_url {
         tracing::info!(url = url, "Proxying stdio to HTTP server");
-        return run_proxy_client_http(url).await;
+        return run_proxy_client_http(url, handshake_deadline).await;
     }
 
     #[cfg(not(unix))]
@@ -39,7 +53,10 @@ pub async fn run_proxy_client(uds_path: Option<&str>, http_url: Option<&str>) ->
 }
 
 #[cfg(unix)]
-async fn run_proxy_client_unix(socket_path: &str) -> Result<bool> {
+async fn run_proxy_client_unix(
+    socket_path: &str,
+    handshake_deadline: Option<Duration>,
+) -> Result<bool> {
     use ahma_http_mcp_client::unix_client::unix_socket_transport;
 
     let client_transport = unix_socket_transport(socket_path, "http://localhost/mcp")
@@ -47,7 +64,13 @@ async fn run_proxy_client_unix(socket_path: &str) -> Result<bool> {
     let stdio_transport = PatchedStdioTransport::new_stdio();
 
     tracing::info!(socket = socket_path, "Proxy connected to bridge via UDS");
-    let result = run_transport_proxy(stdio_transport, client_transport, "unix").await;
+    let result = run_transport_proxy(
+        stdio_transport,
+        client_transport,
+        "unix",
+        handshake_deadline,
+    )
+    .await;
     if let Err(ref e) = result {
         tracing::error!(socket = socket_path, error = %e, "Proxy session ended with error");
     }
@@ -55,7 +78,12 @@ async fn run_proxy_client_unix(socket_path: &str) -> Result<bool> {
 }
 
 #[cfg(unix)]
-async fn run_transport_proxy<S, C>(mut stdio: S, mut client: C, transport: &str) -> Result<bool>
+async fn run_transport_proxy<S, C>(
+    mut stdio: S,
+    mut client: C,
+    transport: &str,
+    handshake_deadline: Option<Duration>,
+) -> Result<bool>
 where
     S: Transport<RoleServer> + Send + 'static,
     C: Transport<RoleClient> + Send + 'static,
@@ -72,8 +100,31 @@ where
     // This is the signal used by handle_version_checks to detect a stale bridge:
     // a healthy bridge always replies to `initialize`; a stale one closes silently.
     let mut bridge_responded = false;
+
+    // Handshake deadline: if the client never sends its first message (the
+    // `initialize` handshake) within this window, the connection was spawned
+    // and abandoned — exit so abandoned `serve stdio` spawns cannot accumulate.
+    // Disarmed once the first message is forwarded; a live idle session is never
+    // killed by this. A far-future sleep stands in for "no deadline".
+    let deadline = handshake_deadline.unwrap_or(Duration::from_secs(u64::MAX / 2));
+    let handshake_timer = tokio::time::sleep(deadline);
+    tokio::pin!(handshake_timer);
+
     loop {
         tokio::select! {
+            _ = &mut handshake_timer, if !forwarded_any => {
+                tracing::warn!(
+                    transport,
+                    ?deadline,
+                    "Proxy exiting: no MCP handshake within deadline (connection spawned but abandoned)"
+                );
+                // Exit the process directly rather than returning up the stack:
+                // the stdin reader thread (tokio::io::stdin) is still blocked in a
+                // read() on the held-open pipe, so a normal return would hang on
+                // runtime shutdown waiting for that thread. The frontend proxy
+                // holds no state worth draining.
+                std::process::exit(0);
+            }
             stdio_msg = stdio.receive() => {
                 let Some(msg) = stdio_msg else {
                     tracing::info!(transport, "Proxy exiting: stdio EOF (Cursor client disconnected)");
@@ -136,7 +187,10 @@ where
     Ok(bridge_responded)
 }
 
-async fn run_proxy_client_http(base_url: &str) -> Result<bool> {
+async fn run_proxy_client_http(
+    base_url: &str,
+    handshake_deadline: Option<Duration>,
+) -> Result<bool> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
@@ -146,8 +200,26 @@ async fn run_proxy_client_http(base_url: &str) -> Result<bool> {
 
     let mut stdio = PatchedStdioTransport::new_stdio();
 
-    // 1. Handshake / Initialize
-    let init_msg = stdio.receive().await.ok_or_else(|| {
+    // 1. Handshake / Initialize — bounded by the handshake deadline so a
+    // connection that is spawned and abandoned (no `initialize` ever sent)
+    // exits rather than parking on stdin forever and piling up.
+    let first_recv = stdio.receive();
+    let init_msg = match handshake_deadline {
+        Some(deadline) => match tokio::time::timeout(deadline, first_recv).await {
+            Ok(msg) => msg,
+            Err(_) => {
+                tracing::warn!(
+                    ?deadline,
+                    "Proxy exiting: no MCP handshake within deadline (connection spawned but abandoned)"
+                );
+                // Exit directly: the stdin reader thread is still blocked on the
+                // held-open pipe, so returning would hang on runtime shutdown.
+                std::process::exit(0);
+            }
+        },
+        None => first_recv.await,
+    }
+    .ok_or_else(|| {
         tracing::error!("Proxy HTTP handshake failed: no initialize message on stdin");
         anyhow!("No initialize message on stdin")
     })?;

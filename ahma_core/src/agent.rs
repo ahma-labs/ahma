@@ -1,5 +1,7 @@
+use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
 use ahma_llm_monitor::ChatMessage;
 use ahma_llm_monitor::client::LlmClient;
+use ahma_mcp::ActiveAgentSession;
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::collections::BTreeMap;
@@ -822,7 +824,9 @@ async fn get_or_create_external_session(
     Ok(sid)
 }
 
-async fn get_or_create_session(
+/// Initialize (or reuse) an MCP session against the local bridge for a tool
+/// call. Shared by the core agent loop and the TUI's manual tool-call path.
+pub async fn get_or_create_session(
     client: &reqwest::Client,
     url: &str,
     mcp: &McpChatConfig,
@@ -873,7 +877,9 @@ async fn get_or_create_session(
     Ok(sid)
 }
 
-fn parse_mcp_response(json_resp: &serde_json::Value) -> (String, bool) {
+/// Parse an MCP `tools/call` JSON-RPC response into `(text, is_error)`.
+/// Shared by the core agent loop and the TUI's manual tool-call path.
+pub fn parse_mcp_response(json_resp: &serde_json::Value) -> (String, bool) {
     let result_val = json_resp.get("result");
     let is_error = json_resp.get("error").is_some()
         || (result_val
@@ -915,7 +921,9 @@ fn extract_content_text(res: &serde_json::Value) -> String {
     }
 }
 
-async fn call_mcp_tool_http(
+/// POST a `tools/call` to the local MCP bridge and parse the response.
+/// Shared by the core agent loop and the TUI's manual tool-call path.
+pub async fn call_mcp_tool_http(
     client: &reqwest::Client,
     url: &str,
     session_id: &str,
@@ -956,7 +964,7 @@ async fn call_mcp_tool_http(
     Ok(parse_mcp_response(&json_resp))
 }
 
-pub(crate) fn needs_approval(tool_name: &str, tool_approval_enabled: bool) -> bool {
+pub fn needs_approval(tool_name: &str, tool_approval_enabled: bool) -> bool {
     if tool_approval_enabled {
         return true;
     }
@@ -966,8 +974,27 @@ pub(crate) fn needs_approval(tool_name: &str, tool_approval_enabled: bool) -> bo
         || tool_name.ends_with("::replace_in_file")
 }
 
-use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
-use ahma_mcp::ActiveAgentSession;
+pub fn get_mcp_base_url(app_config: Option<&ahma_mcp::shell::cli::AppConfig>) -> String {
+    if let Some(config) = app_config {
+        if !config.unix_socket_path.is_empty() {
+            format!("unix://{}", config.unix_socket_path)
+        } else {
+            let host = if config.http_host.is_empty() {
+                "127.0.0.1"
+            } else {
+                &config.http_host
+            };
+            let port = if config.http_port == 0 {
+                3000
+            } else {
+                config.http_port
+            };
+            format!("http://{}:{}", host, port)
+        }
+    } else {
+        "http://127.0.0.1:3000".to_string()
+    }
+}
 
 /// A PromptRunner implementation that executes the agent loop inside ahma_core.
 pub struct CorePromptRunner;
@@ -1028,8 +1055,14 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         let settings = ahma_common::config::AhmaSettings::load();
         let mcp_connections = service.mcp_connections.read().await.clone();
 
+        let local_mcp_base_url = {
+            let app_config_guard = service.app_config.read().unwrap();
+            let app_config_ref = app_config_guard.as_ref().map(|arc| arc.as_ref());
+            get_mcp_base_url(app_config_ref)
+        };
+
         let mcp_config = McpChatConfig {
-            base_url,
+            base_url: local_mcp_base_url,
             workspace_root,
             session_id: None,
             external_http_servers: BTreeMap::new(),
@@ -1370,5 +1403,60 @@ mod tests {
         assert!(got_finish, "Missing ToolCallFinished");
         assert!(got_token, "Missing Token");
         assert!(got_done, "Missing Done");
+    }
+
+    #[test]
+    fn test_get_mcp_base_url_resolution() {
+        use ahma_mcp::shell::cli::AppConfig;
+
+        // 1. Default (None)
+        assert_eq!(get_mcp_base_url(None), "http://127.0.0.1:3000");
+
+        // 2. HTTP host/port
+        let config1 = AppConfig {
+            http_host: "12.34.56.78".to_string(),
+            http_port: 8888,
+            ..AppConfig::default()
+        };
+        assert_eq!(get_mcp_base_url(Some(&config1)), "http://12.34.56.78:8888");
+
+        // 3. Unix socket
+        let config2 = AppConfig {
+            unix_socket_path: "/path/to/socket".to_string(),
+            ..AppConfig::default()
+        };
+        assert_eq!(get_mcp_base_url(Some(&config2)), "unix:///path/to/socket");
+    }
+
+    fn empty_mcp_config(base_url: &str) -> McpChatConfig {
+        McpChatConfig {
+            base_url: base_url.to_string(),
+            workspace_root: PathBuf::from("/tmp"),
+            session_id: None,
+            external_http_servers: BTreeMap::new(),
+            max_turns: 2,
+            tool_approval: false,
+            mcp_connections: ahma_mcp::mcp_client::McpConnectionManager::default(),
+            minimize_tokens: false,
+            small_model_harness: false,
+            context_length: None,
+        }
+    }
+
+    /// Routing guard: a `server::tool` name whose server is registered in
+    /// neither `mcp_connections` nor `external_http_servers` must surface a
+    /// clear "unknown server" error rather than silently falling through to the
+    /// local bridge. This pins the `::` dispatch decision so a future change to
+    /// `dispatch_tool_execution` can't quietly mis-route external calls.
+    #[tokio::test]
+    async fn dispatch_unknown_external_server_errors() {
+        let cfg = empty_mcp_config("http://127.0.0.1:3000");
+        let err = dispatch_tool_execution("ghost::do_thing", serde_json::json!({}), &cfg)
+            .await
+            .expect_err("unknown external server must error");
+        assert!(
+            err.contains("Unknown external MCP server") && err.contains("ghost"),
+            "unexpected error: {err}"
+        );
     }
 }

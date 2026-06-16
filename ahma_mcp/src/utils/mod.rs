@@ -19,6 +19,9 @@ pub mod cancellation;
 pub mod logging;
 /// Helper for generating descriptive operation IDs.
 pub mod operation;
+/// Dead-man's switch that terminates an orphaned frontend process when its
+/// spawning parent (e.g. an IDE) dies.
+pub mod parent_watchdog;
 /// Safe stdout notification delivery for the subprocess-to-bridge protocol.
 pub mod stdio;
 /// Redirection of standard output to standard error.

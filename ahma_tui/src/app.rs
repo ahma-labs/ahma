@@ -3114,7 +3114,12 @@ fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
         }
     } else {
         if let Some(tx) = bridge_tx {
-            spawn_window_llm_task(win_id, base_url, model, command, abort_rx, tx);
+            let mcp = if state.mcp_enabled {
+                Some(mcp_chat_config(state))
+            } else {
+                None
+            };
+            spawn_window_llm_task(win_id, base_url, model, command, mcp, abort_rx, tx);
         }
     }
 }
@@ -3682,7 +3687,7 @@ mod tests {
 
     #[test]
     fn test_needs_approval_filtering() {
-        use crate::llm_bridge::needs_approval;
+        use ahma_core::agent::needs_approval;
         // Gating write_file and replace_in_file by default
         assert!(needs_approval("write_file", false));
         assert!(needs_approval("replace_in_file", false));

@@ -88,7 +88,9 @@ pub struct AppConfig {
     pub tool_bundles: Vec<String>,
 
     // ── Execution ───────────────────────────────────────────────────────────
-    /// Default command timeout in seconds (AHMA_TIMEOUT, default 360).
+    /// Default command timeout in seconds (default 600). Override with the
+    /// `--timeout` CLI flag or `tools.timeout_secs` in settings.toml; individual
+    /// tools can override via `timeout_seconds` in their JSON definition.
     pub timeout_secs: u64,
     /// Run all tools synchronously (AHMA_SYNC=1).
     pub force_sync: bool,
@@ -203,7 +205,7 @@ impl Default for AppConfig {
             tools_dir: None,
             explicit_tools_dir: false,
             tool_bundles: vec![],
-            timeout_secs: 360,
+            timeout_secs: 600,
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
