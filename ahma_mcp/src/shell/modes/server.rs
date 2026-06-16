@@ -438,7 +438,7 @@ async fn handle_version_checks(
     Ok(None)
 }
 
-fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf]) -> Vec<String> {
+pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
     let mut args = vec!["serve".to_string(), "--server-child".to_string()];
 
     // Helper closures to reduce push-pair verbosity.
@@ -448,14 +448,23 @@ fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf])
         a.push(val);
     };
 
-    // Forward the resolved sandbox scope(s) so the bridge can use them as a fallback
-    // for clients that don't send roots/list (e.g. Antigravity) and so the bridge
-    // can pass them on to per-session subprocesses.
-    for scope in resolved_scopes {
+    // Forward ONLY genuinely explicit sandbox scopes (from --sandbox-scope,
+    // --working-dir, or task vault) so the bridge is not locked to a
+    // provisional temp/CWD that the stdio parent derived at startup.
+    // --sandbox and --tmp are forwarded as boolean flags below so the bridge
+    // can derive ~/sandbox and temp access independently for each session.
+    for scope in &config.sandbox_scopes {
         push_val(
             &mut args,
             "--sandbox-scope",
             scope.to_string_lossy().to_string(),
+        );
+    }
+    for wd in &config.working_dirs {
+        push_val(
+            &mut args,
+            "--working-dir",
+            wd.to_string_lossy().to_string(),
         );
     }
 
@@ -513,6 +522,9 @@ fn build_background_bridge_args(config: &AppConfig, resolved_scopes: &[PathBuf])
     }
     if config.defer_sandbox {
         push(&mut args, "--defer-sandbox");
+    }
+    if config.use_sandbox_dir {
+        push(&mut args, "--sandbox");
     }
     if config.tmp_access {
         push(&mut args, "--tmp");
@@ -579,7 +591,6 @@ fn open_capture_file(path: &std::path::Path, banner: &str) -> Option<std::fs::Fi
 
 async fn spawn_background_bridge(
     config: &AppConfig,
-    resolved_scopes: &[PathBuf],
     socket_path_opt: Option<&str>,
     http_url_opt: Option<&str>,
 ) -> Result<()> {
@@ -588,7 +599,7 @@ async fn spawn_background_bridge(
         .to_string_lossy()
         .to_string();
 
-    let server_args = build_background_bridge_args(config, resolved_scopes);
+    let server_args = build_background_bridge_args(config);
 
     let mut cmd = tokio::process::Command::new(&server_command);
     cmd.args(&server_args).env("AHMA_SERVER_CHILD", "1");
@@ -786,7 +797,8 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
 
     if !is_test {
         let resolved_scopes: Vec<PathBuf> = sandbox.scopes().to_vec();
-        spawn_background_bridge(&config, &resolved_scopes, socket_path_opt, http_url_opt).await?;
+        let _ = resolved_scopes; // kept for startup log below; not forwarded to bridge
+        spawn_background_bridge(&config, socket_path_opt, http_url_opt).await?;
         // Proceed with proxy setup
         return crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
             .await;
@@ -814,4 +826,131 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     result?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn base_cfg() -> AppConfig {
+        AppConfig {
+            no_sandbox: true,
+            sandbox_scopes: vec![],
+            use_sandbox_dir: false,
+            sandbox_directory: Some(std::path::PathBuf::from("~/sandbox")),
+            tmp_access: false,
+            defer_sandbox: false,
+            working_dirs: vec![],
+            explicit_tools_dir: false,
+            tools_dir: None,
+            tool_bundles: vec![],
+            timeout_secs: 360,
+            force_sync: false,
+            hot_reload_tools: false,
+            skip_availability_probes: false,
+            no_temp_files: false,
+            log_monitor: false,
+            monitor_rate_limit_secs: 60,
+            package_cache_write: true,
+            http_host: "127.0.0.1".to_string(),
+            http_port: 3000,
+            no_quic: false,
+            disable_http1_1: false,
+            handshake_timeout_secs: 45,
+            unix_socket_path: String::new(),
+            list_server: None,
+            mcp_config: std::path::PathBuf::from("mcp.json"),
+            list_http: None,
+            list_format: crate::shell::OutputFormat::Text,
+            run_tool: None,
+            run_tool_args: vec![],
+            observability: ahma_common::observability::ObservabilityConfig::default(),
+            task_vault: None,
+            require_token: None,
+            require_token_path: None,
+            rate_limit_rps: 0,
+            rate_limit_burst: 10,
+            instance_label: "ahma".to_string(),
+            idle_timeout_secs: None,
+            max_sessions: 10,
+            is_server_child: false,
+            minimize_tokens: false,
+            small_model_harness: false,
+            mutex_groups: ahma_common::config::default_mutex_groups(),
+            separate_cargo_target: false,
+        }
+    }
+
+    /// --sandbox is forwarded; empty sandbox_scopes do not produce --sandbox-scope.
+    #[test]
+    fn test_bridge_args_sandbox_flag_no_scope_forwarded() {
+        let tmp = tempdir().unwrap();
+        let cfg = AppConfig {
+            use_sandbox_dir: true,
+            sandbox_directory: Some(tmp.path().to_path_buf()),
+            ..base_cfg()
+        };
+
+        let args = build_background_bridge_args(&cfg);
+        let has_sandbox_scope = args.windows(2).any(|w| w[0] == "--sandbox-scope");
+        assert!(
+            !has_sandbox_scope,
+            "empty sandbox_scopes must not produce --sandbox-scope: {args:?}"
+        );
+        assert!(
+            args.contains(&"--sandbox".to_string()),
+            "--sandbox flag must be forwarded: {args:?}"
+        );
+    }
+
+    /// Explicit --sandbox-scope is forwarded; --sandbox not forwarded when not set.
+    #[test]
+    fn test_bridge_args_explicit_scope_forwarded_no_sandbox_flag() {
+        let tmp = tempdir().unwrap();
+        let scope = tmp.path().to_path_buf();
+        let cfg = AppConfig {
+            sandbox_scopes: vec![scope.clone()],
+            use_sandbox_dir: false,
+            ..base_cfg()
+        };
+
+        let args = build_background_bridge_args(&cfg);
+        let scope_idx = args
+            .iter()
+            .position(|a| a == "--sandbox-scope")
+            .expect("explicit scope must appear as --sandbox-scope");
+        let expected = scope.to_string_lossy().into_owned();
+        assert!(
+            args[scope_idx + 1].contains(expected.as_str()),
+            "scope value must follow --sandbox-scope: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--sandbox".to_string()),
+            "--sandbox must not appear when use_sandbox_dir is false: {args:?}"
+        );
+    }
+
+    /// Both --sandbox and explicit --sandbox-scope coexist when both are set.
+    #[test]
+    fn test_bridge_args_both_sandbox_and_scope() {
+        let tmp = tempdir().unwrap();
+        let scope = tmp.path().to_path_buf();
+        let cfg = AppConfig {
+            sandbox_scopes: vec![scope.clone()],
+            use_sandbox_dir: true,
+            sandbox_directory: Some(tmp.path().to_path_buf()),
+            ..base_cfg()
+        };
+
+        let args = build_background_bridge_args(&cfg);
+        assert!(
+            args.contains(&"--sandbox".to_string()),
+            "--sandbox must be present: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--sandbox-scope"),
+            "--sandbox-scope must be present: {args:?}"
+        );
+    }
 }

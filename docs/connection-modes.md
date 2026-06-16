@@ -32,7 +32,7 @@ ahma serve stdio
         "Ahma": {
             "type": "stdio",
             "command": "ahma",
-            "args": ["--tmp", "--livelog", "--simplify"]
+            "args": ["serve", "stdio", "--sandbox", "--log-monitor"]
         }
     }
 }
@@ -59,7 +59,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
         "Ahma": {
             "type": "stdio",
             "command": "ahma",
-            "args": ["--tmp", "--livelog", "--simplify"]
+            "args": ["serve", "stdio", "--sandbox", "--log-monitor"]
         }
     }
 }
@@ -73,7 +73,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
         "Ahma": {
             "type": "stdio",
             "command": "ahma",
-            "args": ["--tmp", "--livelog", "--simplify"]
+            "args": ["serve", "stdio", "--sandbox", "--log-monitor"]
         }
     }
 }
@@ -91,7 +91,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
         "stdio",
         "--tools",
         "simplify",
-        "--tmp",
+        "--sandbox",
         "--log-monitor",
         "--sandbox-scope",
         "~/sandbox"
@@ -111,7 +111,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
 First start the server in a terminal with your preferred flags, defaulting to port 3000:
 
 ```bash
-ahma serve http --tmp --livelog --simplify
+ahma serve http --sandbox --log-monitor
 ```
 
 The HTTP server requires **HTTP/2 or HTTP/3**. HTTP/1.1 connections are explicitly rejected.

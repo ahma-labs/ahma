@@ -402,7 +402,7 @@ fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
             "stdio",
             "--tools",
             "simplify",
-            "--tmp",
+            "--sandbox",
             "--log-monitor"
         ]
     })
@@ -431,7 +431,7 @@ fn build_antigravity_servers_entry(transport: &str, home: &Path) -> serde_json::
             "stdio",
             "--tools",
             "simplify",
-            "--tmp",
+            "--sandbox",
             "--log-monitor",
             "--sandbox-scope",
             scope_str
@@ -473,7 +473,7 @@ fn build_claude_desktop_mcp_entry(transport: &str, _home: &Path) -> serde_json::
             "stdio",
             "--tools",
             "simplify",
-            "--tmp",
+            "--sandbox",
             "--log-monitor"
         ]
     })
@@ -602,7 +602,7 @@ fn build_codex_toml_value(transport: &str) -> toml::Value {
                 toml::Value::String("stdio".to_string()),
                 toml::Value::String("--tools".to_string()),
                 toml::Value::String("simplify".to_string()),
-                toml::Value::String("--tmp".to_string()),
+                toml::Value::String("--sandbox".to_string()),
                 toml::Value::String("--log-monitor".to_string()),
             ];
             table.insert("args".to_string(), toml::Value::Array(args));
@@ -1210,5 +1210,53 @@ mod tests {
     #[test]
     fn test_default_all_selection() {
         assert_eq!(default_all_selection(5), "all");
+    }
+
+    // ─── Default install args use --sandbox, not --tmp ────────────────────────
+
+    #[test]
+    fn test_default_mcp_entry_uses_sandbox_not_tmp() {
+        let entry = build_mcp_servers_entry("stdio");
+        let args = entry["args"].as_array().expect("args must be array");
+        let has_sandbox = args.iter().any(|a| a.as_str() == Some("--sandbox"));
+        let has_tmp = args.iter().any(|a| a.as_str() == Some("--tmp"));
+        assert!(
+            has_sandbox,
+            "default stdio entry must include --sandbox: {args:?}"
+        );
+        assert!(
+            !has_tmp,
+            "default stdio entry must NOT include --tmp: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_claude_desktop_entry_uses_sandbox_not_tmp() {
+        let tmp = tempdir().unwrap();
+        let entry = build_claude_desktop_mcp_entry("stdio", tmp.path());
+        let args = entry["args"].as_array().expect("args must be array");
+        let has_sandbox = args.iter().any(|a| a.as_str() == Some("--sandbox"));
+        let has_tmp = args.iter().any(|a| a.as_str() == Some("--tmp"));
+        assert!(has_sandbox, "Claude Desktop entry must include --sandbox: {args:?}");
+        assert!(!has_tmp, "Claude Desktop entry must NOT include --tmp: {args:?}");
+    }
+
+    #[test]
+    fn test_antigravity_entry_uses_sandbox_not_tmp() {
+        let tmp = tempdir().unwrap();
+        let entry = build_antigravity_servers_entry("stdio", tmp.path());
+        let args = entry["args"].as_array().expect("args must be array");
+        let has_sandbox = args.iter().any(|a| a.as_str() == Some("--sandbox"));
+        let has_tmp = args.iter().any(|a| a.as_str() == Some("--tmp"));
+        assert!(has_sandbox, "Antigravity entry must include --sandbox: {args:?}");
+        assert!(!has_tmp, "Antigravity entry must NOT include --tmp: {args:?}");
+    }
+
+    /// Reinstalling over a stale failClosed:true hook entry migrates it to false.
+    /// This behavior is verified via the hooks module's own test at line 1614-1617.
+    #[test]
+    fn test_hook_fail_open_verified_in_hooks_module() {
+        // The assertion that failClosed is false lives in hooks/mod.rs:
+        //   test_cursor_hook_default_has_fail_closed_false
     }
 }

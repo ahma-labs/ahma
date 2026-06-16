@@ -162,6 +162,10 @@ pub struct Sandbox {
     pub(super) no_temp_files: bool,
     /// When true, the canonical temp directory is preserved across scope updates.
     pub(super) tmp_access: bool,
+    /// When set, this directory (typically `~/sandbox`) is preserved across every
+    /// `update_scopes` call so that `roots/list` replacements produce
+    /// `roots ∪ {sandbox_dir}` rather than discarding the secondary scope.
+    pub(super) sandbox_dir: Option<PathBuf>,
     /// When true, the scopes were explicitly provided by the user (via
     /// `--sandbox-scope`, `--working-directories`, or a task vault) and MUST NOT
     /// be widened or replaced via the MCP `roots/list` protocol (SPEC R5.5).
@@ -192,6 +196,7 @@ impl Clone for Sandbox {
             mode: self.mode,
             no_temp_files: self.no_temp_files,
             tmp_access: self.tmp_access,
+            sandbox_dir: self.sandbox_dir.clone(),
             explicit_scopes: self.explicit_scopes,
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
@@ -208,6 +213,7 @@ impl std::fmt::Debug for Sandbox {
             .field("mode", &self.mode)
             .field("no_temp_files", &self.no_temp_files)
             .field("tmp_access", &self.tmp_access)
+            .field("sandbox_dir", &self.sandbox_dir)
             .field("explicit_scopes", &self.explicit_scopes)
             .field("livelog", &self.livelog)
             .field("package_cache_write", &self.package_cache_write)
@@ -244,6 +250,7 @@ impl Sandbox {
             mode,
             no_temp_files,
             tmp_access,
+            sandbox_dir: None,
             explicit_scopes: false,
             livelog,
             package_cache_write: true,
@@ -296,13 +303,38 @@ impl Sandbox {
         self.explicit_scopes
     }
 
-    /// Update the sandbox scopes, preserving the temp directory if `--tmp` was set.
+    /// Set a persistent secondary scope directory (typically `~/sandbox`) that is
+    /// re-appended after every `update_scopes` call so it survives `roots/list`
+    /// replacements.  The path must already be canonicalized by the caller.
+    #[must_use]
+    pub fn with_sandbox_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.sandbox_dir = dir;
+        self
+    }
+
+    /// Return the persistent secondary scope directory, if one was configured.
+    pub fn sandbox_dir(&self) -> Option<&PathBuf> {
+        self.sandbox_dir.as_ref()
+    }
+
+    /// Update the sandbox scopes, preserving the temp directory if `--tmp` was set
+    /// and the sandbox_dir if `--sandbox` was set.
     pub fn update_scopes(&self, scopes: Vec<PathBuf>) -> Result<()> {
         let mut canonicalized = scopes::canonicalize_scopes(
             scopes,
             self.mode,
             "Client must provide valid workspace roots.",
         )?;
+
+        // Re-append ~/sandbox so roots/list replacements don't discard it.
+        if let Some(ref dir) = self.sandbox_dir
+            && !canonicalized.contains(dir) {
+                tracing::info!(
+                    "Preserving sandbox directory in scopes after roots/list: {:?}",
+                    dir
+                );
+                canonicalized.push(dir.clone());
+            }
 
         if let Some(canonical_temp) = self.preserved_temp_dir(&canonicalized) {
             tracing::info!(
@@ -367,7 +399,29 @@ impl Sandbox {
     }
 
     /// Check if a path is within any of the sandbox scopes.
+    ///
+    /// In `SandboxMode::Test` (`--no-sandbox`) scope enforcement is disabled; the
+    /// path is still resolved to canonical form but never rejected.
     pub fn validate_path(&self, path: &Path) -> Result<PathBuf> {
+        if self.is_test_mode() {
+            let canonical = if path.is_absolute() {
+                dunce::canonicalize(path)
+                    .unwrap_or_else(|_| canonicalize_with_fallback(path))
+            } else {
+                let scopes_guard = self.scopes();
+                if let Some(first_scope) = scopes_guard.first() {
+                    let full = first_scope.join(path);
+                    dunce::canonicalize(&full)
+                        .unwrap_or_else(|_| canonicalize_with_fallback(&full))
+                } else {
+                    let full = std::env::current_dir().unwrap_or_default().join(path);
+                    dunce::canonicalize(&full)
+                        .unwrap_or_else(|_| canonicalize_with_fallback(&full))
+                }
+            };
+            return Ok(canonical);
+        }
+
         let scopes_guard = self.scopes();
 
         let canonical = self.resolve_path(path, &scopes_guard)?;
