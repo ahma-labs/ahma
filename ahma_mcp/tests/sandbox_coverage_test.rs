@@ -153,3 +153,74 @@ fn test_sandbox_test_mode_bypass() {
         "Test mode (--no-sandbox) must bypass scope validation: {res:?}"
     );
 }
+
+#[test]
+fn test_sandbox_auto_scoping() {
+    let cwd = std::env::current_dir().unwrap();
+    let root = cwd.join("target").join("test_sandbox_auto_scoping");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    // Create a sandbox with a fake scope, mimicking Antigravity setup
+    let fake_scope = root.join("fake_sandbox");
+    std::fs::create_dir(&fake_scope).unwrap();
+
+    let sandbox = Sandbox::new(
+        vec![fake_scope.clone()],
+        SandboxMode::Strict,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+
+    sandbox.set_roots_received(false);
+
+    assert!(!sandbox.roots_received());
+
+    // Path in fake_sandbox is allowed
+    let allowed_path = fake_scope.join("test.txt");
+    std::fs::write(&allowed_path, "test").unwrap();
+    assert!(sandbox.validate_path(&allowed_path).is_ok());
+
+    // Let's create a workspace/project path outside
+    let workspace_dir = root.join("my_workspace");
+    std::fs::create_dir(&workspace_dir).unwrap();
+    let marker_file = workspace_dir.join("Cargo.toml");
+    std::fs::write(&marker_file, "[package]").unwrap();
+
+    let project_file = workspace_dir.join("src").join("lib.rs");
+    std::fs::create_dir(workspace_dir.join("src")).unwrap();
+    std::fs::write(&project_file, "pub fn foo() {}").unwrap();
+
+    // Initial check: if we validated a file in `my_workspace`, it would fail since it's outside
+    // But since `roots_received` is false, it should auto-discover the `Cargo.toml` parent (`my_workspace`) as a scope!
+    let validated = sandbox.validate_path(&project_file);
+    assert!(
+        validated.is_ok(),
+        "Auto-scoping should have added my_workspace as a scope"
+    );
+
+    // Let's verify that my_workspace is now in the scopes
+    let current_scopes = sandbox.scopes();
+    let has_workspace = current_scopes
+        .iter()
+        .any(|s| s == &dunce::canonicalize(&workspace_dir).unwrap());
+    assert!(has_workspace, "my_workspace should be in sandbox scopes");
+
+    // If we set roots_received to true, no auto-scoping should occur for new paths
+    sandbox.set_roots_received(true);
+    let other_workspace = root.join("other_workspace");
+    std::fs::create_dir(&other_workspace).unwrap();
+    std::fs::write(other_workspace.join("Cargo.toml"), "").unwrap();
+    let other_file = other_workspace.join("main.rs");
+    std::fs::write(&other_file, "").unwrap();
+
+    let res = sandbox.validate_path(&other_file);
+    assert!(
+        res.is_err(),
+        "Auto-scoping must be disabled when roots_received is true"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}

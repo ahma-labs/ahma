@@ -159,6 +159,45 @@ fn canonicalize_with_fallback(full_path: &Path) -> PathBuf {
     scopes::normalize_path_lexically(full_path)
 }
 
+fn find_auto_scope(path: &Path) -> Option<PathBuf> {
+    let home = dirs::home_dir().and_then(|h| dunce::canonicalize(h).ok());
+    const MARKERS: &[&str] = &[
+        ".git",
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "pom.xml",
+        ".hg",
+        ".svn",
+    ];
+
+    let mut cursor = path;
+    while !scopes::is_filesystem_root(cursor) {
+        if let Some(ref h) = home
+            && cursor == h
+        {
+            break;
+        }
+        for marker in MARKERS {
+            if cursor.join(marker).exists() {
+                return Some(cursor.to_path_buf());
+            }
+        }
+        if let Some(parent) = cursor.parent() {
+            cursor = parent;
+        } else {
+            break;
+        }
+    }
+
+    if path.is_dir() {
+        Some(path.to_path_buf())
+    } else {
+        path.parent().map(|p| p.to_path_buf())
+    }
+}
+
 /// The security context for the Ahma session.
 pub struct Sandbox {
     pub(super) scopes: std::sync::RwLock<Vec<PathBuf>>,
@@ -191,6 +230,8 @@ pub struct Sandbox {
     /// `cargo check` and preventing cross-process file-lock contention.
     /// Default `false`.
     pub(super) separate_cargo_target: bool,
+    /// When true, roots/list was successfully received from the client.
+    pub(super) roots_received: std::sync::atomic::AtomicBool,
 }
 
 impl Clone for Sandbox {
@@ -206,6 +247,10 @@ impl Clone for Sandbox {
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
             separate_cargo_target: self.separate_cargo_target,
+            roots_received: std::sync::atomic::AtomicBool::new(
+                self.roots_received
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
         }
     }
 }
@@ -223,6 +268,12 @@ impl std::fmt::Debug for Sandbox {
             .field("livelog", &self.livelog)
             .field("package_cache_write", &self.package_cache_write)
             .field("separate_cargo_target", &self.separate_cargo_target)
+            .field(
+                "roots_received",
+                &self
+                    .roots_received
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -260,6 +311,7 @@ impl Sandbox {
             livelog,
             package_cache_write: true,
             separate_cargo_target: false,
+            roots_received: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -333,13 +385,14 @@ impl Sandbox {
 
         // Re-append ~/sandbox so roots/list replacements don't discard it.
         if let Some(ref dir) = self.sandbox_dir
-            && !canonicalized.contains(dir) {
-                tracing::info!(
-                    "Preserving sandbox directory in scopes after roots/list: {:?}",
-                    dir
-                );
-                canonicalized.push(dir.clone());
-            }
+            && !canonicalized.contains(dir)
+        {
+            tracing::info!(
+                "Preserving sandbox directory in scopes after roots/list: {:?}",
+                dir
+            );
+            canonicalized.push(dir.clone());
+        }
 
         if let Some(canonical_temp) = self.preserved_temp_dir(&canonicalized) {
             tracing::info!(
@@ -358,6 +411,18 @@ impl Sandbox {
         let mut current_scopes = self.scopes.write().unwrap();
         *current_scopes = canonicalized;
         Ok(())
+    }
+
+    /// Set whether roots have been received.
+    pub fn set_roots_received(&self, received: bool) {
+        self.roots_received
+            .store(received, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Return true if roots have been received.
+    pub fn roots_received(&self) -> bool {
+        self.roots_received
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Check if the sandbox is in test mode.
@@ -410,18 +475,15 @@ impl Sandbox {
     pub fn validate_path(&self, path: &Path) -> Result<PathBuf> {
         if self.is_test_mode() {
             let canonical = if path.is_absolute() {
-                dunce::canonicalize(path)
-                    .unwrap_or_else(|_| canonicalize_with_fallback(path))
+                dunce::canonicalize(path).unwrap_or_else(|_| canonicalize_with_fallback(path))
             } else {
                 let scopes_guard = self.scopes();
                 if let Some(first_scope) = scopes_guard.first() {
                     let full = first_scope.join(path);
-                    dunce::canonicalize(&full)
-                        .unwrap_or_else(|_| canonicalize_with_fallback(&full))
+                    dunce::canonicalize(&full).unwrap_or_else(|_| canonicalize_with_fallback(&full))
                 } else {
                     let full = std::env::current_dir().unwrap_or_default().join(path);
-                    dunce::canonicalize(&full)
-                        .unwrap_or_else(|_| canonicalize_with_fallback(&full))
+                    dunce::canonicalize(&full).unwrap_or_else(|_| canonicalize_with_fallback(&full))
                 }
             };
             return Ok(canonical);
@@ -431,26 +493,52 @@ impl Sandbox {
 
         let canonical = self.resolve_path(path, &scopes_guard)?;
 
-        if !self.is_path_allowed(&canonical, &scopes_guard) {
-            return Err(SandboxError::PathOutsideSandbox {
-                path: path.to_path_buf(),
-                scopes: scopes_guard.to_vec(),
-            }
-            .into());
+        if self.is_path_allowed(&canonical, &scopes_guard) {
+            self.check_security_policies(path, &canonical)?;
+            return Ok(canonical);
         }
 
-        self.check_security_policies(path, &canonical)?;
-        Ok(canonical)
+        // Release the read lock before potentially modifying scopes
+        drop(scopes_guard);
+
+        if !self.roots_received()
+            && let Some(auto_scope) = find_auto_scope(&canonical)
+            && auto_scope.is_absolute()
+            && !scopes::is_filesystem_root(&auto_scope)
+            && !is_blocked_temp_path(&auto_scope.to_string_lossy())
+        {
+            tracing::info!(
+                "Auto-adding scope {:?} for path {:?} (no roots/list client)",
+                auto_scope,
+                canonical
+            );
+            let mut new_scopes = self.scopes().to_vec();
+            new_scopes.push(auto_scope);
+            if self.update_scopes(new_scopes).is_ok() {
+                let new_scopes_guard = self.scopes();
+                if self.is_path_allowed(&canonical, &new_scopes_guard) {
+                    self.check_security_policies(path, &canonical)?;
+                    return Ok(canonical);
+                }
+            }
+        }
+
+        // If we get here, it's not allowed, so return PathOutsideSandbox error
+        let final_scopes_guard = self.scopes();
+        Err(SandboxError::PathOutsideSandbox {
+            path: path.to_path_buf(),
+            scopes: final_scopes_guard.to_vec(),
+        }
+        .into())
     }
 
     fn resolve_path(&self, path: &Path, scopes_guard: &[PathBuf]) -> Result<PathBuf> {
-        let first_scope = scopes_guard
-            .first()
-            .ok_or_else(|| anyhow!("No sandbox scopes configured"))?;
-
         let full_path = if path.is_absolute() {
             path.to_path_buf()
         } else {
+            let first_scope = scopes_guard
+                .first()
+                .ok_or_else(|| anyhow!("No sandbox scopes configured"))?;
             first_scope.join(path)
         };
 

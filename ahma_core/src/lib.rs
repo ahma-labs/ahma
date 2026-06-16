@@ -68,6 +68,11 @@ pub use ahma_mcp::{Adapter, AhmaMcpService};
 // Re-export LLM client for direct use
 pub use ahma_llm_monitor::LlmClient;
 
+pub mod agent;
+pub use agent::{
+    AgentApprovalGate, AgentEvent, McpChatConfig, execute_agent_turn, spawn_agent_task,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

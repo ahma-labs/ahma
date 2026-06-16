@@ -528,11 +528,7 @@ pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
         );
     }
     for wd in &config.working_dirs {
-        push_val(
-            &mut args,
-            "--working-dir",
-            wd.to_string_lossy().to_string(),
-        );
+        push_val(&mut args, "--working-dir", wd.to_string_lossy().to_string());
     }
 
     if config.explicit_tools_dir

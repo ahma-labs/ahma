@@ -133,6 +133,8 @@ pub struct AhmaMcpService {
     /// the audit subscriber records the matching `tool_complete` on the
     /// terminal event and removes the id.
     pub vault_audited_ops: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// All external MCP servers (HTTP and stdio) for agent tool routing.
+    pub mcp_connections: Arc<tokio::sync::RwLock<crate::mcp_client::McpConnectionManager>>,
 }
 
 impl AhmaMcpService {
@@ -411,6 +413,10 @@ impl AhmaMcpService {
         let progress_push = progress_push::ProgressPushRouter::new();
         progress_push.spawn_forwarder(&operation_monitor);
 
+        // Reset roots_received to false so that client roots/list negotiation
+        // or no-roots auto-scoping can occur for this service session.
+        adapter.sandbox().set_roots_received(false);
+
         let service = Self {
             adapter,
             operation_monitor,
@@ -443,6 +449,9 @@ impl AhmaMcpService {
             )),
             progress_push,
             vault_audited_ops: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            mcp_connections: Arc::new(tokio::sync::RwLock::new(
+                crate::mcp_client::McpConnectionManager::default(),
+            )),
         };
         service.spawn_vault_audit_subscriber();
         Ok(service)
@@ -1213,14 +1222,34 @@ impl ServerHandler for AhmaMcpService {
                 .with_title("log_monitor"),
             ];
 
-            let configs_lock = self.configs.read().unwrap();
-            for config in configs_lock.values() {
-                if !self.is_config_visible_to_client(config) {
-                    continue;
+            {
+                let configs_lock = self.configs.read().unwrap();
+                for config in configs_lock.values() {
+                    if !self.is_config_visible_to_client(config) {
+                        continue;
+                    }
+                    tools.extend(self.create_tools_from_config(config));
                 }
-                tools.extend(self.create_tools_from_config(config));
             }
-            drop(configs_lock);
+
+            // Add external MCP tools from McpConnectionManager
+            let external_mgr = self.mcp_connections.read().await;
+            for ext_tool in external_mgr.aggregate_tools() {
+                let description = ext_tool.description.clone();
+                let input_schema = match ext_tool.input_schema.clone() {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                let schema_arc = Arc::new(input_schema);
+                tools.push(
+                    Tool::new(
+                        ext_tool.name.clone(),
+                        description.unwrap_or_default(),
+                        schema_arc,
+                    )
+                    .with_title(ext_tool.name.clone()),
+                );
+            }
 
             Ok(ListToolsResult {
                 meta: None,
@@ -1690,6 +1719,39 @@ impl AhmaMcpService {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         self.guard_sandbox_ready_for_tool_calls()?;
+
+        if params.name.contains("::") {
+            let mgr = {
+                let guard = self.mcp_connections.read().await;
+                guard.clone()
+            };
+            if let Some((server_name, _)) = mgr.resolve_tool_name(&params.name)
+                && mgr.servers.iter().any(|s| s.name == server_name)
+            {
+                let arguments = params.arguments.unwrap_or_default();
+                let args_val = serde_json::Value::Object(arguments);
+                match mgr.call_tool(&params.name, args_val).await {
+                    Ok((output, is_error)) => {
+                        if is_error {
+                            return Ok(CallToolResult::error(vec![
+                                rmcp::model::Content::text(output),
+                            ]));
+                        } else {
+                            return Ok(CallToolResult::success(vec![
+                                rmcp::model::Content::text(output),
+                            ]));
+                        }
+                    }
+                    Err(e) => {
+                        return Err(McpError::internal_error(
+                            format!("External tool call failed: {e}"),
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+
         let (config, flattened_subcommand) = self.resolve_configured_tool(&params.name)?;
         self.dispatch_resolved_configured_tool(params, context, config, flattened_subcommand)
             .await

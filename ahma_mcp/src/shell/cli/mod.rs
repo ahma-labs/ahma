@@ -401,8 +401,7 @@ fn is_plausible_workspace(dir: &std::path::Path) -> bool {
         ".svn",
     ];
 
-    let home = dirs::home_dir()
-        .and_then(|h| dunce::canonicalize(h).ok());
+    let home = dirs::home_dir().and_then(|h| dunce::canonicalize(h).ok());
 
     let canonical = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
 
@@ -472,7 +471,8 @@ fn resolve_sandbox_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     // In all three cases we fall back to sandbox_directory or an empty provisional scope so
     // that roots/list from the client can set the correct workspace.
     let cwd_is_temp = {
-        let temp = dunce::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+        let temp =
+            dunce::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
         dunce::canonicalize(&cwd)
             .map(|c| c.starts_with(&temp))
             .unwrap_or(false)
@@ -3562,8 +3562,7 @@ mod tests {
 
     #[test]
     fn test_split_version_and_build_id_without_id() {
-        let (semver, build_id) =
-            super::super::modes::server::split_version_and_build_id("0.12.5");
+        let (semver, build_id) = super::super::modes::server::split_version_and_build_id("0.12.5");
         assert_eq!(semver, "0.12.5");
         assert_eq!(build_id, None);
     }

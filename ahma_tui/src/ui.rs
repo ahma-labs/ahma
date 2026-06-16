@@ -176,30 +176,29 @@ fn draw_collapsed_window(
     frame.render_widget(para, area);
 }
 
-fn draw_expanded_window(
-    frame: &mut Frame,
-    w: &crate::state::TuiWindow,
-    area: Rect,
-    theme: &Theme,
-    status_style: Style,
-) {
-    let border_width = 2;
-    let title_space = (area.width as usize).saturating_sub(border_width);
-
+#[cfg(feature = "tui")]
+fn get_running_spinner(unicode: bool) -> &'static str {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let f = (ms / 150) as usize;
+    if unicode {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        frames[f % frames.len()]
+    } else {
+        let frames = ["-", "\\", "|", "/"];
+        frames[f % frames.len()]
+    }
+}
+
+#[cfg(feature = "tui")]
+fn build_window_title(w: &crate::state::TuiWindow, width: u16, unicode: bool) -> String {
+    let border_width = 2;
+    let title_space = (width as usize).saturating_sub(border_width);
+
     let status_str = if w.status == "Running" {
-        let spinner = if theme.unicode {
-            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            frames[f % frames.len()]
-        } else {
-            let frames = ["-", "\\", "|", "/"];
-            frames[f % frames.len()]
-        };
-        format!("[Running {}]", spinner)
+        format!("[Running {}]", get_running_spinner(unicode))
     } else {
         format!("[{}]", w.status)
     };
@@ -207,11 +206,21 @@ fn draw_expanded_window(
     let title_left = format!(" [-] {} {} {}", w.id, status_str, w.label);
     let title_right = format!("x{} ", w.id);
     let pad_width = title_space.saturating_sub(title_left.len() + title_right.len());
-    let title_combined = if pad_width > 0 {
+    if pad_width > 0 {
         format!("{}{}{}", title_left, " ".repeat(pad_width), title_right)
     } else {
         title_left
-    };
+    }
+}
+
+fn draw_expanded_window(
+    frame: &mut Frame,
+    w: &crate::state::TuiWindow,
+    area: Rect,
+    theme: &Theme,
+    status_style: Style,
+) {
+    let title_combined = build_window_title(w, area.width, theme.unicode);
 
     let block = Block::default()
         .title(Span::styled(title_combined, theme.normal()))
@@ -367,34 +376,55 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
 }
 
 #[cfg(feature = "tui")]
-fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let mcp_label = match (state.mcp_enabled, state.unicode) {
+fn get_mcp_label(mcp_enabled: bool, unicode: bool) -> &'static str {
+    match (mcp_enabled, unicode) {
         (true, true) => " · MCP ✓",
         (true, false) => " · MCP on",
         (false, _) => "",
-    };
-    let (health_char, health_style) = match (state.server_healthy, state.unicode) {
+    }
+}
+
+#[cfg(feature = "tui")]
+fn get_health_indicator(
+    server_healthy: bool,
+    unicode: bool,
+    theme: &Theme,
+) -> (&'static str, Style) {
+    match (server_healthy, unicode) {
         (true, true) => (" ●", theme.healthy()),
         (true, false) => (" *", theme.healthy()),
         (false, true) => (" ○", theme.unhealthy()),
         (false, false) => (" -", theme.unhealthy()),
-    };
-    let health_span = Span::styled(health_char, health_style);
-    let daemon_char = match (state.daemon_healthy, state.unicode) {
+    }
+}
+
+#[cfg(feature = "tui")]
+fn get_daemon_indicator(
+    daemon_healthy: bool,
+    unicode: bool,
+    theme: &Theme,
+) -> (&'static str, Style) {
+    let daemon_char = match (daemon_healthy, unicode) {
         (true, true) => " ● DMON",
         (true, false) => " * DMON",
         (false, true) => " ○ DMON",
         (false, false) => " - DMON",
     };
-    let daemon_style = if state.daemon_healthy {
+    let daemon_style = if daemon_healthy {
         theme.healthy()
     } else {
         theme.unhealthy()
     };
-    let daemon_span = Span::styled(daemon_char, daemon_style);
+    (daemon_char, daemon_style)
+}
+
+#[cfg(feature = "tui")]
+fn get_mcp_connection_counts(
+    servers: &[crate::mcp_connections::McpServerConfig],
+) -> (usize, usize) {
     let mut http_count = 0;
     let mut stdio_count = 0;
-    for s in &state.mcp_connections.servers {
+    for s in servers {
         if s.enabled {
             match &s.kind {
                 crate::mcp_connections::McpServerKind::Http { .. } => http_count += 1,
@@ -402,6 +432,20 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
             }
         }
     }
+    (http_count, stdio_count)
+}
+
+#[cfg(feature = "tui")]
+fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let mcp_label = get_mcp_label(state.mcp_enabled, state.unicode);
+    let (health_char, health_style) =
+        get_health_indicator(state.server_healthy, state.unicode, theme);
+    let health_span = Span::styled(health_char, health_style);
+    let (daemon_char, daemon_style) =
+        get_daemon_indicator(state.daemon_healthy, state.unicode, theme);
+    let daemon_span = Span::styled(daemon_char, daemon_style);
+
+    let (http_count, stdio_count) = get_mcp_connection_counts(&state.mcp_connections.servers);
     let external_tools = state.mcp_connections.aggregate_tool_names().len();
     let external_part = if http_count > 0 || stdio_count > 0 {
         format!(" · ext (http:{http_count} stdio:{stdio_count}) / {external_tools} tools")
@@ -593,6 +637,27 @@ fn push_chat_entry_lines(
 }
 
 #[cfg(feature = "tui")]
+fn format_duration(started_at: Option<std::time::Instant>, duration_ms: Option<u64>) -> String {
+    if let Some(ms) = duration_ms {
+        if ms < 1000 {
+            format!("{}ms", ms)
+        } else {
+            format!("{}s", ms / 1000)
+        }
+    } else if let Some(start) = started_at {
+        let elapsed = start.elapsed();
+        let ms = elapsed.as_millis();
+        if ms < 1000 {
+            format!("{}ms", ms)
+        } else {
+            format!("{}s", elapsed.as_secs())
+        }
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(feature = "tui")]
 fn push_user_chat_lines(
     lines: &mut Vec<Line<'static>>,
     text: &str,
@@ -601,22 +666,7 @@ fn push_user_chat_lines(
     theme: &Theme,
     width: usize,
 ) {
-    let mut dur_str = String::new();
-    if let Some(ms) = duration_ms {
-        if ms < 1000 {
-            dur_str = format!("{}ms", ms);
-        } else {
-            dur_str = format!("{}s", ms / 1000);
-        }
-    } else if let Some(start) = started_at {
-        let elapsed = start.elapsed();
-        let ms = elapsed.as_millis();
-        if ms < 1000 {
-            dur_str = format!("{}ms", ms);
-        } else {
-            dur_str = format!("{}s", elapsed.as_secs());
-        }
-    }
+    let dur_str = format_duration(started_at, duration_ms);
 
     let raw_lines: Vec<&str> = text.lines().collect();
     if raw_lines.is_empty() {
@@ -2622,6 +2672,24 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 #[cfg(feature = "tui")]
+fn format_setting_value(value: &crate::settings_editor::SettingValue) -> String {
+    match value {
+        crate::settings_editor::SettingValue::Bool(v) => {
+            if *v {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            }
+        }
+        crate::settings_editor::SettingValue::String(v) => v.clone(),
+        crate::settings_editor::SettingValue::U64(v) => format!("{}", v),
+        crate::settings_editor::SettingValue::U32(v) => format!("{}", v),
+        crate::settings_editor::SettingValue::Usize(v) => format!("{}", v),
+        crate::settings_editor::SettingValue::StringList(v) => format!("[{}]", v.join(", ")),
+    }
+}
+
+#[cfg(feature = "tui")]
 fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let popup = centered_rect(90, 22, area);
     frame.render_widget(Clear, popup);
@@ -2673,20 +2741,7 @@ fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area:
         };
 
         // Render value indicator
-        let val_string = match &item.value {
-            crate::settings_editor::SettingValue::Bool(v) => {
-                if *v {
-                    "on".to_string()
-                } else {
-                    "off".to_string()
-                }
-            }
-            crate::settings_editor::SettingValue::String(v) => v.clone(),
-            crate::settings_editor::SettingValue::U64(v) => format!("{}", v),
-            crate::settings_editor::SettingValue::U32(v) => format!("{}", v),
-            crate::settings_editor::SettingValue::Usize(v) => format!("{}", v),
-            crate::settings_editor::SettingValue::StringList(v) => format!("[{}]", v.join(", ")),
-        };
+        let val_string = format_setting_value(&item.value);
 
         let sec_indicator = if item.security_tier {
             Span::styled(" [locked]", theme.dim())

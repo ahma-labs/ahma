@@ -402,7 +402,10 @@ impl AhmaMcpService {
         // so that clients that don't support roots/list (e.g. Antigravity) still work
         // when --sandbox-scope was provided at startup.
         let roots = match tokio::time::timeout(timeout_duration, peer.list_roots()).await {
-            Ok(Ok(result)) => result.roots,
+            Ok(Ok(result)) => {
+                self.adapter.sandbox().set_roots_received(true);
+                result.roots
+            }
             Ok(Err(e)) => {
                 if !self.adapter.sandbox().scopes().is_empty() {
                     tracing::info!(
@@ -511,7 +514,30 @@ impl AhmaMcpService {
 
         // Per-client tool discovery: load tools from `<root>/.ahma/` if present.
         let discovery_root = client_root.or(primary_scope);
-        self.maybe_load_per_client_tools(discovery_root).await;
+        self.maybe_load_per_client_tools(discovery_root.clone())
+            .await;
+
+        // Load external MCP servers and discovery for client workspace on the daemon/serve side
+        if let Some(ref root) = discovery_root {
+            match crate::mcp_client::McpConnectionManager::load(root) {
+                Ok(mut manager) => {
+                    tracing::info!("Loaded McpConnectionManager for {}", root.display());
+                    let mcp_connections_clone = self.mcp_connections.clone();
+                    tokio::spawn(async move {
+                        manager.refresh_tools().await;
+                        *mcp_connections_clone.write().await = manager;
+                        tracing::info!("Refreshed external MCP tools on server side");
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load McpConnectionManager for {}: {}",
+                        root.display(),
+                        e
+                    );
+                }
+            }
+        }
 
         // Notify bridge that sandbox has been configured so it can safely
         // forward tools/call requests.  This MUST go through the peer transport
