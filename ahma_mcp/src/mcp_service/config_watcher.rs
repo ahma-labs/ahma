@@ -11,8 +11,16 @@ use crate::utils::stdio::emit_stdout_notification;
 use super::AhmaMcpService;
 use crate::config::{ToolConfig, load_tool_configs};
 
-/// Emit a sandbox JSON-RPC notification on stdout.
+/// Emit a sandbox JSON-RPC notification directly on stdout (raw primitive).
+///
+/// Prefer [`emit_sandbox_notification_via_peer`] for anything sent while the
+/// rmcp peer is live — the raw path races the transport on Windows (see that
+/// function's docs).  This direct write is retained only for the Linux Landlock
+/// fatal-exit path, where the process is aborting on a security failure and a
+/// synchronous write with no async-transport dependency is the right choice.
+///
 /// `error` is `None` for `notifications/sandbox/configured`, `Some(msg)` for failed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn emit_sandbox_notification(method: &str, error: Option<&str>) {
     let payload = match error {
         Some(err) => serde_json::json!({
@@ -33,6 +41,42 @@ fn emit_sandbox_notification(method: &str, error: Option<&str>) {
         Err(_) => {
             tracing::warn!("Failed to serialize sandbox notification: {}", method);
         }
+    }
+}
+
+/// Emit a sandbox JSON-RPC notification through the rmcp **peer transport**.
+///
+/// CRITICAL (Windows correctness): sandbox lifecycle notifications MUST travel
+/// the same serialized rmcp writer that carries `roots/list`, `ping`, and tool
+/// responses — NOT the raw stdout handle used by [`emit_sandbox_notification`].
+///
+/// The raw path opens a *second*, unsynchronized OS handle to the same
+/// subprocess→bridge pipe and writes via `writeln!` (multiple `WriteFile` calls).
+/// Windows pipes give no cross-handle multi-write atomicity, so those bytes
+/// interleave with concurrent rmcp writes — notably the keepalive `ping` that
+/// fires the instant the sandbox locks — corrupting the line. The bridge's
+/// line-oriented reader then fails to parse it and silently drops the
+/// notification, so the client waits forever for `sandbox/configured`. On Unix
+/// per-`write()` atomicity hid the bug. Routing through the peer serializes the
+/// write behind rmcp's transport mutex, guaranteeing a clean, whole line.
+async fn emit_sandbox_notification_via_peer(
+    peer: &Peer<RoleServer>,
+    method: &'static str,
+    error: Option<&str>,
+) {
+    let params = match error {
+        Some(err) => serde_json::json!({ "error": err }),
+        None => serde_json::json!({}),
+    };
+    if let Err(e) = peer
+        .send_notification(rmcp::model::ServerNotification::CustomNotification(
+            rmcp::model::CustomNotification::new(method, Some(params)),
+        ))
+        .await
+    {
+        // Best-effort: a send error here means the bridge already tore the
+        // transport down; log and continue rather than panic.
+        tracing::warn!("Failed to send {} via peer transport: {}", method, e);
     }
 }
 
@@ -218,12 +262,21 @@ impl AhmaMcpService {
     /// client's workspace roots to establish sandbox boundaries.
     /// Update sandbox scopes and (on Linux) enforce Landlock restrictions.
     /// Emits `notifications/sandbox/failed` and returns `false` on error.
-    async fn apply_and_enforce_scopes(&self, new_scopes: Vec<PathBuf>) -> bool {
+    async fn apply_and_enforce_scopes(
+        &self,
+        new_scopes: Vec<PathBuf>,
+        peer: &Peer<RoleServer>,
+    ) -> bool {
         match self.adapter.sandbox().update_scopes(new_scopes.clone()) {
             Ok(()) => tracing::info!("Sandbox scopes updated successfully"),
             Err(e) => {
                 tracing::error!("Failed to update sandbox from roots: {}", e);
-                emit_sandbox_notification("notifications/sandbox/failed", Some(&e.to_string()));
+                emit_sandbox_notification_via_peer(
+                    peer,
+                    "notifications/sandbox/failed",
+                    Some(&e.to_string()),
+                )
+                .await;
                 return false;
             }
         }
@@ -359,7 +412,12 @@ impl AhmaMcpService {
                     vec![]
                 } else {
                     tracing::error!("Failed to request roots/list: {}", e);
-                    emit_sandbox_notification("notifications/sandbox/failed", Some(&e.to_string()));
+                    emit_sandbox_notification_via_peer(
+                        peer,
+                        "notifications/sandbox/failed",
+                        Some(&e.to_string()),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -377,13 +435,15 @@ impl AhmaMcpService {
                          This may indicate a stdio communication issue.",
                         timeout_duration
                     );
-                    emit_sandbox_notification(
+                    emit_sandbox_notification_via_peer(
+                        peer,
                         "notifications/sandbox/failed",
                         Some(&format!(
                             "Timeout waiting for roots/list response after {:?}",
                             timeout_duration
                         )),
-                    );
+                    )
+                    .await;
                     return;
                 }
             }
@@ -409,7 +469,7 @@ impl AhmaMcpService {
                 "Attempting to update sandbox scopes with {} paths",
                 new_scopes.len()
             );
-            if !self.apply_and_enforce_scopes(new_scopes).await {
+            if !self.apply_and_enforce_scopes(new_scopes, peer).await {
                 return;
             }
         } else if !self.adapter.sandbox().scopes().is_empty() {
@@ -454,10 +514,11 @@ impl AhmaMcpService {
         self.maybe_load_per_client_tools(discovery_root).await;
 
         // Notify bridge that sandbox has been configured so it can safely
-        // forward tools/call requests. NOTE: raw JSON on stdout — the HTTP bridge
-        // listens for this on the subprocess stdout stream.
+        // forward tools/call requests.  This MUST go through the peer transport
+        // (not raw stdout) — see emit_sandbox_notification_via_peer for why the
+        // raw path silently drops this notification on Windows.
         tracing::debug!("About to send notifications/sandbox/configured");
-        emit_sandbox_notification("notifications/sandbox/configured", None);
+        emit_sandbox_notification_via_peer(peer, "notifications/sandbox/configured", None).await;
         tracing::debug!("Sent notifications/sandbox/configured");
     }
 }
