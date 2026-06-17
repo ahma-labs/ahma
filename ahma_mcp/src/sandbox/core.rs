@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use dunce;
 use std::path::{Path, PathBuf};
 
+use super::display::{ScopeSource, ScopeView};
 use super::error::SandboxError;
 use super::scopes;
 use super::types::{SandboxMode, ScopesGuard};
@@ -468,6 +469,42 @@ impl Sandbox {
         self.read_scopes.read().unwrap().clone()
     }
 
+    /// Whether kernel enforcement is active. `--no-sandbox` maps to
+    /// [`SandboxMode::Test`], in which scope is resolved but never enforced.
+    pub fn is_enforced(&self) -> bool {
+        !self.is_test_mode()
+    }
+
+    /// Canonical human-readable scope summary with provenance (SPEC R5.4).
+    /// Every surface that shows scope renders through this one path.
+    pub fn scope_text(&self, source: ScopeSource) -> String {
+        let writes = self.scopes.read().unwrap().clone();
+        let reads = self.read_scopes.read().unwrap().clone();
+        ScopeView {
+            write_scopes: &writes,
+            read_scopes: &reads,
+            tmp_access: self.tmp_access,
+            enforced: self.is_enforced(),
+            source,
+        }
+        .render_text()
+    }
+
+    /// Structured scope summary for the `notifications/sandbox/configured`
+    /// payload and any machine-readable surface (SPEC R5.4).
+    pub fn scope_json(&self, source: ScopeSource) -> serde_json::Value {
+        let writes = self.scopes.read().unwrap().clone();
+        let reads = self.read_scopes.read().unwrap().clone();
+        ScopeView {
+            write_scopes: &writes,
+            read_scopes: &reads,
+            tmp_access: self.tmp_access,
+            enforced: self.is_enforced(),
+            source,
+        }
+        .to_json()
+    }
+
     /// Check if a path is within any of the sandbox scopes.
     ///
     /// In `SandboxMode::Test` (`--no-sandbox`) scope enforcement is disabled; the
@@ -592,4 +629,55 @@ fn strip_extended_prefix(path: &Path) -> PathBuf {
         return PathBuf::from(stripped);
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod scope_view_tests {
+    use super::*;
+    use crate::sandbox::display::ScopeSource;
+    use tempfile::tempdir;
+
+    #[test]
+    fn scope_json_reports_scopes_source_and_enforcement() {
+        let dir = tempdir().unwrap();
+        // Test mode avoids filesystem-root rejection and means "not enforced".
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let json = sb.scope_json(ScopeSource::RootsList);
+        assert_eq!(json["source"], serde_json::json!("roots/list"));
+        assert_eq!(json["tmp"], serde_json::json!(false));
+        // Test mode == --no-sandbox == not enforced.
+        assert_eq!(json["enforced"], serde_json::json!(false));
+        let writes = json["write"].as_array().unwrap();
+        assert!(
+            !writes.is_empty(),
+            "expected at least one write scope: {json}"
+        );
+    }
+
+    #[test]
+    fn scope_text_includes_source_attribution() {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let text = sb.scope_text(ScopeSource::Default);
+        assert!(
+            text.contains("source: default"),
+            "missing source line:\n{text}"
+        );
+        assert!(text.contains("Sandbox:"), "missing header:\n{text}");
+    }
 }

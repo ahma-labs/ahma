@@ -39,6 +39,7 @@
 
 mod command;
 pub(crate) mod core;
+pub mod display;
 mod error;
 #[cfg(target_os = "linux")]
 mod landlock;
@@ -53,6 +54,7 @@ mod windows;
 
 pub use core::Sandbox;
 pub use core::{is_target_allowed, load_exceptions};
+pub use display::{ScopeSource, ScopeView};
 pub use error::SandboxError;
 #[cfg(target_os = "linux")]
 pub use landlock::{
