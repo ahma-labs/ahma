@@ -39,6 +39,7 @@
 
 mod command;
 pub(crate) mod core;
+pub mod display;
 mod error;
 #[cfg(target_os = "linux")]
 mod landlock;
@@ -53,6 +54,7 @@ mod windows;
 
 pub use core::Sandbox;
 pub use core::{is_target_allowed, load_exceptions};
+pub use display::{ScopeSource, ScopeView};
 pub use error::SandboxError;
 #[cfg(target_os = "linux")]
 pub use landlock::{
@@ -61,7 +63,6 @@ pub use landlock::{
 pub use prerequisites::{
     check_sandbox_prerequisites, exit_with_sandbox_error, test_sandbox_exec_available,
 };
-pub(crate) use scopes::is_filesystem_root;
 pub use scopes::normalize_path_lexically;
 pub use types::{SandboxMode, ScopesGuard};
 #[cfg(target_os = "windows")]

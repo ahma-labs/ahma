@@ -379,11 +379,8 @@ Examples:
 - Never trust user-provided paths without validation via `path_security` module
 - All file operations are restricted to the sandbox scope by the kernel
 
-### Nested Sandboxes
-When running inside another sandbox (Cursor, VS Code, Docker):
-- System auto-detects and disables internal sandbox
-- Outer sandbox still provides security
-- Use `--disable-sandbox` to suppress detection warnings
+### Disabling the sandbox
+There is **no** automatic "nested sandbox" detection that silently disables enforcement — that would be a silent security downgrade and is prohibited (see SPEC R5 design principles). The kernel sandbox is disabled **only** by the explicit `--no-sandbox` / `--disable-sandbox` flag; the retired `AHMA_DISABLE_SANDBOX` environment variable is ignored. If you are running ahma inside another sandbox (Cursor, VS Code, Docker) and want to rely on the outer sandbox, pass `--disable-sandbox` explicitly.
 
 ### Temp Directory Access (`--tmp`)
 

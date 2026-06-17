@@ -64,10 +64,25 @@ async fn emit_sandbox_notification_via_peer(
     method: &'static str,
     error: Option<&str>,
 ) {
-    let params = match error {
+    emit_sandbox_notification_via_peer_with_scope(peer, method, error, None).await;
+}
+
+/// As [`emit_sandbox_notification_via_peer`], but attaches the canonical scope
+/// summary (SPEC R5.4) under a `scope` key so the client can display the
+/// complete sandbox scope and its provenance without a separate query.
+async fn emit_sandbox_notification_via_peer_with_scope(
+    peer: &Peer<RoleServer>,
+    method: &'static str,
+    error: Option<&str>,
+    scope: Option<serde_json::Value>,
+) {
+    let mut params = match error {
         Some(err) => serde_json::json!({ "error": err }),
         None => serde_json::json!({}),
     };
+    if let (Some(scope), Some(obj)) = (scope, params.as_object_mut()) {
+        obj.insert("scope".to_string(), scope);
+    }
     if let Err(e) = peer
         .send_notification(rmcp::model::ServerNotification::CustomNotification(
             rmcp::model::CustomNotification::new(method, Some(params)),
@@ -543,8 +558,25 @@ impl AhmaMcpService {
         // forward tools/call requests.  This MUST go through the peer transport
         // (not raw stdout) — see emit_sandbox_notification_via_peer for why the
         // raw path silently drops this notification on Windows.
-        tracing::debug!("About to send notifications/sandbox/configured");
-        emit_sandbox_notification_via_peer(peer, "notifications/sandbox/configured", None).await;
+        // SPEC R5.4: the configured notification carries the complete scope and
+        // its provenance so the client can show it without a separate query.
+        let sandbox = self.adapter.sandbox();
+        let source = if sandbox.has_explicit_scopes() {
+            crate::sandbox::ScopeSource::Explicit
+        } else if sandbox.roots_received() {
+            crate::sandbox::ScopeSource::RootsList
+        } else {
+            crate::sandbox::ScopeSource::Default
+        };
+        let scope_json = sandbox.scope_json(source);
+        tracing::info!("Sandbox configured:\n{}", sandbox.scope_text(source));
+        emit_sandbox_notification_via_peer_with_scope(
+            peer,
+            "notifications/sandbox/configured",
+            None,
+            Some(scope_json),
+        )
+        .await;
         tracing::debug!("Sent notifications/sandbox/configured");
     }
 }

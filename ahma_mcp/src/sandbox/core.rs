@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use dunce;
 use std::path::{Path, PathBuf};
 
+use super::display::{ScopeSource, ScopeView};
 use super::error::SandboxError;
 use super::scopes;
 use super::types::{SandboxMode, ScopesGuard};
@@ -157,45 +158,6 @@ fn canonicalize_with_fallback(full_path: &Path) -> PathBuf {
         return parent_canonical.join(name);
     }
     scopes::normalize_path_lexically(full_path)
-}
-
-fn find_auto_scope(path: &Path) -> Option<PathBuf> {
-    let home = dirs::home_dir().and_then(|h| dunce::canonicalize(h).ok());
-    const MARKERS: &[&str] = &[
-        ".git",
-        "Cargo.toml",
-        "package.json",
-        "pyproject.toml",
-        "go.mod",
-        "pom.xml",
-        ".hg",
-        ".svn",
-    ];
-
-    let mut cursor = path;
-    while !scopes::is_filesystem_root(cursor) {
-        if let Some(ref h) = home
-            && cursor == h
-        {
-            break;
-        }
-        for marker in MARKERS {
-            if cursor.join(marker).exists() {
-                return Some(cursor.to_path_buf());
-            }
-        }
-        if let Some(parent) = cursor.parent() {
-            cursor = parent;
-        } else {
-            break;
-        }
-    }
-
-    if path.is_dir() {
-        Some(path.to_path_buf())
-    } else {
-        path.parent().map(|p| p.to_path_buf())
-    }
 }
 
 /// The security context for the Ahma session.
@@ -468,6 +430,42 @@ impl Sandbox {
         self.read_scopes.read().unwrap().clone()
     }
 
+    /// Whether kernel enforcement is active. `--no-sandbox` maps to
+    /// [`SandboxMode::Test`], in which scope is resolved but never enforced.
+    pub fn is_enforced(&self) -> bool {
+        !self.is_test_mode()
+    }
+
+    /// Canonical human-readable scope summary with provenance (SPEC R5.4).
+    /// Every surface that shows scope renders through this one path.
+    pub fn scope_text(&self, source: ScopeSource) -> String {
+        let writes = self.scopes.read().unwrap().clone();
+        let reads = self.read_scopes.read().unwrap().clone();
+        ScopeView {
+            write_scopes: &writes,
+            read_scopes: &reads,
+            tmp_access: self.tmp_access,
+            enforced: self.is_enforced(),
+            source,
+        }
+        .render_text()
+    }
+
+    /// Structured scope summary for the `notifications/sandbox/configured`
+    /// payload and any machine-readable surface (SPEC R5.4).
+    pub fn scope_json(&self, source: ScopeSource) -> serde_json::Value {
+        let writes = self.scopes.read().unwrap().clone();
+        let reads = self.read_scopes.read().unwrap().clone();
+        ScopeView {
+            write_scopes: &writes,
+            read_scopes: &reads,
+            tmp_access: self.tmp_access,
+            enforced: self.is_enforced(),
+            source,
+        }
+        .to_json()
+    }
+
     /// Check if a path is within any of the sandbox scopes.
     ///
     /// In `SandboxMode::Test` (`--no-sandbox`) scope enforcement is disabled; the
@@ -498,30 +496,14 @@ impl Sandbox {
             return Ok(canonical);
         }
 
-        // Release the read lock before potentially modifying scopes
         drop(scopes_guard);
 
-        if !self.roots_received()
-            && let Some(auto_scope) = find_auto_scope(&canonical)
-            && auto_scope.is_absolute()
-            && !scopes::is_filesystem_root(&auto_scope)
-            && !is_blocked_temp_path(&auto_scope.to_string_lossy())
-        {
-            tracing::info!(
-                "Auto-adding scope {:?} for path {:?} (no roots/list client)",
-                auto_scope,
-                canonical
-            );
-            let mut new_scopes = self.scopes().to_vec();
-            new_scopes.push(auto_scope);
-            if self.update_scopes(new_scopes).is_ok() {
-                let new_scopes_guard = self.scopes();
-                if self.is_path_allowed(&canonical, &new_scopes_guard) {
-                    self.check_security_policies(path, &canonical)?;
-                    return Ok(canonical);
-                }
-            }
-        }
+        // SPEC R5.1 / R5.2.1: scope is locked once and is NEVER widened by
+        // inference at runtime. The previous behaviour walked up from an
+        // out-of-scope path looking for a project-marker ancestor and silently
+        // added it as a writable scope — both spoofable marker inference and a
+        // silent post-lock downgrade. An out-of-scope path is now simply
+        // rejected; widening requires an explicit user decision (R5.3).
 
         // If we get here, it's not allowed, so return PathOutsideSandbox error
         let final_scopes_guard = self.scopes();
@@ -592,4 +574,85 @@ fn strip_extended_prefix(path: &Path) -> PathBuf {
         return PathBuf::from(stripped);
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod scope_view_tests {
+    use super::*;
+    use crate::sandbox::display::ScopeSource;
+    use tempfile::tempdir;
+
+    #[test]
+    fn scope_json_reports_scopes_source_and_enforcement() {
+        let dir = tempdir().unwrap();
+        // Test mode avoids filesystem-root rejection and means "not enforced".
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let json = sb.scope_json(ScopeSource::RootsList);
+        assert_eq!(json["source"], serde_json::json!("roots/list"));
+        assert_eq!(json["tmp"], serde_json::json!(false));
+        // Test mode == --no-sandbox == not enforced.
+        assert_eq!(json["enforced"], serde_json::json!(false));
+        let writes = json["write"].as_array().unwrap();
+        assert!(
+            !writes.is_empty(),
+            "expected at least one write scope: {json}"
+        );
+    }
+
+    #[test]
+    fn out_of_scope_path_is_rejected_and_never_widens_scope() {
+        // SPEC R5.1 / R5.2.1: an out-of-scope path is rejected; the locked scope
+        // is never widened by inference at runtime (the removed find_auto_scope
+        // behaviour). Guards against re-introducing silent marker-based widening.
+        let allowed = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        // A project marker in the out-of-scope dir must NOT cause it to be added.
+        std::fs::create_dir(outside.path().join(".git")).unwrap();
+        let outside_file = outside.path().join("escape.txt");
+        std::fs::write(&outside_file, b"x").unwrap();
+
+        let sb = Sandbox::new(
+            vec![allowed.path().to_path_buf()],
+            SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        // Simulate "no roots/list client" — the condition the old auto-add keyed on.
+        sb.set_roots_received(false);
+
+        let before = sb.scopes().to_vec();
+        let result = sb.validate_path(&outside_file);
+        assert!(result.is_err(), "out-of-scope path must be rejected");
+        let after = sb.scopes().to_vec();
+        assert_eq!(before, after, "scope must not be widened by validation");
+    }
+
+    #[test]
+    fn scope_text_includes_source_attribution() {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let text = sb.scope_text(ScopeSource::Default);
+        assert!(
+            text.contains("source: default"),
+            "missing source line:\n{text}"
+        );
+        assert!(text.contains("Sandbox:"), "missing header:\n{text}");
+    }
 }
