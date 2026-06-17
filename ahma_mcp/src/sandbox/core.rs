@@ -160,45 +160,6 @@ fn canonicalize_with_fallback(full_path: &Path) -> PathBuf {
     scopes::normalize_path_lexically(full_path)
 }
 
-fn find_auto_scope(path: &Path) -> Option<PathBuf> {
-    let home = dirs::home_dir().and_then(|h| dunce::canonicalize(h).ok());
-    const MARKERS: &[&str] = &[
-        ".git",
-        "Cargo.toml",
-        "package.json",
-        "pyproject.toml",
-        "go.mod",
-        "pom.xml",
-        ".hg",
-        ".svn",
-    ];
-
-    let mut cursor = path;
-    while !scopes::is_filesystem_root(cursor) {
-        if let Some(ref h) = home
-            && cursor == h
-        {
-            break;
-        }
-        for marker in MARKERS {
-            if cursor.join(marker).exists() {
-                return Some(cursor.to_path_buf());
-            }
-        }
-        if let Some(parent) = cursor.parent() {
-            cursor = parent;
-        } else {
-            break;
-        }
-    }
-
-    if path.is_dir() {
-        Some(path.to_path_buf())
-    } else {
-        path.parent().map(|p| p.to_path_buf())
-    }
-}
-
 /// The security context for the Ahma session.
 pub struct Sandbox {
     pub(super) scopes: std::sync::RwLock<Vec<PathBuf>>,
@@ -535,30 +496,14 @@ impl Sandbox {
             return Ok(canonical);
         }
 
-        // Release the read lock before potentially modifying scopes
         drop(scopes_guard);
 
-        if !self.roots_received()
-            && let Some(auto_scope) = find_auto_scope(&canonical)
-            && auto_scope.is_absolute()
-            && !scopes::is_filesystem_root(&auto_scope)
-            && !is_blocked_temp_path(&auto_scope.to_string_lossy())
-        {
-            tracing::info!(
-                "Auto-adding scope {:?} for path {:?} (no roots/list client)",
-                auto_scope,
-                canonical
-            );
-            let mut new_scopes = self.scopes().to_vec();
-            new_scopes.push(auto_scope);
-            if self.update_scopes(new_scopes).is_ok() {
-                let new_scopes_guard = self.scopes();
-                if self.is_path_allowed(&canonical, &new_scopes_guard) {
-                    self.check_security_policies(path, &canonical)?;
-                    return Ok(canonical);
-                }
-            }
-        }
+        // SPEC R5.1 / R5.2.1: scope is locked once and is NEVER widened by
+        // inference at runtime. The previous behaviour walked up from an
+        // out-of-scope path looking for a project-marker ancestor and silently
+        // added it as a writable scope — both spoofable marker inference and a
+        // silent post-lock downgrade. An out-of-scope path is now simply
+        // rejected; widening requires an explicit user decision (R5.3).
 
         // If we get here, it's not allowed, so return PathOutsideSandbox error
         let final_scopes_guard = self.scopes();
@@ -660,6 +605,36 @@ mod scope_view_tests {
             !writes.is_empty(),
             "expected at least one write scope: {json}"
         );
+    }
+
+    #[test]
+    fn out_of_scope_path_is_rejected_and_never_widens_scope() {
+        // SPEC R5.1 / R5.2.1: an out-of-scope path is rejected; the locked scope
+        // is never widened by inference at runtime (the removed find_auto_scope
+        // behaviour). Guards against re-introducing silent marker-based widening.
+        let allowed = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        // A project marker in the out-of-scope dir must NOT cause it to be added.
+        std::fs::create_dir(outside.path().join(".git")).unwrap();
+        let outside_file = outside.path().join("escape.txt");
+        std::fs::write(&outside_file, b"x").unwrap();
+
+        let sb = Sandbox::new(
+            vec![allowed.path().to_path_buf()],
+            SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        // Simulate "no roots/list client" — the condition the old auto-add keyed on.
+        sb.set_roots_received(false);
+
+        let before = sb.scopes().to_vec();
+        let result = sb.validate_path(&outside_file);
+        assert!(result.is_err(), "out-of-scope path must be rejected");
+        let after = sb.scopes().to_vec();
+        assert_eq!(before, after, "scope must not be widened by validation");
     }
 
     #[test]

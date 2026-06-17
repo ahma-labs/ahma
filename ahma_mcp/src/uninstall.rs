@@ -496,7 +496,9 @@ fn uninstall_agent_skills(dry_run: bool, interactive: bool) -> Result<()> {
     Ok(())
 }
 
-/// Remove the Claude Code plugin that was installed by `install_claude_code_plugin`.
+/// Remove the legacy Claude Code *plugin* install (used before ahma switched to
+/// a native `~/.claude/skills/ahma/` personal skill). Setup now calls this for
+/// migration cleanup, and uninstall calls it for full teardown.
 ///
 /// - Deletes `~/.claude/plugins/cache/local/ahma/` (the entire version tree).
 /// - Removes `ahma@local` from `~/.claude/plugins/installed_plugins.json`.

@@ -695,39 +695,50 @@ fn setup_tls() -> Result<()> {
     Ok(())
 }
 
-fn maybe_install_claude_plugin(home: &Path, interactive: bool) {
-    if !home.join(".claude").exists() {
-        return;
-    }
-    match install_claude_code_plugin(home) {
-        Ok(plugin_dir) if interactive => {
-            println!(
-                "✓ Installed ahma as Claude Code plugin at {}",
-                plugin_dir.display()
-            );
-        }
-        Err(e) if interactive => {
-            println!("  Note: Could not install Claude Code plugin: {e}");
-        }
-        _ => {}
-    }
+/// The skills directories ahma writes `SKILL.md` into. A skill is just one
+/// `SKILL.md` placed in a directory the agent auto-discovers — no plugin
+/// manifest, marketplace, or enable-toggle. The directory name (`ahma`) becomes
+/// the `/ahma` command on every platform.
+///
+///   - `~/.agents/skills/ahma/`  → cross-agent convention (Cursor, …)
+///   - `~/.claude/skills/ahma/`  → Claude Code native personal skill
+///
+/// Both are written unconditionally and idempotently; they are plain file
+/// writes with no version stamping, so `ahma update` simply overwrites them.
+fn skill_install_dirs(home: &Path) -> [PathBuf; 2] {
+    [
+        home.join(".agents").join("skills").join("ahma"),
+        home.join(".claude").join("skills").join("ahma"),
+    ]
 }
 
 async fn setup_agent_skills(interactive: bool) -> Result<()> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
-    // Generic cross-agent path (~/.agents/skills/ahma/SKILL.md)
-    let skill_dir = home.join(".agents").join("skills").join("ahma");
-    let skill_path = skill_dir.join("SKILL.md");
-    std::fs::create_dir_all(&skill_dir)
-        .with_context(|| format!("Failed to create directory {}", skill_dir.display()))?;
-    std::fs::write(&skill_path, SKILL_CONTENT)
-        .with_context(|| format!("Failed to write skill to {}", skill_path.display()))?;
+    for skill_dir in skill_install_dirs(&home) {
+        let skill_path = skill_dir.join("SKILL.md");
+        std::fs::create_dir_all(&skill_dir)
+            .with_context(|| format!("Failed to create directory {}", skill_dir.display()))?;
+        std::fs::write(&skill_path, SKILL_CONTENT)
+            .with_context(|| format!("Failed to write skill to {}", skill_path.display()))?;
+        if interactive {
+            println!("✓ Installed ahma skill to {}", skill_path.display());
+        }
+    }
 
-    maybe_install_claude_plugin(&home, interactive);
+    // Migrate away from the legacy Claude Code *plugin* install (version-stamped
+    // `~/.claude/plugins/cache/local/ahma/<version>/` + `installed_plugins.json`
+    // + `enabledPlugins`). That design was fragile: each version bump
+    // re-registered a new directory and orphaned the one that held the file,
+    // leaving Claude Code pointed at an empty dir. The native personal skill
+    // written above replaces it entirely, so tear the old plugin down.
+    if let Err(e) = crate::uninstall::remove_claude_plugin(&home, false, false)
+        && interactive
+    {
+        println!("  Note: could not clean up legacy Claude Code plugin: {e}");
+    }
 
     if interactive {
-        println!("✓ Installed ahma skill to {}", skill_path.display());
         println!();
     }
 
@@ -814,127 +825,6 @@ async fn prompt_yes_no_setup(prompt: &str) -> Result<bool> {
         Ok(trimmed == "y" || trimmed == "yes")
     })
     .await?
-}
-
-/// Installs the ahma skill as a Claude Code plugin by writing files into
-/// `~/.claude/plugins/cache/local/ahma/<version>/` and registering it in
-/// `installed_plugins.json` and `settings.json`.
-///
-/// Returns the plugin directory path on success.
-fn install_claude_code_plugin(home: &Path) -> Result<PathBuf> {
-    let version = env!("CARGO_PKG_VERSION");
-    let plugin_dir = home
-        .join(".claude")
-        .join("plugins")
-        .join("cache")
-        .join("local")
-        .join("ahma")
-        .join(version);
-
-    // Write skills/ahma/SKILL.md
-    let skill_dir = plugin_dir.join("skills").join("ahma");
-    std::fs::create_dir_all(&skill_dir)
-        .with_context(|| format!("Failed to create {}", skill_dir.display()))?;
-    std::fs::write(skill_dir.join("SKILL.md"), SKILL_CONTENT)
-        .context("Failed to write Claude Code plugin SKILL.md")?;
-
-    // Write .claude-plugin/plugin.json
-    let meta_dir = plugin_dir.join(".claude-plugin");
-    std::fs::create_dir_all(&meta_dir)?;
-    let plugin_json = json!({
-        "name": "ahma",
-        "description": "Kernel-sandboxed MCP server for AI agents. Wraps CLI tools with filesystem sandboxing, async execution, and live log monitoring.",
-        "author": { "name": "Paul Houghton" }
-    });
-    std::fs::write(
-        meta_dir.join("plugin.json"),
-        serde_json::to_string_pretty(&plugin_json)?,
-    )
-    .context("Failed to write plugin.json")?;
-
-    // Register in installed_plugins.json
-    let now = chrono::Utc::now().to_rfc3339();
-    let install_entry = json!({
-        "scope": "user",
-        "installPath": plugin_dir.to_string_lossy().to_string(),
-        "version": version,
-        "installedAt": now,
-        "lastUpdated": now,
-        "gitCommitSha": "local"
-    });
-    let plugins_json_path = home
-        .join(".claude")
-        .join("plugins")
-        .join("installed_plugins.json");
-    merge_installed_plugins(&plugins_json_path, "ahma@local", install_entry)?;
-
-    // Enable in settings.json
-    let settings_path = home.join(".claude").join("settings.json");
-    enable_claude_code_plugin(&settings_path, "ahma@local")?;
-
-    Ok(plugin_dir)
-}
-
-/// Adds or replaces the `plugin_key` entry in `installed_plugins.json`.
-fn merge_installed_plugins(path: &Path, plugin_key: &str, entry: serde_json::Value) -> Result<()> {
-    let mut config: serde_json::Value = if path.exists() {
-        let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| json!({"version": 2, "plugins": {}}))
-    } else {
-        json!({"version": 2, "plugins": {}})
-    };
-
-    if !config.is_object() {
-        config = json!({"version": 2, "plugins": {}});
-    }
-
-    let obj = config.as_object_mut().unwrap();
-    if !obj.get("plugins").is_some_and(|v| v.is_object()) {
-        obj.insert("plugins".to_string(), json!({}));
-    }
-
-    obj.get_mut("plugins")
-        .unwrap()
-        .as_object_mut()
-        .unwrap()
-        .insert(plugin_key.to_string(), json!([entry]));
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(&config)?)?;
-    Ok(())
-}
-
-/// Adds `plugin_key: true` to `enabledPlugins` in `settings.json`.
-fn enable_claude_code_plugin(path: &Path, plugin_key: &str) -> Result<()> {
-    let mut config: serde_json::Value = if path.exists() {
-        let content = std::fs::read_to_string(path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
-    } else {
-        json!({})
-    };
-
-    if !config.is_object() {
-        config = json!({});
-    }
-
-    let obj = config.as_object_mut().unwrap();
-    if !obj.get("enabledPlugins").is_some_and(|v| v.is_object()) {
-        obj.insert("enabledPlugins".to_string(), json!({}));
-    }
-
-    obj.get_mut("enabledPlugins")
-        .unwrap()
-        .as_object_mut()
-        .unwrap()
-        .insert(plugin_key.to_string(), json!(true));
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(&config)?)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1068,130 +958,31 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_installed_plugins_new_file() -> Result<()> {
-        let tmp = tempdir()?;
-        let path = tmp.path().join("installed_plugins.json");
-        let entry = json!({"scope": "user", "installPath": "/some/path", "version": "1.0.0"});
+    fn test_skill_install_dirs_targets_both_conventions() {
+        let home = Path::new("/home/tester");
+        let dirs = skill_install_dirs(home);
 
-        merge_installed_plugins(&path, "ahma@local", entry)?;
-
-        let content = std::fs::read_to_string(&path)?;
-        let parsed: serde_json::Value = serde_json::from_str(&content)?;
-        assert_eq!(parsed["version"], 2);
-        assert_eq!(parsed["plugins"]["ahma@local"][0]["version"], "1.0.0");
-        assert_eq!(parsed["plugins"]["ahma@local"][0]["scope"], "user");
-        Ok(())
-    }
-
-    #[test]
-    fn test_merge_installed_plugins_preserves_other_entries() -> Result<()> {
-        let tmp = tempdir()?;
-        let path = tmp.path().join("installed_plugins.json");
-        std::fs::write(
-            &path,
-            r#"{"version":2,"plugins":{"other@marketplace":[{"scope":"user","version":"2.0.0"}]}}"#,
-        )?;
-        let entry = json!({"scope": "user", "installPath": "/p", "version": "0.11.0"});
-
-        merge_installed_plugins(&path, "ahma@local", entry)?;
-
-        let content = std::fs::read_to_string(&path)?;
-        let parsed: serde_json::Value = serde_json::from_str(&content)?;
+        // Cross-agent convention (Cursor, …) and Claude Code native personal
+        // skill — both end in `skills/ahma` so the directory name yields `/ahma`.
         assert_eq!(
-            parsed["plugins"]["other@marketplace"][0]["version"],
-            "2.0.0"
+            dirs[0],
+            home.join(".agents").join("skills").join("ahma"),
+            "first target must be the generic ~/.agents/skills path"
         );
-        assert_eq!(parsed["plugins"]["ahma@local"][0]["version"], "0.11.0");
-        Ok(())
-    }
-
-    #[test]
-    fn test_enable_claude_code_plugin_new_file() -> Result<()> {
-        let tmp = tempdir()?;
-        let path = tmp.path().join("settings.json");
-
-        enable_claude_code_plugin(&path, "ahma@local")?;
-
-        let content = std::fs::read_to_string(&path)?;
-        let parsed: serde_json::Value = serde_json::from_str(&content)?;
-        assert_eq!(parsed["enabledPlugins"]["ahma@local"], true);
-        Ok(())
-    }
-
-    #[test]
-    fn test_enable_claude_code_plugin_preserves_other_settings() -> Result<()> {
-        let tmp = tempdir()?;
-        let path = tmp.path().join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{"model":"sonnet","enabledPlugins":{"github@claude-plugins-official":true}}"#,
-        )?;
-
-        enable_claude_code_plugin(&path, "ahma@local")?;
-
-        let content = std::fs::read_to_string(&path)?;
-        let parsed: serde_json::Value = serde_json::from_str(&content)?;
-        assert_eq!(parsed["model"], "sonnet");
         assert_eq!(
-            parsed["enabledPlugins"]["github@claude-plugins-official"],
-            true
+            dirs[1],
+            home.join(".claude").join("skills").join("ahma"),
+            "second target must be the Claude Code native ~/.claude/skills path"
         );
-        assert_eq!(parsed["enabledPlugins"]["ahma@local"], true);
-        Ok(())
     }
 
     #[test]
-    fn test_install_claude_code_plugin() -> Result<()> {
-        let tmp = tempdir()?;
-        let home = tmp.path();
-
-        // Create ~/.claude/ so the function proceeds
-        std::fs::create_dir_all(home.join(".claude"))?;
-
-        let plugin_dir = install_claude_code_plugin(home)?;
-
-        // Check SKILL.md was written
-        assert!(
-            plugin_dir
-                .join("skills")
-                .join("ahma")
-                .join("SKILL.md")
-                .exists()
-        );
-        // Check plugin.json was written
-        let plugin_json_path = plugin_dir.join(".claude-plugin").join("plugin.json");
-        assert!(plugin_json_path.exists());
-        let meta: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&plugin_json_path)?)?;
-        assert_eq!(meta["name"], "ahma");
-        // Check installed_plugins.json was updated
-        let plugins_json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
-            home.join(".claude")
-                .join("plugins")
-                .join("installed_plugins.json"),
-        )?)?;
-        assert!(plugins_json["plugins"]["ahma@local"].is_array());
-        // Check settings.json was updated
-        let settings: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
-            home.join(".claude").join("settings.json"),
-        )?)?;
-        assert_eq!(settings["enabledPlugins"]["ahma@local"], true);
-        Ok(())
-    }
-
-    #[test]
-    fn test_install_claude_code_plugin_skipped_when_no_dot_claude() -> Result<()> {
-        let tmp = tempdir()?;
-        let home = tmp.path();
-        // ~/.claude/ does NOT exist — plugin install should be skipped
-        assert!(!home.join(".claude").exists());
-        // setup_agent_skills checks for ~/.claude/ before calling install_claude_code_plugin,
-        // so verify install_claude_code_plugin itself still works (the guard is in the caller)
-        // but also verify it doesn't panic on an absent parent
-        let result = install_claude_code_plugin(home);
-        // It will succeed by creating the dirs under the tmp home
-        assert!(result.is_ok());
-        Ok(())
+    fn test_skill_install_dirs_directory_name_is_ahma() {
+        // The command name is derived from the directory name, so every target
+        // must be named `ahma` for the skill to surface as `/ahma`.
+        for dir in skill_install_dirs(Path::new("/some/home")) {
+            assert_eq!(dir.file_name().unwrap(), "ahma");
+        }
     }
 
     #[test]
