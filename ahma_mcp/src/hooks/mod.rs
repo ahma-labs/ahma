@@ -11,6 +11,9 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
+mod consent;
+pub use consent::HookConsentStore;
+
 const MANAGED_ID_DEFAULT_SHELL_V1: &str = "ahma-default-shell-v1";
 const WRAPPED_BY_MARKER: &str = "ahma-hooks-wrapper-v1";
 const HOOK_TIMEOUT_SECS: u64 = 30;
@@ -18,22 +21,28 @@ const PATH_LOOKUP_BINARY: &str = "ahma";
 
 /// The decision `compute_exec_decision` makes for each tool invocation.
 ///
-/// Every variant begins with `Allow` on purpose: the hook is **fail-open** and
-/// never blocks a command. It either passes it through, rewrites it to route
-/// through the sandbox, or (when ahma is unavailable) allows it unsandboxed with
-/// a loud warning.
+/// When ahma can sandbox, the command is passed through or rewritten to route
+/// through the kernel sandbox. When ahma **cannot** sandbox, the behaviour is
+/// governed by one-time session consent (SPEC R5.5.3): the first such command
+/// fails closed ([`DenyPendingConsent`](HooksDecision::DenyPendingConsent)); only
+/// after explicit consent does it run unsandboxed with a loud, persistent
+/// warning. ahma never silently runs a command unsandboxed.
 #[derive(Debug)]
-#[allow(clippy::enum_variant_names)]
 enum HooksDecision {
     /// Allow the command through without modification (passthrough to default terminal).
     AllowUnchanged,
     /// Allow with a rewritten command that routes through ahma's kernel sandbox.
     AllowRewrite(Value),
-    /// **Fail open**: ahma could not set up sandboxing, so allow the original
-    /// command to run UNSANDBOXED, but surface a loud warning to the user and
-    /// agent. Used whenever ahma itself fails (env detection, cwd resolution,
-    /// wrapper construction). The command is *not* blocked — the user explicitly
-    /// chose fail-open behavior so that a broken ahma never wedges their terminal.
+    /// **Fail closed (pending consent)**: ahma cannot sandbox this command and
+    /// the user has not consented to unsandboxed execution this session. The
+    /// command is DENIED with an actionable message (R5.5.3).
+    DenyPendingConsent {
+        user_message: String,
+        agent_message: String,
+    },
+    /// ahma cannot sandbox, but the user has consented to unsandboxed execution
+    /// this session. Allow the original command UNSANDBOXED with a loud,
+    /// persistent warning (R5.5.3).
     AllowWithWarning {
         user_message: String,
         agent_message: String,
@@ -76,6 +85,17 @@ pub enum HooksCommand {
     /// Internal shell wrapper used by managed hooks.
     #[command(name = "run-shell", hide = true)]
     RunShell(HooksRunShellArgs),
+    /// Allow hook commands to run UNSANDBOXED for this session when ahma cannot
+    /// sandbox them (SPEC R5.5.3). Consent is session-scoped and never persists
+    /// across a reboot; revoke it with `ahma hooks revoke`.
+    #[command(name = "approve-unsandboxed")]
+    ApproveUnsandboxed,
+    /// Revoke this session's unsandboxed-execution consent. Hooks that cannot be
+    /// sandboxed will fail closed again.
+    Revoke,
+    /// Diagnose why ahma cannot sandbox (binary path/version, kernel backend) and
+    /// print repair guidance, plus the current consent state.
+    Doctor,
 }
 
 #[derive(Args, Debug)]
@@ -322,7 +342,72 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
         HooksCommand::Status(args) => run_status(args),
         HooksCommand::Exec(args) => run_exec(args),
         HooksCommand::RunShell(args) => run_shell(args, cfg).await,
+        HooksCommand::ApproveUnsandboxed => run_approve_unsandboxed(),
+        HooksCommand::Revoke => run_revoke_consent(),
+        HooksCommand::Doctor => run_doctor(),
     }
+}
+
+/// `ahma hooks approve-unsandboxed` — grant session-scoped consent (R5.5.3).
+fn run_approve_unsandboxed() -> Result<()> {
+    let store = HookConsentStore::current();
+    store
+        .grant()
+        .context("Failed to record unsandboxed-execution consent")?;
+    println!(
+        "✓ Unsandboxed hook execution APPROVED for this session.\n\
+         Commands that ahma cannot sandbox will now run UNSANDBOXED with a warning.\n\
+         This consent does NOT persist across a reboot. Revoke anytime: `ahma hooks revoke`.\n\
+         Prefer to fix the root cause? Run `ahma hooks doctor`."
+    );
+    Ok(())
+}
+
+/// `ahma hooks revoke` — clear session consent; fall-open fails closed again.
+fn run_revoke_consent() -> Result<()> {
+    HookConsentStore::current()
+        .revoke()
+        .context("Failed to revoke unsandboxed-execution consent")?;
+    println!(
+        "✓ Unsandboxed hook consent REVOKED. Commands ahma cannot sandbox will now \
+         fail closed (be blocked) until you repair ahma or re-approve."
+    );
+    Ok(())
+}
+
+/// `ahma hooks doctor` — report why ahma may be unable to sandbox, plus consent state.
+fn run_doctor() -> Result<()> {
+    println!("ahma hooks doctor\n");
+
+    match std::env::current_exe() {
+        Ok(p) => println!("  binary       : {}", p.display()),
+        Err(e) => println!("  binary       : <unknown> ({e})"),
+    }
+    println!("  version      : {}", env!("CARGO_PKG_VERSION"));
+
+    match crate::sandbox::test_sandbox_exec_available() {
+        Ok(()) => println!("  kernel sandbox: AVAILABLE"),
+        Err(e) => println!(
+            "  kernel sandbox: UNAVAILABLE — {e}\n\
+             \n  Repair: reinstall/update ahma so the hook binary can enforce the sandbox,\n\
+             then retry. On macOS ensure `sandbox-exec` is present; on Linux ensure a\n\
+             Landlock-capable kernel (5.13+)."
+        ),
+    }
+
+    let store = HookConsentStore::current();
+    if store.is_consented() {
+        println!(
+            "  consent      : GRANTED ({} unsandboxed run(s) this session)",
+            store.count()
+        );
+        if let Some(banner) = store.banner() {
+            println!("\n{banner}");
+        }
+    } else {
+        println!("  consent      : none (fall-open fails closed; commands are blocked)");
+    }
+    Ok(())
 }
 
 pub fn run_install(args: HooksInstallArgs) -> Result<()> {
@@ -613,7 +698,8 @@ fn run_exec(args: HooksExecArgs) -> Result<()> {
         Ok(e) => e,
         Err(e) => {
             let decision = if is_ahma_hooks_active() {
-                fail_open_warning(&format!("ahma hook setup failed: {e}"))
+                let consented = HookConsentStore::current().is_consented();
+                unsandboxable_decision(&format!("ahma hook setup failed: {e}"), consented)
             } else {
                 HooksDecision::AllowUnchanged
             };
@@ -625,28 +711,54 @@ fn run_exec(args: HooksExecArgs) -> Result<()> {
     emit_decision(decision, args.platform)
 }
 
-/// Build a fail-open decision: allow the command unsandboxed, with a loud
-/// warning for both the user and the agent.
-fn fail_open_warning(reason: &str) -> HooksDecision {
-    HooksDecision::AllowWithWarning {
-        user_message: format!(
-            "⚠️  ahma sandbox bypassed — {reason}. The command will run WITHOUT \
-             ahma's kernel sandbox. Run `ahma hooks uninstall` or set AHMA_HOOKS=off \
-             to stop attempting to sandbox, or fix the ahma installation to restore it."
-        ),
-        agent_message: format!(
-            "WARNING: ahma sandboxing is unavailable ({reason}). This command is \
-             running in the default terminal WITHOUT kernel-level sandboxing. \
-             File writes are NOT confined to the workspace. Proceed with caution."
-        ),
+/// Build the decision for a command ahma cannot sandbox (SPEC R5.5.3).
+///
+/// Fails closed unless the user has consented to unsandboxed execution this
+/// session, in which case it allows the command unsandboxed with a loud warning.
+/// Pass `consented` from [`HookConsentStore::is_consented`] (threaded in so the
+/// decision logic stays pure and unit-testable).
+fn unsandboxable_decision(reason: &str, consented: bool) -> HooksDecision {
+    if consented {
+        HooksDecision::AllowWithWarning {
+            user_message: format!(
+                "⚠️  ahma sandbox UNAVAILABLE — {reason}. Running UNSANDBOXED \
+                 (you approved this session with `ahma hooks approve-unsandboxed`). \
+                 Run `ahma hooks doctor` to repair, or `ahma hooks revoke` to stop."
+            ),
+            agent_message: format!(
+                "WARNING: ahma sandboxing is unavailable ({reason}). This command is \
+                 running WITHOUT kernel-level sandboxing under a session consent. \
+                 File writes are NOT confined to the workspace. Proceed with caution."
+            ),
+        }
+    } else {
+        HooksDecision::DenyPendingConsent {
+            user_message: format!(
+                "⛔ ahma sandbox UNAVAILABLE — {reason}. The command was BLOCKED to \
+                 avoid running unsandboxed. Fix: run `ahma hooks doctor` to repair the \
+                 ahma installation. To run unsandboxed for THIS session anyway, run \
+                 `ahma hooks approve-unsandboxed` and retry. To stop sandboxing entirely, \
+                 run `ahma hooks uninstall` or set AHMA_HOOKS=off."
+            ),
+            agent_message: format!(
+                "BLOCKED: ahma could not sandbox this command ({reason}) and unsandboxed \
+                 execution has not been approved this session. The command did NOT run. \
+                 Tell the user to run `ahma hooks doctor` (repair) or \
+                 `ahma hooks approve-unsandboxed` (allow unsandboxed this session), then retry."
+            ),
+        }
     }
 }
 
 /// Write the decision to stdout for the IDE, and mirror any fail-open warning to
 /// stderr so it is visible even when the IDE does not surface allow-time messages.
 fn emit_decision(decision: HooksDecision, platform: HookPlatform) -> Result<()> {
-    if let HooksDecision::AllowWithWarning { user_message, .. } = &decision {
-        eprintln!("{user_message}");
+    match &decision {
+        HooksDecision::AllowWithWarning { user_message, .. }
+        | HooksDecision::DenyPendingConsent { user_message, .. } => {
+            eprintln!("{user_message}");
+        }
+        _ => {}
     }
     let output = build_exec_output(decision, platform);
     write_exec_output(&output)
@@ -757,16 +869,26 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
     }
 }
 
-/// Fail-open fallback: run `command` directly in the platform shell, in `cwd`,
-/// without ahma's sandbox. Emits a loud warning explaining that sandboxing was
-/// bypassed, then forwards the command's stdout/stderr and exit status.
+/// Fallback path when ahma's own execution cannot sandbox the command (SPEC
+/// R5.5.3). Fails closed unless the user consented to unsandboxed execution this
+/// session; when consented, runs `command` in the platform shell with a loud,
+/// counted warning and forwards stdout/stderr and exit status.
 async fn run_command_unsandboxed(cwd: &str, command: &str, reason: &str) -> Result<()> {
+    let store = HookConsentStore::current();
+    if !store.is_consented() {
+        // Fail closed: do NOT run the command unsandboxed without explicit consent.
+        bail!(
+            "⛔ ahma sandbox UNAVAILABLE — {reason}. Command BLOCKED (not run) to avoid \
+             unsandboxed execution. Fix: `ahma hooks doctor` to repair, or \
+             `ahma hooks approve-unsandboxed` to allow unsandboxed for this session, then retry."
+        );
+    }
+    let count = store.record_unsandboxed_run().unwrap_or(0);
     eprintln!(
-        "\n⚠️  ahma sandbox bypassed — {reason}.\n\
-         ⚠️  Running this command in the DEFAULT terminal WITHOUT kernel sandboxing.\n\
-         ⚠️  File writes are NOT confined to the workspace. To stop attempting to\n\
-         ⚠️  sandbox, run `ahma hooks uninstall` or set AHMA_HOOKS=off; otherwise\n\
-         ⚠️  fix the ahma installation to restore sandboxing.\n"
+        "\n⚠️  ahma sandbox UNAVAILABLE — {reason}.\n\
+         ⚠️  Running UNSANDBOXED ({count} this session) under your `approve-unsandboxed` consent.\n\
+         ⚠️  File writes are NOT confined to the workspace. Run `ahma hooks doctor` to repair,\n\
+         ⚠️  or `ahma hooks revoke` to stop allowing unsandboxed execution.\n"
     );
 
     let shell = crate::shell_pool::platform_shell_program();
@@ -879,7 +1001,15 @@ fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
 /// 5. Active but ahma setup/rewrite fails → **fail open**: allow the original
 ///    command to run unsandboxed, with a loud warning (never block).
 fn compute_exec_decision(input: &Value, scope: HookScope, env: &HookEnvironment) -> HooksDecision {
-    compute_exec_decision_internal(input, scope, env, is_ahma_hooks_active())
+    let consented = HookConsentStore::current().is_consented();
+    let decision =
+        compute_exec_decision_internal(input, scope, env, is_ahma_hooks_active(), consented);
+    // When we are about to allow an UNSANDBOXED run under consent, count it so the
+    // persistent banner reflects how many commands have bypassed the sandbox.
+    if matches!(decision, HooksDecision::AllowWithWarning { .. }) {
+        let _ = HookConsentStore::current().record_unsandboxed_run();
+    }
+    decision
 }
 
 fn compute_exec_decision_internal(
@@ -887,6 +1017,7 @@ fn compute_exec_decision_internal(
     scope: HookScope,
     env: &HookEnvironment,
     active: bool,
+    consented: bool,
 ) -> HooksDecision {
     let args = match extract_tool_args(input) {
         Ok(Some(a)) => a,
@@ -907,7 +1038,10 @@ fn compute_exec_decision_internal(
     let cwd = match extract_command_cwd(input, &args.tool_input) {
         Ok(cwd) => cwd,
         Err(e) => {
-            return fail_open_warning(&format!("could not determine working directory: {e}"));
+            return unsandboxable_decision(
+                &format!("could not determine working directory: {e}"),
+                consented,
+            );
         }
     };
 
@@ -916,9 +1050,10 @@ fn compute_exec_decision_internal(
             let updated = updated_tool_input(&args.tool_input, wrapped, &args.arg_key);
             HooksDecision::AllowRewrite(updated)
         }
-        // FAIL OPEN: wrapper construction failed — run unsandboxed with a warning
-        // rather than denying the command.
-        Err(e) => fail_open_warning(&format!("failed to build sandbox wrapper: {e}")),
+        // ahma cannot build the sandbox wrapper — fail closed unless consented (R5.5.3).
+        Err(e) => {
+            unsandboxable_decision(&format!("failed to build sandbox wrapper: {e}"), consented)
+        }
     }
 }
 
@@ -968,6 +1103,15 @@ fn build_cursor_hook_output(decision: HooksDecision) -> Value {
             "user_message": user_message,
             "agent_message": agent_message,
         }),
+        // Fail closed (R5.5.3): deny the command outright.
+        HooksDecision::DenyPendingConsent {
+            user_message,
+            agent_message,
+        } => json!({
+            "permission": "deny",
+            "user_message": user_message,
+            "agent_message": agent_message,
+        }),
     }
 }
 
@@ -991,6 +1135,17 @@ fn build_structured_hook_output(decision: HooksDecision) -> Value {
         } => json!({
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
+            "agentMessage": agent_message,
+            "systemMessage": user_message,
+        }),
+        // Fail closed (R5.5.3): deny with reason.
+        HooksDecision::DenyPendingConsent {
+            user_message,
+            agent_message,
+        } => json!({
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": user_message,
             "agentMessage": agent_message,
             "systemMessage": user_message,
         }),
@@ -1694,7 +1849,8 @@ mod tests {
             }
         });
 
-        let decision = compute_exec_decision_internal(&input, HookScope::Project, &env, true);
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
         let output = build_exec_output(decision, HookPlatform::Claude);
         let updated = &output["hookSpecificOutput"]["updatedInput"];
         let command = updated["command"].as_str().unwrap();
@@ -1714,7 +1870,8 @@ mod tests {
             }
         });
 
-        let decision = compute_exec_decision_internal(&input, HookScope::Project, &env, true);
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
         let output = build_exec_output(decision, HookPlatform::Antigravity);
         let updated = &output["hookSpecificOutput"]["updatedInput"];
         let command = updated["CommandLine"].as_str().unwrap();
@@ -1744,7 +1901,8 @@ mod tests {
                 "cwd": "/tmp/project",
             });
             // active=true: even when ahma is on, non-shell tools must pass through
-            let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true);
+            let decision =
+                compute_exec_decision_internal(&input, HookScope::User, &env, true, false);
             let output = build_exec_output(decision, HookPlatform::Copilot);
             // Must return allow with no input modification
             assert_eq!(
@@ -1760,7 +1918,8 @@ mod tests {
 
         // Also check: completely missing tool_input field
         let input_no_args = json!({"tool_name": "unknown", "cwd": "/tmp"});
-        let decision = compute_exec_decision_internal(&input_no_args, HookScope::User, &env, true);
+        let decision =
+            compute_exec_decision_internal(&input_no_args, HookScope::User, &env, true, false);
         let output = build_exec_output(decision, HookPlatform::Copilot);
         assert_eq!(
             output["hookSpecificOutput"]["permissionDecision"].as_str(),
@@ -1919,7 +2078,7 @@ mod tests {
             "tool_input": { "command": "rm -rf /" }
         });
         // active=false → must return allow-unchanged regardless of command
-        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, false);
+        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, false, false);
         let output = build_exec_output(decision, HookPlatform::Cursor);
         assert_eq!(output["permission"].as_str(), Some("allow"));
         assert!(
@@ -1938,7 +2097,7 @@ mod tests {
             "cwd": "/tmp/project",
             "tool_input": { "command": already_wrapped }
         });
-        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true);
+        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true, false);
         let output = build_exec_output(decision, HookPlatform::Cursor);
         assert_eq!(output["permission"].as_str(), Some("allow"));
         assert!(output.get("updated_input").is_none());
@@ -1951,7 +2110,7 @@ mod tests {
             "cwd": "/tmp/project",
             "tool_input": { "command": "cargo build" }
         });
-        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true);
+        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true, false);
         let output = build_exec_output(decision, HookPlatform::Cursor);
         assert_eq!(output["permission"].as_str(), Some("allow"));
         let updated = output["updated_input"]["command"].as_str().unwrap();
@@ -1959,16 +2118,32 @@ mod tests {
     }
 
     #[test]
-    fn test_fail_open_warning_allows_with_messages() {
-        // fail_open_warning must produce an AllowWithWarning (not Deny) so the
-        // command runs unsandboxed.
-        match fail_open_warning("test reason") {
+    fn test_unsandboxable_without_consent_denies() {
+        // SPEC R5.5.3: with no consent, an un-sandboxable command FAILS CLOSED.
+        match unsandboxable_decision("test reason", false) {
+            HooksDecision::DenyPendingConsent {
+                user_message,
+                agent_message,
+            } => {
+                assert!(user_message.contains("test reason"));
+                assert!(user_message.contains("BLOCKED"));
+                assert!(user_message.contains("approve-unsandboxed"));
+                assert!(agent_message.contains("did NOT run"));
+            }
+            other => panic!("expected DenyPendingConsent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unsandboxable_with_consent_allows_with_warning() {
+        // SPEC R5.5.3: after consent, it runs unsandboxed with a loud warning.
+        match unsandboxable_decision("test reason", true) {
             HooksDecision::AllowWithWarning {
                 user_message,
                 agent_message,
             } => {
                 assert!(user_message.contains("test reason"));
-                assert!(user_message.contains("bypassed"));
+                assert!(user_message.contains("UNSANDBOXED"));
                 assert!(agent_message.contains("WITHOUT"));
             }
             other => panic!("expected AllowWithWarning, got {other:?}"),
@@ -1976,29 +2151,34 @@ mod tests {
     }
 
     #[test]
-    fn test_exec_cursor_fail_open_allows_with_warning() {
-        // Cursor fail-open: permission is "allow" (NOT deny) so the command runs,
-        // but warning fields are attached.
-        let output = build_exec_output(fail_open_warning("boom"), HookPlatform::Cursor);
+    fn test_exec_cursor_fail_closed_denies() {
+        // Cursor: with no consent, permission is "deny" (fail closed, R5.5.3).
+        let output = build_exec_output(unsandboxable_decision("boom", false), HookPlatform::Cursor);
         assert_eq!(
             output["permission"].as_str(),
-            Some("allow"),
-            "fail-open must allow the command, never deny it"
+            Some("deny"),
+            "no-consent fall-open must deny the command (R5.5.3)"
         );
         assert!(output["user_message"].as_str().unwrap().contains("boom"));
-        assert!(output["agent_message"].is_string());
     }
 
     #[test]
-    fn test_exec_structured_fail_open_allows_with_warning() {
-        let output = build_exec_output(fail_open_warning("boom"), HookPlatform::Claude);
+    fn test_exec_cursor_consented_allows_with_warning() {
+        let output = build_exec_output(unsandboxable_decision("boom", true), HookPlatform::Cursor);
+        assert_eq!(output["permission"].as_str(), Some("allow"));
+        assert!(output["user_message"].as_str().unwrap().contains("boom"));
+    }
+
+    #[test]
+    fn test_exec_structured_fail_closed_denies() {
+        let output = build_exec_output(unsandboxable_decision("boom", false), HookPlatform::Claude);
         let hs = &output["hookSpecificOutput"];
         assert_eq!(
             hs["permissionDecision"].as_str(),
-            Some("allow"),
-            "fail-open must allow the command, never deny it"
+            Some("deny"),
+            "no-consent fall-open must deny the command (R5.5.3)"
         );
-        assert!(hs["agentMessage"].as_str().unwrap().contains("WITHOUT"));
+        assert!(hs["agentMessage"].as_str().unwrap().contains("did NOT run"));
         assert!(hs["systemMessage"].as_str().unwrap().contains("boom"));
     }
 

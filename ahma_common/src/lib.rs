@@ -26,8 +26,10 @@ pub const BUILD_ID: &str = env!("AHMA_BUILD_ID");
 
 pub mod config;
 pub mod daemon_hub;
+pub mod elicitation;
 pub mod event_dispatcher;
 pub mod file_uri;
+pub mod hook_consent;
 pub mod keepalive;
 pub mod local_tls;
 pub mod observability;
@@ -36,5 +38,7 @@ pub mod peer_factory;
 pub mod peer_transport;
 pub mod prompts;
 pub mod sandbox_state;
+pub mod scope_decision;
 pub mod state_machine;
 pub mod timeouts;
+pub mod workspace_scope;
