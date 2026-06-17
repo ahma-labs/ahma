@@ -24,7 +24,7 @@
 | HTTP Bridge Mode | tests-pass | HTTP/SSE proxy for web clients |
 | HTTP Streaming (Streamable HTTP) | tests-pass | POST SSE with event IDs, event history, Last-Event-Id replay, full multiplexing |
 | HTTP/3 (QUIC) Client Preference | tests-pass | All HTTP clients prefer HTTP/3 (QUIC) when server supports it; transparent fallback to HTTP/2 and HTTP/1.1 |
-| Session Isolation (HTTP) | tests-pass | Per-session sandbox scope via MCP `roots/list` |
+| Session Isolation (HTTP) | tests-pass | Per-workspace sandbox scope (R5.1), shared by attached sessions, sourced via MCP `roots/list` |
 | Built-in `status` Tool | tests-pass | Non-blocking progress check for async operations |
 | Built-in `await` Tool | tests-pass | Blocking wait for operation completion |
 | Built-in `cancel` Tool | tests-pass | Cancel running operations |
@@ -314,27 +314,53 @@ The sandbox scope defines the root directory boundary. AI has **full read/write 
 
 ### R5: Sandbox Scope
 
-- **R5.1**: Sandbox scope is set once at initialization and **cannot** be changed during the session.
-- **R5.2**: **STDIO mode**: Defaults to current working directory (IDE sets `cwd` to `${workspaceFolder}` in `mcp.json`). When the scope is derived *implicitly* (CWD fallback) rather than from an explicit `--sandbox-scope`/`--working-directories`, the server **must** still request `roots/list` from the client and prefer the client-provided workspace roots. This is required for shared-process clients (e.g. Cursor) whose single MCP subprocess is launched with a `cwd` unrelated to the open workspace — often the **system temp directory** — so the implicit CWD scope would otherwise lock the sandbox to the wrong root.
-  - **The system temp directory and the filesystem root MUST NEVER be used as a locked sandbox scope.** If the CWD is inside the temp directory or is a filesystem root, the server must fall back to `~/sandbox` (when `--sandbox` is set) or an empty provisional scope (awaiting `roots/list`), never to the temp path.
-  - Implicit scopes (CWD fallback) serve only as a provisional fallback; they yield to client `roots/list`.
-- **R5.2.1**: **Persistent secondary scope (`~/sandbox`)**: When `--sandbox` is set (or `[sandbox] use_sandbox_directory = true`), the configured `sandbox_directory` (default `~/sandbox`) **must** be added to the sandbox scope as a **persistent secondary scope** that:
-  - Is created at startup if it does not exist.
-  - Survives every `roots/list` update: `update_scopes(roots)` produces `roots ∪ {~/sandbox}`, not just `roots`.
-  - Is forwarded to background bridge subprocesses via the `--sandbox` flag, not as a `--sandbox-scope` value (so subprocesses can derive it themselves and keep it persistent).
-  - Provides the AI a stable per-user scratch space regardless of which workspace is open.
-- **R5.2.2**: **Temp dir is opt-in and auxiliary only**: The system temp directory (`/tmp`, `$TMPDIR`) **must not** be included in the sandbox scope except when explicitly enabled via `--tmp` or `[sandbox] tmp_access = true`. When enabled, it is an auxiliary scope appended after `roots ∪ {~/sandbox}`, never the sole or primary scope.
-- **R5.3**: **HTTP mode**: Set once at server start via (in order of precedence):
-  1. `--sandbox-scope <path>` CLI parameter
-  2. `sandbox.scopes` in the **user** settings file (`~/.ahma/settings.toml`; never the project settings file — see R-CFG2.2)
-  3. Current working directory (only when not inside temp dir and not a filesystem root)
+**Design principles (govern all of R5):** scope is never inferred from spoofable signals; the complete scope is always visible with its provenance; the user is prompted *only* on a genuine security downgrade (never on routine establishment or narrowing); and when the user cannot be asked, ahma fails to a clear, shown default rather than silently widening or running unsandboxed. "No surprises" is the controlling invariant.
 
-  `AHMA_SANDBOX_SCOPE` is no longer honored (R-CFG1.2): sandbox scope **must not** be settable from ambient environment state.
-- **R5.4**: **Write Protection**: The system **must** block any attempt to write to files outside the sandbox scope, including via command arguments (e.g., `touch /outside/file`).
-- **R5.5**: **Explicit Scope Override**: If scopes are provided *explicitly* — `--sandbox-scope`/`--working-directories` via CLI, the user settings file, or a task vault — the system **must** respect them and **must not** attempt to expand or modify them via the MCP `roots/list` protocol (roots requests are skipped). This prevents potential security bypasses where a compromised client could widen the scope, and ensures stability for clients that do not support the roots protocol. The skip applies **only** to explicit scopes: an implicitly-derived scope (CWD fallback) does **not** suppress the `roots/list` request (see R5.2). Note: `--sandbox` sets a persistent secondary scope (R5.2.1) that participates in `roots/list` union updates and does **not** suppress `roots/list`.
-- **R5.5.1**: **Scope propagation to subprocesses**: When the stdio MCP server spawns a background bridge or per-session subprocesses, it **must** forward only genuinely explicit `--sandbox-scope` values (not provisional CWD/temp). The `--sandbox` and `--tmp` boolean flags are forwarded separately so each subprocess can independently derive the persistent secondary and auxiliary scopes.
-- **R5.5.2**: **Default install uses `--sandbox`**: The default MCP server configuration installed by `ahma setup` for Cursor, VSCode, Claude, and Codex **must** include `--sandbox` (not `--tmp`). The `--tmp` flag is never included in default installs; it is opt-in only.
-- **R5.5.3**: **Fail-open hooks**: The Cursor `preToolUse` hook installed by ahma **must** use `failClosed: false` so that if the hook binary is missing, crashes, or times out, Cursor runs the command unsandboxed rather than blocking the user's terminal. Re-running `ahma hooks install` or `ahma setup` **must** migrate an existing `failClosed: true` entry to `false`.
+#### Scope ownership and lifetime
+
+- **R5.1**: **Per-workspace instance ownership**: A sandbox scope is owned by a **per-workspace server instance**, not by an individual MCP session. All sessions (IDE, TUI, CLI) that attach to a workspace instance **share and gate on** that single scope. The scope is set once per instance and **cannot** be mutated for the life of the instance (the lock-once invariant). Sessions do not carry their own scope.
+- **R5.1.1**: **Single commit point**: Every scope commit — derived from `roots/list`, from an explicit flag, from a user elicitation answer, or from the default — **must** go through one atomic compare-and-swap on the instance scope state machine. There is exactly one door to "scope locked"; there is no second path that can set or widen scope after lock.
+
+#### Scope source (no spoofable inference)
+
+- **R5.2**: **Scope source precedence**: The locked scope **must** be derived from exactly one of the following, in order; the chosen source **must** be recorded for display (R5.4):
+  1. **Explicit** `--sandbox-scope` / `--working-directories` (CLI, user settings file, or task vault) — locked immediately; `roots/list` is **not** requested (R5.2.2).
+  2. **Client `roots/list`** — the workspace roots reported by the MCP client.
+  3. **User elicitation answer** — only when reaching the scope requires a downgrade decision (R5.3).
+  4. **Declared default** `~/sandbox` — used when no client roots arrive and no explicit scope is set (R5.2.3).
+- **R5.2.1**: **No marker-based inference**: The server **must not** infer or accept a sandbox scope from the presence of project-marker files (`.git`, `Cargo.toml`, `package.json`, etc.) or any other spoofable, ambient signal in the current working directory. The launch CWD is **not** trusted as a scope on its own; it may only become the scope by being reported through `roots/list` (R5.2 step 2) or named explicitly (step 1). Marker-file "plausible workspace" heuristics are prohibited.
+- **R5.2.2**: **Explicit scope is locked and never widened**: When the scope is provided explicitly (R5.2 step 1), the server **must not** request or apply `roots/list` and **must not** widen the scope by any means. This blocks a compromised or buggy client from widening an operator-chosen scope, and gives roots-less clients a stable scope.
+- **R5.2.3**: **Default `~/sandbox`, shown loudly**: When the client supplies no usable roots and no explicit scope is configured, the server **must** lock to the configured `sandbox_directory` (default `~/sandbox`, created if absent) and surface it prominently with `source: default` (R5.4). The server **must not** lock to the launch CWD, the system temp directory, the home directory, or a filesystem root. `~/sandbox` is the only implicit fallback.
+- **R5.2.4**: **Hard rejections**: The system temp directory, the home directory, and any filesystem root (`/`, `C:\`, UNC root) **must never** be a locked scope, even after symlink resolution (R5.7). These are non-negotiable invariants, not heuristics.
+- **R5.2.5**: **Temp dir is opt-in and auxiliary only**: The system temp directory **must not** be in scope except when explicitly enabled via `--tmp` or `[sandbox] tmp_access = true`, in which case it is an auxiliary scope appended after the primary scope, never the sole or primary scope. Enabling `--tmp` is a downgrade (R5.3).
+
+#### Visibility (nothing silent)
+
+- **R5.4**: **Scope is always visible with provenance**: The complete locked scope — every writable root, every read-only root, `--tmp` status, and whether kernel enforcement is on or off — together with its **`source:`** attribution (`explicit` | `roots/list` | `elicited` | `default`) **must** be rendered through one canonical representation and surfaced at: (a) the startup banner and `ahma status`; (b) the persistent TUI scope panel; (c) the `notifications/sandbox/configured` payload (R5.6); and (d) the body of every scope-related error (e.g. the 409 returned before lock). No scope decision may be communicated only via an internal log line.
+
+#### Downgrade prompts (ask only when it matters)
+
+- **R5.3**: **Prompt only on a genuine downgrade**: The server **must** prompt the user **only** when an action would reduce the security posture: widening the writable set beyond the established scope, accepting client roots broader than an already-established scope, disabling kernel enforcement, adding the system temp directory (`--tmp`), or a terminal hook about to run unsandboxed (R5.5.3). First-time scope **establishment** and any **narrowing** are not downgrades: they are applied and shown (R5.4), never prompted. Prompts **must** be rare enough to remain meaningful; routine operation **must not** generate confirmation prompts ("no security theater").
+- **R5.3.1**: **Elicitation channel**: Downgrade prompts are delivered via the MCP `elicitation/create` request to every attached session whose client advertised the `elicitation` capability at `initialize`. The prompt **must** show the literal paths affected (never a vague "Allow workspace?"). The default-focused choice **must** be the narrowest/safest option; a *widening* choice **must** require an explicit, non-default selection (Enter alone **must not** widen).
+- **R5.3.2**: **Cannot-ask fallback**: When no attached client can be asked (none advertises `elicitation`) and no explicit scope is configured, the server **must not** silently widen or run unsandboxed. It locks to the default `~/sandbox` (R5.2.3) shown loudly; an out-of-band confirmation (TUI, or an explicit CLI command) is the only path to a broader scope.
+- **R5.3.3**: **Dual-modal coordination**: When multiple sessions are attached to one workspace instance, a single downgrade decision is fanned to all capable sessions under one `decision_id`. The server (not any client) owns the decision. When any session answers, the server **must** dismiss the prompt on the others via `notifications/cancelled` for that `decision_id`. When a session that holds an open prompt terminates (e.g. the IDE is closed), the server **must** resolve that prompt as cancelled-not-decided and dismiss any twin.
+- **R5.3.4**: **Conflict resolution — most-restrictive-wins, then re-confirm**: If two sessions answer the same `decision_id` within a short debounce window, the **narrowest** answer wins regardless of arrival order; a widening answer can never win over a narrowing one by timing. When answers conflicted, the committed (narrowest) scope **must** be shown for re-confirmation before lock; because the narrowest option is always the safe choice, this re-confirmation may auto-accept after a brief visible window.
+- **R5.3.5**: **Decision freshness**: A `decision_id` **must** bind to the session generation that created it. An answer that arrives after the handshake deadline (R10) or after the session was recycled **must** be rejected, never applied to a new session.
+- **R5.3.6**: **TUI-only establishment is pending**: An answer given in the TUI when no IDE session is live **must** establish the scope as **pending** (shown as such), applied when the next IDE session attaches to the workspace instance; it **must not** silently lock a scope that no live session is using as if it were active.
+
+#### Subprocess propagation and defaults
+
+- **R5.4.1**: **Scope propagation to subprocesses**: When the stdio MCP server spawns a background bridge or per-session subprocesses, it **must** forward only genuinely explicit `--sandbox-scope` values (never the provisional CWD or temp). The `--sandbox` and `--tmp` boolean flags are forwarded separately so each subprocess derives the default secondary and auxiliary scopes itself.
+- **R5.4.2**: **Default install uses `--sandbox`**: The default MCP server configuration installed by `ahma setup` for Cursor, VSCode, Claude, Antigravity, and Codex **must** include `--sandbox` (not `--tmp`). For clients known not to support `roots/list` (e.g. Antigravity, LM Studio), `ahma setup` **should** additionally inject an explicit `--sandbox-scope` (or rely on the `~/sandbox` default) so the client works without a stall.
+- **R5.4.3**: **Write Protection**: The system **must** block any attempt to write outside the locked scope, including via command arguments (e.g. `touch /outside/file`).
+
+#### Terminal hooks (one-time consent, never silent)
+
+- **R5.5.3**: **Hook fall-open requires one-time, session-scoped consent**: A terminal hook that can sandbox the command runs normally. A hook invocation that *cannot* sandbox (the ahma binary is missing, stale, crashes, times out, or the kernel sandbox is unavailable) **must not** silently run the command unsandboxed. Instead:
+  - The **first** such invocation in a session **fails closed**: it denies that command and emits an actionable message (the reason plus `ahma hooks doctor` / repair guidance and how to approve unsandboxed mode).
+  - Consent is collected **out-of-band** (an `elicitation/create` to an attached client/TUI, or an explicit `ahma hooks approve-unsandboxed` command) — never mid-command. Approving unsandboxed execution is maximal widening and **must** be an explicit, deliberate action, never an Enter-default.
+  - Consent is scoped to **workspace + session generation** and **must not** persist across restarts (persisting would silently re-downgrade the next session).
+  - While consent is active, every surface (R5.4) **must** continuously display a prominent banner stating that hooks are running unsandboxed and how many commands have done so.
 - **R5.6**: **Lifecycle Notifications**: The system **must** emit JSON-RPC notifications for sandbox lifecycle events:
   - `notifications/sandbox/configured`: When sandbox is successfully initialized from roots.
   - `notifications/sandbox/failed`: When sandbox initialization fails (payload: `{"error": "message"}`).
@@ -798,9 +824,9 @@ These three mechanisms together bound how long any abandoned `ahma serve stdio` 
 
 - **R10.1**: `--session-isolation` flag enables per-session subprocess with own sandbox scope.
 - **R10.2**: Session ID (UUID) generated on `initialize`, returned via `Mcp-Session-Id` header.
-- **R10.3**: Sandbox scope determined from first `roots/list` response.
-- **R10.4**: Once set, sandbox scope **cannot** be changed (security invariant).
-- **R10.5**: `roots/list_changed` after sandbox lock → session terminated, HTTP 403.
+- **R10.3**: Sandbox scope is resolved per the R5.2 source precedence (explicit → `roots/list` → elicitation → `~/sandbox` default) and committed through the single atomic compare-and-swap of R5.1.1. Scope is owned by the per-workspace instance and shared by all attached sessions (R5.1), not derived independently per session.
+- **R10.4**: Once committed, the instance sandbox scope **cannot** be changed (security invariant; R5.1).
+- **R10.5**: `roots/list_changed` after sandbox lock → session terminated, HTTP 403. Any scope-widening attempt after lock is rejected at the single commit point (R5.1.1).
 - **R10.6**: **Client Response Mapping**: The HTTP bridge MUST keep track of server-to-client JSON-RPC requests (such as `roots/list` and `sampling/createMessage`) by recording their request IDs. When a client sends a JSON-RPC response with a `result` field, the bridge MUST only process it as a `roots/list` response (and lock the sandbox) if its request ID matches an outstanding `roots/list` request. Client responses to other methods (e.g. keepalive pings or sampling) MUST NOT trigger roots-parsing or sandbox-locking logic, and MUST NOT generate invalid roots warnings or errors.
 - **R10.7**: **Daemon Chat MCP Base URL Resolution**: When the background daemon (`ahma serve` hub) runs an agent task, the `McpChatConfig` base URL (`base_url`) MUST be resolved to the local MCP bridge server's endpoint (HTTP host/port or Unix socket path as configured in the active service's `AppConfig`) rather than being set to the LLM provider's base URL. This ensures local tool calls (e.g. `read_file`) are routed back to the local MCP bridge.
 - **R10.8**: **TUI Window Chat MCP Resolution**: TUI window/subtask LLM tasks MUST be provided with the resolved `McpChatConfig` when running chat tasks to allow proper tool routing and sampling capabilities when requested.
