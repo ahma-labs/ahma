@@ -189,7 +189,7 @@ impl McpTestClient {
         serde_json::from_str::<Value>(&data.join("\n")).ok()
     }
 
-    async fn open_handshake_sse(&self, session_id: &str) -> Result<reqwest::Response, String> {
+    pub async fn open_handshake_sse(&self, session_id: &str) -> Result<reqwest::Response, String> {
         let sse_resp = self
             .client
             .get(self.mcp_url())

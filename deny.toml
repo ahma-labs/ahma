@@ -93,11 +93,10 @@ wildcards = "allow"
 # globally rather than by dependent crate.
 
 # ---------------------------------------------------------------------------
-# Sources – only allow crates.io plus the owner's rust-code-analysis fork
+# Sources – crates.io only (no git dependencies)
 # ---------------------------------------------------------------------------
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# Owner's fork of rust-code-analysis (pinned branch, used by the simplify feature in ahma_mcp)
-allow-git = ["https://github.com/paulirotta/rust-code-analysis"]
+allow-git = []

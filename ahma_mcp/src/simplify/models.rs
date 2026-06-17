@@ -415,9 +415,12 @@ impl FileSimplicity {
     /// Build a [`FileSimplicity`] entry from external analyzer metrics alone,
     /// without a corresponding rust-code-analysis base.
     ///
-    /// Used for language files (e.g. Kotlin) where rca cannot produce metrics
-    /// but an external tool (Detekt) did analyze the file.  SLOC is estimated
-    /// by counting source lines in the file on disk; MI is unknown (0).
+    /// Used for language files (Kotlin, Swift) where rca produces no usable
+    /// metrics — Swift it cannot parse, Kotlin it only stub-parses and is
+    /// deliberately skipped by `analysis::conversion::analyze_file` — but an
+    /// external tool (Detekt/SwiftLint/Lizard) did analyze the file.
+    /// SLOC is estimated by counting source lines in the file on disk; MI is
+    /// unknown (0).
     pub fn from_external(
         path: &std::path::Path,
         external: &super::analysis::ExternalMetrics,

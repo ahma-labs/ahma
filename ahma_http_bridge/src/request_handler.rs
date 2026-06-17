@@ -635,18 +635,24 @@ async fn handle_client_response(
     let has_result = payload.get("result").is_some();
     let has_error = payload.get("error").is_some();
 
+    let mut is_roots_list = false;
     if let Some(id_val) = response_id {
         let id_str = id_val
             .as_str()
             .map_or_else(|| id_val.to_string(), str::to_string);
-        if let Some(session) = session_manager.get_session(session_id)
-            && let Some((_, sender)) = session.routed_requests.remove(&id_str)
-        {
-            let _ = sender.send(payload.clone());
-            return with_session_header(
-                json_response_with_status(StatusCode::ACCEPTED, serde_json::json!({})),
-                session_id,
-            );
+        if let Some(session) = session_manager.get_session(session_id) {
+            if let Some((_, sender)) = session.routed_requests.remove(&id_str) {
+                let _ = sender.send(payload.clone());
+                return with_session_header(
+                    json_response_with_status(StatusCode::ACCEPTED, serde_json::json!({})),
+                    session_id,
+                );
+            }
+            if let Some((_, method)) = session.pending_client_requests.remove(&id_str)
+                && method == "roots/list"
+            {
+                is_roots_list = true;
+            }
         }
     }
 
@@ -659,7 +665,7 @@ async fn handle_client_response(
     );
 
     // Check if this is a roots/list response - extract roots and lock sandbox
-    if let Some(result) = payload.get("result") {
+    if is_roots_list && let Some(result) = payload.get("result") {
         try_lock_sandbox_from_roots(session_manager, session_id, result).await;
     }
 

@@ -178,6 +178,23 @@ pub const WINDOWS_CI_MULTIPLIER: u64 = 4;
 /// Both spawn sites reference this constant so they always agree on the default.
 pub const AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS: u64 = 10;
 
+/// Deadline (seconds) for the IDE-facing `ahma serve stdio` frontend to observe
+/// the client's MCP handshake (the first stdin message, i.e. `initialize`).
+///
+/// A real MCP client sends `initialize` within milliseconds of the connection
+/// opening — well before this deadline, which only starts counting once the
+/// proxy loop is reading stdin (after the background bridge is healthy). If no
+/// message arrives in time, the connection was spawned and abandoned (the
+/// dominant cause of `ahma serve stdio` process pile-up: an editor that
+/// repeatedly spawns servers without reaping them). The frontend then exits so
+/// such abandoned spawns cannot accumulate.
+///
+/// This bounds ONLY the pre-handshake window; once the first message is seen the
+/// deadline is disarmed and a live (possibly idle) session is never killed.
+/// Overridable for tests via the internal `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS`
+/// env var; `0` disables the deadline.
+pub const FRONTEND_HANDSHAKE_DEADLINE_SECS: u64 = 30;
+
 #[cfg(test)]
 mod tests {
     use super::*;

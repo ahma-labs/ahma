@@ -534,12 +534,26 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
     let active_mcps = detect_active_mcp_configs();
     if installed_count > 0 && !active_mcps.is_empty() {
         println!(
-            "\n\x1b[33mwarning\x1b[0m\x1b[1m: redundant shell interception configuration detected\x1b[0m"
+            "\n\x1b[36mnote\x1b[0m\x1b[1m: terminal hooks and an MCP server are both active for \"ahma\" — this is supported\x1b[0m"
         );
         println!(
-            "  \x1b[36m-->\x1b[0m Both terminal hooks and an active MCP server are configured for \"ahma\"."
+            "      The two are \x1b[1mcomplementary\x1b[0m, not redundant. They sandbox different"
         );
-        println!("      This can cause redundant tool wrapping and execution slowness.");
+        println!("      command streams:");
+        println!(
+            "        \x1b[1m• MCP server\x1b[0m   — the named, async tools the agent calls explicitly"
+        );
+        println!("                         (run_terminal_command, file-tools, git, …) with output");
+        println!("                         capture, monitoring and concurrency.");
+        println!(
+            "        \x1b[1m• terminal hooks\x1b[0m — transparently sandbox the shell commands the agent"
+        );
+        println!(
+            "                         runs through its NATIVE terminal/Bash tool, which never"
+        );
+        println!("                         pass through MCP. Without hooks those run unsandboxed.");
+        println!("      Together they give full sandbox coverage. A command is only ever wrapped");
+        println!("      once (already-wrapped and MCP tool calls are passed through untouched).");
         println!();
         println!("  \x1b[1mactive terminal hooks:\x1b[0m");
         for (platform, scope, path) in &installed_hooks {
@@ -557,12 +571,11 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
         }
         println!();
         println!(
-            "  \x1b[1mhelp\x1b[0m: Having both configurations active is redundant and degrades performance."
+            "  \x1b[1mtradeoff\x1b[0m: hooks add a small per-command sandbox cold-start. If your agent only"
         );
         println!(
-            "        It is highly recommended to keep the MCP server and uninstall the hooks."
+            "            uses ahma's MCP tools and never its native terminal, you can drop hooks:"
         );
-        println!("        To uninstall them, run:");
 
         let has_user = installed_hooks
             .iter()
@@ -571,10 +584,10 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
             .iter()
             .any(|(_, s, _)| *s == HookScope::Project);
         if has_user {
-            println!("          ahma hooks uninstall --scope user");
+            println!("              ahma hooks uninstall --scope user");
         }
         if has_project {
-            println!("          ahma hooks uninstall --scope project");
+            println!("              ahma hooks uninstall --scope project");
         }
         println!();
     }

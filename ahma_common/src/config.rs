@@ -494,7 +494,7 @@ impl Default for OmlxSettings {
 pub struct ToolSettings {
     /// Default tool execution timeout in seconds.
     /// Individual tools can override this via `timeout_seconds` in their JSON definition.
-    /// Default: `360`
+    /// Default: `600`
     pub timeout_secs: u64,
     /// Run all tools synchronously.  By default tools are async-first: if a result
     /// arrives within 5 seconds it is returned inline; otherwise an operation ID is
@@ -543,7 +543,7 @@ pub struct ToolSettings {
 impl Default for ToolSettings {
     fn default() -> Self {
         Self {
-            timeout_secs: 360,
+            timeout_secs: 600,
             force_sync: false,
             hot_reload: false,
             skip_probes: false,
@@ -1010,7 +1010,7 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 
 # ── Tool execution ───────────────────────────────────────────────────────────
 # [tools]
-# timeout_secs = 360      # default tool timeout (seconds); per-tool override via timeout_seconds
+# timeout_secs = 600      # default tool timeout (seconds); per-tool override via timeout_seconds
 # force_sync   = false    # run all tools synchronously instead of async-first
 # hot_reload   = false    # reload tools from disk on change — INSECURE in production
 # skip_probes  = false    # skip availability probes at startup
@@ -1379,7 +1379,7 @@ default_model = "llama3.2"
     #[test]
     fn ahma_settings_default_tools_values() {
         let s = AhmaSettings::default();
-        assert_eq!(s.tools.timeout_secs, 360);
+        assert_eq!(s.tools.timeout_secs, 600);
         assert!(!s.tools.force_sync);
         assert!(!s.tools.hot_reload);
         assert!(!s.tools.skip_probes);
@@ -1419,7 +1419,7 @@ default_model = "llama3.2"
         let s = AhmaSettings::load_from(&path);
         // Verify we get defaults, not an error
         assert_eq!(s.omlx.model, "mlx-community/gemma-4-12B-it-8bit");
-        assert_eq!(s.tools.timeout_secs, 360);
+        assert_eq!(s.tools.timeout_secs, 600);
     }
 
     #[test]

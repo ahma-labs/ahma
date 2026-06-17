@@ -242,7 +242,7 @@ pub fn spawn_tool_call_task(
         };
         let url = format!("{}/mcp", request_base_url);
 
-        let session_id = match get_or_create_session(&client, &url, &mcp).await {
+        let session_id = match ahma_core::agent::get_or_create_session(&client, &url, &mcp).await {
             Ok(sid) => sid,
             Err(err) => {
                 let _ = tx
@@ -256,8 +256,14 @@ pub fn spawn_tool_call_task(
             }
         };
 
-        let tool_result =
-            call_mcp_tool_http(&client, &url, &session_id, &tool, arguments.clone()).await;
+        let tool_result = ahma_core::agent::call_mcp_tool_http(
+            &client,
+            &url,
+            &session_id,
+            &tool,
+            arguments.clone(),
+        )
+        .await;
         let (result, failed) = match tool_result {
             Ok((result, failed)) => (result, failed),
             Err(ref err) if err.contains("HTTP 403") => {
@@ -265,9 +271,13 @@ pub fn spawn_tool_call_task(
                     session_id: None,
                     ..mcp.clone()
                 };
-                match get_or_create_session(&client, &url, &fresh_mcp).await {
+                match ahma_core::agent::get_or_create_session(&client, &url, &fresh_mcp).await {
                     Ok(new_sid) => {
-                        match call_mcp_tool_http(&client, &url, &new_sid, &tool, arguments).await {
+                        match ahma_core::agent::call_mcp_tool_http(
+                            &client, &url, &new_sid, &tool, arguments,
+                        )
+                        .await
+                        {
                             Ok((result, failed)) => (result, failed),
                             Err(e) => (format!("Error: {e}"), true),
                         }
@@ -281,140 +291,6 @@ pub fn spawn_tool_call_task(
             .send(BridgeEvent::ToolCallFinished { id, result, failed })
             .await;
     });
-}
-
-async fn get_or_create_session(
-    client: &reqwest::Client,
-    url: &str,
-    mcp: &McpChatConfig,
-) -> Result<String, String> {
-    if let Some(sid) = &mcp.session_id
-        && !sid.is_empty()
-    {
-        return Ok(sid.clone());
-    }
-
-    let init_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "roots": { "listChanged": false } },
-            "clientInfo": { "name": "ahma-tui-tool", "version": env!("CARGO_PKG_VERSION") }
-        }
-    });
-
-    let resp = client
-        .post(url)
-        .json(&init_body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to initialize session: {e}"))?;
-
-    let sid = resp
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| "No mcp-session-id header in response".to_string())?
-        .to_string();
-
-    let initialized_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized"
-    });
-
-    let _ = client
-        .post(url)
-        .header("mcp-session-id", &sid)
-        .json(&initialized_body)
-        .send()
-        .await;
-
-    Ok(sid)
-}
-
-fn parse_mcp_response(json_resp: &serde_json::Value) -> (String, bool) {
-    let result_val = json_resp.get("result");
-    let is_error = json_resp.get("error").is_some()
-        || (result_val
-            .and_then(|r| r.get("isError"))
-            .and_then(|e| e.as_bool())
-            .unwrap_or(false));
-
-    let content_str = if let Some(err) = json_resp.get("error") {
-        parse_error_message(err)
-    } else if let Some(res) = result_val {
-        extract_content_text(res)
-    } else {
-        "Empty result".to_string()
-    };
-
-    (content_str, is_error)
-}
-
-fn parse_error_message(err: &serde_json::Value) -> String {
-    format!(
-        "Error: {}",
-        err.get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error")
-    )
-}
-
-fn extract_content_text(res: &serde_json::Value) -> String {
-    if let Some(content_array) = res.get("content").and_then(|c| c.as_array()) {
-        let mut texts = Vec::new();
-        for item in content_array {
-            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
-                texts.push(t.to_string());
-            }
-        }
-        texts.join("\n")
-    } else {
-        serde_json::to_string_pretty(res).unwrap_or_default()
-    }
-}
-
-async fn call_mcp_tool_http(
-    client: &reqwest::Client,
-    url: &str,
-    session_id: &str,
-    tool: &str,
-    arguments: serde_json::Value,
-) -> Result<(String, bool), String> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "tools/call",
-        "params": {
-            "name": tool,
-            "arguments": arguments
-        }
-    });
-
-    let resp = client
-        .post(url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("mcp-session-id", session_id)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("HTTP {status}: {text}"));
-    }
-
-    let json_resp = resp
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("Failed to parse tool response JSON: {e}"))?;
-
-    Ok(parse_mcp_response(&json_resp))
 }
 
 pub fn spawn_decompose_task(client: LlmClient, goal: String, tx: Sender<BridgeEvent>) {
@@ -573,6 +449,7 @@ pub fn spawn_window_llm_task(
     base_url: String,
     model: String,
     instructions: String,
+    mcp: Option<McpChatConfig>,
     mut abort_rx: tokio::sync::oneshot::Receiver<()>,
     tx: Sender<BridgeEvent>,
 ) {
@@ -581,10 +458,14 @@ pub fn spawn_window_llm_task(
         let system_msg = "You are a reasoning agent performing a subtask. Follow the instructions carefully and output the results.";
         let messages = vec![ChatMessage::user(instructions)];
 
-        let stream = client.chat_stream(messages, Some(system_msg));
-        tokio::pin!(stream);
-
-        use futures::StreamExt;
+        let (core_tx, mut core_rx) = tokio::sync::mpsc::channel(100);
+        ahma_core::agent::spawn_chat_task(
+            client,
+            messages,
+            Some(system_msg.to_string()),
+            mcp,
+            core_tx,
+        );
 
         loop {
             tokio::select! {
@@ -597,17 +478,15 @@ pub fn spawn_window_llm_task(
                     }).await;
                     return;
                 }
-                res = stream.next() => {
+                res = core_rx.recv() => {
                     match res {
-                        Some(Ok(token)) => {
-                            if !token.is_empty() {
-                                let _ = tx.send(BridgeEvent::WindowOutput {
-                                    window_id,
-                                    line: token,
-                                }).await;
-                            }
+                        Some(ahma_core::agent::AgentEvent::Token(token)) if !token.is_empty() => {
+                            let _ = tx.send(BridgeEvent::WindowOutput {
+                                window_id,
+                                line: token,
+                            }).await;
                         }
-                        Some(Err(e)) => {
+                        Some(ahma_core::agent::AgentEvent::Error(e)) => {
                             let _ = tx.send(BridgeEvent::WindowFinished {
                                 window_id,
                                 success: false,
@@ -615,7 +494,7 @@ pub fn spawn_window_llm_task(
                             }).await;
                             return;
                         }
-                        None => {
+                        Some(ahma_core::agent::AgentEvent::Done) | None => {
                             let _ = tx.send(BridgeEvent::WindowFinished {
                                 window_id,
                                 success: true,
@@ -623,20 +502,10 @@ pub fn spawn_window_llm_task(
                             }).await;
                             return;
                         }
+                        _ => {}
                     }
                 }
             }
         }
     });
-}
-
-#[allow(dead_code)]
-pub(crate) fn needs_approval(tool_name: &str, tool_approval_enabled: bool) -> bool {
-    if tool_approval_enabled {
-        return true;
-    }
-    tool_name == "write_file"
-        || tool_name == "replace_in_file"
-        || tool_name.ends_with("::write_file")
-        || tool_name.ends_with("::replace_in_file")
 }

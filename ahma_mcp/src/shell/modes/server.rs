@@ -860,6 +860,17 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     );
 
     if !is_test {
+        // This is the IDE-facing frontend: it was spawned by an editor/agent
+        // over a stdin/stdout pipe and proxies to the detached background
+        // bridge. Arm the parent-death watchdog so we exit if that IDE dies
+        // without cleanly closing our stdin (uncaught kill, inherited pipe
+        // fds, or a hang before the proxy loop begins reading). This is the
+        // backstop that prevents orphaned `ahma serve stdio` processes from
+        // accumulating across IDE sessions. The detached bridge/daemon are
+        // deliberately NOT armed (they outlive their spawner by design and
+        // self-terminate via idle-timeout).
+        crate::utils::parent_watchdog::spawn_parent_death_watchdog();
+
         let resolved_scopes: Vec<PathBuf> = sandbox.scopes().to_vec();
         let _ = resolved_scopes; // kept for startup log below; not forwarded to bridge
         spawn_background_bridge(&config, socket_path_opt, http_url_opt).await?;

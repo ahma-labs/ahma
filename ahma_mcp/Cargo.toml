@@ -43,7 +43,7 @@ rand = "0.10.1"
 regex.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls", "http2", "http3"] }
 rmcp.workspace = true
-rust-code-analysis = { git = "https://github.com/paulirotta/rust-code-analysis.git", branch = "minimal-submodules", optional = true }
+rust-code-analysis = { package = "rust-code-analysis-code-split", version = "0.0.26-cs.0", optional = true }
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -83,7 +83,7 @@ wiremock = "0.6"
 
 [features]
 android = []
-# Code complexity analysis: depends on rust-code-analysis (git dep),
+# Code complexity analysis: depends on rust-code-analysis,
 # so it stays behind a feature gate for lean builds.
 simplify = [
 	"dep:opener",
