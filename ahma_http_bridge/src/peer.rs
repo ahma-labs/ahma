@@ -84,6 +84,12 @@ impl PeerFactory for SubprocessPeerFactory {
                 // self-respawning chain of `ahma serve` processes (process-table
                 // exhaustion). env vars inherit reliably across spawn; flags do not.
                 .env("AHMA_SERVER_CHILD", "1")
+                // Stamp the spawn-depth backstop so a runaway spawn chain through
+                // peers self-limits (see ahma_common::process_guard).
+                .env(
+                    ahma_common::process_guard::SPAWN_DEPTH_ENV,
+                    ahma_common::process_guard::child_spawn_depth(),
+                )
                 // Propagate W3C trace context so subprocess spans are linked
                 // to the current session span (W3C Trace Context 1.0 §3.2).
                 .env(

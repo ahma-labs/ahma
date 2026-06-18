@@ -665,7 +665,10 @@ async fn spawn_background_bridge(
     let server_args = build_background_bridge_args(config);
 
     let mut cmd = tokio::process::Command::new(&server_command);
-    cmd.args(&server_args).env("AHMA_SERVER_CHILD", "1");
+    cmd.args(&server_args).env("AHMA_SERVER_CHILD", "1").env(
+        ahma_common::process_guard::SPAWN_DEPTH_ENV,
+        ahma_common::process_guard::child_spawn_depth(),
+    );
 
     #[cfg(unix)]
     {
@@ -770,6 +773,14 @@ fn resolve_bridge_endpoints(config: &AppConfig) -> (String, String) {
 }
 
 pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
+    // Circuit breaker for self-respawn loops: if this `ahma serve` is nested far
+    // deeper than the legitimate frontend→bridge→peer chain, refuse to start so
+    // the chain stops growing instead of exhausting the OS process table.
+    if let Err(msg) = ahma_common::process_guard::check_spawn_depth() {
+        tracing::error!("{msg}");
+        return Err(anyhow::anyhow!(msg));
+    }
+
     let is_test = is_test_or_server_child(&config);
 
     let (socket_path, http_url) = resolve_bridge_endpoints(&config);
