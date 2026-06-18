@@ -980,6 +980,10 @@ pub struct AppState {
 
     // --- Monitor mode state ---
     pub log_scroll: usize,
+    /// Tail-follow: when true the log pane stays pinned to the newest line and
+    /// tracks new output as it arrives (the default when the monitor opens).
+    /// Scrolling up detaches follow; scrolling back to the bottom re-engages it.
+    pub log_follow: bool,
     pub log_filter: String,
     pub log_filter_active: bool,
     pub palette: PaletteState,
@@ -1127,6 +1131,7 @@ impl AppState {
             activity_scroll: 0,
             token_usage: ahma_llm_monitor::client::TokenUsage::default(),
             log_scroll: 0,
+            log_follow: true,
             log_filter: String::new(),
             log_filter_active: false,
             palette: PaletteState::default(),
@@ -1175,6 +1180,26 @@ impl AppState {
     pub fn sync_log_scroll_to_animation(&self) {
         self.log_scroll_target.set(self.log_scroll as f64);
         self.log_scroll_current.set(self.log_scroll as f64);
+    }
+
+    /// Detach tail-follow before a manual scroll. Snaps `log_scroll` to the
+    /// current bottom (the last rendered `log_max_scroll`) so the upcoming
+    /// up/page-up movement starts from where the user was actually looking,
+    /// not from a stale offset left over while following.
+    pub fn detach_log_follow(&mut self) {
+        if self.log_follow {
+            self.log_follow = false;
+            self.log_scroll = self.log_max_scroll.get();
+            self.sync_log_scroll_to_animation();
+        }
+    }
+
+    /// Re-engage tail-follow if a downward scroll has reached the bottom, so new
+    /// log lines resume tracking at the bottom automatically.
+    pub fn maybe_reengage_log_follow(&mut self) {
+        if self.log_scroll >= self.log_max_scroll.get() {
+            self.log_follow = true;
+        }
     }
 
     pub fn chat_input_text(&self) -> String {
@@ -1301,11 +1326,11 @@ impl AppState {
             self.log.pop_front();
         }
         self.log.push_back(entry);
-        // When a new log line arrives, auto-scroll to bottom if we're already at or near bottom.
-        let visible_len = self.log.len();
-        if self.log_scroll + 5 >= visible_len.saturating_sub(1) {
-            self.log_scroll = visible_len.saturating_sub(1);
-        }
+        // New-line auto-scroll is handled by `log_follow`: when following, the
+        // log pane renders pinned to the bottom (see `draw_log`), so there is no
+        // scroll offset to nudge here. The previous heuristic adjusted
+        // `log_scroll` by raw entry count, which was wrong once line-wrapping
+        // made one entry span several rendered rows.
     }
 
     pub fn filtered_log(&self) -> Vec<&LogEntry> {

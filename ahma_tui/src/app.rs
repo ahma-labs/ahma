@@ -294,6 +294,10 @@ fn submit_log_switcher(state: &mut crate::state::AppState) {
     };
     state.active_log_file = new_file.clone();
     state.active_log_lines.clear();
+    // A freshly opened/switched log tails from the bottom by default.
+    state.log_follow = true;
+    state.log_scroll = 0;
+    state.sync_log_scroll_to_animation();
     if let Some(ref tx) = state.mcp_source_tx {
         let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(new_file));
     }
@@ -529,6 +533,7 @@ fn scroll_focus_up(state: &mut crate::state::AppState) {
         Focus::OpsDag => state.ops_selected = state.ops_selected.saturating_sub(1),
         Focus::AiActivity => state.activity_scroll = state.activity_scroll.saturating_sub(1),
         Focus::Log => {
+            state.detach_log_follow();
             state.log_scroll = state.log_scroll.saturating_sub(1);
             state.sync_log_scroll_to_animation();
         }
@@ -554,10 +559,13 @@ fn scroll_focus_down(state: &mut crate::state::AppState) {
             let max = state.ai_activity.len().saturating_sub(1);
             state.activity_scroll = (state.activity_scroll + 1).min(max);
         }
-        Focus::Log => {
+        // While following we are already pinned to the bottom — nothing to do
+        // (falls through to the no-op arm below).
+        Focus::Log if !state.log_follow => {
             let max = state.log_max_scroll.get();
             state.log_scroll = (state.log_scroll + 1).min(max);
             state.sync_log_scroll_to_animation();
+            state.maybe_reengage_log_follow();
         }
         Focus::Chat => {
             state.chat_scroll = state.chat_scroll.saturating_sub(1);
@@ -575,6 +583,7 @@ fn move_focus_to_top(state: &mut crate::state::AppState) {
         Focus::OpsDag => state.ops_selected = 0,
         Focus::AiActivity => state.activity_scroll = 0,
         Focus::Log => {
+            state.log_follow = false;
             state.log_scroll = 0;
             state.sync_log_scroll_to_animation();
         }
@@ -594,6 +603,8 @@ fn move_focus_to_bottom(state: &mut crate::state::AppState) {
         Focus::OpsDag => state.ops_selected = state.operations.len().saturating_sub(1),
         Focus::AiActivity => state.activity_scroll = state.ai_activity.len().saturating_sub(1),
         Focus::Log => {
+            // Jump to the newest line and resume tracking new output.
+            state.log_follow = true;
             state.log_scroll = state.log_max_scroll.get();
             state.sync_log_scroll_to_animation();
         }
@@ -3489,12 +3500,15 @@ fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::A
         && row < log_area.y + log_area.height
     {
         if up {
+            state.detach_log_follow();
             state.log_scroll = state.log_scroll.saturating_sub(1);
-        } else {
+            state.sync_log_scroll_to_animation();
+        } else if !state.log_follow {
             let max = state.log_max_scroll.get();
             state.log_scroll = (state.log_scroll + 1).min(max);
+            state.sync_log_scroll_to_animation();
+            state.maybe_reengage_log_follow();
         }
-        state.sync_log_scroll_to_animation();
     }
 }
 
@@ -3551,13 +3565,20 @@ fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
         // Log: up scrolls back (lower offset), down scrolls forward.
         let page_size = page_size_for_height(state.log_area.get().height);
         let max_scroll = state.log_max_scroll.get() as f64;
-        let current = state.log_scroll_target.get();
-        let new_target = if up {
-            (current - page_size).max(0.0)
-        } else {
-            (current + page_size).min(max_scroll)
-        };
-        state.log_scroll_target.set(new_target);
+        if up {
+            // Detach follow and page up from the current bottom.
+            state.detach_log_follow();
+            let current = state.log_scroll_target.get();
+            state.log_scroll_target.set((current - page_size).max(0.0));
+        } else if !state.log_follow {
+            let current = state.log_scroll_target.get();
+            let new_target = (current + page_size).min(max_scroll);
+            state.log_scroll_target.set(new_target);
+            // Paging down to the bottom re-engages tail-follow.
+            if new_target >= max_scroll {
+                state.log_follow = true;
+            }
+        }
     }
 }
 
@@ -3772,13 +3793,65 @@ mod tests {
         super::handle_page_up_down(false, &mut state);
         assert_eq!(state.chat_scroll_target.get(), 0.0);
 
-        // Case 2: Mouse over Log Area -> PageUp/PageDown should scroll Log, even if focused on Chat
+        // Case 2: Mouse over Log Area -> Page keys scroll Log even when focused on Chat.
         state.last_mouse_pos.set(Some((10, 25))); // over log area
-        super::handle_page_up_down(false, &mut state); // PageDown log -> target increases (shows newer logs)
-        assert_eq!(state.log_scroll_target.get(), 8.0);
 
-        super::handle_page_up_down(true, &mut state); // PageUp log -> target decreases
+        // Following by default: PageDown is a no-op (already pinned to the bottom).
+        assert!(state.log_follow);
+        super::handle_page_up_down(false, &mut state);
         assert_eq!(state.log_scroll_target.get(), 0.0);
+        assert!(
+            state.log_follow,
+            "PageDown while following stays at the bottom"
+        );
+
+        // PageUp detaches follow and pages up from the bottom (max=50): 50 - 8 = 42.
+        super::handle_page_up_down(true, &mut state);
+        assert!(!state.log_follow, "PageUp detaches follow");
+        assert_eq!(state.log_scroll_target.get(), 42.0);
+
+        // Paging back down to the bottom re-engages follow.
+        super::handle_page_up_down(false, &mut state);
+        assert_eq!(state.log_scroll_target.get(), 50.0);
+        assert!(
+            state.log_follow,
+            "paging down to the bottom re-engages tail-follow"
+        );
+    }
+
+    #[test]
+    fn test_log_tail_follow_transitions() {
+        use crate::state::{AppState, Focus};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Log;
+        state.log_max_scroll.set(50);
+
+        // Opens following by default.
+        assert!(state.log_follow);
+
+        // Scrolling up detaches follow and starts from the bottom (50 - 1 = 49).
+        super::scroll_focus_up(&mut state);
+        assert!(!state.log_follow, "scroll up detaches follow");
+        assert_eq!(state.log_scroll, 49);
+
+        // Scrolling back down to the bottom re-engages follow.
+        super::scroll_focus_down(&mut state);
+        assert_eq!(state.log_scroll, 50);
+        assert!(state.log_follow, "scrolling back to the bottom re-follows");
+
+        // While following, scroll down is a no-op (stays pinned).
+        super::scroll_focus_down(&mut state);
+        assert!(state.log_follow);
+
+        // Home/Top detaches and jumps to the very top.
+        super::move_focus_to_top(&mut state);
+        assert!(!state.log_follow);
+        assert_eq!(state.log_scroll, 0);
+
+        // End/Bottom re-engages follow.
+        super::move_focus_to_bottom(&mut state);
+        assert!(state.log_follow);
     }
 
     #[test]
