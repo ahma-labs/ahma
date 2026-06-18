@@ -92,17 +92,35 @@ Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 
 ## After installation
 
-- The install script now offers optional user-scoped terminal hook setup for Cursor, Claude Code, and Codex. (Note: VS Code does not support execution hooks).
 - Configure your MCP client — see [connection-modes.md](connection-modes.md).
-- Optional terminal hooks for Cursor, Claude Code, Codex, and Copilot CLI:
-	- `ahma hooks install` installs user-scoped managed hooks for all supported platforms including Cursor.
-	- `ahma hooks install --scope project` writes portable project hooks that call `ahma` from `PATH`.
-	- `ahma hooks status` shows both user and project hook status.
-	- `ahma hooks uninstall` removes managed hooks again if you no longer want shell-tool wrapping.
-	- **Hooks fail open** — if the `ahma` binary is missing, crashes, times out, or its sandbox cannot initialize, the command runs in the default terminal **without** ahma sandboxing rather than being blocked. A loud warning is surfaced to the user and the agent each time this happens (Cursor hooks ship with `failClosed: false`). To restore sandboxing, fix the ahma installation; to stop attempting to sandbox entirely, run `ahma hooks uninstall` or set `AHMA_HOOKS=off`.
-	- **Off-switch**: set `AHMA_HOOKS=off` (or `AHMA_DISABLE_HOOKS=1`) in your shell environment to pass all commands through to the default terminal without uninstalling. The hook also auto-detects when ahma is removed from `mcp.json` and passes through.
+- Optional terminal hooks — see [Terminal hooks](#terminal-hooks) below.
 - Optional agent skill — see [agent-skills.md](agent-skills.md).
 - Restart MCP clients or reload your IDE after updating the binary.
+
+### Terminal hooks
+
+Terminal hooks route the shell commands an agent runs through its *native* terminal/Bash tool into ahma's kernel sandbox (the MCP server only sandboxes tools the agent calls explicitly). Supported clients and their config files:
+
+| Client | User scope | Project scope |
+|---|---|---|
+| **Cursor** | `~/.cursor/hooks.json` | `<repo>/.cursor/hooks.json` |
+| **Claude Code** | `~/.claude/settings.json` | `<repo>/.claude/settings.json` |
+| **Codex** | `~/.codex/hooks.json` | `<repo>/.codex/hooks.json` |
+| **GitHub Copilot CLI** | `~/.copilot/hooks/ahma.json` | `<repo>/.github/hooks/ahma.json` |
+| **Antigravity** | `~/.gemini/config/hooks.json` | `<repo>/.agents/hooks.json` |
+
+VS Code and Claude Desktop have no execution-hook mechanism and are not supported.
+
+```bash
+ahma hooks install                                   # user-scoped, all supported clients
+ahma hooks install --platform claude,codex --scope project
+ahma hooks status                                    # effective state + where installed
+ahma hooks uninstall --platform cursor --scope project
+```
+
+- **Installed ≠ active.** `install` only writes the hook file. In the default `auto` mode a hook is **active** only when an ahma MCP server is detected for that client; otherwise it passes commands through **unsandboxed**. `ahma hooks status` prints the *effective* verdict (ACTIVE / INACTIVE) and the reason — always check it after installing.
+- **Off-switch**: set `AHMA_HOOKS=off` (or `AHMA_DISABLE_HOOKS=1`) in your shell environment, or `ahma hooks uninstall`. `AHMA_HOOKS=on` forces hooks active regardless of detection.
+- **Fail-safe, not silent.** If ahma is active but *cannot* sandbox a command (missing binary, no kernel support, unknown working directory), the command is **blocked** — not run unsandboxed — with an actionable message to both user and agent. Diagnose with `ahma hooks doctor`; to allow unsandboxed execution for the current session only (cleared on reboot), run `ahma hooks approve-unsandboxed`, and revoke with `ahma hooks revoke`. The only silent pass-through is when ahma is *inactive* (the off/auto-undetected case above). Cursor hooks ship with `failClosed: false` so a crashed/absent hook binary never wedges your terminal.
 
 ## Platform notes
 

@@ -52,15 +52,29 @@ enum HooksDecision {
 /// Manage terminal hooks for external AI tools.
 #[derive(Args, Debug)]
 #[command(
-    about = "Manage terminal hooks for Cursor, Claude Code, Codex, and GitHub Copilot CLI",
-    after_help = "EXAMPLES:
+    // Keep this list in sync with `HookPlatform::all()` — it is the source of truth.
+    about = "Manage terminal hooks for Cursor, Claude Code, Codex, GitHub Copilot CLI, and Antigravity",
+    after_help = "SUPPORTED CLIENTS: cursor, claude, codex, copilot, antigravity
+
+WHAT THIS DOES:
+  Terminal hooks transparently route the shell commands an agent runs through its
+  NATIVE terminal/Bash tool into ahma's kernel sandbox. (The ahma MCP server only
+  sandboxes the tools the agent calls explicitly; hooks cover the rest.)
+
+ACTIVE vs INSTALLED:
+  `install` only writes the hook file. In the default `auto` mode a hook is only
+  ACTIVE when an ahma MCP server is detected; otherwise it passes commands through
+  UNSANDBOXED. Run `ahma hooks status` to see the effective state. Force with
+  AHMA_HOOKS=on|off (alias AHMA_DISABLE_HOOKS=1) or the `--hooks on|off|auto` flag.
+
+EXAMPLES:
   # Install user-scoped hooks for all supported tools (including Cursor)
   ahma hooks install
 
   # Install project-scoped hooks for Claude Code and Codex
   ahma hooks install --platform claude,codex --scope project
 
-  # Show both user and project hook status
+  # Show effective state plus both user and project hook status
   ahma hooks status
 
   # Remove only the Cursor project hook
@@ -555,30 +569,99 @@ fn is_ahma_hooks_active_with_configs(active_mcps: &[PathBuf]) -> bool {
     !active_mcps.is_empty()
 }
 
-fn detect_active_mcp_configs() -> Vec<PathBuf> {
-    let home = match std::env::var("HOME").ok().map(PathBuf::from) {
-        Some(h) => h,
-        None => return Vec::new(),
-    };
+/// The effective hook activation and a short human reason, mirroring the exact
+/// precedence in [`is_ahma_hooks_active_with_configs`]. Used by `ahma hooks status`
+/// so the user can see whether installed hooks actually *do* anything — installed
+/// but inactive hooks pass every command through UNSANDBOXED.
+fn describe_activation(active_mcps: &[PathBuf]) -> (bool, String) {
+    if let Some(Some(forced)) = HOOKS_MODE_OVERRIDE.get() {
+        return (
+            *forced,
+            format!("--hooks {} flag", if *forced { "on" } else { "off" }),
+        );
+    }
+    if let Ok(val) = std::env::var("AHMA_HOOKS") {
+        match val.to_lowercase().as_str() {
+            "off" | "0" | "false" | "no" => return (false, "AHMA_HOOKS=off".to_string()),
+            "on" | "1" | "true" | "yes" => return (true, "AHMA_HOOKS=on".to_string()),
+            _ => {}
+        }
+    }
+    if std::env::var("AHMA_DISABLE_HOOKS")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return (false, "AHMA_DISABLE_HOOKS=1".to_string());
+    }
+    if active_mcps.is_empty() {
+        (
+            false,
+            "auto: no ahma MCP server found in any known client config".to_string(),
+        )
+    } else {
+        (
+            true,
+            "auto: ahma MCP server detected in client config".to_string(),
+        )
+    }
+}
 
+fn detect_active_mcp_configs() -> Vec<PathBuf> {
+    // Use `dirs::home_dir()` (not `$HOME`): on Windows `$HOME` is usually unset,
+    // which previously made auto-detection silently report "inactive" there.
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    detect_active_mcp_configs_in(&home, detect_project_root().ok().as_deref())
+}
+
+/// Candidate MCP-config files, one per client `ahma setup` can write to. This MUST
+/// stay in sync with `setup.rs::Platform::configure_mcp`: if a client writes its
+/// ahma MCP server to a path that is not listed here, `auto` mode will fail to
+/// detect ahma and silently pass commands through UNSANDBOXED even though the hook
+/// is installed. The previous list omitted Claude Code (`~/.claude.json`), Codex
+/// (`~/.codex/config.toml`) and Antigravity (`~/.gemini/config/mcp_config.json`) —
+/// exactly the clients that get both hooks and an MCP server.
+fn mcp_config_candidates(home: &Path, project_root: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = vec![
+        // Cursor
         home.join(".cursor").join("mcp.json"),
+        // Claude Code (`ahma setup` writes the MCP server here)
+        home.join(".claude.json"),
+        // Codex CLI
+        home.join(".codex").join("config.toml"),
+        // Antigravity / Gemini
+        home.join(".gemini").join("config").join("mcp_config.json"),
+        // LM Studio
+        home.join(".lmstudio").join("mcp.json"),
+        // VS Code (GitHub Copilot Chat)
         home.join("Library/Application Support/Code/User/mcp.json"),
         home.join(".config/Code/User/mcp.json"),
+        home.join("AppData/Roaming/Code/User/mcp.json"),
+        // Claude Desktop
         home.join("Library/Application Support/Claude/claude_desktop_config.json"),
         home.join(".config/Claude/claude_desktop_config.json"),
         home.join("AppData/Roaming/Claude/claude_desktop_config.json"),
     ];
-
-    if let Ok(project_root) = detect_project_root() {
+    if let Some(project_root) = project_root {
         paths.push(project_root.join(".vscode").join("mcp.json"));
     }
+    paths
+}
 
+/// Testable core of [`detect_active_mcp_configs`]: return the config files that
+/// mention an ahma MCP server. The match is a case-insensitive `ahma` substring so
+/// it works across both JSON (`"Ahma": { … }`) and Codex's TOML
+/// (`[mcp_servers.Ahma]`, which has no quotes). Erring toward "detected" is the
+/// fail-secure direction — these files are only consulted when the user already
+/// chose to install hooks, so a false positive merely sandboxes more, never less.
+fn detect_active_mcp_configs_in(home: &Path, project_root: Option<&Path>) -> Vec<PathBuf> {
     let mut active = Vec::new();
-    for path in paths {
+    for path in mcp_config_candidates(home, project_root) {
         if path.exists()
             && let Ok(content) = std::fs::read_to_string(&path)
-            && content.to_lowercase().contains("\"ahma\"")
+            && content.to_lowercase().contains("ahma")
         {
             active.push(path);
         }
@@ -592,6 +675,22 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
         Some(scope) => vec![scope],
         None => vec![HookScope::User, HookScope::Project],
     };
+
+    // Lead with the *effective* state. "installed" only means the hook file exists;
+    // in `auto` mode an installed hook is inert (passes commands through
+    // UNSANDBOXED) until an ahma MCP server is detected. The user must be able to
+    // tell these apart.
+    let active_mcps = detect_active_mcp_configs();
+    let (active, reason) = describe_activation(&active_mcps);
+    if active {
+        println!(
+            "\x1b[1mEffective: \x1b[32mACTIVE\x1b[0m\x1b[1m\x1b[0m ({reason}) — installed hooks route shell commands through ahma's sandbox.\n"
+        );
+    } else {
+        println!(
+            "\x1b[1mEffective: \x1b[33mINACTIVE\x1b[0m ({reason}) — installed hooks pass commands through to the default terminal \x1b[1mUNSANDBOXED\x1b[0m.\n      Force on with AHMA_HOOKS=on, or fix ahma's MCP config so `auto` detects it.\n"
+        );
+    }
 
     println!("{:<14} {:<8} {:<14} Config", "Platform", "Scope", "Status");
     println!("{:-<14} {:-<8} {:-<14} {:-<6}", "", "", "", "");
@@ -616,7 +715,6 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
         }
     }
 
-    let active_mcps = detect_active_mcp_configs();
     if installed_count > 0 && !active_mcps.is_empty() {
         println!(
             "\n\x1b[36mnote\x1b[0m\x1b[1m: terminal hooks and an MCP server are both active for \"ahma\" — this is supported\x1b[0m"
@@ -1006,10 +1104,16 @@ fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
 /// This is the testable core of [`run_exec`]. The decision tree:
 /// 1. Non-shell tools (no `command`/`CommandLine` field) → allow unchanged.
 /// 2. Already-wrapped commands → allow unchanged (prevent double-wrap).
-/// 3. `AHMA_HOOKS=off` or auto with no MCP configured → allow unchanged (passthrough).
+/// 3. `AHMA_HOOKS=off` or auto with no MCP configured → allow unchanged
+///    (passthrough — the command runs unsandboxed in the default terminal; this is
+///    the only genuinely "open" path, and it is silent by design because ahma is
+///    not active).
 /// 4. Shell command + ahma active → rewrite to `ahma hooks run-shell` (sandbox path).
-/// 5. Active but ahma setup/rewrite fails → **fail open**: allow the original
-///    command to run unsandboxed, with a loud warning (never block).
+/// 5. Active but ahma cannot sandbox (no cwd / wrapper build fails) → **fail
+///    closed pending consent** (R5.5.3): the command is DENIED with actionable
+///    guidance until the user runs `ahma hooks approve-unsandboxed`, after which it
+///    runs unsandboxed with a loud, counted warning. ahma never silently runs a
+///    command unsandboxed while it believes it is active.
 fn compute_exec_decision(input: &Value, scope: HookScope, env: &HookEnvironment) -> HooksDecision {
     let consented = HookConsentStore::current().is_consented();
     let decision =
@@ -2213,22 +2317,110 @@ mod tests {
     fn test_detect_active_mcp_configs_case_insensitive() {
         // Write a temp mcp.json using capital-A "Ahma" (matching the user's real config)
         let temp = tempdir().unwrap();
-        let cursor_dir = temp.path().join(".cursor");
+        let home = temp.path();
+        let cursor_dir = home.join(".cursor");
         fs::create_dir_all(&cursor_dir).unwrap();
-        let mcp_path = cursor_dir.join("mcp.json");
         fs::write(
-            &mcp_path,
+            cursor_dir.join("mcp.json"),
             r#"{"mcpServers":{"Ahma":{"command":"ahma","args":["serve","stdio"]}}}"#,
         )
         .unwrap();
 
-        // Override HOME so detect_active_mcp_configs finds our temp file
-        // We test the matching logic directly via the file content
-        let content = fs::read_to_string(&mcp_path).unwrap();
+        let found = detect_active_mcp_configs_in(home, None);
+        assert_eq!(found, vec![cursor_dir.join("mcp.json")]);
+    }
+
+    #[test]
+    fn test_detect_active_mcp_configs_finds_claude_code_dotfile() {
+        // Regression: `ahma setup` writes the Claude Code MCP server to
+        // `~/.claude.json`. The previous detector only inspected the Claude
+        // *Desktop* config, so an installed Claude Code hook was silently inert
+        // in `auto` mode. Detection must cover `~/.claude.json`.
+        unsafe { std::env::remove_var("AHMA_HOOKS") };
+        let temp = tempdir().unwrap();
+        let home = temp.path();
+        fs::write(
+            home.join(".claude.json"),
+            r#"{"mcpServers":{"Ahma":{"command":"ahma"}}}"#,
+        )
+        .unwrap();
+
+        let found = detect_active_mcp_configs_in(home, None);
+        assert_eq!(found, vec![home.join(".claude.json")]);
         assert!(
-            content.to_lowercase().contains("\"ahma\""),
-            "case-insensitive match should find 'Ahma'"
+            is_ahma_hooks_active_with_configs(&found),
+            "a Claude Code ahma MCP server must make auto-mode hooks active"
         );
+    }
+
+    #[test]
+    fn test_detect_active_mcp_configs_finds_codex_toml() {
+        // Codex stores the server in TOML as `[mcp_servers.Ahma]` (no quotes), so a
+        // quoted `"ahma"` match would miss it. The lenient substring match must find it.
+        let temp = tempdir().unwrap();
+        let home = temp.path();
+        let codex_dir = home.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("config.toml"),
+            "[mcp_servers.Ahma]\ncommand = \"ahma\"\n",
+        )
+        .unwrap();
+
+        let found = detect_active_mcp_configs_in(home, None);
+        assert_eq!(found, vec![codex_dir.join("config.toml")]);
+    }
+
+    #[test]
+    fn test_detect_active_mcp_configs_finds_antigravity() {
+        let temp = tempdir().unwrap();
+        let home = temp.path();
+        let cfg_dir = home.join(".gemini").join("config");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        fs::write(
+            cfg_dir.join("mcp_config.json"),
+            r#"{"mcpServers":{"Ahma":{}}}"#,
+        )
+        .unwrap();
+
+        let found = detect_active_mcp_configs_in(home, None);
+        assert_eq!(found, vec![cfg_dir.join("mcp_config.json")]);
+    }
+
+    #[test]
+    fn test_detect_active_mcp_configs_finds_lmstudio() {
+        // `ahma setup` writes the LM Studio MCP server to `~/.lmstudio/mcp.json`.
+        // It must be in the candidate list so auto-mode hooks activate when LM
+        // Studio is the only configured client.
+        let temp = tempdir().unwrap();
+        let home = temp.path();
+        let cfg_dir = home.join(".lmstudio");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        fs::write(cfg_dir.join("mcp.json"), r#"{"mcpServers":{"Ahma":{}}}"#).unwrap();
+
+        let found = detect_active_mcp_configs_in(home, None);
+        assert_eq!(found, vec![cfg_dir.join("mcp.json")]);
+    }
+
+    #[test]
+    fn test_detect_active_mcp_configs_empty_when_no_ahma() {
+        let temp = tempdir().unwrap();
+        let home = temp.path();
+        fs::write(home.join(".claude.json"), r#"{"mcpServers":{"other":{}}}"#).unwrap();
+        assert!(detect_active_mcp_configs_in(home, None).is_empty());
+    }
+
+    #[test]
+    fn test_describe_activation_reports_inactive_reason() {
+        unsafe { std::env::remove_var("AHMA_HOOKS") };
+        unsafe { std::env::remove_var("AHMA_DISABLE_HOOKS") };
+        let (active, reason) = describe_activation(&[]);
+        assert!(!active);
+        assert!(reason.contains("auto"));
+
+        let (active, reason) = describe_activation(&[PathBuf::from("/x/.claude.json")]);
+        assert!(active);
+        assert!(reason.contains("auto"));
     }
 
     #[test]
