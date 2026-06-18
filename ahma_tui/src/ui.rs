@@ -2023,7 +2023,13 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let visible_h = inner.height as usize;
     let max_scroll = display_lines.len().saturating_sub(visible_h);
     state.log_max_scroll.set(max_scroll);
-    let scroll = state.log_scroll.min(max_scroll);
+    // While following, stay pinned to the newest line so freshly arrived output
+    // is always visible at the bottom; otherwise honor the user's scroll offset.
+    let scroll = if state.log_follow {
+        max_scroll
+    } else {
+        state.log_scroll.min(max_scroll)
+    };
 
     let visible_lines: Vec<Line> = display_lines
         .iter()

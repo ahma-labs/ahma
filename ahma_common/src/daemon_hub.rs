@@ -47,7 +47,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -79,6 +79,11 @@ pub fn daemon_port() -> u16 {
 
 /// Interval at which the hub sends liveness pings to connected instances.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Upper bound on retained per-instance operation snapshots. Bounds the memory
+/// the hub spends remembering history for replay to late-joining subscribers;
+/// once exceeded the oldest *finished* op is dropped (running ops are kept).
+const MAX_OPS_PER_INSTANCE: usize = 500;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Protocol types
@@ -459,12 +464,33 @@ where
 // Server-side: run_daemon
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// One operation's replayable state: the `OpStarted` event plus the terminal
+/// `OpFinished` event once it completes. Streaming output (`OpOutput`) is a live
+/// tail and is intentionally not retained for replay.
+#[derive(Clone)]
+struct OpSnapshot {
+    /// Monotonic insertion order, used to evict the oldest finished op first.
+    seq: u64,
+    started: DaemonEvent,
+    finished: Option<DaemonEvent>,
+}
+
+/// Per-instance operation history, keyed by op id.
+type InstanceOpHistory = std::collections::HashMap<String, OpSnapshot>;
+
 /// Internal shared state for the running daemon.
 struct DaemonHub {
     instances: Arc<Mutex<std::collections::HashMap<String, InstanceInfo>>>,
     instance_txs:
         Arc<Mutex<std::collections::HashMap<String, tokio::sync::mpsc::Sender<DaemonMsg>>>>,
     broadcast: broadcast::Sender<DaemonMsg>,
+    /// Last-known operation state per instance. The `broadcast` channel only
+    /// reaches subscribers connected at send time, so without this a TUI opened
+    /// (or reconnected) after calls already ran would show the instance with an
+    /// empty operation list. Replayed to each subscriber right after the initial
+    /// `InstanceList` so the monitor reflects all calls, not just future ones.
+    op_history: Arc<Mutex<std::collections::HashMap<String, InstanceOpHistory>>>,
+    op_seq: AtomicU64,
     connection_count: Arc<AtomicUsize>,
     socket_path: Option<PathBuf>,
 }
@@ -477,11 +503,79 @@ impl DaemonHub {
                 instances: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 instance_txs: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 broadcast: tx,
+                op_history: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                op_seq: AtomicU64::new(0),
                 connection_count: Arc::new(AtomicUsize::new(0)),
                 socket_path,
             },
             rx,
         )
+    }
+
+    /// Record an operation event so it can be replayed to subscribers that join
+    /// later. Only `OpStarted`/`OpFinished` carry replayable state; other events
+    /// (streaming output, log lines) are live-only and ignored here.
+    async fn record_op_event(&self, instance_id: &str, payload: &DaemonEvent) {
+        match payload {
+            DaemonEvent::OpStarted { id, .. } => {
+                let seq = self.op_seq.fetch_add(1, Ordering::Relaxed);
+                let mut hist = self.op_history.lock().await;
+                let inst = hist.entry(instance_id.to_string()).or_default();
+                inst.insert(
+                    id.clone(),
+                    OpSnapshot {
+                        seq,
+                        started: payload.clone(),
+                        finished: None,
+                    },
+                );
+                if inst.len() > MAX_OPS_PER_INSTANCE {
+                    // Evict the oldest finished op; never drop a running one.
+                    if let Some(oldest) = inst
+                        .iter()
+                        .filter(|(_, s)| s.finished.is_some())
+                        .min_by_key(|(_, s)| s.seq)
+                        .map(|(k, _)| k.clone())
+                    {
+                        inst.remove(&oldest);
+                    }
+                }
+            }
+            DaemonEvent::OpFinished { id, .. } => {
+                let mut hist = self.op_history.lock().await;
+                if let Some(inst) = hist.get_mut(instance_id)
+                    && let Some(snap) = inst.get_mut(id)
+                {
+                    snap.finished = Some(payload.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Snapshot the retained op events for every instance, ordered for replay
+    /// (each op's `OpStarted` first, then its `OpFinished` if present).
+    async fn replay_events(&self) -> Vec<DaemonMsg> {
+        let hist = self.op_history.lock().await;
+        let mut snaps: Vec<(String, OpSnapshot)> = hist
+            .iter()
+            .flat_map(|(inst, ops)| ops.values().cloned().map(move |s| (inst.clone(), s)))
+            .collect();
+        snaps.sort_by_key(|(_, s)| s.seq);
+        let mut out = Vec::with_capacity(snaps.len() * 2);
+        for (instance_id, snap) in snaps {
+            out.push(DaemonMsg::Event {
+                instance_id: instance_id.clone(),
+                payload: snap.started,
+            });
+            if let Some(finished) = snap.finished {
+                out.push(DaemonMsg::Event {
+                    instance_id,
+                    payload: finished,
+                });
+            }
+        }
+        out
     }
 }
 
@@ -830,6 +924,7 @@ where
                     msg = recv_msg::<_, ClientMsg>(&mut reader) => {
                         match msg {
                             Ok(ClientMsg::Event { payload }) => {
+                                hub.record_op_event(&id, &payload).await;
                                 let _ = hub.broadcast.send(DaemonMsg::Event {
                                     instance_id: id.clone(),
                                     payload,
@@ -881,6 +976,7 @@ where
 
             hub.instances.lock().await.remove(&id);
             hub.instance_txs.lock().await.remove(&id);
+            hub.op_history.lock().await.remove(&id);
             let _ = hub
                 .broadcast
                 .send(DaemonMsg::InstanceUnregistered { id: id.clone() });
@@ -897,7 +993,20 @@ where
                 return;
             }
 
+            // Subscribe to live events BEFORE replaying retained history, so any
+            // event that arrives during replay is queued by the broadcast channel
+            // rather than lost in the gap between snapshot and live stream.
             let mut rx = hub.broadcast.subscribe();
+
+            // Replay the operations that ran before this subscriber connected, so
+            // the monitor shows all calls — not just ones that start from now on.
+            for msg in hub.replay_events().await {
+                if let Err(e) = send_msg(&mut writer, &msg).await {
+                    debug!("daemon: subscriber replay write failed: {e}");
+                    hub.connection_count.fetch_sub(1, Ordering::Relaxed);
+                    return;
+                }
+            }
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
@@ -1395,5 +1504,109 @@ mod tests {
             conn.is_ok(),
             "daemon should be running after stale socket cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn op_history_replays_started_and_finished_in_order() {
+        let (hub, _rx) = DaemonHub::new(None);
+
+        // op-1 runs to completion; op-2 is still running.
+        hub.record_op_event(
+            "i1",
+            &DaemonEvent::OpStarted {
+                id: "op-1".into(),
+                tool_name: "cargo_build".into(),
+                description: "build".into(),
+                scope: "/w".into(),
+            },
+        )
+        .await;
+        hub.record_op_event(
+            "i1",
+            &DaemonEvent::OpFinished {
+                id: "op-1".into(),
+                status: "Completed".into(),
+                result_summary: Some("ok".into()),
+                duration_ms: 10,
+            },
+        )
+        .await;
+        hub.record_op_event(
+            "i1",
+            &DaemonEvent::OpStarted {
+                id: "op-2".into(),
+                tool_name: "cargo_test".into(),
+                description: "test".into(),
+                scope: "/w".into(),
+            },
+        )
+        .await;
+
+        let replay = hub.replay_events().await;
+        // op-1 started+finished (2) + op-2 started (1) = 3, ordered by record seq.
+        assert_eq!(
+            replay.len(),
+            3,
+            "replay should carry all retained op events"
+        );
+        assert!(
+            matches!(
+                &replay[0],
+                DaemonMsg::Event { instance_id, payload: DaemonEvent::OpStarted { id, .. } }
+                    if instance_id == "i1" && id == "op-1"
+            ),
+            "first replayed event is op-1 OpStarted"
+        );
+        assert!(
+            matches!(
+                &replay[1],
+                DaemonMsg::Event { payload: DaemonEvent::OpFinished { id, .. }, .. } if id == "op-1"
+            ),
+            "op-1 OpFinished follows its OpStarted"
+        );
+        assert!(
+            matches!(
+                &replay[2],
+                DaemonMsg::Event { payload: DaemonEvent::OpStarted { id, .. }, .. } if id == "op-2"
+            ),
+            "still-running op-2 is replayed as OpStarted only"
+        );
+    }
+
+    #[tokio::test]
+    async fn op_history_drops_unregistered_instance_and_ignores_output() {
+        let (hub, _rx) = DaemonHub::new(None);
+
+        // Streaming output is a live tail — never retained for replay.
+        hub.record_op_event(
+            "i1",
+            &DaemonEvent::OpOutput {
+                id: "op-1".into(),
+                line: "compiling…".into(),
+                is_stderr: false,
+            },
+        )
+        .await;
+        assert!(
+            hub.replay_events().await.is_empty(),
+            "OpOutput must not be replayed"
+        );
+
+        hub.record_op_event(
+            "i1",
+            &DaemonEvent::OpStarted {
+                id: "op-1".into(),
+                tool_name: "t".into(),
+                description: "d".into(),
+                scope: "/w".into(),
+            },
+        )
+        .await;
+        assert_eq!(hub.replay_events().await.len(), 1);
+
+        // When an instance unregisters its history is dropped (mirrors the
+        // handle_connection cleanup path).
+        hub.op_history.lock().await.remove("i1");
+        assert!(hub.replay_events().await.is_empty());
     }
 }

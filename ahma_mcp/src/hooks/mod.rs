@@ -781,6 +781,15 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         run_tool: Some("run_terminal_command".to_string()),
         run_tool_args: vec![payload.command.clone()],
         skip_availability_probes: true,
+        // Sandbox the command in the working directory the IDE hook explicitly
+        // handed us. This is not a spoofable CWD inference (SPEC R5.2.1): the IDE
+        // passes the command's own execution directory in the hook payload, which
+        // is exactly the scope this command should be confined to — the same role
+        // roots/list plays for the MCP server. Without this the sandbox falls back
+        // to the default `~/sandbox`, so every real project command is rejected as
+        // "outside the sandbox root" and the hook blocks it (fail-closed, R5.5.3).
+        sandbox_scopes: vec![PathBuf::from(&payload.cwd)],
+        use_sandbox_dir: false,
         ..cfg
     };
 
@@ -855,17 +864,18 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
             println!("{}", output);
             Ok(())
         }
-        // FAIL OPEN: ahma could not execute the command through the sandbox.
-        // Fall back to the default shell (unsandboxed) with a loud warning rather
-        // than failing the command outright.
-        Err(e) => {
-            run_command_unsandboxed(
-                &payload.cwd,
-                &payload.command,
-                &format!("sandbox execution failed: {e}"),
-            )
-            .await
-        }
+        // The sandbox initialized successfully (the `initialize_sandbox` arms
+        // above handle the "cannot sandbox" case), so the command DID run inside
+        // the sandbox. A non-zero exit — a failed build/test, a `grep` with no
+        // match, OR a write the kernel sandbox correctly denied — is the
+        // command's own result and is surfaced verbatim. We deliberately do NOT
+        // re-run it unsandboxed here: doing so would (1) misreport every ordinary
+        // command failure as "sandbox unavailable / BLOCKED", which is exactly
+        // what made hooks look like they were blocking CLI calls, and (2) let a
+        // command the sandbox just blocked succeed on the unsandboxed retry — a
+        // silent confinement bypass. The SPEC R5.5.3 unsandboxed fallback applies
+        // only when the sandbox cannot be initialized at all.
+        Err(e) => Err(e),
     }
 }
 
