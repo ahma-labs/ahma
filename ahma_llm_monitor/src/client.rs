@@ -122,7 +122,7 @@ pub struct LocalProvider {
 /// [`crate::anthropic`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApiFlavor {
-    /// OpenAI-compatible `/chat/completions` (Ollama, llama.cpp, oMLX, OpenAI…).
+    /// OpenAI-compatible `/chat/completions` (Ollama, llama.cpp, LM Studio, OpenAI…).
     #[default]
     OpenAi,
     /// Anthropic native Messages API (`/messages`, `x-api-key`).

@@ -1,6 +1,6 @@
 {
     "name": "decompose",
-    "description": "Split a complex business question into smaller sub-questions, dispatch each to a local LLM (e.g. gemma-4-12B via oMLX or gemma4 via Ollama), and aggregate the results into a single answer. Returns immediately with an operation ID; the aggregated answer is pushed as a progress notification. Use `await` with the operation ID to retrieve the full result.",
+    "description": "Split a complex business question into smaller sub-questions, dispatch each to a local LLM (e.g. gpt-oss-20b via LM Studio or gemma4 via Ollama), and aggregate the results into a single answer. Returns immediately with an operation ID; the aggregated answer is pushed as a progress notification. Use `await` with the operation ID to retrieve the full result.",
     "command": "decompose",
     "tool_type": "decompose",
     "enabled": true,
@@ -19,8 +19,8 @@
     "hints": {
         "custom": {
             "usage": "Call with a complex question as the input. The tool will decompose it into sub-questions, run each against the local LLM, and return a summarized answer.",
-            "local_llm": "Requires a local model running on Apple Silicon via oMLX (mlx_lm.server on port 8080) or Ollama running on port 11434.",
-            "models": "Configure the omlx settings in ~/.ahma/settings.toml to change your default local oMLX model, or modify the inlined llm_provider in this file.",
+            "local_llm": "Requires a local model running via LM Studio (local server on port 1234) or Ollama running on port 11434.",
+            "models": "Configure the lmstudio settings in ~/.ahma/settings.toml to change your default local LM Studio model, or modify the inlined llm_provider in this file.",
             "privacy": "All LLM calls stay on your machine — no data is sent to cloud providers."
         }
     }

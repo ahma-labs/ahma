@@ -136,7 +136,7 @@ pub fn warn_if_looks_like_literal_secret(value: &str) -> bool {
 ///
 /// Selects how the LLM client talks to the endpoint. `openai` (the default)
 /// covers any OpenAI-compatible `/chat/completions` server (Ollama, llama.cpp,
-/// oMLX, OpenAI itself). `anthropic` selects the native Anthropic Messages API
+/// LM Studio, OpenAI itself). `anthropic` selects the native Anthropic Messages API
 /// (`/v1/messages`, `x-api-key`), which is **not** OpenAI-compatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -367,14 +367,14 @@ impl AhmaConfig {
             }
         };
 
-        // Auto-register oMLX provider from settings
+        // Auto-register LM Studio provider from settings
         let settings = AhmaSettings::load();
-        if !cfg.providers.iter().any(|p| p.name == "omlx") {
+        if !cfg.providers.iter().any(|p| p.name == "lmstudio") {
             cfg.providers.push(ProviderEntry {
-                name: "omlx".to_string(),
+                name: "lmstudio".to_string(),
                 kind: ProviderKind::OpenAi,
-                base_url: settings.omlx.base_url.clone(),
-                default_model: settings.omlx.model.clone(),
+                base_url: settings.lmstudio.base_url.clone(),
+                default_model: settings.lmstudio.model.clone(),
                 api_key: None,
             });
         }
@@ -456,34 +456,34 @@ pub fn default_mutex_groups() -> Vec<MutexGroupConfig> {
     }]
 }
 
-/// oMLX / mlx_lm.server provider defaults.
+/// LM Studio local-server provider defaults.
 ///
-/// `mlx_lm.server` exposes an OpenAI-compatible API on localhost.  The default
-/// model (`mlx-community/gemma-4-12B-it-8bit`) runs well on Apple Silicon Macs
-/// with ≥16 GB unified memory.  Change [`model`] to any HuggingFace model ID
-/// hosted at `mlx-community`.
+/// LM Studio exposes an OpenAI-compatible API on localhost via its built-in
+/// **Local Server** (Developer tab → Start Server). Set [`model`] to the model
+/// identifier of whichever model you have loaded in LM Studio (shown next to the
+/// loaded model, e.g. `openai/gpt-oss-20b`).
 ///
-/// Start the server with:
+/// Start the server from the LM Studio app, or headless with:
 /// ```bash
-/// mlx_lm.server --model mlx-community/gemma-4-12B-it-8bit
+/// lms server start
 /// ```
 ///
-/// The server listens on port 8080 by default.
+/// The server listens on port 1234 by default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct OmlxSettings {
-    /// Base URL of the mlx_lm.server endpoint.
-    /// Default: `http://localhost:8080/v1`
+pub struct LmStudioSettings {
+    /// Base URL of the LM Studio local-server endpoint.
+    /// Default: `http://localhost:1234/v1`
     pub base_url: String,
-    /// Model identifier passed to the server, e.g. `mlx-community/gemma-4-12B-it-8bit`.
+    /// Model identifier of the model loaded in LM Studio, e.g. `openai/gpt-oss-20b`.
     pub model: String,
 }
 
-impl Default for OmlxSettings {
+impl Default for LmStudioSettings {
     fn default() -> Self {
         Self {
-            base_url: "http://localhost:8080/v1".to_string(),
-            model: "mlx-community/gemma-4-12B-it-8bit".to_string(),
+            base_url: "http://localhost:1234/v1".to_string(),
+            model: "openai/gpt-oss-20b".to_string(),
         }
     }
 }
@@ -857,8 +857,8 @@ impl Default for FeatureSettings {
 pub struct AhmaSettings {
     /// Runtime feature toggles (simplify, vault, cluster, etc.).
     pub features: FeatureSettings,
-    /// oMLX / mlx_lm.server provider configuration.
-    pub omlx: OmlxSettings,
+    /// LM Studio local-server provider configuration.
+    pub lmstudio: LmStudioSettings,
     /// Tool execution settings.
     pub tools: ToolSettings,
     /// Sandbox and filesystem security settings.
@@ -1031,13 +1031,12 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # separate_cargo_target = false  # use target/ahma/ instead of target/ for ahma's cargo builds,
 #                                # eliminating cross-process file-lock contention with IDE background checks
 
-# ── oMLX (Apple Silicon mlx_lm.server) ──────────────────────────────────────
-# Start the server with:
-#   mlx_lm.server --model mlx-community/gemma-4-12B-it-8bit
+# ── LM Studio (local OpenAI-compatible server) ──────────────────────────────
+# Start the LM Studio Local Server (Developer tab), or headless: lms server start
 #
-# [omlx]
-# base_url = "http://localhost:8080/v1"          # default: 8080 (mlx_lm.server)
-# model    = "mlx-community/gemma-4-12B-it-8bit" # default model
+# [lmstudio]
+# base_url = "http://localhost:1234/v1"  # default: 1234 (LM Studio local server)
+# model    = "openai/gpt-oss-20b"        # set to the model loaded in LM Studio
 
 # ── Sandbox & filesystem security ────────────────────────────────────────────
 # [sandbox]
@@ -1154,9 +1153,9 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().with_extension("nonexistent_config_toml");
         let cfg = AhmaConfig::load_from(&path);
-        // Default contains the auto-registered omlx provider
+        // Default contains the auto-registered lmstudio provider
         assert_eq!(cfg.providers.len(), 1);
-        assert_eq!(cfg.providers[0].name, "omlx");
+        assert_eq!(cfg.providers[0].name, "lmstudio");
     }
 
     #[test]
@@ -1176,11 +1175,11 @@ api_key = "sk-placeholder"
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), toml_str).unwrap();
         let cfg = AhmaConfig::load_from(tmp.path());
-        // 2 from config + 1 auto-registered omlx
+        // 2 from config + 1 auto-registered lmstudio
         assert_eq!(cfg.providers.len(), 3);
         assert!(cfg.providers.iter().any(|p| p.name == "ollama-local"));
         assert!(cfg.providers.iter().any(|p| p.name == "openai"));
-        assert!(cfg.providers.iter().any(|p| p.name == "omlx"));
+        assert!(cfg.providers.iter().any(|p| p.name == "lmstudio"));
     }
 
     #[test]
@@ -1249,7 +1248,7 @@ api_key = "${AHMA_TEST_PROVIDER_KEY}"
         std::fs::write(tmp.path(), toml_text).unwrap();
 
         let reloaded = AhmaConfig::load_from(tmp.path());
-        // 1 from config + 1 auto-registered omlx
+        // 1 from config + 1 auto-registered lmstudio
         assert_eq!(reloaded.providers.len(), 2);
         let p = reloaded
             .providers
@@ -1259,7 +1258,7 @@ api_key = "${AHMA_TEST_PROVIDER_KEY}"
         assert_eq!(p.base_url, "http://localhost:11434/v1");
         assert_eq!(p.default_model, "llama3.2");
         assert!(p.api_key.is_none());
-        assert!(reloaded.providers.iter().any(|x| x.name == "omlx"));
+        assert!(reloaded.providers.iter().any(|x| x.name == "lmstudio"));
     }
 
     /// Add two providers, remove one, re-save, reload — verify only one survives.
@@ -1293,10 +1292,10 @@ api_key = "${AHMA_TEST_PROVIDER_KEY}"
         std::fs::write(tmp.path(), toml_text2).unwrap();
 
         let final_cfg = AhmaConfig::load_from(tmp.path());
-        // keep-me + auto-registered omlx
+        // keep-me + auto-registered lmstudio
         assert_eq!(final_cfg.providers.len(), 2);
         assert!(final_cfg.providers.iter().any(|p| p.name == "keep-me"));
-        assert!(final_cfg.providers.iter().any(|p| p.name == "omlx"));
+        assert!(final_cfg.providers.iter().any(|p| p.name == "lmstudio"));
     }
 
     /// Cluster config (key_file, heartbeat_ttl_secs, peers) survives a
@@ -1360,20 +1359,20 @@ default_model = "llama3.2"
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), toml_str).unwrap();
         let cfg = AhmaConfig::load_from(tmp.path());
-        // 1 from config + 1 auto-registered omlx
+        // 1 from config + 1 auto-registered lmstudio
         assert_eq!(cfg.providers.len(), 2);
         assert!(cfg.providers.iter().any(|p| p.name == "ollama-local"));
-        assert!(cfg.providers.iter().any(|p| p.name == "omlx"));
+        assert!(cfg.providers.iter().any(|p| p.name == "lmstudio"));
         assert!(cfg.cluster.peers.is_empty(), "cluster defaults to no peers");
     }
 
     // ── AhmaSettings tests ────────────────────────────────────────────────────
 
     #[test]
-    fn ahma_settings_default_omlx_values() {
+    fn ahma_settings_default_lmstudio_values() {
         let s = AhmaSettings::default();
-        assert_eq!(s.omlx.model, "mlx-community/gemma-4-12B-it-8bit");
-        assert_eq!(s.omlx.base_url, "http://localhost:8080/v1");
+        assert_eq!(s.lmstudio.model, "openai/gpt-oss-20b");
+        assert_eq!(s.lmstudio.base_url, "http://localhost:1234/v1");
     }
 
     #[test]
@@ -1418,15 +1417,15 @@ default_model = "llama3.2"
         let path = tmp.path().with_extension("nonexistent_settings_toml");
         let s = AhmaSettings::load_from(&path);
         // Verify we get defaults, not an error
-        assert_eq!(s.omlx.model, "mlx-community/gemma-4-12B-it-8bit");
+        assert_eq!(s.lmstudio.model, "openai/gpt-oss-20b");
         assert_eq!(s.tools.timeout_secs, 600);
     }
 
     #[test]
     fn ahma_settings_partial_toml_override() {
         let toml_str = r#"
-[omlx]
-model = "mlx-community/llama-3.2-3B-Instruct-4bit"
+[lmstudio]
+model = "qwen/qwen3-4b"
 
 [tools]
 timeout_secs = 600
@@ -1435,10 +1434,10 @@ timeout_secs = 600
         std::fs::write(tmp.path(), toml_str).unwrap();
         let s = AhmaSettings::load_from(tmp.path());
         // Overridden values
-        assert_eq!(s.omlx.model, "mlx-community/llama-3.2-3B-Instruct-4bit");
+        assert_eq!(s.lmstudio.model, "qwen/qwen3-4b");
         assert_eq!(s.tools.timeout_secs, 600);
         // Non-overridden values stay at defaults
-        assert_eq!(s.omlx.base_url, "http://localhost:8080/v1");
+        assert_eq!(s.lmstudio.base_url, "http://localhost:1234/v1");
         assert!(!s.tools.force_sync);
         assert_eq!(s.logging.target, "file");
     }
@@ -1452,8 +1451,8 @@ timeout_secs = 600
 
         assert!(path.exists(), "template file should be created");
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("mlx-community/gemma-4-12B-it-8bit"));
-        assert!(contents.contains("[omlx]"));
+        assert!(contents.contains("openai/gpt-oss-20b"));
+        assert!(contents.contains("[lmstudio]"));
         assert!(contents.contains("[tools]"));
         assert!(contents.contains("[sandbox]"));
         assert!(contents.contains("[logging]"));

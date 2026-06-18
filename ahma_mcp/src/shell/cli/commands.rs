@@ -57,9 +57,9 @@ pub(crate) fn run_settings_command(args: SettingsArgs) -> Result<()> {
             show_field!("artifact", s.features.artifact, d.features.artifact);
             show_field!("decompose", s.features.decompose, d.features.decompose);
             println!();
-            println!("[omlx]");
-            show_field!("base_url", &s.omlx.base_url, &d.omlx.base_url);
-            show_field!("model", &s.omlx.model, &d.omlx.model);
+            println!("[lmstudio]");
+            show_field!("base_url", &s.lmstudio.base_url, &d.lmstudio.base_url);
+            show_field!("model", &s.lmstudio.model, &d.lmstudio.model);
             println!();
             println!("[tools]");
             show_field!("timeout_secs", s.tools.timeout_secs, d.tools.timeout_secs);

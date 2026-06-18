@@ -351,7 +351,7 @@ The sandbox scope defines the root directory boundary. AI has **full read/write 
 #### Subprocess propagation and defaults
 
 - **R5.4.1**: **Scope propagation to subprocesses**: When the stdio MCP server spawns a background bridge or per-session subprocesses, it **must** forward only genuinely explicit `--sandbox-scope` values (never the provisional CWD or temp). The `--sandbox` and `--tmp` boolean flags are forwarded separately so each subprocess derives the default secondary and auxiliary scopes itself.
-- **R5.4.2**: **Default install uses `--sandbox`**: The default MCP server configuration installed by `ahma setup` for Cursor, VSCode, Claude, Antigravity, and Codex **must** include `--sandbox` (not `--tmp`). For clients known not to support `roots/list` (e.g. Antigravity, LM Studio), `ahma setup` **should** additionally inject an explicit `--sandbox-scope` (or rely on the `~/sandbox` default) so the client works without a stall.
+- **R5.4.2**: **Default install uses `--sandbox`**: The default MCP server configuration installed by `ahma setup` for Cursor, VSCode, Claude, Antigravity, Codex, and LM Studio **must** include `--sandbox` (not `--tmp`). For clients known not to support `roots/list` (e.g. Antigravity, LM Studio), `ahma setup` **should** additionally inject an explicit `--sandbox-scope` (or rely on the `~/sandbox` default) so the client works without a stall.
 - **R5.4.3**: **Write Protection**: The system **must** block any attempt to write outside the locked scope, including via command arguments (e.g. `touch /outside/file`).
 
 #### Terminal hooks (one-time consent, never silent)

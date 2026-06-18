@@ -1026,7 +1026,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         //
         // The TUI overloads `provider` with either a configured provider *name*
         // (from `~/.ahma/config.toml`) or a direct *base URL* — auto-discovered
-        // local providers (Ollama, oMLX, llama-server) have no config entry and
+        // local providers (Ollama, LM Studio, llama-server) have no config entry and
         // are addressed purely by URL. Treat URL-shaped values as a direct base
         // URL so local models remain usable without a named config entry.
         let (base_url, model_name, api_key) = if let Some(p_name) = provider {
