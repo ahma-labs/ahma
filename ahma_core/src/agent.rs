@@ -996,6 +996,14 @@ pub fn get_mcp_base_url(app_config: Option<&ahma_mcp::shell::cli::AppConfig>) ->
     }
 }
 
+/// Whether a `provider` string is a direct base URL rather than a configured
+/// provider name. Auto-discovered local providers are addressed by URL and have
+/// no `[[providers]]` entry to resolve, so callers may pass the URL directly.
+fn provider_is_url(provider: &str) -> bool {
+    let p = provider.trim();
+    p.starts_with("http://") || p.starts_with("https://") || p.starts_with("unix://")
+}
+
 /// A PromptRunner implementation that executes the agent loop inside ahma_core.
 pub struct CorePromptRunner;
 
@@ -1014,14 +1022,25 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         let service = ahma_mcp::get_active_service()
             .ok_or_else(|| "No active AhmaMcpService found in this process".to_string())?;
 
-        // 2. Resolve LLM client connection parameters using provider and model
+        // 2. Resolve LLM client connection parameters using provider and model.
+        //
+        // The TUI overloads `provider` with either a configured provider *name*
+        // (from `~/.ahma/config.toml`) or a direct *base URL* — auto-discovered
+        // local providers (Ollama, oMLX, llama-server) have no config entry and
+        // are addressed purely by URL. Treat URL-shaped values as a direct base
+        // URL so local models remain usable without a named config entry.
         let (base_url, model_name, api_key) = if let Some(p_name) = provider {
-            let config = ahma_common::config::AhmaConfig::load();
-            let resolved = config
-                .resolve_provider(&p_name)
-                .map_err(|e| format!("Failed to resolve provider '{}': {e}", p_name))?;
-            let resolved_model = model.unwrap_or(resolved.default_model);
-            (resolved.base_url, resolved_model, resolved.api_key)
+            if provider_is_url(&p_name) {
+                let resolved_model = model.unwrap_or_default();
+                (p_name, resolved_model, None)
+            } else {
+                let config = ahma_common::config::AhmaConfig::load();
+                let resolved = config
+                    .resolve_provider(&p_name)
+                    .map_err(|e| format!("Failed to resolve provider '{}': {e}", p_name))?;
+                let resolved_model = model.unwrap_or(resolved.default_model);
+                (resolved.base_url, resolved_model, resolved.api_key)
+            }
         } else {
             let config = ahma_common::config::AhmaConfig::load();
             if let Some(first_provider) = config.providers.first() {
@@ -1186,6 +1205,25 @@ mod tests {
             small_model_harness,
             context_length,
         }
+    }
+
+    #[test]
+    fn provider_is_url_recognizes_direct_endpoints() {
+        // Auto-discovered local providers are addressed by URL.
+        assert!(provider_is_url("http://localhost:8000/v1"));
+        assert!(provider_is_url("http://127.0.0.1:11434/v1"));
+        assert!(provider_is_url("https://api.example.com/v1"));
+        assert!(provider_is_url("unix:///tmp/ahma.sock"));
+        assert!(provider_is_url("  http://localhost:8080/v1  "));
+    }
+
+    #[test]
+    fn provider_is_url_rejects_config_names() {
+        // Named providers resolve through ~/.ahma/config.toml.
+        assert!(!provider_is_url("ollama-local"));
+        assert!(!provider_is_url("anthropic"));
+        assert!(!provider_is_url(""));
+        assert!(!provider_is_url("my-http-provider"));
     }
 
     #[test]
