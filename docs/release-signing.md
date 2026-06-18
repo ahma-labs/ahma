@@ -128,3 +128,9 @@ source disclosure for any distributed or network-accessible modification, closin
 of shipping a backdoored binary without publishing the changes. The Sigstore attestation
 verifies that what you install was built from the published, auditable source by the
 official CI pipeline — making an unsigned impostor immediately detectable.
+
+## Known advisories in the verification stack
+
+The Sigstore verification path depends transitively on `tough` (TUF). Accepted/tracked
+third-party advisories affecting this stack — including their analysis and the condition
+for closing them — are recorded in [security-advisories.md](security-advisories.md).
