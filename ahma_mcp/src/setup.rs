@@ -65,8 +65,8 @@ impl SetupAction {
 
 /// An AI tool the wizard can target. Listed in alphabetical order (by label)
 /// for uniform, simple presentation. Not every platform supports every action:
-/// GitHub Copilot has no MCP config target here; VS Code and Claude Desktop are
-/// configured via MCP only (no terminal hook wrapper).
+/// GitHub Copilot has no MCP config target here; VS Code, Claude Desktop, and
+/// LM Studio are configured via MCP only (no terminal hook wrapper).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Platform {
     Antigravity,
@@ -75,6 +75,7 @@ enum Platform {
     Codex,
     Cursor,
     Copilot,
+    LmStudio,
     VsCode,
 }
 
@@ -85,6 +86,7 @@ const PLATFORMS: &[Platform] = &[
     Platform::Codex,
     Platform::Cursor,
     Platform::Copilot,
+    Platform::LmStudio,
     Platform::VsCode,
 ];
 
@@ -97,6 +99,7 @@ impl Platform {
             Platform::Codex => "Codex",
             Platform::Cursor => "Cursor",
             Platform::Copilot => "GitHub Copilot CLI",
+            Platform::LmStudio => "LM Studio",
             Platform::VsCode => "VS Code (GitHub Copilot Chat)",
         }
     }
@@ -106,7 +109,10 @@ impl Platform {
     }
 
     fn supports_hooks(self) -> bool {
-        !matches!(self, Platform::VsCode | Platform::ClaudeDesktop)
+        !matches!(
+            self,
+            Platform::VsCode | Platform::ClaudeDesktop | Platform::LmStudio
+        )
     }
 
     fn hook_platform(self) -> Option<HookPlatform> {
@@ -117,6 +123,7 @@ impl Platform {
             Platform::Codex => Some(HookPlatform::Codex),
             Platform::Cursor => Some(HookPlatform::Cursor),
             Platform::Copilot => Some(HookPlatform::Copilot),
+            Platform::LmStudio => None,
             Platform::VsCode => None,
         }
     }
@@ -127,7 +134,7 @@ impl Platform {
         self,
         transport: &str,
         servers_entry: &serde_json::Value,
-        ant_servers_entry: &serde_json::Value,
+        scoped_servers_entry: &serde_json::Value,
         home: &Path,
     ) -> Result<Option<&'static str>> {
         match self {
@@ -156,8 +163,15 @@ impl Platform {
             }
             Platform::Antigravity => {
                 let path = home.join(".gemini").join("config").join("mcp_config.json");
-                merge_mcp_json(&path, "mcpServers", ant_servers_entry.clone())?;
+                merge_mcp_json(&path, "mcpServers", scoped_servers_entry.clone())?;
                 return Ok(Some("Antigravity"));
+            }
+            Platform::LmStudio => {
+                // LM Studio reads MCP servers from ~/.lmstudio/mcp.json. Like
+                // Antigravity it does not send roots/list, so use the scoped entry.
+                let path = home.join(".lmstudio").join("mcp.json");
+                merge_mcp_json(&path, "mcpServers", scoped_servers_entry.clone())?;
+                return Ok(Some("LM Studio"));
             }
             Platform::Codex => {
                 let path = home.join(".codex").join("config.toml");
@@ -408,14 +422,14 @@ fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
     })
 }
 
-fn build_antigravity_servers_entry(transport: &str, home: &Path) -> serde_json::Value {
+fn build_scoped_servers_entry(transport: &str, home: &Path) -> serde_json::Value {
     if let Some(url) = mcp_shared_transport_url(transport) {
         return json!({ "url": url });
     }
-    // Antigravity doesn't send MCP roots/list, so we must specify a sandbox
-    // scope explicitly.  Use the canonical path (not ~/sandbox) because MCP
-    // clients launch processes without shell tilde expansion, and the sandbox
-    // directory must exist for canonicalization.
+    // Some clients (Antigravity, LM Studio) don't send MCP roots/list, so we must
+    // specify a sandbox scope explicitly.  Use the canonical path (not ~/sandbox)
+    // because MCP clients launch processes without shell tilde expansion, and the
+    // sandbox directory must exist for canonicalization.
     let sandbox_dir = home.join("sandbox");
     if let Err(e) = std::fs::create_dir_all(&sandbox_dir) {
         tracing::warn!(
@@ -523,13 +537,13 @@ async fn setup_mcp_config(
     let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
     let servers_entry = build_mcp_servers_entry(transport);
-    let ant_servers_entry = build_antigravity_servers_entry(transport, &home);
+    let scoped_servers_entry = build_scoped_servers_entry(transport, &home);
 
     let mut configured = Vec::new();
 
     for platform in platforms.iter().copied().filter(|p| p.supports_mcp()) {
         if let Some(name) =
-            platform.configure_mcp(transport, &servers_entry, &ant_servers_entry, &home)?
+            platform.configure_mcp(transport, &servers_entry, &scoped_servers_entry, &home)?
         {
             configured.push(name);
         }
@@ -924,7 +938,7 @@ mod tests {
     fn test_antigravity_servers_entry_uses_canonical_path_and_creates_dir() {
         let tmp = tempdir().unwrap();
         let fake_home = tmp.path();
-        let entry = build_antigravity_servers_entry("stdio", fake_home);
+        let entry = build_scoped_servers_entry("stdio", fake_home);
 
         // The sandbox scope must be a canonical path, not ~/sandbox.
         let args = entry["args"].as_array().expect("args must be an array");
@@ -1041,7 +1055,7 @@ mod tests {
     #[test]
     fn test_antigravity_entry_uses_sandbox_not_tmp() {
         let tmp = tempdir().unwrap();
-        let entry = build_antigravity_servers_entry("stdio", tmp.path());
+        let entry = build_scoped_servers_entry("stdio", tmp.path());
         let args = entry["args"].as_array().expect("args must be array");
         let has_sandbox = args.iter().any(|a| a.as_str() == Some("--sandbox"));
         let has_tmp = args.iter().any(|a| a.as_str() == Some("--tmp"));

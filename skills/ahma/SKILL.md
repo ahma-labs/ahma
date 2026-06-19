@@ -270,7 +270,7 @@ Use the `hooks` subcommand to configure and verify hooks:
 # Check current hook installation status across all platforms
 ahma hooks status
 
-# Install user-scoped hooks for all supported tools (excludes Cursor)
+# Install user-scoped hooks for all supported tools (including Cursor)
 ahma hooks install --scope user
 
 # Install project-scoped hooks for GitHub Copilot specifically
@@ -282,12 +282,16 @@ ahma hooks uninstall --platform copilot --scope user
 
 Supported Hook Platforms:
 - **Cursor**: Configures `${HOME}/.cursor/hooks.json` (user) or `<repo>/.cursor/hooks.json` (project)
-- **Claude Code**: Configures `${HOME}/.claude/settings.json`
+- **Claude Code**: Configures `${HOME}/.claude/settings.json` (user or `<repo>/.claude/settings.json` for project)
 - **Codex**: Configures `${HOME}/.codex/hooks.json`
 - **GitHub Copilot / Copilot CLI**: Configures `${HOME}/.copilot/hooks/ahma.json` (user) and `.github/hooks/ahma.json` (project)
+- **Antigravity**: Configures `${HOME}/.gemini/config/hooks.json` (user) and `<repo>/.agents/hooks.json` (project)
+
+> [!IMPORTANT]
+> **Installed ≠ active.** `ahma hooks install` only writes the hook file. In the default `auto` mode the hook is *active* only when an ahma MCP server is detected for that client; otherwise commands pass through UNSANDBOXED. `ahma hooks status` prints the effective ACTIVE/INACTIVE verdict and why — always check it. Force with `AHMA_HOOKS=on|off`.
 
 > [!NOTE]
-> **Hooks fail open**: if the `ahma` binary is missing, crashes, times out, or its sandbox cannot initialize, the command runs in the default terminal **without** ahma sandboxing rather than being blocked — accompanied by a loud warning to the user and the agent (Cursor hooks use `failClosed: false`). To restore sandboxing, reinstall/fix ahma; to stop attempting to sandbox, run `ahma hooks uninstall` or set `AHMA_HOOKS=off`.
+> **Fail-safe, not silent.** If ahma is *active* but cannot sandbox a command (missing binary, no kernel support, unknown working directory), the command is **blocked**, not run unsandboxed — with an actionable message. `ahma hooks doctor` diagnoses it; `ahma hooks approve-unsandboxed` grants a loud, session-only override (cleared on reboot), and `ahma hooks revoke` clears it. The only silent pass-through is when ahma is *inactive* (off, or `auto` with no MCP server detected). Cursor hooks use `failClosed: false` so a crashed/absent hook binary never wedges your terminal.
 
 > [!IMPORTANT]
 > **Turning off ahma without breaking your terminal**: When you intentionally disable ahma (remove it from `mcp.json`, set `AHMA_HOOKS=off`, or run `ahma hooks uninstall`), the hook automatically passes commands to the default terminal. It never bricks your workflow. The three safe off-switches:
@@ -300,11 +304,8 @@ Supported Hook Platforms:
 > [!NOTE]
 > **Cursor and VS Code Hook Support**: Cursor supports shell execution hooks as of June 2026 via `~/.cursor/hooks.json` or `<project>/.cursor/hooks.json`. The installer configures them automatically. VS Code does not have hook support and is not configured.
 
-> [!IMPORTANT]
-> **Coexistence Guideline**: Avoid having BOTH terminal hooks and an active MCP server configured for "ahma" at the same time. This causes redundant wrapping, sandbox-initialization, and execution overhead. If you use the `ahma` MCP server inside Claude Desktop or Cursor, it is recommended to uninstall terminal hooks:
-> ```bash
-> ahma hooks uninstall --scope user
-> ```
+> [!NOTE]
+> **Hooks + MCP are complementary, not redundant.** Running both the terminal hooks and the ahma MCP server for the same client is **supported and safe** — they sandbox different command streams. The MCP server sandboxes the named tools the agent calls explicitly (`run_terminal_command`, file-tools, git, …); the hooks sandbox the shell commands the agent runs through its *native* terminal/Bash tool, which never pass through MCP. A command is only ever wrapped once (already-wrapped and MCP tool calls pass through untouched). The only tradeoff is a small per-command sandbox cold-start from hooks — if your agent only ever uses ahma's MCP tools and never its native terminal, you can drop hooks with `ahma hooks uninstall --scope user`.
 
 ---
 

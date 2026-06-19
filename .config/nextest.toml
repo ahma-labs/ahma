@@ -116,9 +116,17 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 # Throttle all integration tests (binary_id "ahma_mcp::*") to 1 at a time.
 # The main lib test binary ("ahma_mcp", no :: separator) is NOT matched and
 # runs in parallel with other non-subprocess tests.
+#
+# retries: these tests spawn `ahma serve stdio` and complete an MCP handshake
+# over pipes. On the slow 2-CPU Windows runner that startup/handshake
+# occasionally stalls past the 120s backstop (the "works on M-series, times out
+# on CI" flake this file's header describes — e.g. config_reload_test hanging at
+# exactly period*terminate-after). Retries only rescue a flake; a genuinely
+# broken test still fails every attempt, so this never hides real bugs.
 [[profile.ci.overrides]]
 filter = "binary_id(~ahma_mcp::)"
 threads-required = 2
+retries = 2
 
 # ---------------------------------------------------------------------------
 # Coverage profile (cargo llvm-cov) — instrumentation slows tests significantly

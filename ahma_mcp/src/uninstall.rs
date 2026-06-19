@@ -67,6 +67,7 @@ enum Platform {
     Codex,
     Cursor,
     Copilot,
+    LmStudio,
     VsCode,
 }
 
@@ -77,6 +78,7 @@ const PLATFORMS: &[Platform] = &[
     Platform::Codex,
     Platform::Cursor,
     Platform::Copilot,
+    Platform::LmStudio,
     Platform::VsCode,
 ];
 
@@ -89,6 +91,7 @@ impl Platform {
             Platform::Codex => "Codex",
             Platform::Cursor => "Cursor",
             Platform::Copilot => "GitHub Copilot CLI",
+            Platform::LmStudio => "LM Studio",
             Platform::VsCode => "VS Code (GitHub Copilot Chat)",
         }
     }
@@ -101,6 +104,7 @@ impl Platform {
             Platform::Codex => "codex",
             Platform::Cursor => "cursor",
             Platform::Copilot => "copilot",
+            Platform::LmStudio => "lmstudio",
             Platform::VsCode => "vscode",
         }
     }
@@ -110,7 +114,10 @@ impl Platform {
     }
 
     fn supports_hooks(self) -> bool {
-        !matches!(self, Platform::VsCode | Platform::ClaudeDesktop)
+        !matches!(
+            self,
+            Platform::VsCode | Platform::ClaudeDesktop | Platform::LmStudio
+        )
     }
 
     fn hook_platform(self) -> Option<HookPlatform> {
@@ -121,6 +128,7 @@ impl Platform {
             Platform::Codex => Some(HookPlatform::Codex),
             Platform::Cursor => Some(HookPlatform::Cursor),
             Platform::Copilot => Some(HookPlatform::Copilot),
+            Platform::LmStudio => None,
             Platform::VsCode => None,
         }
     }
@@ -323,6 +331,12 @@ fn uninstall_mcp_config(platforms: &[Platform], dry_run: bool) -> Result<Vec<&'s
                 remove_mcp_entry(&path, "mcpServers", dry_run)
                     .with_context(|| format!("Antigravity MCP config at {}", path.display()))?;
                 Some("Antigravity")
+            }
+            Platform::LmStudio => {
+                let path = home.join(".lmstudio").join("mcp.json");
+                remove_mcp_entry(&path, "mcpServers", dry_run)
+                    .with_context(|| format!("LM Studio MCP config at {}", path.display()))?;
+                Some("LM Studio")
             }
             Platform::Codex => {
                 let path = home.join(".codex").join("config.toml");

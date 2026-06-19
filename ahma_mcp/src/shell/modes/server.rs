@@ -472,12 +472,28 @@ async fn handle_version_checks(
     let client_is_newer = client_is_newer || (same_semver && !same_build);
 
     if client_is_newer {
-        tracing::info!(
-            client_version = client_version,
-            bridge_version = %bridge_version_raw,
-            "Client is newer than bridge (or same version with different build); requesting bridge restart"
-        );
-        restart_bridge_server(socket_path_opt, http_url_opt).await;
+        if std::env::var("AHMA_RESTARTED").is_ok() {
+            // We already restarted once in this lineage. A *persistent*
+            // version/build mismatch must not trigger another restart — that is
+            // how a respawn storm starts when several ahma build-ids transiently
+            // coexist (e.g. a dev rebuild while old `ahma serve` processes still
+            // run). Proxy to whatever bridge is running instead; with a single
+            // installed build-id the mismatch converges after one restart, so a
+            // mismatch that *survives* a restart means restarting again is futile.
+            // (Symmetric with the same-semver stale-bridge branch above.)
+            tracing::warn!(
+                client_version = client_version,
+                bridge_version = %bridge_version_raw,
+                "Bridge version/build mismatch persists after a restart; proxying without restarting again to avoid a respawn storm"
+            );
+        } else {
+            tracing::info!(
+                client_version = client_version,
+                bridge_version = %bridge_version_raw,
+                "Client is newer than bridge (or same version with different build); requesting bridge restart"
+            );
+            restart_bridge_server(socket_path_opt, http_url_opt).await;
+        }
     } else if std::env::var("AHMA_RESTARTED").is_ok() {
         return Err(anyhow::anyhow!(
             "Version mismatch: Client version (v{}) is older than running bridge version (v{}). Please update the client binary.",
@@ -665,7 +681,10 @@ async fn spawn_background_bridge(
     let server_args = build_background_bridge_args(config);
 
     let mut cmd = tokio::process::Command::new(&server_command);
-    cmd.args(&server_args).env("AHMA_SERVER_CHILD", "1");
+    cmd.args(&server_args).env("AHMA_SERVER_CHILD", "1").env(
+        ahma_common::process_guard::SPAWN_DEPTH_ENV,
+        ahma_common::process_guard::child_spawn_depth(),
+    );
 
     #[cfg(unix)]
     {
@@ -770,6 +789,14 @@ fn resolve_bridge_endpoints(config: &AppConfig) -> (String, String) {
 }
 
 pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) -> Result<()> {
+    // Circuit breaker for self-respawn loops: if this `ahma serve` is nested far
+    // deeper than the legitimate frontend→bridge→peer chain, refuse to start so
+    // the chain stops growing instead of exhausting the OS process table.
+    if let Err(msg) = ahma_common::process_guard::check_spawn_depth() {
+        tracing::error!("{msg}");
+        return Err(anyhow::anyhow!(msg));
+    }
+
     let is_test = is_test_or_server_child(&config);
 
     let (socket_path, http_url) = resolve_bridge_endpoints(&config);

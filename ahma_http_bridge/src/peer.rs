@@ -72,6 +72,24 @@ impl PeerFactory for SubprocessPeerFactory {
 
             let mut child = Command::new(&command)
                 .args(&args)
+                // A subprocess peer is ALWAYS a server-child: it serves exactly one
+                // bridge session and must never run the IDE-facing frontend path
+                // (which spawns its own background bridge). We pass `--server-child`
+                // in `args`, but that flag sits after the `stdio` subcommand and is
+                // therefore fragile to parse. Set the internal env marker too — it is
+                // the same mechanism `spawn_background_bridge` uses, and
+                // `is_test_or_server_child()` honors it unconditionally. Without this,
+                // a peer that fails to parse the flag mistakes itself for a frontend
+                // and spawns a bridge, which spawns a peer, … — an unbounded
+                // self-respawning chain of `ahma serve` processes (process-table
+                // exhaustion). env vars inherit reliably across spawn; flags do not.
+                .env("AHMA_SERVER_CHILD", "1")
+                // Stamp the spawn-depth backstop so a runaway spawn chain through
+                // peers self-limits (see ahma_common::process_guard).
+                .env(
+                    ahma_common::process_guard::SPAWN_DEPTH_ENV,
+                    ahma_common::process_guard::child_spawn_depth(),
+                )
                 // Propagate W3C trace context so subprocess spans are linked
                 // to the current session span (W3C Trace Context 1.0 §3.2).
                 .env(

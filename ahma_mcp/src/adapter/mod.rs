@@ -390,10 +390,32 @@ impl Adapter {
             &safe_wd,
         )?;
 
-        let output_res = tokio::time::timeout(timeout, cmd.output()).await;
+        // Spawn manually (rather than `cmd.output()`) so a timeout can take down
+        // the whole process group — `cmd.output()` drops the future on timeout,
+        // and `kill_on_drop` then kills only the direct `sandbox-exec` child,
+        // orphaning `sh`/`cargo`/`rustc` descendants. `base_command` pipes
+        // stdout/stderr and makes the child a process-group leader.
+        // Match `cmd.output()`'s guarantee that stdout/stderr are captured.
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Command execution failed: {}", e))?;
+        // Capture the pid before `wait_with_output` consumes `child`.
+        #[cfg(unix)]
+        let child_pid = child.id();
+
+        let output_res = tokio::time::timeout(timeout, child.wait_with_output()).await;
 
         let output = match output_res {
             Err(_) => {
+                // Kill the entire process group so build descendants don't orphan.
+                #[cfg(unix)]
+                if let Some(pid) = child_pid {
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                }
                 return Err(anyhow::anyhow!(
                     "Operation timed out (exceeded timeout limit): {} seconds",
                     timeout.as_secs()
@@ -1091,6 +1113,26 @@ async fn cancel_operation_timed_out(
         .await;
 }
 
+/// Kill a spawned command and its entire process group, then reap the direct child.
+///
+/// Commands are spawned as process-group leaders (see `Sandbox::base_command`),
+/// so on Unix `kill(-pgid)` takes down the whole descendant tree — e.g.
+/// `sandbox-exec → sh → cargo → rustc` — instead of orphaning the grandchildren
+/// when only the direct child is signalled. On non-Unix it falls back to killing
+/// the direct child. Always `await`s the reap so the direct child does not zombie.
+async fn kill_process_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // Negative pid targets the process group led by the child.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    // Idempotent on Unix after the group kill; reaps the direct child (and on
+    // non-Unix performs the actual kill).
+    let _ = child.kill().await;
+}
+
 /// Execute a command with line-by-line streaming and optional log monitoring.
 ///
 /// This is the single execution path for async operations.  Instead of
@@ -1158,7 +1200,7 @@ async fn execute_with_streaming(
             // Check cancellation
             _ = cancellation_token.cancelled() => {
                 tracing::info!("Operation {} cancelled during streaming", op_id);
-                let _ = child.kill().await;
+                kill_process_tree(&mut child).await;
                 spill.finish().await;
                 handle_cancellation(op_monitor, op_id).await;
                 return;
@@ -1167,7 +1209,7 @@ async fn execute_with_streaming(
             // Timeout
             _ = tokio::time::sleep_until(timeout_deadline) => {
                 tracing::warn!("Operation {} timed out during streaming", op_id);
-                let _ = child.kill().await;
+                kill_process_tree(&mut child).await;
                 spill.finish().await;
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 cancel_operation_timed_out(op_monitor, op_id, duration_ms).await;
@@ -1421,6 +1463,68 @@ async fn process_streaming_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a timed-out/cancelled command must take down its whole process
+    /// group, not just the direct child. Spawn `sh` (direct child) as a
+    /// process-group leader; it backgrounds `sleep 60` (grandchild) and records
+    /// the grandchild pid. `kill_process_tree` must kill the grandchild too —
+    /// otherwise interrupted builds orphan `cargo`/`rustc` and leak processes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_process_tree_takes_down_grandchildren() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 60 & echo $! > {}; wait", pidfile.display()))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            // Same flag base_command sets in production — makes the child a
+            // process-group leader so the group kill reaches the grandchild.
+            .process_group(0);
+        let mut child = cmd.spawn().expect("spawn sh");
+
+        // Wait for the grandchild pid to be recorded.
+        let mut gpid = None;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile)
+                && let Ok(p) = s.trim().parse::<i32>()
+            {
+                gpid = Some(p);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let gpid = gpid.expect("grandchild pid file should be written");
+
+        // Grandchild is alive (signal 0 only probes existence).
+        assert_eq!(
+            unsafe { libc::kill(gpid, 0) },
+            0,
+            "grandchild should be alive before kill"
+        );
+
+        kill_process_tree(&mut child).await;
+
+        // The grandchild should die (and be reaped) shortly after the group kill.
+        let mut dead = false;
+        for _ in 0..100 {
+            if unsafe { libc::kill(gpid, 0) } != 0 {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            dead,
+            "grandchild (pid {gpid}) must be killed via process-group kill, not orphaned"
+        );
+    }
 
     // ============= generate_id tests =============
 

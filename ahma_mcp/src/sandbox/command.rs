@@ -33,6 +33,26 @@ impl Sandbox {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
+        // Scrub ahma's internal supervision markers so they never leak into the
+        // commands ahma runs. Without this, a tool/user command (or a test) that
+        // itself launches `ahma serve` would inherit a bogus server-child role and
+        // spawn depth, making the nested server skip its bridge or trip the
+        // spawn-depth backstop. These vars are set deliberately only on intentional
+        // `ahma serve` children (spawn_background_bridge / SubprocessPeerFactory).
+        cmd.env_remove("AHMA_SERVER_CHILD")
+            .env_remove(ahma_common::process_guard::SPAWN_DEPTH_ENV)
+            .env_remove("AHMA_RESTARTED");
+
+        // Run each command as its own process-group leader so the whole tree can
+        // be killed as a unit on timeout/cancellation. On macOS the direct child
+        // is `sandbox-exec`, which execs `sh -c "<cmd>"`, which may fan out to
+        // `cargo` → `rustc` → `cc`; signalling only the direct child (what
+        // `kill_on_drop`/`Child::kill` do) orphans those descendants, leaking
+        // build processes until they finish. With a dedicated group the adapter
+        // can `kill(-pgid)` the entire subtree (see `kill_process_tree`).
+        #[cfg(unix)]
+        cmd.process_group(0);
+
         // Cargo can be configured (via config or env) to write its target dir outside
         // the session sandbox. Force it back inside the working directory.
         // When `separate_cargo_target` is set, use a dedicated subdirectory so ahma's

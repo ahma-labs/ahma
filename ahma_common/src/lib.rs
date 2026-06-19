@@ -36,6 +36,7 @@ pub mod observability;
 /// Transport-agnostic MCP peer factory abstraction (P6).
 pub mod peer_factory;
 pub mod peer_transport;
+pub mod process_guard;
 pub mod prompts;
 pub mod sandbox_state;
 pub mod scope_decision;

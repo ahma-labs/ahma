@@ -30,6 +30,10 @@ pub enum McpClientType {
     ClaudeDesktop,
     /// Zed editor
     Zed,
+    /// LM Studio - handles progress notifications correctly.
+    LmStudio,
+    /// Ollama - handles progress notifications correctly.
+    Ollama,
     /// Unknown client - optimistically assume progress is supported.
     #[default]
     Unknown,
@@ -52,6 +56,10 @@ impl McpClientType {
             McpClientType::VSCode
         } else if name_lower.contains("zed") {
             McpClientType::Zed
+        } else if name_lower.contains("lm studio") || name_lower.contains("lmstudio") {
+            McpClientType::LmStudio
+        } else if name_lower.contains("ollama") {
+            McpClientType::Ollama
         } else {
             McpClientType::Unknown
         }
@@ -82,6 +90,8 @@ impl McpClientType {
             McpClientType::VSCode => "VSCode/Copilot",
             McpClientType::ClaudeDesktop => "Claude Desktop",
             McpClientType::Zed => "Zed",
+            McpClientType::LmStudio => "LM Studio",
+            McpClientType::Ollama => "Ollama",
             McpClientType::Unknown => "Unknown",
         }
     }
@@ -158,6 +168,34 @@ mod tests {
     }
 
     #[test]
+    fn test_lmstudio_detection() {
+        assert_eq!(
+            McpClientType::from_client_name("lmstudio"),
+            McpClientType::LmStudio
+        );
+        assert_eq!(
+            McpClientType::from_client_name("LM Studio"),
+            McpClientType::LmStudio
+        );
+        assert_eq!(
+            McpClientType::from_client_name("lmstudio-mcp"),
+            McpClientType::LmStudio
+        );
+    }
+
+    #[test]
+    fn test_ollama_detection() {
+        assert_eq!(
+            McpClientType::from_client_name("ollama"),
+            McpClientType::Ollama
+        );
+        assert_eq!(
+            McpClientType::from_client_name("Ollama"),
+            McpClientType::Ollama
+        );
+    }
+
+    #[test]
     fn test_unknown_detection() {
         assert_eq!(
             McpClientType::from_client_name("some-other-client"),
@@ -175,6 +213,8 @@ mod tests {
         assert!(McpClientType::VSCode.supports_progress());
         assert!(McpClientType::ClaudeDesktop.supports_progress());
         assert!(McpClientType::Zed.supports_progress());
+        assert!(McpClientType::LmStudio.supports_progress());
+        assert!(McpClientType::Ollama.supports_progress());
         assert!(McpClientType::Unknown.supports_progress());
     }
 

@@ -140,6 +140,22 @@ Ahma enforces **kernel-level filesystem sandboxing** by default — Landlock on 
 
 See [docs/security-sandbox.md](docs/security-sandbox.md) for platform details, nested sandbox detection, temp directory access, and example `mcp.json` configs.
 
+## Terminal Hooks
+
+The ahma MCP server only sandboxes the tools an agent calls explicitly. **Terminal hooks** extend the same kernel sandbox to the shell commands an agent runs through its *native* terminal/Bash tool — which never pass through MCP. Supported clients: **Cursor, Claude Code, Codex, GitHub Copilot CLI, and Antigravity** (VS Code and Claude Desktop have no execution-hook mechanism).
+
+```bash
+ahma hooks install      # user-scoped hooks for all supported clients
+ahma hooks status       # shows the EFFECTIVE state (active vs installed-but-inactive)
+ahma hooks uninstall    # remove them
+```
+
+`install` only writes the hook file. In the default `auto` mode a hook is **active** only when an ahma MCP server is detected for that client; otherwise commands pass through **unsandboxed**. Always confirm with `ahma hooks status`, which prints the effective verdict and why. Force the behaviour with `AHMA_HOOKS=on|off` (alias `AHMA_DISABLE_HOOKS=1`).
+
+**Fail-safe behaviour:** if ahma is *active* but cannot sandbox a command (broken install, missing kernel support), the command is **blocked**, not run unsandboxed — `ahma hooks doctor` diagnoses it and `ahma hooks approve-unsandboxed` grants a loud, session-only override. ahma never silently runs a command unsandboxed while it believes hooks are active.
+
+See [docs/installation.md](docs/installation.md#terminal-hooks) for the per-client config paths and full details.
+
 ## Configuration Reference
 
 Sandbox scope, logging, execution behaviour, and HTTP transport options are all configured via environment variables. See **[docs/environment-variables.md](docs/environment-variables.md)** for the full reference, including a quick-reference table of every `AHMA_*` variable.

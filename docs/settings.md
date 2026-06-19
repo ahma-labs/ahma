@@ -46,13 +46,12 @@ Run `ahma settings init` to generate this file automatically.
 # the compiled-in default.  CLI flags always take highest priority, followed
 # by this file, followed by deprecated AHMA_* environment variables.
 
-# ── oMLX (Apple Silicon mlx_lm.server) ──────────────────────────────────────
-# Start the server with:
-#   mlx_lm.server --model mlx-community/gemma-4-12B-it-8bit
+# ── LM Studio (local OpenAI-compatible server) ──────────────────────────────
+# Start the LM Studio Local Server (Developer tab), or headless: lms server start
 #
-# [omlx]
-# base_url = "http://localhost:8080/v1"          # default: 8080 (mlx_lm.server)
-# model    = "mlx-community/gemma-4-12B-it-8bit" # default model
+# [lmstudio]
+# base_url = "http://localhost:1234/v1"  # default: 1234 (LM Studio local server)
+# model    = "openai/gpt-oss-20b"        # set to the model loaded in LM Studio
 
 # ── Tool execution ───────────────────────────────────────────────────────────
 # [tools]
@@ -97,50 +96,52 @@ Run `ahma settings init` to generate this file automatically.
 
 ---
 
-## oMLX configuration
+## LM Studio configuration
 
-`oMLX` refers to running a local LLM via Apple's [MLX framework](https://github.com/ml-explore/mlx)
-using the [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) OpenAI-compatible server.
+[LM Studio](https://lmstudio.ai/) runs local LLMs and exposes an OpenAI-compatible
+API through its built-in **Local Server**. Ahma auto-registers an `lmstudio`
+provider from these settings.
 
 ### Starting the server
 
+Open LM Studio, load a model, then go to the **Developer** tab and click
+**Start Server**. Or start it headless:
+
 ```bash
-# Install (requires Python + pip)
-pip install mlx-lm
-
-# Start with the default model
-mlx_lm.server --model mlx-community/gemma-4-12B-it-8bit
-
-# Or use a smaller model
-mlx_lm.server --model mlx-community/gemma-3-4B-it-4bit
+# Start the server (loads the last-used model)
+lms server start
 ```
 
-The server listens on `http://localhost:8080/v1` by default.
+The server listens on `http://localhost:1234/v1` by default.
 
 ### Changing the model in settings.toml
 
+Set `model` to the identifier of the model loaded in LM Studio (shown next to the
+loaded model in the app):
+
 ```toml
-[omlx]
-model = "mlx-community/llama-3.2-3B-Instruct-4bit"
+[lmstudio]
+model = "openai/gpt-oss-20b"
 ```
 
-### Using oMLX as a named provider in tool definitions
+### Using LM Studio as a named provider in tool definitions
 
-The oMLX settings are exposed as a named provider available in decompose and livelog tools:
+The LM Studio settings are exposed as a named provider available in decompose and
+livelog tools:
 
 ```json
 {
   "decompose": {
     "llm_provider": {
-      "base_url": "http://localhost:8080/v1",
-      "model": "mlx-community/gemma-4-12B-it-8bit"
+      "base_url": "http://localhost:1234/v1",
+      "model": "openai/gpt-oss-20b"
     }
   }
 }
 ```
 
-> **Tip**: You can reference the oMLX base URL and model from `settings.toml` directly —
-> the `ahma settings show` command prints the currently configured values.
+> **Tip**: You can reference the LM Studio base URL and model from `settings.toml`
+> directly — the `ahma settings show` command prints the currently configured values.
 
 ---
 

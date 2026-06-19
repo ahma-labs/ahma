@@ -4,10 +4,10 @@ use crate::error::LlmMonitorError;
 /// Discover local LLM providers by probing common ports.
 pub async fn discover_local_providers() -> Result<Vec<LocalProvider>, LlmMonitorError> {
     let endpoints = vec![
-        ("oMLX", "http://localhost:8000/v1"),
+        ("LM Studio", "http://localhost:1234/v1"),
         ("Ollama", "http://localhost:11434/v1"),
         ("llama-server", "http://localhost:8080/v1"),
-        ("oMLX", "http://127.0.0.1:8000/v1"),
+        ("LM Studio", "http://127.0.0.1:1234/v1"),
         ("Ollama", "http://127.0.0.1:11434/v1"),
         ("llama-server", "http://127.0.0.1:8080/v1"),
     ];
