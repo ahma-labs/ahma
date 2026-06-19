@@ -69,6 +69,7 @@ pub use ahma_mcp::{Adapter, AhmaMcpService};
 pub use ahma_llm_monitor::LlmClient;
 
 pub mod agent;
+pub mod approvals;
 pub use agent::{
     AgentApprovalGate, AgentEvent, McpChatConfig, execute_agent_turn, spawn_agent_task,
 };

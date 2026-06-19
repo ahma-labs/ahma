@@ -784,7 +784,12 @@ pub struct LogFileInfo {
 #[derive(Debug, Clone)]
 pub struct ApprovalGate {
     pub op_id: String,
+    /// Raw tool name (e.g. `list_dir`), used when persisting an "always allow".
+    pub tool: String,
     pub description: String,
+    /// Short scope hint (e.g. "new workspace …") shown dim when the prompt
+    /// appears in an unfamiliar workspace; `None` when no context is warranted.
+    pub note: Option<String>,
     pub deadline: Option<Instant>,
     pub diff: Option<String>,
 }

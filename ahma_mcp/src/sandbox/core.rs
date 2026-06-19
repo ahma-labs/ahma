@@ -11,26 +11,72 @@ use super::types::{SandboxMode, ScopesGuard};
 // Livelog symlink resolution helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Path to the out-of-sandbox log-symlink exceptions file
+/// (`~/.config/ahma/log_exceptions.json`), or `None` if no config dir exists.
+///
+/// These approvals are stored *outside* any workspace scope so a sandboxed
+/// agent cannot grant itself access to out-of-scope log targets by writing the
+/// file — the same reasoning as [`ahma_core`-style] tool-approval grants.
+/// Exceptions are keyed by workspace root:
+///
+/// ```json
+/// { "/Users/you/sandbox/ahma": ["/abs/target/one", "/abs/target/two"] }
+/// ```
+fn log_exceptions_path() -> Option<PathBuf> {
+    // Honors `AHMA_CONFIG_DIR` (tests / relocation), else the platform config dir.
+    std::env::var_os("AHMA_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
+        .map(|d| d.join("ahma").join("log_exceptions.json"))
+}
+
+/// Normalise a workspace root into the map key (canonical where possible).
+fn workspace_key(primary_root: &Path) -> String {
+    dunce::canonicalize(primary_root)
+        .unwrap_or_else(|_| primary_root.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn read_exceptions_map(path: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
 pub fn load_exceptions(primary_root: &Path) -> Vec<PathBuf> {
-    let path = primary_root.join(".ahma").join("exceptions.json");
-    if !path.exists() {
+    let Some(path) = log_exceptions_path() else {
         return vec![];
+    };
+    let map = read_exceptions_map(&path);
+    map.get(&workspace_key(primary_root))
+        .map(|targets| targets.iter().map(PathBuf::from).collect())
+        .unwrap_or_default()
+}
+
+/// Persist an approved out-of-scope symlink `target` for `primary_root` to the
+/// out-of-sandbox exceptions file. Idempotent.
+pub fn add_log_exception(primary_root: &Path, target: &Path) -> std::io::Result<()> {
+    let Some(path) = log_exceptions_path() else {
+        return Ok(()); // no config dir — nothing we can do, fail soft
+    };
+
+    let mut map = read_exceptions_map(&path);
+    let key = workspace_key(primary_root);
+    let target_str = target.to_string_lossy().into_owned();
+    let entry = map.entry(key).or_default();
+    if !entry.iter().any(|t| t == &target_str) {
+        entry.push(target_str);
+        entry.sort();
     }
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return vec![];
-    };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return vec![];
-    };
-    let Some(arr) = val.get("approved_log_symlinks").and_then(|v| v.as_array()) else {
-        return vec![];
-    };
-    arr.iter()
-        .filter_map(|item| {
-            let target = item.get("target_path").and_then(|v| v.as_str())?;
-            Some(PathBuf::from(target))
-        })
-        .collect()
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let serialized = serde_json::to_string_pretty(&map)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(&path, serialized)
 }
 
 pub fn is_target_allowed(target: &Path, scopes: &[PathBuf], exceptions: &[PathBuf]) -> bool {

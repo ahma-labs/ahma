@@ -90,41 +90,10 @@ impl AhmaMcpService {
             .cloned()
             .ok_or_else(|| mcp_internal("No sandbox scopes configured"))?;
 
-        let exceptions_dir = primary_root.join(".ahma");
-        if !exceptions_dir.exists() {
-            std::fs::create_dir_all(&exceptions_dir)
-                .map_err(|e| mcp_internal(format!("Failed to create .ahma directory: {e}")))?;
-        }
-
-        let exceptions_file = exceptions_dir.join("exceptions.json");
-        let mut approved = vec![];
-
-        if exceptions_file.exists()
-            && let Ok(content) = std::fs::read_to_string(&exceptions_file)
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&content)
-            && let Some(arr) = val.get("approved_log_symlinks").and_then(|v| v.as_array())
-        {
-            for item in arr {
-                if let Some(t) = item.get("target_path").and_then(|v| v.as_str()) {
-                    approved.push(t.to_string());
-                }
-            }
-        }
-
-        let target_str = canonical_target.to_string_lossy().to_string();
-        if !approved.contains(&target_str) {
-            approved.push(target_str);
-        }
-
-        let new_val = serde_json::json!({
-            "approved_log_symlinks": approved.into_iter().map(|t| serde_json::json!({ "target_path": t })).collect::<Vec<_>>()
-        });
-
-        let new_content = serde_json::to_string_pretty(&new_val)
-            .map_err(|e| mcp_internal(format!("Failed to serialize exceptions: {e}")))?;
-
-        std::fs::write(&exceptions_file, new_content)
-            .map_err(|e| mcp_internal(format!("Failed to write exceptions.json: {e}")))?;
+        // Persisted out-of-sandbox (~/.config/ahma/) so a sandboxed agent
+        // cannot grant itself access by writing the file inside the workspace.
+        crate::sandbox::add_log_exception(&primary_root, &canonical_target)
+            .map_err(|e| mcp_internal(format!("Failed to write log exceptions: {e}")))?;
 
         Ok(text_result(format!(
             "Successfully approved symlink target: {}. Please restart the TUI/session to apply changes.",

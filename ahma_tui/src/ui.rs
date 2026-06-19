@@ -317,7 +317,9 @@ fn draw_windows_layout(
 fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
     let approval_h: u16 = if let Some(gate) = &state.approval {
-        if gate.diff.is_some() { 12 } else { 3 }
+        // +2 for the rounded border (top/bottom). 2 content lines normally,
+        // or 2 + blank + up to 9 diff lines when a diff is attached.
+        if gate.diff.is_some() { 14 } else { 4 }
     } else {
         0
     };
@@ -968,7 +970,9 @@ fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     }
 
     let approval_h: u16 = if let Some(gate) = &state.approval {
-        if gate.diff.is_some() { 12 } else { 3 }
+        // +2 for the rounded border (top/bottom). 2 content lines normally,
+        // or 2 + blank + up to 9 diff lines when a diff is attached.
+        if gate.diff.is_some() { 14 } else { 4 }
     } else {
         0
     };
@@ -2244,34 +2248,54 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
 
     let countdown = gate
         .remaining_secs()
-        .map(|s| format!("  ({s}s left)"))
+        .map(|s| format!("  ·  {s}s left"))
         .unwrap_or_default();
 
-    let desc = truncate(&gate.description, (area.width as usize).saturating_sub(50));
     let warn = if state.unicode { "⚠ " } else { "! " };
+
+    // A red outline keeps the prompt unmistakable without a jarring full-bleed
+    // background. The keyword lives in the title; details sit inside.
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(theme.approval_border())
+        .title(Span::styled(
+            format!(" {warn}APPROVAL REQUIRED "),
+            theme.approval_border(),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+
+    let desc = truncate(&gate.description, (inner.width as usize).saturating_sub(24));
+
+    let note = gate
+        .note
+        .as_deref()
+        .map(|n| format!("   ·  {n}"))
+        .unwrap_or_default();
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(
-                format!(" {warn}APPROVAL REQUIRED  {}", gate.op_id),
-                theme.approval_banner(),
-            ),
-            Span::styled(format!("  {desc}"), theme.approval_banner()),
-            Span::styled(countdown, theme.approval_banner()),
+            Span::styled(format!("{}  ", gate.op_id), theme.dim()),
+            Span::styled(desc, theme.normal()),
+            Span::styled(note, theme.approval_note()),
+            Span::styled(countdown, theme.dim()),
         ]),
         Line::from(vec![
-            Span::styled("   [y] approve  ", theme.approval_banner()),
-            Span::styled("[n] reject  ", theme.approval_banner()),
-            Span::styled(
-                "[Tab] focus other panels while deciding",
-                theme.approval_banner(),
-            ),
+            Span::styled("[y]", theme.approval_key()),
+            Span::styled(" approve    ", theme.normal()),
+            Span::styled("[a]", theme.approval_key()),
+            Span::styled(" always allow    ", theme.normal()),
+            Span::styled("[n]", theme.approval_key()),
+            Span::styled(" reject", theme.normal()),
         ]),
     ];
 
     if let Some(diff) = &gate.diff {
         lines.push(Line::from(""));
-        for diff_line in diff.lines().take(9) {
+        let budget = inner.height.saturating_sub(3) as usize;
+        for diff_line in diff.lines().take(budget) {
             let style = if diff_line.starts_with('+') {
                 theme.success()
             } else if diff_line.starts_with('-') {
@@ -2279,15 +2303,12 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
             } else {
                 theme.normal()
             };
-            lines.push(Line::from(Span::styled(
-                format!("    {}", diff_line),
-                style,
-            )));
+            lines.push(Line::from(Span::styled(format!("  {}", diff_line), style)));
         }
     }
 
-    let para = Paragraph::new(Text::from(lines)).style(theme.approval_banner());
-    frame.render_widget(para, area);
+    let para = Paragraph::new(Text::from(lines));
+    frame.render_widget(para, inner);
 }
 
 // ─── Footer ───────────────────────────────────────────────────────────────────

@@ -357,7 +357,13 @@ async fn execute_single_tool_call(
     let args_str = serde_json::to_string(&args_value).unwrap_or_default();
 
     let approved = if needs_approval(&call.name, cfg.tool_approval) {
-        gate.request_approval(&call.id, &call.name, &args_str).await
+        // A previously granted "always allow" for this tool in this workspace
+        // skips the prompt entirely.
+        if crate::approvals::is_tool_approved(&cfg.workspace_root, &call.name).await {
+            true
+        } else {
+            gate.request_approval(&call.id, &call.name, &args_str).await
+        }
     } else {
         true
     };

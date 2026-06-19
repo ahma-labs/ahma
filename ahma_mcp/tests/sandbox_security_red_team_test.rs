@@ -486,22 +486,14 @@ async fn red_team_livelog_symlink_read_allowed() {
     let outside_forbidden = outside_dir.path().join("forbidden.log");
     std::fs::write(&outside_forbidden, "forbidden content").unwrap();
 
-    // Set up exceptions.json so that livelog's is_target_allowed() approves
-    // the outside target, allowing it to be added to Landlock read_scopes.
+    // Approve the outside target so livelog's is_target_allowed() admits it to
+    // the Landlock read_scopes. Approvals live out-of-sandbox now; redirect the
+    // config dir to a temp location for isolation (nextest = process-per-test).
     // Without this, the out-of-scope symlink target would be silently blocked
     // by resolve_log_symlink and never added to read_scopes.
-    let ahma_dir = scope_dir.path().join(".ahma");
-    std::fs::create_dir_all(&ahma_dir).unwrap();
-    let exceptions_json = serde_json::json!({
-        "approved_log_symlinks": [
-            {"target_path": outside_target.to_str().expect("non-UTF-8 path")}
-        ]
-    });
-    std::fs::write(
-        ahma_dir.join("exceptions.json"),
-        serde_json::to_string(&exceptions_json).unwrap(),
-    )
-    .unwrap();
+    let config_dir = create_non_tmp_tempdir();
+    unsafe { std::env::set_var("AHMA_CONFIG_DIR", config_dir.path()) };
+    ahma_mcp::sandbox::add_log_exception(scope_dir.path(), &outside_target).unwrap();
 
     let malicious_link = log_dir.join("live.log");
     match symlink(&outside_target, &malicious_link) {

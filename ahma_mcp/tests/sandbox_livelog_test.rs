@@ -194,19 +194,11 @@ mod unix_tests {
 
         symlink(&actual_log, log_dir.join("current.log")).unwrap();
 
-        let ahma_dir = scope.join(".ahma");
-        std::fs::create_dir_all(&ahma_dir).unwrap();
-
-        let exceptions = serde_json::json!({
-            "approved_log_symlinks": [
-                { "target_path": resolved_target.to_string_lossy().to_string() }
-            ]
-        });
-        std::fs::write(
-            ahma_dir.join("exceptions.json"),
-            serde_json::to_string(&exceptions).unwrap(),
-        )
-        .unwrap();
+        // Approvals are stored out-of-sandbox; point the config dir at a temp
+        // location for isolation (nextest runs each test in its own process).
+        let config_dir = tempdir().unwrap();
+        unsafe { std::env::set_var("AHMA_CONFIG_DIR", config_dir.path()) };
+        ahma_mcp::sandbox::add_log_exception(&scope, &resolved_target).unwrap();
 
         let sandbox = Sandbox::new(vec![scope], SandboxMode::Strict, false, true, false).unwrap();
         let read_scopes = sandbox.read_scopes();
