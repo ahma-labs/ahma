@@ -1055,17 +1055,36 @@ where
                 hub.instances.lock().await.keys().next().cloned()
             };
 
-            if let Some(tid) = target_id {
-                if let Some(tx) = hub.instance_txs.lock().await.get(&tid) {
-                    let _ = tx
+            // Route to the chosen instance. Every failure path must broadcast an
+            // AgentError so the TUI stops its elapsed counter and shows feedback
+            // — silently dropping the prompt leaves the user staring at a
+            // forever-incrementing timer with no answer and no error.
+            let delivered = if let Some(tid) = target_id {
+                let tx = hub.instance_txs.lock().await.get(&tid).cloned();
+                match tx {
+                    Some(tx) => tx
                         .send(DaemonMsg::RunPrompt {
                             messages,
                             system_prompt,
                             provider,
                             model,
                         })
-                        .await;
+                        .await
+                        .is_ok(),
+                    None => false,
                 }
+            } else {
+                false
+            };
+
+            if !delivered {
+                warn!("daemon: SubmitPrompt could not be routed — no instance available to run it");
+                let _ = hub.broadcast.send(DaemonMsg::AgentError {
+                    error: "No ahma instance is available to run the prompt. \
+                            Make sure an ahma server is connected (it normally \
+                            auto-starts); try reopening the TUI."
+                        .to_string(),
+                });
             }
         }
 
@@ -1118,6 +1137,57 @@ fn uuid_v4() -> String {
 mod tests {
     use super::*;
     use tokio::io::BufReader;
+
+    // ── SubmitPrompt routing ──────────────────────────────────────────────────
+
+    /// Regression: a `SubmitPrompt` that cannot be routed (no instance is
+    /// registered) MUST broadcast an `AgentError` back to subscribers. Silently
+    /// dropping it left the TUI's elapsed counter incrementing forever with no
+    /// answer and no error — exactly the "ahma tui says nothing" symptom.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn submit_prompt_without_instance_broadcasts_agent_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("regress.sock");
+
+        let hub = try_start_hub_server_at(socket_path.clone())
+            .await
+            .unwrap()
+            .expect("embedded hub should bind a fresh socket");
+
+        // Subscribe in-process before sending so the broadcast is observed.
+        let mut rx = hub.subscribe();
+
+        // Connect as a client and submit a prompt with no instances registered.
+        let mut client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        send_msg(
+            &mut client,
+            &ClientMsg::SubmitPrompt {
+                messages: vec![],
+                system_prompt: None,
+                provider: None,
+                model: None,
+                target_instance_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("AgentError should be broadcast, not dropped")
+            .expect("broadcast channel open");
+
+        match msg {
+            DaemonMsg::AgentError { error } => {
+                assert!(
+                    error.contains("No ahma instance"),
+                    "unexpected error text: {error}"
+                );
+            }
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+    }
 
     // ── NDJ framing ───────────────────────────────────────────────────────────
 
