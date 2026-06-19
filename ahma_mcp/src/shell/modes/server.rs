@@ -472,12 +472,28 @@ async fn handle_version_checks(
     let client_is_newer = client_is_newer || (same_semver && !same_build);
 
     if client_is_newer {
-        tracing::info!(
-            client_version = client_version,
-            bridge_version = %bridge_version_raw,
-            "Client is newer than bridge (or same version with different build); requesting bridge restart"
-        );
-        restart_bridge_server(socket_path_opt, http_url_opt).await;
+        if std::env::var("AHMA_RESTARTED").is_ok() {
+            // We already restarted once in this lineage. A *persistent*
+            // version/build mismatch must not trigger another restart — that is
+            // how a respawn storm starts when several ahma build-ids transiently
+            // coexist (e.g. a dev rebuild while old `ahma serve` processes still
+            // run). Proxy to whatever bridge is running instead; with a single
+            // installed build-id the mismatch converges after one restart, so a
+            // mismatch that *survives* a restart means restarting again is futile.
+            // (Symmetric with the same-semver stale-bridge branch above.)
+            tracing::warn!(
+                client_version = client_version,
+                bridge_version = %bridge_version_raw,
+                "Bridge version/build mismatch persists after a restart; proxying without restarting again to avoid a respawn storm"
+            );
+        } else {
+            tracing::info!(
+                client_version = client_version,
+                bridge_version = %bridge_version_raw,
+                "Client is newer than bridge (or same version with different build); requesting bridge restart"
+            );
+            restart_bridge_server(socket_path_opt, http_url_opt).await;
+        }
     } else if std::env::var("AHMA_RESTARTED").is_ok() {
         return Err(anyhow::anyhow!(
             "Version mismatch: Client version (v{}) is older than running bridge version (v{}). Please update the client binary.",
