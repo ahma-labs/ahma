@@ -220,6 +220,15 @@ impl McpConnectionManager {
         let mut cmd = Command::new(command);
         cmd.args(args);
         cmd.kill_on_drop(true);
+        // Defense in depth: stamp the spawn-depth backstop so that if a
+        // self-referential MCP server ever slips past `is_self_ahma_serve`
+        // (e.g. an explicit entry in mcp-clients.toml), the chain self-limits at
+        // MAX_SPAWN_DEPTH instead of growing unbounded. Harmless for non-ahma
+        // servers, which ignore the variable.
+        cmd.env(
+            ahma_common::process_guard::SPAWN_DEPTH_ENV,
+            ahma_common::process_guard::child_spawn_depth(),
+        );
 
         let handler = McpClientHandler {
             workspace_root: self.workspace_root.clone(),
@@ -426,6 +435,23 @@ fn ide_entry_to_server(name: &str, entry: &Value) -> Option<McpServerConfig> {
         })
         .unwrap_or_default();
 
+    // CRITICAL: never register ahma's own `serve` command as an "external" MCP
+    // server. The IDE mcp.json entry that launched *this* process points right
+    // back at `ahma serve …`; treating it as an external server makes every
+    // ahma instance spawn another ahma to list its tools, which spawns another,
+    // … — an unbounded self-respawn chain that exhausts the process table
+    // (observed: hundreds of stuck `ahma serve stdio … --log-monitor`
+    // processes). Self-aggregation is meaningless anyway: this server already
+    // exposes its own tools directly.
+    if is_self_ahma_serve(command, &args) {
+        tracing::debug!(
+            server = name,
+            command,
+            "Skipping IDE MCP server entry that points at ahma itself (would self-recurse)"
+        );
+        return None;
+    }
+
     Some(McpServerConfig {
         name: name.to_string(),
         enabled: true,
@@ -434,6 +460,33 @@ fn ide_entry_to_server(name: &str, entry: &Value) -> Option<McpServerConfig> {
             args,
         },
     })
+}
+
+/// True when `command`+`args` would launch ahma's own `serve` mode — i.e. this
+/// process's own binary. Matches the bare name `ahma`, an absolute/relative path
+/// whose file stem is `ahma`, or the current executable's own file stem, in all
+/// cases gated on an `serve` argument so non-server ahma subcommands (which do
+/// not loop) are unaffected.
+fn is_self_ahma_serve(command: &str, args: &[String]) -> bool {
+    let runs_serve = args.iter().any(|a| a == "serve");
+    if !runs_serve {
+        return false;
+    }
+    let cmd_stem = Path::new(command)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command);
+    if cmd_stem.eq_ignore_ascii_case("ahma") {
+        return true;
+    }
+    // Also match by the current executable's stem, in case the binary was
+    // installed/renamed but the IDE config references it by that path.
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(Path::file_stem)
+        .and_then(|s| s.to_str())
+        .is_some_and(|exe_stem| exe_stem.eq_ignore_ascii_case(cmd_stem))
 }
 
 async fn call_mcp_tool_stdio(
@@ -580,6 +633,55 @@ async fn call_mcp_tool_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Self-reference filter (process-table exhaustion regression) ───────────
+
+    #[test]
+    fn self_referential_ahma_serve_entry_is_rejected() {
+        // The exact shape of the Cursor / Claude Desktop "Ahma" entry that
+        // launched this process. Registering it as an external server made every
+        // ahma spawn another ahma to list its tools → unbounded self-respawn.
+        let entry = serde_json::json!({
+            "type": "stdio",
+            "command": "ahma",
+            "args": ["serve", "stdio", "--tools", "simplify", "--sandbox", "--log-monitor"],
+        });
+        assert!(
+            ide_entry_to_server("Ahma", &entry).is_none(),
+            "ahma's own serve command must never be registered as an external MCP server"
+        );
+    }
+
+    #[test]
+    fn ahma_serve_by_absolute_path_is_rejected() {
+        let entry = serde_json::json!({
+            "command": "/Users/me/.local/bin/ahma",
+            "args": ["serve", "stdio"],
+        });
+        assert!(ide_entry_to_server("Ahma", &entry).is_none());
+    }
+
+    #[test]
+    fn non_serve_ahma_subcommand_is_allowed() {
+        // `ahma` running a non-server subcommand does not loop, so it is a
+        // legitimate external server and must NOT be filtered.
+        let entry = serde_json::json!({
+            "command": "ahma",
+            "args": ["some-other-tool"],
+        });
+        assert!(ide_entry_to_server("ahma-tool", &entry).is_some());
+    }
+
+    #[test]
+    fn other_mcp_servers_are_preserved() {
+        let entry = serde_json::json!({
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-github", "serve"],
+        });
+        // `serve` appears in args but the command is not ahma → keep it.
+        let server = ide_entry_to_server("github", &entry).expect("non-ahma server kept");
+        assert_eq!(server.name, "github");
+    }
 
     #[test]
     fn test_mcp_config_serialization() {

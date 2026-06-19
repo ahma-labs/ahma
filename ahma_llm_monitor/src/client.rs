@@ -12,6 +12,40 @@ use crate::anthropic;
 use crate::error::LlmMonitorError;
 use crate::prompt::build_messages;
 
+/// Max time to establish a TCP/TLS connection to the LLM endpoint.
+///
+/// Catches an unreachable or wedged local server (e.g. Ollama not actually
+/// listening) quickly instead of waiting on the OS default, which can be
+/// minutes.
+const LLM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max time to wait between successive bytes from the LLM endpoint.
+///
+/// This is a *per-read* inactivity window, not a cap on total request
+/// duration: a model that is actively producing tokens (streaming) or busy
+/// generating a non-streaming completion keeps the connection warm and never
+/// trips it. It exists so a silently dropped/hung connection surfaces as an
+/// error rather than leaving the agent loop — and the TUI's elapsed counter —
+/// spinning forever with no answer and no error.
+const LLM_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Build the shared HTTP client with connect/read timeouts so a stalled or
+/// unreachable LLM endpoint fails loudly instead of hanging indefinitely.
+///
+/// Falls back to a default client if the builder rejects the configuration
+/// (should never happen with static timeouts, but we must not panic at
+/// construction time).
+fn build_http_client() -> Client {
+    Client::builder()
+        .connect_timeout(LLM_CONNECT_TIMEOUT)
+        .read_timeout(LLM_READ_TIMEOUT)
+        .build()
+        .unwrap_or_else(|e| {
+            warn!("Failed to build HTTP client with timeouts ({e}); using default client");
+            Client::new()
+        })
+}
+
 // ─── Chat types ───────────────────────────────────────────────────────────────
 
 /// Role in a chat conversation.
@@ -175,7 +209,7 @@ impl LlmClient {
             (_, key) => key,
         };
         Self {
-            http: Client::new(),
+            http: build_http_client(),
             base_url,
             model: model.into(),
             api_key,
