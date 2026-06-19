@@ -49,3 +49,6 @@ ahma-release-new.pem
 
 # Local session files
 .ahma/session.toml
+
+# Local Ahma exports
+.ahma/exports/
