@@ -25,6 +25,7 @@ reqwest = { workspace = true, features = ["json", "rustls"] }
 uuid.workspace = true
 futures.workspace = true
 async-trait.workspace = true
+dirs.workspace = true
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["tokio"] }

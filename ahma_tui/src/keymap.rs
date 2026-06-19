@@ -18,6 +18,7 @@ pub enum Action {
     BackTab,
     // Approval
     Approve,
+    ApproveAlways,
     Reject,
     // Op actions
     CancelOp,

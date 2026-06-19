@@ -61,12 +61,12 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 rust-version = "1.95.0"
-version = "0.12.9"
+version = "0.12.10"
 
 [workspace.dependencies]
 anyhow = "1.0"
 async-trait = "0.1.89"
-chrono = { version = "0.4.44", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.5"
 directories = "6.0"

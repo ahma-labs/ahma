@@ -81,11 +81,18 @@ impl Theme {
     pub fn unknown_health(&self) -> Style {
         Style::default().fg(Color::Yellow)
     }
-    pub fn approval_banner(&self) -> Style {
-        Style::default()
-            .bg(Color::Red)
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
+    /// Red accent for the approval banner border and title — a tasteful outline
+    /// rather than a full-bleed red fill.
+    pub fn approval_border(&self) -> Style {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    }
+    /// Highlight for the actionable `[y]` / `[n]` / `[a]` key hints.
+    pub fn approval_key(&self) -> Style {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    }
+    /// Calm contextual note (e.g. "new workspace …") — informative, not alarming.
+    pub fn approval_note(&self) -> Style {
+        Style::default().fg(Color::Yellow)
     }
     pub fn footer(&self) -> Style {
         Style::default().bg(Color::DarkGray).fg(Color::DarkGray)

@@ -151,6 +151,7 @@ async fn run_ratatui(
                             } else if handle_settings_key(key, &mut state)
                                 || handle_help_key(key, &mut state)
                                 || handle_picker_key(key, &mut state)
+                                || handle_approval_key(key, &mut state)
                                 || handle_chat_input_key(key, &mut state)
                             {
                                 // handled directly by an overlay/editor widget
@@ -625,11 +626,39 @@ fn handle_approval_action(
 
     match action {
         Action::Approve => resolve_approval(state, true),
+        Action::ApproveAlways => resolve_approval_always(state),
         Action::Reject => resolve_approval(state, false),
         _ => return false,
     }
 
     true
+}
+
+/// "Always allow": persist a grant for this tool+workspace (so it is never
+/// re-prompted), then approve this call. Persistence lives outside the sandbox
+/// in `~/.config/ahma/` — see [`ahma_core::approvals`].
+#[cfg(feature = "tui")]
+fn resolve_approval_always(state: &mut crate::state::AppState) {
+    use crate::state::{LogEntry, LogLevel};
+
+    if let Some(gate) = state.approval.as_ref() {
+        let tool = gate.tool.clone();
+        let workspace = std::path::PathBuf::from(&state.workspace);
+        match ahma_core::approvals::remember_tool_approval(&workspace, &tool) {
+            Ok(()) => state.push_log(LogEntry {
+                timestamp: chrono::Local::now(),
+                level: LogLevel::Info,
+                message: format!("Always allowing tool '{tool}' in this workspace"),
+            }),
+            Err(e) => state.push_log(LogEntry {
+                timestamp: chrono::Local::now(),
+                level: LogLevel::Warn,
+                message: format!("Could not persist always-allow for '{tool}': {e}"),
+            }),
+        }
+    }
+
+    resolve_approval(state, true);
 }
 
 #[cfg(feature = "tui")]
@@ -1431,6 +1460,48 @@ fn active_picker_mut(state: &mut crate::state::AppState) -> Option<&mut crate::s
         state.provider_picker.as_mut()
     } else {
         state.model_picker.as_mut()
+    }
+}
+
+#[cfg(feature = "tui")]
+/// When an approval is pending, a bare `y` / `n` resolves it immediately — no
+/// matter which panel has focus. Without this, the chat input box swallows the
+/// keystroke as typed text (the bug where pressing "y" just sent "y" as a
+/// message), forcing the user to Tab away before the global keymap saw it.
+///
+/// We deliberately bail when a text-entry overlay is active (navigator, palette,
+/// pickers, log filter) so the user can still type a `y`/`n` there.
+#[cfg(feature = "tui")]
+fn handle_approval_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut crate::state::AppState,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if state.approval.is_none()
+        || state.navigator.visible
+        || state.palette.visible
+        || state.log_filter_active
+        || state.provider_picker.is_some()
+        || state.model_picker.is_some()
+    {
+        return false;
+    }
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('y'), KeyModifiers::NONE) => {
+            handle_action(crate::keymap::Action::Approve, state);
+            true
+        }
+        (KeyCode::Char('a'), KeyModifiers::NONE) => {
+            handle_action(crate::keymap::Action::ApproveAlways, state);
+            true
+        }
+        (KeyCode::Char('n'), KeyModifiers::NONE) => {
+            handle_action(crate::keymap::Action::Reject, state);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2616,9 +2687,13 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
                 None
             };
 
+            let note =
+                ahma_core::approvals::reask_note(std::path::Path::new(&state.workspace), &tool);
             state.approval = Some(crate::state::ApprovalGate {
                 op_id: id,
+                tool: tool.clone(),
                 description: format!("Execute tool {tool}"),
+                note,
                 deadline: None,
                 diff,
             });
@@ -2992,9 +3067,13 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             } else {
                 None
             };
+            let note =
+                ahma_core::approvals::reask_note(std::path::Path::new(&state.workspace), &tool);
             state.approval = Some(crate::state::ApprovalGate {
                 op_id: id,
+                tool: tool.clone(),
                 description: format!("Execute tool {tool}"),
+                note,
                 deadline: None,
                 diff,
             });
@@ -3731,7 +3810,9 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         state.approval = Some(crate::state::ApprovalGate {
             op_id: "op_test".to_string(),
+            tool: "list_dir".to_string(),
             description: "test".to_string(),
+            note: None,
             deadline: None,
             diff: None,
         });
@@ -3743,6 +3824,61 @@ mod tests {
 
         let approved = rx.blocking_recv().unwrap();
         assert!(approved);
+    }
+
+    /// Regression: a bare `y` while an approval is pending must resolve the
+    /// approval even when the chat input box has focus, instead of being typed
+    /// into the message as text.
+    #[test]
+    fn test_approval_key_resolves_while_chat_focused() {
+        use crate::state::{AppState, Focus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.approval = Some(crate::state::ApprovalGate {
+            op_id: "op_test".to_string(),
+            tool: "list_dir".to_string(),
+            description: "list_dir".to_string(),
+            note: None,
+            deadline: None,
+            diff: None,
+        });
+        state.approval_tx = Some(tx);
+
+        let handled = super::handle_approval_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut state,
+        );
+
+        assert!(handled, "y must be consumed by the approval banner");
+        assert!(state.approval.is_none(), "approval should be cleared");
+        assert!(
+            state.chat_input_is_empty(),
+            "y must not land in the input box"
+        );
+        assert!(
+            rx.blocking_recv().unwrap(),
+            "decision sent should be approve"
+        );
+    }
+
+    /// When no approval is pending, `y` must fall through to normal handling.
+    #[test]
+    fn test_approval_key_ignored_without_pending_gate() {
+        use crate::state::{AppState, Focus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+
+        let handled = super::handle_approval_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(!handled, "y must pass through when no approval is pending");
     }
 
     #[test]
