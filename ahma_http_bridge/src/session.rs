@@ -35,9 +35,12 @@
 //!
 //! ### Handling Roots Changes
 //!
-//! For security, session isolation mode rejects roots changes after the sandbox is locked.
-//! If `notifications/roots/list_changed` is received after locking, the subprocess is
-//! immediately terminated to prevent sandbox escape.
+//! The committed sandbox scope is immutable for the life of the instance and can
+//! never be widened (R5.1 / R5.1.1 / R5.2.2). A client `notifications/roots/list_changed`
+//! received after the sandbox is locked is therefore a tolerated no-op: the
+//! locked scope is kept and the notification is ignored (not forwarded to the
+//! subprocess), and the session stays alive. Sandbox escape is prevented by the
+//! immutability of the commit, not by tearing down the session.
 
 use crate::error::{BridgeError, Result};
 use crate::peer::{PeerFactory, PeerShutdownFn, PeerStreams, SubprocessPeerFactory};
@@ -1129,44 +1132,54 @@ impl SessionManager {
         Ok(true)
     }
 
-    /// Handle roots/list_changed notification
+    /// Handle a client `notifications/roots/list_changed`.
     ///
-    /// Per R8D.12-R8D.13, if sandbox is locked, terminate the session immediately
-    pub async fn handle_roots_changed(&self, session_id: &str) -> Result<()> {
+    /// Returns `Ok(true)` when the notification is a **tolerated no-op** (the
+    /// sandbox is already locked) and the caller should acknowledge it without
+    /// forwarding it to the subprocess. Returns `Ok(false)` when the sandbox is
+    /// still `AwaitingRoots`, so the caller proceeds with the normal handshake
+    /// (forwarding the notification).
+    ///
+    /// ## Why a locked roots change is a no-op (not a session kill)
+    ///
+    /// The sandbox scope is owned by the per-workspace **instance** and is
+    /// committed exactly once at a single commit point, after which it is
+    /// immutable and can never be widened by any means (SPEC R5.1 / R5.1.1 /
+    /// R5.2.2). A session-level `roots/list_changed` therefore cannot mutate or
+    /// widen the committed scope — there is nothing to apply. Real clients
+    /// (Cursor, VS Code) routinely re-emit `roots/list_changed` during a session
+    /// (reconnects, focus/workspace events); terminating the session over a
+    /// benign re-emit was a self-inflicted DoS that produced 403 → stdio-proxy
+    /// respawn churn. The security invariant is upheld by the immutability of the
+    /// commit, so the safe and robust response is to keep the locked scope and
+    /// ignore the notification.
+    pub async fn handle_roots_changed(&self, session_id: &str) -> Result<bool> {
         let session = self.sessions.get(session_id).ok_or_else(|| {
             BridgeError::Communication(format!("Session not found: {}", session_id))
         })?;
 
-        if !matches!(
+        if matches!(
             session.sandbox_state_machine.current(),
             SandboxState::AwaitingRoots
         ) {
-            // Security violation: attempt to change roots after sandbox lock
-            let scopes = session.sandbox_scopes.lock().await.clone();
-            error!(
+            // Sandbox not yet locked - allow as part of the normal handshake.
+            warn!(
                 session_id = %session_id,
-                sandbox_scopes = ?scopes,
-                "Roots change rejected after sandbox lock - terminating session"
+                "Roots change received before sandbox lock - allowing"
             );
-
-            // Drop the session reference before terminating to avoid deadlock
-            drop(session);
-
-            self.terminate_session(session_id, SessionTerminationReason::RootsChangeRejected)
-                .await?;
-
-            return Err(BridgeError::Communication(
-                "Session terminated: roots change not allowed after sandbox lock".to_string(),
-            ));
+            return Ok(false);
         }
 
-        // Sandbox not yet locked - this is unusual but allowed
-        // (roots/list hasn't been processed yet)
+        // Sandbox already locked: the committed instance scope is immutable and
+        // cannot be widened, so this is a tolerated no-op. Keep the session and
+        // the locked scope; do not forward to the subprocess.
+        let scopes = session.sandbox_scopes.lock().await.clone();
         warn!(
             session_id = %session_id,
-            "Roots change received before sandbox lock - allowing"
+            sandbox_scopes = ?scopes,
+            "Roots change after sandbox lock ignored - committed scope is immutable (session kept)"
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Terminate a session

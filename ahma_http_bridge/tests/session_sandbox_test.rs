@@ -181,9 +181,11 @@ async fn test_sandbox_scope_immutable_after_lock() {
     );
 }
 
-/// Test that roots/list_changed notification terminates session after sandbox lock.
+/// roots/list_changed after sandbox lock is a tolerated no-op: the committed
+/// scope is immutable (R5.1/R5.2.2), so the notification is ignored and the
+/// session is kept alive (no 403, no termination, no stdio-proxy respawn churn).
 #[tokio::test]
-async fn test_roots_change_terminates_session_after_lock() {
+async fn test_roots_change_after_lock_is_tolerated_noop() {
     let server_default_scope = std::env::temp_dir().join("server");
     let session_manager = create_test_session_manager(Some(server_default_scope));
 
@@ -202,19 +204,68 @@ async fn test_roots_change_terminates_session_after_lock() {
         .lock_sandbox(&session_id, &roots)
         .await
         .expect("Should lock sandbox");
+    let locked_scopes = session_manager
+        .get_session(&session_id)
+        .unwrap()
+        .get_sandbox_scopes()
+        .await;
 
-    // Attempt to change roots after lock
+    // A client roots change after lock must be tolerated as a no-op.
     let result = session_manager.handle_roots_changed(&session_id).await;
-
     assert!(
-        result.is_err(),
-        "Roots change after lock should return error"
+        matches!(result, Ok(true)),
+        "Roots change after lock should be a tolerated no-op (Ok(true)), got {result:?}"
     );
 
-    // Session should no longer exist (terminated)
+    // Session must survive...
     assert!(
-        !session_manager.session_exists(&session_id),
-        "Session should be terminated after roots change rejection"
+        session_manager.session_exists(&session_id),
+        "Session must NOT be terminated by a benign roots change"
+    );
+    // ...and the locked scope must be unchanged (never widened).
+    let after_scopes = session_manager
+        .get_session(&session_id)
+        .unwrap()
+        .get_sandbox_scopes()
+        .await;
+    assert_eq!(
+        locked_scopes, after_scopes,
+        "Locked sandbox scope must be immutable across a roots change"
+    );
+
+    // Scope commit must NOT be reverted to AwaitingRoots by the roots change.
+    // (lock_sandbox transitions to Configuring; Active requires a real
+    // subprocess `configured` notification, which this unit test doesn't have.)
+    assert!(
+        !matches!(
+            session_manager
+                .get_session(&session_id)
+                .unwrap()
+                .current_sandbox_state(),
+            ahma_common::sandbox_state::SandboxState::AwaitingRoots
+        ),
+        "Sandbox commit must not revert to AwaitingRoots after a tolerated roots change"
+    );
+}
+
+/// A roots/list_changed received BEFORE lock (AwaitingRoots) is allowed and
+/// signals "proceed with the handshake" (Ok(false)), not a no-op.
+#[tokio::test]
+async fn test_roots_change_before_lock_proceeds() {
+    let session_manager = create_test_session_manager(None);
+    let session_id = session_manager
+        .create_session()
+        .await
+        .expect("Should create session");
+
+    let result = session_manager.handle_roots_changed(&session_id).await;
+    assert!(
+        matches!(result, Ok(false)),
+        "Roots change before lock should proceed with handshake (Ok(false)), got {result:?}"
+    );
+    assert!(
+        session_manager.session_exists(&session_id),
+        "Session must survive a pre-lock roots change"
     );
 }
 

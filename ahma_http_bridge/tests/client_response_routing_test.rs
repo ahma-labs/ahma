@@ -124,8 +124,7 @@ impl ahma_common::peer_factory::PeerFactory for FakePeerFactory {
                     // unlocking tool calls (it means the subprocess sandbox is
                     // enforced), so emitting it for a fake ping would correctly
                     // unlock and defeat the point of this negative test.
-                    if line.contains(expected_id)
-                        && matches!(behavior, PeerBehavior::SendRealRoots)
+                    if line.contains(expected_id) && matches!(behavior, PeerBehavior::SendRealRoots)
                     {
                         let configured = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/sandbox/configured\",\"params\":{}}\n";
                         println!(

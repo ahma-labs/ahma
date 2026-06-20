@@ -383,15 +383,21 @@ async fn handle_roots_changed_request(
     session_manager: &SessionManager,
     session_id: &str,
 ) -> Option<Response> {
-    if let Err(e) = session_manager.handle_roots_changed(session_id).await {
-        error!(session_id = %session_id, "Roots change rejected: {}", e);
-        Some(error_response_with_status(
-            StatusCode::FORBIDDEN,
-            -32600,
-            "Session terminated: roots change not allowed",
-        ))
-    } else {
-        None
+    match session_manager.handle_roots_changed(session_id).await {
+        // Tolerated no-op: sandbox already locked. Acknowledge with success and
+        // short-circuit so the notification is NOT forwarded to the subprocess
+        // (its scope is locked too). Keeps the session alive — see
+        // SessionManager::handle_roots_changed for the rationale.
+        Ok(true) => Some(with_session_header(
+            json_response_with_status(StatusCode::ACCEPTED, serde_json::json!({})),
+            session_id,
+        )),
+        // Sandbox still AwaitingRoots: proceed with the normal handshake (forward).
+        Ok(false) => None,
+        Err(e) => {
+            error!(session_id = %session_id, "Roots change handling failed: {}", e);
+            Some(session_not_found_response())
+        }
     }
 }
 

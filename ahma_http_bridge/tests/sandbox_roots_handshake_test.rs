@@ -1022,43 +1022,19 @@ async fn test_mixed_valid_invalid_uris() {
 // Test: Post-Lock Roots Rejection (R8.4.6)
 // =============================================================================
 
-/// Verify that a session is no longer usable after a post-lock roots change attempt.
-/// Polls with a tool call and asserts it fails, catching a silent-accept security violation.
-async fn verify_session_terminated_after_roots_change(
-    client: &Client,
-    base_url: &str,
-    session_id: &str,
-    dir: &Path,
-) {
-    sleep(TestTimeouts::poll_interval()).await;
-    let tool_call = pwd_tool_call(3, Some(dir));
-    match send_mcp_request(client, base_url, &tool_call, Some(session_id)).await {
-        Err(e) => {
-            eprintln!("Session terminated after roots change (expected): {}", e);
-        }
-        Ok((response, _)) => {
-            assert!(
-                response.get("error").is_some(),
-                "SECURITY VIOLATION: Tool call succeeded after roots/list_changed. \
-                 Session should have been terminated. Response: {:?}",
-                response
-            );
-        }
-    }
-}
-
-/// SECURITY TEST: Attempts to change roots after sandbox lock must be rejected.
+/// SECURITY TEST: a `roots/list_changed` after sandbox lock must NOT widen the
+/// sandbox — but it must NOT tear down the session either.
 ///
-/// Per requirement R8.4.6: "notifications/roots/list_changed after sandbox lock
-/// → session terminated (HTTP 403)"
-///
-/// This is a critical security invariant. Once the sandbox is locked to specific
-/// workspace roots, a malicious or buggy client cannot expand the sandbox by
-/// sending another roots/list_changed notification.
+/// Per the instance-ownership model (SPEC R5.1 / R5.1.1 / R5.2.2) the committed
+/// scope is immutable and can never be widened by any means. A client
+/// `roots/list_changed` after lock is therefore a tolerated no-op: the session
+/// stays alive (no HTTP 403, no termination — which previously caused
+/// stdio-proxy respawn churn) and, crucially, the sandbox is NOT expanded to any
+/// newly-announced root. This test pins both halves of that invariant.
 #[tokio::test]
-async fn test_post_lock_roots_change_rejected() {
+async fn test_post_lock_roots_change_does_not_widen_sandbox() {
     let initial_root = TempDir::new().expect("Failed to create initial root");
-    let _new_root = TempDir::new().expect("Failed to create new root"); // Unused but demonstrates attacker's intent
+    let new_root = TempDir::new().expect("Failed to create new root"); // attacker's target
     let tools_temp = TempDir::new().expect("Failed to create tools temp dir");
     let tools_dir = tools_temp.path().join("tools");
     write_pwd_tool_config(&tools_dir);
@@ -1094,7 +1070,7 @@ async fn test_post_lock_roots_change_rejected() {
         response
     );
 
-    // NOW: Send roots/list_changed notification (attempt to change roots)
+    // NOW: Send roots/list_changed notification (attempt to change/widen roots).
     let roots_changed = json!({
         "jsonrpc": "2.0",
         "method": "notifications/roots/list_changed"
@@ -1102,29 +1078,43 @@ async fn test_post_lock_roots_change_rejected() {
 
     let result = send_mcp_request(&client, &base_url, &roots_changed, Some(&session_id)).await;
 
-    // The session should be terminated or the notification rejected
-    // Either HTTP 403 or a subsequent tool call should fail
-    match result {
-        Err(e) => {
-            eprintln!("Roots change rejected with error (expected): {}", e);
-            // HTTP 403 or similar error is expected
-            assert!(
-                e.contains("403") || e.contains("terminate") || e.contains("reject"),
-                "Expected 403/terminate/reject error, got: {}",
-                e
-            );
-        }
-        Ok(_) => {
-            // Notification was accepted - verify session is now invalid
-            verify_session_terminated_after_roots_change(
-                &client,
-                &base_url,
-                &session_id,
-                initial_root.path(),
-            )
-            .await;
-        }
-    }
+    // It must be TOLERATED (no 403 / no termination): the request succeeds.
+    assert!(
+        result.is_ok(),
+        "roots/list_changed after lock must be a tolerated no-op (no 403/termination), got: {:?}",
+        result
+    );
+
+    // The session must stay alive: the originally-locked root still works.
+    sleep(TestTimeouts::poll_interval()).await;
+    let (still_ok, _) = send_mcp_request(
+        &client,
+        &base_url,
+        &pwd_tool_call(3, Some(initial_root.path())),
+        Some(&session_id),
+    )
+    .await
+    .expect("Session must survive a benign roots change");
+    assert!(
+        still_ok.get("error").is_none(),
+        "Original locked root must still work after roots change: {:?}",
+        still_ok
+    );
+
+    // SECURITY: the sandbox must NOT have widened — the new root is still blocked.
+    let (forbidden, _) = send_mcp_request(
+        &client,
+        &base_url,
+        &pwd_tool_call(4, Some(new_root.path())),
+        Some(&session_id),
+    )
+    .await
+    .expect("Forbidden tool call request should complete");
+    assert!(
+        forbidden.get("error").is_some(),
+        "SECURITY VIOLATION: sandbox widened to a new root after roots/list_changed. Response: {:?}",
+        forbidden
+    );
 }
 
 /// Test that working_directory outside locked sandbox roots is rejected.
