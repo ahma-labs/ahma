@@ -410,6 +410,22 @@ impl AhmaMcpService {
     }
 
     pub async fn configure_sandbox_from_roots(&self, peer: &Peer<RoleServer>) {
+        // SPEC R5.1 / R5.1.1 / R5.2.2: the sandbox scope is committed exactly once
+        // and is immutable thereafter. A second invocation — e.g. a pure-stdio
+        // client re-announcing `roots/list_changed`, or a non-deferred
+        // `on_initialized` configuration followed by a later `roots/list_changed`
+        // — must NOT re-query or re-derive scopes, as that could widen the locked
+        // sandbox. This mirrors the HTTP bridge's post-lock tolerated-no-op
+        // handling (a roots change after lock is acknowledged but never applied).
+        // Fast path: skip the roots/list round-trip entirely once committed.
+        if self.adapter.sandbox().is_committed() {
+            tracing::warn!(
+                "roots/list(_changed) received after sandbox already committed - \
+                 ignoring (scope is immutable and is never widened; SPEC R5.2.2)"
+            );
+            return;
+        }
+
         let timeout_duration = TestTimeouts::get(TimeoutCategory::SseStream);
         tracing::info!(timeout = ?timeout_duration, "Requesting roots/list from client...");
 
@@ -483,6 +499,16 @@ impl AhmaMcpService {
         let client_root: Option<PathBuf> = new_scopes.first().cloned();
 
         if !new_scopes.is_empty() {
+            // Claim the one-shot commit BEFORE mutating scopes so a concurrent or
+            // repeat roots/list can never widen the locked sandbox (SPEC R5.1.1).
+            // The loser of the race returns without touching the committed scope.
+            if !self.adapter.sandbox().try_commit() {
+                tracing::warn!(
+                    "roots/list provided scopes but the sandbox is already committed - \
+                     ignoring to preserve the immutable scope (SPEC R5.2.2)"
+                );
+                return;
+            }
             tracing::debug!(
                 "Attempting to update sandbox scopes with {} paths",
                 new_scopes.len()
@@ -493,6 +519,13 @@ impl AhmaMcpService {
         } else if !self.adapter.sandbox().scopes().is_empty() {
             // Client provided no file:// roots but we have pre-configured scopes
             // from --working-directories. These are valid, so proceed.
+            if !self.adapter.sandbox().try_commit() {
+                tracing::warn!(
+                    "Pre-configured scopes present but the sandbox is already committed - \
+                     ignoring repeat configuration (SPEC R5.2.2)"
+                );
+                return;
+            }
             tracing::info!(
                 "No new scopes from roots/list; using pre-configured scopes: {:?}",
                 self.adapter.sandbox().scopes()

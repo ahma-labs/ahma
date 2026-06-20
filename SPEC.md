@@ -319,7 +319,7 @@ The sandbox scope defines the root directory boundary. AI has **full read/write 
 #### Scope ownership and lifetime
 
 - **R5.1**: **Per-workspace instance ownership**: A sandbox scope is owned by a **per-workspace server instance**, not by an individual MCP session. All sessions (IDE, TUI, CLI) that attach to a workspace instance **share and gate on** that single scope. The scope is set once per instance and **cannot** be mutated for the life of the instance (the lock-once invariant). Sessions do not carry their own scope.
-- **R5.1.1**: **Single commit point**: Every scope commit — derived from `roots/list`, from an explicit flag, from a user elicitation answer, or from the default — **must** go through one atomic compare-and-swap on the instance scope state machine. There is exactly one door to "scope locked"; there is no second path that can set or widen scope after lock.
+- **R5.1.1**: **Single commit point**: Every scope commit — derived from `roots/list`, from an explicit flag, from a user elicitation answer, or from the default — **must** go through one atomic compare-and-swap on the instance scope state machine. There is exactly one door to "scope locked"; there is no second path that can set or widen scope after lock. This holds on **both** transports: the HTTP bridge swallows a post-lock `roots/list_changed` (R10.5), and the direct-stdio configuration path (`configure_sandbox_from_roots`, used when a client speaks to `ahma serve stdio` without the bridge) latches the commit once and treats any later `roots/list` / `roots/list_changed` as a tolerated no-op — it does **not** re-request `roots/list` or re-derive scope.
 
 #### Scope source (no spoofable inference)
 

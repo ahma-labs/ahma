@@ -240,6 +240,11 @@ pub struct Sandbox {
     pub(super) separate_cargo_target: bool,
     /// When true, roots/list was successfully received from the client.
     pub(super) roots_received: std::sync::atomic::AtomicBool,
+    /// One-shot latch: set the first time the sandbox scope is committed (locked)
+    /// from client roots or pre-configured scopes. Once set, the scope is
+    /// immutable and MUST NOT be re-derived or widened by a subsequent
+    /// `roots/list` / `roots/list_changed` (SPEC R5.1 / R5.1.1 / R5.2.2).
+    pub(super) committed: std::sync::atomic::AtomicBool,
 }
 
 impl Clone for Sandbox {
@@ -258,6 +263,9 @@ impl Clone for Sandbox {
             roots_received: std::sync::atomic::AtomicBool::new(
                 self.roots_received
                     .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            committed: std::sync::atomic::AtomicBool::new(
+                self.committed.load(std::sync::atomic::Ordering::Relaxed),
             ),
         }
     }
@@ -281,6 +289,10 @@ impl std::fmt::Debug for Sandbox {
                 &self
                     .roots_received
                     .load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field(
+                "committed",
+                &self.committed.load(std::sync::atomic::Ordering::Relaxed),
             )
             .finish()
     }
@@ -320,6 +332,7 @@ impl Sandbox {
             package_cache_write: true,
             separate_cargo_target: false,
             roots_received: std::sync::atomic::AtomicBool::new(true),
+            committed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -431,6 +444,29 @@ impl Sandbox {
     pub fn roots_received(&self) -> bool {
         self.roots_received
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns true once the sandbox scope has been committed (locked). After
+    /// this, the scope is immutable and must not be re-derived from a later
+    /// `roots/list` / `roots/list_changed` (SPEC R5.1 / R5.2.2).
+    pub fn is_committed(&self) -> bool {
+        self.committed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Atomically claim the one-shot scope commit. Returns `true` for the single
+    /// caller that wins the latch (and may proceed to apply/enforce scopes) and
+    /// `false` for every subsequent call, which must treat the configuration as
+    /// a tolerated no-op rather than widening the locked sandbox (SPEC R5.1.1).
+    #[must_use]
+    pub fn try_commit(&self) -> bool {
+        self.committed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Check if the sandbox is in test mode.
