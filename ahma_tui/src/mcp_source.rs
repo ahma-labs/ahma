@@ -280,9 +280,17 @@ async fn mcp_source_task(
                 // Call status to get current operations
                 if let Some(ref session) = mcp_state {
                     match call_status(&client, &request_base_url, session).await {
-                        Ok(ops) => {
+                        Ok(StatusPoll::Ready(ops)) => {
                             prev_status_ok = true;
                             send(&tx, SourceEvent::OperationsUpdated { ops }).await;
+                        }
+                        Ok(StatusPoll::Initializing) => {
+                            // Sandbox handshake still completing on the bridge.
+                            // The session is valid — keep it and retry next tick.
+                            // Tearing it down here would spawn a fresh session
+                            // that races the same handshake and 409s again,
+                            // looping forever so no tool call ever runs.
+                            send(&tx, SourceEvent::SandboxStatus { status: "INITIALIZING".to_string() }).await;
                         }
                         Err(e) => {
                             if prev_status_ok {
@@ -765,11 +773,24 @@ fn status_call_error(url: &str, status: reqwest::StatusCode) -> anyhow::Error {
     anyhow::anyhow!("status call to {url} returned HTTP {status} ({hint})")
 }
 
+/// Outcome of a `status` poll.
+///
+/// A `409 Conflict` from the bridge means the sandbox handshake is still
+/// completing (the subprocess has not finished locking its scope yet). The MCP
+/// session is valid and will become usable within milliseconds, so the caller
+/// must keep it and retry on the next tick rather than tearing it down — doing
+/// otherwise spawns a fresh session that races the same handshake and 409s
+/// again, an infinite reset loop in which no tool call ever succeeds.
+enum StatusPoll {
+    Ready(Vec<Operation>),
+    Initializing,
+}
+
 async fn call_status(
     client: &reqwest::Client,
     base_url: &str,
     session: &McpSession,
-) -> Result<Vec<Operation>> {
+) -> Result<StatusPoll> {
     let url = format!("{base_url}/mcp");
     let req_id = session.next_req_id();
     let body = json!({
@@ -788,6 +809,11 @@ async fn call_status(
         .send()
         .await?;
 
+    if resp.status() == reqwest::StatusCode::CONFLICT {
+        // Transient: sandbox still locking. Keep the session and retry.
+        return Ok(StatusPoll::Initializing);
+    }
+
     if !resp.status().is_success() {
         let s = resp.status();
         return Err(status_call_error(&url, s));
@@ -795,7 +821,7 @@ async fn call_status(
 
     let val = resp.json::<Value>().await?;
     let ops = parse_operations(&val);
-    Ok(ops)
+    Ok(StatusPoll::Ready(ops))
 }
 
 // ─── Parsing helpers ──────────────────────────────────────────────────────────

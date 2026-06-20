@@ -421,3 +421,148 @@ async fn mcp_source_emits_tools_list() {
         "expected 'mock_tool' in tools list, got: {tools:?}"
     );
 }
+
+// ─── Transient 409 during sandbox handshake regression test ──────────────────
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Mock MCP server whose `status` tool call returns `409 Conflict` for the
+/// first poll (sandbox still locking on the bridge) and `200 OK` thereafter.
+///
+/// This reproduces the real bridge behaviour where a `status` poll can race
+/// ahead of the subprocess finishing its sandbox lock. The TUI must treat that
+/// 409 as transient and keep the session, not tear it down.
+async fn flaky_status_mcp(
+    axum::extract::State(status_calls): axum::extract::State<Arc<AtomicUsize>>,
+    Json(body): Json<Value>,
+) -> Response {
+    let method = body
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    let id = body.get("id").cloned().unwrap_or(Value::Null);
+
+    match method {
+        "initialize" => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "mcp-session-id",
+                "flaky-status-session".parse().expect("valid header value"),
+            );
+            (
+                StatusCode::OK,
+                headers,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "serverInfo": {"name": "flaky-status-mock", "version": "0.0.1"}
+                    }
+                })),
+            )
+                .into_response()
+        }
+        "tools/call" => {
+            let tool = body
+                .pointer("/params/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if tool == "status" {
+                // First status poll races the sandbox lock and 409s; the bridge
+                // finishes locking immediately after, so every later poll is OK.
+                let n = status_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    return (
+                        StatusCode::CONFLICT,
+                        "sandbox still initializing — complete MCP handshake (roots/list) before tools/call",
+                    )
+                        .into_response();
+                }
+            }
+            (
+                StatusCode::OK,
+                Json(json!({"jsonrpc": "2.0", "id": id, "result": {"content": []}})),
+            )
+                .into_response()
+        }
+        _ => (
+            StatusCode::OK,
+            Json(json!({"jsonrpc": "2.0", "id": id, "result": null})),
+        )
+            .into_response(),
+    }
+}
+
+/// Regression test: a transient `409` from the `status` poll must NOT tear down
+/// the MCP session.
+///
+/// Before the fix, a 409 (sandbox still locking) was treated as fatal: the TUI
+/// dropped the session, then immediately re-initialized and polled again,
+/// racing the same handshake and 409-ing forever. The session id flapped to
+/// empty on every reset and no tool call (e.g. `pwd`) ever ran — the
+/// "tool calls don't work in ahma tui" bug.
+///
+/// The fixed behaviour: the session is kept across the 409 and the next poll
+/// succeeds. We assert that `OperationsUpdated` is eventually emitted and that
+/// no session-reset (`SessionId { id: "" }`) was observed in the meantime.
+#[tokio::test]
+async fn transient_409_status_poll_does_not_reset_session() {
+    let status_calls = Arc::new(AtomicUsize::new(0));
+    let router = Router::new()
+        .route("/health", get(mock_health))
+        .route("/mcp", post(flaky_status_mcp).get(mock_mcp_sse))
+        .with_state(status_calls.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind flaky-status mock server");
+    let port = listener.local_addr().expect("local_addr").port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let _server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("flaky-status mock server error");
+    });
+    tokio::time::sleep(TestTimeouts::short_delay()).await;
+
+    let (tx, mut rx) = mpsc::channel(64);
+    let connection = ResolvedConnection {
+        display_url: base_url.clone(),
+        transport: ResolvedTransport::Http(base_url),
+    };
+    let _cmd_tx = spawn_mcp_source(connection, tx, None);
+
+    // The status tick is 3s, so the first poll (409) and the recovering second
+    // poll (200) land within ~6s. Allow generous headroom.
+    let got_operations = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                // A reset would clear the session id — this must never happen
+                // for a merely-transient 409.
+                SourceEvent::SessionId { id } if id.is_empty() => {
+                    panic!(
+                        "session was reset (SessionId cleared) on a transient 409 — \
+                         the handshake-race reset loop has regressed"
+                    );
+                }
+                SourceEvent::OperationsUpdated { .. } => return true,
+                _ => {}
+            }
+        }
+        false
+    })
+    .await
+    .expect("timed out waiting for OperationsUpdated after a transient 409");
+
+    assert!(
+        got_operations,
+        "TUI should recover from a transient 409 and emit operations"
+    );
+    assert!(
+        status_calls.load(Ordering::SeqCst) >= 2,
+        "expected the status poll to be retried on the same session after the 409"
+    );
+}
