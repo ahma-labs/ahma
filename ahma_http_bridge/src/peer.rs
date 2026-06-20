@@ -1,5 +1,6 @@
 //! Peer connection abstraction for bridge sessions (P1 / P6).
 //!
+
 //! Re-exports [`PeerFactory`], [`PeerStreams`], and related types from
 //! [`ahma_common::peer_factory`] (P6 split) so call sites in the bridge and
 //! in `ahma_mcp::test_utils` can import them from a single, lightweight
@@ -12,6 +13,7 @@
 //! [`ahma_common::peer_factory`]: ahma_common::peer_factory
 //! [`SessionManagerConfig`]: crate::session::SessionManagerConfig
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
 use tracing::info;
@@ -37,6 +39,11 @@ pub struct SubprocessPeerFactory {
     /// colored debug output.  When `false` stderr is inherited (goes to the
     /// bridge's own stderr / journal).
     pub enable_colored_output: bool,
+    /// Explicit fallback sandbox scope forwarded to the subprocess as
+    /// `--sandbox-scope <path>`.  Without this, a subprocess spawned with
+    /// `--defer-sandbox` has no pre-configured scopes and will defer its
+    /// sandbox indefinitely when the client returns 0 roots.
+    pub default_sandbox_scope: Option<PathBuf>,
 }
 
 impl SubprocessPeerFactory {
@@ -46,7 +53,15 @@ impl SubprocessPeerFactory {
             command: command.into(),
             args,
             enable_colored_output,
+            default_sandbox_scope: None,
         }
+    }
+
+    /// Set the fallback sandbox scope for the subprocess.
+    #[must_use]
+    pub fn with_default_sandbox_scope(mut self, scope: Option<PathBuf>) -> Self {
+        self.default_sandbox_scope = scope;
+        self
     }
 }
 
@@ -55,12 +70,17 @@ impl PeerFactory for SubprocessPeerFactory {
         let command = self.command.clone();
         let base_args = self.args.clone();
         let enable_colored_output = self.enable_colored_output;
+        let default_sandbox_scope = self.default_sandbox_scope.clone();
 
         Box::pin(async move {
             // Append the flags the subprocess needs: defer its own sandbox
             // setup until the bridge sends roots/list_changed, and suppress
             // the interactive CLI output path.
             let mut args = base_args;
+            if let Some(ref scope) = default_sandbox_scope {
+                args.push("--sandbox-scope".to_string());
+                args.push(scope.to_string_lossy().to_string());
+            }
             args.push("--defer-sandbox".to_string());
             args.push("--server-child".to_string());
 

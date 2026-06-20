@@ -881,6 +881,7 @@ impl SessionManager {
                 self.config.server_args.clone(),
                 self.config.enable_colored_output,
             )
+            .with_default_sandbox_scope(self.config.default_scope.clone())
             .create()
             .await
             .map_err(|e| BridgeError::ServerProcess(e.to_string()))?,
