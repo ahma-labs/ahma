@@ -35,9 +35,12 @@
 //!
 //! ### Handling Roots Changes
 //!
-//! For security, session isolation mode rejects roots changes after the sandbox is locked.
-//! If `notifications/roots/list_changed` is received after locking, the subprocess is
-//! immediately terminated to prevent sandbox escape.
+//! The committed sandbox scope is immutable for the life of the instance and can
+//! never be widened (R5.1 / R5.1.1 / R5.2.2). A client `notifications/roots/list_changed`
+//! received after the sandbox is locked is therefore a tolerated no-op: the
+//! locked scope is kept and the notification is ignored (not forwarded to the
+//! subprocess), and the session stays alive. Sandbox escape is prevented by the
+//! immutability of the commit, not by tearing down the session.
 
 use crate::error::{BridgeError, Result};
 use crate::peer::{PeerFactory, PeerShutdownFn, PeerStreams, SubprocessPeerFactory};
@@ -640,11 +643,44 @@ async fn await_response(
     }
 }
 
+/// Extract the write scopes carried in a `notifications/sandbox/configured`
+/// payload (`params.scope.write`, an array of display path strings).
+///
+/// Returns an empty vec when the notification omits the scope summary; the
+/// caller then preserves any in-flight `Configuring` scopes instead.
+fn parse_configured_scopes(value: &Value) -> Vec<PathBuf> {
+    value
+        .get("params")
+        .and_then(|p| p.get("scope"))
+        .and_then(|s| s.get("write"))
+        .and_then(Value::as_array)
+        .map(|writes| {
+            writes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Handle sandbox lifecycle notifications received from the subprocess.
 ///
 /// Drives the `SandboxStateMachine` forward based on `notifications/sandbox/*` methods.
-fn handle_sandbox_configured(session: &Arc<Session>) {
-    if let Err(e) = session.sandbox_state_machine.transition_to_active() {
+///
+/// The subprocess's `notifications/sandbox/configured` is authoritative: it is
+/// only emitted after the subprocess has applied and enforced its scopes, so the
+/// bridge advances to `Active` from *any* non-terminal state. Requiring the
+/// bridge to reach `Configuring` first was racy — if `configured` arrived before
+/// `auto_lock_if_default_scope` transitioned `AwaitingRoots -> Configuring`, the
+/// session stuck forever: the TUI showed `[LOCKED]` (it saw the SSE-forwarded
+/// notification) while every `tools/call` returned HTTP 409 / JSON-RPC -32001.
+fn handle_sandbox_configured(session: &Arc<Session>, value: &Value) {
+    let scopes = parse_configured_scopes(value);
+    if let Err(e) = session
+        .sandbox_state_machine
+        .transition_to_active_with_scopes(scopes)
+    {
         warn!(
             session_id = %session.id,
             error = %e,
@@ -685,7 +721,7 @@ fn handle_sandbox_failed(session: &Arc<Session>, value: &Value) {
 fn handle_sandbox_notification(session: &Arc<Session>, value: &Value) {
     match value.get("method").and_then(Value::as_str) {
         Some("notifications/sandbox/configured") => {
-            handle_sandbox_configured(session);
+            handle_sandbox_configured(session, value);
         }
         Some("notifications/sandbox/failed") => {
             handle_sandbox_failed(session, value);
@@ -1097,44 +1133,54 @@ impl SessionManager {
         Ok(true)
     }
 
-    /// Handle roots/list_changed notification
+    /// Handle a client `notifications/roots/list_changed`.
     ///
-    /// Per R8D.12-R8D.13, if sandbox is locked, terminate the session immediately
-    pub async fn handle_roots_changed(&self, session_id: &str) -> Result<()> {
+    /// Returns `Ok(true)` when the notification is a **tolerated no-op** (the
+    /// sandbox is already locked) and the caller should acknowledge it without
+    /// forwarding it to the subprocess. Returns `Ok(false)` when the sandbox is
+    /// still `AwaitingRoots`, so the caller proceeds with the normal handshake
+    /// (forwarding the notification).
+    ///
+    /// ## Why a locked roots change is a no-op (not a session kill)
+    ///
+    /// The sandbox scope is owned by the per-workspace **instance** and is
+    /// committed exactly once at a single commit point, after which it is
+    /// immutable and can never be widened by any means (SPEC R5.1 / R5.1.1 /
+    /// R5.2.2). A session-level `roots/list_changed` therefore cannot mutate or
+    /// widen the committed scope — there is nothing to apply. Real clients
+    /// (Cursor, VS Code) routinely re-emit `roots/list_changed` during a session
+    /// (reconnects, focus/workspace events); terminating the session over a
+    /// benign re-emit was a self-inflicted DoS that produced 403 → stdio-proxy
+    /// respawn churn. The security invariant is upheld by the immutability of the
+    /// commit, so the safe and robust response is to keep the locked scope and
+    /// ignore the notification.
+    pub async fn handle_roots_changed(&self, session_id: &str) -> Result<bool> {
         let session = self.sessions.get(session_id).ok_or_else(|| {
             BridgeError::Communication(format!("Session not found: {}", session_id))
         })?;
 
-        if !matches!(
+        if matches!(
             session.sandbox_state_machine.current(),
             SandboxState::AwaitingRoots
         ) {
-            // Security violation: attempt to change roots after sandbox lock
-            let scopes = session.sandbox_scopes.lock().await.clone();
-            error!(
+            // Sandbox not yet locked - allow as part of the normal handshake.
+            warn!(
                 session_id = %session_id,
-                sandbox_scopes = ?scopes,
-                "Roots change rejected after sandbox lock - terminating session"
+                "Roots change received before sandbox lock - allowing"
             );
-
-            // Drop the session reference before terminating to avoid deadlock
-            drop(session);
-
-            self.terminate_session(session_id, SessionTerminationReason::RootsChangeRejected)
-                .await?;
-
-            return Err(BridgeError::Communication(
-                "Session terminated: roots change not allowed after sandbox lock".to_string(),
-            ));
+            return Ok(false);
         }
 
-        // Sandbox not yet locked - this is unusual but allowed
-        // (roots/list hasn't been processed yet)
+        // Sandbox already locked: the committed instance scope is immutable and
+        // cannot be widened, so this is a tolerated no-op. Keep the session and
+        // the locked scope; do not forward to the subprocess.
+        let scopes = session.sandbox_scopes.lock().await.clone();
         warn!(
             session_id = %session_id,
-            "Roots change received before sandbox lock - allowing"
+            sandbox_scopes = ?scopes,
+            "Roots change after sandbox lock ignored - committed scope is immutable (session kept)"
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Terminate a session
@@ -1347,5 +1393,54 @@ impl SessionManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_configured_parse_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_configured_scopes_extracts_write_paths() {
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/sandbox/configured",
+            "params": {
+                "scope": {
+                    "write": ["/work/project", "/work/extra"],
+                    "read": ["/etc"],
+                    "tmp": false,
+                    "enforced": true,
+                    "source": "roots/list"
+                }
+            }
+        });
+        let scopes = parse_configured_scopes(&notif);
+        assert_eq!(
+            scopes,
+            vec![PathBuf::from("/work/project"), PathBuf::from("/work/extra")]
+        );
+    }
+
+    #[test]
+    fn parse_configured_scopes_missing_scope_is_empty() {
+        // The notification may omit the scope summary entirely. The caller then
+        // preserves any in-flight Configuring scopes, so an empty vec is correct.
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/sandbox/configured"
+        });
+        assert!(parse_configured_scopes(&notif).is_empty());
+    }
+
+    #[test]
+    fn parse_configured_scopes_empty_write_is_empty() {
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/sandbox/configured",
+            "params": { "scope": { "write": [] } }
+        });
+        assert!(parse_configured_scopes(&notif).is_empty());
     }
 }

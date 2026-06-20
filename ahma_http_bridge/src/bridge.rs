@@ -1932,6 +1932,315 @@ for line in sys.stdin:
         assert_eq!(text, "tool ok");
     }
 
+    // ----------------------------------------------------------------------
+    // Sandbox-configured authority: regression coverage for the desync where
+    // the TUI showed `[LOCKED]` while every tools/call returned HTTP 409.
+    //
+    // Root cause: the subprocess's `notifications/sandbox/configured` is the
+    // authoritative "sandbox is enforced" signal, but the bridge only advanced
+    // its state machine `Configuring -> Active`. If `configured` arrived while
+    // the bridge was still in `AwaitingRoots` (no roots lock, or before
+    // `auto_lock` ran), the transition was dropped and the session was wedged
+    // in a non-Active state forever — yet the SSE-forwarded notification still
+    // flipped the client UI to LOCKED.
+    //
+    // These tests pin the invariant: once the subprocess reports `configured`,
+    // a subsequent tools/call MUST be forwarded (never 409), across the full
+    // matrix of handshake orderings and timings.
+    // ----------------------------------------------------------------------
+
+    /// A mock subprocess that emits `notifications/sandbox/configured` as soon
+    /// as it observes `notifications/roots/list_changed`, *without* requiring or
+    /// echoing any client roots. This reproduces a real client (e.g. the TUI, or
+    /// any editor with no workspace folder open) that returns empty roots while
+    /// the subprocess configures from its own fallback scope.
+    fn write_mock_configures_on_roots_changed(temp_dir: &TempDir) -> std::path::PathBuf {
+        let script_path = temp_dir.path().join("mock_configures.py");
+        let script_content = r#"import sys
+import json
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(msg, dict) or "method" not in msg:
+        continue
+
+    method = msg.get("method")
+    msg_id = msg.get("id")
+
+    if method == "initialize":
+        print(json.dumps({
+            "jsonrpc": "2.0", "id": msg_id,
+            "result": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "serverInfo": {"name": "mock", "version": "1.0"}}
+        }))
+        sys.stdout.flush()
+        continue
+
+    if method == "tools/call":
+        print(json.dumps({
+            "jsonrpc": "2.0", "id": msg_id,
+            "result": {"content": [{"type": "text", "text": "tool ok"}]}
+        }))
+        sys.stdout.flush()
+        continue
+
+    if method == "notifications/roots/list_changed":
+        # Subprocess configured its sandbox from its OWN fallback scope and
+        # reports it as enforced — carrying the scope summary like the real one.
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "method": "notifications/sandbox/configured",
+            "params": {"scope": {"write": ["/mock/scope"], "read": [],
+                                 "tmp": False, "enforced": True,
+                                 "source": "default"}}
+        }))
+        sys.stdout.flush()
+        continue
+
+    if msg_id is not None:
+        print(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": {}}))
+        sys.stdout.flush()
+"#;
+        fs::write(&script_path, script_content).expect("Failed to write mock configures script");
+        script_path
+    }
+
+    fn make_session_manager(
+        script: &Path,
+        default_scope: Option<std::path::PathBuf>,
+    ) -> Arc<SessionManager> {
+        Arc::new(SessionManager::new(SessionManagerConfig {
+            server_command: python_cmd().to_string(),
+            server_args: vec![script.to_string_lossy().to_string()],
+            default_scope,
+            enable_colored_output: false,
+            handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            max_sessions: 50,
+            peer_factory: None,
+        }))
+    }
+
+    async fn post_mcp(app: &Router, session_id: &str, body: &Value) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header(MCP_SESSION_ID_HEADER, session_id)
+                    .body(Body::from(serde_json::to_vec(body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    fn initialized_notification() -> Value {
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    }
+
+    fn tool_call_request(id: i64) -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": "dummy", "arguments": {}}
+        })
+    }
+
+    async fn assert_tool_call_ok(app: &Router, session_id: &str, id: i64) {
+        let (status, json) = post_mcp(app, session_id, &tool_call_request(id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "tools/call after sandbox configured must be forwarded, got {status}: {json}"
+        );
+        assert_eq!(
+            json["result"]["content"][0]["text"].as_str(),
+            Some("tool ok"),
+            "unexpected tools/call result: {json}"
+        );
+    }
+
+    /// DETERMINISTIC REGRESSION (the screenshot bug): the bridge has no
+    /// `default_scope` and the client never locks roots, but the subprocess
+    /// reports `configured`. Before the fix the bridge stayed in `AwaitingRoots`
+    /// forever and tools/call returned 409 -32001 — exactly while the TUI header
+    /// showed `[LOCKED]`. After the fix `configured` is authoritative and the
+    /// tool call is forwarded.
+    #[tokio::test]
+    async fn test_configured_is_authoritative_without_roots_lock() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let script = write_mock_configures_on_roots_changed(&temp_dir);
+        let session_manager = make_session_manager(&script, None);
+        let app = create_app(create_state_with_session_manager(Arc::clone(
+            &session_manager,
+        )));
+
+        let session_id = session_manager.create_session().await.expect("session");
+
+        // Complete MCP init.
+        let (status, _) = post_mcp(&app, &session_id, &initialized_notification()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let session = session_manager.get_session(&session_id).expect("session");
+
+        // Before configured: tools/call is gated with 409 / -32001.
+        let (status, json) = post_mcp(&app, &session_id, &tool_call_request(1)).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "expected 409 before configured"
+        );
+        assert_eq!(json["error"]["code"], -32001);
+
+        // SSE connects -> bridge sends roots/list_changed -> subprocess emits
+        // `configured`. The bridge never locks from roots (no default_scope, no
+        // client roots), so this is the pure desync scenario.
+        session.mark_sse_connected().await.expect("sse mark");
+
+        // The authoritative `configured` must drive the bridge to Active.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            session.wait_for_sandbox_active(),
+        )
+        .await
+        .expect("sandbox must reach Active after configured (regression: it never did)")
+        .expect("sandbox configuration must not fail");
+
+        assert!(session.is_sandbox_locked());
+        assert!(matches!(
+            session.current_sandbox_state(),
+            ahma_common::sandbox_state::SandboxState::Active { .. }
+        ));
+
+        // The scope summary carried by the notification is recorded.
+        if let ahma_common::sandbox_state::SandboxState::Active { scopes } =
+            session.current_sandbox_state()
+        {
+            assert_eq!(scopes, vec![std::path::PathBuf::from("/mock/scope")]);
+        }
+
+        // And tools/call is now forwarded successfully.
+        assert_tool_call_ok(&app, &session_id, 2).await;
+    }
+
+    /// TIMING/RACE MATRIX: with `default_scope` configured, the bridge runs
+    /// `auto_lock` (AwaitingRoots -> Configuring) concurrently with the
+    /// subprocess `configured` notification (Configuring/AwaitingRoots ->
+    /// Active). Whichever wins, the session must end Active and stay there.
+    /// We vary the handshake ordering (SSE before vs after `initialized`) and
+    /// repeat to shake out the nondeterministic race that wedged the session.
+    #[tokio::test]
+    async fn test_configured_race_with_auto_lock_never_wedges() {
+        for iteration in 0..8 {
+            let sse_first = iteration % 2 == 0;
+            let temp_dir = TempDir::new().expect("temp dir");
+            let script = write_mock_configures_on_roots_changed(&temp_dir);
+            // default_scope set => auto_lock races the configured notification.
+            let session_manager =
+                make_session_manager(&script, Some(temp_dir.path().to_path_buf()));
+            let app = create_app(create_state_with_session_manager(Arc::clone(
+                &session_manager,
+            )));
+
+            let session_id = session_manager.create_session().await.expect("session");
+            let session = session_manager.get_session(&session_id).expect("session");
+
+            if sse_first {
+                // SSE connects before MCP init: roots/list_changed fires when
+                // `initialized` arrives, then auto_lock runs right after.
+                session.mark_sse_connected().await.expect("sse mark");
+                let (status, _) = post_mcp(&app, &session_id, &initialized_notification()).await;
+                assert_eq!(status, StatusCode::OK);
+            } else {
+                let (status, _) = post_mcp(&app, &session_id, &initialized_notification()).await;
+                assert_eq!(status, StatusCode::OK);
+                session.mark_sse_connected().await.expect("sse mark");
+            }
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                session.wait_for_sandbox_active(),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "iteration {iteration} (sse_first={sse_first}): sandbox wedged, \
+                     never reached Active (configured/auto_lock race regression)"
+                )
+            })
+            .expect("sandbox configuration must not fail");
+
+            assert_tool_call_ok(&app, &session_id, 1).await;
+
+            // A repeated/replayed `configured` (idempotency) must keep Active.
+            session.mark_sse_connected().await.ok();
+            assert!(session.is_sandbox_locked());
+            assert_tool_call_ok(&app, &session_id, 2).await;
+        }
+    }
+
+    /// HAPPY PATH still intact: the normal `Configuring -> Active` flow. The
+    /// bridge locks from `default_scope` (auto_lock on `initialized` ->
+    /// Configuring), then the subprocess confirms `configured` *without* a scope
+    /// payload. The fix must preserve the in-flight Configuring scopes rather
+    /// than clobbering them with an empty set, and still reach Active.
+    #[tokio::test]
+    async fn test_configuring_then_configured_preserves_scopes() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        // Original mock emits `configured` with NO scope payload, so the
+        // bridge must keep the scopes it recorded during Configuring.
+        let script = write_mock_mcp_server_script(&temp_dir);
+        let session_manager = make_session_manager(&script, Some(temp_dir.path().to_path_buf()));
+        let app = create_app(create_state_with_session_manager(Arc::clone(
+            &session_manager,
+        )));
+
+        let session_id = session_manager.create_session().await.expect("session");
+        let session = session_manager.get_session(&session_id).expect("session");
+
+        // `initialized` -> auto_lock from default_scope -> Configuring{temp_dir}.
+        let (status, _) = post_mcp(&app, &session_id, &initialized_notification()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Subprocess confirms configuration (no scope payload).
+        session.mark_sse_connected().await.expect("sse mark");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            session.wait_for_sandbox_active(),
+        )
+        .await
+        .expect("Active after Configuring + configured")
+        .expect("sandbox configuration must not fail");
+
+        // The Configuring scopes survived the Active transition.
+        match session.current_sandbox_state() {
+            ahma_common::sandbox_state::SandboxState::Active { scopes } => {
+                assert_eq!(scopes, vec![temp_dir.path().to_path_buf()]);
+            }
+            other => panic!("expected Active, got {other:?}"),
+        }
+        let scope = session.get_sandbox_scope().await.expect("scope set");
+        assert_eq!(scope, temp_dir.path().to_path_buf());
+
+        assert_tool_call_ok(&app, &session_id, 1).await;
+    }
+
     #[tokio::test]
     async fn test_health_check_endpoint() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");

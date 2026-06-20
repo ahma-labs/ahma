@@ -117,7 +117,15 @@ impl ahma_common::peer_factory::PeerFactory for FakePeerFactory {
                         break;
                     }
                     println!("[FakePeer {:?}] Received line: {}", behavior, line.trim());
-                    if line.contains(expected_id) {
+                    // Only a genuine roots/list response configures the sandbox.
+                    // A fake ping is unrelated to sandbox setup, so it must NOT
+                    // fabricate a `configured` signal: the subprocess's
+                    // `notifications/sandbox/configured` is authoritative for
+                    // unlocking tool calls (it means the subprocess sandbox is
+                    // enforced), so emitting it for a fake ping would correctly
+                    // unlock and defeat the point of this negative test.
+                    if line.contains(expected_id) && matches!(behavior, PeerBehavior::SendRealRoots)
+                    {
                         let configured = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/sandbox/configured\",\"params\":{}}\n";
                         println!(
                             "[FakePeer {:?}] Sending configured notification: {}",

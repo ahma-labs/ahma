@@ -175,6 +175,70 @@ fn test_update_scopes_preserves_sandbox_dir() {
     );
 }
 
+// ============= One-shot commit latch (SPEC R5.1.1) tests =============
+
+/// A fresh sandbox is not yet committed; the first `try_commit` wins and every
+/// later `try_commit` loses. This is the latch that prevents a repeat
+/// `roots/list` / `roots/list_changed` from re-deriving (and widening) scope on
+/// the direct-stdio path, mirroring the HTTP bridge's post-lock no-op.
+#[test]
+fn test_commit_latch_is_one_shot() {
+    let tmp = tempdir().unwrap();
+    let sandbox = Sandbox::new(
+        vec![tmp.path().to_path_buf()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+
+    assert!(
+        !sandbox.is_committed(),
+        "new sandbox must start uncommitted"
+    );
+    assert!(sandbox.try_commit(), "first try_commit must win the latch");
+    assert!(
+        sandbox.is_committed(),
+        "sandbox must report committed after winning"
+    );
+    assert!(
+        !sandbox.try_commit(),
+        "second try_commit must lose (one-shot)"
+    );
+    assert!(
+        !sandbox.try_commit(),
+        "every subsequent try_commit must keep losing"
+    );
+    assert!(sandbox.is_committed(), "commit state must remain latched");
+}
+
+/// The commit latch survives `Clone` (the service clones its handler), so a
+/// clone cannot re-win the latch and re-apply scopes.
+#[test]
+fn test_commit_latch_survives_clone() {
+    let tmp = tempdir().unwrap();
+    let sandbox = Sandbox::new(
+        vec![tmp.path().to_path_buf()],
+        SandboxMode::Test,
+        false,
+        false,
+        false,
+    )
+    .unwrap();
+
+    assert!(sandbox.try_commit(), "first commit wins");
+    let cloned = sandbox.clone();
+    assert!(
+        cloned.is_committed(),
+        "clone must observe the committed latch"
+    );
+    assert!(
+        !cloned.try_commit(),
+        "clone must not be able to re-win the latch"
+    );
+}
+
 /// When no sandbox_dir is set, update_scopes replaces scopes normally.
 #[test]
 fn test_update_scopes_no_sandbox_dir_replaces() {
