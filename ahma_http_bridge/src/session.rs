@@ -640,11 +640,44 @@ async fn await_response(
     }
 }
 
+/// Extract the write scopes carried in a `notifications/sandbox/configured`
+/// payload (`params.scope.write`, an array of display path strings).
+///
+/// Returns an empty vec when the notification omits the scope summary; the
+/// caller then preserves any in-flight `Configuring` scopes instead.
+fn parse_configured_scopes(value: &Value) -> Vec<PathBuf> {
+    value
+        .get("params")
+        .and_then(|p| p.get("scope"))
+        .and_then(|s| s.get("write"))
+        .and_then(Value::as_array)
+        .map(|writes| {
+            writes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Handle sandbox lifecycle notifications received from the subprocess.
 ///
 /// Drives the `SandboxStateMachine` forward based on `notifications/sandbox/*` methods.
-fn handle_sandbox_configured(session: &Arc<Session>) {
-    if let Err(e) = session.sandbox_state_machine.transition_to_active() {
+///
+/// The subprocess's `notifications/sandbox/configured` is authoritative: it is
+/// only emitted after the subprocess has applied and enforced its scopes, so the
+/// bridge advances to `Active` from *any* non-terminal state. Requiring the
+/// bridge to reach `Configuring` first was racy — if `configured` arrived before
+/// `auto_lock_if_default_scope` transitioned `AwaitingRoots -> Configuring`, the
+/// session stuck forever: the TUI showed `[LOCKED]` (it saw the SSE-forwarded
+/// notification) while every `tools/call` returned HTTP 409 / JSON-RPC -32001.
+fn handle_sandbox_configured(session: &Arc<Session>, value: &Value) {
+    let scopes = parse_configured_scopes(value);
+    if let Err(e) = session
+        .sandbox_state_machine
+        .transition_to_active_with_scopes(scopes)
+    {
         warn!(
             session_id = %session.id,
             error = %e,
@@ -685,7 +718,7 @@ fn handle_sandbox_failed(session: &Arc<Session>, value: &Value) {
 fn handle_sandbox_notification(session: &Arc<Session>, value: &Value) {
     match value.get("method").and_then(Value::as_str) {
         Some("notifications/sandbox/configured") => {
-            handle_sandbox_configured(session);
+            handle_sandbox_configured(session, value);
         }
         Some("notifications/sandbox/failed") => {
             handle_sandbox_failed(session, value);
@@ -1346,5 +1379,54 @@ impl SessionManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_configured_parse_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_configured_scopes_extracts_write_paths() {
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/sandbox/configured",
+            "params": {
+                "scope": {
+                    "write": ["/work/project", "/work/extra"],
+                    "read": ["/etc"],
+                    "tmp": false,
+                    "enforced": true,
+                    "source": "roots/list"
+                }
+            }
+        });
+        let scopes = parse_configured_scopes(&notif);
+        assert_eq!(
+            scopes,
+            vec![PathBuf::from("/work/project"), PathBuf::from("/work/extra")]
+        );
+    }
+
+    #[test]
+    fn parse_configured_scopes_missing_scope_is_empty() {
+        // The notification may omit the scope summary entirely. The caller then
+        // preserves any in-flight Configuring scopes, so an empty vec is correct.
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/sandbox/configured"
+        });
+        assert!(parse_configured_scopes(&notif).is_empty());
+    }
+
+    #[test]
+    fn parse_configured_scopes_empty_write_is_empty() {
+        let notif = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/sandbox/configured",
+            "params": { "scope": { "write": [] } }
+        });
+        assert!(parse_configured_scopes(&notif).is_empty());
     }
 }

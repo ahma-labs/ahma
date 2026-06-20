@@ -144,6 +144,65 @@ impl SandboxStateMachine {
         }
     }
 
+    /// Transition to Active from any non-terminal state.
+    ///
+    /// Unlike [`transition_to_active`](Self::transition_to_active), which only
+    /// fires from `Configuring`, this advances to `Active` from either
+    /// `AwaitingRoots` or `Configuring`. It exists because the *authoritative*
+    /// signal that the sandbox is locked is the subprocess's
+    /// `notifications/sandbox/configured` notification: when the HTTP bridge
+    /// observes it, the subprocess has already applied and enforced its scopes,
+    /// regardless of whether the bridge itself observed a `roots/list` lock
+    /// first.
+    ///
+    /// Requiring `Configuring` first created a race: when SSE connects, the
+    /// bridge fires `roots/list_changed` to the subprocess (which may emit
+    /// `configured` immediately) on one task while `auto_lock_if_default_scope`
+    /// transitions `AwaitingRoots -> Configuring` on another. If `configured`
+    /// won that race, [`transition_to_active`](Self::transition_to_active) was a
+    /// no-op and the session stuck forever — the TUI showed `[LOCKED]` (it saw
+    /// the SSE-forwarded notification) while every `tools/call` returned HTTP
+    /// 409 / JSON-RPC -32001.
+    ///
+    /// When transitioning from `Configuring`, the existing scopes are preserved
+    /// if `scopes` is empty (the notification may omit them); otherwise the
+    /// provided `scopes` win. Terminal states (`Failed`, `Terminated`) are
+    /// preserved and yield an error. Already-`Active` is a no-op success
+    /// (idempotent).
+    pub fn transition_to_active_with_scopes(
+        &self,
+        scopes: Vec<PathBuf>,
+    ) -> Result<(), &'static str> {
+        self.sender.send_if_modified(|state| match state {
+            SandboxState::AwaitingRoots => {
+                *state = SandboxState::Active {
+                    scopes: scopes.clone(),
+                };
+                true
+            }
+            SandboxState::Configuring {
+                scopes: existing_scopes,
+            } => {
+                let resolved = if scopes.is_empty() {
+                    std::mem::take(existing_scopes)
+                } else {
+                    scopes.clone()
+                };
+                *state = SandboxState::Active { scopes: resolved };
+                true
+            }
+            // Already Active (idempotent) or terminal: do not modify.
+            SandboxState::Active { .. }
+            | SandboxState::Failed { .. }
+            | SandboxState::Terminated => false,
+        });
+        if self.sender.borrow().is_active() {
+            Ok(())
+        } else {
+            Err("Cannot transition to Active from a terminal state")
+        }
+    }
+
     /// Transition to Failed from any non-terminal state
     pub fn transition_to_failed(&self, error: String) -> Result<(), &'static str> {
         let mut transitioned = false;
@@ -250,6 +309,82 @@ mod tests {
     fn test_invalid_transition_awaiting_to_active() {
         let sm = SandboxStateMachine::new();
         assert!(sm.transition_to_active().is_err());
+    }
+
+    #[test]
+    fn test_authoritative_active_from_awaiting_roots() {
+        // The subprocess's notifications/sandbox/configured is authoritative:
+        // the bridge must reach Active even if it never observed a roots lock
+        // (it stayed in AwaitingRoots). This is the desync that made the TUI
+        // show [LOCKED] while tools/call returned 409 forever.
+        let scope = test_scope();
+        let sm = SandboxStateMachine::new();
+        assert!(matches!(sm.current(), SandboxState::AwaitingRoots));
+
+        sm.transition_to_active_with_scopes(vec![scope.clone()])
+            .unwrap();
+        assert!(matches!(
+            sm.current(),
+            SandboxState::Active { scopes } if scopes == vec![scope]
+        ));
+    }
+
+    #[test]
+    fn test_authoritative_active_from_configuring_preserves_scopes() {
+        // configured may carry no scope payload; when it arrives while the
+        // bridge is mid-Configuring, the in-flight scopes must be preserved.
+        let scope = test_scope();
+        let sm = SandboxStateMachine::new();
+        sm.transition_to_configuring(vec![scope.clone()]).unwrap();
+
+        sm.transition_to_active_with_scopes(Vec::new()).unwrap();
+        assert!(matches!(
+            sm.current(),
+            SandboxState::Active { scopes } if scopes == vec![scope]
+        ));
+    }
+
+    #[test]
+    fn test_authoritative_active_idempotent() {
+        let scope = test_scope();
+        let sm = SandboxStateMachine::new_active(vec![scope.clone()]);
+        // A second configured notification (e.g. SSE replay) must not error.
+        sm.transition_to_active_with_scopes(Vec::new()).unwrap();
+        assert!(sm.is_active());
+    }
+
+    #[test]
+    fn test_authoritative_active_rejected_from_terminal() {
+        let sm = SandboxStateMachine::new();
+        sm.transition_to_failed("boom".to_string()).unwrap();
+        // A late configured must not resurrect a Failed session.
+        assert!(
+            sm.transition_to_active_with_scopes(vec![test_scope()])
+                .is_err()
+        );
+        assert!(matches!(sm.current(), SandboxState::Failed { .. }));
+    }
+
+    #[test]
+    fn test_authoritative_active_wins_race_against_late_configuring() {
+        // Models the bridge race: configured (authoritative) reaches the state
+        // machine BEFORE auto_lock's transition_to_configuring. Active must win
+        // and the late Configuring attempt must be a no-op.
+        let scope = test_scope();
+        let sm = SandboxStateMachine::new();
+
+        // configured arrives first while still AwaitingRoots.
+        sm.transition_to_active_with_scopes(vec![scope.clone()])
+            .unwrap();
+        assert!(sm.is_active());
+
+        // auto_lock's transition_to_configuring loses (only fires from
+        // AwaitingRoots), so the session stays Active rather than getting stuck.
+        assert!(sm.transition_to_configuring(vec![scope.clone()]).is_err());
+        assert!(matches!(
+            sm.current(),
+            SandboxState::Active { scopes } if scopes == vec![scope]
+        ));
     }
 
     #[test]
