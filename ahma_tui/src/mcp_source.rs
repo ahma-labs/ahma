@@ -434,7 +434,14 @@ async fn init_mcp_session(
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow::anyhow!("no mcp-session-id in initialize response"))?;
 
-    // Step 1.5: Spawn the SSE listener in the background to handle the roots/list protocol requirements
+    // Step 1.5: Open the long-lived GET /mcp SSE stream BEFORE announcing readiness.
+    //
+    // The MCP Streamable-HTTP handshake requires the SSE return stream to be open
+    // before `notifications/initialized`; otherwise the server has nowhere to
+    // deliver its roots/list request and the session hangs with no response
+    // (observed as repeated "Broadcasting to 0 SSE subscribers" on the bridge).
+    // The listener signals `ready_rx` once the GET returns 2xx.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let sse_client_clone = sse_client.clone();
     let client_clone = client.clone();
     let sse_url_clone = url.clone();
@@ -450,14 +457,33 @@ async fn init_mcp_session(
             session_id_clone,
             workspace_path_clone,
             tx_clone,
+            Some(ready_tx),
         )
         .await
         {
-            debug!("SSE listener terminated with error: {:?}", e);
+            warn!("TUI MCP SSE listener terminated with error: {e:#}");
         }
     });
 
-    // Step 2: notifications/initialized
+    // Wait for the SSE stream to be established. A dropped sender (Err) means the
+    // listener failed before the stream opened; a timeout means it never did.
+    // Either way we abort the handshake so the caller retries with backoff rather
+    // than proceeding into a half-open session that can never receive responses.
+    match tokio::time::timeout(Duration::from_secs(5), ready_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return Err(anyhow::anyhow!(
+                "MCP SSE stream failed to open; aborting handshake"
+            ));
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "timed out waiting for MCP SSE stream to open; aborting handshake"
+            ));
+        }
+    }
+
+    // Step 2: notifications/initialized (only now that the SSE return stream is live).
     let notif_body = json!({
         "jsonrpc": "2.0",
         "method": "notifications/initialized"
@@ -470,20 +496,11 @@ async fn init_mcp_session(
         .send()
         .await;
 
-    // Step 3: respond to roots/list if the server requests it
-    // (We also send an empty roots list proactively to unblock sandbox init in case server doesn't support SSE)
-    let roots_resp_body = json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "result": { "roots": [] }
-    });
-    let _ = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("mcp-session-id", &session_id)
-        .json(&roots_resp_body)
-        .send()
-        .await;
+    // The server's roots/list request is answered over the SSE stream by
+    // `handle_sse_event`, which replies with the actual workspace scope. We
+    // deliberately do NOT proactively POST an empty roots list here: doing so
+    // races the real reply and can lock the sandbox with zero scopes (every
+    // subsequent tool call then 409s).
 
     Ok(McpSession::new(session_id))
 }
@@ -630,6 +647,7 @@ async fn run_sse_listener(
     session_id: String,
     workspace_path: Option<std::path::PathBuf>,
     tx: mpsc::Sender<SourceEvent>,
+    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     let response = sse_client
         .get(&sse_url)
@@ -640,10 +658,19 @@ async fn run_sse_listener(
         .await?;
 
     if !response.status().is_success() {
+        // `ready_tx` is dropped here, which the caller observes as a failed
+        // handshake (the SSE return stream never opened).
         return Err(anyhow::anyhow!(
             "SSE stream failed with HTTP {}",
             response.status()
         ));
+    }
+
+    // The GET /mcp SSE stream is now established server-side, so the server has
+    // a channel to deliver roots/list and notifications. Signal the caller that
+    // it is safe to send `notifications/initialized` (see `init_mcp_session`).
+    if let Some(ready_tx) = ready_tx {
+        let _ = ready_tx.send(());
     }
 
     let mut resp = response;
