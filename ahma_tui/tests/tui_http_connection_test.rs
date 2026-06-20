@@ -265,46 +265,29 @@ async fn handshake_mcp(
     }
 }
 
-/// Regression test for the TUI MCP handshake race.
-///
-/// The TUI must open the GET /mcp SSE return stream BEFORE sending
-/// `notifications/initialized`; otherwise the bridge has nowhere to deliver its
-/// roots/list request and the session hangs with no response (the original
-/// "ran ls, got nothing" bug). This test asserts that, at the moment the server
-/// receives `notifications/initialized`, the SSE stream was already connected.
-#[tokio::test]
-async fn handshake_opens_sse_before_initialized() {
-    let state = HandshakeState {
+fn new_handshake_state() -> HandshakeState {
+    HandshakeState {
         sse_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         sse_ready_at_initialized: std::sync::Arc::new(std::sync::Mutex::new(None)),
-    };
+    }
+}
 
-    let router = Router::new()
+fn handshake_router(state: HandshakeState) -> Router {
+    Router::new()
         .route("/health", get(mock_health))
         .route("/mcp", post(handshake_mcp).get(handshake_sse))
-        .with_state(state.clone());
+        .with_state(state)
+}
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind handshake mock server");
-    let port = listener.local_addr().expect("local_addr").port();
-    let base_url = format!("http://127.0.0.1:{port}");
-    let _server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .await
-            .expect("handshake mock server error");
-    });
-    tokio::time::sleep(TestTimeouts::short_delay()).await;
-
+/// Drive the full TUI handshake against `connection` and assert that the SSE
+/// return stream was connected at the instant the server received
+/// `notifications/initialized`. This is the transport-agnostic core of the
+/// handshake-race regression: `init_mcp_session`/`run_sse_listener` are shared
+/// by every transport, so each variant must satisfy the same ordering.
+async fn assert_sse_open_before_initialized(connection: ResolvedConnection, state: HandshakeState) {
     let (tx, _rx) = mpsc::channel(32);
-    let connection = ResolvedConnection {
-        display_url: base_url.clone(),
-        transport: ResolvedTransport::Http(base_url),
-    };
     let _cmd_tx = spawn_mcp_source(connection, tx, None);
 
-    // Wait until the server records the SSE state seen when it first received
-    // notifications/initialized.
     let recorded = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Some(v) = *state.sse_ready_at_initialized.lock().expect("lock") {
@@ -320,6 +303,94 @@ async fn handshake_opens_sse_before_initialized() {
         recorded,
         "SSE return stream must be connected before notifications/initialized is sent"
     );
+}
+
+/// Regression test for the TUI MCP handshake race over plain HTTP.
+///
+/// The TUI must open the GET /mcp SSE return stream BEFORE sending
+/// `notifications/initialized`; otherwise the bridge has nowhere to deliver its
+/// roots/list request and the session hangs with no response (the original
+/// "ran ls, got nothing" bug).
+#[tokio::test]
+async fn handshake_opens_sse_before_initialized_http() {
+    let state = new_handshake_state();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind handshake mock server");
+    let port = listener.local_addr().expect("local_addr").port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let router = handshake_router(state.clone());
+    let _server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("handshake mock server error");
+    });
+    tokio::time::sleep(TestTimeouts::short_delay()).await;
+
+    let connection = ResolvedConnection {
+        display_url: base_url.clone(),
+        transport: ResolvedTransport::Http(base_url),
+    };
+    assert_sse_open_before_initialized(connection, state).await;
+}
+
+/// Same handshake-ordering invariant over the `ResolvedTransport::Http3` path.
+///
+/// In `mcp_source`, `extract_http_base_url` treats `Http3(url)` identically to
+/// `Http(url)` and builds the same reqwest client, so the MCP traffic flows over
+/// the same code regardless of whether the connection was QUIC-upgraded. This
+/// test therefore points an `Http3` transport at a plain-HTTP mock (no real QUIC
+/// stack is needed) to prove the `Http3` variant still opens SSE first.
+#[tokio::test]
+async fn handshake_opens_sse_before_initialized_http3() {
+    let state = new_handshake_state();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind handshake mock server");
+    let port = listener.local_addr().expect("local_addr").port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let router = handshake_router(state.clone());
+    let _server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("handshake mock server error");
+    });
+    tokio::time::sleep(TestTimeouts::short_delay()).await;
+
+    let connection = ResolvedConnection {
+        display_url: base_url.clone(),
+        transport: ResolvedTransport::Http3(base_url),
+    };
+    assert_sse_open_before_initialized(connection, state).await;
+}
+
+/// Same handshake-ordering invariant over the Unix-socket transport.
+///
+/// `ahma serve unix` is the default local transport, so the race must be proven
+/// gone here too. The mock MCP server is served over a Unix domain socket and
+/// the TUI connects via `ResolvedTransport::UnixSocket`.
+#[cfg(unix)]
+#[tokio::test]
+async fn handshake_opens_sse_before_initialized_unix() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let socket_path = tmp.path().join("ahma_tui_handshake_test.sock");
+
+    let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind unix socket");
+    let state = new_handshake_state();
+    let router = handshake_router(state.clone());
+    let _server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .await
+            .expect("handshake mock server error");
+    });
+    tokio::time::sleep(TestTimeouts::short_delay()).await;
+
+    let socket_str = socket_path.to_string_lossy().into_owned();
+    let connection = ResolvedConnection {
+        display_url: format!("unix://{socket_str}"),
+        transport: ResolvedTransport::UnixSocket(socket_str),
+    };
+    assert_sse_open_before_initialized(connection, state).await;
 }
 
 /// `spawn_mcp_source` emits `ToolsListUpdated` with the tool names returned by
