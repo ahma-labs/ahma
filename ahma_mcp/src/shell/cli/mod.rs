@@ -449,16 +449,43 @@ fn resolve_deferred_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     if !cfg.working_dirs.is_empty() {
         let scopes = canonicalize_paths(&cfg.working_dirs, "working directory")?;
         tracing::info!("Sandbox initialized from AHMA_WORKING_DIRS: {:?}", scopes);
-        Ok(Some(scopes))
-    } else {
-        tracing::warn!(
-            "Sandbox initialization deferred with ZERO scopes — tool calls will return \
-             HTTP 409 until the client sends roots/list or roots/list_changed. \
-             If your client does not send roots (e.g. Antigravity), add \
-             --sandbox-scope <path> or --working-directories <path> to prevent this."
-        );
-        Ok(Some(Vec::new()))
+        return Ok(Some(scopes));
     }
+
+    // An explicit `--sandbox-scope` is a valid provisional fallback in defer mode:
+    // it lets clients that never send `roots/list` (Claude Desktop, Antigravity,
+    // LM Studio) still lock a sandbox instead of failing the handshake. The HTTP
+    // bridge forwards its `default_scope` to the subprocess exactly this way
+    // (`--sandbox-scope <path> --defer-sandbox`, see ahma_http_bridge peer.rs).
+    // Without this, the subprocess starts with zero scopes; when the client
+    // returns -32601 to `roots/list`, config_watcher has no pre-configured scope
+    // to fall back to and emits `notifications/sandbox/failed`, poisoning the
+    // session so every `tools/call` returns HTTP 409 forever. Seeded scopes still
+    // yield to client-provided roots (config_watcher prefers parsed roots), so
+    // this stays provisional and does not widen any locked scope.
+    if !cfg.sandbox_scopes.is_empty() {
+        let mut scopes = Vec::with_capacity(cfg.sandbox_scopes.len());
+        for scope in &cfg.sandbox_scopes {
+            let canonical = ahma_common::config::ensure_sandbox_directory(scope)
+                .with_context(|| format!("Failed to initialize sandbox scope: {:?}", scope))?;
+            if !scopes.contains(&canonical) {
+                scopes.push(canonical);
+            }
+        }
+        tracing::info!(
+            "Deferred sandbox seeded from --sandbox-scope fallback (no client roots required): {:?}",
+            scopes
+        );
+        return Ok(Some(scopes));
+    }
+
+    tracing::warn!(
+        "Sandbox initialization deferred with ZERO scopes — tool calls will return \
+         HTTP 409 until the client sends roots/list or roots/list_changed. \
+         If your client does not send roots (e.g. Antigravity), add \
+         --sandbox-scope <path> or --working-directories <path> to prevent this."
+    );
+    Ok(Some(Vec::new()))
 }
 
 fn add_temp_scope_if_requested(
@@ -2745,6 +2772,53 @@ mod tests {
         let scopes = resolve_sandbox_scopes(&cfg).unwrap();
         assert!(scopes.is_some());
         assert_eq!(scopes.unwrap().len(), 1);
+    }
+
+    /// Regression: a deferred sandbox with an explicit `--sandbox-scope` but no
+    /// `--working-directories` must seed that scope as a provisional fallback,
+    /// NOT return an empty scope set. The HTTP bridge forwards its `default_scope`
+    /// to the subprocess as `--sandbox-scope <path> --defer-sandbox`; if defer
+    /// resolution drops that scope, a client that doesn't support `roots/list`
+    /// (Claude Desktop, Antigravity) gets `-32601`, the subprocess has no
+    /// pre-configured scope to fall back to, and emits `notifications/sandbox/failed`
+    /// — poisoning the session so every `tools/call` returns HTTP 409 forever.
+    #[test]
+    fn test_resolve_deferred_scopes_falls_back_to_sandbox_scope() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let cfg = AppConfig {
+            no_sandbox: true,
+            defer_sandbox: true,
+            sandbox_scopes: vec![tmp.path().to_path_buf()],
+            ..make_cfg()
+        };
+        let scopes = resolve_deferred_scopes(&cfg)
+            .unwrap()
+            .expect("deferred scopes resolve to Some");
+        assert_eq!(
+            scopes.len(),
+            1,
+            "explicit --sandbox-scope must seed a provisional deferred scope, got {scopes:?}"
+        );
+        assert_eq!(dunce::canonicalize(tmp.path()).unwrap(), scopes[0]);
+    }
+
+    /// `--working-directories` still wins over `--sandbox-scope` in defer mode.
+    #[test]
+    fn test_resolve_deferred_scopes_working_dirs_win_over_sandbox_scope() {
+        init_test();
+        let work = tempdir().unwrap();
+        let fallback = tempdir().unwrap();
+        let cfg = AppConfig {
+            no_sandbox: true,
+            defer_sandbox: true,
+            working_dirs: vec![work.path().to_path_buf()],
+            sandbox_scopes: vec![fallback.path().to_path_buf()],
+            ..make_cfg()
+        };
+        let scopes = resolve_deferred_scopes(&cfg).unwrap().unwrap();
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(dunce::canonicalize(work.path()).unwrap(), scopes[0]);
     }
 
     // ─── add_temp_scope_if_requested ────────────────────────────────────────
