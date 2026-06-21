@@ -499,19 +499,119 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     frame.render_widget(Paragraph::new(line).style(theme.header_bar()), area);
 }
 
-/// Estimate the number of physical terminal rows a ratatui [`Line`] will occupy
-/// when word-wrapped into `width` columns.  This uses simple character-count
-/// arithmetic (ignoring double-width Unicode codepoints) which is accurate for
-/// typical ASCII/Latin chat content and "close enough" for the scrollbar thumb.
+/// Word-wrap a single logical [`Line`] into one or more physical rows that each
+/// fit within `width` columns, preserving every span's style. Words longer than
+/// `width` are hard-split. This is the *authoritative* wrap used both for
+/// rendering and for scroll-bounds math, so the two can never disagree — the
+/// number of physical rows the chat occupies is exactly `wrap_line_to_rows(..).len()`.
+///
+/// Column accounting is by character count (ignoring double-width Unicode
+/// codepoints), which matches typical ASCII/Latin chat content. Called every
+/// frame against the live inner width, so it re-wraps automatically on resize.
+#[cfg(feature = "tui")]
+fn wrap_line_to_rows(line: &ratatui::text::Line<'_>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+
+    // Flatten the line into (char, style) cells so words can be re-segmented
+    // across span boundaries while keeping each character's original style.
+    let cells: Vec<(char, Style)> = line
+        .spans
+        .iter()
+        .flat_map(|s| {
+            let style = s.style;
+            s.content.chars().map(move |c| (c, style))
+        })
+        .collect();
+
+    // Preserve blank lines as a single empty row (spacers between entries).
+    if cells.is_empty() {
+        return vec![Line::default()];
+    }
+
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut cur: Vec<(char, Style)> = Vec::new();
+
+    let flush = |cur: &mut Vec<(char, Style)>, rows: &mut Vec<Vec<(char, Style)>>| {
+        rows.push(std::mem::take(cur));
+    };
+
+    let mut i = 0;
+    while i < cells.len() {
+        let is_space = cells[i].0.is_whitespace();
+        let start = i;
+        while i < cells.len() && cells[i].0.is_whitespace() == is_space {
+            i += 1;
+        }
+        let segment = &cells[start..i];
+
+        if is_space {
+            // Whitespace that fits stays on the line; whitespace that would spill
+            // past the edge is dropped at the wrap point (so the next row does
+            // not start with stray leading spaces).
+            if cur.len() + segment.len() <= width {
+                cur.extend_from_slice(segment);
+            } else {
+                flush(&mut cur, &mut rows);
+            }
+        } else if segment.len() <= width {
+            // A word that fits on its own; move it to the next row if needed.
+            if cur.len() + segment.len() > width && !cur.is_empty() {
+                flush(&mut cur, &mut rows);
+            }
+            cur.extend_from_slice(segment);
+        } else {
+            // A word longer than the whole width: hard-split across rows.
+            for &cell in segment {
+                if cur.len() == width {
+                    flush(&mut cur, &mut rows);
+                }
+                cur.push(cell);
+            }
+        }
+    }
+    if !cur.is_empty() || rows.is_empty() {
+        rows.push(cur);
+    }
+
+    rows.into_iter().map(cells_to_line).collect()
+}
+
+/// Coalesce a row of (char, style) cells into a styled [`Line`], merging runs of
+/// identical styles into single spans.
+#[cfg(feature = "tui")]
+fn cells_to_line(cells: Vec<(char, Style)>) -> Line<'static> {
+    if cells.is_empty() {
+        return Line::default();
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cur_style = cells[0].1;
+    let mut cur_text = String::new();
+    for (ch, style) in cells {
+        if style == cur_style {
+            cur_text.push(ch);
+        } else {
+            spans.push(Span::styled(std::mem::take(&mut cur_text), cur_style));
+            cur_style = style;
+            cur_text.push(ch);
+        }
+    }
+    spans.push(Span::styled(cur_text, cur_style));
+    Line::from(spans)
+}
+
+/// Flatten logical lines into the physical rows they occupy at `width`, in order.
+#[cfg(feature = "tui")]
+fn wrap_lines_to_rows(lines: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .flat_map(|l| wrap_line_to_rows(l, width))
+        .collect()
+}
+
+/// Number of physical rows a logical [`Line`] occupies when wrapped at `width`.
 #[cfg(feature = "tui")]
 fn line_wrapped_rows(line: &ratatui::text::Line<'_>, width: usize) -> usize {
-    let width = width.max(1);
-    let total_chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-    if total_chars == 0 {
-        1
-    } else {
-        total_chars.div_ceil(width)
-    }
+    wrap_line_to_rows(line, width).len()
 }
 
 /// Total wrapped physical rows for a slice of logical lines at the given width.
@@ -549,26 +649,40 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     }
 
     let visible_h = inner.height as usize;
-    let lines = build_chat_history_lines(state, theme, inner.width as usize);
-    let max_scroll = lines.len().saturating_sub(visible_h);
+    // Reserve the rightmost column for the scrollbar so the wrap width is stable
+    // whether or not the bar is currently visible — otherwise showing the bar
+    // would re-wrap the text, which could change the row count and oscillate.
+    let text_width = (inner.width as usize).saturating_sub(1).max(1);
+
+    // Pre-wrap into physical rows at the *current* width, so one rendered row
+    // equals one screen line. All scroll math is then in true screen rows and
+    // re-derived every frame — a terminal resize immediately re-wraps and
+    // re-bounds the scroll, and chat_scroll == 0 always shows the real bottom.
+    let logical = build_chat_history_lines(state, theme, text_width);
+    let rows = wrap_lines_to_rows(&logical, text_width);
+    let max_scroll = rows.len().saturating_sub(visible_h);
     state.chat_max_scroll.set(max_scroll);
 
-    let scroll = chat_history_scroll_offset(lines.len(), visible_h, state.chat_scroll);
-    let visible_lines: Vec<Line<'static>> =
-        lines.iter().skip(scroll).take(visible_h).cloned().collect();
-    frame.render_widget(
-        Paragraph::new(Text::from(visible_lines)).wrap(Wrap { trim: false }),
-        inner,
-    );
+    let scroll = chat_history_scroll_offset(rows.len(), visible_h, state.chat_scroll);
+    let visible_rows: Vec<Line<'static>> =
+        rows.iter().skip(scroll).take(visible_h).cloned().collect();
+    // Rows are already wrapped to `text_width`; render without ratatui's wrap so
+    // the rendered height matches the row count exactly. Confine the paragraph to
+    // the reserved text column width to leave room for the scrollbar.
+    let text_area = Rect {
+        width: inner.width.saturating_sub(1).max(1),
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(Text::from(visible_rows)), text_area);
 
-    if lines.len() > visible_h {
+    if rows.len() > visible_h {
         let sb = Scrollbar::default()
             .orientation(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None);
-        // Use logical-line units so position, viewport, and content length all
-        // match the scroll offset used for rendering (lines.len() / visible_h / scroll).
-        let mut sb_state = ScrollbarState::new(lines.len())
+        // Physical-row units so position, viewport, and content length all match
+        // the scroll offset used for rendering (rows.len() / visible_h / scroll).
+        let mut sb_state = ScrollbarState::new(rows.len())
             .viewport_content_length(visible_h)
             .position(scroll);
         frame.render_stateful_widget(sb, inner, &mut sb_state);
@@ -2936,5 +3050,114 @@ mod tests {
         // The thumb should NOT be at position 6 of a 10-line logical space (60%),
         // but at 6 of a 15-row wrapped space (40%). The important thing: pos_w < total_w.
         assert!(pos_w < total_w);
+    }
+
+    fn row_text(line: &Line) -> String {
+        line.spans.iter().map(|s| &*s.content).collect()
+    }
+
+    #[test]
+    fn wrap_line_word_boundary_keeps_whole_words() {
+        // Greedy word wrap at width 8: "hello " (6) + "world" (5) overflows → wrap.
+        let rows = wrap_line_to_rows(&make_line("hello world foo"), 8);
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        assert_eq!(texts, vec!["hello ", "world ", "foo"]);
+    }
+
+    #[test]
+    fn wrap_line_hard_splits_overlong_word() {
+        // A single word longer than the width is split at the column boundary.
+        let rows = wrap_line_to_rows(&make_line(&"x".repeat(25)), 10);
+        let texts: Vec<String> = rows.iter().map(row_text).collect();
+        assert_eq!(texts, vec!["xxxxxxxxxx", "xxxxxxxxxx", "xxxxx"]);
+    }
+
+    #[test]
+    fn wrap_line_blank_stays_one_row() {
+        assert_eq!(wrap_line_to_rows(&Line::default(), 10).len(), 1);
+        assert_eq!(wrap_line_to_rows(&make_line(""), 10).len(), 1);
+    }
+
+    #[test]
+    fn wrap_preserves_span_styles_across_split() {
+        let red = Style::default().fg(Color::Red);
+        let blue = Style::default().fg(Color::Blue);
+        // 4 red + 4 blue, no spaces → one over-long "word" hard-split at width 4.
+        let line = Line::from(vec![Span::styled("aaaa", red), Span::styled("bbbb", blue)]);
+        let rows = wrap_line_to_rows(&line, 4);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_text(&rows[0]), "aaaa");
+        assert!(rows[0].spans.iter().all(|s| s.style == red));
+        assert_eq!(row_text(&rows[1]), "bbbb");
+        assert!(rows[1].spans.iter().all(|s| s.style == blue));
+    }
+
+    #[test]
+    fn no_row_exceeds_width_after_wrapping() {
+        let logical = vec![
+            make_line("ahma here is a fairly long assistant answer that must wrap"),
+            make_line(&"verylongunbreakabletoken".repeat(3)),
+        ];
+        let width = 12;
+        for row in wrap_lines_to_rows(&logical, width) {
+            let len: usize = row.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(len <= width, "row {len:?} chars exceeds width {width}");
+        }
+    }
+
+    /// Regression: with logical-line scroll math, pinning to the bottom
+    /// (chat_scroll == 0) sliced the last `visible_h` *logical* lines, which —
+    /// once word-wrapped — overflowed the viewport and clipped the end of the
+    /// answer, with no way to scroll further down. After the fix the scroll math
+    /// is in physical rows, so the true final row is always the last visible row.
+    #[test]
+    fn wrapped_bottom_row_reachable_at_scroll_zero() {
+        let width = 10;
+        let visible_h = 4;
+        // A header line plus one long line that wraps into several rows.
+        let logical = vec![make_line("ahma hi"), make_line(&"word ".repeat(10))];
+        let rows = wrap_lines_to_rows(&logical, width);
+        assert!(
+            rows.len() > visible_h,
+            "content must overflow the viewport for this test"
+        );
+
+        // chat_scroll == 0 → pinned to the newest content.
+        let scroll = chat_history_scroll_offset(rows.len(), visible_h, 0);
+        let visible: Vec<&Line> = rows.iter().skip(scroll).take(visible_h).collect();
+        assert_eq!(visible.len(), visible_h);
+
+        // The genuine final wrapped row is the last visible row — bottom reached.
+        assert_eq!(
+            row_text(visible.last().unwrap()),
+            row_text(rows.last().unwrap())
+        );
+        // And every visible row fits, so nothing is clipped off the bottom edge.
+        for row in &visible {
+            let len: usize = row.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert!(len <= width);
+        }
+    }
+
+    /// Documents the old bug directly: slicing the last `visible_h` *logical*
+    /// lines and then wrapping produces MORE physical rows than the viewport can
+    /// show, so the bottom would be clipped.
+    #[test]
+    fn logical_line_slice_overflows_viewport() {
+        let width = 10;
+        let visible_h = 4;
+        let logical = [make_line("a"), make_line(&"x".repeat(50))]; // last → 5 rows
+        let scroll = logical.len().saturating_sub(visible_h); // 0
+        let slice: Vec<Line<'static>> = logical
+            .iter()
+            .skip(scroll)
+            .take(visible_h)
+            .cloned()
+            .collect();
+        let wrapped = wrap_lines_to_rows(&slice, width);
+        assert!(
+            wrapped.len() > visible_h,
+            "old logical-line slice overflows the viewport (clips the bottom)"
+        );
     }
 }

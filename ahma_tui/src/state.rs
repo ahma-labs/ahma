@@ -81,6 +81,21 @@ impl ChatHistory {
         self.entries.clear();
     }
 
+    /// Drop completed entries, keeping only work still in progress: assistant
+    /// output that is still streaming and tool calls awaiting a result. Used by
+    /// `/clear` so an ongoing turn is not yanked off the screen mid-flight.
+    pub fn retain_in_flight(&mut self) {
+        self.entries.retain(|entry| {
+            matches!(
+                entry,
+                ChatEntry::Assistant {
+                    streaming: true,
+                    ..
+                } | ChatEntry::ToolCall { result: None, .. }
+            )
+        });
+    }
+
     /// Append a token to the last `Assistant` entry if it's still streaming.
     /// If no such entry exists, creates a new one.
     pub fn append_token(&mut self, token: &str) {
@@ -277,7 +292,7 @@ pub fn builtin_commands() -> Vec<NavCommand> {
         },
         NavCommand {
             command: "/clear".into(),
-            description: "clear chat history",
+            description: "clear chat & finished windows (logs kept)",
         },
         NavCommand {
             command: "/agent list".into(),
@@ -882,6 +897,10 @@ pub struct TuiWindow {
 pub struct AppState {
     pub windows: Vec<TuiWindow>,
     pub next_window_id: usize,
+    /// Set by `/clear`. Operations that had already completed before this
+    /// instant are not re-materialised as windows when a source re-pushes them,
+    /// so cleared results stay cleared.
+    pub cleared_at: Option<Instant>,
     #[cfg(feature = "tui")]
     pub window_rects: std::cell::RefCell<Vec<(usize, Rect)>>,
     #[cfg(not(feature = "tui"))]
@@ -1161,6 +1180,7 @@ impl AppState {
 
             windows: vec![],
             next_window_id: 0,
+            cleared_at: None,
             window_rects: std::cell::RefCell::new(vec![]),
 
             unicode,
@@ -1174,6 +1194,57 @@ impl AppState {
             approval_tx: None,
             #[cfg(not(feature = "tui"))]
             approval_tx: None,
+        }
+    }
+
+    /// Clear the visible chat history and finished command/LLM windows, then
+    /// reset every scroll position to its startup default. Work still in
+    /// progress is preserved: streaming assistant output, in-flight tool calls,
+    /// and running/pending windows all stay on screen and keep updating.
+    ///
+    /// The monitor log (and its loaded file) is intentionally left untouched —
+    /// `/clear` resets the chat surface, not the log feed. Scroll positions snap
+    /// back to defaults: chat/ops/activity to the newest entry, and the log back
+    /// to following the tail.
+    pub fn clear_screen(&mut self) {
+        // Chat: keep only the turn(s) still in flight.
+        self.chat.retain_in_flight();
+
+        // Windows: keep only those still running/pending (no finish timestamp).
+        self.windows.retain(|w| w.finished_at.is_none());
+
+        // Watermark so already-completed operations a source re-pushes are not
+        // resurrected as windows (see `window_suppressed_by_clear`).
+        self.cleared_at = Some(Instant::now());
+
+        // Reset scroll positions to their startup defaults.
+        self.chat_scroll = 0;
+        self.chat_max_scroll.set(0);
+        self.activity_scroll = 0;
+        self.ops_selected = 0;
+        self.ops_scroll.set(0);
+        self.sync_chat_scroll_to_animation();
+
+        // Log content is preserved; only the view snaps back to the tail.
+        self.log_follow = true;
+        self.log_scroll = self.log_max_scroll.get();
+        self.sync_log_scroll_to_animation();
+    }
+
+    /// True when `op` finished before the most recent `/clear` and therefore
+    /// should not be re-shown as a window. Operations still running (or that
+    /// started after the clear) are never suppressed.
+    pub fn window_suppressed_by_clear(&self, op: &Operation) -> bool {
+        let Some(cleared) = self.cleared_at else {
+            return false;
+        };
+        if !op.status.is_terminal() {
+            return false;
+        }
+        match op.completed_at.or(op.started_at) {
+            Some(t) => t <= cleared,
+            // Terminal but with no timestamp at all: treat as pre-clear.
+            None => true,
         }
     }
 
@@ -1657,6 +1728,130 @@ mod tests {
 
         let op4 = Operation::new("a8f9c2d3", "run_terminal_command", OpStatus::Running);
         assert_eq!(op4.clean_id(), "a8f9c2");
+    }
+
+    fn test_window(id: usize, status: &str, finished: bool) -> TuiWindow {
+        let (abort_tx, _abort_rx) = tokio::sync::oneshot::channel::<()>();
+        TuiWindow {
+            id,
+            label: format!("win {id}"),
+            status: status.to_string(),
+            content: vec![],
+            collapsed: false,
+            finished_at: if finished { Some(Instant::now()) } else { None },
+            is_cli: true,
+            command: String::new(),
+            working_dir: String::new(),
+            llm_model: None,
+            visible: true,
+            abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(abort_tx))),
+            op_id: None,
+        }
+    }
+
+    #[test]
+    fn retain_in_flight_keeps_only_active_turns() {
+        let mut hist = ChatHistory::default();
+        hist.push(ChatEntry::User {
+            text: "done turn".into(),
+            started_at: None,
+            duration_ms: None,
+        });
+        hist.push(ChatEntry::Assistant {
+            content: "finished reply".into(),
+            streaming: false,
+        });
+        hist.start_tool_call("call_done".into(), "tool".into(), "{}".into());
+        hist.finish_tool_call("call_done", "ok".into(), false);
+        // In-flight work that must survive a clear:
+        hist.start_tool_call("call_live".into(), "tool".into(), "{}".into());
+        hist.push(ChatEntry::Assistant {
+            content: "streaming…".into(),
+            streaming: true,
+        });
+
+        hist.retain_in_flight();
+
+        assert_eq!(hist.len(), 2);
+        assert!(matches!(
+            hist.entries()[0],
+            ChatEntry::ToolCall { result: None, .. }
+        ));
+        assert!(matches!(
+            hist.entries()[1],
+            ChatEntry::Assistant {
+                streaming: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn clear_screen_drops_finished_keeps_running_and_resets_scroll() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        s.windows.push(test_window(1, "Running", false));
+        s.windows.push(test_window(2, "Finished", true));
+        s.windows.push(test_window(3, "Pending", false));
+
+        s.chat.push(ChatEntry::User {
+            text: "hi".into(),
+            started_at: None,
+            duration_ms: None,
+        });
+
+        // Logs must be preserved across a clear.
+        s.push_log(LogEntry {
+            timestamp: chrono::Local::now(),
+            level: LogLevel::Info,
+            message: "keep me".into(),
+        });
+
+        // Dirty scroll state that clear must reset.
+        s.chat_scroll = 42;
+        s.activity_scroll = 7;
+        s.ops_selected = 3;
+        s.ops_scroll.set(9);
+        s.log_follow = false;
+
+        s.clear_screen();
+
+        let ids: Vec<usize> = s.windows.iter().map(|w| w.id).collect();
+        assert_eq!(ids, vec![1, 3], "finished window removed, in-flight kept");
+        assert!(s.chat.is_empty(), "completed chat entries cleared");
+        assert_eq!(s.log.len(), 1, "log feed preserved");
+        assert_eq!(s.chat_scroll, 0);
+        assert_eq!(s.activity_scroll, 0);
+        assert_eq!(s.ops_selected, 0);
+        assert_eq!(s.ops_scroll.get(), 0);
+        assert!(s.log_follow, "log re-engages tail-follow");
+        assert!(s.cleared_at.is_some());
+    }
+
+    #[test]
+    fn window_suppressed_by_clear_only_hits_pre_clear_terminal_ops() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+
+        // Before any clear nothing is suppressed.
+        let done = Operation::new("op1", "cargo_build", OpStatus::Succeeded);
+        assert!(!s.window_suppressed_by_clear(&done));
+
+        s.clear_screen();
+
+        // A terminal op that finished before the clear is suppressed.
+        let mut old = Operation::new("op2", "cargo_build", OpStatus::Succeeded);
+        old.started_at = Some(Instant::now() - Duration::from_secs(5));
+        old.completed_at = Some(Instant::now() - Duration::from_secs(4));
+        assert!(s.window_suppressed_by_clear(&old));
+
+        // A still-running op is never suppressed, even if it started earlier.
+        let mut running = Operation::new("op3", "cargo_build", OpStatus::Running);
+        running.started_at = Some(Instant::now() - Duration::from_secs(5));
+        assert!(!s.window_suppressed_by_clear(&running));
+
+        // A brand-new op that completes after the clear stays visible.
+        let mut fresh = Operation::new("op4", "cargo_build", OpStatus::Succeeded);
+        fresh.completed_at = Some(Instant::now() + Duration::from_secs(1));
+        assert!(!s.window_suppressed_by_clear(&fresh));
     }
 
     #[test]
