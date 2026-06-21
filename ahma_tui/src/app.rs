@@ -1023,7 +1023,7 @@ fn maybe_run_cli_command(text: &str, state: &mut crate::state::AppState) -> bool
         let w = TuiWindow {
             id: win_id,
             label,
-            status: "Running".to_string(),
+            status: crate::state::WindowStatus::Running,
             content: vec![],
             collapsed: false,
             finished_at: None,
@@ -2554,7 +2554,7 @@ fn handle_decomposed_event(
         let w = crate::state::TuiWindow {
             id: win_id,
             label,
-            status: "Pending".to_string(),
+            status: crate::state::WindowStatus::Pending,
             content: vec![format!("Task: {}", step.task)],
             collapsed: false,
             finished_at: None,
@@ -2610,9 +2610,9 @@ fn handle_window_finished_event(
     let mut current_failed = false;
     if let Some(w) = state.windows.iter_mut().find(|w| w.id == window_id) {
         w.status = if success {
-            "Finished".to_string()
+            crate::state::WindowStatus::Finished
         } else {
-            "Error".to_string()
+            crate::state::WindowStatus::Error
         };
         w.content.push(summary);
         w.finished_at = Some(std::time::Instant::now());
@@ -2622,8 +2622,8 @@ fn handle_window_finished_event(
     }
     if current_failed {
         for w in &mut state.windows {
-            if w.status == "Pending" {
-                w.status = "Cancelled".to_string();
+            if w.status == crate::state::WindowStatus::Pending {
+                w.status = crate::state::WindowStatus::Cancelled;
                 w.finished_at = Some(std::time::Instant::now());
             }
         }
@@ -2867,14 +2867,14 @@ fn window_content_for(op: &crate::state::Operation, unicode: bool) -> Vec<String
 }
 
 #[cfg(feature = "tui")]
-fn window_status_for(op: &crate::state::Operation) -> String {
+fn window_status_for(op: &crate::state::Operation) -> crate::state::WindowStatus {
+    use crate::state::{OpStatus, WindowStatus};
     match op.status {
-        crate::state::OpStatus::Running => "Running".to_string(),
-        crate::state::OpStatus::Pending => "Pending".to_string(),
-        crate::state::OpStatus::Succeeded => "Finished".to_string(),
-        crate::state::OpStatus::Failed => "Error".to_string(),
-        crate::state::OpStatus::Cancelled => "Cancelled".to_string(),
-        crate::state::OpStatus::Waiting => "Pending".to_string(),
+        OpStatus::Running => WindowStatus::Running,
+        OpStatus::Pending | OpStatus::Waiting => WindowStatus::Pending,
+        OpStatus::Succeeded => WindowStatus::Finished,
+        OpStatus::Failed => WindowStatus::Error,
+        OpStatus::Cancelled => WindowStatus::Cancelled,
     }
 }
 
@@ -3200,7 +3200,11 @@ fn http_base_url(connection: &ResolvedConnection) -> String {
 
 #[cfg(feature = "tui")]
 fn run_next_pending_window(state: &mut crate::state::AppState) {
-    if let Some(pos) = state.windows.iter().position(|w| w.status == "Pending") {
+    if let Some(pos) = state
+        .windows
+        .iter()
+        .position(|w| w.status == crate::state::WindowStatus::Pending)
+    {
         let win_id = state.windows[pos].id;
         start_window_execution(win_id, state);
     }
@@ -3215,7 +3219,7 @@ fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
     let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) else {
         return;
     };
-    w.status = "Running".to_string();
+    w.status = crate::state::WindowStatus::Running;
 
     let is_cli = w.is_cli;
     let command = w.command.clone();
@@ -3252,7 +3256,7 @@ fn close_window_by_id(win_id: usize, state: &mut crate::state::AppState) {
             let _ = abort_tx.send(());
         }
         w.visible = false;
-        w.status = "Cancelled".to_string();
+        w.status = crate::state::WindowStatus::Cancelled;
         w.finished_at = Some(std::time::Instant::now());
     }
 }
@@ -3781,7 +3785,7 @@ mod tests {
         let w = TuiWindow {
             id: 3,
             label: "Test Window".to_string(),
-            status: "Running".to_string(),
+            status: crate::state::WindowStatus::Running,
             content: vec![],
             collapsed: true,
             finished_at: None,
@@ -3805,7 +3809,10 @@ mod tests {
         let handled_close = super::handle_window_nav_commands("/x3", &mut state);
         assert!(handled_close);
         assert!(!state.windows[0].visible);
-        assert_eq!(state.windows[0].status, "Cancelled");
+        assert_eq!(
+            state.windows[0].status,
+            crate::state::WindowStatus::Cancelled
+        );
 
         // Test /quit (primary advertised command) to quit
         let mut state_quit = AppState::new("http://localhost:3000", "HTTP", true);
@@ -4046,7 +4053,7 @@ mod tests {
         let w = TuiWindow {
             id: 26,
             label: "Test Window".to_string(),
-            status: "Running".to_string(),
+            status: crate::state::WindowStatus::Running,
             content: vec![],
             collapsed: false,
             finished_at: None,
@@ -4065,17 +4072,23 @@ mod tests {
         super::submit_chat_input(&mut state);
 
         assert!(!state.windows[0].visible);
-        assert_eq!(state.windows[0].status, "Cancelled");
+        assert_eq!(
+            state.windows[0].status,
+            crate::state::WindowStatus::Cancelled
+        );
 
         // Restore window
         state.windows[0].visible = true;
-        state.windows[0].status = "Running".to_string();
+        state.windows[0].status = crate::state::WindowStatus::Running;
 
         // Type "X26" in chat input
         state.chat_input.insert_str("X26");
         super::submit_chat_input(&mut state);
 
         assert!(!state.windows[0].visible);
-        assert_eq!(state.windows[0].status, "Cancelled");
+        assert_eq!(
+            state.windows[0].status,
+            crate::state::WindowStatus::Cancelled
+        );
     }
 }

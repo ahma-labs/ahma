@@ -119,14 +119,14 @@ fn compute_window_layouts(
 }
 
 #[cfg(feature = "tui")]
-fn window_status_style(status: &str, theme: &Theme) -> Style {
+fn window_status_style(status: crate::state::WindowStatus, theme: &Theme) -> Style {
+    use crate::state::WindowStatus;
     match status {
-        "Running" => theme.running(),
-        "Finished" => theme.success(),
-        "Error" => theme.failed(),
-        "Cancelled" => theme.cancelled(),
-        "Pending" => theme.pending(),
-        _ => theme.normal(),
+        WindowStatus::Running => theme.running(),
+        WindowStatus::Finished => theme.success(),
+        WindowStatus::Error => theme.failed(),
+        WindowStatus::Cancelled => theme.cancelled(),
+        WindowStatus::Pending => theme.pending(),
     }
 }
 
@@ -142,7 +142,7 @@ fn draw_collapsed_window(
         .unwrap_or_default()
         .as_millis();
     let f = (ms / 150) as usize;
-    let status_str = if w.status == "Running" {
+    let status_str = if w.status == crate::state::WindowStatus::Running {
         let spinner = if theme.unicode {
             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             frames[f % frames.len()]
@@ -152,7 +152,7 @@ fn draw_collapsed_window(
         };
         format!("Running {}", spinner)
     } else {
-        w.status.clone()
+        w.status.label().to_string()
     };
 
     let mut spans = vec![
@@ -195,7 +195,7 @@ fn build_window_title(w: &crate::state::TuiWindow, width: u16, unicode: bool) ->
     let border_width = 2;
     let title_space = (width as usize).saturating_sub(border_width);
 
-    let status_str = if w.status == "Running" {
+    let status_str = if w.status == crate::state::WindowStatus::Running {
         format!("[Running {}]", get_running_spinner(unicode))
     } else {
         format!("[{}]", w.status)
@@ -276,7 +276,7 @@ fn draw_single_window(
     area: Rect,
     theme: &Theme,
 ) {
-    let status_style = window_status_style(&w.status, theme);
+    let status_style = window_status_style(w.status, theme);
     if l.collapsed {
         draw_collapsed_window(frame, w, area, theme, status_style);
     } else {

@@ -943,11 +943,52 @@ impl ModalState {
 // ─── Application state ────────────────────────────────────────────────────────
 
 /// A window representing a running or finished CLI command or LLM call.
+/// Display status of a [`TuiWindow`] (a CLI-command or LLM-call card).
+///
+/// Typed rather than a free-form string so comparisons and styling are
+/// exhaustively checked by the compiler (SPEC R23: states are not modeled as
+/// strings). Derived from an operation's [`OpStatus`] via `window_status_for`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowStatus {
+    Pending,
+    Running,
+    Finished,
+    Cancelled,
+    Error,
+}
+
+impl WindowStatus {
+    /// The human-readable label shown in window titles and headers.
+    pub fn label(self) -> &'static str {
+        match self {
+            WindowStatus::Pending => "Pending",
+            WindowStatus::Running => "Running",
+            WindowStatus::Finished => "Finished",
+            WindowStatus::Cancelled => "Cancelled",
+            WindowStatus::Error => "Error",
+        }
+    }
+
+    /// True once the window has reached a final state.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            WindowStatus::Finished | WindowStatus::Cancelled | WindowStatus::Error
+        )
+    }
+}
+
+impl std::fmt::Display for WindowStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiWindow {
     pub id: usize,
     pub label: String,
-    pub status: String, // "Pending", "Running", "Finished", "Cancelled", "Error"
+    pub status: WindowStatus,
     pub content: Vec<String>,
     pub collapsed: bool,
     pub finished_at: Option<std::time::Instant>,
@@ -1961,12 +2002,12 @@ mod tests {
         assert_eq!(op4.clean_id(), "a8f9c2");
     }
 
-    fn test_window(id: usize, status: &str, finished: bool) -> TuiWindow {
+    fn test_window(id: usize, status: WindowStatus, finished: bool) -> TuiWindow {
         let (abort_tx, _abort_rx) = tokio::sync::oneshot::channel::<()>();
         TuiWindow {
             id,
             label: format!("win {id}"),
-            status: status.to_string(),
+            status,
             content: vec![],
             collapsed: false,
             finished_at: if finished { Some(Instant::now()) } else { None },
@@ -2020,9 +2061,9 @@ mod tests {
     #[test]
     fn clear_screen_drops_finished_keeps_running_and_resets_scroll() {
         let mut s = AppState::new("http://localhost:3000", "HTTP", true);
-        s.windows.push(test_window(1, "Running", false));
-        s.windows.push(test_window(2, "Finished", true));
-        s.windows.push(test_window(3, "Pending", false));
+        s.windows.push(test_window(1, WindowStatus::Running, false));
+        s.windows.push(test_window(2, WindowStatus::Finished, true));
+        s.windows.push(test_window(3, WindowStatus::Pending, false));
 
         s.chat.push(ChatEntry::User {
             text: "hi".into(),
