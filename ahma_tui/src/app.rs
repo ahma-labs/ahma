@@ -2692,15 +2692,17 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
 
             let note =
                 ahma_core::approvals::reask_note(std::path::Path::new(&state.workspace), &tool);
-            state.approval = Some(crate::state::ApprovalGate {
-                op_id: id,
-                tool: tool.clone(),
-                description: format!("Execute tool {tool}"),
-                note,
-                deadline: None,
-                diff,
-            });
-            state.approval_tx = Some(tx);
+            state.request_approval(
+                crate::state::ApprovalGate {
+                    op_id: id,
+                    tool: tool.clone(),
+                    description: format!("Execute tool {tool}"),
+                    note,
+                    deadline: None,
+                    diff,
+                },
+                Some(tx),
+            );
         }
     }
 }
@@ -3072,15 +3074,17 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             };
             let note =
                 ahma_core::approvals::reask_note(std::path::Path::new(&state.workspace), &tool);
-            state.approval = Some(crate::state::ApprovalGate {
-                op_id: id,
-                tool: tool.clone(),
-                description: format!("Execute tool {tool}"),
-                note,
-                deadline: None,
-                diff,
-            });
-            state.approval_tx = None;
+            state.request_approval(
+                crate::state::ApprovalGate {
+                    op_id: id,
+                    tool: tool.clone(),
+                    description: format!("Execute tool {tool}"),
+                    note,
+                    deadline: None,
+                    diff,
+                },
+                None,
+            );
         }
         SourceEvent::AgentDone => {
             state.chat.finish_stream();
@@ -3816,15 +3820,17 @@ mod tests {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        state.approval = Some(crate::state::ApprovalGate {
-            op_id: "op_test".to_string(),
-            tool: "list_dir".to_string(),
-            description: "test".to_string(),
-            note: None,
-            deadline: None,
-            diff: None,
-        });
-        state.approval_tx = Some(tx);
+        state.request_approval(
+            crate::state::ApprovalGate {
+                op_id: "op_test".to_string(),
+                tool: "list_dir".to_string(),
+                description: "test".to_string(),
+                note: None,
+                deadline: None,
+                diff: None,
+            },
+            Some(tx),
+        );
 
         super::resolve_approval(&mut state, true);
         assert!(state.approval.is_none());
@@ -3832,6 +3838,34 @@ mod tests {
 
         let approved = rx.blocking_recv().unwrap();
         assert!(approved);
+    }
+
+    /// Regression: raising a second approval while one is pending must
+    /// auto-reject (not silently drop) the first, so its waiter never hangs.
+    #[test]
+    fn test_superseded_approval_is_auto_rejected() {
+        use crate::state::{ApprovalGate, AppState};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        let gate = |op: &str| ApprovalGate {
+            op_id: op.to_string(),
+            tool: "list_dir".to_string(),
+            description: "test".to_string(),
+            note: None,
+            deadline: None,
+            diff: None,
+        };
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        state.request_approval(gate("op_1"), Some(tx1));
+
+        // A second gate supersedes the first.
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        state.request_approval(gate("op_2"), Some(tx2));
+
+        // The first waiter is resolved with a rejection, never dropped.
+        assert_eq!(rx1.blocking_recv().ok(), Some(false));
+        assert_eq!(state.approval.as_ref().map(|g| g.op_id.as_str()), Some("op_2"));
     }
 
     /// Regression: a bare `y` while an approval is pending must resolve the

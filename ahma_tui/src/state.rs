@@ -1049,6 +1049,33 @@ pub struct AppState {
     pub approval_tx: Option<()>,
 }
 
+#[cfg(feature = "tui")]
+impl AppState {
+    /// Raise an approval gate — the single guarded entry into the
+    /// approval-pending state.
+    ///
+    /// If an approval is already pending it is auto-rejected first so its
+    /// `oneshot` waiter is always resolved exactly once and never silently
+    /// dropped. Previously a second `RequestApproval` overwrote `approval`
+    /// while leaking the prior `approval_tx`, leaving the earlier caller's
+    /// receiver dangling (SPEC R23: the pending gate and its sender are one
+    /// state, mutated only through this method).
+    pub fn request_approval(
+        &mut self,
+        gate: ApprovalGate,
+        tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    ) {
+        if self.approval.take().is_some()
+            && let Some(old_tx) = self.approval_tx.take()
+        {
+            // Auto-reject the superseded gate so the waiter is not left hanging.
+            let _ = old_tx.send(false);
+        }
+        self.approval = Some(gate);
+        self.approval_tx = tx;
+    }
+}
+
 impl AppState {
     pub fn new(
         server_url: impl Into<String>,
