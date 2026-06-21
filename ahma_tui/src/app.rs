@@ -2725,14 +2725,9 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             let note =
                 ahma_core::approvals::reask_note(std::path::Path::new(&state.workspace), &tool);
             state.request_approval(
-                crate::state::ApprovalGate {
-                    op_id: id,
-                    tool: tool.clone(),
-                    description: format!("Execute tool {tool}"),
-                    note,
-                    deadline: None,
-                    diff,
-                },
+                crate::state::ApprovalGate::new(id, tool.clone(), format!("Execute tool {tool}"))
+                    .with_note(note)
+                    .with_diff(diff),
                 Some(tx),
             );
         }
@@ -3107,14 +3102,9 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             let note =
                 ahma_core::approvals::reask_note(std::path::Path::new(&state.workspace), &tool);
             state.request_approval(
-                crate::state::ApprovalGate {
-                    op_id: id,
-                    tool: tool.clone(),
-                    description: format!("Execute tool {tool}"),
-                    note,
-                    deadline: None,
-                    diff,
-                },
+                crate::state::ApprovalGate::new(id, tool.clone(), format!("Execute tool {tool}"))
+                    .with_note(note)
+                    .with_diff(diff),
                 None,
             );
         }
@@ -3853,14 +3843,7 @@ mod tests {
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         state.request_approval(
-            crate::state::ApprovalGate {
-                op_id: "op_test".to_string(),
-                tool: "list_dir".to_string(),
-                description: "test".to_string(),
-                note: None,
-                deadline: None,
-                diff: None,
-            },
+            crate::state::ApprovalGate::new("op_test", "list_dir", "test"),
             Some(tx),
         );
 
@@ -3879,14 +3862,7 @@ mod tests {
         use crate::state::{AppState, ApprovalGate};
 
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
-        let gate = |op: &str| ApprovalGate {
-            op_id: op.to_string(),
-            tool: "list_dir".to_string(),
-            description: "test".to_string(),
-            note: None,
-            deadline: None,
-            diff: None,
-        };
+        let gate = |op: &str| ApprovalGate::new(op, "list_dir", "test");
 
         let (tx1, rx1) = tokio::sync::oneshot::channel();
         state.request_approval(gate("op_1"), Some(tx1));
@@ -3915,15 +3891,10 @@ mod tests {
         state.focus = Focus::Chat;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        state.approval = Some(crate::state::ApprovalGate {
-            op_id: "op_test".to_string(),
-            tool: "list_dir".to_string(),
-            description: "list_dir".to_string(),
-            note: None,
-            deadline: None,
-            diff: None,
-        });
-        state.approval_tx = Some(tx);
+        state.request_approval(
+            crate::state::ApprovalGate::new("op_test", "list_dir", "list_dir"),
+            Some(tx),
+        );
 
         let handled = super::handle_approval_key(
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),

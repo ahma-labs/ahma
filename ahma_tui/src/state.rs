@@ -803,6 +803,47 @@ pub struct ApprovalGate {
 }
 
 impl ApprovalGate {
+    /// Create a gate for `op_id`/`tool` with a human-readable `description`.
+    ///
+    /// The optional context (note, deadline, diff) starts empty; attach it with
+    /// the `with_*` builders. Accepting `impl Into<String>` lets callers pass
+    /// `&str` literals or owned `String`s without sprinkling `.to_string()`.
+    pub fn new(
+        op_id: impl Into<String>,
+        tool: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            op_id: op_id.into(),
+            tool: tool.into(),
+            description: description.into(),
+            note: None,
+            deadline: None,
+            diff: None,
+        }
+    }
+
+    /// Attach a short scope-hint note (shown dim in unfamiliar workspaces).
+    #[must_use]
+    pub fn with_note(mut self, note: Option<String>) -> Self {
+        self.note = note;
+        self
+    }
+
+    /// Attach a deadline after which the gate auto-expires.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = deadline;
+        self
+    }
+
+    /// Attach a diff preview to display alongside the prompt.
+    #[must_use]
+    pub fn with_diff(mut self, diff: Option<String>) -> Self {
+        self.diff = diff;
+        self
+    }
+
     pub fn remaining_secs(&self) -> Option<u64> {
         self.deadline.map(|d| {
             let now = Instant::now();
