@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn observable_only_notifies_on_actual_change() {
         let obs = Observable::new(Light::Green);
-        let mut rx = obs.subscribe();
+        let rx = obs.subscribe();
         // A rejected transition must not mark the channel changed.
         let _ = go(&obs);
         assert!(!rx.has_changed().unwrap());

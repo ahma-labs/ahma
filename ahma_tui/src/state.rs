@@ -1001,6 +1001,31 @@ pub struct TuiWindow {
     pub op_id: Option<String>,
 }
 
+/// Seed the liveness xorshift generator from the wall clock, forced non-zero
+/// (xorshift64 is stuck at zero). The exact value is irrelevant — it only needs
+/// to differ run-to-run so the random light pattern is not identical each launch.
+fn liveness_initial_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos | 1
+}
+
+/// Map an xorshift state to a "liveness light" glyph. In unicode mode this is a
+/// random non-blank cell from the Braille Patterns block (U+2801..=U+28FF) so it
+/// reads as a shifting cluster of dots; otherwise a rotating ASCII spinner char.
+fn liveness_char(state: u64, unicode: bool) -> char {
+    if unicode {
+        // 0x2800 is the all-dots-off (blank) cell; skip it so the glyph is always visible.
+        let offset = (state % 255) as u32 + 1;
+        char::from_u32(0x2800 + offset).unwrap_or('⠿')
+    } else {
+        const ASCII: [char; 4] = ['|', '/', '-', '\\'];
+        ASCII[(state % ASCII.len() as u64) as usize]
+    }
+}
+
 /// Top-level application state — owns all panel data and UI mode.
 pub struct AppState {
     pub windows: Vec<TuiWindow>,
@@ -1133,6 +1158,16 @@ pub struct AppState {
     // ── Settings editor ──
     pub settings_editor: crate::settings_editor::SettingsEditor,
 
+    // ── Liveness indicator ──
+    /// Braille "liveness" glyph shown in front of the streaming `ahma` response
+    /// line (e.g. `⢷ ahma`). It is re-randomised by [`AppState::bump_liveness`]
+    /// only when the server sends a fresh signal (tokens/thinking, tool events,
+    /// usage) so it visibly proves the connection is alive and more is coming.
+    /// Reset to a space when the turn completes.
+    pub liveness_glyph: char,
+    /// xorshift64 state driving the random liveness glyph. Never zero.
+    pub liveness_seed: u64,
+
     // ── Config ──
     pub unicode: bool,
     pub should_quit: bool,
@@ -1188,6 +1223,26 @@ impl AppState {
     /// True when any user overlay is open.
     pub fn modal_open(&self) -> bool {
         self.modal.is_open()
+    }
+
+    /// Re-randomise the liveness glyph. Call this whenever the server sends an
+    /// indication that the turn is alive and more is coming (a token/thinking
+    /// chunk, a tool-call edge, a usage update). The glyph only ever changes
+    /// here, so its movement is a faithful pulse of real server activity.
+    pub fn bump_liveness(&mut self) {
+        // xorshift64 — cheap, dependency-free, and seeded away from zero.
+        let mut x = self.liveness_seed;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.liveness_seed = x;
+        self.liveness_glyph = liveness_char(x, self.unicode);
+    }
+
+    /// Clear the liveness glyph back to a space once the turn is complete and no
+    /// further server updates are expected for the current response line.
+    pub fn reset_liveness(&mut self) {
+        self.liveness_glyph = ' ';
     }
 
     /// True when a text-entry overlay (navigator, palette, or an inline picker)
@@ -1455,6 +1510,8 @@ impl AppState {
             cleared_at: None,
             window_rects: std::cell::RefCell::new(vec![]),
 
+            liveness_glyph: ' ',
+            liveness_seed: liveness_initial_seed(),
             unicode,
             should_quit: false,
             bridge_tx: None,
@@ -1818,6 +1875,55 @@ mod tests {
         assert_eq!(count_wrapped_lines(" ", 10), 1);
         assert_eq!(count_wrapped_lines("", 10), 1);
         assert_eq!(count_wrapped_lines("one two three four five", 100), 1);
+    }
+
+    #[test]
+    fn liveness_char_is_visible_braille_in_unicode_mode() {
+        // Every possible xorshift residue maps to a non-blank Braille cell.
+        for state in 0u64..512 {
+            let c = liveness_char(state, true);
+            let cp = c as u32;
+            assert!(
+                (0x2801..=0x28FF).contains(&cp),
+                "expected a non-blank braille cell, got U+{cp:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn liveness_char_is_ascii_spinner_without_unicode() {
+        for state in 0u64..16 {
+            assert!(matches!(
+                liveness_char(state, false),
+                '|' | '/' | '-' | '\\'
+            ));
+        }
+    }
+
+    #[test]
+    fn bump_liveness_changes_glyph_and_reset_clears_it() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        assert_eq!(s.liveness_glyph, ' ', "starts idle");
+
+        s.bump_liveness();
+        let first = s.liveness_glyph;
+        assert_ne!(first, ' ', "a bump produces a visible glyph");
+
+        // The seed advances, so successive bumps move the glyph (deterministically
+        // via xorshift). Collect a few and confirm they are not all identical.
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(first);
+        for _ in 0..8 {
+            s.bump_liveness();
+            seen.insert(s.liveness_glyph);
+        }
+        assert!(seen.len() > 1, "liveness glyph should change across bumps");
+
+        s.reset_liveness();
+        assert_eq!(
+            s.liveness_glyph, ' ',
+            "reset collapses the glyph to a space"
+        );
     }
 
     #[test]

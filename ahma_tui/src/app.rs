@@ -2637,6 +2637,19 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
     use crate::llm_bridge::BridgeEvent;
     use crate::state::ChatEntry;
 
+    // Any server signal that the turn is alive and more is coming re-randomises
+    // the liveness glyph in front of the `ahma` response line. Done/Error clear
+    // it back to a space below.
+    if matches!(
+        event,
+        BridgeEvent::Token(_)
+            | BridgeEvent::Usage(_)
+            | BridgeEvent::ToolCallStarted { .. }
+            | BridgeEvent::ToolCallFinished { .. }
+    ) {
+        state.bump_liveness();
+    }
+
     match event {
         BridgeEvent::Token(token) => {
             state.chat.append_token(&token);
@@ -2648,6 +2661,7 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             state.token_usage.total_tokens += usage.total_tokens;
         }
         BridgeEvent::Done => {
+            state.reset_liveness();
             state.chat.finish_stream();
             state.chat.finish_user_timing();
             if let Some(profile) = &state.active_profile
@@ -2666,6 +2680,7 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             }
         }
         BridgeEvent::Error(msg) => {
+            state.reset_liveness();
             state.chat.finish_stream();
             state.chat.finish_user_timing();
             state.chat.push(ChatEntry::Assistant {

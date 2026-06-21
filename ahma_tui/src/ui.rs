@@ -854,15 +854,22 @@ fn push_assistant_chat_lines(
     let cursor = assistant_stream_cursor(streaming, state.unicode);
     let display = format!("{content}{cursor}");
 
+    // First-line prefix carries the liveness glyph while streaming (e.g. `⢷ ahma `)
+    // and collapses the glyph to a space once the turn is done (` ahma `). The
+    // continuation indent matches the 7-column prefix width so wrapped text stays
+    // aligned under the response.
+    let prefix = assistant_line_prefix(streaming, state);
+    const CONT_INDENT: &str = "       "; // 7 spaces == width of "X ahma "
+
     for (index, line_str) in display.lines().enumerate() {
         if index == 0 {
             lines.push(Line::from(vec![
-                Span::styled("ahma ", theme.running()),
+                Span::styled(prefix.clone(), theme.running()),
                 Span::styled(line_str.to_string(), theme.normal()),
             ]));
         } else {
             lines.push(Line::from(vec![
-                Span::styled("     ", theme.running()),
+                Span::styled(CONT_INDENT, theme.running()),
                 Span::styled(line_str.to_string(), theme.normal()),
             ]));
         }
@@ -870,10 +877,19 @@ fn push_assistant_chat_lines(
 
     if display.is_empty() && streaming {
         lines.push(Line::from(vec![
-            Span::styled("ahma ", theme.running()),
+            Span::styled(prefix, theme.running()),
             Span::styled(assistant_stream_cursor(true, state.unicode), theme.dim()),
         ]));
     }
+}
+
+/// Build the `ahma` response prefix. While the turn is live the leading glyph is
+/// the random Braille liveness pulse (`state.liveness_glyph`); when complete it
+/// collapses to a space so the column reads ` ahma`.
+#[cfg(feature = "tui")]
+fn assistant_line_prefix(streaming: bool, state: &AppState) -> String {
+    let glyph = if streaming { state.liveness_glyph } else { ' ' };
+    format!("{glyph} ahma ")
 }
 
 #[cfg(feature = "tui")]
