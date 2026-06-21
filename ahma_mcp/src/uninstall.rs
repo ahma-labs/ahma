@@ -295,57 +295,7 @@ fn uninstall_mcp_config(platforms: &[Platform], dry_run: bool) -> Result<Vec<&'s
     let mut removed = Vec::new();
 
     for platform in platforms.iter().copied().filter(|p| p.supports_mcp()) {
-        let result = match platform {
-            Platform::VsCode => {
-                if let Some(path) = vscode_mcp_path() {
-                    remove_mcp_entry(&path, "servers", dry_run)
-                        .with_context(|| format!("VS Code MCP config at {}", path.display()))?;
-                    Some("VS Code (GitHub Copilot Chat)")
-                } else {
-                    None
-                }
-            }
-            Platform::ClaudeCode => {
-                let path = home.join(".claude.json");
-                remove_mcp_entry(&path, "mcpServers", dry_run)
-                    .context("Claude Code MCP config (~/.claude.json)")?;
-                Some("Claude Code")
-            }
-            Platform::ClaudeDesktop => {
-                if let Some(path) = claude_desktop_config_path() {
-                    remove_mcp_entry(&path, "mcpServers", dry_run)
-                        .with_context(|| format!("Claude Desktop config at {}", path.display()))?;
-                    Some("Claude Desktop")
-                } else {
-                    None
-                }
-            }
-            Platform::Cursor => {
-                let path = home.join(".cursor").join("mcp.json");
-                remove_mcp_entry(&path, "mcpServers", dry_run)
-                    .context("Cursor MCP config (~/.cursor/mcp.json)")?;
-                Some("Cursor")
-            }
-            Platform::Antigravity => {
-                let path = home.join(".gemini").join("config").join("mcp_config.json");
-                remove_mcp_entry(&path, "mcpServers", dry_run)
-                    .with_context(|| format!("Antigravity MCP config at {}", path.display()))?;
-                Some("Antigravity")
-            }
-            Platform::LmStudio => {
-                let path = home.join(".lmstudio").join("mcp.json");
-                remove_mcp_entry(&path, "mcpServers", dry_run)
-                    .with_context(|| format!("LM Studio MCP config at {}", path.display()))?;
-                Some("LM Studio")
-            }
-            Platform::Codex => {
-                let path = home.join(".codex").join("config.toml");
-                remove_codex_mcp(&path, dry_run).context("Codex config (~/.codex/config.toml)")?;
-                Some("Codex CLI")
-            }
-            Platform::Copilot => None,
-        };
-        if let Some(name) = result {
+        if let Some(name) = remove_platform_mcp(platform, &home, dry_run)? {
             if dry_run {
                 println!("[dry-run] Would remove Ahma MCP entry from {}", name);
             }
@@ -354,6 +304,68 @@ fn uninstall_mcp_config(platforms: &[Platform], dry_run: bool) -> Result<Vec<&'s
     }
 
     Ok(removed)
+}
+
+/// Remove the Ahma MCP entry for a single platform.
+///
+/// Returns the platform's display name when an entry was targeted, or `None`
+/// when the platform has no MCP config path (or does not support MCP).
+fn remove_platform_mcp(
+    platform: Platform,
+    home: &Path,
+    dry_run: bool,
+) -> Result<Option<&'static str>> {
+    let name = match platform {
+        Platform::VsCode => {
+            if let Some(path) = vscode_mcp_path() {
+                remove_mcp_entry(&path, "servers", dry_run)
+                    .with_context(|| format!("VS Code MCP config at {}", path.display()))?;
+                Some("VS Code (GitHub Copilot Chat)")
+            } else {
+                None
+            }
+        }
+        Platform::ClaudeCode => {
+            let path = home.join(".claude.json");
+            remove_mcp_entry(&path, "mcpServers", dry_run)
+                .context("Claude Code MCP config (~/.claude.json)")?;
+            Some("Claude Code")
+        }
+        Platform::ClaudeDesktop => {
+            if let Some(path) = claude_desktop_config_path() {
+                remove_mcp_entry(&path, "mcpServers", dry_run)
+                    .with_context(|| format!("Claude Desktop config at {}", path.display()))?;
+                Some("Claude Desktop")
+            } else {
+                None
+            }
+        }
+        Platform::Cursor => {
+            let path = home.join(".cursor").join("mcp.json");
+            remove_mcp_entry(&path, "mcpServers", dry_run)
+                .context("Cursor MCP config (~/.cursor/mcp.json)")?;
+            Some("Cursor")
+        }
+        Platform::Antigravity => {
+            let path = home.join(".gemini").join("config").join("mcp_config.json");
+            remove_mcp_entry(&path, "mcpServers", dry_run)
+                .with_context(|| format!("Antigravity MCP config at {}", path.display()))?;
+            Some("Antigravity")
+        }
+        Platform::LmStudio => {
+            let path = home.join(".lmstudio").join("mcp.json");
+            remove_mcp_entry(&path, "mcpServers", dry_run)
+                .with_context(|| format!("LM Studio MCP config at {}", path.display()))?;
+            Some("LM Studio")
+        }
+        Platform::Codex => {
+            let path = home.join(".codex").join("config.toml");
+            remove_codex_mcp(&path, dry_run).context("Codex config (~/.codex/config.toml)")?;
+            Some("Codex CLI")
+        }
+        Platform::Copilot => None,
+    };
+    Ok(name)
 }
 
 /// Remove the `"Ahma"` key from `config[servers_key]` in a JSON MCP config file.
@@ -646,52 +658,59 @@ fn uninstall_binary(dry_run: bool) -> Result<()> {
     });
 
     if dry_run {
-        if binary_path.exists() {
-            println!("[dry-run] Would remove {}", binary_path.display());
-        }
-        if old_path.exists() {
-            println!("[dry-run] Would remove {}", old_path.display());
+        for path in [&binary_path, &old_path] {
+            if path.exists() {
+                println!("[dry-run] Would remove {}", path.display());
+            }
         }
         return Ok(());
     }
 
     #[cfg(unix)]
-    {
-        if old_path.exists() {
-            let _ = std::fs::remove_file(&old_path);
-        }
-        if binary_path.exists() {
-            std::fs::remove_file(&binary_path)
-                .with_context(|| format!("Failed to remove {}", binary_path.display()))?;
-            println!("✓ Removed {}", binary_path.display());
-        } else {
-            println!(
-                "  Binary not found at {} — nothing to remove.",
-                binary_path.display()
-            );
-        }
-    }
+    remove_binary_unix(&binary_path, &old_path)?;
 
     #[cfg(windows)]
-    {
-        // A running Windows .exe cannot delete itself.  Print instructions instead.
-        if binary_path.exists() {
-            println!(
-                "  To remove the ahma binary on Windows, run this after closing all ahma processes:"
-            );
-            println!("    Remove-Item -Force \"{}\"", binary_path.display());
-            if old_path.exists() {
-                println!("    Remove-Item -Force \"{}\"", old_path.display());
-            }
-        } else {
-            println!(
-                "  Binary not found at {} — nothing to remove.",
-                binary_path.display()
-            );
-        }
-    }
+    print_windows_removal_instructions(&binary_path, &old_path);
 
     Ok(())
+}
+
+/// Delete the installed binary (and any leftover `ahma.old`) on Unix.
+#[cfg(unix)]
+fn remove_binary_unix(binary_path: &Path, old_path: &Path) -> Result<()> {
+    if old_path.exists() {
+        let _ = std::fs::remove_file(old_path);
+    }
+    if binary_path.exists() {
+        std::fs::remove_file(binary_path)
+            .with_context(|| format!("Failed to remove {}", binary_path.display()))?;
+        println!("✓ Removed {}", binary_path.display());
+    } else {
+        println!(
+            "  Binary not found at {} — nothing to remove.",
+            binary_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// A running Windows `.exe` cannot delete itself, so print manual removal steps.
+#[cfg(windows)]
+fn print_windows_removal_instructions(binary_path: &Path, old_path: &Path) {
+    if binary_path.exists() {
+        println!(
+            "  To remove the ahma binary on Windows, run this after closing all ahma processes:"
+        );
+        println!("    Remove-Item -Force \"{}\"", binary_path.display());
+        if old_path.exists() {
+            println!("    Remove-Item -Force \"{}\"", old_path.display());
+        }
+    } else {
+        println!(
+            "  Binary not found at {} — nothing to remove.",
+            binary_path.display()
+        );
+    }
 }
 
 /// Resolve the directory where the binary was installed.

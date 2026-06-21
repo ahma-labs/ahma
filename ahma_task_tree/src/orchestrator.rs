@@ -536,43 +536,62 @@ impl TaskTreeOrchestrator {
             node_id.0, decision.action
         );
 
-        if decision.action == "re_plan" {
-            let Some(new_steps) = decision.steps else {
-                return Ok(false);
-            };
-            info!(
-                "Re-planning node {} with {} new steps",
-                node_id.0,
-                new_steps.len()
-            );
-            // Clear unexecuted remaining steps from queue
-            queue.clear();
+        if decision.action != "re_plan" {
+            return Ok(false);
+        }
+        let Some(new_steps) = decision.steps else {
+            return Ok(false);
+        };
+        info!(
+            "Re-planning node {} with {} new steps",
+            node_id.0,
+            new_steps.len()
+        );
+        // Clear unexecuted remaining steps from queue
+        queue.clear();
 
-            let mut new_child_ids = Vec::new();
-            for step in new_steps {
-                let child_id = self.create_child_node(
-                    tree,
-                    node_id,
-                    &step,
-                    parent_scopes,
-                    parent_tools,
-                    parent_domains,
-                    true,
-                )?;
-                new_child_ids.push(child_id);
-            }
-
-            queue.extend(new_child_ids);
-
-            // Reset parent node state to Running
-            if let Some(n) = tree.get_node_mut(node_id) {
-                n.state = NodeState::Running;
-            }
-
-            return Ok(true);
+        let mut new_child_ids = Vec::new();
+        for step in new_steps {
+            let child_id = self.create_child_node(
+                tree,
+                node_id,
+                &step,
+                parent_scopes,
+                parent_tools,
+                parent_domains,
+                true,
+            )?;
+            new_child_ids.push(child_id);
         }
 
-        Ok(false)
+        queue.extend(new_child_ids);
+
+        // Reset parent node state to Running
+        if let Some(n) = tree.get_node_mut(node_id) {
+            n.state = NodeState::Running;
+        }
+
+        Ok(true)
+    }
+
+    /// Enforce that `command` matches one of the parent's allowed tool prefixes.
+    /// A `None` policy means no restriction.
+    fn enforce_command_allowed(command: &str, parent_tools: &Option<Vec<String>>) -> Result<()> {
+        let Some(allowed_tools) = parent_tools else {
+            return Ok(());
+        };
+        let trimmed_cmd = command.trim();
+        let is_allowed = allowed_tools.iter().any(|prefix| {
+            trimmed_cmd == prefix || trimmed_cmd.starts_with(&format!("{} ", prefix))
+        });
+        if !is_allowed {
+            return Err(anyhow!(
+                "Security policy block: Command {:?} rejected. It does not match allowed tools prefixes {:?}",
+                command,
+                allowed_tools
+            ));
+        }
+        Ok(())
     }
 
     async fn execute_shell_command_node(
@@ -582,19 +601,7 @@ impl TaskTreeOrchestrator {
         command: &str,
     ) -> Result<NodeResult> {
         let parent_tools = self.get_effective_parent_allowed_tools(tree, node_id);
-        if let Some(ref allowed_tools) = parent_tools {
-            let trimmed_cmd = command.trim();
-            let is_allowed = allowed_tools.iter().any(|prefix| {
-                trimmed_cmd == prefix || trimmed_cmd.starts_with(&format!("{} ", prefix))
-            });
-            if !is_allowed {
-                return Err(anyhow!(
-                    "Security policy block: Command {:?} rejected. It does not match allowed tools prefixes {:?}",
-                    command,
-                    allowed_tools
-                ));
-            }
-        }
+        Self::enforce_command_allowed(command, &parent_tools)?;
 
         let resolved_scopes = self.get_effective_parent_scopes(tree, node_id);
         let working_dir = resolved_scopes.first().cloned().unwrap_or_else(|| {

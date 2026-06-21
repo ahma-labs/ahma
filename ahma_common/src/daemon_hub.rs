@@ -865,7 +865,6 @@ async fn accept_loop(listener: tokio::net::TcpListener, hub: Arc<DaemonHub>) -> 
 
 // ── Per-connection handler (generic over stream type) ─────────────────────────
 
-#[allow(clippy::collapsible_if)]
 async fn handle_connection<S>(stream: S, hub: Arc<DaemonHub>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -884,145 +883,18 @@ where
         }
     };
 
+    // Each arm handles one connection role end-to-end; the larger long-lived
+    // loops (instance / subscriber) live in dedicated helpers. Every arm returns
+    // normally so the single `fetch_sub` below runs exactly once.
     match first {
         ClientMsg::Register {
             pid,
             mode,
             scope,
             label,
-        } => {
-            let id = uuid_v4();
-            let info = InstanceInfo {
-                id: id.clone(),
-                pid,
-                mode,
-                scope,
-                label,
-            };
-            hub.instances.lock().await.insert(id.clone(), info.clone());
+        } => serve_instance(&mut reader, &mut writer, &hub, pid, mode, scope, label).await,
 
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<DaemonMsg>(100);
-            hub.instance_txs.lock().await.insert(id.clone(), tx);
-
-            let _ = hub
-                .broadcast
-                .send(DaemonMsg::InstanceRegistered { instance: info });
-            info!("daemon: instance registered id={id} pid={pid}");
-
-            // Exchange events and liveness pings until the instance disconnects.
-            let mut ping_interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + PING_INTERVAL,
-                PING_INTERVAL,
-            );
-            ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut ping_seq: u32 = 0;
-
-            loop {
-                tokio::select! {
-                    biased;
-
-                    msg = recv_msg::<_, ClientMsg>(&mut reader) => {
-                        match msg {
-                            Ok(ClientMsg::Event { payload }) => {
-                                hub.record_op_event(&id, &payload).await;
-                                let _ = hub.broadcast.send(DaemonMsg::Event {
-                                    instance_id: id.clone(),
-                                    payload,
-                                });
-                            }
-                            Ok(ClientMsg::Pong { .. }) => {
-                                // Liveness confirmed — nothing else to do for now.
-                                debug!("daemon: pong received from id={id}");
-                            }
-                            Ok(ClientMsg::ChatToken { token }) => {
-                                let _ = hub.broadcast.send(DaemonMsg::ChatToken { token });
-                            }
-                            Ok(ClientMsg::ApprovalRequested { id: call_id, tool, args }) => {
-                                let _ = hub.broadcast.send(DaemonMsg::ApprovalRequested { id: call_id, tool, args });
-                            }
-                            Ok(ClientMsg::AgentDone) => {
-                                let _ = hub.broadcast.send(DaemonMsg::AgentDone);
-                            }
-                            Ok(ClientMsg::AgentError { error }) => {
-                                let _ = hub.broadcast.send(DaemonMsg::AgentError { error });
-                            }
-                            Ok(ClientMsg::Unregister) | Err(_) => break,
-                            Ok(_) => {} // ignore unexpected messages
-                        }
-                    }
-
-                    daemon_msg = rx.recv() => {
-                        if let Some(msg) = daemon_msg {
-                            if send_msg(&mut writer, &msg).await.is_err() {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-
-                    _ = ping_interval.tick() => {
-                        ping_seq = ping_seq.wrapping_add(1);
-                        debug!("daemon: sending ping to id={id} seq={ping_seq}");
-                        if send_msg(&mut writer, &DaemonMsg::Ping { seq: ping_seq })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            hub.instances.lock().await.remove(&id);
-            hub.instance_txs.lock().await.remove(&id);
-            hub.op_history.lock().await.remove(&id);
-            let _ = hub
-                .broadcast
-                .send(DaemonMsg::InstanceUnregistered { id: id.clone() });
-            info!("daemon: instance unregistered id={id}");
-        }
-
-        ClientMsg::Subscribe => {
-            // Send current instance list, then stream events.
-            let instances: Vec<InstanceInfo> =
-                hub.instances.lock().await.values().cloned().collect();
-            if let Err(e) = send_msg(&mut writer, &DaemonMsg::InstanceList { instances }).await {
-                debug!("daemon: subscriber write failed: {e}");
-                hub.connection_count.fetch_sub(1, Ordering::Relaxed);
-                return;
-            }
-
-            // Subscribe to live events BEFORE replaying retained history, so any
-            // event that arrives during replay is queued by the broadcast channel
-            // rather than lost in the gap between snapshot and live stream.
-            let mut rx = hub.broadcast.subscribe();
-
-            // Replay the operations that ran before this subscriber connected, so
-            // the monitor shows all calls — not just ones that start from now on.
-            for msg in hub.replay_events().await {
-                if let Err(e) = send_msg(&mut writer, &msg).await {
-                    debug!("daemon: subscriber replay write failed: {e}");
-                    hub.connection_count.fetch_sub(1, Ordering::Relaxed);
-                    return;
-                }
-            }
-            loop {
-                match rx.recv().await {
-                    Ok(msg) => {
-                        if let Err(e) = send_msg(&mut writer, &msg).await {
-                            debug!("daemon: subscriber write failed: {e}");
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("daemon: subscriber lagged by {n} messages");
-                        // Continue — lagging is non-fatal.
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
+        ClientMsg::Subscribe => serve_subscriber(&mut writer, &hub).await,
 
         ClientMsg::ListInstances => {
             let instances: Vec<InstanceInfo> =
@@ -1049,19 +921,14 @@ where
             model,
             target_instance_id,
         } => {
-            let target_id = if let Some(ref tid) = target_instance_id {
-                Some(tid.clone())
-            } else {
-                hub.instances.lock().await.keys().next().cloned()
-            };
+            let target_id = resolve_target(&hub, target_instance_id.as_deref()).await;
 
             // Route to the chosen instance. Every failure path must broadcast an
             // AgentError so the TUI stops its elapsed counter and shows feedback
             // — silently dropping the prompt leaves the user staring at a
             // forever-incrementing timer with no answer and no error.
-            let delivered = if let Some(tid) = target_id {
-                let tx = hub.instance_txs.lock().await.get(&tid).cloned();
-                match tx {
+            let delivered = match target_id {
+                Some(tid) => match hub.instance_txs.lock().await.get(&tid).cloned() {
                     Some(tx) => tx
                         .send(DaemonMsg::RunPrompt {
                             messages,
@@ -1072,9 +939,8 @@ where
                         .await
                         .is_ok(),
                     None => false,
-                }
-            } else {
-                false
+                },
+                None => false,
             };
 
             if !delivered {
@@ -1092,16 +958,10 @@ where
             approved,
             target_instance_id,
         } => {
-            let target_id = if let Some(ref tid) = target_instance_id {
-                Some(tid.clone())
-            } else {
-                hub.instances.lock().await.keys().next().cloned()
-            };
-
-            if let Some(tid) = target_id {
-                if let Some(tx) = hub.instance_txs.lock().await.get(&tid) {
-                    let _ = tx.send(DaemonMsg::SubmitApproval { approved }).await;
-                }
+            if let Some(tid) = resolve_target(&hub, target_instance_id.as_deref()).await
+                && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
+            {
+                let _ = tx.send(DaemonMsg::SubmitApproval { approved }).await;
             }
         }
 
@@ -1111,6 +971,159 @@ where
     }
 
     hub.connection_count.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Resolve which instance a TUI request targets: the explicit id when given,
+/// otherwise the first currently-registered instance (`None` if none exist).
+async fn resolve_target(hub: &DaemonHub, target: Option<&str>) -> Option<String> {
+    match target {
+        Some(tid) => Some(tid.to_string()),
+        None => hub.instances.lock().await.keys().next().cloned(),
+    }
+}
+
+/// Serve a registered ahma instance: register it, then exchange events and
+/// liveness pings until it disconnects, finally cleaning up its state.
+async fn serve_instance<R, W>(
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+    hub: &Arc<DaemonHub>,
+    pid: u32,
+    mode: String,
+    scope: String,
+    label: String,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let id = uuid_v4();
+    let info = InstanceInfo {
+        id: id.clone(),
+        pid,
+        mode,
+        scope,
+        label,
+    };
+    hub.instances.lock().await.insert(id.clone(), info.clone());
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DaemonMsg>(100);
+    hub.instance_txs.lock().await.insert(id.clone(), tx);
+
+    let _ = hub
+        .broadcast
+        .send(DaemonMsg::InstanceRegistered { instance: info });
+    info!("daemon: instance registered id={id} pid={pid}");
+
+    // Exchange events and liveness pings until the instance disconnects.
+    let mut ping_interval =
+        tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ping_seq: u32 = 0;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            msg = recv_msg::<_, ClientMsg>(reader) => {
+                match msg {
+                    Ok(ClientMsg::Event { payload }) => {
+                        hub.record_op_event(&id, &payload).await;
+                        let _ = hub.broadcast.send(DaemonMsg::Event {
+                            instance_id: id.clone(),
+                            payload,
+                        });
+                    }
+                    Ok(ClientMsg::Pong { .. }) => {
+                        // Liveness confirmed — nothing else to do for now.
+                        debug!("daemon: pong received from id={id}");
+                    }
+                    Ok(ClientMsg::ChatToken { token }) => {
+                        let _ = hub.broadcast.send(DaemonMsg::ChatToken { token });
+                    }
+                    Ok(ClientMsg::ApprovalRequested { id: call_id, tool, args }) => {
+                        let _ = hub.broadcast.send(DaemonMsg::ApprovalRequested { id: call_id, tool, args });
+                    }
+                    Ok(ClientMsg::AgentDone) => {
+                        let _ = hub.broadcast.send(DaemonMsg::AgentDone);
+                    }
+                    Ok(ClientMsg::AgentError { error }) => {
+                        let _ = hub.broadcast.send(DaemonMsg::AgentError { error });
+                    }
+                    Ok(ClientMsg::Unregister) | Err(_) => break,
+                    Ok(_) => {} // ignore unexpected messages
+                }
+            }
+
+            daemon_msg = rx.recv() => {
+                match daemon_msg {
+                    Some(msg) if send_msg(writer, &msg).await.is_ok() => {}
+                    _ => break,
+                }
+            }
+
+            _ = ping_interval.tick() => {
+                ping_seq = ping_seq.wrapping_add(1);
+                debug!("daemon: sending ping to id={id} seq={ping_seq}");
+                if send_msg(writer, &DaemonMsg::Ping { seq: ping_seq })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    hub.instances.lock().await.remove(&id);
+    hub.instance_txs.lock().await.remove(&id);
+    hub.op_history.lock().await.remove(&id);
+    let _ = hub
+        .broadcast
+        .send(DaemonMsg::InstanceUnregistered { id: id.clone() });
+    info!("daemon: instance unregistered id={id}");
+}
+
+/// Serve a TUI subscriber: send the current instance list, replay retained op
+/// history, then stream live events until the connection closes.
+async fn serve_subscriber<W>(writer: &mut W, hub: &Arc<DaemonHub>)
+where
+    W: AsyncWriteExt + Unpin,
+{
+    // Send current instance list, then stream events.
+    let instances: Vec<InstanceInfo> = hub.instances.lock().await.values().cloned().collect();
+    if let Err(e) = send_msg(writer, &DaemonMsg::InstanceList { instances }).await {
+        debug!("daemon: subscriber write failed: {e}");
+        return;
+    }
+
+    // Subscribe to live events BEFORE replaying retained history, so any
+    // event that arrives during replay is queued by the broadcast channel
+    // rather than lost in the gap between snapshot and live stream.
+    let mut rx = hub.broadcast.subscribe();
+
+    // Replay the operations that ran before this subscriber connected, so
+    // the monitor shows all calls — not just ones that start from now on.
+    for msg in hub.replay_events().await {
+        if let Err(e) = send_msg(writer, &msg).await {
+            debug!("daemon: subscriber replay write failed: {e}");
+            return;
+        }
+    }
+    loop {
+        match rx.recv().await {
+            Ok(msg) => {
+                if let Err(e) = send_msg(writer, &msg).await {
+                    debug!("daemon: subscriber write failed: {e}");
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                warn!("daemon: subscriber lagged by {n} messages");
+                // Continue — lagging is non-fatal.
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 // ─── Tiny UUID v4 without the uuid crate ──────────────────────────────────────
