@@ -1031,8 +1031,28 @@ async fn test_mixed_valid_invalid_uris() {
 /// stays alive (no HTTP 403, no termination — which previously caused
 /// stdio-proxy respawn churn) and, crucially, the sandbox is NOT expanded to any
 /// newly-announced root. This test pins both halves of that invariant.
+/// True when the platform's OS-level sandbox can actually be enforced.
+///
+/// In a nested sandbox (Docker, Cursor, an outer `sandbox-exec`, CI running
+/// inside a sandbox) `sandbox_apply` is denied, so the spawned bridge runs
+/// without kernel enforcement and a "widened" out-of-scope path is reachable
+/// regardless of the lock. The widen assertion below only means something when
+/// the kernel sandbox engages, so skip otherwise rather than report a false
+/// failure — it still runs and must pass on real CI hosts.
+fn os_sandbox_enforced() -> bool {
+    ahma_mcp::sandbox::check_sandbox_prerequisites().is_ok()
+        && ahma_mcp::sandbox::test_sandbox_exec_available().is_ok()
+}
+
 #[tokio::test]
 async fn test_post_lock_roots_change_does_not_widen_sandbox() {
+    if !os_sandbox_enforced() {
+        eprintln!(
+            "Skipping test: OS-level sandbox cannot be enforced in this environment \
+             (nested sandbox); kernel enforcement is required for the widen assertion."
+        );
+        return;
+    }
     let initial_root = TempDir::new().expect("Failed to create initial root");
     let new_root = TempDir::new().expect("Failed to create new root"); // attacker's target
     let tools_temp = TempDir::new().expect("Failed to create tools temp dir");
@@ -1120,6 +1140,13 @@ async fn test_post_lock_roots_change_does_not_widen_sandbox() {
 /// Test that working_directory outside locked sandbox roots is rejected.
 #[tokio::test]
 async fn test_working_directory_outside_sandbox_rejected() {
+    if !os_sandbox_enforced() {
+        eprintln!(
+            "Skipping test: OS-level sandbox cannot be enforced in this environment \
+             (nested sandbox); kernel enforcement is required to reject an out-of-scope cwd."
+        );
+        return;
+    }
     let allowed_root = TempDir::new().expect("Failed to create allowed root");
     let forbidden_root = TempDir::new().expect("Failed to create forbidden root");
     let tools_temp = TempDir::new().expect("Failed to create tools temp dir");

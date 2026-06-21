@@ -139,6 +139,34 @@ macro_rules! skip_if_landlock_unavailable {
     };
 }
 
+/// True when the platform's OS-level sandbox can actually be enforced for a
+/// spawned server.
+///
+/// In a nested sandbox (Docker, Cursor, an outer `sandbox-exec`, CI running
+/// inside a sandbox) `sandbox_apply` is denied, so the test harness runs the
+/// server WITHOUT OS enforcement (see `ClientBuilder::run_command`, which sets
+/// `force_no_sandbox` when `is_nested_sandbox_environment()`). Tests that depend
+/// on *kernel-level* blocking (a `>` shell redirect that application-level
+/// `validate_path` cannot see) therefore cannot hold in that environment. They
+/// skip here rather than report a false failure — the assertion still runs and
+/// must pass on real CI hosts where the OS sandbox engages.
+fn os_sandbox_enforced() -> bool {
+    ahma_mcp::sandbox::check_sandbox_prerequisites().is_ok()
+        && ahma_mcp::sandbox::test_sandbox_exec_available().is_ok()
+}
+
+macro_rules! skip_if_os_sandbox_unenforced {
+    () => {
+        if !os_sandbox_enforced() {
+            eprintln!(
+                "Skipping test: OS-level sandbox cannot be enforced in this environment \
+                 (nested sandbox); kernel enforcement is required for this assertion."
+            );
+            return;
+        }
+    };
+}
+
 // =============================================================================
 // RED TEAM TEST 1: Path Traversal Attacks
 // =============================================================================
@@ -686,6 +714,10 @@ async fn red_team_spawned_child_landlock_enforced_from_worker_thread() {
 )]
 async fn red_team_command_write_escape_blocked() {
     init_test_logging();
+    // The escape is a `>` shell redirect that only the kernel sandbox can block;
+    // skip when OS enforcement is unavailable (nested sandbox), since the harness
+    // then runs the server unsandboxed and the write cannot be blocked.
+    skip_if_os_sandbox_unenforced!();
 
     let temp_dir = TempDir::new().unwrap();
     let outside_dir = TempDir::new().unwrap();
