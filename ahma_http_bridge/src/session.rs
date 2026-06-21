@@ -45,6 +45,7 @@
 use crate::error::{BridgeError, Result};
 use crate::peer::{PeerFactory, PeerShutdownFn, PeerStreams, SubprocessPeerFactory};
 use ahma_common::sandbox_state::{SandboxState, SandboxStateMachine};
+use ahma_common::state_machine::{FsmState, StateMachine};
 use chrono::Local;
 use dashmap::DashMap;
 use owo_colors::OwoColorize;
@@ -91,6 +92,22 @@ pub enum HandshakeState {
     RootsRequested,
     /// Sandbox locked, handshake complete
     Complete,
+}
+
+impl FsmState for HandshakeState {
+    fn name(&self) -> &'static str {
+        match self {
+            HandshakeState::AwaitingBoth => "AwaitingBoth",
+            HandshakeState::AwaitingSseOnly => "AwaitingSseOnly",
+            HandshakeState::AwaitingMcpOnly => "AwaitingMcpOnly",
+            HandshakeState::RootsRequested => "RootsRequested",
+            HandshakeState::Complete => "Complete",
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(self, HandshakeState::Complete)
+    }
 }
 
 /// Action to perform after a state transition
@@ -153,8 +170,6 @@ pub struct Session {
     /// Broadcast channel for SSE events from this session.
     /// Each message is `(event_id, json_string)`.
     broadcast_tx: broadcast::Sender<(u64, String)>,
-    /// Sandbox scopes (set on first roots/list response) - supports multiple roots
-    sandbox_scopes: Mutex<Option<Vec<PathBuf>>>,
     /// Whether the session has been terminated
     terminated: AtomicBool,
     /// Termination reason (if terminated)
@@ -165,8 +180,10 @@ pub struct Session {
     /// this is `None` (drop semantics handle cleanup).
     peer_shutdown: Mutex<Option<PeerShutdownFn>>,
 
-    /// Handshake state machine protected by a sync Mutex for atomic transitions
-    handshake_state: std::sync::Mutex<HandshakeState>,
+    /// Handshake state machine (atomic transitions via the shared StateMachine
+    /// wrapper). Transition methods return a `HandshakeAction` to run outside the
+    /// lock, matching the workspace convention (SPEC R23).
+    handshake_state: StateMachine<HandshakeState>,
 
     /// Notify for waiting on MCP initialization
     mcp_initialized_notify: Notify,
@@ -246,7 +263,7 @@ impl Session {
 
     /// Get the current handshake state
     pub fn handshake_state(&self) -> HandshakeState {
-        *self.handshake_state.lock().unwrap()
+        *self.handshake_state.lock()
     }
 
     /// Check if the SSE stream is connected (client opened GET /mcp)
@@ -313,18 +330,23 @@ impl Session {
         }
     }
 
-    /// Get the first sandbox scope
+    /// Get the first sandbox scope.
+    ///
+    /// Sourced from the sandbox state machine, the single source of truth for the
+    /// committed scope (SPEC R20/R23). The session keeps no shadow copy.
     pub async fn get_sandbox_scope(&self) -> Option<PathBuf> {
-        self.sandbox_scopes
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|v| v.first().cloned())
+        self.sandbox_state_machine
+            .current()
+            .scopes()
+            .and_then(|s| s.first().cloned())
     }
 
-    /// Get all sandbox scopes
+    /// Get all sandbox scopes (from the sandbox state machine).
     pub async fn get_sandbox_scopes(&self) -> Option<Vec<PathBuf>> {
-        self.sandbox_scopes.lock().await.clone()
+        self.sandbox_state_machine
+            .current()
+            .scopes()
+            .map(|s| s.to_vec())
     }
 
     /// Subscribe to SSE events. Each item is `(event_id, json_string)`.
@@ -404,8 +426,7 @@ impl Session {
 
     /// Helper to transitions state and return necessary action
     fn transition_sse_connected(&self) -> HandshakeAction {
-        let mut state = self.handshake_state.lock().unwrap();
-        match *state {
+        self.handshake_state.transition(|state| match *state {
             HandshakeState::AwaitingBoth => {
                 *state = HandshakeState::AwaitingSseOnly;
                 info!(session_id = %self.id, from = ?HandshakeState::AwaitingBoth, to = ?HandshakeState::AwaitingSseOnly, "SSE connected");
@@ -416,36 +437,35 @@ impl Session {
                 info!(session_id = %self.id, from = ?HandshakeState::AwaitingMcpOnly, to = ?HandshakeState::RootsRequested, "SSE connected (completing handshake)");
                 HandshakeAction::SendRootsListChanged
             }
-            _ => {
-                debug!(session_id = %self.id, state = ?*state, "SSE connected but already handled/advanced");
+            other => {
+                debug!(session_id = %self.id, state = ?other, "SSE connected but already handled/advanced");
                 HandshakeAction::None
             }
-        }
+        })
     }
 
     /// Helper to transition state for MCP initialization
     fn transition_mcp_initialized(&self) -> HandshakeAction {
-        let mut state = self.handshake_state.lock().unwrap();
-        match *state {
+        let action = self.handshake_state.transition(|state| match *state {
             HandshakeState::AwaitingBoth => {
                 *state = HandshakeState::AwaitingMcpOnly;
                 info!(session_id = %self.id, from = ?HandshakeState::AwaitingBoth, to = ?HandshakeState::AwaitingMcpOnly, "MCP initialized");
-                self.mcp_initialized_notify.notify_waiters();
                 HandshakeAction::None
             }
             HandshakeState::AwaitingSseOnly => {
                 *state = HandshakeState::RootsRequested;
                 info!(session_id = %self.id, from = ?HandshakeState::AwaitingSseOnly, to = ?HandshakeState::RootsRequested, "MCP initialized (completing handshake)");
-                self.mcp_initialized_notify.notify_waiters();
                 HandshakeAction::SendRootsListChanged
             }
-            _ => {
-                debug!(session_id = %self.id, state = ?*state, "MCP initialized but already handled/advanced");
-                // Ensure waiters are notified even if state was already advanced
-                self.mcp_initialized_notify.notify_waiters();
+            other => {
+                debug!(session_id = %self.id, state = ?other, "MCP initialized but already handled/advanced");
                 HandshakeAction::None
             }
-        }
+        });
+        // Always notify waiters, even when the state was already advanced — the
+        // notification must not be lost to a race with the transition.
+        self.mcp_initialized_notify.notify_waiters();
+        action
     }
 
     /// Mark SSE as connected and trigger action if needed
@@ -472,11 +492,12 @@ impl Session {
 
     /// Mark handshake as complete (sandbox locked).
     pub fn mark_handshake_complete(&self) {
-        let mut state = self.handshake_state.lock().unwrap();
-        if *state == HandshakeState::RootsRequested {
-            *state = HandshakeState::Complete;
-            info!(session_id = %self.id, "Handshake complete");
-        }
+        self.handshake_state.transition(|state| {
+            if *state == HandshakeState::RootsRequested {
+                *state = HandshakeState::Complete;
+                info!(session_id = %self.id, "Handshake complete");
+            }
+        });
     }
 
     /// Send roots/list_changed notification to subprocess.
@@ -935,11 +956,10 @@ impl SessionManager {
             sender: Mutex::new(tx),
             pending_requests: pending_requests.clone(),
             broadcast_tx: broadcast_tx.clone(),
-            sandbox_scopes: Mutex::new(None),
             terminated: AtomicBool::new(false),
             termination_reason: Mutex::new(None),
             peer_shutdown: Mutex::new(shutdown_fn),
-            handshake_state: std::sync::Mutex::new(HandshakeState::AwaitingBoth),
+            handshake_state: StateMachine::new(HandshakeState::AwaitingBoth),
             mcp_initialized_notify: Notify::new(),
             sandbox_state_machine: Arc::new(SandboxStateMachine::new()),
             created_at: Instant::now(),
@@ -1116,13 +1136,11 @@ impl SessionManager {
             "Locking sandbox scope(s) for session"
         );
 
-        // Store the sandbox scopes
-        *session.sandbox_scopes.lock().await = Some(scopes.clone());
-
-        // Transition to Configuring state
+        // Transition to Configuring state. The state machine is the single owner
+        // of the committed scope (SPEC R20/R23) — no separate cached copy.
         if let Err(e) = session
             .sandbox_state_machine
-            .transition_to_configuring(scopes.clone())
+            .transition_to_configuring(scopes)
         {
             warn!(session_id = %session_id, error = %e, "Failed to transition sandbox state to Configuring");
         }
@@ -1174,7 +1192,11 @@ impl SessionManager {
         // Sandbox already locked: the committed instance scope is immutable and
         // cannot be widened, so this is a tolerated no-op. Keep the session and
         // the locked scope; do not forward to the subprocess.
-        let scopes = session.sandbox_scopes.lock().await.clone();
+        let scopes = session
+            .sandbox_state_machine
+            .current()
+            .scopes()
+            .map(<[_]>::to_vec);
         warn!(
             session_id = %session_id,
             sandbox_scopes = ?scopes,

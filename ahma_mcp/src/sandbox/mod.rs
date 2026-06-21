@@ -45,6 +45,7 @@ mod error;
 mod landlock;
 pub(crate) mod pkg_cache;
 mod prerequisites;
+mod scope_lock;
 mod scopes;
 #[cfg(target_os = "macos")]
 mod seatbelt;
@@ -63,6 +64,7 @@ pub use landlock::{
 pub use prerequisites::{
     check_sandbox_prerequisites, exit_with_sandbox_error, test_sandbox_exec_available,
 };
+pub use scope_lock::ScopeLockState;
 pub use scopes::normalize_path_lexically;
 pub use types::{SandboxMode, ScopesGuard};
 #[cfg(target_os = "windows")]

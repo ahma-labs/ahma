@@ -3,7 +3,7 @@
 #[cfg(feature = "tui")]
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::state::{Focus, Mode, PaletteState};
+use crate::state::{Focus, ModalState, Mode};
 
 /// High-level action emitted from a key press.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,22 +85,17 @@ pub fn map_key(
     key: KeyEvent,
     _mode: Mode,
     focus: Focus,
-    palette: &PaletteState,
-    nav_visible: bool,
+    modal: &ModalState,
     log_filter_active: bool,
-    log_files_modal_open: bool,
 ) -> Action {
-    // Navigator has highest priority when open.
-    if nav_visible {
-        return map_navigator_key(key);
-    }
-
-    if log_files_modal_open {
-        return map_log_modal_key(key);
-    }
-
-    if palette.visible {
-        return map_palette_key(key);
+    // Open overlays take key priority, in this order: navigator > log-file
+    // switcher > palette. (Help and the inline pickers are dispatched before
+    // map_key is reached.)
+    match modal {
+        ModalState::Navigator(_) => return map_navigator_key(key),
+        ModalState::LogFiles { .. } => return map_log_modal_key(key),
+        ModalState::Palette(_) => return map_palette_key(key),
+        _ => {}
     }
 
     if log_filter_active {

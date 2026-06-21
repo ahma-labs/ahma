@@ -20,8 +20,8 @@
 //! let is_ready = sm.wait_for_active().await;
 //! ```
 
+use crate::state_machine::{FsmState, InvalidTransition, MachineDropped, Observable};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::sync::watch;
 
 /// Sandbox lifecycle states - single source of truth per R20.
@@ -63,85 +63,95 @@ impl SandboxState {
     }
 }
 
+impl FsmState for SandboxState {
+    fn name(&self) -> &'static str {
+        match self {
+            SandboxState::AwaitingRoots => "AwaitingRoots",
+            SandboxState::Configuring { .. } => "Configuring",
+            SandboxState::Active { .. } => "Active",
+            SandboxState::Failed { .. } => "Failed",
+            SandboxState::Terminated => "Terminated",
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        // Delegate to the inherent method so both views agree.
+        SandboxState::is_terminal(self)
+    }
+}
+
 /// Observable sandbox state machine using watch channels for immediate notification.
 ///
 /// This implements R18 (No-Wait State Transitions) and R20 (Single Source of Truth).
 /// All state changes are immediately visible to all subscribers without polling.
 #[derive(Clone)]
 pub struct SandboxStateMachine {
-    sender: Arc<watch::Sender<SandboxState>>,
-    // Keep a receiver to ensure the channel stays alive
-    _receiver: watch::Receiver<SandboxState>,
+    inner: Observable<SandboxState>,
 }
 
 impl SandboxStateMachine {
     /// Create a new state machine in AwaitingRoots state
     pub fn new() -> Self {
-        let (sender, receiver) = watch::channel(SandboxState::AwaitingRoots);
         Self {
-            sender: Arc::new(sender),
-            _receiver: receiver,
+            inner: Observable::new(SandboxState::AwaitingRoots),
         }
     }
 
     /// Create a new state machine that starts in Active state (for non-deferred sandbox)
     pub fn new_active(scopes: Vec<PathBuf>) -> Self {
-        let (sender, receiver) = watch::channel(SandboxState::Active { scopes });
         Self {
-            sender: Arc::new(sender),
-            _receiver: receiver,
+            inner: Observable::new(SandboxState::Active { scopes }),
         }
     }
 
     /// Get the current state without blocking
     pub fn current(&self) -> SandboxState {
-        self.sender.borrow().clone()
+        self.inner.current()
     }
 
     /// Subscribe to state changes - returns a receiver that will be notified
     /// immediately when state changes (no polling required)
     pub fn subscribe(&self) -> watch::Receiver<SandboxState> {
-        self.sender.subscribe()
+        self.inner.subscribe()
     }
 
     /// Transition from AwaitingRoots to Configuring
-    pub fn transition_to_configuring(&self, scopes: Vec<PathBuf>) -> Result<(), &'static str> {
-        self.sender.send_if_modified(|state| {
+    pub fn transition_to_configuring(&self, scopes: Vec<PathBuf>) -> Result<(), InvalidTransition> {
+        self.inner.modify(|state| {
+            let from = state.name();
             if matches!(state, SandboxState::AwaitingRoots) {
-                *state = SandboxState::Configuring {
-                    scopes: scopes.clone(),
-                };
-                true
+                *state = SandboxState::Configuring { scopes };
+                (true, Ok(()))
             } else {
-                false
+                (
+                    false,
+                    Err(InvalidTransition {
+                        from,
+                        action: "to_configuring",
+                    }),
+                )
             }
-        });
-        // Check if transition actually happened
-        if matches!(&*self.sender.borrow(), SandboxState::Configuring { .. }) {
-            Ok(())
-        } else {
-            Err("Can only transition to Configuring from AwaitingRoots")
-        }
+        })
     }
 
     /// Transition from Configuring to Active
-    pub fn transition_to_active(&self) -> Result<(), &'static str> {
-        let mut transitioned = false;
-        self.sender.send_if_modified(|state| {
+    pub fn transition_to_active(&self) -> Result<(), InvalidTransition> {
+        self.inner.modify(|state| {
+            let from = state.name();
             if let SandboxState::Configuring { scopes } = state {
                 let s = std::mem::take(scopes);
                 *state = SandboxState::Active { scopes: s };
-                transitioned = true;
-                true
+                (true, Ok(()))
             } else {
-                false
+                (
+                    false,
+                    Err(InvalidTransition {
+                        from,
+                        action: "to_active",
+                    }),
+                )
             }
-        });
-        if transitioned {
-            Ok(())
-        } else {
-            Err("Can only transition to Active from Configuring")
-        }
+        })
     }
 
     /// Transition to Active from any non-terminal state.
@@ -172,13 +182,11 @@ impl SandboxStateMachine {
     pub fn transition_to_active_with_scopes(
         &self,
         scopes: Vec<PathBuf>,
-    ) -> Result<(), &'static str> {
-        self.sender.send_if_modified(|state| match state {
+    ) -> Result<(), InvalidTransition> {
+        self.inner.modify(|state| match state {
             SandboxState::AwaitingRoots => {
-                *state = SandboxState::Active {
-                    scopes: scopes.clone(),
-                };
-                true
+                *state = SandboxState::Active { scopes };
+                (true, Ok(()))
             }
             SandboxState::Configuring {
                 scopes: existing_scopes,
@@ -186,87 +194,90 @@ impl SandboxStateMachine {
                 let resolved = if scopes.is_empty() {
                     std::mem::take(existing_scopes)
                 } else {
-                    scopes.clone()
+                    scopes
                 };
                 *state = SandboxState::Active { scopes: resolved };
-                true
+                (true, Ok(()))
             }
-            // Already Active (idempotent) or terminal: do not modify.
-            SandboxState::Active { .. }
-            | SandboxState::Failed { .. }
-            | SandboxState::Terminated => false,
-        });
-        if self.sender.borrow().is_active() {
-            Ok(())
-        } else {
-            Err("Cannot transition to Active from a terminal state")
-        }
+            // Already Active is an idempotent no-op success.
+            SandboxState::Active { .. } => (false, Ok(())),
+            // Terminal states are preserved and reject the transition.
+            SandboxState::Failed { .. } => (
+                false,
+                Err(InvalidTransition {
+                    from: "Failed",
+                    action: "to_active_with_scopes",
+                }),
+            ),
+            SandboxState::Terminated => (
+                false,
+                Err(InvalidTransition {
+                    from: "Terminated",
+                    action: "to_active_with_scopes",
+                }),
+            ),
+        })
     }
 
     /// Transition to Failed from any non-terminal state
-    pub fn transition_to_failed(&self, error: String) -> Result<(), &'static str> {
-        let mut transitioned = false;
-        self.sender.send_if_modified(|state| {
+    pub fn transition_to_failed(&self, error: String) -> Result<(), InvalidTransition> {
+        self.inner.modify(|state| {
+            let from = state.name();
             if !state.is_terminal() {
-                *state = SandboxState::Failed {
-                    error: error.clone(),
-                };
-                transitioned = true;
-                true
+                *state = SandboxState::Failed { error };
+                (true, Ok(()))
             } else {
-                false
+                (
+                    false,
+                    Err(InvalidTransition {
+                        from,
+                        action: "to_failed",
+                    }),
+                )
             }
-        });
-        if transitioned {
-            Ok(())
-        } else {
-            Err("Cannot transition from terminal state")
-        }
+        })
     }
 
     /// Transition to Terminated from any non-terminal state
-    pub fn transition_to_terminated(&self) -> Result<(), &'static str> {
-        let mut transitioned = false;
-        self.sender.send_if_modified(|state| {
+    pub fn transition_to_terminated(&self) -> Result<(), InvalidTransition> {
+        self.inner.modify(|state| {
+            let from = state.name();
             if !state.is_terminal() {
                 *state = SandboxState::Terminated;
-                transitioned = true;
-                true
+                (true, Ok(()))
             } else {
-                false
+                (
+                    false,
+                    Err(InvalidTransition {
+                        from,
+                        action: "to_terminated",
+                    }),
+                )
             }
-        });
-        if transitioned {
-            Ok(())
-        } else {
-            Err("Cannot transition from terminal state")
-        }
+        })
     }
 
     /// Wait until sandbox is Active - NO POLLING, uses watch channel
     /// Returns the scopes if successful, or error message if failed/terminated
     pub async fn wait_for_active(&self) -> Result<Vec<PathBuf>, String> {
-        let mut rx = self.sender.subscribe();
-        loop {
-            {
-                let state = rx.borrow();
-                match &*state {
-                    SandboxState::Active { scopes } => return Ok(scopes.clone()),
-                    SandboxState::Failed { error } => return Err(error.clone()),
-                    SandboxState::Terminated => return Err("Session terminated".to_string()),
-                    _ => {}
-                }
-            }
-            // Wait for next state change - this is NOT polling, it's event-driven
-            if rx.changed().await.is_err() {
-                return Err("State machine dropped".to_string());
-            }
+        let outcome = self
+            .inner
+            .wait_until(|state| match state {
+                SandboxState::Active { scopes } => Some(Ok(scopes.clone())),
+                SandboxState::Failed { error } => Some(Err(error.clone())),
+                SandboxState::Terminated => Some(Err("Session terminated".to_string())),
+                _ => None,
+            })
+            .await;
+        match outcome {
+            Ok(result) => result,
+            Err(MachineDropped) => Err("State machine dropped".to_string()),
         }
     }
 
     /// Check if currently in Active state
     pub fn is_active(&self) -> bool {
-        self.sender.borrow().is_active()
+        self.inner.read(SandboxState::is_active)
     }
 }
 
