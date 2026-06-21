@@ -569,7 +569,10 @@ fn scroll_focus_down(state: &mut crate::state::AppState) {
             state.maybe_reengage_log_follow();
         }
         Focus::Chat => {
-            state.chat_scroll = state.chat_scroll.saturating_sub(1);
+            // Clamp against max too: a resize can shrink the content, leaving a
+            // stale chat_scroll above the new max that a lone decrement wouldn't fix.
+            let max = state.chat_max_scroll.get();
+            state.chat_scroll = state.chat_scroll.min(max).saturating_sub(1);
             state.sync_chat_scroll_to_animation();
         }
         _ => {}
@@ -1648,7 +1651,7 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
 fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     match cmd {
         "/help" | "/?" => state.show_help = true,
-        "/clear" => state.chat.clear(),
+        "/clear" => state.clear_screen(),
         "/compact" => {
             state.chat.compact(4);
             push_assistant_message(state, "Context window compacted (kept 4 latest turns).");
@@ -2936,7 +2939,7 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
             .find(|w| w.op_id.as_deref() == Some(&op.id))
         {
             update_existing_window(w, op, state.unicode);
-        } else {
+        } else if !state.window_suppressed_by_clear(op) {
             let w = build_new_window(op, state);
             to_add.push(w);
         }
@@ -3562,11 +3565,11 @@ fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::A
         && row >= chat_area.y
         && row < chat_area.y + chat_area.height
     {
+        let max = state.chat_max_scroll.get();
         if up {
-            let max = state.chat_max_scroll.get();
             state.chat_scroll = (state.chat_scroll + 1).min(max);
         } else {
-            state.chat_scroll = state.chat_scroll.saturating_sub(1);
+            state.chat_scroll = state.chat_scroll.min(max).saturating_sub(1);
         }
         state.sync_chat_scroll_to_animation();
         return;
@@ -3663,8 +3666,13 @@ fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
 
 #[cfg(feature = "tui")]
 fn update_scroll_animations(state: &mut crate::state::AppState) {
-    let chat_curr = state.chat_scroll_current.get();
-    let chat_tgt = state.chat_scroll_target.get();
+    // Clamp the animation against the live max so a resize that shrank the
+    // content (recomputed in draw as chat_max_scroll) pulls a stale target/offset
+    // back into range instead of stranding the view above the oldest line.
+    let chat_max = state.chat_max_scroll.get() as f64;
+    let chat_curr = state.chat_scroll_current.get().clamp(0.0, chat_max);
+    let chat_tgt = state.chat_scroll_target.get().clamp(0.0, chat_max);
+    state.chat_scroll_target.set(chat_tgt);
     if (chat_curr - chat_tgt).abs() > 0.01 {
         let next = chat_curr + (chat_tgt - chat_curr) * 0.25;
         state.chat_scroll_current.set(next);
