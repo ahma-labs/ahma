@@ -1014,6 +1014,59 @@ started_rx.await.ok();  // Don't return until spawn is live
 - **R22.2**: Standard ASCII text **should** be used for all status indications and visual cues.
 - **R22.3**: Emojis are **forbidden** in source code logs and terminal output unless explicitly required for a specific standardized protocol.
 
+#### R23: State Machine Standard
+
+Any non-trivial lifecycle — anything with three or more states, or where an
+invalid combination of flags is currently representable — **must** be modeled as
+an explicit state machine rather than ad-hoc `bool`/`Option` fields mutated in
+place. This is the concrete mechanism behind R18.2 and R20.
+
+- **R23.1 — Hand-written, no FSM crate.** Ahma deliberately does **not** depend
+  on a third-party state-machine crate. The popular options do not fit this
+  codebase and adding one would enlarge the audit/supply-chain surface of a
+  security product for no benefit:
+  - `rust-fsm` (and similar transition-table DSLs) model states as **unit
+    variants**; our states carry data (`Active { scopes }`,
+    `Completed { output }`, `Configuring { scopes }`) and cannot be expressed.
+  - `statig` is an opinionated **event-dispatch framework** that would fight the
+    `tokio::sync::watch` observability model R18/R20 require; no FSM crate
+    integrates with no-poll watch observation.
+  - compile-time `typestate` (state-as-type) cannot be stored in a struct field
+    and shared/observed across async tasks behind an `Arc`, which every one of
+    our machines needs.
+
+- **R23.2 — Shared building blocks.** State machines are built from the
+  primitives in `ahma_common::state_machine`:
+  - `FsmState` — every state enum implements it (`name()` for logs/metrics,
+    `is_terminal()` for guards), giving one vocabulary across crates.
+  - `InvalidTransition` — the typed error a rejected guarded transition returns.
+  - `Observable<S>` — a `tokio::sync::watch`-backed single source of truth for
+    state shared across tasks. Exposes `current()`/`read()` (non-blocking reads),
+    `subscribe()`, guarded `modify()`, and event-driven `wait_until()`. This is
+    the generalized engine behind `sandbox_state::SandboxStateMachine`.
+  - `StateMachine<S>` — a `Mutex`-plus-closure wrapper for **local** state that
+    is not observed across tasks (e.g. OAuth `AuthState`).
+
+- **R23.3 — Shape of a machine.** States are a data-carrying `enum`. Transitions
+  are **named, guarded methods** on the owning type (`to_active`,
+  `to_failed`, …) that encode their legal predecessor states and return
+  `Result<_, InvalidTransition>` (or a domain `Result`). Callers never mutate the
+  state field directly. Terminal states are preserved — a transition out of a
+  terminal state is rejected, not silently applied.
+
+- **R23.4 — Observability.** Cross-task lifecycles use `Observable` (or another
+  `watch`-based channel) so observers react immediately and never poll (R18).
+  State has exactly one authoritative location (R20); do **not** keep a shadow
+  copy of any field that the machine already owns.
+
+- **R23.5 — Tests.** Every machine tests both the happy-path transition sequence
+  and that each illegal transition is rejected (and leaves state unchanged). The
+  reference implementation is `ahma_common::sandbox_state`.
+
+- **R23.6 — Exemptions.** Enums used purely as **classifiers** or **strategy
+  selectors** (e.g. `GrantStatus`, `ReduceMode`, `TransportMode`) are not
+  lifecycles and are exempt; they have no transitions to guard.
+
 ---
 
 ## 10. Testing Philosophy
