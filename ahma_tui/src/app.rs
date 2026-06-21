@@ -3844,7 +3844,7 @@ mod tests {
     /// auto-reject (not silently drop) the first, so its waiter never hangs.
     #[test]
     fn test_superseded_approval_is_auto_rejected() {
-        use crate::state::{ApprovalGate, AppState};
+        use crate::state::{AppState, ApprovalGate};
 
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         let gate = |op: &str| ApprovalGate {
@@ -3865,7 +3865,10 @@ mod tests {
 
         // The first waiter is resolved with a rejection, never dropped.
         assert_eq!(rx1.blocking_recv().ok(), Some(false));
-        assert_eq!(state.approval.as_ref().map(|g| g.op_id.as_str()), Some("op_2"));
+        assert_eq!(
+            state.approval.as_ref().map(|g| g.op_id.as_str()),
+            Some("op_2")
+        );
     }
 
     /// Regression: a bare `y` while an approval is pending must resolve the

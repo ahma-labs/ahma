@@ -1192,7 +1192,11 @@ impl SessionManager {
         // Sandbox already locked: the committed instance scope is immutable and
         // cannot be widened, so this is a tolerated no-op. Keep the session and
         // the locked scope; do not forward to the subprocess.
-        let scopes = session.sandbox_state_machine.current().scopes().map(<[_]>::to_vec);
+        let scopes = session
+            .sandbox_state_machine
+            .current()
+            .scopes()
+            .map(<[_]>::to_vec);
         warn!(
             session_id = %session_id,
             sandbox_scopes = ?scopes,

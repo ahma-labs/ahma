@@ -156,7 +156,10 @@ mod tests {
         assert!(lock.try_commit(), "first commit must win the latch");
         assert!(lock.is_committed());
         assert!(!lock.try_commit(), "second commit must lose (one-shot)");
-        assert!(!lock.try_commit(), "every subsequent commit must keep losing");
+        assert!(
+            !lock.try_commit(),
+            "every subsequent commit must keep losing"
+        );
     }
 
     #[test]
@@ -174,7 +177,10 @@ mod tests {
         let lock = ScopeLock::new(true);
         assert!(lock.try_commit());
         let cloned = lock.clone();
-        assert!(cloned.is_committed(), "clone must carry the committed latch");
+        assert!(
+            cloned.is_committed(),
+            "clone must carry the committed latch"
+        );
         assert!(
             !cloned.try_commit(),
             "cloned lock is already committed, so try_commit must lose"
