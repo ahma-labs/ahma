@@ -144,8 +144,8 @@ async fn run_ratatui(
                     match maybe {
                         Some(Ok(Event::Key(key))) => {
                             if (key.code == crossterm::event::KeyCode::PageUp || key.code == crossterm::event::KeyCode::PageDown)
-                                && !state.show_help
-                                && !state.log_files_modal_open
+                                && !state.is_help_open()
+                                && state.log_files_selected().is_none()
                             {
                                 handle_page_up_down(key.code == crossterm::event::KeyCode::PageUp, &mut state);
                             } else if handle_settings_key(key, &mut state)
@@ -160,10 +160,8 @@ async fn run_ratatui(
                                     key,
                                     state.mode,
                                     state.focus,
-                                    &state.palette,
-                                    state.navigator.visible,
+                                    &state.modal,
                                     state.log_filter_active,
-                                    state.log_files_modal_open,
                                 );
                                 handle_action(action, &mut state);
                             }
@@ -267,7 +265,7 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         Action::Quit => state.should_quit = true,
         Action::Tab => state.focus = state.focus.cycle_next(),
         Action::BackTab => state.focus = state.focus.cycle_prev(),
-        Action::ToggleHelp => state.show_help = !state.show_help,
+        Action::ToggleHelp => state.toggle_help(),
         Action::FocusChat => {
             state.focus = crate::state::Focus::Chat;
         }
@@ -278,10 +276,9 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
 
 #[cfg(feature = "tui")]
 fn submit_log_switcher(state: &mut crate::state::AppState) {
-    if !state.log_files_modal_open {
+    let Some(idx) = state.log_files_selected() else {
         return;
-    }
-    let idx = state.log_files_modal_selected;
+    };
     let new_file: Option<String> = if idx == 0 {
         None
     } else {
@@ -289,7 +286,7 @@ fn submit_log_switcher(state: &mut crate::state::AppState) {
         if file_idx < state.log_files.len() {
             Some(state.log_files[file_idx].name.clone())
         } else {
-            state.log_files_modal_open = false;
+            state.close_modal();
             return;
         }
     };
@@ -302,7 +299,7 @@ fn submit_log_switcher(state: &mut crate::state::AppState) {
     if let Some(ref tx) = state.mcp_source_tx {
         let _ = tx.try_send(crate::mcp_source::McpSourceCommand::SetActiveFile(new_file));
     }
-    state.log_files_modal_open = false;
+    state.close_modal();
 }
 
 #[cfg(feature = "tui")]
@@ -364,8 +361,7 @@ fn handle_log_monitor_action(
             true
         }
         Action::OpenLogSwitcher => {
-            state.log_files_modal_open = true;
-            state.log_files_modal_selected = 0;
+            state.open_log_files_modal(0);
             // Proactively request logs list refresh when modal is opened
             if let Some(ref tx) = state.mcp_source_tx {
                 let _ = tx.try_send(crate::mcp_source::McpSourceCommand::RefreshLogs);
@@ -373,22 +369,28 @@ fn handle_log_monitor_action(
             true
         }
         Action::CloseLogSwitcher => {
-            state.log_files_modal_open = false;
+            if state.log_files_selected().is_some() {
+                state.close_modal();
+            }
             true
         }
         Action::SubmitLogSwitcher => {
             submit_log_switcher(state);
             true
         }
-        Action::Up if state.log_files_modal_open => {
-            if state.log_files_modal_selected > 0 {
-                state.log_files_modal_selected -= 1;
+        Action::Up if state.log_files_selected().is_some() => {
+            if let Some(sel) = state.log_files_selected()
+                && sel > 0
+            {
+                state.set_log_files_selected(sel - 1);
             }
             true
         }
-        Action::Down if state.log_files_modal_open => {
-            if state.log_files_modal_selected < state.log_files.len() {
-                state.log_files_modal_selected += 1;
+        Action::Down if state.log_files_selected().is_some() => {
+            if let Some(sel) = state.log_files_selected()
+                && sel < state.log_files.len()
+            {
+                state.set_log_files_selected(sel + 1);
             }
             true
         }
@@ -439,12 +441,12 @@ fn select_active_picker_next(state: &mut crate::state::AppState) {
 
 #[cfg(feature = "tui")]
 fn submit_active_picker(state: &mut crate::state::AppState) {
-    if let Some(picker) = state.provider_picker.take() {
+    if let Some(picker) = state.take_provider_picker() {
         submit_provider_picker(picker, state);
         return;
     }
 
-    if let Some(picker) = state.model_picker.take() {
+    if let Some(picker) = state.take_model_picker() {
         submit_model_picker(picker, state);
     }
 }
@@ -504,8 +506,12 @@ fn submit_model_picker(picker: crate::state::PickerState, state: &mut crate::sta
 
 #[cfg(feature = "tui")]
 fn close_active_pickers(state: &mut crate::state::AppState) {
-    state.provider_picker = None;
-    state.model_picker = None;
+    if matches!(
+        state.modal,
+        crate::state::ModalState::ProviderPicker(_) | crate::state::ModalState::ModelPicker(_)
+    ) {
+        state.close_modal();
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -770,11 +776,15 @@ fn handle_palette_action(
         Action::OpenPalette => open_palette(state),
         Action::PaletteEsc => close_palette(state),
         Action::PaletteChar(c) => {
-            state.palette.input.push(*c);
+            if let Some(palette) = state.palette_mut() {
+                palette.input.push(*c);
+            }
             refresh_palette_completions(state);
         }
         Action::PaletteBackspace => {
-            state.palette.input.pop();
+            if let Some(palette) = state.palette_mut() {
+                palette.input.pop();
+            }
             refresh_palette_completions(state);
         }
         Action::PaletteComplete => apply_palette_completion(state),
@@ -789,54 +799,62 @@ fn handle_palette_action(
 
 #[cfg(feature = "tui")]
 fn open_palette(state: &mut crate::state::AppState) {
-    state.palette.open();
+    state.modal = crate::state::ModalState::Palette(crate::state::PaletteState::default());
     refresh_palette_completions(state);
     state.focus = crate::state::Focus::Palette;
 }
 
 #[cfg(feature = "tui")]
 fn close_palette(state: &mut crate::state::AppState) {
-    state.palette.close();
+    if state.palette().is_some() {
+        state.close_modal();
+    }
     state.focus = crate::state::Focus::AiActivity;
 }
 
 #[cfg(feature = "tui")]
 fn refresh_palette_completions(state: &mut crate::state::AppState) {
     let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
-    state.palette.update_completions(&tools);
+    if let Some(palette) = state.palette_mut() {
+        palette.update_completions(&tools);
+    }
 }
 
 #[cfg(feature = "tui")]
 fn apply_palette_completion(state: &mut crate::state::AppState) {
-    let n = state.palette.completions.len();
+    let Some(palette) = state.palette_mut() else {
+        return;
+    };
+    let n = palette.completions.len();
     if n == 0 {
         return;
     }
 
-    state.palette.selected_completion = (state.palette.selected_completion + 1) % n;
-    let idx = state.palette.selected_completion;
-    if let Some(name) = state.palette.completions.get(idx).cloned() {
-        state.palette.input = name;
+    palette.selected_completion = (palette.selected_completion + 1) % n;
+    let idx = palette.selected_completion;
+    if let Some(name) = palette.completions.get(idx).cloned() {
+        palette.input = name;
     }
 }
 
 #[cfg(feature = "tui")]
 fn advance_palette_selection(state: &mut crate::state::AppState) {
-    let n = state.palette.completions.len();
-    if n > 0 {
-        state.palette.selected_completion = (state.palette.selected_completion + 1) % n;
+    if let Some(palette) = state.palette_mut() {
+        let n = palette.completions.len();
+        if n > 0 {
+            palette.selected_completion = (palette.selected_completion + 1) % n;
+        }
     }
 }
 
 #[cfg(feature = "tui")]
 fn rewind_palette_selection(state: &mut crate::state::AppState) {
-    let n = state.palette.completions.len();
-    if n > 0 {
-        state.palette.selected_completion = state
-            .palette
-            .selected_completion
-            .checked_sub(1)
-            .unwrap_or(n - 1);
+    if let Some(palette) = state.palette_mut() {
+        let n = palette.completions.len();
+        if n > 0 {
+            palette.selected_completion =
+                palette.selected_completion.checked_sub(1).unwrap_or(n - 1);
+        }
     }
 }
 
@@ -844,7 +862,7 @@ fn rewind_palette_selection(state: &mut crate::state::AppState) {
 fn submit_palette_command(state: &mut crate::state::AppState) {
     use crate::state::{LogEntry, LogLevel};
 
-    let cmd = state.palette.input.clone();
+    let cmd = state.palette().map(|p| p.input.clone()).unwrap_or_default();
     close_palette(state);
     if cmd.is_empty() {
         return;
@@ -1337,18 +1355,38 @@ fn handle_navigator_action(
 
     match action {
         Action::OpenNavigator => open_navigator(state),
-        Action::NavEsc => state.navigator.close(),
+        Action::NavEsc => {
+            if state.navigator().is_some() {
+                state.close_modal();
+            }
+        }
         Action::NavChar(c) => {
-            state.navigator.input.push(*c);
+            if let Some(nav) = state.navigator_mut() {
+                nav.input.push(*c);
+            }
             refresh_navigator_completions(state);
         }
         Action::NavBackspace => {
-            state.navigator.input.pop();
+            if let Some(nav) = state.navigator_mut() {
+                nav.input.pop();
+            }
             refresh_navigator_completions(state);
         }
-        Action::NavComplete => state.navigator.tab_complete(),
-        Action::NavUp => state.navigator.select_prev(),
-        Action::NavDown => state.navigator.select_next(),
+        Action::NavComplete => {
+            if let Some(nav) = state.navigator_mut() {
+                nav.tab_complete();
+            }
+        }
+        Action::NavUp => {
+            if let Some(nav) = state.navigator_mut() {
+                nav.select_prev();
+            }
+        }
+        Action::NavDown => {
+            if let Some(nav) = state.navigator_mut() {
+                nav.select_next();
+            }
+        }
         Action::NavSubmit => submit_navigator_command(state),
         _ => return false,
     }
@@ -1359,19 +1397,24 @@ fn handle_navigator_action(
 #[cfg(feature = "tui")]
 fn open_navigator(state: &mut crate::state::AppState) {
     let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
-    state.navigator.open(&tools);
+    state.modal =
+        crate::state::ModalState::Navigator(crate::state::CommandNavigator::opened(&tools));
 }
 
 #[cfg(feature = "tui")]
 fn refresh_navigator_completions(state: &mut crate::state::AppState) {
     let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
-    state.navigator.refresh_completions(&tools);
+    if let Some(nav) = state.navigator_mut() {
+        nav.refresh_completions(&tools);
+    }
 }
 
 #[cfg(feature = "tui")]
 fn submit_navigator_command(state: &mut crate::state::AppState) {
-    let cmd = state.navigator.selected_command();
-    state.navigator.close();
+    let Some(cmd) = state.navigator().map(|n| n.selected_command()) else {
+        return;
+    };
+    state.close_modal();
     dispatch_nav_command(&cmd, state);
 }
 
@@ -1407,13 +1450,13 @@ fn handle_settings_key(
 fn handle_help_key(key: crossterm::event::KeyEvent, state: &mut crate::state::AppState) -> bool {
     use crossterm::event::KeyCode;
 
-    if !state.show_help {
+    if !state.is_help_open() {
         return false;
     }
 
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) | (KeyCode::Char('?'), _) => {
-            state.show_help = false;
+            state.close_modal();
             true
         }
         _ => true,
@@ -1459,10 +1502,11 @@ fn handle_picker_key(key: crossterm::event::KeyEvent, state: &mut crate::state::
 
 #[cfg(feature = "tui")]
 fn active_picker_mut(state: &mut crate::state::AppState) -> Option<&mut crate::state::PickerState> {
-    if state.provider_picker.is_some() {
-        state.provider_picker.as_mut()
-    } else {
-        state.model_picker.as_mut()
+    match &mut state.modal {
+        crate::state::ModalState::ProviderPicker(p) | crate::state::ModalState::ModelPicker(p) => {
+            Some(p)
+        }
+        _ => None,
     }
 }
 
@@ -1481,13 +1525,7 @@ fn handle_approval_key(
 ) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    if state.approval.is_none()
-        || state.navigator.visible
-        || state.palette.visible
-        || state.log_filter_active
-        || state.provider_picker.is_some()
-        || state.model_picker.is_some()
-    {
+    if state.approval.is_none() || state.text_entry_modal_open() || state.log_filter_active {
         return false;
     }
 
@@ -1516,13 +1554,7 @@ fn handle_chat_input_key(
     use crate::state::Focus;
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    if state.focus != Focus::Chat
-        || state.navigator.visible
-        || state.provider_picker.is_some()
-        || state.model_picker.is_some()
-        || state.palette.visible
-        || state.log_filter_active
-    {
+    if state.focus != Focus::Chat || state.text_entry_modal_open() || state.log_filter_active {
         return false;
     }
 
@@ -1535,9 +1567,10 @@ fn handle_chat_input_key(
             if state.chat_input_is_empty() {
                 state.chat_input.insert_str("/run ");
                 let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
-                state.navigator.open(&tools);
-                state.navigator.input = "run ".to_string();
-                state.navigator.refresh_completions(&tools);
+                let mut nav = crate::state::CommandNavigator::opened(&tools);
+                nav.input = "run ".to_string();
+                nav.refresh_completions(&tools);
+                state.modal = crate::state::ModalState::Navigator(nav);
             }
             true
         }
@@ -1558,8 +1591,7 @@ fn handle_chat_input_key(
             true
         }
         (KeyCode::Char('/'), KeyModifiers::NONE) if state.chat_input_is_empty() => {
-            let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
-            state.navigator.open(&tools);
+            open_navigator(state);
             true
         }
         _ => state.chat_input.input(textarea_input_from_key_event(key)),
@@ -1650,7 +1682,7 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
 #[cfg(feature = "tui")]
 fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
     match cmd {
-        "/help" | "/?" => state.show_help = true,
+        "/help" | "/?" => state.modal = crate::state::ModalState::Help,
         "/clear" => state.clear_screen(),
         "/compact" => {
             state.chat.compact(4);
@@ -2102,7 +2134,7 @@ fn open_provider_picker(state: &mut crate::state::AppState) {
             .unwrap_or_default();
         picker.select_exact(&selected);
     }
-    state.provider_picker = Some(picker);
+    state.modal = crate::state::ModalState::ProviderPicker(picker);
 }
 
 #[cfg(feature = "tui")]
@@ -2138,7 +2170,7 @@ fn open_model_picker(state: &mut crate::state::AppState) {
         let exact = format!("{selected_provider} / {selected_model}");
         picker.select_exact(&exact);
     }
-    state.model_picker = Some(picker);
+    state.modal = crate::state::ModalState::ModelPicker(picker);
 }
 
 #[cfg(feature = "tui")]

@@ -335,22 +335,15 @@ pub struct CommandNavigator {
     pub completions: Vec<NavCommand>,
     /// Index of the highlighted completion.
     pub selected: usize,
-    /// True when the overlay is visible.
-    pub visible: bool,
 }
 
 impl CommandNavigator {
-    pub fn open(&mut self, tools: &[String]) {
-        self.visible = true;
-        self.input.clear();
-        self.selected = 0;
-        self.refresh_completions(tools);
-    }
-
-    pub fn close(&mut self) {
-        self.visible = false;
-        self.input.clear();
-        self.completions.clear();
+    /// Build a freshly-opened navigator with completions seeded from `tools`.
+    /// Visibility is owned by [`ModalState`], not this struct (SPEC R23).
+    pub fn opened(tools: &[String]) -> Self {
+        let mut nav = CommandNavigator::default();
+        nav.refresh_completions(tools);
+        nav
     }
 
     /// Rebuild completions from builtins + dynamic `/run <tool>` entries.
@@ -837,24 +830,17 @@ pub struct PaletteState {
     pub input: String,
     pub completions: Vec<String>,
     pub selected_completion: usize,
-    pub visible: bool,
     /// When set, user must type `y` to confirm before the command is dispatched.
     pub confirm_prompt: Option<String>,
 }
 
 impl PaletteState {
-    pub fn open(&mut self) {
-        self.visible = true;
+    /// Reset the palette's transient fields when (re)opening. Visibility is
+    /// owned by [`ModalState`], not this struct (SPEC R23).
+    pub fn reset(&mut self) {
         self.input.clear();
         self.completions.clear();
         self.selected_completion = 0;
-        self.confirm_prompt = None;
-    }
-
-    pub fn close(&mut self) {
-        self.visible = false;
-        self.input.clear();
-        self.completions.clear();
         self.confirm_prompt = None;
     }
 
@@ -870,6 +856,46 @@ impl PaletteState {
                 .collect();
         }
         self.selected_completion = 0;
+    }
+}
+
+// ─── Modal overlays ───────────────────────────────────────────────────────────
+
+/// The single active overlay/modal (SPEC R23).
+///
+/// At most one user overlay is open at a time, so previously-representable
+/// invalid combinations — e.g. the help screen *and* the command navigator *and*
+/// the log-file switcher all "open" at once — are now unrepresentable. Each
+/// variant owns the data its overlay needs, giving one source of truth for both
+/// "which overlay is open" and its contents.
+///
+/// The bridge-driven approval gate is intentionally *not* a variant here: it is
+/// raised asynchronously by the daemon and may legitimately be pending while a
+/// user overlay is open, so it lives in its own guarded field
+/// ([`AppState::request_approval`]).
+#[derive(Debug, Default)]
+pub enum ModalState {
+    /// No overlay is open.
+    #[default]
+    None,
+    /// The help screen.
+    Help,
+    /// The `/` command navigator.
+    Navigator(CommandNavigator),
+    /// The command palette / confirm prompt.
+    Palette(PaletteState),
+    /// The inline provider picker.
+    ProviderPicker(PickerState),
+    /// The inline model picker.
+    ModelPicker(PickerState),
+    /// The log-file switcher, with the highlighted row index.
+    LogFiles { selected: usize },
+}
+
+impl ModalState {
+    /// True when some overlay is open.
+    pub fn is_open(&self) -> bool {
+        !matches!(self, ModalState::None)
     }
 }
 
@@ -953,12 +979,10 @@ pub struct AppState {
     pub available_models: Vec<String>,
     /// Chat scroll offset (lines from bottom = 0 is newest).
     pub chat_scroll: usize,
-    /// Command navigator state.
-    pub navigator: CommandNavigator,
-    /// Inline provider picker (Some when active).
-    pub provider_picker: Option<PickerState>,
-    /// Inline model picker (Some when active).
-    pub model_picker: Option<PickerState>,
+    /// The single active overlay/modal (navigator, palette, pickers, help,
+    /// log-file switcher). Replaces the former independent bool/Option flags so
+    /// two overlays can never be open at once (SPEC R23).
+    pub modal: ModalState,
 
     // ── UI state ──
     pub focus: Focus,
@@ -1010,12 +1034,9 @@ pub struct AppState {
     pub log_follow: bool,
     pub log_filter: String,
     pub log_filter_active: bool,
-    pub palette: PaletteState,
     pub log_files: Vec<LogFileInfo>,
     pub active_log_file: Option<String>,
     pub active_log_lines: Vec<String>,
-    pub log_files_modal_open: bool,
-    pub log_files_modal_selected: usize,
     pub log_wrap_enabled: bool,
     pub log_zoom_enabled: bool,
     #[cfg(feature = "tui")]
@@ -1026,7 +1047,6 @@ pub struct AppState {
     pub ops_list_state: std::cell::RefCell<ratatui::widgets::ListState>,
     #[cfg(not(feature = "tui"))]
     pub ops_list_state: std::cell::RefCell<()>,
-    pub show_help: bool,
 
     // ── Settings editor ──
     pub settings_editor: crate::settings_editor::SettingsEditor,
@@ -1077,6 +1097,155 @@ impl AppState {
 }
 
 impl AppState {
+    // ── Modal accessors ──
+    //
+    // `self.modal` is the single source of truth for which overlay is open
+    // (SPEC R23). These helpers project it back to the per-overlay views the
+    // rest of the code uses, so no caller mutates the discriminant directly.
+
+    /// True when any user overlay is open.
+    pub fn modal_open(&self) -> bool {
+        self.modal.is_open()
+    }
+
+    /// True when a text-entry overlay (navigator, palette, or an inline picker)
+    /// is open. Used to decide whether a bare key should be consumed as overlay
+    /// input rather than a global shortcut (e.g. approval `y`/`n`).
+    pub fn text_entry_modal_open(&self) -> bool {
+        matches!(
+            self.modal,
+            ModalState::Navigator(_)
+                | ModalState::Palette(_)
+                | ModalState::ProviderPicker(_)
+                | ModalState::ModelPicker(_)
+        )
+    }
+
+    /// Close whatever overlay is currently open.
+    pub fn close_modal(&mut self) {
+        self.modal = ModalState::None;
+    }
+
+    /// True when the help screen is open.
+    pub fn is_help_open(&self) -> bool {
+        matches!(self.modal, ModalState::Help)
+    }
+
+    /// Toggle the help screen, closing any other overlay first.
+    pub fn toggle_help(&mut self) {
+        self.modal = if self.is_help_open() {
+            ModalState::None
+        } else {
+            ModalState::Help
+        };
+    }
+
+    /// The command navigator, if it is open.
+    pub fn navigator(&self) -> Option<&CommandNavigator> {
+        match &self.modal {
+            ModalState::Navigator(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// The command navigator (mutable), if it is open.
+    pub fn navigator_mut(&mut self) -> Option<&mut CommandNavigator> {
+        match &mut self.modal {
+            ModalState::Navigator(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// The command palette, if it is open.
+    pub fn palette(&self) -> Option<&PaletteState> {
+        match &self.modal {
+            ModalState::Palette(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The command palette (mutable), if it is open.
+    pub fn palette_mut(&mut self) -> Option<&mut PaletteState> {
+        match &mut self.modal {
+            ModalState::Palette(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The inline provider picker, if it is open.
+    pub fn provider_picker(&self) -> Option<&PickerState> {
+        match &self.modal {
+            ModalState::ProviderPicker(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The inline provider picker (mutable), if it is open.
+    pub fn provider_picker_mut(&mut self) -> Option<&mut PickerState> {
+        match &mut self.modal {
+            ModalState::ProviderPicker(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Close the provider picker and return its state, if it was open.
+    pub fn take_provider_picker(&mut self) -> Option<PickerState> {
+        match std::mem::take(&mut self.modal) {
+            ModalState::ProviderPicker(p) => Some(p),
+            other => {
+                self.modal = other;
+                None
+            }
+        }
+    }
+
+    /// The inline model picker, if it is open.
+    pub fn model_picker(&self) -> Option<&PickerState> {
+        match &self.modal {
+            ModalState::ModelPicker(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The inline model picker (mutable), if it is open.
+    pub fn model_picker_mut(&mut self) -> Option<&mut PickerState> {
+        match &mut self.modal {
+            ModalState::ModelPicker(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Close the model picker and return its state, if it was open.
+    pub fn take_model_picker(&mut self) -> Option<PickerState> {
+        match std::mem::take(&mut self.modal) {
+            ModalState::ModelPicker(p) => Some(p),
+            other => {
+                self.modal = other;
+                None
+            }
+        }
+    }
+
+    /// The highlighted row of the log-file switcher, if it is open.
+    pub fn log_files_selected(&self) -> Option<usize> {
+        match self.modal {
+            ModalState::LogFiles { selected } => Some(selected),
+            _ => None,
+        }
+    }
+
+    /// Open the log-file switcher at row `selected`.
+    pub fn open_log_files_modal(&mut self, selected: usize) {
+        self.modal = ModalState::LogFiles { selected };
+    }
+
+    /// Update the highlighted row of the log-file switcher (no-op if closed).
+    pub fn set_log_files_selected(&mut self, selected: usize) {
+        if let ModalState::LogFiles { selected: s } = &mut self.modal {
+            *s = selected;
+        }
+    }
+
     pub fn new(
         server_url: impl Into<String>,
         transport_label: impl Into<String>,
@@ -1140,9 +1309,7 @@ impl AppState {
             active_instances: vec![],
             available_models: vec![],
             chat_scroll: 0,
-            navigator: CommandNavigator::default(),
-            provider_picker: None,
-            model_picker: None,
+            modal: ModalState::None,
 
             focus: Focus::default(),
             ops_selected: 0,
@@ -1185,12 +1352,9 @@ impl AppState {
             log_follow: true,
             log_filter: String::new(),
             log_filter_active: false,
-            palette: PaletteState::default(),
             log_files: vec![],
             active_log_file: None,
             active_log_lines: vec![],
-            log_files_modal_open: false,
-            log_files_modal_selected: 0,
             log_wrap_enabled: false,
             log_zoom_enabled: false,
             #[cfg(feature = "tui")]
@@ -1201,7 +1365,6 @@ impl AppState {
             ops_list_state: std::cell::RefCell::new(ratatui::widgets::ListState::default()),
             #[cfg(not(feature = "tui"))]
             ops_list_state: std::cell::RefCell::new(()),
-            show_help: false,
 
             settings_editor: crate::settings_editor::SettingsEditor::default(),
 
@@ -1883,11 +2046,10 @@ mod tests {
 
     #[test]
     fn test_navigator_completions_filtering() {
-        let mut nav = CommandNavigator::default();
         let tools = vec!["cargo_build".to_string()];
 
         // When input is empty, should return all builtins (including /quit, but NOT /q) plus dynamic tools
-        nav.open(&tools);
+        let mut nav = CommandNavigator::opened(&tools);
         assert!(nav.completions.iter().any(|c| c.command == "/quit"));
         assert!(!nav.completions.iter().any(|c| c.command == "/q"));
         assert!(
@@ -1936,5 +2098,54 @@ mod tests {
         nav.refresh_completions(&tools);
         assert!(!nav.completions.iter().any(|c| c.command == "/q"));
         assert!(nav.completions.iter().any(|c| c.command == "/quit"));
+    }
+
+    /// SPEC R23: at most one user overlay is open at a time. Opening a second
+    /// overlay replaces the first; the projection accessors agree with the
+    /// active variant and report `None` for every other overlay.
+    #[test]
+    fn modal_state_is_mutually_exclusive() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        assert!(!s.modal_open());
+
+        // Opening the help screen.
+        s.modal = ModalState::Help;
+        assert!(s.is_help_open());
+        assert!(s.navigator().is_none());
+        assert!(s.palette().is_none());
+
+        // Opening the navigator replaces help — both are never open at once.
+        s.modal = ModalState::Navigator(CommandNavigator::opened(&[]));
+        assert!(!s.is_help_open());
+        assert!(s.navigator().is_some());
+        assert!(s.text_entry_modal_open());
+
+        // Opening the log-file switcher replaces the navigator.
+        s.open_log_files_modal(2);
+        assert!(s.navigator().is_none());
+        assert_eq!(s.log_files_selected(), Some(2));
+        assert!(!s.text_entry_modal_open());
+
+        // Closing returns to the no-overlay state.
+        s.close_modal();
+        assert!(!s.modal_open());
+        assert_eq!(s.log_files_selected(), None);
+    }
+
+    /// `take_*_picker` extracts the picker and closes the modal; calling it for
+    /// the wrong picker leaves the modal untouched.
+    #[test]
+    fn take_picker_extracts_and_closes() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        s.modal = ModalState::ProviderPicker(PickerState::new("p", vec!["a".into()]));
+
+        // Wrong picker: no extraction, modal preserved.
+        assert!(s.take_model_picker().is_none());
+        assert!(s.provider_picker().is_some());
+
+        // Right picker: extracted and modal closed.
+        let picker = s.take_provider_picker();
+        assert!(picker.is_some());
+        assert!(!s.modal_open());
     }
 }

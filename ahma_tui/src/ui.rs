@@ -30,21 +30,19 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
         Mode::Monitor => draw_monitor_layout(frame, state, theme),
     }
 
-    // Overlays drawn on top of whichever layout is active.
+    // Overlays drawn on top of whichever layout is active. At most one user
+    // overlay is open (SPEC R23); the palette is rendered inline in the layout,
+    // so it is a no-op here.
     let full = frame.area();
-    if state.show_help {
-        draw_help(frame, theme, full);
-    }
-    if state.navigator.visible {
-        draw_navigator(frame, state, theme, full);
-    }
-    if let Some(picker) = &state.provider_picker {
-        draw_picker(frame, picker, theme, full);
-    } else if let Some(picker) = &state.model_picker {
-        draw_picker(frame, picker, theme, full);
-    }
-    if state.log_files_modal_open {
-        draw_log_files_modal(frame, state, theme, full);
+    match &state.modal {
+        crate::state::ModalState::None | crate::state::ModalState::Palette(_) => {}
+        crate::state::ModalState::Help => draw_help(frame, theme, full),
+        crate::state::ModalState::Navigator(_) => draw_navigator(frame, state, theme, full),
+        crate::state::ModalState::ProviderPicker(picker)
+        | crate::state::ModalState::ModelPicker(picker) => draw_picker(frame, picker, theme, full),
+        crate::state::ModalState::LogFiles { .. } => {
+            draw_log_files_modal(frame, state, theme, full)
+        }
     }
     if state.settings_editor.open {
         draw_settings_panel(frame, state, theme, full);
@@ -1147,7 +1145,7 @@ fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     draw_input_box(frame, state, theme, input_a);
     draw_chat_footer(frame, state, theme, footer_a);
 
-    if state.palette.visible {
+    if state.palette().is_some() {
         draw_palette(frame, state, theme, full);
     }
 }
@@ -1204,6 +1202,9 @@ fn navigator_list_items(
 
 #[cfg(feature = "tui")]
 fn draw_navigator(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let Some(nav) = state.navigator() else {
+        return;
+    };
     let w = 64u16.min(area.width);
     let max_items = 12u16;
     let h = (3 + max_items).min(area.height);
@@ -1227,7 +1228,7 @@ fn draw_navigator(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(
         Paragraph::new(Span::styled(
-            format!("/ {}{cursor}", state.navigator.input),
+            format!("/ {}{cursor}", nav.input),
             theme.running(),
         )),
         input_area,
@@ -1241,22 +1242,22 @@ fn draw_navigator(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     render_horizontal_rule(frame, sep_area, state.unicode, theme);
 
     let list_h = inner.height.saturating_sub(2);
-    if list_h == 0 || state.navigator.completions.is_empty() {
+    if list_h == 0 || nav.completions.is_empty() {
         return;
     }
     let list_area = Rect::new(inner.x, inner.y + 2, inner.width, list_h);
 
     let desc_col = (inner.width as usize).saturating_sub(32).max(20);
     let items = navigator_list_items(
-        &state.navigator.completions,
-        state.navigator.selected,
+        &nav.completions,
+        nav.selected,
         desc_col,
         inner.width as usize,
         list_h as usize,
         theme,
     );
 
-    let mut list_state = ListState::default().with_selected(Some(state.navigator.selected));
+    let mut list_state = ListState::default().with_selected(Some(nav.selected));
     frame.render_stateful_widget(
         List::new(items).highlight_style(theme.selected_item()),
         list_area,
@@ -2250,6 +2251,7 @@ fn build_log_file_list_item(
 
 #[cfg(feature = "tui")]
 fn draw_log_files_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let selected = state.log_files_selected().unwrap_or(0);
     let popup = centered_rect(70, 15, area);
     frame.render_widget(Clear, popup);
 
@@ -2265,7 +2267,7 @@ fn draw_log_files_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area
 
     // Item 0: System Logs
     let is_active = state.active_log_file.is_none();
-    let is_selected = state.log_files_modal_selected == 0;
+    let is_selected = selected == 0;
     let style = if is_selected {
         theme.normal().bg(Color::Cyan).fg(Color::Black)
     } else {
@@ -2281,7 +2283,7 @@ fn draw_log_files_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area
     // Item 1..N: Log Files
     for (i, f) in state.log_files.iter().enumerate() {
         let is_active = state.active_log_file.as_ref() == Some(&f.name);
-        let is_selected = state.log_files_modal_selected == i + 1;
+        let is_selected = selected == i + 1;
         items.push(build_log_file_list_item(f, is_active, is_selected, theme));
     }
 
@@ -2706,6 +2708,9 @@ fn palette_list_items(
 
 #[cfg(feature = "tui")]
 fn draw_palette(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let Some(palette) = state.palette() else {
+        return;
+    };
     let w = 60u16.min(area.width);
     let max_items = 10u16;
     let h = (3 + max_items).min(area.height);
@@ -2726,14 +2731,14 @@ fn draw_palette(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
 
     // Input line with blinking cursor illusion
     let cursor = overlay_bar_cursor(state.unicode);
-    let input_display = format!("> {}{cursor}", state.palette.input);
+    let input_display = format!("> {}{cursor}", palette.input);
     let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(
         Paragraph::new(Span::styled(input_display, theme.running())),
         input_area,
     );
 
-    if inner.height < 3 || state.palette.completions.is_empty() {
+    if inner.height < 3 || palette.completions.is_empty() {
         return;
     }
 
@@ -2747,14 +2752,13 @@ fn draw_palette(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
     let list_area = Rect::new(inner.x, inner.y + 2, inner.width, list_h);
 
     let items = palette_list_items(
-        &state.palette.completions,
-        state.palette.selected_completion,
+        &palette.completions,
+        palette.selected_completion,
         list_h as usize,
         theme,
     );
 
-    let mut list_state =
-        ListState::default().with_selected(Some(state.palette.selected_completion));
+    let mut list_state = ListState::default().with_selected(Some(palette.selected_completion));
     let list = List::new(items).highlight_style(theme.selected_item());
     frame.render_stateful_widget(list, list_area, &mut list_state);
 }
