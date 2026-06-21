@@ -53,6 +53,23 @@ impl OperationStatus {
     }
 }
 
+impl ahma_common::state_machine::FsmState for OperationStatus {
+    fn name(&self) -> &'static str {
+        match self {
+            OperationStatus::Pending => "Pending",
+            OperationStatus::InProgress => "InProgress",
+            OperationStatus::Completed => "Completed",
+            OperationStatus::Failed => "Failed",
+            OperationStatus::Cancelled => "Cancelled",
+            OperationStatus::TimedOut => "TimedOut",
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        OperationStatus::is_terminal(self)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Information about a running operation
 pub struct Operation {
@@ -143,6 +160,33 @@ impl Operation {
             alerts: Vec::new(),
             output_file: None,
         }
+    }
+
+    /// Attempt the standard lifecycle transition into `next` (SPEC R23).
+    ///
+    /// This is the single guarded entry point for changing an operation's state.
+    /// It enforces the monitor's core invariant — **the first terminal writer
+    /// wins** — by rejecting any transition out of an already-terminal state
+    /// (returning [`InvalidTransition`]) rather than silently overwriting it. On
+    /// success it sets the state and, for a terminal target, stamps `end_time`.
+    /// Transition-specific side effects (result payload, cancellation-token
+    /// signalling, history move) remain the caller's responsibility.
+    fn try_transition(
+        &mut self,
+        next: OperationStatus,
+    ) -> Result<(), ahma_common::state_machine::InvalidTransition> {
+        use ahma_common::state_machine::FsmState;
+        if self.state.is_terminal() {
+            return Err(ahma_common::state_machine::InvalidTransition {
+                from: self.state.name(),
+                action: next.name(),
+            });
+        }
+        self.state = next;
+        if next.is_terminal() {
+            self.end_time = Some(SystemTime::now());
+        }
+        Ok(())
     }
 
     /// Subscribe to the completion channel.
@@ -401,14 +445,13 @@ impl OperationMonitor {
         let Some(op) = ops.get_mut(id) else {
             return;
         };
-        if op.state.is_terminal() {
+        // First terminal writer wins; a concurrent transition already finished.
+        if op.try_transition(OperationStatus::TimedOut).is_err() {
             return;
         }
 
         tracing::warn!("Timing out operation: {} - {}", id, reason);
 
-        op.state = OperationStatus::TimedOut;
-        op.end_time = Some(SystemTime::now());
         op.cancellation_token.cancel();
         op.result = Some(serde_json::json!({
             "timed_out": true,
@@ -455,11 +498,12 @@ impl OperationMonitor {
         let mut updated_op = None;
 
         if let Some(op) = ops.get_mut(id) {
-            // Guard: never overwrite an already-terminal state.  Terminal ops are removed
-            // from the active map immediately, so if one is still present here a concurrent
-            // transition must be in flight.  The first terminal writer wins; subsequent
-            // attempts become a no-op with a debug trace rather than silently corrupting state.
-            if op.state.is_terminal() {
+            // Guard via the single lifecycle entry point: the first terminal
+            // writer wins. Terminal ops are removed from the active map
+            // immediately, so if one is still present here a concurrent
+            // transition must be in flight; rejecting keeps state uncorrupted.
+            let from = op.state;
+            if op.try_transition(status).is_err() {
                 tracing::debug!(
                     "update_status: ignoring {:?} for op {} — already terminal ({:?})",
                     status,
@@ -469,17 +513,10 @@ impl OperationMonitor {
                 return;
             }
 
-            tracing::debug!(
-                "Updating operation {} from {:?} to {:?}",
-                id,
-                op.state,
-                status
-            );
-            op.state = status;
+            tracing::debug!("Updating operation {} from {:?} to {:?}", id, from, status);
             op.result = result;
 
             if status.is_terminal() {
-                op.end_time = Some(SystemTime::now());
                 operation_to_move = ops.remove(id);
             } else {
                 updated_op = Some(op.clone());
@@ -510,7 +547,9 @@ impl OperationMonitor {
             return false;
         };
 
-        if op.state.is_terminal() {
+        // First terminal writer wins: refuse to cancel an already-terminal op.
+        let from = op.state;
+        if op.try_transition(OperationStatus::Cancelled).is_err() {
             tracing::warn!("Attempted to cancel already terminal operation: {}", id);
             return false;
         }
@@ -520,11 +559,9 @@ impl OperationMonitor {
             "CANCEL_OPERATION_WITH_REASON: id='{}', reason={:?}, current_state={:?}",
             id,
             reason,
-            op.state
+            from
         );
 
-        op.state = OperationStatus::Cancelled;
-        op.end_time = Some(SystemTime::now());
         op.cancellation_token.cancel();
         op.result = Some(build_cancellation_result(reason));
 

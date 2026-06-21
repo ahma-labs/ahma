@@ -238,13 +238,11 @@ pub struct Sandbox {
     /// `cargo check` and preventing cross-process file-lock contention.
     /// Default `false`.
     pub(super) separate_cargo_target: bool,
-    /// When true, roots/list was successfully received from the client.
-    pub(super) roots_received: std::sync::atomic::AtomicBool,
-    /// One-shot latch: set the first time the sandbox scope is committed (locked)
-    /// from client roots or pre-configured scopes. Once set, the scope is
-    /// immutable and MUST NOT be re-derived or widened by a subsequent
-    /// `roots/list` / `roots/list_changed` (SPEC R5.1 / R5.1.1 / R5.2.2).
-    pub(super) committed: std::sync::atomic::AtomicBool,
+    /// The scope commit latch and roots-received flag, modeled as an explicit
+    /// state machine (SPEC R23). Owns the one-shot lock semantics and the memory
+    /// ordering that the commit decision must not be reordered past the scopes
+    /// write (SPEC R5.1 / R5.1.1 / R5.2.2).
+    pub(super) scope_lock: super::scope_lock::ScopeLock,
 }
 
 impl Clone for Sandbox {
@@ -260,13 +258,7 @@ impl Clone for Sandbox {
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
             separate_cargo_target: self.separate_cargo_target,
-            roots_received: std::sync::atomic::AtomicBool::new(
-                self.roots_received
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            committed: std::sync::atomic::AtomicBool::new(
-                self.committed.load(std::sync::atomic::Ordering::Relaxed),
-            ),
+            scope_lock: self.scope_lock.clone(),
         }
     }
 }
@@ -284,16 +276,7 @@ impl std::fmt::Debug for Sandbox {
             .field("livelog", &self.livelog)
             .field("package_cache_write", &self.package_cache_write)
             .field("separate_cargo_target", &self.separate_cargo_target)
-            .field(
-                "roots_received",
-                &self
-                    .roots_received
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            )
-            .field(
-                "committed",
-                &self.committed.load(std::sync::atomic::Ordering::Relaxed),
-            )
+            .field("scope_lock", &self.scope_lock)
             .finish()
     }
 }
@@ -331,8 +314,7 @@ impl Sandbox {
             livelog,
             package_cache_write: true,
             separate_cargo_target: false,
-            roots_received: std::sync::atomic::AtomicBool::new(true),
-            committed: std::sync::atomic::AtomicBool::new(false),
+            scope_lock: super::scope_lock::ScopeLock::new(true),
         })
     }
 
@@ -436,21 +418,24 @@ impl Sandbox {
 
     /// Set whether roots have been received.
     pub fn set_roots_received(&self, received: bool) {
-        self.roots_received
-            .store(received, std::sync::atomic::Ordering::Relaxed);
+        self.scope_lock.set_roots_received(received);
     }
 
     /// Return true if roots have been received.
     pub fn roots_received(&self) -> bool {
-        self.roots_received
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.scope_lock.roots_received()
+    }
+
+    /// The current observable state of the sandbox scope lock (SPEC R23).
+    pub fn lock_state(&self) -> super::scope_lock::ScopeLockState {
+        self.scope_lock.state()
     }
 
     /// Returns true once the sandbox scope has been committed (locked). After
     /// this, the scope is immutable and must not be re-derived from a later
     /// `roots/list` / `roots/list_changed` (SPEC R5.1 / R5.2.2).
     pub fn is_committed(&self) -> bool {
-        self.committed.load(std::sync::atomic::Ordering::Acquire)
+        self.scope_lock.is_committed()
     }
 
     /// Atomically claim the one-shot scope commit. Returns `true` for the single
@@ -459,14 +444,7 @@ impl Sandbox {
     /// a tolerated no-op rather than widening the locked sandbox (SPEC R5.1.1).
     #[must_use]
     pub fn try_commit(&self) -> bool {
-        self.committed
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            )
-            .is_ok()
+        self.scope_lock.try_commit()
     }
 
     /// Check if the sandbox is in test mode.
