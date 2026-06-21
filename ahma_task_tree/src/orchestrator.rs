@@ -13,7 +13,7 @@ use ahma_mcp::sandbox::Sandbox;
 use crate::config::TaskTreeConfig;
 use crate::parser::parse_steps;
 use crate::prompt::{build_planning_prompt, build_summarisation_prompt};
-use crate::tree::{NodeId, NodeResult, NodeState, TaskTree, TaskType};
+use crate::tree::{NodeId, NodeResult, TaskTree, TaskType};
 
 pub struct TaskTreeOrchestrator {
     config: TaskTreeConfig,
@@ -81,7 +81,9 @@ impl TaskTreeOrchestrator {
 
             {
                 let n = tree.get_node_mut(node_id).unwrap();
-                n.state = NodeState::Running;
+                if let Err(e) = n.start() {
+                    warn!(node = node_id.0, %e, "Unexpected node state transition");
+                }
             }
 
             let result = match &node.node_type {
@@ -99,16 +101,16 @@ impl TaskTreeOrchestrator {
                 }
             }?;
 
-            let state = if result.success {
-                NodeState::Completed
-            } else {
-                NodeState::Failed
-            };
-
             {
                 let n = tree.get_node_mut(node_id).unwrap();
-                n.state = state;
-                n.result = Some(result.clone());
+                let outcome = if result.success {
+                    n.complete(result.clone())
+                } else {
+                    n.fail(result.clone())
+                };
+                if let Err(e) = outcome {
+                    warn!(node = node_id.0, %e, "Unexpected node state transition");
+                }
             }
 
             Ok(result)
@@ -192,9 +194,10 @@ impl TaskTreeOrchestrator {
                     "Retrying child node {} (attempt {}/{})",
                     child_id.0, retry, max_retries
                 );
-                if let Some(child_node) = tree.get_node_mut(child_id) {
-                    child_node.retry_count = retry;
-                    child_node.state = NodeState::Created;
+                if let Some(child_node) = tree.get_node_mut(child_id)
+                    && let Err(e) = child_node.reset_for_retry(retry)
+                {
+                    warn!(node = child_id.0, %e, "Unexpected node state transition");
                 }
             }
 
@@ -490,8 +493,10 @@ impl TaskTreeOrchestrator {
         };
 
         // Mark parent planning node state as Backtracking
-        if let Some(n) = tree.get_node_mut(node_id) {
-            n.state = NodeState::Backtracking;
+        if let Some(n) = tree.get_node_mut(node_id)
+            && let Err(e) = n.begin_backtracking()
+        {
+            warn!(node = node_id.0, %e, "Unexpected node state transition");
         }
 
         let branch_context = self.build_branch_context(tree, node_id);
@@ -566,9 +571,11 @@ impl TaskTreeOrchestrator {
 
         queue.extend(new_child_ids);
 
-        // Reset parent node state to Running
-        if let Some(n) = tree.get_node_mut(node_id) {
-            n.state = NodeState::Running;
+        // Resume parent node: Backtracking -> Running
+        if let Some(n) = tree.get_node_mut(node_id)
+            && let Err(e) = n.start()
+        {
+            warn!(node = node_id.0, %e, "Unexpected node state transition");
         }
 
         Ok(true)
@@ -1061,9 +1068,10 @@ mod tests {
         assert!(context1.contains("root goal"));
         assert!(!context1.contains("Completed Sibling"));
 
-        // Set step 1 outcome
+        // Set step 1 outcome (test shortcut: force the terminal state directly
+        // rather than driving the full Created -> Running -> Completed path).
         if let Some(node) = tree.get_node_mut(step1_id) {
-            node.state = NodeState::Completed;
+            node.state = crate::tree::NodeState::Completed;
             node.result = Some(NodeResult {
                 exit_code: Some(0),
                 stdout: "Build ok".to_string(),
