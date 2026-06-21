@@ -29,5 +29,14 @@ rustflags = ["-C", "linker=rust-lld", "--cfg", "reqwest_unstable"]
 jobs = 4
 # Enable reqwest's unstable HTTP/3 (QUIC) feature.
 rustflags = ["--cfg", "reqwest_unstable"]
+# Neutralize any globally-configured rustc wrapper (e.g. sccache in
+# ~/.cargo/config.toml). ahma is frequently built *inside* its own Seatbelt
+# sandbox (scope = the workspace). sccache stores cached compiler outputs in
+# ~/Library/Caches/Mozilla.sccache, outside that scope, and copying them into
+# target/ is denied by the kernel with "Operation not permitted (os error 1)",
+# breaking `cargo build`/`nextest`. An empty wrapper overrides the inherited
+# value so sandboxed builds work. Project config has higher precedence than the
+# user-global config, so this takes effect for this repo only.
+rustc-wrapper = ""
 
 
