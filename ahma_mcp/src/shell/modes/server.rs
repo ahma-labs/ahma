@@ -413,51 +413,7 @@ async fn handle_version_checks(
     let same_build = bridge_build_id.is_none_or(|bid| bid == client_build_id);
 
     if same_semver && same_build {
-        tracing::info!(
-            "Local bridge server is already running (v{bridge_version_raw}). Forwarding stdio as a proxy client."
-        );
-        let proxy_result =
-            crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
-                .await;
-        return match proxy_result {
-            Ok(true) => {
-                // Bridge responded normally — this was a real MCP session that ended cleanly.
-                Ok(Some(()))
-            }
-            result => {
-                // Proxy failed (Err) OR the bridge closed the connection before sending any
-                // response (Ok(false)).  Both indicate a stale / incompatible bridge daemon
-                // that happens to report the same version string.
-                if let Err(ref e) = result {
-                    tracing::warn!(
-                        bridge_version = %bridge_version_raw,
-                        error = %e,
-                        "Proxy to same-version bridge failed; bridge may be stale"
-                    );
-                } else {
-                    tracing::warn!(
-                        bridge_version = %bridge_version_raw,
-                        "Proxy to same-version bridge exited without forwarding any bridge \
-                         response; bridge may be stale (same semver, incompatible binary)"
-                    );
-                }
-                if std::env::var("AHMA_RESTARTED").is_err() {
-                    tracing::info!(
-                        "Triggering bridge restart and falling back to fresh bridge spawn..."
-                    );
-                    restart_bridge_server(socket_path_opt, http_url_opt).await;
-                    // Return Ok(None) so run_server_mode proceeds to spawn a fresh bridge
-                    // and connect to it.
-                    Ok(None)
-                } else {
-                    Err(anyhow::anyhow!(
-                        "Proxy to same-version bridge (v{bridge_version_raw}) failed after \
-                         restart attempt. Please restart ahma manually: \
-                         `pkill -f 'ahma serve'` then restart your IDE."
-                    ))
-                }
-            }
-        };
+        return proxy_to_matching_bridge(socket_path_opt, http_url_opt, &bridge_version_raw).await;
     }
 
     let c_ver = parse_version(client_semver);
@@ -471,6 +427,80 @@ async fn handle_version_checks(
     // version; treat it as stale (client binary is "newer" in intent).
     let client_is_newer = client_is_newer || (same_semver && !same_build);
 
+    reconcile_version_mismatch(
+        socket_path_opt,
+        http_url_opt,
+        client_version,
+        &bridge_version_raw,
+        client_is_newer,
+    )
+    .await
+}
+
+/// Bridge reports the same semver and build-id as the client: forward stdio to it as a
+/// proxy client. If the proxy fails, or the bridge closed without forwarding any response,
+/// the daemon is stale — restart it once and fall back to a fresh spawn (`Ok(None)`), or
+/// error out if a restart was already attempted in this lineage.
+async fn proxy_to_matching_bridge(
+    socket_path_opt: Option<&str>,
+    http_url_opt: Option<&str>,
+    bridge_version_raw: &str,
+) -> Result<Option<()>> {
+    tracing::info!(
+        "Local bridge server is already running (v{bridge_version_raw}). Forwarding stdio as a proxy client."
+    );
+    let proxy_result =
+        crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt).await;
+    match proxy_result {
+        // Bridge responded normally — this was a real MCP session that ended cleanly.
+        Ok(true) => Ok(Some(())),
+        result => {
+            // Proxy failed (Err) OR the bridge closed the connection before sending any
+            // response (Ok(false)).  Both indicate a stale / incompatible bridge daemon
+            // that happens to report the same version string.
+            if let Err(ref e) = result {
+                tracing::warn!(
+                    bridge_version = %bridge_version_raw,
+                    error = %e,
+                    "Proxy to same-version bridge failed; bridge may be stale"
+                );
+            } else {
+                tracing::warn!(
+                    bridge_version = %bridge_version_raw,
+                    "Proxy to same-version bridge exited without forwarding any bridge \
+                     response; bridge may be stale (same semver, incompatible binary)"
+                );
+            }
+            if std::env::var("AHMA_RESTARTED").is_err() {
+                tracing::info!(
+                    "Triggering bridge restart and falling back to fresh bridge spawn..."
+                );
+                restart_bridge_server(socket_path_opt, http_url_opt).await;
+                // Return Ok(None) so run_server_mode proceeds to spawn a fresh bridge
+                // and connect to it.
+                Ok(None)
+            } else {
+                Err(anyhow::anyhow!(
+                    "Proxy to same-version bridge (v{bridge_version_raw}) failed after \
+                     restart attempt. Please restart ahma manually: \
+                     `pkill -f 'ahma serve'` then restart your IDE."
+                ))
+            }
+        }
+    }
+}
+
+/// Bridge semver/build differs from the client. When the client is newer, restart the
+/// bridge (unless a restart already ran this lineage, which would risk a respawn storm).
+/// When the client is older, re-exec into the matching binary, or error if we already did.
+/// Returns `Ok(None)` so the caller proceeds to spawn/connect to a fresh bridge.
+async fn reconcile_version_mismatch(
+    socket_path_opt: Option<&str>,
+    http_url_opt: Option<&str>,
+    client_version: &str,
+    bridge_version_raw: &str,
+    client_is_newer: bool,
+) -> Result<Option<()>> {
     if client_is_newer {
         if std::env::var("AHMA_RESTARTED").is_ok() {
             // We already restarted once in this lineage. A *persistent*

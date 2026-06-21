@@ -716,66 +716,74 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
     }
 
     if installed_count > 0 && !active_mcps.is_empty() {
-        println!(
-            "\n\x1b[36mnote\x1b[0m\x1b[1m: terminal hooks and an MCP server are both active for \"ahma\" — this is supported\x1b[0m"
-        );
-        println!(
-            "      The two are \x1b[1mcomplementary\x1b[0m, not redundant. They sandbox different"
-        );
-        println!("      command streams:");
-        println!(
-            "        \x1b[1m• MCP server\x1b[0m   — the named, async tools the agent calls explicitly"
-        );
-        println!("                         (run_terminal_command, file-tools, git, …) with output");
-        println!("                         capture, monitoring and concurrency.");
-        println!(
-            "        \x1b[1m• terminal hooks\x1b[0m — transparently sandbox the shell commands the agent"
-        );
-        println!(
-            "                         runs through its NATIVE terminal/Bash tool, which never"
-        );
-        println!("                         pass through MCP. Without hooks those run unsandboxed.");
-        println!("      Together they give full sandbox coverage. A command is only ever wrapped");
-        println!("      once (already-wrapped and MCP tool calls are passed through untouched).");
-        println!();
-        println!("  \x1b[1mactive terminal hooks:\x1b[0m");
-        for (platform, scope, path) in &installed_hooks {
-            println!(
-                "    - {} ({} scope) at {}",
-                platform.label(),
-                scope.label(),
-                path.display()
-            );
-        }
-        println!();
-        println!("  \x1b[1mactive MCP configurations:\x1b[0m");
-        for path in &active_mcps {
-            println!("    - {}", path.display());
-        }
-        println!();
-        println!(
-            "  \x1b[1mtradeoff\x1b[0m: hooks add a small per-command sandbox cold-start. If your agent only"
-        );
-        println!(
-            "            uses ahma's MCP tools and never its native terminal, you can drop hooks:"
-        );
-
-        let has_user = installed_hooks
-            .iter()
-            .any(|(_, s, _)| *s == HookScope::User);
-        let has_project = installed_hooks
-            .iter()
-            .any(|(_, s, _)| *s == HookScope::Project);
-        if has_user {
-            println!("              ahma hooks uninstall --scope user");
-        }
-        if has_project {
-            println!("              ahma hooks uninstall --scope project");
-        }
-        println!();
+        print_hooks_mcp_coexistence_note(&installed_hooks, &active_mcps);
     }
 
     Ok(())
+}
+
+/// Print the explanatory note shown when terminal hooks AND an ahma MCP server are
+/// both active. Split out of [`run_status`] so that function stays focused on
+/// gathering state; this is pure presentation with no branching logic of its own.
+fn print_hooks_mcp_coexistence_note(
+    installed_hooks: &[(HookPlatform, HookScope, PathBuf)],
+    active_mcps: &[PathBuf],
+) {
+    println!(
+        "\n\x1b[36mnote\x1b[0m\x1b[1m: terminal hooks and an MCP server are both active for \"ahma\" — this is supported\x1b[0m"
+    );
+    println!(
+        "      The two are \x1b[1mcomplementary\x1b[0m, not redundant. They sandbox different"
+    );
+    println!("      command streams:");
+    println!(
+        "        \x1b[1m• MCP server\x1b[0m   — the named, async tools the agent calls explicitly"
+    );
+    println!("                         (run_terminal_command, file-tools, git, …) with output");
+    println!("                         capture, monitoring and concurrency.");
+    println!(
+        "        \x1b[1m• terminal hooks\x1b[0m — transparently sandbox the shell commands the agent"
+    );
+    println!("                         runs through its NATIVE terminal/Bash tool, which never");
+    println!("                         pass through MCP. Without hooks those run unsandboxed.");
+    println!("      Together they give full sandbox coverage. A command is only ever wrapped");
+    println!("      once (already-wrapped and MCP tool calls are passed through untouched).");
+    println!();
+    println!("  \x1b[1mactive terminal hooks:\x1b[0m");
+    for (platform, scope, path) in installed_hooks {
+        println!(
+            "    - {} ({} scope) at {}",
+            platform.label(),
+            scope.label(),
+            path.display()
+        );
+    }
+    println!();
+    println!("  \x1b[1mactive MCP configurations:\x1b[0m");
+    for path in active_mcps {
+        println!("    - {}", path.display());
+    }
+    println!();
+    println!(
+        "  \x1b[1mtradeoff\x1b[0m: hooks add a small per-command sandbox cold-start. If your agent only"
+    );
+    println!(
+        "            uses ahma's MCP tools and never its native terminal, you can drop hooks:"
+    );
+
+    let has_user = installed_hooks
+        .iter()
+        .any(|(_, s, _)| *s == HookScope::User);
+    let has_project = installed_hooks
+        .iter()
+        .any(|(_, s, _)| *s == HookScope::Project);
+    if has_user {
+        println!("              ahma hooks uninstall --scope user");
+    }
+    if has_project {
+        println!("              ahma hooks uninstall --scope project");
+    }
+    println!();
 }
 
 fn run_exec(args: HooksExecArgs) -> Result<()> {
