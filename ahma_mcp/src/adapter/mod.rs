@@ -185,6 +185,12 @@ pub struct Adapter {
     pub shell_sessions: Arc<crate::shell_session::ShellSessionManager>,
     /// Configurable per-(group, directory) command serialisation registry.
     pub mutex_registry: Arc<CommandMutexRegistry>,
+    /// Optional sink for auto-detected sandbox scope violations. When set, an
+    /// out-of-scope path (rejected up front, or surfaced by a stderr denial) raises
+    /// a "grant access to X?" prompt through this notifier. `None` disables
+    /// detection (the default). The notifier only *persists* an approved grant — it
+    /// never widens the live session (SPEC R5).
+    scope_grant_notifier: Option<Arc<dyn sandbox::ScopeGrantNotifier>>,
 }
 
 impl Adapter {
@@ -236,6 +242,7 @@ impl Adapter {
             )),
             shell_sessions: crate::shell_session::ShellSessionManager::new(),
             mutex_registry,
+            scope_grant_notifier: None,
         })
     }
 
@@ -273,6 +280,46 @@ impl Adapter {
     pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
         self.retry_config = Some(config);
         self
+    }
+
+    /// Sets the scope-grant notifier that auto-detected violations are routed to.
+    ///
+    /// With a notifier installed, an out-of-scope path rejected by validation, or a
+    /// stderr denial from a sandboxed command, raises a "grant access to X?" prompt.
+    /// Without one, detection is inert. The notifier never widens the live session;
+    /// an approved grant is persisted for the next server start (SPEC R5).
+    pub fn with_scope_grant_notifier(
+        mut self,
+        notifier: Arc<dyn sandbox::ScopeGrantNotifier>,
+    ) -> Self {
+        self.scope_grant_notifier = Some(notifier);
+        self
+    }
+
+    /// Validate a working directory against the sandbox scope, raising a scope-grant
+    /// prompt (best-effort, never blocking the error) when it is rejected as
+    /// out-of-scope. Returns the same `Result` as [`Sandbox::validate_path`] so
+    /// callers keep failing closed.
+    async fn validate_working_dir(
+        &self,
+        working_dir: &str,
+        tool: &str,
+    ) -> Result<std::path::PathBuf> {
+        match self
+            .sandbox
+            .validate_path(std::path::Path::new(working_dir))
+        {
+            Ok(p) => Ok(p),
+            Err(e) => {
+                sandbox::grant_channel::notify_pre_exec(
+                    self.scope_grant_notifier.as_ref(),
+                    &e,
+                    tool,
+                )
+                .await;
+                Err(e)
+            }
+        }
     }
 
     /// Returns the retry configuration, if set.
@@ -359,9 +406,7 @@ impl Adapter {
         );
 
         // Validate working directory against sandbox scope.
-        let safe_wd = self
-            .sandbox
-            .validate_path(std::path::Path::new(working_dir))?;
+        let safe_wd = self.validate_working_dir(working_dir, command).await?;
 
         let (program, args_vec) = self
             .prepare_command_and_args(command, args.as_ref(), subcommand_config, &safe_wd)
@@ -425,6 +470,18 @@ impl Adapter {
             Ok(Ok(output)) => output,
         };
 
+        // A non-zero exit may be a runtime sandbox denial the kernel did not name;
+        // scan stderr and (best-effort, never blocking the result) offer to grant
+        // an out-of-scope path it references.
+        if !output.status.success() {
+            sandbox::grant_channel::notify_stderr_denial(
+                &self.sandbox,
+                self.scope_grant_notifier.as_ref(),
+                &String::from_utf8_lossy(&output.stderr),
+                command,
+            )
+            .await;
+        }
         interpret_sync_command_output(output)
     }
 
@@ -534,9 +591,7 @@ impl Adapter {
         } = options;
 
         // Validate working directory against sandbox scope.
-        let safe_wd = self
-            .sandbox
-            .validate_path(std::path::Path::new(working_dir))?;
+        let safe_wd = self.validate_working_dir(working_dir, tool_name).await?;
         let safe_wd_str = safe_wd.to_string_lossy().into_owned();
 
         // Validate command arguments
@@ -588,6 +643,7 @@ impl Adapter {
             command_executor: self.command_executor.clone(),
             output_optimizer: self.output_optimizer.clone(),
             mutex_registry: self.mutex_registry.clone(),
+            scope_grant_notifier: self.scope_grant_notifier.clone(),
         }));
 
         // Store the handle for graceful shutdown
@@ -613,9 +669,7 @@ impl Adapter {
         timeout: Option<u64>,
         id: Option<String>,
     ) -> Result<String> {
-        let safe_wd = self
-            .sandbox
-            .validate_path(std::path::Path::new(working_dir))?;
+        let safe_wd = self.validate_working_dir(working_dir, tool_name).await?;
         let op_id = id.unwrap_or_else(|| generate_id(tool_name, command_str));
 
         let mut operation = Operation::new_with_timeout(
@@ -678,9 +732,7 @@ impl Adapter {
         timeout: Option<u64>,
         id: Option<String>,
     ) -> Result<String> {
-        let safe_wd = self
-            .sandbox
-            .validate_path(std::path::Path::new(working_dir))?;
+        let safe_wd = self.validate_working_dir(working_dir, tool_name).await?;
         let op_id = id.unwrap_or_else(|| generate_id(tool_name, command_str));
 
         let mut operation = Operation::new_with_timeout(
@@ -806,6 +858,7 @@ struct AsyncOperationRun {
     command_executor: Arc<dyn executor::CommandExecutor>,
     output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     mutex_registry: Arc<CommandMutexRegistry>,
+    scope_grant_notifier: Option<Arc<dyn sandbox::ScopeGrantNotifier>>,
 }
 
 async fn run_async_operation(ctx: AsyncOperationRun) {
@@ -824,6 +877,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         command_executor,
         output_optimizer,
         mutex_registry,
+        scope_grant_notifier,
     } = ctx;
 
     let cancellation_token = match monitor.get_operation(&op_id).await {
@@ -924,6 +978,9 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         start_time,
         &monitor,
         &output_optimizer,
+        &sandbox,
+        scope_grant_notifier.as_ref(),
+        &command,
     )
     .await;
 
@@ -1152,6 +1209,9 @@ async fn execute_with_streaming(
     start_time: Instant,
     op_monitor: &Arc<OperationMonitor>,
     output_optimizer: &Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
+    sandbox: &Arc<sandbox::Sandbox>,
+    scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
+    tool: &str,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -1272,6 +1332,9 @@ async fn execute_with_streaming(
         &collected_stderr,
         op_monitor,
         op_id,
+        sandbox,
+        scope_grant_notifier,
+        tool,
     )
     .await;
 }
@@ -1316,6 +1379,7 @@ async fn drain_remaining_stream_lines(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize_streaming_operation(
     child: &mut tokio::process::Child,
     start_time: Instant,
@@ -1323,6 +1387,9 @@ async fn finalize_streaming_operation(
     collected_stderr: &BoundedLineCollector,
     op_monitor: &Arc<OperationMonitor>,
     op_id: &str,
+    sandbox: &Arc<sandbox::Sandbox>,
+    scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
+    tool: &str,
 ) {
     let exit_status = child.wait().await;
     let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -1336,6 +1403,19 @@ async fn finalize_streaming_operation(
 
     let stdout_str = collected_stdout.rendered_output();
     let stderr_str = collected_stderr.rendered_output();
+
+    // A failed async command may have hit a runtime sandbox denial the kernel did
+    // not name; scan stderr and (best-effort) offer to grant an out-of-scope path.
+    // This is the async-path twin of the scan in `execute_sync_in_dir`.
+    if !success {
+        sandbox::grant_channel::notify_stderr_denial(
+            sandbox,
+            scope_grant_notifier,
+            &stderr_str,
+            tool,
+        )
+        .await;
+    }
 
     let final_output = json!({
         "stdout": stdout_str,

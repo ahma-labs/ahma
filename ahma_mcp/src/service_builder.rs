@@ -147,12 +147,24 @@ impl<'a> ServiceBuilder<'a> {
             &config.mutex_groups,
         ));
 
-        let adapter = Arc::new(Adapter::new_with_registry(
-            operation_monitor.clone(),
-            shell_pool_manager.clone(),
-            sandbox.clone(),
-            mutex_registry,
-        )?);
+        // Auto-detect sandbox scope violations and surface a "grant access?" prompt.
+        // This PR ships the logging notifier (observable in logs); later PRs plug the
+        // TUI modal and MCP elicitation surfaces into the same shared coordinator.
+        // The coordinator only *persists* an approved grant for the next start — it
+        // never widens the live session (SPEC R5).
+        let grant_notifier: Arc<dyn crate::sandbox::ScopeGrantNotifier> =
+            Arc::new(crate::sandbox::LoggingGrantNotifier::new(Arc::new(
+                ahma_common::scope_grant::GrantCoordinator::new(),
+            )));
+        let adapter = Arc::new(
+            Adapter::new_with_registry(
+                operation_monitor.clone(),
+                shell_pool_manager.clone(),
+                sandbox.clone(),
+                mutex_registry,
+            )?
+            .with_scope_grant_notifier(grant_notifier),
+        );
 
         let raw_configs = load_tool_configs(config, config.tools_dir.as_deref())
             .await

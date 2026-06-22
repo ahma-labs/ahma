@@ -643,6 +643,20 @@ impl Sandbox {
         .into())
     }
 
+    /// Whether `path` resolves to a location inside the current (locked) scopes.
+    ///
+    /// Unlike [`Self::validate_path`], this is **not** relaxed in test mode — it
+    /// answers the real scope-membership question in every mode. Read-only: it
+    /// never mutates scopes. Used by the scope-grant detector to skip denials for
+    /// paths that are already in scope (so it does not offer to "grant" them).
+    pub fn is_path_in_scope(&self, path: &Path) -> bool {
+        let scopes_guard = self.scopes();
+        match self.resolve_path(path, &scopes_guard) {
+            Ok(canonical) => self.is_path_allowed(&canonical, &scopes_guard),
+            Err(_) => false,
+        }
+    }
+
     fn resolve_path(&self, path: &Path, scopes_guard: &[PathBuf]) -> Result<PathBuf> {
         let full_path = if path.is_absolute() {
             path.to_path_buf()

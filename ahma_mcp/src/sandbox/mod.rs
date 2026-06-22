@@ -39,8 +39,10 @@
 
 mod command;
 pub(crate) mod core;
+pub mod denial_scan;
 pub mod display;
 mod error;
+pub mod grant_channel;
 #[cfg(target_os = "linux")]
 mod landlock;
 pub(crate) mod pkg_cache;
@@ -55,8 +57,10 @@ mod windows;
 
 pub use core::Sandbox;
 pub use core::{add_log_exception, is_target_allowed, load_exceptions};
+pub use denial_scan::{DenialHit, scan_denial};
 pub use display::{ScopeSource, ScopeView};
 pub use error::SandboxError;
+pub use grant_channel::{LoggingGrantNotifier, ScopeGrantNotifier};
 #[cfg(target_os = "linux")]
 pub use landlock::{
     apply_landlock_ruleset_in_child, enforce_landlock_sandbox, landlock_ruleset_fd,
