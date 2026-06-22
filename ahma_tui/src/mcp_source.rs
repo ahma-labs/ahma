@@ -77,6 +77,14 @@ pub enum McpSourceCommand {
     SetActiveFile(Option<String>),
     RefreshLogs,
     SetDaemonHealthy(bool),
+    /// Run a shell command inside the sandbox via the daemon's
+    /// `run_terminal_command` tool. Emitted when a human types a `$`/`%`/`!`
+    /// prefix in the chat input. (The unsandboxed `!!` prefix never reaches the
+    /// source — it runs locally in the TUI process.)
+    RunTerminalCommand {
+        command: String,
+        working_dir: String,
+    },
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -183,6 +191,25 @@ async fn mcp_source_task(
                         let interval_secs = if healthy { 10 } else { 3 };
                         status_tick = tokio::time::interval(Duration::from_secs(interval_secs));
                         status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    }
+                    Some(McpSourceCommand::RunTerminalCommand { command, working_dir }) => {
+                        if let Some(ref session) = mcp_state {
+                            if let Err(e) = call_run_terminal_command(
+                                &client, &request_base_url, session, &command, &working_dir,
+                            ).await {
+                                send(&tx, SourceEvent::LogLine(LogEntry {
+                                    timestamp: chrono::Local::now(),
+                                    level: LogLevel::Warn,
+                                    message: format!("Failed to start sandboxed command: {e:#}"),
+                                })).await;
+                            }
+                        } else {
+                            send(&tx, SourceEvent::LogLine(LogEntry {
+                                timestamp: chrono::Local::now(),
+                                level: LogLevel::Warn,
+                                message: "Cannot run command: sandbox session not ready yet".to_string(),
+                            })).await;
+                        }
                     }
                     None => {
                         // The TUI is shutting down.  Delete the MCP session so the bridge
@@ -969,6 +996,58 @@ fn extract_http_base_url(connection: &ResolvedConnection) -> String {
 
 async fn send(tx: &mpsc::Sender<SourceEvent>, event: SourceEvent) {
     let _ = tx.send(event).await; // ignore channel-closed errors
+}
+
+/// Start a sandboxed shell command via the daemon's `run_terminal_command`
+/// tool. The command runs async inside the kernel sandbox and surfaces in the
+/// operations panel on the next status poll, so we only need to confirm the
+/// call was accepted.
+async fn call_run_terminal_command(
+    client: &reqwest::Client,
+    base_url: &str,
+    session: &McpSession,
+    command: &str,
+    working_dir: &str,
+) -> Result<()> {
+    let url = format!("{base_url}/mcp");
+    let req_id = session.next_req_id();
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("command".to_string(), json!(command));
+    if !working_dir.is_empty() {
+        arguments.insert("working_directory".to_string(), json!(working_dir));
+    }
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "method": "tools/call",
+        "params": { "name": "run_terminal_command", "arguments": arguments }
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("mcp-session-id", &session.id)
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "run_terminal_command returned HTTP {}",
+            resp.status()
+        ));
+    }
+
+    let val = resp.json::<Value>().await?;
+    if let Some(err) = val.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(anyhow::anyhow!("{msg}"));
+    }
+    Ok(())
 }
 
 async fn call_logs_list(

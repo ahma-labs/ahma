@@ -1018,56 +1018,111 @@ fn maybe_decompose_goal(
 }
 
 fn maybe_run_cli_command(text: &str, state: &mut crate::state::AppState) -> bool {
-    use crate::llm_bridge::spawn_window_cli_task;
-    use crate::state::TuiWindow;
+    // `!!` — UNSANDBOXED escape hatch. Runs the command locally at the user's
+    // full privilege with NO sandbox. This is permitted ONLY because a human
+    // explicitly typed `!!` into the chat input. LLM/agent turns submit work via
+    // `SubmitPrompt` and never write to this input box, so there is no automated
+    // path to this branch — every invocation is a deliberate human-in-the-loop
+    // action. Must be matched before the single-`!` case it is a prefix of.
+    if let Some(stripped) = text.strip_prefix("!!") {
+        let cmd_str = stripped.trim().to_string();
+        if !cmd_str.is_empty() {
+            run_unsandboxed_command(cmd_str, state);
+        }
+        return true;
+    }
 
-    if let Some(stripped_cmd) = text
+    // `$` / `%` / `!` — sandboxed terminal command. Routed through the daemon's
+    // `run_terminal_command` tool so the kernel sandbox confines writes to the
+    // workspace; the operation then appears in the operations panel.
+    if let Some(stripped) = text
         .strip_prefix('%')
         .or_else(|| text.strip_prefix('$'))
         .or_else(|| text.strip_prefix('!'))
     {
-        let cmd_str = stripped_cmd.trim().to_string();
-        if cmd_str.is_empty() {
-            return true;
+        let cmd_str = stripped.trim().to_string();
+        if !cmd_str.is_empty() {
+            run_sandboxed_command(cmd_str, state);
         }
-        let win_id = state.next_window_id;
-        state.next_window_id = (state.next_window_id + 1) % 100;
+        return true;
+    }
+    false
+}
 
-        let working_dir = state.workspace.clone();
-        let label = format!(
-            "Command: {} in {}",
-            cmd_str,
-            crate::ui::shorten_path(&working_dir, 20)
-        );
+/// Run a command OUTSIDE the sandbox, locally, at full user privilege.
+///
+/// SECURITY: reachable only via the human-typed `!!` prefix (see
+/// [`maybe_run_cli_command`]). Never call this from automated/agent code paths —
+/// it deliberately bypasses the kernel sandbox and is gated on explicit human
+/// intervention for every single command.
+fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) {
+    use crate::llm_bridge::spawn_window_cli_task;
+    use crate::state::{LogEntry, LogLevel, TuiWindow};
 
-        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
-        let w = TuiWindow {
-            id: win_id,
-            label,
-            status: crate::state::WindowStatus::Running,
-            content: vec![],
-            collapsed: false,
-            finished_at: None,
-            is_cli: true,
+    state.push_log(LogEntry {
+        timestamp: chrono::Local::now(),
+        level: LogLevel::Warn,
+        message: format!("UNSANDBOXED command (human-authorized via !!): {cmd_str}"),
+    });
+
+    let win_id = state.next_window_id;
+    state.next_window_id = (state.next_window_id + 1) % 100;
+
+    let working_dir = state.workspace.clone();
+    let label = format!(
+        "UNSANDBOXED: {} in {}",
+        cmd_str,
+        crate::ui::shorten_path(&working_dir, 20)
+    );
+
+    let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
+    let w = TuiWindow {
+        id: win_id,
+        label,
+        status: crate::state::WindowStatus::Running,
+        content: vec![],
+        collapsed: false,
+        finished_at: None,
+        is_cli: true,
+        command: cmd_str.clone(),
+        working_dir: working_dir.clone(),
+        llm_model: None,
+        visible: true,
+        abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(abort_tx))),
+        op_id: None,
+    };
+
+    state.windows.push(w);
+    if state.windows.len() > 100 {
+        state.windows.remove(0);
+    }
+
+    if let Some(tx) = &state.bridge_tx {
+        spawn_window_cli_task(win_id, cmd_str, working_dir, abort_rx, tx.clone());
+    }
+}
+
+/// Run a command INSIDE the sandbox by routing it through the daemon's
+/// `run_terminal_command` tool. The kernel sandbox confines the command to the
+/// workspace; the resulting async operation shows up in the operations panel.
+fn run_sandboxed_command(cmd_str: String, state: &mut crate::state::AppState) {
+    use crate::state::{LogEntry, LogLevel};
+
+    if let Some(tx) = &state.mcp_source_tx {
+        let _ = tx.try_send(crate::mcp_source::McpSourceCommand::RunTerminalCommand {
             command: cmd_str.clone(),
-            working_dir: working_dir.clone(),
-            llm_model: None,
-            visible: true,
-            abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(abort_tx))),
-            op_id: None,
-        };
-
-        state.windows.push(w);
-        if state.windows.len() > 100 {
-            state.windows.remove(0);
-        }
-
-        if let Some(tx) = &state.bridge_tx {
-            spawn_window_cli_task(win_id, cmd_str, working_dir, abort_rx, tx.clone());
-        }
-        true
+            working_dir: state.workspace.clone(),
+        });
+        state.push_log(LogEntry {
+            timestamp: chrono::Local::now(),
+            level: LogLevel::Info,
+            message: format!("Running (sandboxed): {cmd_str}"),
+        });
     } else {
-        false
+        push_assistant_message(
+            state,
+            "No sandbox server connected — cannot run terminal command.",
+        );
     }
 }
 
