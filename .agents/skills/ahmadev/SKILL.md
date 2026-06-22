@@ -8,11 +8,14 @@ description: >
    (/ahmadev land), cut a release (/ahmadev release), hunt a regression
    (/ahmadev bisect), add test coverage where it matters most
    (/ahmadev coverage), update dependencies safely (/ahmadev update), bump the
-   version (/ahmadev bump), install a local build (/ahmadev install), and help
+   version (/ahmadev bump), install a local build (/ahmadev install), configure
+   git for the squash-only workflow (/ahmadev gitconfig), and help
    (/ahmadev help).
    Trigger phrases: "ahmadev", "ahmadev land", "ahmadev release",
    "ahmadev bisect", "ahmadev coverage", "add test coverage", "improve coverage",
    "where do we need tests", "raise coverage", "coverage report", "ahmadev update", "ahmadev help", "land this feature",
+   "ahmadev gitconfig", "configure git", "git setup", "set up git config",
+   "recommended git settings", "git config for ahma",
    "squash merge to main", "open a PR and merge", "merge to main", "ship it",
    "cut a release", "release this", "publish a release", "bump and release",
    "find the regression", "git bisect", "which commit broke", "find what broke",
@@ -57,6 +60,7 @@ Two commands carry the day-to-day loop; the rest are occasional specialists.
 | `/ahmadev coverage` | Read the published coverage summary and add tests where they most reduce reversions (integration tests preferred) |
 | `/ahmadev update` | Upgrade workspace deps that are ≥14 days old and advisory-clean |
 | `/ahmadev install` | Build the working tree in release mode and install it to `~/.local/bin/ahma` (unsigned, for *this* machine — does not ship) |
+| `/ahmadev gitconfig` | Configure git on this machine for the squash-only, linear-history workflow (idempotent `git config` commands; never overwrites your identity/editor). **One-time per machine/checkout.** |
 | `/ahmadev bump [X.Y.Z]` | Bump the version across all version-bearing files. **Building block of `release` — you rarely call it directly** (see note below) |
 
 The intended day-to-day loop is **many small single-feature branches, each squash-merged
@@ -143,6 +147,7 @@ landed behind it. It's a good idea here precisely because:
 /ahmadev coverage  — Read the published coverage summary; add tests where they most reduce reversions
 /ahmadev update    — Upgrade workspace dependencies (safe: ≥14d old, no known advisories)
 /ahmadev install   — Build the working tree (release) and install to ~/.local/bin/ahma (this machine only; unsigned)
+/ahmadev gitconfig — Configure git for the squash-only, linear-history workflow (one-time per machine/checkout)
 /ahmadev bump      — Bump version across version-bearing files (Cargo.toml, Cargo.lock, …) — building block of release
 ```
 
@@ -177,6 +182,23 @@ check (~5 min) passes. The full cross-platform matrix runs *post-merge* on `main
 > landing takes only ~5 min, so the cost is tiny. If you must work ahead, rebase the upper
 > branch onto `origin/main` after the lower one lands:
 > `git rebase --onto origin/main <lower-branch-old-tip> <upper-branch>`.
+
+### Preflight: git-config drift check (read-only — never writes)
+
+Before branching, run this **read-only** check. It only calls `git config --get` (safe inside the
+sandbox, instant, mutates nothing) and nudges the human to run `/ahmadev gitconfig` if their git
+isn't set up for the squash-only, linear-history workflow. It never edits config itself — a drift
+warning is advisory, not a blocker:
+
+```bash
+for kv in pull.ff=only fetch.prune=true rebase.autostash=true; do
+  k=${kv%=*}; want=${kv#*=}; got=$(git config --get "$k" || true)
+  [ "$got" = "$want" ] || echo "⚠ git config $k = '${got:-unset}' (want '$want') — run /ahmadev gitconfig"
+done
+```
+
+If it prints any `⚠` line, surface it to the human and suggest `/ahmadev gitconfig`, then continue
+— don't block the land. If it prints nothing, git is configured; proceed silently.
 
 ### Workflow (how to invoke as an agent)
 
@@ -263,6 +285,12 @@ that tag does not already exist**. So a release = landing a version bump on `mai
 > cleanly under the gate.
 
 ### Workflow (how to invoke as an agent)
+
+0. **Preflight: git-config drift check (read-only).** Run the same read-only drift check as
+   `/ahmadev land` (see its **Preflight** section — `git config --get` on `pull.ff`, `fetch.prune`,
+   `rebase.autostash`). It matters extra here because release does `git pull --ff-only` and
+   `git reset --hard origin/main`; if `pull.ff` isn't `only`, nudge the human to run
+   `/ahmadev gitconfig` first. Advisory, not a blocker.
 
 1. **Land the feature(s)** with `/ahmadev land` (skip if the work is already on `origin/main`).
 
@@ -672,6 +700,138 @@ release build only if you specifically want everything compiled.
   (see the bump section — the version number is the release trigger).
 - No quality pipeline is run here. Run `cargo nextest run` / clippy / fmt as part of your
   normal Definition of Done before relying on the build.
+
+---
+
+## `/ahmadev gitconfig` — Configure Git for the Squash-Only Workflow
+
+### What it does
+
+Sets the handful of git options that make `/ahmadev land`, `release`, and `bisect` run without
+friction, by **emitting idempotent `git config` commands** (and applying the in-repo ones for
+you where the sandbox allows). It is a **one-time** setup, run once per machine (`--global`) or
+once per checkout (`--local`). It is safe to re-run — it only sets keys that are missing or
+different, and **never** touches your identity or editor.
+
+> **Honest framing — ahma does not require any of this.** The ahma MCP server / sandbox reads
+> **no** git config (`~/.gitconfig` is outside the sandbox and the binary never opens it). These
+> settings exist to make *the human + agent git workflow* match how `main` is actually protected:
+> **squash-only merges on a linear history** (see **Gate Model**). Without them nothing breaks —
+> you just hit avoidable papercuts (a `git pull` that makes a merge commit `main` will reject, a
+> stale tracking ref after auto-delete, a rebase that aborts on a dirty tree).
+
+### The settings (and why each one earns its place)
+
+**Tier 1 — workflow-aligned (the reason this command exists):**
+
+| `git config` key | Value | Why it matters here |
+|------------------|-------|---------------------|
+| `pull.ff` | `only` | `main` enforces **linear history**; `land`/`release` do `git pull --ff-only`. This makes a *bare* `git pull` refuse to create the merge commit `main` would reject — fail loud, not silently-wrong. |
+| `fetch.prune` | `true` | `gh pr merge --delete-branch` removes the remote branch; `land` step 7 relies on prune to clear its now-dangling tracking ref so `git branch -D` is clean. |
+| `rebase.autostash` | `true` | The "rebase your feature onto `origin/main`" path won't abort just because the tree is dirty. |
+| `rerere.enabled` | `true` | The workflow does `git revert` and rebases; rerere remembers a conflict resolution and replays it next time (reverts of reverts, re-lands, etc.). |
+| `rerere.autoupdate` | `true` | Stages the remembered resolution automatically, so a replayed conflict needs no re-add. |
+| `merge.conflictstyle` | `zdiff3` | Clearer 3-way conflict markers (shows the common base) during those reverts/rebases. Requires Git ≥ 2.35 — skip on older git (see notes). |
+| `push.autoSetupRemote` | `true` | `git push` on a fresh branch just works without `-u` (the skill passes `-u` explicitly, but this covers ad-hoc pushes). |
+| `commit.verbose` | `true` | Shows the diff in the commit editor. The squash body is built from your commit messages (`squash_merge_commit_message = COMMIT_MESSAGES`) — better messages become the permanent `main` log. |
+
+**Tier 2 — harmless sensible defaults (set them; not ahma-specific):**
+
+| `git config` key | Value | Why |
+|------------------|-------|-----|
+| `init.defaultBranch` | `main` | Matches this repo; only affects *new* `git init`. |
+| `branch.sort` | `-committerdate` | `git branch` lists most-recent first — handy with many short-lived feature branches. |
+| `column.ui` | `auto` | Multi-column `git branch`/`status` output in a terminal. |
+
+**Tier 3 — DO NOT prescribe (verify, never overwrite):**
+
+| Key | Action |
+|-----|--------|
+| `user.name`, `user.email` | **Required for commits, but the values are the human's.** Only *check* they are set; if missing, tell the human to set them (don't invent a value). Never overwrite an existing identity. |
+| `core.editor` | Pure personal preference (nano/vim/code/…). **Leave it entirely alone.** |
+
+### Scope: `--global` vs `--local` (and the sandbox angle)
+
+| Scope | Writes to | Reach | Can ahma apply it itself? |
+|-------|-----------|-------|---------------------------|
+| `--global` *(default)* | `~/.gitconfig` | **all** repos on this machine | **No** — `~/.gitconfig` is outside the workspace sandbox; the human runs the commands in their **native** terminal (prefix each with `!` in this session to run it inline). |
+| `--local` | `<workspace>/.git/config` | this checkout only | **Yes (usually)** — `.git/config` is inside the workspace, so `run_terminal_command` can apply it; fall back to the native terminal if the sandbox blocks the write. |
+
+Default to **`--global`**: the intent is "set up each client computer once" and the Tier-1 settings
+are good defaults for any repo you treat as squash-only. Offer `--local` when the human wants to
+keep their global git untouched (e.g. they deliberately use merge commits elsewhere) — that
+variant is fully applyable from inside the sandbox.
+
+### Workflow (how to invoke as an agent)
+
+1. **Show current vs desired — don't blind-set.** Read what's already configured so the human
+   sees exactly what will change (and that re-running is a no-op):
+
+   ```bash
+   for k in pull.ff fetch.prune rebase.autostash rerere.enabled rerere.autoupdate \
+            merge.conflictstyle push.autoSetupRemote commit.verbose \
+            init.defaultBranch branch.sort column.ui; do
+     printf '%-22s %s\n' "$k" "$(git config --global --get "$k" || echo '(unset)')"
+   done
+   git config --global --get user.name  || echo 'user.name  (unset — you must set this)'
+   git config --global --get user.email || echo 'user.email (unset — you must set this)'
+   ```
+   (Use `--local` instead of `--global` for the per-checkout variant.)
+
+2. **Emit the apply block.** Present the exact commands. These are idempotent — running them
+   again with the same values changes nothing:
+
+   ```bash
+   git config --global pull.ff only
+   git config --global fetch.prune true
+   git config --global rebase.autostash true
+   git config --global rerere.enabled true
+   git config --global rerere.autoupdate true
+   git config --global merge.conflictstyle zdiff3   # needs git >= 2.35; omit on older git
+   git config --global push.autoSetupRemote true
+   git config --global commit.verbose true
+   git config --global init.defaultBranch main
+   git config --global branch.sort -committerdate
+   git config --global column.ui auto
+   ```
+
+   - **`--global`:** these write `~/.gitconfig`, **outside the sandbox** — the human runs them in
+     their native terminal. In this session they can paste the block with a leading `!` so it runs
+     inline (e.g. `! git config --global pull.ff only`). Do **not** try to route a global write
+     through `run_terminal_command`; the sandbox will (correctly) refuse it.
+   - **`--local`:** swap `--global`→`--local` and run them via `run_terminal_command` from the
+     workspace root; `.git/config` is in-scope. If a write is blocked, fall back to the native
+     terminal (same pattern as `/ahmadev install`'s out-of-scope step).
+
+3. **Identity check — never auto-fill.** If step 1 showed `user.name`/`user.email` unset, tell the
+   human to set their own:
+   ```bash
+   git config --global user.name  "Your Name"
+   git config --global user.email "you@example.com"
+   ```
+   Do not guess these from the OS, the git log, or the session — wrong identity on a commit is
+   worse than an unset one. **Never** modify an already-set identity, and **never** set
+   `core.editor` (leave the human's editor choice alone).
+
+4. **Confirm.** Re-print the Tier-1/2 keys (the step-1 loop) so the human sees them all populated.
+
+### Why `git config` commands, not editing `~/.gitconfig` text
+
+Editing the file by hand is clobber-prone: a stray bracket can break `[user]`, and you can't tell
+"already correct" from "needs change" without parsing it. `git config <key> <value>` is
+idempotent, scope-aware, validates the key, and leaves every *other* section (your identity, your
+editor, your aliases) untouched. Always prefer it.
+
+### Notes
+
+- **Idempotent + non-destructive:** safe to re-run; only sets the listed keys; never removes or
+  rewrites unrelated config, identity, or editor.
+- **`merge.conflictstyle zdiff3` needs Git ≥ 2.35.** Check `git --version`; on older git use
+  `diff3` or omit the line — it's a nicety, not load-bearing.
+- **This is a skill procedure, not a `cargo xtask`,** and intentionally so: it touches files
+  *outside* the workspace (`~/.gitconfig`), which the sandbox must not write — the value here is
+  the curated key set + the human-run apply step, which is documentation, not code.
+- It does **not** commit, push, bump, or release. It only configures git.
 
 ---
 
