@@ -44,10 +44,14 @@ async fn run_ratatui(
     use crossterm::{
         event::{
             DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-            Event, EventStream,
+            Event, EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+            PushKeyboardEnhancementFlags,
         },
         execute,
-        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+        terminal::{
+            EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+            supports_keyboard_enhancement,
+        },
     };
     use futures::StreamExt;
     use ratatui::{Terminal, backend::CrosstermBackend};
@@ -139,6 +143,17 @@ async fn run_ratatui(
         EnableMouseCapture,
         EnableBracketedPaste
     )?;
+    // Enable the Kitty keyboard protocol's escape-code disambiguation when the
+    // terminal supports it. Without it, terminals collapse Shift+Enter into a
+    // plain Enter, so it would submit instead of inserting a newline. We remember
+    // whether the push succeeded so teardown only pops when we actually enabled it.
+    let keyboard_enhanced = matches!(supports_keyboard_enhancement(), Ok(true));
+    if keyboard_enhanced {
+        execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -253,6 +268,9 @@ async fn run_ratatui(
 
     // ── Always restore terminal ───────────────────────────────────────────────
     let _ = disable_raw_mode();
+    if keyboard_enhanced {
+        let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -1660,6 +1678,12 @@ fn handle_chat_input_key(
         }
         (KeyCode::Enter, KeyModifiers::NONE) => {
             handle_action(crate::keymap::Action::InputSubmit, state);
+            true
+        }
+        // Shift+Enter inserts a newline instead of submitting (requires the
+        // terminal's keyboard-enhancement support enabled at startup).
+        (KeyCode::Enter, KeyModifiers::SHIFT) => {
+            state.chat_input.insert_newline();
             true
         }
         (KeyCode::Esc, _) => {
@@ -4008,6 +4032,36 @@ mod tests {
         assert!(
             rx.blocking_recv().unwrap(),
             "decision sent should be approve"
+        );
+    }
+
+    /// Shift+Enter inserts a newline into the chat input instead of submitting,
+    /// while plain Enter still submits.
+    #[test]
+    fn test_shift_enter_inserts_newline() {
+        use crate::state::{AppState, Focus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+        state.chat_input.insert_str("first");
+
+        let handled = super::handle_chat_input_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            &mut state,
+        );
+        assert!(handled, "Shift+Enter must be consumed by the chat input");
+
+        state.chat_input.insert_str("second");
+        assert_eq!(
+            state.chat_input.lines(),
+            ["first", "second"],
+            "Shift+Enter must add a line without submitting"
+        );
+        assert_eq!(
+            state.chat_input.lines().len(),
+            2,
+            "buffer should still hold both lines (not submitted)"
         );
     }
 
