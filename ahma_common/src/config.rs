@@ -562,7 +562,7 @@ impl Default for ToolSettings {
 /// Maps onto the sandbox's two enforcement sets: `Rw` paths join the writable
 /// `scopes` (Landlock read+write / Seatbelt `allow file*`); `Ro` paths join the
 /// read-only `read_scopes` (Landlock read / Seatbelt `allow file-read*`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ScopeAccess {
     /// Read-only access.
@@ -765,7 +765,7 @@ fn default_sandbox_directory() -> Option<PathBuf> {
 }
 
 /// Expand `~` or `~/…` to the user's home directory.
-fn expand_home(path: &Path) -> PathBuf {
+pub(crate) fn expand_home(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s == "~" {
         if let Some(home) = dirs::home_dir() {
