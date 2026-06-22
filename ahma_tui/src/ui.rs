@@ -1016,7 +1016,7 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     let is_empty = rendered_lines.len() == 1 && rendered_lines[0].is_empty();
 
     if is_empty {
-        let placeholder = "Type a message... (Prefix $ or % to run terminal command, ! to decompose, / for commands)";
+        let placeholder = "Type a message... (Prefix $, %, or ! to run terminal command, # to decompose, / for commands)";
         let text = if focused {
             let cursor = if state.unicode { "│" } else { "|" };
             format!("{}{}", cursor, placeholder)
@@ -2555,8 +2555,8 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Arrows / Home / End", "Move within editor"),
         ("", ""),
         ("CHAT INPUT PREFIXES", ""),
-        ("$ / % / # <command>", "Run terminal command (e.g. $ pwd)"),
-        ("! <goal>", "Decompose goal using LLM"),
+        ("$ / % / ! <command>", "Run terminal command (e.g. $ pwd)"),
+        ("# <goal>", "Decompose goal using LLM"),
         ("/", "Open navigator (from empty input)"),
         ("", ""),
         ("PICKERS", ""),
@@ -2621,8 +2621,8 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Arrow keys / Home / End", "Move within the editor"),
         ("", ""),
         ("CHAT INPUT PREFIXES", ""),
-        ("$ or % or # <command>", "Run terminal command (e.g. $ pwd)"),
-        ("! <goal>", "Decompose goal using LLM (e.g. ! run tests)"),
+        ("$ or % or ! <command>", "Run terminal command (e.g. $ pwd)"),
+        ("# <goal>", "Decompose goal using LLM (e.g. # run tests)"),
         ("/", "Open command navigator (from empty input)"),
         ("", ""),
         ("PICKERS", ""),

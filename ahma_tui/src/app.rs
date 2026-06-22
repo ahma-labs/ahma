@@ -993,7 +993,7 @@ fn maybe_decompose_goal(
     use crate::state::{LogEntry, LogLevel};
     use ahma_llm_monitor::client::LlmClient;
 
-    if let Some(stripped_goal) = text.strip_prefix('!') {
+    if let Some(stripped_goal) = text.strip_prefix('#') {
         let goal = stripped_goal.trim().to_string();
         if goal.is_empty() {
             return true;
@@ -1024,7 +1024,7 @@ fn maybe_run_cli_command(text: &str, state: &mut crate::state::AppState) -> bool
     if let Some(stripped_cmd) = text
         .strip_prefix('%')
         .or_else(|| text.strip_prefix('$'))
-        .or_else(|| text.strip_prefix('#'))
+        .or_else(|| text.strip_prefix('!'))
     {
         let cmd_str = stripped_cmd.trim().to_string();
         if cmd_str.is_empty() {
