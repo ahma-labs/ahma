@@ -116,7 +116,12 @@ fn candidate_in_target(base_target: &Path, subdir: &str, bin_name: &str) -> Path
 pub fn resolve_binary_path() -> Result<PathBuf, String> {
     static BINARY_LOG_ONCE: std::sync::Once = std::sync::Once::new();
 
-    let debug_bin = ahma_mcp::test_utils::cli::get_binary_path("ahma", "ahma");
+    // Ensure the debug binary is rebuilt if stale before resolving candidates.
+    // The bridge tests spawn this binary directly; without this, a stale
+    // target/debug/ahma (e.g. after a version bump) is silently exercised —
+    // the skew that broke test_health_check_version_and_restart. cargo's
+    // incremental check makes this a fast no-op when the binary is current.
+    let debug_bin = ahma_mcp::test_utils::cli::build_binary_cached("ahma_bin", "ahma");
     // Construct sibling binary paths with the correct platform executable extension.
     let exe_ext = if cfg!(windows) { ".exe" } else { "" };
     let bin_name = format!("ahma{exe_ext}");

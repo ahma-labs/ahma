@@ -478,9 +478,88 @@ struct Row {
     new_ver: String,
     age_days: Option<i64>,
     status: String,
+    /// Extra human-readable context for non-obvious statuses (e.g. why a
+    /// candidate is `skipped:blocked`). Printed beneath the summary table.
+    note: Option<String>,
 }
 
-/// Entry point for the `safe-update` subcommand.
+/// A planned upgrade carrying both endpoints so the lockfile pin can be
+/// disambiguated as `name@<old> --precise <new>`. Threading `old_ver` through is
+/// what prevents the "specification `X` is ambiguous" failures when two major
+/// versions of a crate coexist in the tree (bitflags 1.x + 2.x, socket2 0.5 +
+/// 0.6, …): the bare `-p name` form cannot pick which one to bump.
+struct Upgrade {
+    name: String,
+    old_ver: String,
+    new_ver: String,
+}
+
+/// Outcome of attempting to apply a single planned upgrade. `error` is `None` on
+/// success; on failure it holds the most informative line of cargo's stderr so
+/// the final summary can report *why* — instead of silently counting the attempt
+/// as a success (the old behavior, which reported "8 upgraded" when 1 applied).
+struct ApplyResult {
+    name: String,
+    old_ver: String,
+    new_ver: String,
+    error: Option<String>,
+}
+
+/// Run a `cargo <args>` invocation, capturing output. Returns `Ok(())` on
+/// success, or `Err(reason)` with the most informative stderr line on failure.
+fn run_cargo_capture(root: &Path, args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new("cargo")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(extract_cargo_error(&String::from_utf8_lossy(
+        &output.stderr,
+    )))
+}
+
+/// Pull the most useful single line out of a captured cargo stderr blob: prefer
+/// the first `error:` line, else the last non-empty line, else a placeholder.
+fn extract_cargo_error(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("error"))
+        .or_else(|| stderr.lines().map(str::trim).rfind(|l| !l.is_empty()))
+        .unwrap_or("unknown cargo error")
+        .to_string()
+}
+
+/// Dry-run a precise lockfile pin to check the upgrade is actually resolvable
+/// *before* we promise it in the plan. Catches structurally-blocked upgrades
+/// (e.g. `lru 0.18` blocked by `ratatui-core` requiring `^0.16`) so the preview
+/// shows `skipped:blocked` instead of the apply step surprising the caller.
+fn precise_pin_resolvable(
+    root: &Path,
+    name: &str,
+    old_ver: &str,
+    new_ver: &str,
+) -> Result<(), String> {
+    run_cargo_capture(
+        root,
+        &[
+            "update",
+            "--dry-run",
+            "-p",
+            &format!("{name}@{old_ver}"),
+            "--precise",
+            new_ver,
+        ],
+    )
+}
+
+/// Pin skipped/unsafe candidates to their *current* version in Cargo.lock so a
+/// targeted upgrade can't drag them past the age gate as a resolver side effect.
+/// Pins use the `name@version` spec to stay unambiguous when multiple majors of
+/// the crate are present in the tree.
 fn pin_skipped_dependencies(root: &Path, rows: &[Row]) {
     println!("Pinning skipped/unsafe dependencies to current versions in Cargo.lock…");
     for row in rows {
@@ -490,8 +569,16 @@ fn pin_skipped_dependencies(root: &Path, rows: &[Row]) {
                 name = row.name,
                 version = row.old_ver
             );
+            // `name@old --precise old` is a no-op pin that nonetheless
+            // disambiguates when several versions of `name` are in the lock.
             let _ = std::process::Command::new("cargo")
-                .args(["update", "-p", &row.name, "--precise", &row.old_ver])
+                .args([
+                    "update",
+                    "-p",
+                    &format!("{}@{}", row.name, row.old_ver),
+                    "--precise",
+                    &row.old_ver,
+                ])
                 .current_dir(root)
                 .status();
         }
@@ -551,11 +638,12 @@ fn safe_update(args: &[String]) {
     // --- Step 2: collect known-vulnerable (crate, version) pairs from cargo-deny ---
     let vulnerable_pairs = parse_deny_advisories(&root);
 
-    // --- Step 3: evaluate each candidate ---
-    let (rows, to_apply) = evaluate_candidates(&candidates, &vulnerable_pairs, &opts);
+    // --- Step 3: evaluate each candidate (includes a resolvability pre-check) ---
+    let (rows, to_apply) = evaluate_candidates(&root, &candidates, &vulnerable_pairs, &opts);
 
-    // --- Step 4: print summary table ---
+    // --- Step 4: print summary table + notes ---
     print_summary_table(&rows);
+    print_blocked_notes(&rows);
 
     if to_apply.is_empty() {
         println!("Nothing to upgrade.");
@@ -573,21 +661,23 @@ fn safe_update(args: &[String]) {
     // Pin skipped/unsafe candidates to their old versions in Cargo.lock to prevent transitives/resolver from upgrading them
     pin_skipped_dependencies(&root, &rows);
 
-    // --- Step 5: apply upgrades ---
+    // --- Step 5: apply upgrades, tracking real per-crate outcomes ---
     println!("Applying {} upgrade(s)…", to_apply.len());
-    for (name, ver) in &to_apply {
-        let is_direct = direct_upgrades.contains(name);
-        apply_upgrade(&root, name, ver, is_direct);
-    }
+    let results: Vec<ApplyResult> = to_apply
+        .iter()
+        .map(|up| apply_upgrade(&root, up, direct_upgrades.contains(&up.name)))
+        .collect();
 
     // --- Step 6: verify workspace still compiles ---
     verify_workspace_compiles(&root);
 
+    // --- Step 7: honest summary; exit non-zero if any planned upgrade failed ---
     println!();
-    println!(
-        "Done. {} crate(s) upgraded. Review `git diff Cargo.toml Cargo.lock` before committing.",
-        to_apply.len()
-    );
+    println!("{}", format_apply_summary(&results));
+    println!("Review `git diff Cargo.toml Cargo.lock` before committing.");
+    if results.iter().any(|r| r.error.is_some()) {
+        process::exit(1);
+    }
 }
 
 fn print_summary_table(rows: &[Row]) {
@@ -608,6 +698,27 @@ fn print_summary_table(rows: &[Row]) {
     }
 }
 
+/// Print the reason behind every `skipped:blocked` row beneath the table so a
+/// structurally-blocked upgrade (e.g. `lru` held by `ratatui-core`) is visible
+/// in the preview rather than discovered only at apply time.
+fn print_blocked_notes(rows: &[Row]) {
+    let blocked: Vec<&Row> = rows.iter().filter(|r| r.note.is_some()).collect();
+    if blocked.is_empty() {
+        return;
+    }
+    println!();
+    println!("Blocked upgrades (eligible by age/advisory, but not resolvable):");
+    for row in blocked {
+        println!(
+            "  {name} {old} → {new}: {note}",
+            name = row.name,
+            old = row.old_ver,
+            new = row.new_ver,
+            note = row.note.as_deref().unwrap_or("")
+        );
+    }
+}
+
 fn candidate_row(
     name: &str,
     old_ver: &str,
@@ -621,16 +732,18 @@ fn candidate_row(
         new_ver: new_ver.to_string(),
         age_days,
         status: status.into(),
+        note: None,
     }
 }
 
 fn evaluate_one_candidate(
+    root: &Path,
     name: &str,
     old_ver: &str,
     new_ver: &str,
     vulnerable_pairs: &std::collections::HashSet<(String, String)>,
     opts: &SafeUpdateOpts,
-) -> (Row, Option<(String, String)>) {
+) -> (Row, Option<Upgrade>) {
     if is_prerelease(new_ver) {
         return (
             candidate_row(name, old_ver, new_ver, None, "skipped:pre-release"),
@@ -661,25 +774,41 @@ fn evaluate_one_candidate(
             ),
             None,
         ),
-        Ok(age) => (
-            candidate_row(name, old_ver, new_ver, Some(age), "upgrade"),
-            Some((name.to_string(), new_ver.to_string())),
-        ),
+        Ok(age) => {
+            // Honesty gate: an age- and advisory-clean candidate is only a real
+            // "upgrade" if its precise pin actually resolves. Verify now so the
+            // preview never promises a structurally-blocked bump (e.g. lru).
+            if let Err(reason) = precise_pin_resolvable(root, name, old_ver, new_ver) {
+                let mut row = candidate_row(name, old_ver, new_ver, Some(age), "skipped:blocked");
+                row.note = Some(reason);
+                return (row, None);
+            }
+            (
+                candidate_row(name, old_ver, new_ver, Some(age), "upgrade"),
+                Some(Upgrade {
+                    name: name.to_string(),
+                    old_ver: old_ver.to_string(),
+                    new_ver: new_ver.to_string(),
+                }),
+            )
+        }
     }
 }
 
 fn evaluate_candidates(
+    root: &Path,
     candidates: &[(String, String, String)],
     vulnerable_pairs: &std::collections::HashSet<(String, String)>,
     opts: &SafeUpdateOpts,
-) -> (Vec<Row>, Vec<(String, String)>) {
+) -> (Vec<Row>, Vec<Upgrade>) {
     let mut rows = Vec::with_capacity(candidates.len());
     let mut to_apply = Vec::new();
     for (name, old_ver, new_ver) in candidates {
-        let (row, apply) = evaluate_one_candidate(name, old_ver, new_ver, vulnerable_pairs, opts);
+        let (row, apply) =
+            evaluate_one_candidate(root, name, old_ver, new_ver, vulnerable_pairs, opts);
         rows.push(row);
-        if let Some(pair) = apply {
-            to_apply.push(pair);
+        if let Some(up) = apply {
+            to_apply.push(up);
         }
     }
     (rows, to_apply)
@@ -982,41 +1111,83 @@ fn fetch_crate_publish_age_days(name: &str, version: &str) -> Result<i64, String
     Ok(age)
 }
 
-/// Apply a single upgrade: bump Cargo.toml via `cargo upgrade -p name@version` (if direct),
-/// then tighten/pin Cargo.lock via `cargo update -p name --precise version`.
-fn apply_upgrade(root: &Path, name: &str, version: &str, is_direct: bool) {
-    if is_direct {
-        println!("  Upgrading direct dependency {name} → {version}");
-        // cargo upgrade -p name@version writes Cargo.toml requirement
-        let exit = std::process::Command::new("cargo")
-            .args(["upgrade", "-p", &format!("{name}@{version}")])
-            .current_dir(root)
-            .status()
-            .unwrap_or_else(|e| {
-                eprintln!("ERROR: `cargo upgrade -p {name}@{version}` failed: {e}");
-                process::exit(1);
-            });
-        if !exit.success() {
-            eprintln!("ERROR: `cargo upgrade -p {name}@{version}` exited with: {exit}");
-            process::exit(1);
+/// Apply one planned upgrade, returning an [`ApplyResult`] that records whether
+/// it actually succeeded. Failures are captured and reported (never silently
+/// swallowed) so the caller can tally real successes and exit non-zero on any
+/// genuine failure.
+fn apply_upgrade(root: &Path, up: &Upgrade, is_direct: bool) -> ApplyResult {
+    let kind = if is_direct { "direct" } else { "transitive" };
+    let result = (|| {
+        if is_direct {
+            // `cargo upgrade -p name@new` already carries a version, so it is
+            // unambiguous; it rewrites the Cargo.toml requirement.
+            run_cargo_capture(
+                root,
+                &["upgrade", "-p", &format!("{}@{}", up.name, up.new_ver)],
+            )?;
         }
-    } else {
-        println!("  Upgrading transitive dependency {name} → {version}");
+        // Pin Cargo.lock. `name@old --precise new` disambiguates when several
+        // versions of `name` coexist — the bare `-p name` form errors as
+        // "specification is ambiguous" and used to fail silently.
+        run_cargo_capture(
+            root,
+            &[
+                "update",
+                "-p",
+                &format!("{}@{}", up.name, up.old_ver),
+                "--precise",
+                &up.new_ver,
+            ],
+        )
+    })();
+
+    match &result {
+        Ok(()) => println!(
+            "  ✓ {kind} {name} {old} → {new}",
+            name = up.name,
+            old = up.old_ver,
+            new = up.new_ver
+        ),
+        Err(reason) => println!(
+            "  ✗ {kind} {name} {old} → {new}: {reason}",
+            name = up.name,
+            old = up.old_ver,
+            new = up.new_ver
+        ),
     }
 
-    // cargo update -p name --precise version pins Cargo.lock
-    let exit = std::process::Command::new("cargo")
-        .args(["update", "-p", name, "--precise", version])
-        .current_dir(root)
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("ERROR: `cargo update -p {name} --precise {version}` failed: {e}");
-            process::exit(1);
-        });
-    if !exit.success() {
-        eprintln!("WARN: `cargo update -p {name} --precise {version}` exited with: {exit}");
-        // Non-fatal — Cargo.lock will still be resolved on next build
+    ApplyResult {
+        name: up.name.clone(),
+        old_ver: up.old_ver.clone(),
+        new_ver: up.new_ver.clone(),
+        error: result.err(),
     }
+}
+
+/// Build the honest post-apply summary lines from per-crate results: a count of
+/// what truly applied vs. was planned, plus an explicit failure block. Pure and
+/// unit-tested so the accounting can't drift from reality the way the old
+/// `to_apply.len()` count did.
+fn format_apply_summary(results: &[ApplyResult]) -> String {
+    let failed: Vec<&ApplyResult> = results.iter().filter(|r| r.error.is_some()).collect();
+    let applied = results.len() - failed.len();
+    let mut out = format!(
+        "Applied {applied} of {planned} planned upgrade(s).",
+        planned = results.len()
+    );
+    if !failed.is_empty() {
+        out.push_str(&format!("\nFAILED to apply {} upgrade(s):", failed.len()));
+        for r in &failed {
+            out.push_str(&format!(
+                "\n  {name} {old} → {new}: {reason}",
+                name = r.name,
+                old = r.old_ver,
+                new = r.new_ver,
+                reason = r.error.as_deref().unwrap_or("unknown error")
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1089,5 +1260,77 @@ mod tests {
             parsed[1],
             ("cc".to_string(), "1.2.62".to_string(), "1.2.63".to_string())
         );
+    }
+
+    fn apply_result(name: &str, old: &str, new: &str, error: Option<&str>) -> super::ApplyResult {
+        super::ApplyResult {
+            name: name.to_string(),
+            old_ver: old.to_string(),
+            new_ver: new.to_string(),
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_format_apply_summary_all_success() {
+        // Regression: the old code printed `to_apply.len()` (attempt count) as
+        // the success count, reporting "8 upgraded" when only 1 applied. The
+        // summary must reflect ACTUAL successes and carry no FAILED block.
+        let results = vec![
+            apply_result("prost", "0.14.3", "0.14.4", None),
+            apply_result("socket2", "0.6.3", "0.6.4", None),
+        ];
+        let summary = super::format_apply_summary(&results);
+        assert_eq!(summary, "Applied 2 of 2 planned upgrade(s).");
+        assert!(!summary.contains("FAILED"));
+    }
+
+    #[test]
+    fn test_format_apply_summary_partial_failure_lists_reasons() {
+        let results = vec![
+            apply_result("prost", "0.14.3", "0.14.4", None),
+            apply_result(
+                "lru",
+                "0.16.4",
+                "0.18.0",
+                Some("error: failed to select a version"),
+            ),
+        ];
+        let summary = super::format_apply_summary(&results);
+        assert!(
+            summary.starts_with("Applied 1 of 2 planned upgrade(s)."),
+            "must count only real successes, got: {summary}"
+        );
+        assert!(summary.contains("FAILED to apply 1 upgrade(s):"));
+        assert!(
+            summary.contains("lru 0.16.4 → 0.18.0: error: failed to select a version"),
+            "failure block must name the crate and the reason, got: {summary}"
+        );
+        assert!(
+            !summary.contains("prost 0.14.3"),
+            "succeeded crates must not appear in the FAILED block"
+        );
+    }
+
+    #[test]
+    fn test_extract_cargo_error_prefers_error_line() {
+        let stderr = "    Updating crates.io index\n\
+                      error: specificationm `bitflags` is ambiguous\n\
+                      help: re-run this command with one of the following specifications\n";
+        assert_eq!(
+            super::extract_cargo_error(stderr),
+            "error: specificationm `bitflags` is ambiguous"
+        );
+    }
+
+    #[test]
+    fn test_extract_cargo_error_falls_back_to_last_nonempty_line() {
+        let stderr = "some warning\nfinal detail line\n\n";
+        assert_eq!(super::extract_cargo_error(stderr), "final detail line");
+    }
+
+    #[test]
+    fn test_extract_cargo_error_empty_input() {
+        assert_eq!(super::extract_cargo_error("   \n\n"), "unknown cargo error");
     }
 }

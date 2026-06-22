@@ -104,6 +104,8 @@ Only deviate from this rule when the user explicitly specifies a different versi
 
 > **Why no quality pipeline?** `/ahmadev bump` intentionally skips `cargo fmt`, `cargo nextest run`, and `cargo clippy` because the xtask command only edits version-bearing strings and ensures they are internally consistent. Running the full test suite here would be a poor cost/benefit trade-off — do that in the natural course of testing your other work.
 
+> **Stale-binary note:** A bump changes `CARGO_PKG_VERSION`, which can make integration tests that spawn the `ahma` binary fail against a stale `target/debug/ahma` (e.g. the `/health` semver assertion in `ahma_http_bridge`). The test harness now self-heals: `build_binary_cached` (in `ahma_mcp::test_utils::cli`) rebuilds the binary when it is **stale** — older than the newest workspace source file — so `cargo nextest run` no longer requires a manual `cargo build -p ahma_bin` first. A binary that is already fresh is used as-is and never rebuilt, so a build made with specific flags (e.g. CI's `--no-default-features`) keeps its feature set. If you ever bypass the harness, build the binary yourself before spawning it.
+
 ### Failure recovery
 
 If the change is incorrect or compilation fails, revert files and retry:
