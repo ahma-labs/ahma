@@ -218,6 +218,15 @@ pub struct Sandbox {
     /// `update_scopes` call so that `roots/list` replacements produce
     /// `roots ∪ {sandbox_dir}` rather than discarding the secondary scope.
     pub(super) sandbox_dir: Option<PathBuf>,
+    /// User-granted external directories (writable) that survive `roots/list`
+    /// replacement, just like [`sandbox_dir`](Self::sandbox_dir). These come from
+    /// `[sandbox].persistent_scopes` with `access = "rw"` (e.g. an sccache cache
+    /// outside the workspace) and are re-appended on every `update_scopes` call.
+    pub(super) persistent_write_scopes: Vec<PathBuf>,
+    /// User-granted external directories (read-only) that survive `roots/list`
+    /// replacement. These come from `[sandbox].persistent_scopes` with
+    /// `access = "ro"` and are merged into `read_scopes` on every update.
+    pub(super) persistent_read_scopes: Vec<PathBuf>,
     /// When true, the scopes were explicitly provided by the user (via
     /// `--sandbox-scope`, `--working-directories`, or a task vault) and MUST NOT
     /// be widened or replaced via the MCP `roots/list` protocol (SPEC R5.5).
@@ -254,6 +263,8 @@ impl Clone for Sandbox {
             no_temp_files: self.no_temp_files,
             tmp_access: self.tmp_access,
             sandbox_dir: self.sandbox_dir.clone(),
+            persistent_write_scopes: self.persistent_write_scopes.clone(),
+            persistent_read_scopes: self.persistent_read_scopes.clone(),
             explicit_scopes: self.explicit_scopes,
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
@@ -272,6 +283,8 @@ impl std::fmt::Debug for Sandbox {
             .field("no_temp_files", &self.no_temp_files)
             .field("tmp_access", &self.tmp_access)
             .field("sandbox_dir", &self.sandbox_dir)
+            .field("persistent_write_scopes", &self.persistent_write_scopes)
+            .field("persistent_read_scopes", &self.persistent_read_scopes)
             .field("explicit_scopes", &self.explicit_scopes)
             .field("livelog", &self.livelog)
             .field("package_cache_write", &self.package_cache_write)
@@ -310,6 +323,8 @@ impl Sandbox {
             no_temp_files,
             tmp_access,
             sandbox_dir: None,
+            persistent_write_scopes: Vec::new(),
+            persistent_read_scopes: Vec::new(),
             explicit_scopes: false,
             livelog,
             package_cache_write: true,
@@ -377,8 +392,40 @@ impl Sandbox {
         self.sandbox_dir.as_ref()
     }
 
-    /// Update the sandbox scopes, preserving the temp directory if `--tmp` was set
-    /// and the sandbox_dir if `--sandbox` was set.
+    /// Register user-granted persistent scopes (from `[sandbox].persistent_scopes`).
+    ///
+    /// `write` paths join the writable scope set; `read` paths join the read-only
+    /// set. Both are folded into the live scopes immediately — so the very first
+    /// platform enforcement (Landlock at startup / Seatbelt per-command) already
+    /// includes them — and stored so [`update_scopes`](Self::update_scopes)
+    /// re-appends them after every `roots/list` replacement. Paths must already be
+    /// canonicalized by the caller.
+    #[must_use]
+    pub fn with_persistent_scopes(mut self, write: Vec<PathBuf>, read: Vec<PathBuf>) -> Self {
+        if !write.is_empty() {
+            let mut scopes = self.scopes.write().unwrap();
+            for p in &write {
+                if !scopes.contains(p) {
+                    scopes.push(p.clone());
+                }
+            }
+        }
+        if !read.is_empty() {
+            let mut reads = self.read_scopes.write().unwrap();
+            for p in &read {
+                if !reads.contains(p) {
+                    reads.push(p.clone());
+                }
+            }
+        }
+        self.persistent_write_scopes = write;
+        self.persistent_read_scopes = read;
+        self
+    }
+
+    /// Update the sandbox scopes, preserving the temp directory if `--tmp` was set,
+    /// the sandbox_dir if `--sandbox` was set, and any user-granted persistent
+    /// scopes (`[sandbox].persistent_scopes`).
     pub fn update_scopes(&self, scopes: Vec<PathBuf>) -> Result<()> {
         let mut canonicalized = scopes::canonicalize_scopes(
             scopes,
@@ -397,6 +444,19 @@ impl Sandbox {
             canonicalized.push(dir.clone());
         }
 
+        // Re-append user-granted writable persistent scopes so a client's
+        // roots/list (e.g. Cursor sending its workspace root) does not silently
+        // drop them. This is the durable half of the `ahma sandbox grant` flow.
+        for dir in &self.persistent_write_scopes {
+            if !canonicalized.contains(dir) {
+                tracing::info!(
+                    "Preserving granted persistent scope after roots/list: {:?}",
+                    dir
+                );
+                canonicalized.push(dir.clone());
+            }
+        }
+
         if let Some(canonical_temp) = self.preserved_temp_dir(&canonicalized) {
             tracing::info!(
                 "Preserving temp directory in sandbox scopes via --tmp: {:?}",
@@ -405,10 +465,19 @@ impl Sandbox {
             canonicalized.push(canonical_temp);
         }
 
-        if self.livelog && self.mode != SandboxMode::Test {
-            let new_read_scopes = resolve_livelog_scopes(&canonicalized);
+        {
             let mut current_read_scopes = self.read_scopes.write().unwrap();
-            *current_read_scopes = new_read_scopes;
+            // The livelog read set is recomputed from the new write scopes, so it
+            // replaces the prior value wholesale — re-add granted read-only scopes
+            // afterwards so they too survive the roots/list update.
+            if self.livelog && self.mode != SandboxMode::Test {
+                *current_read_scopes = resolve_livelog_scopes(&canonicalized);
+            }
+            for dir in &self.persistent_read_scopes {
+                if !current_read_scopes.contains(dir) {
+                    current_read_scopes.push(dir.clone());
+                }
+            }
         }
 
         let mut current_scopes = self.scopes.write().unwrap();
@@ -634,6 +703,67 @@ fn strip_extended_prefix(path: &Path) -> PathBuf {
         return PathBuf::from(stripped);
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod persistent_scope_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// The core guarantee behind `ahma sandbox grant`: a granted external
+    /// directory survives a client `roots/list` that otherwise replaces the
+    /// workspace scope wholesale. Without the re-append in `update_scopes`, the
+    /// grant would silently vanish the moment Cursor sent its workspace root.
+    #[test]
+    fn granted_scopes_survive_roots_list_replacement() {
+        let workspace = tempdir().unwrap();
+        let cache = tempdir().unwrap(); // rw grant (e.g. sccache)
+        let toolchains = tempdir().unwrap(); // ro grant
+        let client_root = tempdir().unwrap(); // arrives later via roots/list
+
+        let sb = Sandbox::new(
+            vec![workspace.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap()
+        .with_persistent_scopes(
+            vec![cache.path().to_path_buf()],
+            vec![toolchains.path().to_path_buf()],
+        );
+
+        // Builder folds grants into the live scopes immediately so the first
+        // enforcement pass already covers them.
+        assert!(sb.scopes().iter().any(|p| p == cache.path()));
+        assert!(sb.read_scopes().iter().any(|p| p == toolchains.path()));
+
+        // Simulate the client sending workspace roots, replacing the scope set.
+        sb.update_scopes(vec![client_root.path().to_path_buf()])
+            .unwrap();
+
+        let scopes = sb.scopes();
+        let client_canon = dunce::canonicalize(client_root.path()).unwrap();
+        assert!(
+            scopes.contains(&client_canon),
+            "client root applied: {scopes:?}"
+        );
+        assert!(
+            scopes.iter().any(|p| p == cache.path()),
+            "rw grant survived roots/list: {scopes:?}"
+        );
+        let ws_canon = dunce::canonicalize(workspace.path()).unwrap();
+        assert!(
+            !scopes.contains(&ws_canon),
+            "old workspace scope was replaced: {scopes:?}"
+        );
+        assert!(
+            sb.read_scopes().iter().any(|p| p == toolchains.path()),
+            "ro grant survived roots/list: {:?}",
+            sb.read_scopes()
+        );
+    }
 }
 
 #[cfg(test)]

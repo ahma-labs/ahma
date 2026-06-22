@@ -137,6 +137,10 @@ pub struct AppConfig {
     /// Allow package-manager caches (cargo registry/git) to be written inside
     /// the sandbox (default `true`; disable with `AHMA_NO_PACKAGE_CACHE_WRITE=1`).
     pub package_cache_write: bool,
+    /// User-granted external directories (from `[sandbox].persistent_scopes`) that
+    /// survive `roots/list` replacement — the persistence behind `ahma sandbox
+    /// grant`. Resolved into the sandbox's writable/read-only scope sets.
+    pub persistent_scopes: Vec<ahma_common::config::PersistentScope>,
 
     // ── HTTP serve mode ─────────────────────────────────────────────────────
     /// Bind host for HTTP mode (default 127.0.0.1).
@@ -225,6 +229,7 @@ impl Default for AppConfig {
             log_monitor: false,
             monitor_rate_limit_secs: 60,
             package_cache_write: true,
+            persistent_scopes: vec![],
             http_host: "127.0.0.1".to_string(),
             http_port: 3000,
             no_quic: false,
@@ -533,6 +538,56 @@ fn add_temp_scope_if_requested(
     Some(scopes)
 }
 
+/// Resolve `[sandbox].persistent_scopes` into canonical (writable, read-only)
+/// path lists for [`sandbox::Sandbox::with_persistent_scopes`].
+///
+/// Writable (`rw`) grants are auto-created if missing (a fresh build cache is
+/// expected not to exist yet); read-only (`ro`) grants are never created — a
+/// missing one is logged and skipped rather than silently materialised.
+fn resolve_persistent_scopes(cfg: &AppConfig) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    use ahma_common::config::ScopeAccess;
+    let mut write = Vec::new();
+    let mut read = Vec::new();
+    for scope in &cfg.persistent_scopes {
+        let raw = expand_tilde(scope.path.clone());
+        match scope.access {
+            ScopeAccess::Rw => match ahma_common::config::ensure_sandbox_directory(&scope.path) {
+                Ok(canonical) => {
+                    if !write.contains(&canonical) {
+                        tracing::info!(
+                            "Granted persistent scope (read+write): {} [{}]",
+                            canonical.display(),
+                            scope.granted_by.as_deref().unwrap_or("user")
+                        );
+                        write.push(canonical);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "Skipping persistent scope {}: could not create/canonicalize ({e})",
+                    raw.display()
+                ),
+            },
+            ScopeAccess::Ro => match dunce::canonicalize(&raw) {
+                Ok(canonical) => {
+                    if !read.contains(&canonical) {
+                        tracing::info!(
+                            "Granted persistent scope (read-only): {} [{}]",
+                            canonical.display(),
+                            scope.granted_by.as_deref().unwrap_or("user")
+                        );
+                        read.push(canonical);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "Skipping read-only persistent scope {} (does not exist or unreadable): {e}",
+                    raw.display()
+                ),
+            },
+        }
+    }
+    (write, read)
+}
+
 fn create_sandbox_instance(
     scopes: Option<Vec<PathBuf>>,
     policy: &SandboxPolicy,
@@ -574,6 +629,12 @@ fn create_sandbox_instance(
         None
     };
 
+    // User-granted persistent scopes (e.g. an sccache cache outside the workspace).
+    // Folded into the sandbox now (so initial enforcement covers them) and
+    // re-applied on every roots/list update so a client's workspace root cannot
+    // silently drop them.
+    let (persistent_write_scopes, persistent_read_scopes) = resolve_persistent_scopes(cfg);
+
     let s = sandbox::Sandbox::new(
         scopes.clone(),
         policy.mode,
@@ -584,6 +645,7 @@ fn create_sandbox_instance(
     .context("Failed to initialize sandbox")?
     .with_explicit_scopes(explicit_scopes)
     .with_sandbox_dir(sandbox_dir)
+    .with_persistent_scopes(persistent_write_scopes, persistent_read_scopes)
     .with_package_cache_write(cfg.package_cache_write)
     .with_separate_cargo_target(cfg.separate_cargo_target);
 
@@ -817,6 +879,10 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
         Subcommands::Prompts(args) => {
             tracing::info!("Running in prompts mode");
             run_prompts_command(args)
+        }
+        Subcommands::Sandbox(args) => {
+            tracing::info!("Running in sandbox-scope management mode");
+            commands::run_sandbox_command(args)
         }
     }
 }
@@ -1138,6 +1204,11 @@ pub enum Subcommands {
     Settings(SettingsArgs),
     /// Manage LLM prompt templates (~/.ahma/prompts.toml).
     Prompts(PromptsArgs),
+    /// Grant, list, and revoke persistent sandbox scopes — external directories
+    /// (outside the workspace) that a trusted tool needs, e.g. an sccache build
+    /// cache. Grants are recorded in `~/.ahma/settings.toml` and survive every
+    /// `roots/list` update, so they stay in effect for the whole session.
+    Sandbox(SandboxArgs),
 }
 
 /// Arguments for `ahma setup`.
@@ -1262,6 +1333,58 @@ pub enum SettingsCommand {
     /// Shows the current value of each setting and where it came from:
     /// settings file, deprecated environment variable, or compiled-in default.
     Show,
+}
+
+// ── sandbox scope grants ─────────────────────────────────────────────────────
+
+/// Arguments for `ahma sandbox`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct SandboxArgs {
+    #[command(subcommand)]
+    pub command: SandboxCommand,
+}
+
+/// Subcommands for `ahma sandbox` — manage persistent sandbox scope grants.
+///
+/// A *persistent scope* is an external directory (outside the workspace) added
+/// to the kernel sandbox that **survives `roots/list` replacement**, so it stays
+/// available no matter which workspace the client opens. Grants are stored in
+/// `[sandbox].persistent_scopes` in `~/.ahma/settings.toml` — a file that lives
+/// outside every sandbox scope and so cannot be edited by a sandboxed tool call.
+/// Changes take effect the next time an ahma server starts.
+#[derive(Subcommand, Debug, Clone)]
+pub enum SandboxCommand {
+    /// Grant a directory persistent access in the sandbox.
+    ///
+    /// Defaults to read+write (most external tool dirs are caches the tool both
+    /// reads and writes); pass `--read-only` for read access alone. A writable
+    /// directory is created if it does not yet exist.
+    ///
+    /// Example (allow an sccache cache outside the workspace):
+    ///   ahma sandbox grant ~/Library/Caches/Mozilla.sccache --by sccache \
+    ///     --note "compiler cache"
+    Grant {
+        /// Directory to grant. `~` is expanded to your home directory.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        /// Grant read-only access instead of the default read+write.
+        #[arg(long = "read-only")]
+        read_only: bool,
+        /// Record what asked for this scope (e.g. a tool name), for auditing.
+        #[arg(long = "by", value_name = "WHO")]
+        by: Option<String>,
+        /// Free-form note explaining why this scope exists.
+        #[arg(long = "note", value_name = "TEXT")]
+        note: Option<String>,
+    },
+    /// List the persistent scopes currently granted, and the file they live in.
+    List,
+    /// Revoke a previously granted persistent scope.
+    Revoke {
+        /// Directory to revoke (matched after `~` expansion).
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
 }
 
 // ── prompts ──────────────────────────────────────────────────────────────────
@@ -2309,6 +2432,9 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         log_monitor,
         monitor_rate_limit_secs,
         package_cache_write,
+        // Loaded from settings.toml (honors --no-settings via `s`); survives
+        // roots/list because the subprocess reads it directly, not via the bridge.
+        persistent_scopes: s.sandbox.persistent_scopes.clone(),
         http_host: serve.http_host,
         http_port: serve.http_port,
         no_quic,
@@ -2532,6 +2658,7 @@ mod tests {
             log_monitor: false,
             monitor_rate_limit_secs: 60,
             package_cache_write: true,
+            persistent_scopes: vec![],
             http_host: "127.0.0.1".to_string(),
             http_port: 3000,
             no_quic: false,

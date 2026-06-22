@@ -557,6 +557,83 @@ impl Default for ToolSettings {
     }
 }
 
+/// Access level granted to a [`PersistentScope`].
+///
+/// Maps onto the sandbox's two enforcement sets: `Rw` paths join the writable
+/// `scopes` (Landlock read+write / Seatbelt `allow file*`); `Ro` paths join the
+/// read-only `read_scopes` (Landlock read / Seatbelt `allow file-read*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScopeAccess {
+    /// Read-only access.
+    Ro,
+    /// Read and write access (the default — most external tool dirs are caches
+    /// that the tool both reads and writes).
+    #[default]
+    Rw,
+}
+
+impl ScopeAccess {
+    /// Whether this access level permits writes.
+    pub fn is_write(self) -> bool {
+        matches!(self, ScopeAccess::Rw)
+    }
+
+    /// Short human label (`"read-only"` / `"read+write"`).
+    pub fn label(self) -> &'static str {
+        match self {
+            ScopeAccess::Ro => "read-only",
+            ScopeAccess::Rw => "read+write",
+        }
+    }
+}
+
+/// A user-granted, machine-local directory added to the sandbox scope that
+/// **survives `roots/list` replacement** (unlike the provisional `scopes` list).
+///
+/// This is the persistence record behind the "add an external tool directory to
+/// the sandbox" flow (e.g. an sccache / ccache / shared toolchain cache that
+/// lives outside the workspace). Entries are written only by the trusted
+/// `ahma sandbox grant` command — never by a sandboxed tool call, since the
+/// settings file lives in `$HOME`, outside every workspace scope, and is
+/// therefore kernel-unwritable from inside the sandbox. That property is the
+/// whole point: the AI can *request* a scope, but only the human, editing the
+/// out-of-band file, can *grant* one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentScope {
+    /// The directory to add to the sandbox scope. `~` is expanded to `$HOME`.
+    pub path: PathBuf,
+    /// Read-only or read+write. Default: `rw`.
+    #[serde(default)]
+    pub access: ScopeAccess,
+    /// What asked for this scope (e.g. `"sccache"`), for auditability. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_by: Option<String>,
+    /// When it was granted (ISO `YYYY-MM-DD`), stamped by `ahma sandbox grant`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_at: Option<String>,
+    /// Free-form human note explaining why this scope exists. Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Outcome of [`SandboxSettings::grant_scope`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantOutcome {
+    /// A brand-new scope entry was appended.
+    Added,
+    /// An existing entry for the same path was replaced; carries the old value.
+    Updated(Box<PersistentScope>),
+}
+
+/// Compare two scope paths for equivalence after `~` expansion, so that
+/// `~/Library/Caches/x` and `/Users/me/Library/Caches/x` match. Falls back to a
+/// plain comparison when the home directory cannot be resolved.
+fn scope_paths_equiv(a: &Path, b: &Path) -> bool {
+    expand_home(a) == expand_home(b)
+}
+
 /// Sandbox and filesystem security settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -613,6 +690,56 @@ pub struct SandboxSettings {
     /// is open.
     /// Default: `false`
     pub use_sandbox_directory: bool,
+    /// Machine-local external directories granted to the sandbox scope that
+    /// **survive `roots/list` replacement** — the persistence backing the
+    /// `ahma sandbox grant` flow (e.g. an sccache cache outside the workspace).
+    ///
+    /// Unlike [`scopes`](Self::scopes) (a provisional, roots-replaceable list),
+    /// every entry here is re-appended after each `roots/list` update so the
+    /// grant stays in effect for the whole session regardless of which workspace
+    /// the client opens. Edited via `ahma sandbox grant|list|revoke`, or by hand.
+    /// Default: empty list
+    #[serde(default)]
+    pub persistent_scopes: Vec<PersistentScope>,
+}
+
+impl SandboxSettings {
+    /// Find a persistent scope whose path matches `path` (after `~` expansion).
+    pub fn find_scope(&self, path: &Path) -> Option<&PersistentScope> {
+        self.persistent_scopes
+            .iter()
+            .find(|s| scope_paths_equiv(&s.path, path))
+    }
+
+    /// Add a persistent scope, or replace the existing entry for the same path.
+    ///
+    /// Matching is by `~`-expanded path, so re-granting `~/x` after `/home/u/x`
+    /// updates in place rather than duplicating. Returns whether this added a new
+    /// entry or replaced one (the previous value is returned for the confirm
+    /// message).
+    pub fn grant_scope(&mut self, scope: PersistentScope) -> GrantOutcome {
+        if let Some(existing) = self
+            .persistent_scopes
+            .iter_mut()
+            .find(|s| scope_paths_equiv(&s.path, &scope.path))
+        {
+            let old = std::mem::replace(existing, scope);
+            GrantOutcome::Updated(Box::new(old))
+        } else {
+            self.persistent_scopes.push(scope);
+            GrantOutcome::Added
+        }
+    }
+
+    /// Remove the persistent scope for `path` (matched after `~` expansion).
+    /// Returns the removed entry, or `None` if no match existed.
+    pub fn revoke_scope(&mut self, path: &Path) -> Option<PersistentScope> {
+        let idx = self
+            .persistent_scopes
+            .iter()
+            .position(|s| scope_paths_equiv(&s.path, path))?;
+        Some(self.persistent_scopes.remove(idx))
+    }
 }
 
 impl Default for SandboxSettings {
@@ -628,6 +755,7 @@ impl Default for SandboxSettings {
             package_cache_write: true,
             sandbox_directory: default_sandbox_directory(),
             use_sandbox_directory: false,
+            persistent_scopes: Vec::new(),
         }
     }
 }
@@ -1049,6 +1177,15 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # package_cache_write  = true     # allow package-manager caches (cargo registry/git) to be written
 # working_dirs         = []       # directories containing allowed working directories
 # sandbox_directory    = "~/sandbox"  # default scratch directory, auto-created when needed
+#
+# persistent_scopes: machine-local external directories that survive roots/list
+# replacement — e.g. a build cache outside the workspace (sccache, ccache).
+# Manage with `ahma sandbox grant|list|revoke`, or edit by hand.  Unlike `scopes`
+# (provisional, replaced when the client sends workspace roots), these are
+# re-added on every roots/list update so the grant lasts the whole session.
+# persistent_scopes = [
+#   { path = "~/Library/Caches/Mozilla.sccache", access = "rw", granted_by = "sccache", note = "compiler cache" },
+# ]
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # [logging]
@@ -1530,5 +1667,106 @@ timeout_secs = 600
             AhmaSettings::load_from_result(&path).is_ok(),
             "unknown key in [tools] should be tolerated"
         );
+    }
+
+    // ── persistent_scopes ────────────────────────────────────────────────────
+
+    #[test]
+    fn scope_access_serializes_as_lowercase() {
+        assert_eq!(
+            toml::to_string(&PersistentScope {
+                path: PathBuf::from("/x"),
+                access: ScopeAccess::Ro,
+                granted_by: None,
+                granted_at: None,
+                note: None,
+            })
+            .unwrap()
+            .trim(),
+            "path = \"/x\"\naccess = \"ro\""
+        );
+        assert!(ScopeAccess::Rw.is_write());
+        assert!(!ScopeAccess::Ro.is_write());
+    }
+
+    #[test]
+    fn persistent_scope_toml_round_trip_defaults_to_rw() {
+        let toml_str = r#"
+[sandbox]
+persistent_scopes = [
+  { path = "~/Library/Caches/Mozilla.sccache", granted_by = "sccache", note = "compiler cache" },
+  { path = "/opt/toolchains", access = "ro" },
+]
+"#;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), toml_str).unwrap();
+        let s = AhmaSettings::load_from(tmp.path());
+        assert_eq!(s.sandbox.persistent_scopes.len(), 2);
+        // access omitted ⇒ defaults to rw
+        assert_eq!(s.sandbox.persistent_scopes[0].access, ScopeAccess::Rw);
+        assert_eq!(
+            s.sandbox.persistent_scopes[0].granted_by.as_deref(),
+            Some("sccache")
+        );
+        assert_eq!(s.sandbox.persistent_scopes[1].access, ScopeAccess::Ro);
+    }
+
+    #[test]
+    fn grant_scope_adds_then_updates_in_place() {
+        let mut sb = SandboxSettings::default();
+        let mk = |access| PersistentScope {
+            path: PathBuf::from("/cache"),
+            access,
+            granted_by: None,
+            granted_at: None,
+            note: None,
+        };
+        assert_eq!(sb.grant_scope(mk(ScopeAccess::Rw)), GrantOutcome::Added);
+        assert_eq!(sb.persistent_scopes.len(), 1);
+
+        // Re-granting the same path updates in place rather than duplicating,
+        // and hands back the previous value for the confirm message.
+        match sb.grant_scope(mk(ScopeAccess::Ro)) {
+            GrantOutcome::Updated(old) => assert_eq!(old.access, ScopeAccess::Rw),
+            GrantOutcome::Added => panic!("expected an in-place update"),
+        }
+        assert_eq!(sb.persistent_scopes.len(), 1);
+        assert_eq!(sb.persistent_scopes[0].access, ScopeAccess::Ro);
+    }
+
+    #[test]
+    fn revoke_scope_removes_match_or_reports_absent() {
+        let mut sb = SandboxSettings::default();
+        sb.grant_scope(PersistentScope {
+            path: PathBuf::from("/cache"),
+            access: ScopeAccess::Rw,
+            granted_by: None,
+            granted_at: None,
+            note: None,
+        });
+        assert!(sb.revoke_scope(Path::new("/nope")).is_none());
+        let removed = sb.revoke_scope(Path::new("/cache")).expect("removed");
+        assert_eq!(removed.path, PathBuf::from("/cache"));
+        assert!(sb.persistent_scopes.is_empty());
+    }
+
+    #[test]
+    fn scope_matching_is_tilde_insensitive() {
+        let Some(home) = dirs::home_dir() else {
+            return; // no home dir in this environment; skip
+        };
+        let mut sb = SandboxSettings::default();
+        sb.grant_scope(PersistentScope {
+            path: PathBuf::from("~/foo"),
+            access: ScopeAccess::Rw,
+            granted_by: None,
+            granted_at: None,
+            note: None,
+        });
+        // Looking up by the expanded absolute path finds the ~-stored entry.
+        assert!(sb.find_scope(&home.join("foo")).is_some());
+        // Revoking by the expanded path removes the ~-stored entry.
+        assert!(sb.revoke_scope(&home.join("foo")).is_some());
+        assert!(sb.persistent_scopes.is_empty());
     }
 }

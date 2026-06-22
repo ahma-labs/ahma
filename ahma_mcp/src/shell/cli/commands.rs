@@ -6,7 +6,8 @@
 
 use super::{
     AppConfig, BundleArgs, BundleAuditArgs, BundleCommand, BundleSignArgs, BundleVerifyArgs,
-    InfoArgs, PromptsArgs, PromptsCommand, SettingsArgs, SettingsCommand,
+    InfoArgs, PromptsArgs, PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs,
+    SettingsCommand,
 };
 use crate::shell::{list_tools, resolution};
 use anyhow::{Context, Result};
@@ -303,6 +304,133 @@ fn handle_prompts_update() -> Result<()> {
     fs::write(&path, template)?;
     println!("✓ Wrote latest prompt defaults to {}", path.display());
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sandbox scope grants
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
+    use ahma_common::config::{
+        AhmaSettings, GrantOutcome, PersistentScope, ScopeAccess, settings_path,
+    };
+
+    let file = settings_path()
+        .context("Cannot determine ~/.ahma/settings.toml (home directory not found)")?;
+
+    // Strict load on the write paths: refuse to clobber a settings file we cannot
+    // parse. A missing file is fine (returns defaults) — the first grant creates it.
+    let load = |p: &std::path::Path| -> Result<AhmaSettings> {
+        AhmaSettings::load_from_result(p).map_err(|e| anyhow::anyhow!(e))
+    };
+
+    match args.command {
+        SandboxCommand::Grant {
+            path: dir,
+            read_only,
+            by,
+            note,
+        } => {
+            let access = if read_only {
+                ScopeAccess::Ro
+            } else {
+                ScopeAccess::Rw
+            };
+            let mut settings = load(&file)?;
+            let scope = PersistentScope {
+                path: dir.clone(),
+                access,
+                granted_by: by,
+                granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+                note,
+            };
+            let outcome = settings.sandbox.grant_scope(scope);
+            settings
+                .save_to(&file)
+                .with_context(|| format!("Failed to write {}", file.display()))?;
+
+            match outcome {
+                GrantOutcome::Added => {
+                    println!("✓ Granted {} access to {}", access.label(), dir.display());
+                }
+                GrantOutcome::Updated(old) => {
+                    println!(
+                        "✓ Updated grant for {}: {} → {}",
+                        dir.display(),
+                        old.access.label(),
+                        access.label()
+                    );
+                }
+            }
+            println!();
+            println!("Recorded in: {}", file.display());
+            println!("  This file lives outside every sandbox scope, so a sandboxed tool — or the");
+            println!("  AI — cannot edit it; only you can. Edit it by hand, or run");
+            println!(
+                "  `ahma sandbox revoke {}` to remove this grant.",
+                dir.display()
+            );
+            println!();
+            println!("Takes effect the next time an ahma server starts (restart your IDE's MCP");
+            println!("connection, or `ahma serve …`, to apply it now).");
+            Ok(())
+        }
+        SandboxCommand::List => {
+            let settings = load(&file)?;
+            let scopes = &settings.sandbox.persistent_scopes;
+            println!("# Persistent sandbox scopes");
+            println!("# File: {}", file.display());
+            println!();
+            if scopes.is_empty() {
+                println!("(none granted)");
+                println!();
+                println!(
+                    "Grant one with:  ahma sandbox grant <PATH> [--read-only] [--by WHO] [--note TEXT]"
+                );
+                return Ok(());
+            }
+            for s in scopes {
+                println!("• {}  ({})", s.path.display(), s.access.label());
+                if let Some(by) = &s.granted_by {
+                    println!("    granted by: {by}");
+                }
+                if let Some(at) = &s.granted_at {
+                    println!("    granted on: {at}");
+                }
+                if let Some(note) = &s.note {
+                    println!("    note:       {note}");
+                }
+            }
+            println!();
+            println!("These survive every roots/list update. Use `ahma sandbox grant|revoke` (or");
+            println!("edit the file directly) to change them; restart the server to apply.");
+            Ok(())
+        }
+        SandboxCommand::Revoke { path: dir } => {
+            let mut settings = load(&file)?;
+            match settings.sandbox.revoke_scope(&dir) {
+                Some(removed) => {
+                    settings
+                        .save_to(&file)
+                        .with_context(|| format!("Failed to write {}", file.display()))?;
+                    println!(
+                        "✓ Revoked {} access to {}",
+                        removed.access.label(),
+                        removed.path.display()
+                    );
+                    println!();
+                    println!("Updated: {}", file.display());
+                    println!("Takes effect the next time an ahma server starts.");
+                    Ok(())
+                }
+                None => {
+                    println!("No persistent scope matching {} was found.", dir.display());
+                    println!("Run `ahma sandbox list` to see current grants.");
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn run_prompts_command(args: PromptsArgs) -> Result<()> {

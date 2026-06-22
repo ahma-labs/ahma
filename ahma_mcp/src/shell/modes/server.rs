@@ -976,6 +976,7 @@ mod tests {
             tmp_access: false,
             defer_sandbox: false,
             working_dirs: vec![],
+            persistent_scopes: vec![],
             explicit_tools_dir: false,
             tools_dir: None,
             tool_bundles: vec![],
