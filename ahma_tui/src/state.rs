@@ -1712,6 +1712,26 @@ impl AppState {
         }
     }
 
+    /// Insert pasted text into the chat input without submitting it.
+    ///
+    /// The trailing newline that terminals append to a paste (e.g. pasting
+    /// `"somecommand\n"`) is stripped so the paste is shown but not sent — the
+    /// user presses Enter to submit. Interior newlines are preserved, so a
+    /// multi-line paste becomes multiple input lines (one request, not many).
+    pub fn paste_into_chat_input(&mut self, text: &str) {
+        #[cfg(feature = "tui")]
+        {
+            let trimmed = text.trim_end_matches(['\r', '\n']);
+            if !trimmed.is_empty() {
+                self.chat_input.insert_str(trimmed);
+            }
+        }
+        #[cfg(not(feature = "tui"))]
+        {
+            let _ = text;
+        }
+    }
+
     pub fn selected_model(&self) -> String {
         self.llm_label
             .rsplit_once(" / ")
@@ -1866,6 +1886,51 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "tui")]
+    fn paste_strips_trailing_newline_without_submitting() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        // Pasting "somecommand\n" shows "somecommand" — the trailing newline is
+        // dropped so it is not auto-submitted; the user must press Enter.
+        state.paste_into_chat_input("somecommand\n");
+        assert_eq!(state.chat_input_text(), "somecommand");
+    }
+
+    #[test]
+    #[cfg(feature = "tui")]
+    fn paste_strips_trailing_crlf() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.paste_into_chat_input("somecommand\r\n");
+        assert_eq!(state.chat_input_text(), "somecommand");
+    }
+
+    #[test]
+    #[cfg(feature = "tui")]
+    fn paste_keeps_interior_newlines_as_multiline_input() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        // A multi-line paste becomes multiple input lines (a single request),
+        // with the trailing newline still stripped.
+        state.paste_into_chat_input("line one\nline two\n");
+        assert_eq!(state.chat_input_text(), "line one\nline two");
+    }
+
+    #[test]
+    #[cfg(feature = "tui")]
+    fn paste_appends_to_existing_input() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.chat_input.insert_str("echo ");
+        state.paste_into_chat_input("hello\n");
+        assert_eq!(state.chat_input_text(), "echo hello");
+    }
+
+    #[test]
+    #[cfg(feature = "tui")]
+    fn paste_of_only_newline_is_noop() {
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.paste_into_chat_input("\n");
+        assert!(state.chat_input_is_empty());
+    }
 
     #[test]
     #[cfg(feature = "tui")]

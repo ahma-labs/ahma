@@ -42,7 +42,10 @@ async fn run_ratatui(
     use std::time::Duration;
 
     use crossterm::{
-        event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream},
+        event::{
+            DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+            Event, EventStream,
+        },
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     };
@@ -126,7 +129,16 @@ async fn run_ratatui(
     // ── Terminal setup ───────────────────────────────────────────────────────
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Bracketed paste makes the terminal deliver a paste as a single `Event::Paste`
+    // (interior newlines included) instead of a stream of keystrokes. Without it, a
+    // pasted trailing newline arrives as `Enter` and auto-submits, and a multi-line
+    // paste fires one submission per line. See the `Event::Paste` handler below.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -184,6 +196,14 @@ async fn run_ratatui(
                                 _ => {}
                             }
                         }
+                        Some(Ok(Event::Paste(text))) => {
+                            // Show the pasted text in the chat input but do NOT submit it.
+                            // A trailing newline (e.g. pasting "somecommand\n") is dropped so
+                            // it does not trigger a send; the user must press Enter themselves.
+                            // Interior newlines are kept, so a multi-line paste appears as
+                            // multiple lines in one input rather than many separate requests.
+                            state.paste_into_chat_input(&text);
+                        }
                         Some(Err(e)) => {
                             debug!("terminal event error: {e}");
                         }
@@ -237,6 +257,7 @@ async fn run_ratatui(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture,
+        DisableBracketedPaste,
     );
     let _ = terminal.show_cursor();
 
