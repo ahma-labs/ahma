@@ -6,11 +6,13 @@ description: >
    Repo-local development skill for the ahma workspace. NOT distributed.
    USE THIS SKILL to drive a single feature from branch to squash-merged-on-main
    (/ahmadev land), cut a release (/ahmadev release), hunt a regression
-   (/ahmadev bisect), update dependencies safely (/ahmadev update), bump the
+   (/ahmadev bisect), add test coverage where it matters most
+   (/ahmadev coverage), update dependencies safely (/ahmadev update), bump the
    version (/ahmadev bump), install a local build (/ahmadev install), and help
    (/ahmadev help).
    Trigger phrases: "ahmadev", "ahmadev land", "ahmadev release",
-   "ahmadev bisect", "ahmadev update", "ahmadev help", "land this feature",
+   "ahmadev bisect", "ahmadev coverage", "add test coverage", "improve coverage",
+   "where do we need tests", "raise coverage", "coverage report", "ahmadev update", "ahmadev help", "land this feature",
    "squash merge to main", "open a PR and merge", "merge to main", "ship it",
    "cut a release", "release this", "publish a release", "bump and release",
    "find the regression", "git bisect", "which commit broke", "find what broke",
@@ -52,6 +54,7 @@ Two commands carry the day-to-day loop; the rest are occasional specialists.
 |---------|---------|
 | `/ahmadev help` | Show the process overview + subcommand list |
 | `/ahmadev bisect` | Find the commit that introduced a regression via `git bisect run` (local, zero-CI) |
+| `/ahmadev coverage` | Read the published coverage summary and add tests where they most reduce reversions (integration tests preferred) |
 | `/ahmadev update` | Upgrade workspace deps that are ≥14 days old and advisory-clean |
 | `/ahmadev install` | Build the working tree in release mode and install it to `~/.local/bin/ahma` (unsigned, for *this* machine — does not ship) |
 | `/ahmadev bump [X.Y.Z]` | Bump the version across all version-bearing files. **Building block of `release` — you rarely call it directly** (see note below) |
@@ -137,6 +140,7 @@ landed behind it. It's a good idea here precisely because:
 /ahmadev land      — Branch → PR → auto squash-merge on main when Fast Tier passes  ← drive a fix to main
 /ahmadev release   — Land pending work + bump version on main; CI publishes the GitHub Release  ← ship to users
 /ahmadev bisect    — git bisect run a repro to find the commit that introduced a regression (local, free)
+/ahmadev coverage  — Read the published coverage summary; add tests where they most reduce reversions
 /ahmadev update    — Upgrade workspace dependencies (safe: ≥14d old, no known advisories)
 /ahmadev install   — Build the working tree (release) and install to ~/.local/bin/ahma (this machine only; unsigned)
 /ahmadev bump      — Bump version across version-bearing files (Cargo.toml, Cargo.lock, …) — building block of release
@@ -397,6 +401,111 @@ at the merge gate (before landing) or have an obvious suspect (the last land). `
 is the everyday safety net; `git bisect` is the occasional diagnostic for "it broke sometime
 in the last N landed features and I have a repro." Keep features small and squashed and you
 rarely need bisect — but when you do, it's surgical and free.
+
+---
+
+## `/ahmadev coverage` — Add Tests Where They Most Reduce Reversions
+
+### What it does
+
+Reads the **published** coverage report, picks the *one* area where added tests will do the
+most to stop code from being reverted, writes those tests (favoring **integration** tests where
+the value lives in cross-module behavior), confirms the new tests pass and actually exercise the
+target code, then lands them through the normal `/ahmadev land` gate.
+
+This is a coverage-*planning* command, not a coverage-*measuring* one. **Do not run
+`cargo llvm-cov` locally** — the coverage tool instruments and writes profraw/profdata files and
+is not designed to run inside ahma's kernel sandbox. CI already measures coverage on every push
+to `main`; this command *consumes* that measurement and adds tests with reasoning.
+
+### Where the numbers come from (read the compact summary, never the giant HTML)
+
+CI's `job-coverage` (in `.github/workflows/build.yml`) runs the instrumented suite once and
+publishes three artifacts to GitHub Pages, rooted at `https://paulirotta.github.io/ahma/`:
+
+| Artifact | URL | Use |
+|----------|-----|-----|
+| **`coverage-lowest.md`** | `https://paulirotta.github.io/ahma/coverage-lowest.md` | **Read this first.** A few-KB markdown table of every workspace file sorted ascending by line coverage, with totals — no source lines. This is the planning input. |
+| `coverage-summary.json` | `https://paulirotta.github.io/ahma/coverage-summary.json` | Same data, machine-readable (`cargo llvm-cov --json --summary-only`), if you want to filter/sort programmatically. |
+| Full line-by-line HTML | `https://paulirotta.github.io/ahma/html/` | **Only** drill in here for a *single* already-chosen file. It is large and per-line — reading it broadly swamps context with trivia. |
+
+> **Why a compact summary exists.** The raw llvm-cov HTML is tens of MB of per-line markup —
+> useless for planning and ruinous for an LLM's context window. CI therefore also emits the
+> sorted `coverage-lowest.md` / `coverage-summary.json`. **If you change the coverage job, keep
+> these compact artifacts** — losing them forces this command back onto the HTML.
+>
+> If the compact artifacts are not on Pages yet (e.g. the job hasn't run since they were added),
+> fetch them from the latest run's `coverage-summary` workflow artifact instead:
+> `gh run download -n coverage-summary` (pick the most recent `build.yml` run on `main`), or as a
+> last resort scrape the HTML index for the per-file table.
+
+### Choosing the target (the judgment that makes this command worth running)
+
+Pick where coverage most **reduces reversions** — not whatever has the lowest percentage.
+Rank candidates by *blast radius if it breaks silently*, then by how cheaply a test pins the
+behavior:
+
+1. **Prefer code on a hard invariant or a wide call path.** Sandbox scope derivation, path
+   security, approvals/gating, the MCP handshake, session isolation, daemon/bridge request
+   routing, shell-pool command construction — a silent break here is exactly what gets reverted.
+   These are also where **integration tests are the gold standard**: they catch the cross-module
+   contract a unit test mocks away. See the **Hard Invariants** section in `AGENTS.md` (HTTP
+   handshake, `-32001` sandbox gating, no print-only tests) — encode those as assertions.
+2. **Then prefer big, untested, logic-heavy files.** A 0%/low-coverage module with real branching
+   (e.g. `ahma_mcp/src/daemon_reporter.rs`, `ahma_mcp/src/service_builder.rs`,
+   `ahma_mcp/src/shell/cli/commands.rs`, `ahma_core/src/approvals.rs`) is high-yield: many
+   uncovered branches per test.
+3. **Skip the trivia even though it shows 0%.** Binary entry points (`ahma_bin/src/main.rs`,
+   `ahma_http_bridge/src/main.rs`) and pure glue are **explicitly exempt** from the ≥80% target in
+   `AGENTS.md` (tested via CLI integration). Coverage there is cosmetic and rarely prevents a
+   revert — don't burn the change on it.
+
+State the chosen target and the one-sentence reason ("breaks silently + wide blast radius +
+currently N% over M lines") before writing tests.
+
+### Workflow (how to invoke as an agent)
+
+1. **Branch from canonical main** (same rule as `land` — never from local `main`):
+   ```bash
+   git fetch origin && git switch -c test/coverage-<area> origin/main
+   ```
+
+2. **Fetch the compact summary** and read totals + the worst files:
+   ```bash
+   curl -fsSL https://paulirotta.github.io/ahma/coverage-lowest.md
+   # fallback if not published yet:  gh run download -n coverage-summary
+   ```
+
+3. **Choose ONE target** using the ranking above and announce it with its reason.
+
+4. **Read the target source** with native file tools and identify the uncovered behavior worth
+   pinning. For one chosen file you may open its HTML page
+   (`https://paulirotta.github.io/ahma/html/<path>.html`) to see exactly which lines are red.
+
+5. **Write tests, integration-first where it fits.** Put cross-module/workflow tests in the
+   workspace/crate `tests/` dir; reserve in-module `#[cfg(test)]` for pure unit logic. Obey the
+   repo test rules in `AGENTS.md`: `tempfile::TempDir` for all file I/O, `test_utils::path_helpers`
+   for paths (never hardcode `/tmp`, `/bin/sh`, `/dev/null`), assert on success/failure **and** key
+   output (no print-only tests), and for the HTTP bridge follow the exact handshake sequence.
+
+6. **Verify locally** — tests must pass *and* genuinely exercise the target (a test that doesn't
+   hit the uncovered lines adds nothing):
+   ```bash
+   cargo nextest run -E 'test(<your_new_tests>)' --no-default-features
+   cargo fmt --all && cargo clippy --all-targets --locked
+   ```
+
+7. **Land it** via `/ahmadev land` (`test:`-typed commits). Coverage is re-measured by CI on the
+   next push to `main`; check `coverage-lowest.md` after it lands to confirm the target moved.
+
+### Scope discipline (avoid the rabbit hole)
+
+- **One area per invocation.** Resist "while I'm here" sprawl across crates — small, single-target
+  test PRs land in ~5 min and keep `main` linear. Re-run the command for the next area.
+- **Don't refactor to make code testable as part of this command** unless trivial; if the target
+  needs restructuring to be tested, say so and land that separately (it's a `refactor:`, and may be
+  a human-confirmation point if it touches an invariant).
+- This command **does not** run the coverage tool, bump, or release. It only adds tests.
 
 ---
 

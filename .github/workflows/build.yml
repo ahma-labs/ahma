@@ -496,7 +496,39 @@ jobs:
       - name: Generate coverage report
         timeout-minutes: 40
         run: |
-          cargo llvm-cov nextest --profile coverage --locked --no-default-features --html --output-dir ./coverage -E 'not (test(kotlin) or test(android))'
+          # Run the instrumented test suite ONCE, deferring report generation so we can
+          # emit several report formats from the same profdata without re-running tests.
+          cargo llvm-cov nextest --no-report --profile coverage --locked --no-default-features -E 'not (test(kotlin) or test(android))'
+
+          # 1. Full line-by-line HTML for humans drilling into a specific file.
+          cargo llvm-cov report --html --output-dir ./coverage
+
+          # 2. Compact machine-readable per-file summary (no per-line trivia) for coverage
+          #    planning by tools/agents — see /ahmadev coverage.
+          cargo llvm-cov report --json --summary-only --output-path ./coverage/coverage-summary.json
+
+          # 3. Tiny markdown table of the WORST-covered workspace files, sorted ascending by
+          #    line coverage. This is the single artifact an LLM should read to plan tests:
+          #    it is a few KB and contains no source lines. Paths are made workspace-relative.
+          #    Non-fatal: a jq hiccup must never block the HTML/Pages deploy (coverage-summary.json
+          #    still carries the same data for /ahmadev coverage to fall back on).
+          jq -r --arg ws "$PWD/" '
+            "Coverage summary (sorted by line coverage, ascending). Generated from coverage-summary.json.",
+            "",
+            "Totals: lines \(.data[0].totals.lines.percent | .*100 | round / 100)% (\(.data[0].totals.lines.covered)/\(.data[0].totals.lines.count)), " +
+              "functions \(.data[0].totals.functions.percent | .*100 | round / 100)%, " +
+              "regions \(.data[0].totals.regions.percent | .*100 | round / 100)%.",
+            "",
+            "| file | line% | lines (cov/total) | fn% | region% |",
+            "|------|------:|-------------------|----:|--------:|",
+            ( .data[0].files
+              | map({ f: (.filename | sub("^"+$ws; "")),
+                      lp: .summary.lines.percent, lcov: .summary.lines.covered, lc: .summary.lines.count,
+                      fp: .summary.functions.percent, rp: .summary.regions.percent })
+              | sort_by(.lp)[]
+              | "| \(.f) | \(.lp*100|round/100) | \(.lcov)/\(.lc) | \(.fp*100|round/100) | \(.rp*100|round/100) |" )
+          ' ./coverage/coverage-summary.json > ./coverage/coverage-lowest.md \
+            || echo "coverage-lowest.md generation failed (non-fatal); use coverage-summary.json" > ./coverage/coverage-lowest.md
 
       - name: Generate code simplicity report
         run: |
@@ -523,6 +555,14 @@ jobs:
         with:
           name: code-simplicity-report
           path: ./coverage/CODE_SIMPLICITY.md
+
+      - name: Upload compact coverage summary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-summary
+          path: |
+            ./coverage/coverage-summary.json
+            ./coverage/coverage-lowest.md
 
       - name: Deploy to GitHub Pages
         id: deployment
