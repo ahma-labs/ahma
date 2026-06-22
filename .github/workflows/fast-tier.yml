@@ -1,0 +1,121 @@
+name: Fast Tier
+
+# FAST FEEDBACK for the AI/dev iteration loop. Runs on every pull-request push and gives a
+# verdict in ~5 min: cargo fmt --check, clippy, and the nextest `smoke` profile (Linux only,
+# in-process tests only — no subprocess integration suite). It is NOT the merge gate: the full
+# cross-platform matrix (.github/workflows/build.yml) runs at the merge queue and is the
+# required "CI green" check that actually authorizes a land. Keep this tier cheap and quick;
+# put thoroughness in the merge gate, not here.
+#
+# Trigger model: PR only. The full matrix deliberately does NOT run on pull_request, so this
+# is the sole signal during iteration. Superseded pushes are cancelled to save runner minutes.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fast-tier-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main, production]
+  workflow_dispatch:
+
+env:
+  RUSTUP_MAX_RETRIES: 10
+  CARGO_TERM_COLOR: always
+  CARGO_PAGER: cat
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_NET_RETRY: 10
+  RUSTFLAGS: -C debuginfo=0 --cfg reqwest_unstable
+  RUST_BACKTRACE: 1
+  IS_DEV_BUILD: "true"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache
+  SCCACHE_MAX_SIZE: 2G
+  SCCACHE_DIRECT: "true"
+
+jobs:
+  fast-tier:
+    name: Fast Tier (fmt + clippy + smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+          token: ${{ github.token }}
+          persist-credentials: true
+
+      - name: Get current day number
+        id: day-number
+        run: echo "day=$(date +%j)" >> "$GITHUB_OUTPUT"
+
+      # Reuse build.yml's cache keys so the fast tier warms from the same registry + sccache
+      # entries (both are Linux/X64). restore-keys fall back across days and to the merge-gate
+      # caches, maximizing cold-PR hit rate.
+      - name: Cache Cargo registry and git
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/.package-cache
+            ~/.cargo/bin
+          key: cargo-registry-test-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+          restore-keys: |
+            cargo-registry-test-${{ runner.os }}-${{ runner.arch }}-
+            cargo-registry-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache sccache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-test-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+          restore-keys: |
+            sccache-test-${{ runner.os }}-${{ runner.arch }}-
+            sccache-${{ runner.os }}-${{ runner.arch }}-
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+          rustflags: ""
+          cache: false
+
+      - name: Configure deterministic tooling env
+        run: |
+          git config --global core.pager cat
+          {
+            echo "PAGER=cat"
+            echo "LC_ALL=C"
+            echo "LANG=C"
+          } >> "$GITHUB_ENV"
+
+      - name: Install sccache and nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache,nextest
+
+      - name: Add Cargo Bin to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Cheapest check first: fail in <1s on a formatting violation before any compile.
+      - name: Cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: Cargo Clippy
+        run: cargo clippy --all-targets --locked
+
+      # The `smoke` nextest profile (.config/nextest.toml) excludes the subprocess-spawning
+      # integration suite and Android/Kotlin tests, so this runs fast and fully parallel.
+      - name: Cargo Nextest (smoke)
+        run: cargo nextest run --profile smoke --locked --no-default-features
+
+      - name: Show sccache stats
+        if: always()
+        run: |
+          sccache --show-stats || true
+          sccache --stop-server || true

@@ -4,16 +4,22 @@ version: 0.1.0
 author: Paul Houghton
 description: >
    Repo-local development skill for the ahma workspace. NOT distributed.
-   USE THIS SKILL for safe dependency updates (/ahmadev update),
-   version bumping (/ahmadev bump), installing a local build
-   (/ahmadev install), and help (/ahmadev help).
-   Trigger phrases: "ahmadev", "ahmadev update", "ahmadev help",
-   "safe dep update", "ahmadev bump", "bump version", "version bump",
-   "update rust dependencies safely", "safe dependency upgrade",
-   "cargo safe update", "update dependencies", "bump deps",
-   "upgrade workspace deps", "ahmadev install", "install local build",
-   "build and install ahma", "install my changes", "get the fix on my machine",
-   "local release build", "install without waiting for CI".
+   USE THIS SKILL to drive a single feature from branch to squash-merged-on-main
+   (/ahmadev land), cut a release (/ahmadev release), hunt a regression
+   (/ahmadev bisect), update dependencies safely (/ahmadev update), bump the
+   version (/ahmadev bump), install a local build (/ahmadev install), and help
+   (/ahmadev help).
+   Trigger phrases: "ahmadev", "ahmadev land", "ahmadev release",
+   "ahmadev bisect", "ahmadev update", "ahmadev help", "land this feature",
+   "squash merge to main", "open a PR and merge", "merge to main", "ship it",
+   "cut a release", "release this", "publish a release", "bump and release",
+   "find the regression", "git bisect", "which commit broke", "find what broke",
+   "revert the bad commit", "safe dep update", "ahmadev bump", "bump version",
+   "version bump", "update rust dependencies safely", "safe dependency upgrade",
+   "cargo safe update", "update dependencies", "bump deps", "upgrade workspace deps",
+   "ahmadev install", "install local build", "build and install ahma",
+   "install my changes", "get the fix on my machine", "local release build",
+   "install without waiting for CI".
 user-invocable: true
 scope: repo
 ---
@@ -34,9 +40,17 @@ It is **not** part of the distributed ahma skill bundle.
 | Command | Purpose |
 |---------|---------|
 | `/ahmadev help` | List all available subcommands and their usage |
+| `/ahmadev land` | Drive one feature branch → PR → squash-merge on `main` through the CI gate |
+| `/ahmadev release` | Land a feature, bump the version on `main`, and watch CI publish the release |
+| `/ahmadev bisect` | Find the commit that introduced a regression via `git bisect run` (local, zero-CI) |
 | `/ahmadev update` | Upgrade workspace deps that are ≥14 days old and advisory-clean |
-| `/ahmadev bump <X.Y.Z>` | Bump ahma version in Cargo.toml |
+| `/ahmadev bump <X.Y.Z>` | Bump ahma version across all version-bearing files |
 | `/ahmadev install` | Build the working tree in release mode and install it to `~/.local/bin/ahma` |
+
+The intended day-to-day loop is **many small single-feature branches, each squash-merged
+onto `main`**: `land` is the workhorse, `release` is `land` + a version bump, `bisect` is the
+surgical undo-finder when something slips through. See the **Workflow Model** section at the
+bottom for how squash-merge, `git revert`, and `git bisect` fit together.
 
 ---
 
@@ -46,13 +60,248 @@ When the user types `/ahmadev help`, respond with:
 
 ```
 /ahmadev help      — Show this help list
-/ahmadev bump      — Bump ahma version in Cargo.toml (workspace.package.version)
+/ahmadev land      — Branch → PR → squash-merge on main, gated on CI ("CI green")
+/ahmadev release   — Land + bump version on main; CI publishes the GitHub Release
+/ahmadev bisect    — git bisect run a repro to find the commit that introduced a regression
+/ahmadev bump      — Bump ahma version across all version-bearing files (Cargo.toml, Cargo.lock, …)
 /ahmadev update    — Upgrade workspace dependencies (safe: ≥14d old, no known advisories)
 /ahmadev install   — Build the working tree (release) and install it to ~/.local/bin/ahma
 ```
 
 Reference `/ahma help` for general ahma tooling (sandbox, livelog, run_terminal_command,
 simplify, ahma update, etc.).
+
+---
+
+## `/ahmadev land` — Branch → PR → Squash-Merge on `main`
+
+### What it does
+
+Takes one focused change and lands it as a **single squashed commit** on `main`, gated on
+CI. This is the workhorse of the many-small-features workflow. Squash + auto-merge are
+already enabled on the repo; the merge queue runs the full cross-platform matrix at land
+time and merges only when the required **`CI green`** check passes.
+
+> **Always branch from `origin/main`, never from local `main`.** This checkout's local
+> `main` can sit on a diverged/rewritten history (different root commit than `origin/main`),
+> so basing work on it produces a PR full of phantom conflicts. Fetch and branch from the
+> remote ref.
+
+### Workflow (how to invoke as an agent)
+
+1. **Branch from canonical main:**
+   ```bash
+   git fetch origin
+   git switch -c feat/<short-slug> origin/main
+   ```
+   If you already have a feature branch with work, rebase it onto the latest main instead:
+   ```bash
+   git fetch origin && git rebase origin/main
+   ```
+
+2. **Make the change** as small, conventional commits (`feat:`, `fix:`, `refactor:` …). The
+   squash body is built from these commit messages (`squash_merge_commit_message =
+   COMMIT_MESSAGES`), so they become the permanent `main` log entry — write them well.
+
+3. **Get fast local feedback** (mirrors the PR fast tier — see `.github/workflows/fast-tier.yml`):
+   ```bash
+   cargo fmt --all && cargo clippy --all-targets --locked && cargo nextest run --profile smoke
+   ```
+
+4. **Push and open the PR:**
+   ```bash
+   git push -u origin HEAD
+   gh pr create --fill --base main
+   ```
+   The PR push triggers the **fast tier** (~5 min Linux fmt + clippy + smoke) for quick feedback.
+
+5. **Auto-merge through the gate.** Enable squash auto-merge; GitHub adds the PR to the merge
+   queue, runs the full matrix on the `merge_group` ref, and squash-merges when `CI green` passes:
+   ```bash
+   gh pr merge --squash --auto --delete-branch
+   ```
+
+6. **Watch it land:**
+   ```bash
+   gh pr checks --watch
+   ```
+   On success the branch is deleted and the feature is one commit on `main`.
+
+### Why `gh pr merge`, never local `git merge --squash` + push
+
+A local squash-and-push **bypasses the `CI green` gate** and can put red code on `main`.
+Always route landings through the PR + merge queue so nothing merges untested. (Branch
+protection blocks direct pushes to `main` anyway once the gate is enabled.)
+
+### Human-intervention points (pause and ask first)
+
+Drive routine features straight to merged, but **stop and confirm with the human** when the
+change: touches the sandbox/security invariants (SPEC R5/R6) or the release-signing path;
+alters CI or branch-protection itself; changes a public API in a breaking way; or when the
+merge queue reports a cross-platform failure that is **not** an obvious flake. Otherwise,
+the philosophy is push-forward-and-clean-up: land it, and use `git revert` if it turns out wrong.
+
+### If it turns out wrong after landing
+
+Because the feature is one single-parent commit, the undo is a one-liner — see
+**Workflow Model** at the bottom:
+```bash
+git revert <sha>     # then land the revert via a PR (or /ahmadev release to ship it)
+```
+
+---
+
+## `/ahmadev release` — Land + Bump + Publish
+
+### What it does
+
+Ships a release. The **version number is the release trigger**: every push to `main` builds
+release binaries, but `job-publish-release` creates the GitHub Release `v<version>` **only if
+that tag does not already exist**. So a release = landing a version bump on `main`.
+
+> **`cargo xtask bump-version` now also refreshes `Cargo.lock`** (every workspace member
+> carries its version there, and all CI builds `--locked`). A bump commit therefore builds
+> cleanly under the gate.
+
+### Workflow (how to invoke as an agent)
+
+1. **Land the feature(s)** with `/ahmadev land` (skip if the work is already on `origin/main`).
+
+2. **Sync to canonical main** (local `main` is frequently behind/diverged):
+   ```bash
+   git fetch origin
+   git switch main && git reset --hard origin/main
+   ```
+   > `reset --hard` discards local-`main` state. That is intended here (local `main` carries
+   > only stale duplicates of already-merged commits). If you are unsure local `main` has no
+   > unpushed work, confirm with the human before resetting.
+
+3. **Decide the version. HUMAN GATE.** Default = increment the patch component `Z` of the
+   current `[workspace.package].version` in `Cargo.toml`. Show the human the diff since the
+   last release tag and the proposed `vX.Y.Z`, and confirm before bumping. Only deviate from
+   patch-increment if the human specifies a version.
+
+4. **Bump on a release branch** (branch protection routes everything through PRs, including
+   the bump):
+   ```bash
+   git switch -c chore/release-<X.Y.Z> origin/main
+   cargo xtask bump-version <X.Y.Z>     # edits Cargo.toml, Cargo.lock, SKILL.md, install.sh, install.ps1
+   git add Cargo.toml Cargo.lock skills/ahma/SKILL.md scripts/install.sh scripts/install.ps1
+   git commit -m "chore(release): bump version to <X.Y.Z>"
+   git push -u origin HEAD
+   gh pr create --fill --base main
+   gh pr merge --squash --auto --delete-branch
+   ```
+
+5. **Watch the publish.** When the bump lands on `main`, the main run builds the binaries and
+   publishes the Release:
+   ```bash
+   gh run watch
+   gh release view v<X.Y.Z>      # confirm it published
+   ```
+
+### Abort / failure paths
+
+- **Main run fails:** no release publishes (the tag is never created). Fix forward with a new
+  `/ahmadev land`, then re-run `/ahmadev release`. **Never** force a tag or reuse a version.
+- **A released version is bad:** do not delete or rewrite the tag. `git revert` the offending
+  commit, then `/ahmadev release` a new patch that ships the fix.
+- **Pushed to `main` without bumping:** CI runs but nothing publishes; `ahma update` keeps
+  serving the previous release. Any user-facing change you want shipped needs a bump.
+
+---
+
+## `/ahmadev bisect` — Find the Commit That Introduced a Regression
+
+### When to use it (be honest)
+
+`git bisect` is the right tool for **one** situation: a regression of **unknown origin** that
+**reproduces deterministically** with a one-command test. Its advantage here is that it runs
+**locally at zero CI cost**. Do **not** reach for it when:
+
+- CI is simply red on the change you just made → **fix forward**, just read the failure.
+- There is an obvious suspect commit → check that one first.
+- You have no reliable repro → **write the failing regression test first**, then bisect.
+
+### Inputs
+
+| Input | Default |
+|-------|---------|
+| **bad** ref (bug reproduces here) | `origin/main` |
+| **good** ref (bug absent here) | latest release tag: `gh release view --json tagName -q .tagName` |
+| **repro** command (exits non-zero when the bug is present) | a narrow `cargo nextest` filter — ideally a regression test |
+
+### Procedure
+
+```bash
+git fetch origin
+# Always clean up bisect state, even on Ctrl-C or error:
+trap 'git bisect reset' EXIT
+
+git bisect start
+git bisect bad  <bad-ref>      # default: origin/main
+git bisect good <good-ref>     # default: last release tag
+
+# Exit-code contract for `git bisect run`:
+#   0        => commit is GOOD
+#   1..124   => commit is BAD
+#   125      => SKIP this commit (e.g. it does not compile)
+git bisect run bash -c '
+  cargo build --locked -q 2>/dev/null || exit 125
+  cargo nextest run --no-default-features -E "test(<narrow_repro>)" 2>/dev/null
+'
+# git prints: "<sha> is the first bad commit"
+git bisect reset    # (the trap also does this)
+```
+
+### Output to the human
+
+Report the culprit and the suggested undo:
+```bash
+git show --stat <sha>          # what the bad commit changed (and which PR it came from)
+git revert <sha>               # clean single-parent revert; land via PR, or /ahmadev release to ship
+```
+
+### Notes
+
+- A **flaky** repro poisons bisect — make it deterministic first, or `git bisect skip`
+  commits where the test genuinely can't run.
+- Because every feature lands as **one squashed commit**, the culprit `<sha>` *is* the
+  feature; reverting it removes exactly that feature, nothing more.
+- This is intentionally a **skill procedure, not a `cargo xtask`** — the value is the
+  good/bad/repro discipline and the exit-code contract, which is documentation, not code.
+
+---
+
+## Workflow Model — Squash-Merge, Revert, Bisect (primer)
+
+The three tools compose cleanly, and squash-merge is what makes the other two clean:
+
+- **Squash-merge** is how every feature lands: one PR → one commit on a **linear** `main`
+  (branch protection enforces linear history). This gives a readable `git log`, a trivial
+  revert, and an ideal bisect space.
+
+- **`git revert <sha>`** undoes a landed feature. Because a squashed commit has a **single
+  parent**, there is no `-m` parent-selection ambiguity — it is a clean one-liner:
+  ```bash
+  git revert <sha>      # creates a new commit that undoes <sha>
+  ```
+  - **Re-introduce later:** `git revert <revert-sha>` (revert the revert) brings the change
+    back, or simply re-land the original branch as a fresh PR.
+  - **Conflicts:** if `main` moved a lot since `<sha>`, the revert may conflict; resolve, then
+    `git revert --continue`.
+  - A revert is a normal change → it lands through a **PR + the CI gate** like anything else.
+    Don't push reverts straight to `main`.
+
+- **`git bisect`** finds an **unknown** culprit (see `/ahmadev bisect`). Use it only when a
+  regression appeared, you don't know which landed feature caused it, **and** you have a
+  deterministic repro. Otherwise fix forward.
+
+**Are you over-relying on bisect?** A little — most regressions in this workflow are caught
+at the merge gate (before landing) or have an obvious suspect (the last land). `git revert`
+is the everyday safety net; `git bisect` is the occasional diagnostic for "it broke sometime
+in the last N landed features and I have a repro." Keep features small and squashed and you
+rarely need bisect — but when you do, it's surgical and free.
 
 ---
 
@@ -96,7 +345,7 @@ Only deviate from this rule when the user explicitly specifies a different versi
    ```bash
    cargo xtask bump-version <X.Y.Z>
    ```
-   *Note: This command updates `Cargo.toml`, `skills/ahma/SKILL.md`, `scripts/install.sh`, and `scripts/install.ps1` automatically. Running this command first prevents build panics/errors caused by version mismatches between files.*
+   *Note: This command updates `Cargo.toml`, `Cargo.lock` (via `cargo update --workspace`, so the `--locked` CI build passes), `skills/ahma/SKILL.md`, `scripts/install.sh`, and `scripts/install.ps1` automatically. Running this command first prevents build panics/errors caused by version mismatches between files.*
 4. **Review git diff** to confirm version-bearing files are correctly modified:
    ```bash
    git diff

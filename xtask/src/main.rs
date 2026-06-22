@@ -184,11 +184,99 @@ fn perform_normal_bump(root: &Path, cargo_toml_path: &Path, cur_ver: &str, new_v
         "scripts/install.ps1",
     );
 
+    // 5. Cargo.lock — every workspace member carries its own version here, and ALL CI
+    //    builds with `--locked`.  If we bump Cargo.toml but leave Cargo.lock stale, the
+    //    release-bump commit fails to build on CI (and the local pre-push `cargo check
+    //    --locked` hook rejects it).  Refresh the lockfile so the member versions match.
+    refresh_cargo_lock(root, new_ver);
+
     println!();
     println!("Done. Version bumped to {new_ver}.");
     println!("Suggested commit:");
-    println!("  git add Cargo.toml skills/ahma/SKILL.md scripts/install.sh scripts/install.ps1");
+    println!(
+        "  git add Cargo.toml Cargo.lock skills/ahma/SKILL.md scripts/install.sh scripts/install.ps1"
+    );
     println!("  git commit -m \"chore(release): bump version to {new_ver}\"");
+}
+
+/// Refresh `Cargo.lock` so every workspace member's `version` entry matches the just-bumped
+/// `Cargo.toml`.  Uses `cargo update --workspace`, which re-resolves ONLY the workspace
+/// packages and leaves third-party dependency pins untouched (so the bump never perturbs the
+/// dependency graph).  Tries `--offline` first (workspace-member resolution needs no network
+/// and keeps the bump deterministic); falls back to an online run only if offline fails.
+/// After updating, verifies the lockfile actually moved to `new_ver` and warns loudly if not,
+/// because a silently-stale Cargo.lock is exactly the regression this guards against.
+fn refresh_cargo_lock(root: &Path, new_ver: &str) {
+    let updated = run_cargo_update_workspace(root, true) || run_cargo_update_workspace(root, false);
+    if !updated {
+        eprintln!(
+            "WARNING: `cargo update --workspace` did not succeed — Cargo.lock may be stale.\n\
+             Run `cargo update --workspace` manually and include Cargo.lock in the release commit,\n\
+             or CI's `--locked` build will fail."
+        );
+        return;
+    }
+    let lock_path = root.join("Cargo.lock");
+    match fs::read_to_string(&lock_path) {
+        Ok(lock) => match package_version_in_lock(&lock, "ahma_bin") {
+            Some(v) if v == new_ver => println!("  OK Cargo.lock (workspace members → {new_ver})"),
+            Some(v) => eprintln!(
+                "WARNING: Cargo.lock still pins ahma_bin = {v} after update (expected {new_ver}); \
+                 verify the lockfile before committing."
+            ),
+            None => eprintln!(
+                "WARNING: could not find ahma_bin in Cargo.lock to verify the bump; \
+                 review Cargo.lock before committing."
+            ),
+        },
+        Err(e) => eprintln!("WARNING: could not read Cargo.lock to verify the bump: {e}"),
+    }
+}
+
+/// Run `cargo update --workspace` (optionally `--offline`) in `root`.
+/// Returns `true` only on a clean exit.
+fn run_cargo_update_workspace(root: &Path, offline: bool) -> bool {
+    let mut args: Vec<&str> = vec!["update", "--workspace"];
+    if offline {
+        args.push("--offline");
+    }
+    match std::process::Command::new("cargo")
+        .args(&args)
+        .current_dir(root)
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(e) => {
+            eprintln!(
+                "  (could not spawn `cargo update --workspace{}`: {e})",
+                if offline { " --offline" } else { "" }
+            );
+            false
+        }
+    }
+}
+
+/// Parse a `Cargo.lock` and return the `version` of the `[[package]]` entry named `package`.
+///
+/// Cargo.lock is line-oriented TOML; each package is a `[[package]]` block with `name = "..."`
+/// and `version = "..."` lines.  We scan for the block whose `name` matches and return the
+/// first `version` that follows it.  Pure (no I/O) so it is cheaply unit-testable.
+fn package_version_in_lock(lock_contents: &str, package: &str) -> Option<String> {
+    let target = format!("name = \"{package}\"");
+    let mut in_target = false;
+    for line in lock_contents.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[package]]" {
+            in_target = false;
+        } else if trimmed == target {
+            in_target = true;
+        } else if in_target {
+            if let Some(rest) = trimmed.strip_prefix("version = \"") {
+                return rest.strip_suffix('"').map(str::to_string);
+            }
+        }
+    }
+    None
 }
 
 /// Re-apply the source file's trailing newline after line-oriented edits.
@@ -1332,5 +1420,62 @@ mod tests {
     #[test]
     fn test_extract_cargo_error_empty_input() {
         assert_eq!(super::extract_cargo_error("   \n\n"), "unknown cargo error");
+    }
+
+    // Regression (PR #273 fixed this once and it regressed): a version bump must also
+    // refresh Cargo.lock, because every workspace member's version lives there and all CI
+    // builds with `--locked`.  These tests guard the lockfile-consistency parser used to
+    // verify the bump landed.
+    #[test]
+    fn test_package_version_in_lock_finds_workspace_member() {
+        let lock = r#"
+# This file is automatically @generated by Cargo.
+version = 4
+
+[[package]]
+name = "ahma_common"
+version = "0.12.19"
+
+[[package]]
+name = "ahma_bin"
+version = "0.12.19"
+dependencies = [
+ "ahma_common",
+]
+
+[[package]]
+name = "anyhow"
+version = "1.0.100"
+"#;
+        assert_eq!(
+            super::package_version_in_lock(lock, "ahma_bin").as_deref(),
+            Some("0.12.19")
+        );
+        assert_eq!(
+            super::package_version_in_lock(lock, "ahma_common").as_deref(),
+            Some("0.12.19")
+        );
+        // A third-party crate's version must not be confused for a workspace member's.
+        assert_eq!(
+            super::package_version_in_lock(lock, "anyhow").as_deref(),
+            Some("1.0.100")
+        );
+        assert_eq!(super::package_version_in_lock(lock, "nonexistent"), None);
+    }
+
+    #[test]
+    fn test_package_version_in_lock_detects_stale_lock() {
+        // Simulate the exact bug: Cargo.toml bumped to 0.12.20 but Cargo.lock left at 0.12.19.
+        let stale_lock = r#"
+[[package]]
+name = "ahma_bin"
+version = "0.12.19"
+"#;
+        let bumped = "0.12.20";
+        assert_ne!(
+            super::package_version_in_lock(stale_lock, "ahma_bin").as_deref(),
+            Some(bumped),
+            "a stale Cargo.lock must be detectable as not matching the bumped version"
+        );
     }
 }

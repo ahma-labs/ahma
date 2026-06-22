@@ -29,13 +29,22 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  # Ref-aware cancellation: cancel superseded runs on merge-queue / dispatch refs (iterative
+  # work), but NEVER cancel a run on main/production — each main push is a distinct
+  # squash-merge that may publish a release, so it must always finish.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/production' }}
 
+# TIERED CI (see .github/workflows/fast-tier.yml):
+#   - Pull requests run the FAST tier only (Linux fmt + clippy + nextest `smoke`), ~5 min.
+#   - This full cross-platform matrix runs at the MERGE GATE via the merge queue
+#     (`merge_group`) — once per landed feature, not on every iteration push — and on
+#     every push to main/production (which also builds + publishes the release).
+# This is why `pull_request` is intentionally NOT a trigger here: the full matrix is the
+# gate to LAND, the fast tier is the gate to ITERATE.
 on:
   push:
     branches: [main, production]
-  pull_request:
-    branches: [main, production]
+  merge_group:
   workflow_dispatch:
 
 env:
@@ -62,7 +71,10 @@ jobs:
         shell: bash
     strategy:
       fail-fast: false
-      max-parallel: 2
+      # Free OSS allows up to 20 concurrent jobs; capping at 2 forced Windows nextest to
+      # queue ~9-10 min behind ubuntu+macos before even starting. Run the whole matrix at
+      # once so the critical path is the slowest single leg (Windows), not the sum of waves.
+      max-parallel: 4
       matrix:
         include:
           - os: ubuntu-latest
@@ -169,6 +181,13 @@ jobs:
       - name: Add Cargo Bin to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      # Fail fast on formatting before any expensive compile. The PR fast tier already runs
+      # this, but a direct push to main (e.g. the release version-bump commit) bypasses the
+      # fast tier — this is main's fmt backstop. <1s; Linux only (rustfmt is platform-agnostic).
+      - name: Cargo fmt --check
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: cargo fmt --all --check
+
       - name: Build ahma binary (required by integration tests)
         if: matrix.test_mode == 'full'
         run: cargo build --locked --no-default-features -p ahma_bin
@@ -268,6 +287,33 @@ jobs:
 
       - name: Check workspace license boundaries
         run: bash ./scripts/check-license-boundaries.sh
+
+  #######################################
+
+  # Single aggregate gate. This is the ONE required status check on main (rename-stable —
+  # individual matrix legs can be renamed without touching branch protection). The merge
+  # queue runs this on `merge_group` before merging; a push to main runs it as the release
+  # precondition. `if: always()` + explicit result checks make a skipped/failed dependency
+  # FAIL the gate (a plain `needs:` would let a skipped dep pass silently).
+  ci-green:
+    name: CI green
+    if: always()
+    needs:
+      - job-cargo-nextest
+      - job-android-nextest
+      - job-security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all required jobs succeeded
+        run: |
+          echo "nextest=${{ needs.job-cargo-nextest.result }}"
+          echo "android=${{ needs.job-android-nextest.result }}"
+          echo "security=${{ needs.job-security.result }}"
+          fail=0
+          [ "${{ needs.job-cargo-nextest.result }}" = "success" ] || { echo '::error::test matrix did not pass'; fail=1; }
+          [ "${{ needs.job-android-nextest.result }}" = "success" ] || { echo '::error::android tests did not pass'; fail=1; }
+          [ "${{ needs.job-security.result }}" = "success" ] || { echo '::error::security (cargo deny) did not pass'; fail=1; }
+          exit $fail
 
   #######################################
 
@@ -503,7 +549,9 @@ jobs:
         shell: bash
     strategy:
       fail-fast: false
-      max-parallel: 2
+      # 6 release targets; run them all concurrently. At max-parallel:2 the musl-arm64 tail
+      # didn't start until +22 min and set the ~31-min post-merge time on its own.
+      max-parallel: 6
       matrix:
         include:
           # Native builds (no cross-compilation needed)
@@ -695,12 +743,13 @@ jobs:
 
   job-publish-release:
     name: Publish Release
+    # Gate the release on correctness (ci-green already aggregates nextest + android +
+    # security) plus the actual artifacts (release-binaries). Coverage is a Pages/reporting
+    # job (~8 min) and is intentionally NOT on the release critical path anymore — it runs
+    # in parallel without blocking the publish.
     needs:
-      - job-cargo-nextest
-      - job-android-nextest
+      - ci-green
       - job-release-binaries
-      - job-coverage
-      - job-security
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

@@ -160,3 +160,25 @@ slow-timeout = { period = "600s", terminate-after = 2 }
 [[profile.coverage.overrides]]
 filter = "binary_id(~ahma_mcp::)"
 threads-required = 2
+
+# ---------------------------------------------------------------------------
+# Smoke profile — the PR FAST TIER (.github/workflows/fast-tier.yml)
+# Activated by: cargo nextest run --profile smoke
+# ---------------------------------------------------------------------------
+#
+# Purpose: sub-6-minute fast feedback on every PR iteration push. This is NOT full
+# coverage — the full cross-platform matrix at the MERGE GATE (build.yml on merge_group)
+# is the authority. Smoke deliberately EXCLUDES the subprocess-spawning integration tests
+# (which fork `ahma serve` and complete an MCP handshake over pipes — the slow, throttled,
+# occasionally-flaky suite) and the Android/Kotlin tests. What remains — every crate's lib
+# unit tests, the ahma_mcp lib unit binary (no `::`), and all in-process tests in other
+# packages — runs with FULL parallelism (no subprocess throttle needed), catching compile
+# errors and logic regressions fast. The merge gate catches the rest before anything lands.
+#
+# default-filter is applied automatically; the fast-tier job just runs `--profile smoke`.
+[profile.smoke]
+default-filter = "not (package(ahma_http_bridge) or binary_id(~ahma_mcp::) or test(kotlin) or test(android))"
+slow-timeout = { period = "60s", terminate-after = 2 }
+failure-output = "immediate"
+success-output = "never"
+retries = 0
