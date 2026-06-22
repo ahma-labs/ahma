@@ -1,7 +1,7 @@
 //! Application state — single source of truth for all TUI panels.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -1056,6 +1056,14 @@ pub struct AppState {
     // ── Panel data ──
     pub ai_activity: VecDeque<AiActivityEntry>,
     pub operations: Vec<Operation>,
+    /// Live output lines that arrived (via the daemon hub) before the operation
+    /// they belong to was materialised in `operations`. Keyed by op id. The
+    /// daemon hub delivers `OpStarted` and `OpOutput` over one ordered socket,
+    /// but on a hub reconnect only `OpStarted`/`OpFinished` are replayed — so an
+    /// output line can outrun its operation. Rather than drop it (which left fast
+    /// commands like `!pwd` showing no result until the next status poll), we
+    /// stash it here and flush into the op's `stdout_tail` in `upsert_operation`.
+    pub pending_output: HashMap<String, VecDeque<String>>,
     pub log: VecDeque<LogEntry>,
     pub approval: Option<ApprovalGate>,
     pub tools_list: Vec<crate::mcp_connections::ToolInfo>,
@@ -1429,6 +1437,7 @@ impl AppState {
             token_prefs: crate::TokenPrefs::default(),
             ai_activity: VecDeque::with_capacity(ACTIVITY_RING_CAP),
             operations: vec![],
+            pending_output: HashMap::new(),
             log: VecDeque::with_capacity(LOG_RING_CAP),
             approval: None,
             tools_list: vec![],
@@ -1803,6 +1812,7 @@ impl AppState {
     }
 
     pub fn upsert_operation(&mut self, op: Operation) {
+        let id = op.id.clone();
         match self
             .operations
             .iter_mut()
@@ -1811,7 +1821,44 @@ impl AppState {
             Some(existing) => Self::merge_operation(existing, op),
             None => self.operations.push(op),
         }
+        // Flush any output that arrived before this op was materialised (see
+        // `pending_output`). Append into the (now present) op's tail via the
+        // same overlap-dedup merge the poll/hub paths use, so a later poll that
+        // re-sends the full tail does not duplicate these lines.
+        if let Some(pending) = self.pending_output.remove(&id)
+            && let Some(existing) = self.operations.iter_mut().find(|o| o.id == id)
+        {
+            let new_lines = Self::tail_suffix_to_append(&existing.stdout_tail, &pending);
+            for line in new_lines {
+                if existing.stdout_tail.len() >= STDOUT_TAIL_CAP {
+                    existing.stdout_tail.pop_front();
+                }
+                existing.stdout_tail.push_back(line);
+            }
+        }
         self.clamp_ops_selection();
+    }
+
+    /// Stash a live output line for an operation not yet present in
+    /// `operations`. Flushed into the op's tail by [`Self::upsert_operation`]
+    /// when the operation is first materialised. Bounded per-op at
+    /// `STDOUT_TAIL_CAP`; the number of distinct buffered ops is capped so a
+    /// stream of output for ops that never materialise cannot grow without
+    /// bound. Returns `true` if the line was buffered.
+    pub fn buffer_pending_output(&mut self, op_id: &str, line: String) -> bool {
+        // Cap distinct buffered ops: if this is a new op id and we are already
+        // at the cap, drop the line rather than grow unboundedly.
+        const MAX_PENDING_OPS: usize = 64;
+        if !self.pending_output.contains_key(op_id) && self.pending_output.len() >= MAX_PENDING_OPS
+        {
+            return false;
+        }
+        let buf = self.pending_output.entry(op_id.to_string()).or_default();
+        if buf.len() >= STDOUT_TAIL_CAP {
+            buf.pop_front();
+        }
+        buf.push_back(line);
+        true
     }
 
     /// Merge an incoming operation update into the matching existing entry.
@@ -2063,6 +2110,66 @@ mod tests {
         same.stdout_tail = vec!["a".to_string(), "b".to_string(), "c".to_string()].into();
         s.upsert_operation(same);
         assert_eq!(s.operations[0].stdout_tail.len(), 3);
+    }
+
+    #[test]
+    fn pending_output_flushes_when_op_materialises() {
+        // Regression: an OpOutput line that arrives before its operation (e.g.
+        // after a daemon-hub reconnect) must not be dropped. It is buffered and
+        // flushed into the op's tail once the op appears, so fast commands like
+        // `!pwd` still show their output.
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+
+        // Output arrives first — no matching op yet.
+        assert!(s.buffer_pending_output("op1", "/work/dir".to_string()));
+        assert!(s.operations.is_empty());
+
+        // The op's snapshot lands afterwards (empty tail, as OpStarted carries
+        // no output) and must absorb the buffered line.
+        s.upsert_operation(Operation::new(
+            "op1",
+            "run_terminal_command",
+            OpStatus::Running,
+        ));
+        assert_eq!(s.operations.len(), 1);
+        assert_eq!(
+            s.operations[0].stdout_tail,
+            vec!["/work/dir".to_string()],
+            "buffered output should flush into the materialised op"
+        );
+        // Buffer is consumed, not left to leak or double-flush.
+        assert!(s.pending_output.is_empty());
+    }
+
+    #[test]
+    fn pending_output_flush_does_not_duplicate_against_poll_tail() {
+        // If the op later materialises via the poll path (which re-sends the
+        // full tail), the overlap-dedup merge must not duplicate the line the
+        // hub already buffered.
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        s.buffer_pending_output("op1", "line-a".to_string());
+
+        // Poll snapshot already includes "line-a" in its tail.
+        let mut op = Operation::new("op1", "run_terminal_command", OpStatus::Succeeded);
+        op.stdout_tail = vec!["line-a".to_string()].into();
+        s.upsert_operation(op);
+
+        assert_eq!(s.operations[0].stdout_tail, vec!["line-a".to_string()]);
+    }
+
+    #[test]
+    fn pending_output_caps_distinct_ops() {
+        // A flood of output for ops that never materialise must not grow the
+        // buffer without bound.
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        for i in 0..64 {
+            assert!(s.buffer_pending_output(&format!("op{i}"), "x".to_string()));
+        }
+        // 65th distinct op is refused.
+        assert!(!s.buffer_pending_output("op64", "x".to_string()));
+        // But more output for an already-buffered op is still accepted.
+        assert!(s.buffer_pending_output("op0", "y".to_string()));
+        assert_eq!(s.pending_output.len(), 64);
     }
 
     #[test]

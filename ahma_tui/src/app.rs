@@ -3255,8 +3255,13 @@ fn handle_operation_output(
         .or_else(|| state.operations.iter().position(|o| o.id == op_id));
 
     let Some(idx) = op_idx else {
-        // Output for an operation we have not seen yet — the OpStarted event
-        // (or the next reconciliation poll) will create it; drop the line.
+        // Output for an operation we have not seen yet. This happens when an
+        // OpOutput line outruns the snapshot that materialises the op (e.g.
+        // after a daemon-hub reconnect, which replays OpStarted/OpFinished but
+        // not OpOutput). Buffer the line instead of dropping it; it is flushed
+        // into the op's tail by `upsert_operation` once the op appears — so
+        // fast commands like `!pwd` no longer lose their output.
+        state.buffer_pending_output(op_id, line);
         return;
     };
 
