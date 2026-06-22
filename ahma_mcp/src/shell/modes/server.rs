@@ -859,6 +859,17 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     // Try to wire up an HTTP MCP client proxy if mcp.json specifies one.
     try_setup_mcp_client(&config).await?;
 
+    // Scope-grant auto-detection: one shared coordinator drives both the adapter's
+    // notifier (which emits requests) and the reporter (which resolves answers and
+    // persists). The notifier delivers requests to the hub so a connected TUI can
+    // show the "grant access?" modal; approval is persisted for the next start,
+    // never applied to the live session (SPEC R5.4.7).
+    let grant_coordinator = Arc::new(ahma_common::scope_grant::GrantCoordinator::new());
+    let (grant_req_tx, grant_req_rx) = tokio::sync::mpsc::unbounded_channel();
+    let grant_notifier: Arc<dyn crate::sandbox::ScopeGrantNotifier> = Arc::new(
+        crate::sandbox::HubGrantNotifier::new(grant_coordinator.clone(), grant_req_tx),
+    );
+
     // Build the MCP service: monitor → pool → adapter → configs → service.
     let BuiltService {
         service,
@@ -868,6 +879,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         loaded_tools_count,
         configs: _configs,
     } = ServiceBuilder::new(&config, sandbox.clone())
+        .with_scope_grant_notifier(grant_notifier)
         .build()
         .await?;
     let service_handler = service;
@@ -886,6 +898,10 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
             "stdio",
             scope_str,
             label,
+            Some(crate::daemon_reporter::GrantReporting {
+                coordinator: grant_coordinator,
+                req_rx: grant_req_rx,
+            }),
         );
     }
 

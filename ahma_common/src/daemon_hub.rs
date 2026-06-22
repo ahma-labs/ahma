@@ -185,6 +185,23 @@ pub enum ClientMsg {
         tool: String,
         args: String,
     },
+    /// An instance asking every TUI to raise a "grant access to X?" prompt for an
+    /// auto-detected out-of-scope path. Mirrors [`Self::ApprovalRequested`] but the
+    /// decision is three-valued and the grant is persisted for the next start, never
+    /// applied to the live session (SPEC R5.4.7).
+    ScopeGrantRequested {
+        request: crate::scope_grant::ScopeGrantRequest,
+    },
+    /// A TUI's three-valued answer to a scope-grant prompt, routed back to the
+    /// instance that raised it.
+    SubmitScopeGrant {
+        decision_id: String,
+        decision: crate::scope_grant::GrantDecision,
+        target_instance_id: Option<String>,
+    },
+    /// An instance announcing a scope-grant decision is resolved, so the hub can
+    /// dismiss the prompt on any other TUI showing the same `decision_id`.
+    ScopeGrantResolved { decision_id: String },
     /// Notify that the agent turn is done.
     AgentDone,
     /// Notify that the agent turn encountered an error.
@@ -226,6 +243,21 @@ pub enum DaemonMsg {
     },
     /// Forward user approval to registered instance.
     SubmitApproval { approved: bool },
+    /// Prompt every TUI to raise a "grant access to X?" modal for an auto-detected
+    /// out-of-scope path. The default/Enter choice must be the safe Deny
+    /// (SPEC R5.3.1); the grant is persisted for the next start, never live.
+    ScopeGrantRequested {
+        request: crate::scope_grant::ScopeGrantRequest,
+    },
+    /// Forward a TUI's scope-grant decision to the registered instance that raised
+    /// it, where it is resolved and (if approved) persisted.
+    SubmitScopeGrant {
+        decision_id: String,
+        decision: crate::scope_grant::GrantDecision,
+    },
+    /// Tell every TUI to dismiss the scope-grant modal for `decision_id` (a twin
+    /// surface answered, or the instance withdrew it).
+    ScopeGrantDismiss { decision_id: String },
     /// Notify TUI that the agent turn is done.
     AgentDone,
     /// Notify TUI that the agent turn encountered an error.
@@ -965,6 +997,23 @@ where
             }
         }
 
+        ClientMsg::SubmitScopeGrant {
+            decision_id,
+            decision,
+            target_instance_id,
+        } => {
+            if let Some(tid) = resolve_target(&hub, target_instance_id.as_deref()).await
+                && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
+            {
+                let _ = tx
+                    .send(DaemonMsg::SubmitScopeGrant {
+                        decision_id,
+                        decision,
+                    })
+                    .await;
+            }
+        }
+
         _ => {
             debug!("daemon: unexpected message, closing connection");
         }
@@ -1042,6 +1091,12 @@ async fn serve_instance<R, W>(
                     }
                     Ok(ClientMsg::ApprovalRequested { id: call_id, tool, args }) => {
                         let _ = hub.broadcast.send(DaemonMsg::ApprovalRequested { id: call_id, tool, args });
+                    }
+                    Ok(ClientMsg::ScopeGrantRequested { request }) => {
+                        let _ = hub.broadcast.send(DaemonMsg::ScopeGrantRequested { request });
+                    }
+                    Ok(ClientMsg::ScopeGrantResolved { decision_id }) => {
+                        let _ = hub.broadcast.send(DaemonMsg::ScopeGrantDismiss { decision_id });
                     }
                     Ok(ClientMsg::AgentDone) => {
                         let _ = hub.broadcast.send(DaemonMsg::AgentDone);
@@ -1370,6 +1425,54 @@ mod tests {
     fn uuid_v4_contains_dashes() {
         let id = uuid_v4();
         assert!(id.contains('-'), "UUID should contain dashes: {id}");
+    }
+
+    #[test]
+    fn scope_grant_messages_round_trip() {
+        use crate::scope_grant::{GrantDecision, GrantReason, ScopeGrantRequest};
+
+        let request = ScopeGrantRequest {
+            decision_id: "dec-42".into(),
+            path: std::path::PathBuf::from("/opt/ext/cache"),
+            access: crate::config::ScopeAccess::Rw,
+            reason: GrantReason::StderrHeuristic,
+            tool: Some("sccache".into()),
+        };
+
+        // ClientMsg side (instance → hub, and TUI → hub).
+        for msg in [
+            ClientMsg::ScopeGrantRequested {
+                request: request.clone(),
+            },
+            ClientMsg::SubmitScopeGrant {
+                decision_id: "dec-42".into(),
+                decision: GrantDecision::GrantRo,
+                target_instance_id: Some("inst-1".into()),
+            },
+            ClientMsg::ScopeGrantResolved {
+                decision_id: "dec-42".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            let back: ClientMsg = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{msg:?}"), format!("{back:?}"));
+        }
+
+        // DaemonMsg side (hub → TUI, and hub → instance).
+        for msg in [
+            DaemonMsg::ScopeGrantRequested { request },
+            DaemonMsg::SubmitScopeGrant {
+                decision_id: "dec-42".into(),
+                decision: GrantDecision::Deny,
+            },
+            DaemonMsg::ScopeGrantDismiss {
+                decision_id: "dec-42".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            let back: DaemonMsg = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{msg:?}"), format!("{back:?}"));
+        }
     }
 
     // ── In-process daemon integration (Unix only) ─────────────────────────────

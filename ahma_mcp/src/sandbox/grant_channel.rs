@@ -84,6 +84,64 @@ impl ScopeGrantNotifier for LoggingGrantNotifier {
     }
 }
 
+/// A notifier that forwards each de-duplicated grant request to the daemon hub
+/// (for a connected TUI to show as a modal) **and** logs it (so it stays
+/// observable even when no TUI is attached). The shared [`GrantCoordinator`] is
+/// the same instance the daemon reporter uses to resolve the answer, so dedup,
+/// first-answer-wins, and dismiss all coordinate across the request and the reply.
+#[derive(Debug)]
+pub struct HubGrantNotifier {
+    coordinator: Arc<GrantCoordinator>,
+    req_tx: tokio::sync::mpsc::UnboundedSender<ahma_common::scope_grant::ScopeGrantRequest>,
+}
+
+impl HubGrantNotifier {
+    /// Create a hub-delivering notifier sharing `coordinator`, sending fresh
+    /// requests on `req_tx` (drained by the daemon reporter and forwarded to the
+    /// hub as `ClientMsg::ScopeGrantRequested`).
+    pub fn new(
+        coordinator: Arc<GrantCoordinator>,
+        req_tx: tokio::sync::mpsc::UnboundedSender<ahma_common::scope_grant::ScopeGrantRequest>,
+    ) -> Self {
+        Self {
+            coordinator,
+            req_tx,
+        }
+    }
+}
+
+#[async_trait]
+impl ScopeGrantNotifier for HubGrantNotifier {
+    async fn notify_violation(
+        &self,
+        path: &Path,
+        access: ScopeAccess,
+        reason: GrantReason,
+        tool: Option<String>,
+    ) {
+        let Some(req) = self.coordinator.begin(path, access, reason, tool) else {
+            return;
+        };
+        // Log unconditionally so the violation is visible even with no TUI attached.
+        let ro_flag = if req.access == ScopeAccess::Ro {
+            " --read-only"
+        } else {
+            ""
+        };
+        tracing::warn!(
+            path = %req.path.display(),
+            access = req.access.label(),
+            "Sandbox blocked an out-of-scope path. Approve the prompt, or run \
+             `ahma sandbox grant {}{}` — takes effect on the next server start.",
+            req.path.display(),
+            ro_flag,
+        );
+        // Deliver to the hub; if the channel is closed (no reporter yet) the log
+        // above is the fallback.
+        let _ = self.req_tx.send(req);
+    }
+}
+
 /// Wiring helper: a `PathOutsideSandbox` was returned by path validation up front,
 /// so the offending path is known exactly. Offers it as a read+write grant (a
 /// working directory / path argument is used for both). A no-op when there is no
@@ -242,6 +300,44 @@ mod tests {
         assert!(
             rec.seen.lock().unwrap().is_empty(),
             "in-scope denials must not raise a grant prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn hub_notifier_emits_once_per_key_and_carries_fields() {
+        let coordinator = Arc::new(GrantCoordinator::new());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let notifier = HubGrantNotifier::new(coordinator, tx);
+        let p = Path::new("/opt/ext/cache");
+
+        notifier
+            .notify_violation(
+                p,
+                ScopeAccess::Rw,
+                GrantReason::StderrHeuristic,
+                Some("sccache".into()),
+            )
+            .await;
+        // Same (path, access) again — dedup must suppress a second emission.
+        notifier
+            .notify_violation(
+                p,
+                ScopeAccess::Rw,
+                GrantReason::StderrHeuristic,
+                Some("sccache".into()),
+            )
+            .await;
+
+        let req = rx
+            .try_recv()
+            .expect("first violation is delivered to the hub channel");
+        assert_eq!(req.access, ScopeAccess::Rw);
+        assert_eq!(req.reason, GrantReason::StderrHeuristic);
+        assert_eq!(req.tool.as_deref(), Some("sccache"));
+        assert!(!req.decision_id.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "the duplicate violation is deduped, not re-emitted"
         );
     }
 

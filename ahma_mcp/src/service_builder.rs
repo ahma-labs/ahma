@@ -76,6 +76,7 @@ pub struct ServiceBuilder<'a> {
     force_synchronous: bool,
     defer_sandbox: bool,
     monitor_rate_limit: u64,
+    scope_grant_notifier: Option<Arc<dyn crate::sandbox::ScopeGrantNotifier>>,
 }
 
 impl<'a> ServiceBuilder<'a> {
@@ -89,7 +90,20 @@ impl<'a> ServiceBuilder<'a> {
             force_synchronous: config.force_sync,
             defer_sandbox: config.defer_sandbox,
             monitor_rate_limit: config.monitor_rate_limit_secs,
+            scope_grant_notifier: None,
         }
+    }
+
+    /// Override the scope-grant notifier the adapter routes auto-detected
+    /// violations to. When unset, a logging notifier is installed (violations are
+    /// reported to the log). The server installs a hub-delivering notifier so a
+    /// connected TUI can show the "grant access?" modal.
+    pub fn with_scope_grant_notifier(
+        mut self,
+        notifier: Arc<dyn crate::sandbox::ScopeGrantNotifier>,
+    ) -> Self {
+        self.scope_grant_notifier = Some(notifier);
+        self
     }
 
     /// Override the guidance configuration.
@@ -148,14 +162,16 @@ impl<'a> ServiceBuilder<'a> {
         ));
 
         // Auto-detect sandbox scope violations and surface a "grant access?" prompt.
-        // This PR ships the logging notifier (observable in logs); later PRs plug the
-        // TUI modal and MCP elicitation surfaces into the same shared coordinator.
-        // The coordinator only *persists* an approved grant for the next start — it
-        // never widens the live session (SPEC R5).
+        // The caller (server mode) installs a hub-delivering notifier so a connected
+        // TUI can show the modal; without one we fall back to a logging notifier so
+        // violations remain observable. Either way the notifier only *persists* an
+        // approved grant for the next start — it never widens the live session (R5).
         let grant_notifier: Arc<dyn crate::sandbox::ScopeGrantNotifier> =
-            Arc::new(crate::sandbox::LoggingGrantNotifier::new(Arc::new(
-                ahma_common::scope_grant::GrantCoordinator::new(),
-            )));
+            self.scope_grant_notifier.unwrap_or_else(|| {
+                Arc::new(crate::sandbox::LoggingGrantNotifier::new(Arc::new(
+                    ahma_common::scope_grant::GrantCoordinator::new(),
+                )))
+            });
         let adapter = Arc::new(
             Adapter::new_with_registry(
                 operation_monitor.clone(),

@@ -510,6 +510,11 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
         DaemonMsg::AgentError { error } => Applied::AgentError(error),
         DaemonMsg::RunPrompt { .. } => Applied::None,
         DaemonMsg::SubmitApproval { .. } => Applied::None,
+        // Scope-grant modal is wired in a later PR; ignore for now so the new hub
+        // protocol variants do not break the TUI build.
+        DaemonMsg::ScopeGrantRequested { .. } => Applied::None,
+        DaemonMsg::SubmitScopeGrant { .. } => Applied::None,
+        DaemonMsg::ScopeGrantDismiss { .. } => Applied::None,
     }
 }
 

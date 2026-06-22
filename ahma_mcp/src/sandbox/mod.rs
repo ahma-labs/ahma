@@ -60,7 +60,7 @@ pub use core::{add_log_exception, is_target_allowed, load_exceptions};
 pub use denial_scan::{DenialHit, scan_denial};
 pub use display::{ScopeSource, ScopeView};
 pub use error::SandboxError;
-pub use grant_channel::{LoggingGrantNotifier, ScopeGrantNotifier};
+pub use grant_channel::{HubGrantNotifier, LoggingGrantNotifier, ScopeGrantNotifier};
 #[cfg(target_os = "linux")]
 pub use landlock::{
     apply_landlock_ruleset_in_child, enforce_landlock_sandbox, landlock_ruleset_fd,

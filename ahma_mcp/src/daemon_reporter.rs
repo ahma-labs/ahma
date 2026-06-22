@@ -12,11 +12,28 @@
 
 use crate::mcp_service::{ActiveAgentSession, get_global_prompt_runner};
 use crate::operation_monitor::{Operation, OperationMonitor, OperationStatus};
+use ahma_common::config::settings_path;
 use ahma_common::daemon_hub::{
     ClientMsg, DaemonEvent, DaemonMsg, connect_to_daemon, ensure_daemon_running, recv_msg, send_msg,
 };
+use ahma_common::scope_grant::{
+    GrantCoordinator, GrantResolveOutcome, ScopeGrantRequest, persist_grant,
+};
 use std::{sync::Arc, time::Duration};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{debug, warn};
+
+/// The shared scope-grant plumbing handed to the reporter. The `coordinator` is
+/// the same instance the [`crate::sandbox::HubGrantNotifier`] uses, so a request it
+/// emits and the answer routed back here resolve against one coordinator (dedup,
+/// first-answer-wins, dismiss). `req_rx` receives fresh requests to forward to the
+/// hub as [`ClientMsg::ScopeGrantRequested`].
+pub struct GrantReporting {
+    /// Resolves answers and persists approved grants.
+    pub coordinator: Arc<GrantCoordinator>,
+    /// Stream of fresh requests to forward to the hub.
+    pub req_rx: UnboundedReceiver<ScopeGrantRequest>,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
@@ -39,14 +56,54 @@ pub fn spawn_reporter(
     mode: impl Into<String> + Send + 'static,
     scope: impl Into<String> + Send + 'static,
     label: impl Into<String> + Send + 'static,
+    grant: Option<GrantReporting>,
 ) {
     let mode = mode.into();
     let scope = scope.into();
     let label = label.into();
 
     tokio::spawn(async move {
-        run_reporter_loop(monitor, mode, scope, label).await;
+        run_reporter_loop(monitor, mode, scope, label, grant).await;
     });
+}
+
+/// Await the next grant request, or pend forever when there is no receiver — the
+/// idiom for an optional `tokio::select!` branch.
+async fn recv_optional_grant(
+    rx: Option<&mut UnboundedReceiver<ScopeGrantRequest>>,
+) -> Option<ScopeGrantRequest> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Persist an approved grant to `~/.ahma/settings.toml` — never the live session
+/// (SPEC R5.4.7). Stamps today's date and records the requesting tool as
+/// `granted_by` provenance. Best-effort: a write failure is logged, not fatal.
+fn persist_resolved_grant(
+    path: &std::path::Path,
+    access: ahma_common::config::ScopeAccess,
+    tool: Option<String>,
+) {
+    let granted_at = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let granted_by = tool.or_else(|| Some("scope-grant prompt".to_string()));
+    match settings_path() {
+        Some(file) => {
+            match persist_grant(&file, path, access, granted_by, Some(granted_at), None) {
+                Ok(_) => tracing::info!(
+                    path = %path.display(),
+                    access = access.label(),
+                    "scope grant approved and persisted; effective on the next server start"
+                ),
+                Err(e) => warn!(
+                    "daemon_reporter: failed to persist scope grant for {}: {e:#}",
+                    path.display()
+                ),
+            }
+        }
+        None => warn!("daemon_reporter: cannot persist scope grant (home directory unknown)"),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,9 +116,17 @@ async fn run_reporter_loop(
     mode: String,
     scope: String,
     label: String,
+    grant: Option<GrantReporting>,
 ) {
     let pid = std::process::id();
     let mut backoff_secs: u64 = 1;
+
+    // Split the grant plumbing: the coordinator is an `Arc` (cheap to clone into
+    // each handler), while the request receiver is the single `&mut`-borrowed
+    // resource in the select. Keeping them separate avoids a double-mutable-borrow
+    // of one struct across two select branches.
+    let grant_coordinator = grant.as_ref().map(|g| g.coordinator.clone());
+    let mut grant_req_rx = grant.map(|g| g.req_rx);
 
     loop {
         // ── Ensure daemon is running ─────────────────────────────────────────
@@ -210,6 +275,20 @@ async fn run_reporter_loop(
                     }
                 }
 
+                // 2b. Fresh scope-grant requests to forward to the hub.
+                maybe_req = recv_optional_grant(grant_req_rx.as_mut()) => {
+                    match maybe_req {
+                        Some(req) => {
+                            if send_msg(&mut writer, &ClientMsg::ScopeGrantRequested { request: req }).await.is_err() {
+                                debug!("daemon_reporter: send ScopeGrantRequested failed, reconnecting");
+                                closed = true;
+                            }
+                        }
+                        // Sender dropped — stop polling a dead receiver.
+                        None => grant_req_rx = None,
+                    }
+                }
+
                 // 3. Incoming messages from daemon hub
                 daemon_msg = recv_msg::<_, DaemonMsg>(&mut reader) => {
                     match daemon_msg {
@@ -247,6 +326,22 @@ async fn run_reporter_loop(
                                 let _ = tx.send(approved);
                             } else {
                                 debug!("daemon_reporter: received SubmitApproval but no approval sender pending");
+                            }
+                        }
+                        Ok(DaemonMsg::SubmitScopeGrant { decision_id, decision }) => {
+                            debug!("daemon_reporter: received SubmitScopeGrant id={decision_id} decision={decision:?}");
+                            if let Some(coord) = &grant_coordinator {
+                                match coord.resolve(&decision_id, decision) {
+                                    GrantResolveOutcome::Persist { path, access, tool } => {
+                                        persist_resolved_grant(&path, access, tool);
+                                        // Dismiss any twin modal on other TUIs.
+                                        let _ = send_msg(&mut writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
+                                    }
+                                    GrantResolveOutcome::Denied { .. } => {
+                                        let _ = send_msg(&mut writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
+                                    }
+                                    GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => {}
+                                }
                             }
                         }
                         Ok(msg) => {
