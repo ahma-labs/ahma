@@ -37,39 +37,114 @@ It is **not** part of the distributed ahma skill bundle.
 
 ## User-Invocable Subcommands
 
+Two commands carry the day-to-day loop; the rest are occasional specialists.
+
+**Everyday (the loop):**
+
 | Command | Purpose |
 |---------|---------|
-| `/ahmadev help` | List all available subcommands and their usage |
-| `/ahmadev land` | Drive one feature branch → PR → squash-merge on `main` through the CI gate |
-| `/ahmadev release` | Land a feature, bump the version on `main`, and watch CI publish the release |
+| `/ahmadev land` | Drive one feature branch → PR → squash-merge on `main` through the CI gate. **This is how a fix reaches `main`.** |
+| `/ahmadev release` | Land any pending work, bump the version on `main`, and watch CI publish the GitHub Release. **This is how you ship to users.** |
+
+**Occasional (specialists):**
+
+| Command | Purpose |
+|---------|---------|
+| `/ahmadev help` | Show the process overview + subcommand list |
 | `/ahmadev bisect` | Find the commit that introduced a regression via `git bisect run` (local, zero-CI) |
 | `/ahmadev update` | Upgrade workspace deps that are ≥14 days old and advisory-clean |
-| `/ahmadev bump <X.Y.Z>` | Bump ahma version across all version-bearing files |
-| `/ahmadev install` | Build the working tree in release mode and install it to `~/.local/bin/ahma` |
+| `/ahmadev install` | Build the working tree in release mode and install it to `~/.local/bin/ahma` (unsigned, for *this* machine — does not ship) |
+| `/ahmadev bump [X.Y.Z]` | Bump the version across all version-bearing files. **Building block of `release` — you rarely call it directly** (see note below) |
 
 The intended day-to-day loop is **many small single-feature branches, each squash-merged
 onto `main`**: `land` is the workhorse, `release` is `land` + a version bump, `bisect` is the
 surgical undo-finder when something slips through. See the **Workflow Model** section at the
 bottom for how squash-merge, `git revert`, and `git bisect` fit together.
 
+> **On overlap / "old commands":** the set is well-factored — there is **no dead command to
+> delete**. The only overlap is that `bump` is a strict sub-step of `release` (`release` runs
+> `bump` for you). It stays as a standalone command for the rare case of bumping without
+> landing a feature, but in the everyday loop you should reach for `release`, not `bump`.
+> `install` and `/ahma update` look similar but are not duplicates: `install` puts your
+> *local unsigned* build on *your* machine; `/ahma update` pulls the *published, attested*
+> release for *everyone*.
+
 ---
 
-## `/ahmadev help` — List Subcommands
+## `/ahmadev help` — Process Overview + Subcommands
 
-When the user types `/ahmadev help`, respond with:
+When the user types `/ahmadev help`, respond with the process overview below, then the
+subcommand list.
+
+### The development loop (what to do, in order)
+
+This repo is built for **many small single-feature changes, each landed fast on `main`**.
+The whole loop is two commands:
 
 ```
-/ahmadev help      — Show this help list
-/ahmadev land      — Branch → PR → squash-merge on main, gated on CI ("CI green")
-/ahmadev release   — Land + bump version on main; CI publishes the GitHub Release
-/ahmadev bisect    — git bisect run a repro to find the commit that introduced a regression
-/ahmadev bump      — Bump ahma version across all version-bearing files (Cargo.toml, Cargo.lock, …)
+   you fix something
+        │
+        ▼
+  /ahmadev land  ──►  branch from origin/main ─► PR ─► full cross-platform CI ─► squash-merge to main
+        │                                              (merges ONLY if "CI green" passes)
+        ▼
+  (repeat land for each small fix…)
+        │
+        ▼
+  /ahmadev release ─► sync main ─► bump version on main ─► CI builds + publishes GitHub Release v<X.Y.Z>
+```
+
+**Q: I fixed something — how do I drive it to `main` if it passes PR CI?**
+→ `/ahmadev land`. It branches from `origin/main`, makes small conventional commits, opens a
+PR, and runs `gh pr merge --squash --auto`. The change squash-merges to `main` **by itself,
+the moment the full cross-platform matrix passes** (the `CI green` aggregate check). You don't
+hand-merge; you don't babysit. If CI is red it simply never merges. That's the "passes PR CI →
+auto-lands" you're asking for.
+
+**Q: What do I type to publish a new release?**
+→ `/ahmadev release`. The **version number is the release trigger**: every push to `main`
+builds release binaries, but the publish step creates `v<X.Y.Z>` *only if that tag doesn't
+already exist yet*. So a release = landing a version bump on `main`. `release` syncs `main`,
+asks you to confirm the version (default: patch bump), lands the bump through the same gate,
+then watches CI publish the GitHub Release. (You almost never type `/ahmadev bump` directly —
+`release` runs it for you.)
+
+**Q: Is auto-merging to `main` even a good idea?**
+→ Yes, *with this design* — because "auto" does **not** mean "merge blindly." `--auto` arms
+the PR so GitHub merges it **only after the required `CI green` check passes** (the full
+Linux/macOS/Windows/Android matrix + clippy + cargo-deny). So the safety is identical to a
+human waiting and clicking merge — minus the waiting. It's a good idea precisely because:
+- changes are **small and squashed** → one revertable commit each, a clean linear `main`;
+- the gate is **real and full** → nothing lands that didn't pass every platform;
+- undo is a **one-liner** → `git revert <sha>` (single parent), so the cost of a wrong land is low.
+
+  It is **not** a fire-and-forget rubber stamp. CI can't catch design mistakes, security/
+  invariant regressions, or breaking API changes. So `/ahmadev land` **pauses for human
+  confirmation** when a change touches sandbox/security invariants (SPEC R5/R6) or release
+  signing, alters CI or branch-protection itself, breaks a public API, or hits a
+  cross-platform failure that isn't an obvious flake. For routine small fixes: let it
+  auto-land. The philosophy is *push-forward-and-clean-up*, with `git revert` as the net.
+
+### Subcommand list
+
+```
+/ahmadev help      — Show this overview + subcommand list
+/ahmadev land      — Branch → PR → auto squash-merge on main when "CI green" passes  ← drive a fix to main
+/ahmadev release   — Land pending work + bump version on main; CI publishes the GitHub Release  ← ship to users
+/ahmadev bisect    — git bisect run a repro to find the commit that introduced a regression (local, free)
 /ahmadev update    — Upgrade workspace dependencies (safe: ≥14d old, no known advisories)
-/ahmadev install   — Build the working tree (release) and install it to ~/.local/bin/ahma
+/ahmadev install   — Build the working tree (release) and install to ~/.local/bin/ahma (this machine only; unsigned)
+/ahmadev bump      — Bump version across version-bearing files (Cargo.toml, Cargo.lock, …) — building block of release
 ```
 
 Reference `/ahma help` for general ahma tooling (sandbox, livelog, run_terminal_command,
 simplify, ahma update, etc.).
+
+> **Prerequisite for the gate to actually gate (one-time bootstrap):** `/ahmadev land`'s
+> `--auto` only waits for checks that branch protection marks **required**. Until `CI green`
+> is a required status check *and* the merge queue is enabled on `main`, `--auto` may merge
+> before the full matrix runs. See **Gate Bootstrap Status** at the bottom of this file for
+> the exact settings and how to verify them before trusting auto-merge.
 
 ---
 
@@ -605,3 +680,71 @@ Options:
   --exclude <a,b,...>    Skip these crates (comma-separated)
   -h, --help             Show xtask help for this subcommand
 ```
+
+---
+
+## Gate Bootstrap Status — make `--auto` actually safe (one-time setup)
+
+`/ahmadev land` relies on `gh pr merge --squash --auto`. GitHub's auto-merge only waits for
+checks that branch protection marks **required**. If `CI green` is not required, `--auto` can
+merge a PR before the full cross-platform matrix has even run — silently defeating the gate.
+PR #286 deliberately bootstrapped the *workflow* (the `CI green` job now exists) but could not
+configure protection in the same PR, because the `CI green` status context only starts existing
+**after** `build.yml` first runs on `main`. That has now happened, so the protection can be set.
+
+### Target configuration (repo `paulirotta/ahma`, ruleset `15266938`)
+
+| Setting | Required value | Why |
+|---------|----------------|-----|
+| Required status check | `CI green` | The single rename-stable gate `--auto` must wait for |
+| Merge queue rule | enabled | Runs the full matrix on the `merge_group` ref, merges in order |
+| `required_linear_history` | enabled | Squash-only linear `main` → clean revert/bisect |
+| `non_fast_forward` | enabled (already on) | Blocks force-push to `main` |
+| `allow_merge_commit` | `false` | Force squash-only landings |
+| `allow_squash_merge` | `true` (already on) | The one allowed merge style |
+| `delete_branch_on_merge` | `true` | Auto-clean merged feature branches |
+
+### Verify current state
+
+```bash
+# Required checks + merge_queue + linear history present in the ruleset?
+gh api repos/paulirotta/ahma/rulesets/15266938 --jq '[.rules[].type]'
+# Repo merge-style + branch cleanup flags:
+gh api repos/paulirotta/ahma --jq '{merge:.allow_merge_commit, squash:.allow_squash_merge, delete:.delete_branch_on_merge}'
+```
+
+### Applied vs. remaining (status: 2026-06-22)
+
+**Applied via API (done):**
+- ✅ ruleset rules: `deletion`, `non_fast_forward`, `required_linear_history`, `code_quality`
+- ✅ repo flags: `allow_merge_commit=false`, `allow_rebase_merge=false`, `allow_squash_merge=true`,
+  `delete_branch_on_merge=true`
+
+**Remaining — must be done in the web UI (the API cannot):**
+The `merge_queue` rule returns a `422 Invalid rule 'merge_queue'` on PUT/POST — a long-standing
+GitHub REST limitation. The merge queue is **only** configurable in the web UI. And because
+`build.yml` triggers on `push`/`merge_group` but **not** `pull_request`, the `CI green` check
+*only runs inside the merge queue* — so requiring it without the queue would **deadlock every
+PR**. Therefore add both, together, in one UI visit:
+
+1. Repo → **Settings → Rules → Rulesets → `main`** (id 15266938).
+2. Enable **Require merge queue** → method **Squash**, grouping **ALLGREEN** (defaults for the
+   entry counts/timeout are fine).
+3. Enable **Require status checks to pass** → add **`CI green`**.
+4. Save.
+
+Then verify the queue + check are present:
+```bash
+gh api repos/paulirotta/ahma/rulesets/15266938 --jq '[.rules[].type]'
+# expect to include: merge_queue, required_status_checks
+```
+
+> **Until step 2–4 are done, do not trust `--auto`.** With no merge queue, `gh pr merge
+> --squash --auto` would merge as soon as branch protection is satisfied — and since `CI green`
+> can't run on a PR, it isn't gating. For now, land with `gh pr merge --squash` **only after**
+> `gh pr checks` shows the run green, or finish the UI step above first.
+
+> **Caution (history-rewrite constraints):** editing this ruleset is sensitive — see the
+> repo's known constraints around force-pushing `main` and release-backed tags. Changing CI
+> or branch-protection is a documented **human-confirmation** point in `/ahmadev land`; make
+> these changes deliberately, not as part of an automated land.
