@@ -66,6 +66,15 @@ pub enum SourceEvent {
         tool: String,
         args: String,
     },
+    /// An auto-detected sandbox scope violation: raise the "grant access?" modal.
+    ScopeGrantRequested {
+        request: ahma_common::scope_grant::ScopeGrantRequest,
+    },
+    /// Dismiss the scope-grant modal for `decision_id` (a twin answered, or the
+    /// instance withdrew it).
+    ScopeGrantDismiss {
+        decision_id: String,
+    },
     AgentDone,
     AgentError {
         error: String,

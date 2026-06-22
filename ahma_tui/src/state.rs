@@ -852,6 +852,40 @@ impl ApprovalGate {
     }
 }
 
+// ─── Scope-grant gate ─────────────────────────────────────────────────────────
+
+/// A pending "grant access to X?" prompt raised when a sandboxed command was
+/// blocked by an out-of-scope path (SPEC R5.4.7). Three-valued: the default/Enter
+/// choice is the safe Deny — widening (`y`=read+write, `r`=read-only) requires an
+/// explicit non-default key (R5.3.1). Lives in its own `AppState.scope_grant`
+/// field, parallel to `approval`, because it is daemon-raised and may coexist with
+/// an open user overlay (it is rendered as an overlay, not a `ModalState`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeGrantGate {
+    pub decision_id: String,
+    /// The literal canonical path the prompt is about (never abbreviated).
+    pub path: String,
+    /// The access the detector inferred is needed.
+    pub access: ahma_common::config::ScopeAccess,
+    /// Whether the path was found up front or via a stderr denial heuristic.
+    pub reason: ahma_common::scope_grant::GrantReason,
+    /// The tool/command that tripped the scope, if known.
+    pub tool: Option<String>,
+}
+
+impl ScopeGrantGate {
+    /// Build a gate from a hub [`ahma_common::scope_grant::ScopeGrantRequest`].
+    pub fn from_request(request: ahma_common::scope_grant::ScopeGrantRequest) -> Self {
+        Self {
+            decision_id: request.decision_id,
+            path: request.path.display().to_string(),
+            access: request.access,
+            reason: request.reason,
+            tool: request.tool,
+        }
+    }
+}
+
 // ─── Click target ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1066,6 +1100,8 @@ pub struct AppState {
     pub pending_output: HashMap<String, VecDeque<String>>,
     pub log: VecDeque<LogEntry>,
     pub approval: Option<ApprovalGate>,
+    /// Pending scope-grant prompt, if any (parallel to `approval`).
+    pub scope_grant: Option<ScopeGrantGate>,
     pub tools_list: Vec<crate::mcp_connections::ToolInfo>,
     pub mcp_connections: McpConnectionManager,
 
@@ -1440,6 +1476,7 @@ impl AppState {
             pending_output: HashMap::new(),
             log: VecDeque::with_capacity(LOG_RING_CAP),
             approval: None,
+            scope_grant: None,
             tools_list: vec![],
             mcp_connections,
 

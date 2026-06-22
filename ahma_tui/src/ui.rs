@@ -47,6 +47,11 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     if state.settings_editor.open {
         draw_settings_panel(frame, state, theme, full);
     }
+    // The scope-grant prompt is a security decision — draw it last so it sits on
+    // top of every other overlay.
+    if state.scope_grant.is_some() {
+        draw_scope_grant_modal(frame, state, theme, full);
+    }
 }
 
 // ─── Chat layout ──────────────────────────────────────────────────────────────
@@ -2306,6 +2311,72 @@ fn draw_log_files_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area
 
     let list = List::new(items);
     frame.render_widget(list, inner);
+}
+
+/// The "grant access to X?" overlay raised when a sandboxed command was blocked by
+/// an out-of-scope path (SPEC R5.4.7). The path is shown literally; Deny is the
+/// highlighted default and Enter/Esc deny — widening requires an explicit key.
+#[cfg(feature = "tui")]
+fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let Some(gate) = &state.scope_grant else {
+        return;
+    };
+    let popup = centered_rect(76, 14, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Sandbox · grant access? ",
+            theme.title().bold(),
+        ))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let reason = match gate.reason {
+        ahma_common::scope_grant::GrantReason::PreExecViolation => {
+            "a command targeted a path outside the sandbox"
+        }
+        ahma_common::scope_grant::GrantReason::StderrHeuristic => {
+            "a command was blocked accessing a path outside the sandbox"
+        }
+    };
+    let tool = gate.tool.as_deref().unwrap_or("A sandboxed command");
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(tool.to_string(), theme.normal().bold()),
+            Span::styled(
+                format!(" needs {} access to:", gate.access.label()),
+                theme.normal(),
+            ),
+        ]),
+        Line::from(Span::styled(gate.path.clone(), theme.success().bold())),
+        Line::from(""),
+        Line::from(Span::styled(format!("Why: {reason}."), theme.dim())),
+        Line::from(Span::styled(
+            "Approving records a persistent grant in ~/.ahma/settings.toml and takes",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(
+            "effect on the NEXT server start — it does not change this running session.",
+            theme.dim(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [n] ", theme.failed().bold()),
+            Span::styled("Deny (default)    ", theme.normal().bold()),
+            Span::styled("[r] ", theme.pending().bold()),
+            Span::styled("Grant read-only    ", theme.normal()),
+            Span::styled("[y] ", theme.success().bold()),
+            Span::styled("Grant read+write", theme.normal()),
+        ]),
+        Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
+    ];
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
 }
 
 #[cfg(feature = "tui")]

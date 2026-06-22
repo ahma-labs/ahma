@@ -178,6 +178,7 @@ async fn run_ratatui(
                             } else if handle_settings_key(key, &mut state)
                                 || handle_help_key(key, &mut state)
                                 || handle_picker_key(key, &mut state)
+                                || handle_scope_grant_key(key, &mut state)
                                 || handle_approval_key(key, &mut state)
                                 || handle_chat_input_key(key, &mut state)
                             {
@@ -1638,6 +1639,85 @@ fn handle_approval_key(
         }
         _ => false,
     }
+}
+
+/// Keys for the scope-grant modal. Three-valued and **Enter-safe**: Enter / Esc /
+/// `n` deny (the default), `r` grants read-only, `y` grants read+write. Widening
+/// always requires an explicit non-default key (SPEC R5.3.1).
+#[cfg(feature = "tui")]
+fn handle_scope_grant_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut crate::state::AppState,
+) -> bool {
+    use ahma_common::scope_grant::GrantDecision;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if state.scope_grant.is_none() || state.text_entry_modal_open() || state.log_filter_active {
+        return false;
+    }
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('y'), KeyModifiers::NONE) => {
+            resolve_scope_grant(state, GrantDecision::GrantRw);
+            true
+        }
+        (KeyCode::Char('r'), KeyModifiers::NONE) => {
+            resolve_scope_grant(state, GrantDecision::GrantRo);
+            true
+        }
+        (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
+            resolve_scope_grant(state, GrantDecision::Deny);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Resolve the pending scope-grant prompt: send the decision to the daemon (which
+/// resolves + persists for the next start — never the live session) and log it.
+#[cfg(feature = "tui")]
+fn resolve_scope_grant(
+    state: &mut crate::state::AppState,
+    decision: ahma_common::scope_grant::GrantDecision,
+) {
+    use crate::state::{LogEntry, LogLevel};
+    use ahma_common::scope_grant::GrantDecision;
+
+    let Some(gate) = state.scope_grant.take() else {
+        return;
+    };
+
+    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitScopeGrant {
+        decision_id: gate.decision_id,
+        decision,
+        target_instance_id: None,
+    });
+
+    let (level, message) = match decision {
+        GrantDecision::Deny => (
+            LogLevel::Warn,
+            format!("Denied sandbox access to {}", gate.path),
+        ),
+        GrantDecision::GrantRo => (
+            LogLevel::Info,
+            format!(
+                "Granted read-only access to {} — effective on the next server start",
+                gate.path
+            ),
+        ),
+        GrantDecision::GrantRw => (
+            LogLevel::Info,
+            format!(
+                "Granted read+write access to {} — effective on the next server start",
+                gate.path
+            ),
+        ),
+    };
+    state.push_log(LogEntry {
+        timestamp: chrono::Local::now(),
+        level,
+        message,
+    });
 }
 
 #[cfg(feature = "tui")]
@@ -3223,6 +3303,21 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
                 None,
             );
         }
+        SourceEvent::ScopeGrantRequested { request } => {
+            // A grant prompt never overwrites a different pending one silently; the
+            // newest replaces only if it is a fresh decision (dedup happens upstream
+            // in the GrantCoordinator, so duplicates never reach here).
+            state.scope_grant = Some(crate::state::ScopeGrantGate::from_request(request));
+        }
+        SourceEvent::ScopeGrantDismiss { decision_id } => {
+            if state
+                .scope_grant
+                .as_ref()
+                .is_some_and(|g| g.decision_id == decision_id)
+            {
+                state.scope_grant = None;
+            }
+        }
         SourceEvent::AgentDone => {
             state.chat.finish_stream();
             state.chat.finish_user_timing();
@@ -4038,6 +4133,91 @@ mod tests {
             rx.blocking_recv().unwrap(),
             "decision sent should be approve"
         );
+    }
+
+    /// Build a pending scope-grant gate for the key-handler tests.
+    #[cfg(test)]
+    fn test_scope_grant_gate() -> crate::state::ScopeGrantGate {
+        use ahma_common::scope_grant::{GrantReason, ScopeGrantRequest};
+        crate::state::ScopeGrantGate::from_request(ScopeGrantRequest {
+            decision_id: "dec_test".to_string(),
+            path: std::path::PathBuf::from("/some/external/dir"),
+            access: ahma_common::config::ScopeAccess::Rw,
+            reason: GrantReason::PreExecViolation,
+            tool: Some("run_terminal_command".to_string()),
+        })
+    }
+
+    /// `y` widens to read+write, clears the gate, and is consumed even with chat
+    /// focus so it never lands in the input box.
+    #[test]
+    fn test_scope_grant_key_y_grants_rw() {
+        use crate::state::{AppState, Focus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+        state.scope_grant = Some(test_scope_grant_gate());
+
+        let handled = super::handle_scope_grant_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(handled, "y must be consumed by the scope-grant modal");
+        assert!(state.scope_grant.is_none(), "gate should be cleared");
+        assert!(
+            state.chat_input_is_empty(),
+            "y must not land in the input box"
+        );
+    }
+
+    /// `r` grants read-only and clears the gate.
+    #[test]
+    fn test_scope_grant_key_r_grants_ro() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.scope_grant = Some(test_scope_grant_gate());
+
+        let handled = super::handle_scope_grant_key(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(handled);
+        assert!(state.scope_grant.is_none());
+    }
+
+    /// Enter / Esc / `n` all resolve to the safe default Deny — Enter must never
+    /// widen the sandbox (SPEC R5.3.1).
+    #[test]
+    fn test_scope_grant_key_enter_esc_n_deny() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('n')] {
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            state.scope_grant = Some(test_scope_grant_gate());
+
+            let handled =
+                super::handle_scope_grant_key(KeyEvent::new(code, KeyModifiers::NONE), &mut state);
+            assert!(handled, "{code:?} must be consumed (deny)");
+            assert!(state.scope_grant.is_none(), "{code:?} must clear the gate");
+        }
+    }
+
+    /// With no pending gate the handler is inert so other handlers see the key.
+    #[test]
+    fn test_scope_grant_key_noop_when_no_gate() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        let handled = super::handle_scope_grant_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(!handled, "no gate → not handled, key falls through");
     }
 
     /// Shift+Enter inserts a newline into the chat input instead of submitting,
