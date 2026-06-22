@@ -85,10 +85,13 @@ The whole loop is two commands:
    you fix something
         │
         ▼
-  /ahmadev land  ──►  branch from origin/main ─► PR ─► full cross-platform CI ─► squash-merge to main
-        │                                              (merges ONLY if "CI green" passes)
+  /ahmadev land  ──►  branch from origin/main ─► PR ─► Fast Tier (~5m) ─► squash-merge to main
+        │                                              (merges when Fast Tier passes)        │
+        │                                                                                     ▼
+        │                                                       main: full matrix (~30m) runs post-merge;
+        │                                                       red ⇒ fix out-of-band (revert / forward-fix)
         ▼
-  (repeat land for each small fix…)
+  (repeat land for each small fix… landings don't wait on the 30m matrix)
         │
         ▼
   /ahmadev release ─► sync main ─► bump version on main ─► CI builds + publishes GitHub Release v<X.Y.Z>
@@ -96,10 +99,10 @@ The whole loop is two commands:
 
 **Q: I fixed something — how do I drive it to `main` if it passes PR CI?**
 → `/ahmadev land`. It branches from `origin/main`, makes small conventional commits, opens a
-PR, and runs `gh pr merge --squash --auto`. The change squash-merges to `main` **by itself,
-the moment the full cross-platform matrix passes** (the `CI green` aggregate check). You don't
-hand-merge; you don't babysit. If CI is red it simply never merges. That's the "passes PR CI →
-auto-lands" you're asking for.
+PR, and runs `gh pr merge --squash --auto --delete-branch`. The change squash-merges to `main`
+**by itself, the moment the Fast Tier check passes** (~5 min: Linux fmt + clippy + smoke tests).
+You don't hand-merge; you don't babysit. The full cross-platform matrix then runs on `main`
+*after* the merge (it can't gate the PR — it doesn't run on PRs) as a safety net.
 
 **Q: What do I type to publish a new release?**
 → `/ahmadev release`. The **version number is the release trigger**: every push to `main`
@@ -110,26 +113,28 @@ then watches CI publish the GitHub Release. (You almost never type `/ahmadev bum
 `release` runs it for you.)
 
 **Q: Is auto-merging to `main` even a good idea?**
-→ Yes, *with this design* — because "auto" does **not** mean "merge blindly." `--auto` arms
-the PR so GitHub merges it **only after the required `CI green` check passes** (the full
-Linux/macOS/Windows/Android matrix + clippy + cargo-deny). So the safety is identical to a
-human waiting and clicking merge — minus the waiting. It's a good idea precisely because:
+→ Yes, *with this optimistic design* — because "auto" does **not** mean "merge blindly." `--auto`
+arms the PR so GitHub merges it **only after the required Fast Tier check passes**. This trades
+*pre-merge* cross-platform certainty for **fast, non-blocking landings**: the full matrix runs
+post-merge, and a rare platform break is fixed out-of-band without blocking the features that
+landed behind it. It's a good idea here precisely because:
 - changes are **small and squashed** → one revertable commit each, a clean linear `main`;
-- the gate is **real and full** → nothing lands that didn't pass every platform;
-- undo is a **one-liner** → `git revert <sha>` (single parent), so the cost of a wrong land is low.
+- undo is a **one-liner** → `git revert <sha>` (single parent), so the cost of a wrong land is low;
+- the full matrix is *off the critical path* → you land in ~5 min instead of waiting ~30.
 
-  It is **not** a fire-and-forget rubber stamp. CI can't catch design mistakes, security/
-  invariant regressions, or breaking API changes. So `/ahmadev land` **pauses for human
-  confirmation** when a change touches sandbox/security invariants (SPEC R5/R6) or release
-  signing, alters CI or branch-protection itself, breaks a public API, or hits a
-  cross-platform failure that isn't an obvious flake. For routine small fixes: let it
-  auto-land. The philosophy is *push-forward-and-clean-up*, with `git revert` as the net.
+  It is **not** a fire-and-forget rubber stamp. Fast Tier (and CI generally) can't catch design
+  mistakes, security/invariant regressions, or breaking API changes — and it doesn't run the
+  other-OS suites at all before merge. So `/ahmadev land` **pauses for human confirmation** when a
+  change touches sandbox/security invariants (SPEC R5/R6) or release signing, alters CI or
+  branch-protection itself, breaks a public API, or is otherwise platform-sensitive. For routine
+  small fixes: let it auto-land. The philosophy is *push-forward-and-clean-up*, with `git revert`
+  as the net. See **Gate Model** at the bottom for the full rationale (and why there's no merge queue).
 
 ### Subcommand list
 
 ```
 /ahmadev help      — Show this overview + subcommand list
-/ahmadev land      — Branch → PR → auto squash-merge on main when "CI green" passes  ← drive a fix to main
+/ahmadev land      — Branch → PR → auto squash-merge on main when Fast Tier passes  ← drive a fix to main
 /ahmadev release   — Land pending work + bump version on main; CI publishes the GitHub Release  ← ship to users
 /ahmadev bisect    — git bisect run a repro to find the commit that introduced a regression (local, free)
 /ahmadev update    — Upgrade workspace dependencies (safe: ≥14d old, no known advisories)
@@ -140,11 +145,10 @@ human waiting and clicking merge — minus the waiting. It's a good idea precise
 Reference `/ahma help` for general ahma tooling (sandbox, livelog, run_terminal_command,
 simplify, ahma update, etc.).
 
-> **Prerequisite for the gate to actually gate (one-time bootstrap):** `/ahmadev land`'s
-> `--auto` only waits for checks that branch protection marks **required**. Until `CI green`
-> is a required status check *and* the merge queue is enabled on `main`, `--auto` may merge
-> before the full matrix runs. See **Gate Bootstrap Status** at the bottom of this file for
-> the exact settings and how to verify them before trusting auto-merge.
+> **The gate is live:** `main` requires the **Fast Tier** status check, so `/ahmadev land`'s
+> `gh pr merge --squash --auto` is safe — it merges only when Fast Tier passes. The full
+> cross-platform matrix runs *post-merge* on `main` as a safety net. See **Gate Model** at the
+> bottom for the rationale and the exact settings (and why there's no merge queue).
 
 ---
 
@@ -152,15 +156,23 @@ simplify, ahma update, etc.).
 
 ### What it does
 
-Takes one focused change and lands it as a **single squashed commit** on `main`, gated on
-CI. This is the workhorse of the many-small-features workflow. Squash + auto-merge are
-already enabled on the repo; the merge queue runs the full cross-platform matrix at land
-time and merges only when the required **`CI green`** check passes.
+Takes one focused change and lands it as a **single squashed commit** on `main`, gated on the
+**Fast Tier** check. This is the workhorse of the many-small-features workflow. Squash +
+auto-merge are enabled on the repo; `--auto` squash-merges as soon as the required Fast Tier
+check (~5 min) passes. The full cross-platform matrix runs *post-merge* on `main` (see
+**Gate Model**).
 
 > **Always branch from `origin/main`, never from local `main`.** This checkout's local
 > `main` can sit on a diverged/rewritten history (different root commit than `origin/main`),
 > so basing work on it produces a PR full of phantom conflicts. Fetch and branch from the
 > remote ref.
+
+> **Don't stack feature branches.** Squash-merge rewrites each landed feature into a *new*
+> single commit, so a branch based on another *unmerged* feature will replay that feature's
+> old commits and conflict. Branch every feature from fresh `origin/main` and serialize —
+> landing takes only ~5 min, so the cost is tiny. If you must work ahead, rebase the upper
+> branch onto `origin/main` after the lower one lands:
+> `git rebase --onto origin/main <lower-branch-old-tip> <upper-branch>`.
 
 ### Workflow (how to invoke as an agent)
 
@@ -190,31 +202,39 @@ time and merges only when the required **`CI green`** check passes.
    ```
    The PR push triggers the **fast tier** (~5 min Linux fmt + clippy + smoke) for quick feedback.
 
-5. **Auto-merge through the gate.** Enable squash auto-merge; GitHub adds the PR to the merge
-   queue, runs the full matrix on the `merge_group` ref, and squash-merges when `CI green` passes:
+5. **Auto-merge through the gate.** Arm squash auto-merge; GitHub squash-merges when the
+   required **Fast Tier** check passes:
    ```bash
    gh pr merge --squash --auto --delete-branch
    ```
 
-6. **Watch it land:**
+6. **Watch it land, then watch the post-merge matrix (code changes):**
    ```bash
-   gh pr checks --watch
+   gh pr checks --watch       # Fast Tier → auto-merges; remote branch auto-deleted
+   gh run watch               # the ~30 min full matrix now running on main; red ⇒ fix out-of-band
    ```
-   On success the branch is deleted and the feature is one commit on `main`.
+   For docs-only changes you can skip the second watch.
+
+7. **Tidy up locally** (remote branch is already gone; `fetch.prune` clears its tracking ref):
+   ```bash
+   git switch main && git pull --ff-only && git branch -D <branch>   # -D: squash isn't seen as "merged"
+   ```
 
 ### Why `gh pr merge`, never local `git merge --squash` + push
 
-A local squash-and-push **bypasses the `CI green` gate** and can put red code on `main`.
-Always route landings through the PR + merge queue so nothing merges untested. (Branch
-protection blocks direct pushes to `main` anyway once the gate is enabled.)
+A local squash-and-push **bypasses the Fast Tier gate** and can put unbuildable code on `main`.
+Always route landings through the PR so nothing merges unchecked. (Branch protection — required
+status check + `enforce_admins` + blocked force-push — refuses direct pushes to `main` anyway.)
 
 ### Human-intervention points (pause and ask first)
 
 Drive routine features straight to merged, but **stop and confirm with the human** when the
 change: touches the sandbox/security invariants (SPEC R5/R6) or the release-signing path;
-alters CI or branch-protection itself; changes a public API in a breaking way; or when the
-merge queue reports a cross-platform failure that is **not** an obvious flake. Otherwise,
-the philosophy is push-forward-and-clean-up: land it, and use `git revert` if it turns out wrong.
+alters CI or branch-protection itself; changes a public API in a breaking way; or is
+platform-sensitive (Windows/macOS/Android paths) — Fast Tier won't catch an other-OS break
+before it lands, so these warrant extra care. Otherwise, the philosophy is
+push-forward-and-clean-up: land it, watch the post-merge matrix, and `git revert` (or
+forward-fix) if it turns out wrong.
 
 ### If it turns out wrong after landing
 
@@ -683,66 +703,60 @@ Options:
 
 ---
 
-## Gate Bootstrap Status — make `--auto` actually safe (one-time setup)
+## Gate Model — how `main` is actually protected (live as of 2026-06-22)
 
-`/ahmadev land` relies on `gh pr merge --squash --auto`. GitHub's auto-merge only waits for
-checks that branch protection marks **required**. If `CI green` is not required, `--auto` can
-merge a PR before the full cross-platform matrix has even run — silently defeating the gate.
-PR #286 deliberately bootstrapped the *workflow* (the `CI green` job now exists) but could not
-configure protection in the same PR, because the `CI green` status context only starts existing
-**after** `build.yml` first runs on `main`. That has now happened, so the protection can be set.
+> **Design note — no merge queue.** PR #286 envisioned a GitHub *merge queue* running the full
+> matrix on the `merge_group` ref at land time. That turned out to be **unavailable** for this
+> repo: the `merge_queue` ruleset rule 422s via the REST API, and the toggle is absent from both
+> the rulesets UI and the classic branch-protection editor (public Free-tier user repo). So the
+> queue-based design was abandoned in favour of the **optimistic model** below.
 
-### Target configuration (repo `paulirotta/ahma`, ruleset `15266938`)
+### The optimistic model (Fast-Tier-gates, full-matrix-post-merge)
 
-| Setting | Required value | Why |
-|---------|----------------|-----|
-| Required status check | `CI green` | The single rename-stable gate `--auto` must wait for |
-| Merge queue rule | enabled | Runs the full matrix on the `merge_group` ref, merges in order |
-| `required_linear_history` | enabled | Squash-only linear `main` → clean revert/bisect |
-| `non_fast_forward` | enabled (already on) | Blocks force-push to `main` |
-| `allow_merge_commit` | `false` | Force squash-only landings |
-| `allow_squash_merge` | `true` (already on) | The one allowed merge style |
-| `delete_branch_on_merge` | `true` | Auto-clean merged feature branches |
+Landing is gated on the cheap **Fast Tier** check; the expensive cross-platform matrix runs
+**after** merge, off the critical path. This optimizes *time-to-landed* and keeps the pipeline
+non-blocking — at the cost of catching Windows/macOS/Android/full-suite breaks *after* a feature
+lands (fix out-of-band, never blocks the features that landed behind it).
+
+Three gates, cheapest first:
+1. **Local** (before push): `cargo fmt --all && cargo clippy --all-targets --locked && cargo nextest run --profile smoke`.
+2. **Fast Tier on the PR (~5 min) — the required merge gate.** `fast-tier.yml` runs on
+   `pull_request`; `--auto` waits for it. A clean-room re-run of gate 1 (catches uncommitted
+   files / stale `Cargo.lock` / dirty-tree bugs).
+3. **Full matrix on `main` (~30 min) — post-merge safety net.** `build.yml` runs on `push` to
+   `main`. Not a required check; it can't gate (it doesn't run on PRs). If it goes red → fix
+   out-of-band (new branch from current `main`; `git revert <sha>` for a clean undo, or a
+   forward-fix if later features depend on the bad code).
+
+### Live configuration (verify with the commands below)
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| Required status check (classic protection on `main`) | `Fast Tier (fmt + clippy + smoke)` | The single gate `--auto` waits for |
+| "Require branches up to date" (`strict`) | **off** | Forcing a rebase between every land kills throughput; the post-merge matrix covers staleness |
+| `enforce_admins` ("Do not allow bypassing") | on | Rules apply to the owner too |
+| `allow_force_pushes` / `allow_deletions` (on `main`) | off / off | Protect history |
+| ruleset `15266938` rules | `deletion`, `non_fast_forward`, `required_linear_history`, `code_quality` | Linear squash-only history → clean revert/bisect |
+| `allow_merge_commit` / `allow_rebase_merge` | `false` / `false` | Squash-only landings |
+| `allow_squash_merge` / `delete_branch_on_merge` | `true` / `true` | One merge style; auto-clean merged branches |
 
 ### Verify current state
 
 ```bash
-# Required checks + merge_queue + linear history present in the ruleset?
+gh api repos/paulirotta/ahma/branches/main/protection --jq '{required:[.required_status_checks.checks[].context], strict:.required_status_checks.strict, admins:.enforce_admins.enabled, force:.allow_force_pushes.enabled}'
 gh api repos/paulirotta/ahma/rulesets/15266938 --jq '[.rules[].type]'
-# Repo merge-style + branch cleanup flags:
-gh api repos/paulirotta/ahma --jq '{merge:.allow_merge_commit, squash:.allow_squash_merge, delete:.delete_branch_on_merge}'
+gh api repos/paulirotta/ahma --jq '{merge:.allow_merge_commit, rebase:.allow_rebase_merge, squash:.allow_squash_merge, delete:.delete_branch_on_merge}'
 ```
 
-### Applied vs. remaining (status: 2026-06-22)
+> **`--auto` is now safe and real.** `gh pr merge --squash --auto --delete-branch` merges each PR
+> the moment **Fast Tier** passes. Watch the post-merge `main` build (`gh run watch`) for code
+> changes; for docs-only changes you can ignore it.
 
-**Applied via API (done):**
-- ✅ ruleset rules: `deletion`, `non_fast_forward`, `required_linear_history`, `code_quality`
-- ✅ repo flags: `allow_merge_commit=false`, `allow_rebase_merge=false`, `allow_squash_merge=true`,
-  `delete_branch_on_merge=true`
-
-**Remaining — must be done in the web UI (the API cannot):**
-The `merge_queue` rule returns a `422 Invalid rule 'merge_queue'` on PUT/POST — a long-standing
-GitHub REST limitation. The merge queue is **only** configurable in the web UI. And because
-`build.yml` triggers on `push`/`merge_group` but **not** `pull_request`, the `CI green` check
-*only runs inside the merge queue* — so requiring it without the queue would **deadlock every
-PR**. Therefore add both, together, in one UI visit:
-
-1. Repo → **Settings → Rules → Rulesets → `main`** (id 15266938).
-2. Enable **Require merge queue** → method **Squash**, grouping **ALLGREEN** (defaults for the
-   entry counts/timeout are fine).
-3. Enable **Require status checks to pass** → add **`CI green`**.
-4. Save.
-
-Then verify the queue + check are present:
-```bash
-gh api repos/paulirotta/ahma/rulesets/15266938 --jq '[.rules[].type]'
-# expect to include: merge_queue, required_status_checks
-```
-
-> **Until step 2–4 are done, do not trust `--auto`.** With no merge queue, `gh pr merge
-> --squash --auto` would merge as soon as branch protection is satisfied — and since `CI green`
-> can't run on a PR, it isn't gating. For now, land with `gh pr merge --squash` **only after**
-> `gh pr checks` shows the run green, or finish the UI step above first.
+> **Editing protection via API vs UI.** The GitHub *web UI* triggers a "Confirm access" (sudo /
+> 2FA) prompt for these settings; the `gh` CLI token edits them directly without sudo
+> (`gh api -X PUT repos/<o>/<r>/branches/main/protection --input <json>`). Prefer the CLI. This
+> is a CI/branch-protection change → a documented human-confirmation point; respect
+> [[github-history-rewrite-constraints]] when touching the ruleset.
 
 > **Caution (history-rewrite constraints):** editing this ruleset is sensitive — see the
 > repo's known constraints around force-pushing `main` and release-backed tags. Changing CI
