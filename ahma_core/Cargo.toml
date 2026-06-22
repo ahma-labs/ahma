@@ -29,3 +29,4 @@ dirs.workspace = true
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["tokio"] }
+tempfile.workspace = true
