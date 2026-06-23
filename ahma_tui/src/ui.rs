@@ -624,6 +624,40 @@ fn total_wrapped_rows(lines: &[ratatui::text::Line<'_>], width: usize) -> usize 
     lines.iter().map(|l| line_wrapped_rows(l, width)).sum()
 }
 
+/// Render a vertical scrollbar on the right edge of `inner` whose thumb length
+/// is proportional to the visible window (`visible_h`) over the total content
+/// (`total_len`), positioned at `scroll`. All three values are in the same
+/// units the caller scrolls in (physical rows for wrapped text, list items
+/// otherwise), so the thumb stays proportional as content grows and re-bounds
+/// when a resize re-wraps the content. The thumb is painted as a solid filled
+/// cell instead of ratatui's default `█` glyph, which renders as dashes under
+/// terminal line-spacing. No bar is drawn when everything already fits.
+#[cfg(feature = "tui")]
+fn draw_scrollbar(
+    frame: &mut Frame,
+    theme: &Theme,
+    total_len: usize,
+    visible_h: usize,
+    scroll: usize,
+    inner: Rect,
+) {
+    if total_len <= visible_h {
+        return;
+    }
+    let sb = Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .thumb_symbol(" ")
+        .thumb_style(theme.scrollbar_thumb())
+        .track_symbol(Some(" "))
+        .track_style(theme.scrollbar_track());
+    let mut sb_state = ScrollbarState::new(total_len)
+        .viewport_content_length(visible_h)
+        .position(scroll);
+    frame.render_stateful_widget(sb, inner, &mut sb_state);
+}
+
 #[cfg(feature = "tui")]
 fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Chat;
@@ -678,18 +712,9 @@ fn draw_chat_history(frame: &mut Frame, state: &AppState, theme: &Theme, area: R
     };
     frame.render_widget(Paragraph::new(Text::from(visible_rows)), text_area);
 
-    if rows.len() > visible_h {
-        let sb = Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None);
-        // Physical-row units so position, viewport, and content length all match
-        // the scroll offset used for rendering (rows.len() / visible_h / scroll).
-        let mut sb_state = ScrollbarState::new(rows.len())
-            .viewport_content_length(visible_h)
-            .position(scroll);
-        frame.render_stateful_widget(sb, inner, &mut sb_state);
-    }
+    // Physical-row units so position, viewport, and content length all match
+    // the scroll offset used for rendering (rows.len() / visible_h / scroll).
+    draw_scrollbar(frame, theme, rows.len(), visible_h, scroll, inner);
 }
 
 #[cfg(feature = "tui")]
@@ -1586,16 +1611,14 @@ fn draw_ai_activity(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, inner, &mut list_state);
 
-    if state.ai_activity.len() > visible_h {
-        let sb = Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None);
-        let mut sb_state = ScrollbarState::new(state.ai_activity.len())
-            .viewport_content_length(visible_h)
-            .position(scroll);
-        frame.render_stateful_widget(sb, inner, &mut sb_state);
-    }
+    draw_scrollbar(
+        frame,
+        theme,
+        state.ai_activity.len(),
+        visible_h,
+        scroll,
+        inner,
+    );
 }
 
 // ─── Operations DAG ───────────────────────────────────────────────────────────
@@ -2086,26 +2109,6 @@ fn render_empty_log_hint(frame: &mut Frame, state: &AppState, theme: &Theme, inn
 }
 
 #[cfg(feature = "tui")]
-fn render_scrollbar(
-    frame: &mut Frame,
-    total_len: usize,
-    visible_h: usize,
-    scroll: usize,
-    inner: Rect,
-) {
-    if total_len > visible_h {
-        let sb = Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None);
-        let mut sb_state = ScrollbarState::new(total_len)
-            .viewport_content_length(visible_h)
-            .position(scroll);
-        frame.render_stateful_widget(sb, inner, &mut sb_state);
-    }
-}
-
-#[cfg(feature = "tui")]
 fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Log;
     let border_style = if focused {
@@ -2180,7 +2183,7 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         .collect();
 
     frame.render_widget(Paragraph::new(visible_lines), inner);
-    render_scrollbar(frame, display_lines.len(), visible_h, scroll, inner);
+    draw_scrollbar(frame, theme, display_lines.len(), visible_h, scroll, inner);
 }
 
 #[cfg(feature = "tui")]
@@ -3156,6 +3159,95 @@ mod tests {
         // The thumb should NOT be at position 6 of a 10-line logical space (60%),
         // but at 6 of a 15-row wrapped space (40%). The important thing: pos_w < total_w.
         assert!(pos_w < total_w);
+    }
+
+    /// Render `draw_scrollbar` into a test buffer and return, for the scrollbar
+    /// column (rightmost), the per-row `(symbol, bg_color)` so tests can inspect
+    /// what the thumb/track actually paint.
+    #[cfg(feature = "tui")]
+    fn render_scrollbar_column(
+        total_len: usize,
+        visible_h: usize,
+        scroll: usize,
+        height: u16,
+    ) -> Vec<(String, Option<Color>)> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        let width = 6u16;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                draw_scrollbar(frame, &theme, total_len, visible_h, scroll, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                let cell = buf.cell((width - 1, y)).unwrap();
+                (cell.symbol().to_string(), cell.bg.into())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scrollbar_thumb_is_solid_proportional_and_top_anchored() {
+        // 40 rows of content, 10 visible, pinned to the top (scroll 0).
+        let height = 10u16;
+        let col = render_scrollbar_column(40, 10, 0, height);
+        let thumb_bg = Theme::new(true).scrollbar_thumb().bg;
+        let track_bg = Theme::new(true).scrollbar_track().bg;
+
+        // The thumb is painted as a filled cell (space), never the `█` glyph that
+        // renders as dashes under terminal line-spacing.
+        for (sym, _) in &col {
+            assert_ne!(
+                sym, "█",
+                "thumb/track must not use the gap-prone full block"
+            );
+        }
+
+        let thumb_rows: Vec<usize> = col
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, bg))| *bg == thumb_bg)
+            .map(|(i, _)| i)
+            .collect();
+        // Proportional: ~visible/total of the bar, and strictly shorter than the
+        // whole track (content overflows the viewport).
+        assert!(
+            !thumb_rows.is_empty() && thumb_rows.len() < height as usize,
+            "thumb should be a proper sub-range of the track, got {thumb_rows:?}"
+        );
+        // Contiguous: a single run, no gaps (the dashed-thumb regression).
+        assert_eq!(
+            thumb_rows.last().unwrap() - thumb_rows.first().unwrap() + 1,
+            thumb_rows.len(),
+            "thumb cells must be contiguous, got {thumb_rows:?}"
+        );
+        // Top-anchored at scroll 0.
+        assert_eq!(*thumb_rows.first().unwrap(), 0);
+        // Every non-thumb cell is the visible track groove.
+        for (i, (_, bg)) in col.iter().enumerate() {
+            if !thumb_rows.contains(&i) {
+                assert_eq!(*bg, track_bg, "row {i} should be track groove");
+            }
+        }
+    }
+
+    #[test]
+    fn scrollbar_thumb_grows_proportionally_as_content_shrinks() {
+        // Same viewport; less overflow ⇒ a longer thumb (closer to filling the bar).
+        let long_content = render_scrollbar_column(100, 10, 0, 10);
+        let short_content = render_scrollbar_column(15, 10, 0, 10);
+        let thumb_bg = Theme::new(true).scrollbar_thumb().bg;
+        let count =
+            |col: &[(String, Option<Color>)]| col.iter().filter(|(_, bg)| *bg == thumb_bg).count();
+        assert!(
+            count(&short_content) > count(&long_content),
+            "thumb should be longer when less content overflows the viewport"
+        );
     }
 
     fn row_text(line: &Line) -> String {

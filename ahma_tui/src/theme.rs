@@ -145,6 +145,22 @@ impl Theme {
     pub fn border_unfocused(&self) -> Style {
         Style::default().fg(Color::DarkGray)
     }
+
+    // ── Scrollbar ─────────────────────────────────────────────────────────────
+
+    /// The moving thumb, rendered as a filled cell background rather than the
+    /// default `█` glyph. Stacked `█` glyphs leave horizontal gaps between rows
+    /// under terminal line-spacing, making the thumb look dashed; painting the
+    /// cell background fills it edge-to-edge so the proportional thumb reads as
+    /// one continuous bar.
+    pub fn scrollbar_thumb(&self) -> Style {
+        Style::default().bg(Color::Rgb(110, 120, 132))
+    }
+    /// The full-height groove behind the thumb. Keeping it visible (a darker
+    /// fill) lets the thumb's length be read as a proportion of the whole.
+    pub fn scrollbar_track(&self) -> Style {
+        Style::default().bg(Color::Rgb(44, 50, 60))
+    }
 }
 
 /// Stub used when the `tui` feature is disabled so the crate still compiles.
