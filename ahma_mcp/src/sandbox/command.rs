@@ -197,20 +197,32 @@ impl Sandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::ffi::{OsStr, OsString};
     use tempfile::tempdir;
 
-    /// create_command in Test mode delegates directly to base_command.
-    #[test]
-    fn test_create_command_test_mode_succeeds() {
-        let td = tempdir().unwrap();
-        let sandbox = Sandbox::new(
-            vec![td.path().to_path_buf()],
+    fn make_test_sandbox(scope: &std::path::Path) -> Sandbox {
+        Sandbox::new(
+            vec![scope.to_path_buf()],
             SandboxMode::Test,
             false,
             false,
             false,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    fn cmd_envs(cmd: &std::process::Command) -> HashMap<OsString, Option<OsString>> {
+        cmd.get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
+            .collect()
+    }
+
+    /// create_command in Test mode delegates directly to base_command.
+    #[test]
+    fn test_create_command_test_mode_succeeds() {
+        let td = tempdir().unwrap();
+        let sandbox = make_test_sandbox(td.path());
         let result = sandbox.create_command("echo", &["hello".to_string()], td.path());
         assert!(result.is_ok(), "create_command in Test mode should succeed");
     }
@@ -219,26 +231,13 @@ mod tests {
     #[test]
     fn test_create_command_cargo_sets_target_dir() {
         let td = tempdir().unwrap();
-        let sandbox = Sandbox::new(
-            vec![td.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
+        let sandbox = make_test_sandbox(td.path());
         let result = sandbox.create_command("cargo", &["build".to_string()], td.path());
         assert!(result.is_ok(), "create_command for cargo should succeed");
-        let cmd = result.unwrap();
-
-        let std_cmd = cmd.as_std();
-        let envs: std::collections::HashMap<_, _> = std_cmd
-            .get_envs()
-            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
-            .collect();
+        let envs = cmd_envs(result.unwrap().as_std());
 
         assert_eq!(
-            envs.get(std::ffi::OsStr::new("CARGO_TARGET_DIR")),
+            envs.get(OsStr::new("CARGO_TARGET_DIR")),
             Some(&Some(td.path().join("target").into_os_string()))
         );
     }
@@ -247,63 +246,33 @@ mod tests {
     #[test]
     fn test_create_command_cargo_separate_target_dir() {
         let td = tempdir().unwrap();
-        let sandbox = Sandbox::new(
-            vec![td.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap()
-        .with_separate_cargo_target(true);
+        let sandbox = make_test_sandbox(td.path()).with_separate_cargo_target(true);
         let result = sandbox.create_command("cargo", &["build".to_string()], td.path());
         assert!(result.is_ok(), "create_command for cargo should succeed");
-        let cmd = result.unwrap();
-
-        let std_cmd = cmd.as_std();
-        let envs: std::collections::HashMap<_, _> = std_cmd
-            .get_envs()
-            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
-            .collect();
+        let envs = cmd_envs(result.unwrap().as_std());
 
         assert_eq!(
-            envs.get(std::ffi::OsStr::new("CARGO_TARGET_DIR")),
+            envs.get(OsStr::new("CARGO_TARGET_DIR")),
             Some(&Some(td.path().join("target/ahma").into_os_string())),
             "separate_cargo_target should use target/ahma/"
         );
     }
 
-    /// RUSTC_WRAPPER and RUSTC_WORKSPACE_WRAPPER are neutralized for cargo commands so
-    /// tools like sccache (configured in ~/.cargo/config.toml) cannot run inside the sandbox
-    /// and attempt to write their cache outside the workspace scope.
     #[test]
     fn test_create_command_cargo_neutralizes_rustc_wrapper() {
         let td = tempdir().unwrap();
-        let sandbox = Sandbox::new(
-            vec![td.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
+        let sandbox = make_test_sandbox(td.path());
         let result = sandbox.create_command("cargo", &["build".to_string()], td.path());
         assert!(result.is_ok(), "create_command for cargo should succeed");
-        let cmd = result.unwrap();
-
-        let std_cmd = cmd.as_std();
-        let envs: std::collections::HashMap<_, _> = std_cmd
-            .get_envs()
-            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
-            .collect();
+        let envs = cmd_envs(result.unwrap().as_std());
 
         assert_eq!(
-            envs.get(std::ffi::OsStr::new("RUSTC_WRAPPER")),
+            envs.get(OsStr::new("RUSTC_WRAPPER")),
             Some(&Some("".into())),
             "RUSTC_WRAPPER must be neutralized to prevent sccache inside the sandbox"
         );
         assert_eq!(
-            envs.get(std::ffi::OsStr::new("RUSTC_WORKSPACE_WRAPPER")),
+            envs.get(OsStr::new("RUSTC_WORKSPACE_WRAPPER")),
             Some(&Some("".into())),
             "RUSTC_WORKSPACE_WRAPPER must be neutralized to prevent sccache inside the sandbox"
         );
@@ -313,26 +282,13 @@ mod tests {
     #[test]
     fn test_create_command_non_cargo_does_not_set_rustc_wrapper() {
         let td = tempdir().unwrap();
-        let sandbox = Sandbox::new(
-            vec![td.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
+        let sandbox = make_test_sandbox(td.path());
         let result = sandbox.create_command("echo", &["hello".to_string()], td.path());
         assert!(result.is_ok());
-        let cmd = result.unwrap();
-
-        let std_cmd = cmd.as_std();
-        let envs: std::collections::HashMap<_, _> = std_cmd
-            .get_envs()
-            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
-            .collect();
+        let envs = cmd_envs(result.unwrap().as_std());
 
         assert!(
-            !envs.contains_key(std::ffi::OsStr::new("RUSTC_WRAPPER")),
+            !envs.contains_key(OsStr::new("RUSTC_WRAPPER")),
             "RUSTC_WRAPPER should not be set for non-cargo commands"
         );
     }
@@ -341,14 +297,7 @@ mod tests {
     #[test]
     fn test_create_shell_command_test_mode_succeeds() {
         let td = tempdir().unwrap();
-        let sandbox = Sandbox::new(
-            vec![td.path().to_path_buf()],
-            SandboxMode::Test,
-            false,
-            false,
-            false,
-        )
-        .unwrap();
+        let sandbox = make_test_sandbox(td.path());
 
         // Use platform-appropriate shell
         #[cfg(not(target_os = "windows"))]
