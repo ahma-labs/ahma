@@ -1,3 +1,25 @@
+//! # Ahma Harness Tools
+//!
+//! Scope-validated file I/O, glob and regex search, and web-page fetch
+//! utilities that back the sandboxed MCP harness tools in the ahma workspace.
+//!
+//! Every operation that touches the filesystem accepts a `scopes: &[PathBuf]`
+//! allowlist.  Paths that canonicalize outside every listed scope are rejected
+//! with an error, so callers can enforce the same confinement boundaries as the
+//! kernel sandbox without duplicating the validation logic.
+//!
+//! ## Public API
+//!
+//! | Function | Description |
+//! |----------|-------------|
+//! | [`read_file`] | Read a file (optionally line-sliced) within scope |
+//! | [`write_file`] | Create or overwrite a file within scope |
+//! | [`replace_in_file`] | In-place string substitution within scope |
+//! | [`list_dir`] | List directory entries within scope |
+//! | [`file_search`] | Glob-pattern file discovery within scope |
+//! | [`grep_search`] | Plain-text or regex line search within scope |
+//! | [`fetch_webpage`] | Fetch a URL and render its HTML as plain text |
+
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 use serde::Serialize;

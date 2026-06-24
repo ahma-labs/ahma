@@ -3,6 +3,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 name = "ahma_llm_monitor"
+description = "OpenAI-compatible LLM client for log analysis, streaming chat, and local-provider discovery. Used by the ahma live-log monitor pipeline (MIT OR Apache-2.0)."
 readme.workspace = true
 rust-version.workspace = true
 version.workspace = true

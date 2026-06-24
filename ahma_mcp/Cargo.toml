@@ -3,6 +3,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 name = "ahma_mcp"
+description = "MCP server engine with kernel-enforced sandbox (Landlock/Seatbelt/Job Objects), async shell pool, and operation tracking. Core of the ahma AI-agent execution platform (MIT OR Apache-2.0)."
 readme.workspace = true
 rust-version.workspace = true
 version.workspace = true

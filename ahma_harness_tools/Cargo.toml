@@ -3,6 +3,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 name = "ahma_harness_tools"
+description = "Scope-validated file I/O, glob and regex search, and web-page fetch utilities backing the ahma MCP harness tools (MIT OR Apache-2.0)."
 readme.workspace = true
 rust-version.workspace = true
 version.workspace = true

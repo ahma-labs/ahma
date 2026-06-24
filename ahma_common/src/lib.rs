@@ -1,20 +1,38 @@
 //! # Ahma Common: Shared Foundation and CI Stability
 //!
-//! `ahma_common` provides a collection of shared types, constants, and utilities
-//! used across the entire Ahma workspace. Its primary goal is to provide a single,
-//! reliable "ground truth" for cross-platform behavior and environmental scaling.
+//! `ahma_common` provides shared types, configuration, and utilities used across the
+//! entire ahma workspace. Its primary goal is a single, reliable source of truth for
+//! cross-platform behavior, environmental scaling, and workspace-wide contracts.
 //!
-//! ## Core Utilities
+//! ## Modules
 //!
-//! - **[`timeouts`]**: The most critical component for CI stability. It provides
-//!   platform-aware timeout scaling to ensure that slow CI runners (particularly
-//!   Windows) don't experience intermittent failures during process spawning or
-//!   network operations.
+//! | Module | Purpose |
+//! |--------|---------|
+//! | [`config`] | Workspace-wide configuration types and defaults (mutex groups, tool paths) |
+//! | [`daemon_hub`] | Shared hub state for the HTTP bridge daemon |
+//! | [`elicitation`] | User-input elicitation request/response types (MCP elicitation extension) |
+//! | [`event_dispatcher`] | Broadcast event bus for cross-component notifications |
+//! | [`file_uri`] | `file://` URI construction and parsing helpers |
+//! | [`hook_consent`] | Consent tracking for permission hooks |
+//! | [`keepalive`] | Keepalive ping logic for long-lived HTTP/SSE connections |
+//! | [`local_tls`] | Self-signed TLS certificate generation via `rcgen` |
+//! | [`observability`] | OpenTelemetry tracing initialisation helpers |
+//! | [`peer_factory`] | Transport-agnostic MCP peer factory abstraction (P6) |
+//! | [`peer_transport`] | Peer-transport enum wrapping stdio and HTTP bridge transports |
+//! | [`process_guard`] | RAII guard that kills a child process on drop |
+//! | [`prompts`] | Shared MCP prompt definitions |
+//! | [`sandbox_state`] | Shared sandbox-lock state communicated across process boundaries |
+//! | [`scope_decision`] | Scope-selection decision types surfaced to callers |
+//! | [`scope_grant`] | Granted scope record stored after user approval |
+//! | [`state_machine`] | Generic state-machine helpers |
+//! | [`timeouts`] | **CI stability.** Platform-aware timeout scaling for slow runners (Windows) |
+//! | [`workspace_scope`] | Workspace root discovery and scope derivation |
 //!
 //! ## Design Goal: Workspace Consistency
 //!
-//! By centralizing these primitives here, we ensure that both the core server and the
-//! bridges behave consistently regardless of the OS they are running on.
+//! Centralising these primitives here ensures that both the core server and the
+//! bridges behave consistently across Linux, macOS, and Windows, without each
+//! crate re-implementing its own platform detection or timeout heuristics.
 
 /// Compile-time build identifier embedded by `build.rs`.
 ///

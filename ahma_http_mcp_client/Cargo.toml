@@ -3,6 +3,7 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 name = "ahma_http_mcp_client"
+description = "Async MCP client for the Streamable HTTP transport (MCP 2025-03-26) with OAuth2 and SSE support. Part of the ahma AI-agent execution platform (MIT OR Apache-2.0)."
 readme.workspace = true
 rust-version.workspace = true
 version.workspace = true

@@ -2,6 +2,7 @@
 edition.workspace = true
 license.workspace = true
 name = "generate_tool_schema"
+description = "CLI tool that generates the JSON Schema for the ahma Multi-Tool Definition Format (MTDF) (MIT OR Apache-2.0)."
 readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
