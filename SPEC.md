@@ -477,6 +477,336 @@ The planned implementation uses two mechanisms in order of preference:
 
 ---
 
+## 4.6 Web Egress Sandboxing (R-WEB)
+
+### Design rationale and critical analysis
+
+The filesystem sandbox (R5/R6) governs what the agent can *read and write locally*. It says nothing about what the agent can *send outward*. This is a distinct and under-addressed threat:
+
+- **Exfiltration**: A prompt-injection payload in a fetched file can instruct the agent to POST vault contents to an attacker-controlled server. The filesystem sandbox prevents the file from being read outside the scope, but if `fetch_webpage` is also used to POST, the data leaves via HTTP.
+- **SSRF (Server-Side Request Forgery)**: Unrestricted outbound HTTP from the ahma process — which runs with the user's full network privileges — can reach `http://localhost:8080/admin`, `http://192.168.1.1/` (home router), or `http://169.254.169.254/latest/meta-data/` (cloud instance metadata). None of these are reachable from inside a browser's origin model; they are reachable from a local process.
+- **Uncontrolled API spend / rate abuse**: An agent running in a loop can burn API quotas or trigger account suspension on any service whose domain is reachable.
+- **DNS rebinding after approval**: A domain approved at time T can have its DNS entry changed to resolve to `169.254.169.254` at time T+1, routing subsequent traffic to the metadata service under the cover of an approved pattern.
+
+**Why "just copy the filesystem grant model" is insufficient:**
+
+The filesystem grant says: *this directory is structurally safe to access.* The filesystem is passive — a path grants access to bytes that sit still.
+
+A web domain grant says: *I trust bidirectional communication with this domain, including data I send to it.* The internet is active — a domain is an operator who receives your data, can redirect you, changes DNS, and may share data downstream.
+
+This matters for design:
+1. Filesystem approval is about *access*; web approval is also about *disclosure*.
+2. The "deny is safe" invariant is even more important for web than filesystem: a denied web request leaks nothing; a denied file read blocks the agent, but data stays local.
+3. Domain-level approval is necessarily coarse. Approving `github.com` approves every GitHub API endpoint — the repos API, the Gist upload API, the OAuth token exchange endpoint. There is no path-level approval; see R-WEB.13.
+
+**Established patterns this design draws from:**
+
+| System | Pattern used | What ahma adapts |
+|--------|-------------|-----------------|
+| Browser Content Security Policy | `api.example.com`, `*.example.com` (single-level) | Pattern syntax |
+| macOS AppSandbox entitlements | `com.apple.security.network.client` enable/disable | Process-level `default_policy` |
+| Little Snitch / LuLu | Per-connection prompts; once / always; domain patterns | Three-tier approval + TUI modal |
+| Burp Suite intercept | Every request, show full URL, user decides | "Allow once" option |
+| `docs/egress-sandbox.md` (subprocess proxy) | Per-vault allowlist, deny-by-default | Persistent allowlist format and pattern syntax |
+| DNS-based blocklists (Pi-hole) | Domain block/allow with wildcard | Pattern matching rules |
+
+**What this design explicitly does NOT do, and why:**
+
+- **No path-based approval** (`github.com/api/*` vs `github.com/login/*`): URL paths and query strings are not meaningful security boundaries — the same data can be sent via POST body to any path, and redirects can change the path after approval. Path patterns create false confidence. See R-WEB.13.
+- **No response content filtering**: Scanning response bodies for sensitive data is expensive, unreliable, and privacy-invasive. The right control is at the request level, not the response level.
+- **No per-HTTP-method distinction in patterns**: The current `fetch_webpage` tool is GET-only. Future tools may add POST. When they do, the method should be *shown in the approval prompt* but the approved pattern covers all methods for that domain — restricting by method in a pattern creates false confidence (any GET can include query parameters that effectively write data).
+- **No rate limiting in this module**: Rate limiting per approved domain is important but orthogonal; it belongs in a separate rate-limit layer, not in the domain-approval flow.
+
+---
+
+### R-WEB.1: Scope
+
+This section governs **tool-level outbound HTTP requests made by the ahma process itself** — currently `fetch_webpage`, and any future tool that uses `EgressClient` (R-WEB.14). It does **not** govern:
+- Subprocess HTTP traffic inside task vaults (that is the HTTP proxy described in `docs/egress-sandbox.md`, formalized in R-WEB.16).
+- The ahma process's own MCP client connections (LLM provider `base_url`) — those are operator-configured endpoints, not agent-driven requests.
+- Inbound connections to the ahma MCP server.
+
+---
+
+### R-WEB.2: Default policy
+
+- **R-WEB.2.1**: The default policy is `"allow"`. In `allow` mode, requests to domains not in `always_allow` or `never_allow` are **passed through without prompting** — preserving backward compatibility with existing `fetch_webpage` usage.
+- **R-WEB.2.2**: Setting `default_policy = "deny"` in `[web]` switches to **strict mode**: any domain not in the session grant list or `always_allow` causes the request to be held and a prompt raised (R-WEB.6). Strict mode is the recommended production posture.
+- **R-WEB.2.3**: Regardless of `default_policy`, `never_allow` entries **always block** and `block_private_ranges` (R-WEB.3) **always enforces**. Neither can be overridden by session grants or `always_allow` patterns.
+- **R-WEB.2.4**: Regardless of `default_policy`, `always_allow` entries **always permit** without a prompt.
+
+> **Recommendation:** New ahma installations default to `"allow"` for backward compatibility, but the setup wizard and documentation **must** prominently recommend `"deny"` for any workspace handling sensitive data, credentials, or proprietary code. A future major version may flip the default.
+
+---
+
+### R-WEB.3: Private-range blocking (always-on)
+
+- **R-WEB.3.1**: The following address ranges are **always blocked**, regardless of `default_policy`, session grants, `always_allow`, or any other setting:
+
+  | Range | Description |
+  |-------|-------------|
+  | `127.0.0.0/8` | IPv4 loopback |
+  | `::1/128` | IPv6 loopback |
+  | `10.0.0.0/8` | RFC-1918 private |
+  | `172.16.0.0/12` | RFC-1918 private |
+  | `192.168.0.0/16` | RFC-1918 private |
+  | `169.254.0.0/16` | Link-local / cloud metadata (AWS IMDS, GCP metadata server) |
+  | `fc00::/7` | IPv6 unique-local |
+  | `fe80::/10` | IPv6 link-local |
+  | Symbolic names: `localhost` | Resolved before check |
+
+- **R-WEB.3.2**: The private-range check **must** run at **DNS resolution time** — on the resolved IP address(es), not on the domain name string. A domain pattern entry resolving to a private IP is blocked at connection time, catching DNS rebinding attacks where a whitelisted domain's IP changes after approval. A pattern entry whose literal text is a private IP address **must** be rejected at parse time.
+- **R-WEB.3.3**: `block_private_ranges = false` (in `[web]`) disables the private-range check. This opt-out is permitted for development environments where the agent legitimately needs to reach a local dev server. Setting it to `false` **must** produce a loud startup warning and a persistent TUI banner, identical in prominence to the `--disable-sandbox` unsandboxed-mode banner.
+- **R-WEB.3.4**: The resolved-IP check is the responsibility of a custom `reqwest` connector configured in `EgressClient` (R-WEB.14). Raw `reqwest::Client::new()` callers bypass this check — this is why all tools are required to use `EgressClient`.
+
+---
+
+### R-WEB.4: Domain pattern syntax
+
+Patterns are **domain-only** — no path or query components. Scheme and port are optional qualifiers.
+
+```
+pattern  = [scheme "://"] domain [":" port]
+scheme   = "https" | "http"
+domain   = exact | wildcard
+exact    = <hostname>        # matches this hostname only
+wildcard = "*." <hostname>   # matches any one-level subdomain only
+port     = <decimal>
+```
+
+| Pattern | Matches | Does NOT match |
+|---------|---------|----------------|
+| `api.github.com` | `api.github.com` | `github.com`, `raw.github.com`, `deep.api.github.com` |
+| `*.github.com` | `api.github.com`, `raw.github.com` | `github.com`, `deep.api.github.com` |
+| `github.com` | `github.com` | `api.github.com` (exact only) |
+| `https://api.github.com` | `api.github.com` over HTTPS | `api.github.com` over HTTP |
+| `api.github.com:8080` | `api.github.com` on port 8080 | port 443 |
+| `*` (bare) | — | **Rejected at parse time** |
+| `*.com` | — | **Rejected at parse time** (TLD-level wildcard) |
+
+> **User expectation gap**: Most users expect `github.com` to match all of GitHub including `api.github.com`. It does **not** — this is intentional and consistent with CSP semantics. To allow all of a domain including subdomains, add both `github.com` and `*.github.com`. The TUI modal (R-WEB.6) suggests both entries when the matched URL is a subdomain with no matching root-domain entry.
+
+- **R-WEB.4.1**: Patterns containing a private IP or `localhost` **must** be rejected at parse time.
+- **R-WEB.4.2**: `http://`-scheme entries in `always_allow` **must** produce a warning at parse time and a visible caution in the TUI modal. They are not blocked — some dev environments legitimately use HTTP — but they are never silently persisted.
+- **R-WEB.4.3**: Pattern matching is **case-insensitive** for the hostname component (RFC 4343) and **case-sensitive** for scheme.
+
+---
+
+### R-WEB.5: Three-tier approval model
+
+Parallel to the filesystem persistent-scope grant model (R5.4.4–R5.4.7):
+
+| Tier | Lifetime | Storage | Agent can self-grant? |
+|------|---------|---------|----------------------|
+| **Allow once** | This request only | None | No — requires human key press |
+| **Allow session** | Until server restart | In-process `HashSet` | No — requires human key press |
+| **Allow always** | Permanent | `[web] always_allow` in `~/.ahma/settings.toml` | No — settings file is outside sandbox |
+
+- **R-WEB.5.1**: Session grants are cleared when the server process exits. They are **never** serialized to disk.
+- **R-WEB.5.2**: A persistent grant (`allow always`) is written **only** to `~/.ahma/settings.toml` — outside every workspace scope and therefore kernel-unwritable from inside the sandbox (same guarantee as filesystem persistent scopes, R5.4.5). An agent cannot grant itself permanent web access.
+- **R-WEB.5.3**: After a persistent grant is written, the server **must** display the full settings file path, the exact line number, and the content added (e.g. `~/.ahma/settings.toml +47: "api.github.com"`).
+- **R-WEB.5.4**: A session deny suppresses re-prompting for that domain for the remainder of the session. There is no interactive "deny always"; use `never_allow` in settings or `ahma web deny <pattern>` for permanent blocks.
+- **R-WEB.5.5**: Unlike filesystem scope grants (which take effect on next server start — the R5 invariant), web `always_allow` entries added at runtime **may** take effect immediately within the current session: the session policy is hot-reloaded from the updated settings struct. This is safe because the agent cannot write `settings.toml` — only the human action did.
+
+---
+
+### R-WEB.6: TUI approval modal
+
+When a request is blocked under `default_policy = "deny"` and a TUI surface is attached:
+
+- **R-WEB.6.1**: The modal **must** display: the tool name, the full URL truncated at 256 characters (to prevent prompt-injection via crafted URLs), and the domain string that would be approved for each tier.
+- **R-WEB.6.2**: Key layout:
+  ```
+  Web Request · allow access?
+
+  Tool:    fetch_webpage
+  URL:     https://api.github.com/repos/owner/repo/issues
+  Domain:  api.github.com
+
+  [n] Deny (default)    [o] Allow once
+  [s] Allow session: api.github.com
+  [p] Persist:       api.github.com  →  ~/.ahma/settings.toml
+  Enter / Esc = Deny
+  ```
+- **R-WEB.6.3**: **Enter and Esc must deny.** Approving at any tier requires an explicit non-default key. This is the same invariant as the scope-grant modal (R5.3.1: Enter must never widen).
+- **R-WEB.6.4**: For `http://` URLs, the `[p]` line **must** carry a visible caution marker: `[p] Persist (⚠ cleartext HTTP): api.github.com`.
+- **R-WEB.6.5**: After `[p]` is pressed, the modal area shows the file and line added before dismissing — no separate notification required.
+- **R-WEB.6.6**: The modal is drawn last in the TUI render pass, overlaying all other content (same as the scope-grant modal).
+- **R-WEB.6.7**: When no TUI is attached, the `elicitation/create` MCP mechanism is used (R5.3.1 pattern). When neither surface is available, the request is **denied** and the tool call returns an error with an actionable message: the exact `ahma web allow <pattern>` command to pre-approve the domain.
+
+---
+
+### R-WEB.7: Dedup / debounce coordinator
+
+A `WebApprovalCoordinator` struct parallel to `GrantCoordinator` (`ahma_common::scope_grant`):
+
+- **R-WEB.7.1**: The same domain is **asked at most once per session**. After the first prompt resolves (deny or grant), subsequent requests for the same domain return the cached answer immediately.
+- **R-WEB.7.2**: Concurrent requests to the same domain that arrive while a prompt is pending are **queued**, not dropped. When the prompt resolves, queued requests inherit the decision.
+- **R-WEB.7.3**: A denied domain is added to the session deny-list. Further requests in the session are denied immediately (no re-prompt), preventing prompt storms if the agent retries aggressively.
+- **R-WEB.7.4**: First-answer-wins when a prompt is fanned to multiple surfaces simultaneously.
+
+---
+
+### R-WEB.8: Redirect chain validation
+
+- **R-WEB.8.1**: When the HTTP client follows a 3xx redirect from an approved domain to a **different** domain, the redirect target **must** be independently checked against the policy. Redirects do not inherit the source domain's approval.
+- **R-WEB.8.2**: Default: **block cross-domain redirects** (fail the request with a clear error). The config key `on_redirect_to_new_domain = "block" | "prompt"` governs; `"prompt"` raises a new approval modal for the redirect target.
+- **R-WEB.8.3**: Same-domain redirects (including HTTP→HTTPS scheme upgrades for the same host) are permitted without a new prompt.
+- **R-WEB.8.4**: The redirect target's resolved IP is also checked against the private-range block (R-WEB.3) regardless of redirect-approval setting.
+
+---
+
+### R-WEB.9: Audit log
+
+- **R-WEB.9.1**: Every outbound HTTP request from a tool (approved, denied, or passed through in `allow` mode) **must** be written to the session audit log with: timestamp, tool name, HTTP method, full URL, resolved domain, decision, and matched pattern.
+- **R-WEB.9.2**: Structured JSONL format, appended to the same session log used by filesystem scope-grant events:
+  ```json
+  {"ts":"2026-06-24T12:00:00Z","kind":"web_request","tool":"fetch_webpage",
+   "method":"GET","url":"https://api.github.com/repos/…","domain":"api.github.com",
+   "decision":"approved-session","matched_pattern":"api.github.com"}
+  ```
+- **R-WEB.9.3**: Audit log writes are best-effort (non-fatal on error) and **must not** block the HTTP request.
+
+---
+
+### R-WEB.10: CLI management commands
+
+Parallel to `ahma sandbox grant|list|revoke`:
+
+| Command | Effect |
+|---------|--------|
+| `ahma web allow <pattern>` | Add to `[web] always_allow`; show file path + line added |
+| `ahma web deny <pattern>` | Add to `[web] never_allow`; show file path + line added |
+| `ahma web list` | Show `default_policy`, `block_private_ranges`, all entries with provenance |
+| `ahma web revoke <pattern>` | Remove from `always_allow` or `never_allow`; show file path + line removed |
+| `ahma web check <url>` | Dry-run: report what decision the policy would make for this URL |
+
+- **R-WEB.10.1**: `ahma web allow` and `ahma web deny` **must** reject invalid patterns (bare `*`, TLD-level wildcards, private IP addresses) and warn on `http://`-scheme patterns.
+- **R-WEB.10.2**: Every mutation command **must** print the settings file path and the exact line changed or added.
+- **R-WEB.10.3**: `ahma web list` includes a `last_used` timestamp column (tracked in-session, cleared on restart) to encourage pruning stale entries.
+
+---
+
+### R-WEB.11: TOML configuration schema
+
+The `[web]` section in `~/.ahma/settings.toml` (parallel to `[sandbox]`):
+
+```toml
+[web]
+# "allow" (default, backward-compatible) or "deny" (strict mode: prompt for unknown domains).
+# Recommendation: use "deny" for any workspace handling sensitive data or credentials.
+default_policy = "allow"
+
+# Block loopback, RFC-1918, link-local, and cloud-metadata IP ranges.
+# Enforced at DNS resolution time (not just pattern matching) to resist DNS rebinding.
+# STRONGLY recommended: keep true. Setting false enables SSRF attacks against local services.
+block_private_ranges = true
+
+# "block" (default): cross-domain redirects fail the request.
+# "prompt": raise a new approval modal for the redirect target domain.
+on_redirect_to_new_domain = "block"
+
+# Domains always permitted without a runtime prompt.
+# Syntax: exact ("api.github.com"), single-level wildcard ("*.github.com"),
+#         scheme-qualified ("https://api.github.com"), port-qualified ("api.github.com:8080").
+# Note: "github.com" matches github.com only — NOT api.github.com.
+#       Add both "github.com" and "*.github.com" to allow all of GitHub.
+always_allow = []
+
+# Domains always blocked regardless of default_policy, always_allow, or session grants.
+never_allow = []
+```
+
+- **R-WEB.11.1**: The `[web]` section uses `#[serde(deny_unknown_fields)]` so a typo is a hard error rather than a silent no-op.
+- **R-WEB.11.2**: `ahma config validate` **must** parse and validate every pattern in `always_allow` and `never_allow`, rejecting the config with a clear error if any pattern is invalid.
+- **R-WEB.11.3**: The settings file lives in `~/.ahma/settings.toml` — outside every workspace scope — so no sandboxed tool can read or modify it (same guarantee as `persistent_scopes`, R5.4.5).
+
+---
+
+### R-WEB.12: Provenance and file confirmation
+
+- **R-WEB.12.1**: `always_allow` and `never_allow` entries support optional inline-table provenance (plain strings are also accepted and round-trip as plain strings):
+  ```toml
+  always_allow = [
+    { pattern = "api.github.com", granted_at = "2026-06-24", note = "GitHub API for PR tooling" },
+    "*.stackoverflow.com",
+  ]
+  ```
+- **R-WEB.12.2**: When a persistent grant is made via TUI or CLI, the confirmation message **must** include the settings file absolute path, the zero-based line number, and the full text of the line as written:
+  ```
+  Persisted: ~/.ahma/settings.toml +47
+    "api.github.com"
+  Takes effect immediately for this session.
+  ```
+
+---
+
+### R-WEB.13: No path-based restrictions (by design)
+
+Path-based domain approval (`github.com/api/*` permitted, `github.com/login/*` denied) is **explicitly not supported**. This is a deliberate design choice:
+
+1. **Query parameters carry as much data as paths**: `github.com/search?q=secret` and a POST to `github.com/submit` with a body containing `secret` are equivalent exfiltration vectors. Path filtering addresses neither.
+2. **False confidence**: a user who sees `github.com/api/*` in the allowlist believes `github.com/upload` is blocked, when in fact the path component is not inspected.
+3. **Practical coverage**: the meaningful security boundary is the domain operator, not the URL path. Trusting `github.com` means trusting GitHub's access controls.
+
+Users who need path-level or header-level egress control should route traffic through a dedicated HTTP proxy (the subprocess egress proxy, R-WEB.16). That is the right tool for that job.
+
+---
+
+### R-WEB.14: Internal implementation architecture
+
+- **`WebPolicy`** (`ahma_common::config`): the `[web]` config struct. `#[serde(deny_unknown_fields, default)]`. Parsed at startup, stored in `AhmaSettings`.
+- **`WebDomainPattern`** (`ahma_common::web_egress`): validated parsed pattern. `parse(s) -> Result<Self, PatternError>`. `matches(url: &Url) -> bool` (case-insensitive hostname, optional scheme/port filter).
+- **`WebApprovalRequest`** (`ahma_common::web_egress`): `{ request_id: Uuid, url: Url, domain: String, method: HttpMethod, tool: String }`.
+- **`WebDecision`** enum: `Deny | AllowOnce | AllowSession(WebDomainPattern) | AllowPersist(WebDomainPattern)`.
+- **`WebApprovalCoordinator`** (`ahma_common::web_egress`): holds a `Mutex<HashMap<String, PendingSlot>>` keyed by domain (R-WEB.7), a `HashSet<WebDomainPattern>` for session grants, a `HashSet<String>` for the session deny-list.
+- **`EgressClient`** (`ahma_common::web_egress`): wraps `reqwest::Client`. Pre-request async check sequence: (1) `never_allow` → immediate error; (2) private-range block on URL host → immediate error; (3) `always_allow` → pass; (4) session grant set → pass; (5) `default_policy = "allow"` and no match → pass; (6) otherwise → call `WebApprovalCoordinator::request_decision()` and await. On redirect, re-run the full sequence for the new URL (R-WEB.8). On connect, re-check resolved IP (R-WEB.3.4).
+- **All tools making outbound HTTP calls must use `EgressClient`**, not `reqwest::Client::new()`. A Clippy deny lint **should** be added to prevent bare `Client::new()` in tool-handler code.
+- The TUI `draw_web_approval_modal` function follows the same pattern as `draw_scope_grant_modal`: drawn last, `[n]` highlighted as default, Enter/Esc deny.
+
+---
+
+### R-WEB.15: Interaction with existing approval systems
+
+- **R-WEB.15.1**: Web domain approval is **orthogonal** to tool-level approval (`ahma_core::approvals`). Approving `fetch_webpage` as a tool does not automatically approve any domain; domain approval is a separate, independent control.
+- **R-WEB.15.2**: Web domain approval and filesystem scope-grant decisions are independent; the two coordinators operate without cross-coupling.
+- **R-WEB.15.3**: When both systems require approval simultaneously (a tool that trips both a filesystem scope violation and a web domain block), the modals are queued and presented in sequence; each decision is independent.
+
+---
+
+### R-WEB.16: Subprocess egress sandbox (task vault HTTP proxy)
+
+> Design narrative: `docs/egress-sandbox.md`. This section provides the SPEC-level requirements that were previously missing.
+
+The subprocess egress sandbox is a complementary mechanism that covers HTTP traffic from **subprocesses spawned inside a task vault** — not the ahma process itself (which is governed by R-WEB.1–R-WEB.15).
+
+- **R-WEB.16.1**: When `ahma serve` starts with a `--task-vault <path>`, it **must** bind an HTTP proxy to a random localhost port and inject `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY=127.0.0.1,::1,localhost` into the subprocess environment.
+- **R-WEB.16.2**: Requests from subprocesses to domains **not** in `egress.allowlist` **must** receive `407 Proxy Authentication Required` (CONNECT / HTTPS) or `403 Forbidden` (plain HTTP). The response **must** be indistinguishable from a real network failure, preventing the agent from detecting the proxy's presence via error content.
+- **R-WEB.16.3**: `egress.allowlist` pattern syntax matches R-WEB.4. An empty or absent file means deny all.
+- **R-WEB.16.4**: The proxy **must not** decrypt HTTPS traffic (no MITM). CONNECT tunnels are forwarded for approved domains and rejected for unapproved ones.
+- **R-WEB.16.5**: The private-range block (R-WEB.3.1) is applied by the proxy regardless of `egress.allowlist` entries.
+- **R-WEB.16.6**: QUIC (HTTP/3) connections are not intercepted by an HTTP proxy. For strict subprocess egress, HTTP/3 **should** be disabled in the subprocess environment (`AHMA_NO_HTTP3=1` or equivalent).
+- **R-WEB.16.7**: `EgressAllowlist` (Rust API in `ahma_core`) is the canonical type for managing the allowlist file. `EgressClient` (in `ahma_common`) is the canonical HTTP client for enforced requests from the ahma process itself.
+
+---
+
+### Security invariants summary (R-WEB)
+
+| Invariant | Requirement |
+|-----------|------------|
+| Private ranges blocked at DNS resolution time, not just pattern match | R-WEB.3.2 |
+| Enter/Esc is always Deny in every approval modal | R-WEB.6.3 |
+| Persistent grants written only to out-of-sandbox settings file | R-WEB.5.2 |
+| Session grants are never serialized to disk | R-WEB.5.1 |
+| Redirect targets are independently checked (no inherited approval) | R-WEB.8.1 |
+| No path-based filtering (explicitly excluded to avoid false safety) | R-WEB.13 |
+| All outbound HTTP tools must use `EgressClient`, not bare `reqwest` | R-WEB.14 |
+| Every request is audit-logged regardless of policy | R-WEB.9.1 |
+| `never_allow` cannot be overridden by session grants or `always_allow` | R-WEB.2.3 |
+| `block_private_ranges` cannot be overridden by any domain pattern | R-WEB.3.1 |
+
+---
+
 ## 5. Tool Definition (MTDF Schema)
 
 ### 5.1 Basic Structure
