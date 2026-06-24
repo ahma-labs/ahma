@@ -216,15 +216,19 @@ If it prints any `⚠` line, surface it to the human and suggest `/ahmadev gitco
    squash body is built from these commit messages (`squash_merge_commit_message =
    COMMIT_MESSAGES`), so they become the permanent `main` log entry — write them well.
 
-3. **Get fast local feedback** (mirrors the PR fast tier — see `.github/workflows/fast-tier.yml`):
+3. **Fix and check locally** (clippy before fmt so fmt doesn't revert auto-fixes):
    ```bash
-   cargo fmt --all && cargo clippy --all-targets --locked && cargo nextest run --profile smoke
+   cargo clippy --allow-dirty --fix
+   cargo clippy --tests --allow-dirty --fix
+   cargo fmt --all
+   cargo nextest run
    ```
 
-4. **Push and open the PR:**
+4. **Push, open the PR, and view it in the browser:**
    ```bash
    git push -u origin HEAD
    gh pr create --fill --base main
+   gh pr view --web
    ```
    The PR push triggers the **fast tier** (~5 min Linux fmt + clippy + smoke) for quick feedback.
 
@@ -308,17 +312,19 @@ that tag does not already exist**. So a release = landing a version bump on `mai
    last release tag and the proposed `vX.Y.Z`, and confirm before bumping. Only deviate from
    patch-increment if the human specifies a version.
 
-4. **Bump on a release branch** (branch protection routes everything through PRs, including
-   the bump):
+4. **Bump on a release branch, then land it exactly like `/ahmadev land`** — no duplicated
+   steps here, the land flow owns quality checks, browser open, auto-merge, and local tidy:
    ```bash
    git switch -c chore/release-<X.Y.Z> origin/main
    cargo xtask bump-version <X.Y.Z>     # edits Cargo.toml, Cargo.lock, SKILL.md, install.sh, install.ps1
    git add Cargo.toml Cargo.lock skills/ahma/SKILL.md scripts/install.sh scripts/install.ps1
    git commit -m "chore(release): bump version to <X.Y.Z>"
-   git push -u origin HEAD
-   gh pr create --fill --base main
-   gh pr merge --squash --auto --delete-branch
    ```
+   Then follow **`/ahmadev land` steps 3–7 exactly**: `cargo clippy --allow-dirty --fix`,
+   `cargo clippy --tests --allow-dirty --fix`, `cargo fmt --all`, `cargo nextest run`,
+   push, `gh pr create --fill --base main`, `gh pr view --web`,
+   `gh pr merge --squash --auto --delete-branch`, `gh pr checks --watch`,
+   then `git switch main && git pull --ff-only && git branch -D chore/release-<X.Y.Z>`.
 
 5. **Watch the publish.** When the bump lands on `main`, the main run builds the binaries and
    publishes the Release:
@@ -988,7 +994,7 @@ non-blocking — at the cost of catching Windows/macOS/Android/full-suite breaks
 lands (fix out-of-band, never blocks the features that landed behind it).
 
 Three gates, cheapest first:
-1. **Local** (before push): `cargo fmt --all && cargo clippy --all-targets --locked && cargo nextest run --profile smoke`.
+1. **Local** (before push): `cargo clippy --allow-dirty --fix`, then `cargo clippy --tests --allow-dirty --fix`, then `cargo fmt --all`, then `cargo nextest run`.
 2. **Fast Tier on the PR (~5 min) — the required merge gate.** `fast-tier.yml` runs on
    `pull_request`; `--auto` waits for it. A clean-room re-run of gate 1 (catches uncommitted
    files / stale `Cargo.lock` / dirty-tree bugs).
