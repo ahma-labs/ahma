@@ -57,7 +57,7 @@ Two commands carry the day-to-day loop; the rest are occasional specialists.
 |---------|---------|
 | `/ahmadev help` | Show the process overview + subcommand list |
 | `/ahmadev bisect` | Find the commit that introduced a regression via `git bisect run` (local, zero-CI) |
-| `/ahmadev coverage` | Read the published coverage summary and add tests where they most reduce reversions (integration tests preferred) |
+| `/ahmadev coverage` | Fan out parallel subagents across 3–10 low-coverage files, close all holes in each (≥80% target per file), land as one PR |
 | `/ahmadev update` | Upgrade workspace deps that are ≥14 days old and advisory-clean |
 | `/ahmadev install` | Build the working tree in release mode and install it to `~/.local/bin/ahma` (unsigned, for *this* machine — does not ship) |
 | `/ahmadev gitconfig` | Configure git on this machine for the squash-only, linear-history workflow (idempotent `git config` commands; never overwrites your identity/editor). **One-time per machine/checkout.** |
@@ -144,7 +144,7 @@ landed behind it. It's a good idea here precisely because:
 /ahmadev land      — Branch → PR → auto squash-merge on main when Fast Tier passes  ← drive a fix to main
 /ahmadev release   — Land pending work + bump version on main; CI publishes the GitHub Release  ← ship to users
 /ahmadev bisect    — git bisect run a repro to find the commit that introduced a regression (local, free)
-/ahmadev coverage  — Read the published coverage summary; add tests where they most reduce reversions
+/ahmadev coverage  — Fan out parallel subagents (3–10 files), close all holes per file (≥80% each), land one batch PR
 /ahmadev update    — Upgrade workspace dependencies (safe: ≥14d old, no known advisories)
 /ahmadev install   — Build the working tree (release) and install to ~/.local/bin/ahma (this machine only; unsigned)
 /ahmadev gitconfig — Configure git for the squash-only, linear-history workflow (one-time per machine/checkout)
@@ -438,19 +438,23 @@ rarely need bisect — but when you do, it's surgical and free.
 
 ---
 
-## `/ahmadev coverage` — Add Tests Where They Most Reduce Reversions
+## `/ahmadev coverage` — Drive Significant Coverage Gains Across Multiple Files
 
 ### What it does
 
-Reads the **published** coverage report, picks the *one* area where added tests will do the
-most to stop code from being reverted, writes those tests (favoring **integration** tests where
-the value lives in cross-module behavior), confirms the new tests pass and actually exercise the
-target code, then lands them through the normal `/ahmadev land` gate.
+Reads the **published** coverage report, selects a **batch of 3–10 high-value target files**,
+fans out **parallel subagents** (one per file) to write comprehensive tests that close all holes
+in each target, then consolidates and lands everything in one PR.
 
-This is a coverage-*planning* command, not a coverage-*measuring* one. **Do not run
-`cargo llvm-cov` locally** — the coverage tool instruments and writes profraw/profdata files and
-is not designed to run inside ahma's kernel sandbox. CI already measures coverage on every push
-to `main`; this command *consumes* that measurement and adds tests with reasoning.
+This is NOT a "add a few tests and call it done" command. Each invocation should move the
+workspace coverage total **visibly** — measured in hundreds of newly-covered lines, not tens.
+The minimum bar for each chosen file is **≥80% line coverage from its current baseline**. A
+file at 0% with real logic should finish at 80%+. A file at 40% should finish at ≥80%. If you
+write 3 tests for a 300-line file you have not done this work.
+
+This is a coverage-*planning + writing* command, not a coverage-*measuring* one. **Do not run
+`cargo llvm-cov` locally** — CI already measures coverage on every push to `main`. This command
+consumes CI's measurements and writes the tests.
 
 ### Where the numbers come from (read the compact summary, never the giant HTML)
 
@@ -461,7 +465,7 @@ publishes three artifacts to GitHub Pages, rooted at `https://paulirotta.github.
 |----------|-----|-----|
 | **`coverage-lowest.md`** | `https://paulirotta.github.io/ahma/coverage-lowest.md` | **Read this first.** A few-KB markdown table of every workspace file sorted ascending by line coverage, with totals — no source lines. This is the planning input. |
 | `coverage-summary.json` | `https://paulirotta.github.io/ahma/coverage-summary.json` | Same data, machine-readable (`cargo llvm-cov --json --summary-only`), if you want to filter/sort programmatically. |
-| Full line-by-line HTML | `https://paulirotta.github.io/ahma/html/` | **Only** drill in here for a *single* already-chosen file. It is large and per-line — reading it broadly swamps context with trivia. |
+| Full line-by-line HTML | `https://paulirotta.github.io/ahma/html/` | Drill into this **per-file** once you have chosen targets. The per-file page shows exactly which lines are red — the input to "close the holes". |
 
 > **Why a compact summary exists.** The raw llvm-cov HTML is tens of MB of per-line markup —
 > useless for planning and ruinous for an LLM's context window. CI therefore also emits the
@@ -473,73 +477,146 @@ publishes three artifacts to GitHub Pages, rooted at `https://paulirotta.github.
 > `gh run download -n coverage-summary` (pick the most recent `build.yml` run on `main`), or as a
 > last resort scrape the HTML index for the per-file table.
 
-### Choosing the target (the judgment that makes this command worth running)
+### Choosing the BATCH (not one file — a batch of 3–10)
 
-Pick where coverage most **reduces reversions** — not whatever has the lowest percentage.
-Rank candidates by *blast radius if it breaks silently*, then by how cheaply a test pins the
-behavior:
+**Do not pick a single file.** Pick 3–10 files. Rank by:
 
-1. **Prefer code on a hard invariant or a wide call path.** Sandbox scope derivation, path
-   security, approvals/gating, the MCP handshake, session isolation, daemon/bridge request
-   routing, shell-pool command construction — a silent break here is exactly what gets reverted.
-   These are also where **integration tests are the gold standard**: they catch the cross-module
-   contract a unit test mocks away. See the **Hard Invariants** section in `AGENTS.md` (HTTP
-   handshake, `-32001` sandbox gating, no print-only tests) — encode those as assertions.
-2. **Then prefer big, untested, logic-heavy files.** A 0%/low-coverage module with real branching
-   (e.g. `ahma_mcp/src/daemon_reporter.rs`, `ahma_mcp/src/service_builder.rs`,
-   `ahma_mcp/src/shell/cli/commands.rs`, `ahma_core/src/approvals.rs`) is high-yield: many
-   uncovered branches per test.
-3. **Skip the trivia even though it shows 0%.** Binary entry points (`ahma_bin/src/main.rs`,
-   `ahma_http_bridge/src/main.rs`) and pure glue are **explicitly exempt** from the ≥80% target in
-   `AGENTS.md` (tested via CLI integration). Coverage there is cosmetic and rarely prevents a
-   revert — don't burn the change on it.
+1. **Blast radius × uncovered lines.** A 0%-covered 300-line module with real branching is
+   worth 10× the attention of a 0%-covered 14-line glue file. Prioritize:
+   - Sandbox scope derivation, path security, approvals/gating
+   - The MCP handshake and session isolation paths
+   - Daemon/bridge request routing, shell-pool command construction
+   - Any logic-heavy module where a silent break causes a reversion
+   Integration tests are the gold standard here — they catch cross-module contracts that unit
+   tests mock away. See the **Hard Invariants** section in `AGENTS.md`.
 
-State the chosen target and the one-sentence reason ("breaks silently + wide blast radius +
-currently N% over M lines") before writing tests.
+2. **Logic density.** Skip files that are pure wiring (no branching, no error paths). Prefer
+   files with many `match`, `if let`, `?` chains, and error paths — those are the branches
+   that break silently and never get caught without tests.
+
+3. **Coherent groupings land faster.** Group related files in one PR when they share fixtures
+   (e.g. all of `update/`, all of `sandbox/`, all of a single crate's handler layer). One PR
+   touching 5 related files is faster to review than 5 separate PRs.
+
+4. **Skip exempt trivia even at 0%:** `ahma_bin/src/main.rs`, `ahma_http_bridge/src/main.rs`
+   (binary entry points — exempt per `AGENTS.md`), and test-infrastructure files (`test_utils/`
+   — already covered by the tests that use them).
+
+5. **State your batch before starting.** List each file, current %, target %, and the estimated
+   uncovered lines you will cover. Total the lines — that is your PR's "lines added to coverage"
+   metric. If you cannot credibly bring a file to ≥80%, note why and pick a different file.
+
+### Depth requirement: close the holes, not check the box
+
+For each chosen file, the goal is **systematic coverage of every branch**, not a handful of
+happy-path smoke tests. Before writing tests for a file:
+
+1. **Read the source completely** — understand every function, every error path, every `match`
+   arm, every early return.
+2. **Fetch and read the HTML page for that file** to see exactly which lines are red:
+   `https://paulirotta.github.io/ahma/html/<crate>/src/<path>.html`
+3. **Make a list of uncovered behaviors** — every red block is a gap to close.
+4. **Write tests for every item on that list:**
+   - Every public function (happy path AND error path)
+   - Every `Result::Err` branch, every `bail!`, every `?` that can fail
+   - Every early return / guard clause
+   - Boundary conditions: empty input, None, max-size, zero timeout
+   - Env-var-gated behavior (use the `ENV_MUTEX` + `unsafe { std::env::set_var }` pattern
+     from `ahma_mcp/src/update/source.rs` to serialize env-var-touching tests)
+
+A file previously at 20% should be at ≥80% when you are done with it. A small file at 0%
+should be at 100%. Stopping at 50% is not acceptable unless the remaining lines require
+network I/O, a real platform binary, or a refactor (explain which, and why).
+
+### Parallel subagent workflow (one Agent per file)
+
+After selecting the batch, fan out one `Agent` tool call per file. All agents run concurrently.
+Each subagent's prompt must include:
+
+- The exact file path and its current coverage %
+- The URL of its HTML coverage page (so it can fetch the red-line map)
+- Instruction to read the source completely before writing a single test
+- Instruction to cover every uncovered branch identified from the HTML page
+- The repo test conventions from `AGENTS.md`:
+  - `tempfile::TempDir` for all file I/O (never hardcode `/tmp`, `/dev/null`, `/bin/sh`)
+  - `test_utils::path_helpers` for cross-platform paths
+  - Assert on success/failure AND key output (no print-only tests)
+  - In-module `#[cfg(test)]` block for pure unit logic; crate `tests/` dir for integration tests
+  - HTTP bridge: follow the exact 5-step handshake sequence documented in Hard Invariants
+  - Env-var tests: use `LazyLock<Mutex<()>>` guard (see `update/source.rs` for the pattern)
+- Instruction to run `cargo nextest run -E 'test(<filter>)'` and confirm all tests pass
+- Instruction to **return the complete test code** and a summary: test count, which lines
+  each test covers, and expected new coverage %
+
+After all agents complete, apply their output to your branch. Where agents edited the same
+file, merge their `#[cfg(test)]` blocks. Run the full suite on the consolidated result.
+
+**Up to 10 files per invocation.** Launching 10 agents in parallel is normal and expected —
+that is the whole point of this command. Do not serialize them; do not do this file-by-file
+yourself. The agent fan-out IS the work.
 
 ### Workflow (how to invoke as an agent)
 
-1. **Branch from canonical main** (same rule as `land` — never from local `main`):
+0. **Branch from canonical main** (never from local `main`):
    ```bash
-   git fetch origin && git switch -c test/coverage-<area> origin/main
+   git fetch origin && git switch -c test/coverage-batch-<area> origin/main
    ```
 
-2. **Fetch the compact summary** and read totals + the worst files:
+1. **Fetch and read the compact summary:**
    ```bash
    curl -fsSL https://paulirotta.github.io/ahma/coverage-lowest.md
-   # fallback if not published yet:  gh run download -n coverage-summary
+   # fallback: gh run download -n coverage-summary  (most recent build.yml run on main)
    ```
 
-3. **Choose ONE target** using the ranking above and announce it with its reason.
+2. **Select and announce the batch.** Before writing any code, output a table:
 
-4. **Read the target source** with native file tools and identify the uncovered behavior worth
-   pinning. For one chosen file you may open its HTML page
-   (`https://paulirotta.github.io/ahma/html/<path>.html`) to see exactly which lines are red.
+   | File | Current % | Lines uncovered | Target % | Why chosen |
+   |------|-----------|-----------------|----------|------------|
+   | ahma_mcp/src/update/mod.rs | 9% | 275 | ≥80% | update flow, wide blast radius |
+   | ... | | | | |
 
-5. **Write tests, integration-first where it fits.** Put cross-module/workflow tests in the
-   workspace/crate `tests/` dir; reserve in-module `#[cfg(test)]` for pure unit logic. Obey the
-   repo test rules in `AGENTS.md`: `tempfile::TempDir` for all file I/O, `test_utils::path_helpers`
-   for paths (never hardcode `/tmp`, `/bin/sh`, `/dev/null`), assert on success/failure **and** key
-   output (no print-only tests), and for the HTTP bridge follow the exact handshake sequence.
+   Total the "lines uncovered" column. That is the impact of this PR.
 
-6. **Verify locally** — tests must pass *and* genuinely exercise the target (a test that doesn't
-   hit the uncovered lines adds nothing):
+3. **Fan out subagents.** One `Agent` call per file, all in the same response (parallel).
+   Each agent writes tests, verifies them, and returns the test code + summary.
+
+4. **Consolidate.** Apply all subagent edits to your branch. Merge any overlapping `#[cfg(test)]`
+   blocks. Resolve any naming conflicts between test functions.
+
+5. **Verify the full batch:**
    ```bash
-   cargo nextest run -E 'test(<your_new_tests>)' --no-default-features
-   cargo fmt --all && cargo clippy --all-targets --locked
+   cargo nextest run  # all tests in the workspace (or scope to touched crates)
+   cargo fmt --all && cargo clippy --all-targets
    ```
 
-7. **Land it** via `/ahmadev land` (`test:`-typed commits). Coverage is re-measured by CI on the
-   next push to `main`; check `coverage-lowest.md` after it lands to confirm the target moved.
+6. **Land via `/ahmadev land`.** PR title: `test: coverage batch — <area> (<N> files, +<M> lines)`.
+   PR description must list:
+   - Each file: before % → estimated after %
+   - Total new lines brought into coverage
+   - Which hard invariants are now pinned by tests
 
-### Scope discipline (avoid the rabbit hole)
+### Scope discipline
 
-- **One area per invocation.** Resist "while I'm here" sprawl across crates — small, single-target
-  test PRs land in ~5 min and keep `main` linear. Re-run the command for the next area.
-- **Don't refactor to make code testable as part of this command** unless trivial; if the target
-  needs restructuring to be tested, say so and land that separately (it's a `refactor:`, and may be
-  a human-confirmation point if it touches an invariant).
+- **Batch = 3–10 files per invocation.** Fewer is leaving value on the table. More starts to
+  make the PR hard to review — split at 10.
+- **Each file must reach ≥80%** or the subagent must explain why (network call, platform binary,
+  needs a refactor first). "I ran out of time" is not an explanation.
+- **Don't refactor to make code testable** as part of this command. If a file cannot be tested
+  without restructuring, flag it (suggest a `refactor:` PR) and move to the next target.
 - This command **does not** run the coverage tool, bump, or release. It only adds tests.
+
+### Anti-patterns (what NOT to do)
+
+- **Picking the smallest/easiest 0% file instead of the highest-blast-radius file.** A 14-line
+  glue file at 0% is noise. A 300-line request handler at 0% is a reversion waiting to happen.
+- **Writing 3–10 tests for a file and calling it done** when the file has 50+ uncovered branches.
+  If you would not call this "systematic coverage", do not call it coverage.
+- **Landing one file at a time in separate PRs.** The parallel subagent workflow exists precisely
+  to avoid this. Ship 5–10 files in one PR; it lands in the same ~5 min as one file.
+- **Picking files based on % alone without reading the source.** A file at 2% with 20 lines of
+  pure `println!` is not the same as a file at 2% with 500 lines of branching logic. Read first.
+- **Skipping the HTML per-file page.** The compact summary gives % and line counts. The HTML gives
+  you the exact red lines. You need both: the summary to pick targets, the HTML to close the holes.
 
 ---
 
