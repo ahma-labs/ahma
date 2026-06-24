@@ -10,7 +10,8 @@ description: >
    (/ahmadev coverage), update dependencies safely (/ahmadev update), bump the
    version (/ahmadev bump), install a local build (/ahmadev install), configure
    git for the squash-only workflow (/ahmadev gitconfig), and help
-   (/ahmadev help).
+   (/ahmadev help), and simplify the changed code with before/after metrics
+   (/ahmadev simplify).
    Trigger phrases: "ahmadev", "ahmadev land", "ahmadev release",
    "ahmadev bisect", "ahmadev coverage", "add test coverage", "improve coverage",
    "where do we need tests", "raise coverage", "coverage report", "ahmadev update", "ahmadev help", "land this feature",
@@ -24,7 +25,9 @@ description: >
    "cargo safe update", "update dependencies", "bump deps", "upgrade workspace deps",
    "ahmadev install", "install local build", "build and install ahma",
    "install my changes", "get the fix on my machine", "local release build",
-   "install without waiting for CI".
+   "install without waiting for CI",
+   "ahmadev simplify", "simplify the diff", "simplify the code", "simplify changed code",
+   "clean up the diff", "refactor the diff", "reduce duplication".
 user-invocable: true
 scope: repo
 ---
@@ -56,6 +59,7 @@ Two commands carry the day-to-day loop; the rest are occasional specialists.
 | Command | Purpose |
 |---------|---------|
 | `/ahmadev help` | Show the process overview + subcommand list |
+| `/ahmadev simplify` | Review the changed diff for reuse/simplification/efficiency/altitude issues, apply fixes, report **before/after metrics table** |
 | `/ahmadev bisect` | Find the commit that introduced a regression via `git bisect run` (local, zero-CI) |
 | `/ahmadev coverage` | Fan out parallel subagents across 3–10 low-coverage files, close all holes in each (≥80% target per file), land as one PR |
 | `/ahmadev update` | Upgrade workspace deps that are ≥14 days old and advisory-clean |
@@ -143,6 +147,7 @@ landed behind it. It's a good idea here precisely because:
 /ahmadev help      — Show this overview + subcommand list
 /ahmadev land      — Branch → PR → auto squash-merge on main when Fast Tier passes  ← drive a fix to main
 /ahmadev release   — Land pending work + bump version on main; CI publishes the GitHub Release  ← ship to users
+/ahmadev simplify  — Review the diff for cleanup opportunities, apply fixes, report before/after metrics table
 /ahmadev bisect    — git bisect run a repro to find the commit that introduced a regression (local, free)
 /ahmadev coverage  — Fan out parallel subagents (3–10 files), close all holes per file (≥80% each), land one batch PR
 /ahmadev update    — Upgrade workspace dependencies (safe: ≥14d old, no known advisories)
@@ -617,6 +622,92 @@ yourself. The agent fan-out IS the work.
   pure `println!` is not the same as a file at 2% with 500 lines of branching logic. Read first.
 - **Skipping the HTML per-file page.** The compact summary gives % and line counts. The HTML gives
   you the exact red lines. You need both: the summary to pick targets, the HTML to close the holes.
+
+---
+
+## `/ahmadev simplify` — Simplify Changed Code with Before/After Metrics
+
+### What it does
+
+Reviews the diff for reuse, simplification, efficiency, and altitude issues, applies the fixes,
+and bookends the work with a **mandatory before/after metrics table** that makes the value of each
+run concrete and comparable across sessions. The metrics table is not optional — running simplify
+and reporting no numbers is not acceptable.
+
+Quality only: this command does not hunt for correctness bugs (use `/code-review` for that) and
+does not bump, release, or push (unless the human explicitly asks to land the result).
+
+### Mandatory metrics — collect BEFORE doing anything
+
+Before writing a single line of code, measure every file that appears in the diff and display
+this table:
+
+| File | Lines | Duplication instances |
+|------|---------|-----------------------|
+| `path/to/file.rs` | N | e.g. "5× identical `Sandbox::new(…)` blocks; 4× `get_envs()→HashMap`" |
+
+**How to collect:**
+- **Lines**: `wc -l <file>` for each file in the diff.
+- **Duplication instances**: read the diff, count visually identical blocks (copy-paste groups).
+  Name them concisely: "N× `<short description of the block>`".
+- **Complexity** (optional): if `mcp__Ahma__simplify` is available, run it on the changed files
+  and add a "Complexity" column with the score. This is a bonus, not a gate.
+
+Display the before-table and wait for the review agents before touching any code.
+
+### Four parallel review agents (same as `/simplify`)
+
+Launch all four concurrently. Pass each agent the diff and one angle:
+
+| Agent | Angle |
+|-------|-------|
+| **Reuse** | New code that re-implements something the codebase already has — name the existing helper |
+| **Simplification** | Redundant state, copy-paste variation, deep nesting, dead code — name the simpler form |
+| **Efficiency** | Wasted computation, sequential independent ops, blocking work on hot paths |
+| **Altitude** | Bandaid layered on shared infrastructure — fix at the right depth, not with a special case |
+
+Each agent returns: `file`, `line`, one-line `summary`, concrete cost.
+
+### Apply fixes and collect AFTER metrics
+
+Dedup overlapping findings. Apply each fix. For findings skipped (behavior change, out-of-scope,
+false positive), note the skip and the reason.
+
+After all fixes are applied, measure every file that was modified and display:
+
+| File | Lines | Duplication removed | Δ lines |
+|------|-------|---------------------|---------|
+| `path/to/file.rs` | N′ | e.g. "5 setup blocks → `make_test_sandbox`; 4 collection blocks → `cmd_envs`" | −ΔN |
+
+Then a one-line summary: **"Net −N lines across K files; M duplication instances collapsed."**
+
+If nothing was fixable, say so explicitly ("diff is already clean — no findings to apply") and
+show the after-table anyway so the before/after comparison is complete.
+
+### Example (from a real session)
+
+**Before:**
+
+| File | Lines | Duplication instances |
+|------|---------|-----------------------|
+| `ahma_mcp/src/sandbox/command.rs` | 386 | 5× `Sandbox::new(…,Test,…)` setup; 4× `get_envs()→HashMap` |
+
+**After:**
+
+| File | Lines | Duplication removed | Δ lines |
+|------|-------|---------------------|---------|
+| `ahma_mcp/src/sandbox/command.rs` | 302 | 5 setup blocks → `make_test_sandbox`; 4 collection blocks → `cmd_envs` | −84 |
+
+**Summary:** Net −84 lines across 1 file; 9 duplication instances collapsed into 2 helpers.
+
+### Landing the result
+
+If fixes were applied, land via `/ahmadev land` with a `refactor:`-typed commit:
+```bash
+git add <modified files>
+git commit -m "refactor(<scope>): <what was simplified>"
+```
+Then follow `/ahmadev land` steps 3–7 (clippy → fmt → nextest → push → PR → auto-merge → tidy).
 
 ---
 
