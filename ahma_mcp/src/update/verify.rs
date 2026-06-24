@@ -166,3 +166,135 @@ fn sha256_hex(path: &Path) -> Result<String> {
         std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{LazyLock, Mutex};
+    use tempfile::tempdir;
+
+    // Serialize env-var-touching tests so they don't race each other.
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    // SAFETY: all env-var writes are guarded by ENV_MUTEX; nextest runs each
+    // test binary in an isolated process, so there is no cross-binary interference.
+
+    #[test]
+    fn skip_verify_false_when_unset() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+        assert!(!should_skip_verify());
+    }
+
+    #[test]
+    fn skip_verify_truthy_values() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+        for val in ["1", "true", "yes", "on"] {
+            unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", val) };
+            assert!(
+                should_skip_verify(),
+                "expected skip for AHMA_INSECURE_SKIP_VERIFY={val}"
+            );
+        }
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+    }
+
+    #[test]
+    fn skip_verify_falsy_values() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+        for val in ["0", "false", "no", "off"] {
+            unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", val) };
+            assert!(
+                !should_skip_verify(),
+                "expected no skip for AHMA_INSECURE_SKIP_VERIFY={val}"
+            );
+        }
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+    }
+
+    #[test]
+    fn skip_verify_trims_whitespace() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", " 1 ") };
+        assert!(should_skip_verify());
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+    }
+
+    #[test]
+    fn skip_verify_legacy_var_honored() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_SIGNATURE", "1") };
+        assert!(should_skip_verify());
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+    }
+
+    #[test]
+    fn sha256_known_value() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hello.bin");
+        std::fs::write(&path, b"hello").unwrap();
+        // echo -n "hello" | sha256sum
+        assert_eq!(
+            sha256_hex(&path).unwrap(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[test]
+    fn sha256_empty_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+        std::fs::write(&path, b"").unwrap();
+        // sha256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        assert_eq!(
+            sha256_hex(&path).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_missing_file_returns_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonexistent.bin");
+        let err = sha256_hex(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to read"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_artifact_ok_when_skip_env_set() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+        // Path need not exist — we return before reading it.
+        let result = verify_artifact(std::path::Path::new("/nonexistent/artifact")).await;
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        assert!(
+            result.is_ok(),
+            "expected Ok when skip env var is set: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_cli_errors_on_missing_artifact() {
+        use std::path::PathBuf;
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+        let args = VerifyArgs {
+            path: Some(PathBuf::from("/nonexistent/path/artifact.bin")),
+            self_check: false,
+        };
+        let err = run_cli(args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Artifact not found"),
+            "unexpected error: {err}"
+        );
+    }
+}
