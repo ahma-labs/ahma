@@ -620,7 +620,9 @@ release" command. It is equivalent to:
 cargo build --release -p ahma_bin \
   && cp target/release/ahma ~/.local/bin/ahma.new \
   && chmod +x ~/.local/bin/ahma.new \
-  && mv -f ~/.local/bin/ahma.new ~/.local/bin/ahma   # atomic rename, NOT cp-over
+  && mv -f ~/.local/bin/ahma.new ~/.local/bin/ahma \
+  && { [ "$(uname -s)" = "Darwin" ] && \
+       codesign --force --sign - --options runtime ~/.local/bin/ahma || true; }
 ```
 
 > **Why `mv` (rename), never `cp` over the live file** — ahma is almost always already
@@ -632,6 +634,14 @@ cargo build --release -p ahma_bin \
 > temp name and doing an atomic `mv` gives the path a **fresh inode** with a clean
 > signature and leaves the running processes on the old inode untouched. This is exactly
 > why `scripts/install.sh` uses `mv`, not `cp`.
+>
+> **Why `codesign --options runtime` on macOS** — `cargo`-built binaries are ad-hoc signed
+> (`Signature=adhoc, linker-signed`) without the hardened runtime entitlement. Under memory
+> pressure the OS can evict and must re-validate those code pages; without `--options runtime`
+> re-validation fails and the kernel sends `SIGKILL` (`EXC_BAD_ACCESS`, termination
+> namespace=`CODESIGNING`, indicator=`Invalid Page`). Adding the flag opts the binary into
+> the hardened runtime, enabling safe page eviction. This is the same signing mode that
+> `scripts/install.sh` applies after Sigstore attestation.
 
 ### When to use it vs. `/ahma update`
 

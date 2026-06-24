@@ -322,6 +322,17 @@ else
     echo "WARNING: Sigstore attestation verification bypassed (AHMA_INSECURE_SKIP_VERIFY=1)." >&2
 fi
 
+# On macOS: re-sign with the hardened runtime entitlement to prevent CODESIGNING SIGKILL
+# under memory pressure. Ad-hoc signed binaries built with `cargo` lack --options runtime,
+# so the OS cannot safely evict and re-fault their code pages. When memory pressure forces
+# a page-out, re-validation of the ad-hoc signature fails and the kernel sends SIGKILL
+# (crash type EXC_BAD_ACCESS, termination namespace=CODESIGNING, indicator=Invalid Page).
+# This step runs after Sigstore attestation is verified so the security guarantee is preserved.
+if [ "$OS" = "darwin" ]; then
+    echo "Re-signing with hardened runtime (prevents macOS CODESIGNING SIGKILL under memory pressure)..."
+    codesign --force --sign - --options runtime "$INSTALLED_BIN"
+fi
+
 "$INSTALLED_BIN" --version
 echo "Success! Installed and verified ahma to ${INSTALL_DIR}"
 AHMA_BIN="$INSTALLED_BIN"
