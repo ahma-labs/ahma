@@ -67,6 +67,14 @@ impl Sandbox {
                 working_dir.join("target")
             };
             cmd.env("CARGO_TARGET_DIR", target_dir);
+            // Neutralize any rustc compiler wrapper (e.g. sccache) from the user's
+            // ~/.cargo/config.toml. Inside the sandbox, sccache tries to write its
+            // cache outside the workspace scope → kernel EPERM, which taints the
+            // sccache daemon and breaks subsequent C-extension builds (ring, openssl).
+            // An empty env var takes precedence over the config-file [build] setting;
+            // cargo treats it as "no wrapper" (checks `!wrapper.is_empty()` before use).
+            cmd.env("RUSTC_WRAPPER", "")
+                .env("RUSTC_WORKSPACE_WRAPPER", "");
         }
         cmd
     }
@@ -262,6 +270,70 @@ mod tests {
             envs.get(std::ffi::OsStr::new("CARGO_TARGET_DIR")),
             Some(&Some(td.path().join("target/ahma").into_os_string())),
             "separate_cargo_target should use target/ahma/"
+        );
+    }
+
+    /// RUSTC_WRAPPER and RUSTC_WORKSPACE_WRAPPER are neutralized for cargo commands so
+    /// tools like sccache (configured in ~/.cargo/config.toml) cannot run inside the sandbox
+    /// and attempt to write their cache outside the workspace scope.
+    #[test]
+    fn test_create_command_cargo_neutralizes_rustc_wrapper() {
+        let td = tempdir().unwrap();
+        let sandbox = Sandbox::new(
+            vec![td.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let result = sandbox.create_command("cargo", &["build".to_string()], td.path());
+        assert!(result.is_ok(), "create_command for cargo should succeed");
+        let cmd = result.unwrap();
+
+        let std_cmd = cmd.as_std();
+        let envs: std::collections::HashMap<_, _> = std_cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
+            .collect();
+
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("RUSTC_WRAPPER")),
+            Some(&Some("".into())),
+            "RUSTC_WRAPPER must be neutralized to prevent sccache inside the sandbox"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("RUSTC_WORKSPACE_WRAPPER")),
+            Some(&Some("".into())),
+            "RUSTC_WORKSPACE_WRAPPER must be neutralized to prevent sccache inside the sandbox"
+        );
+    }
+
+    /// Non-cargo commands do NOT have RUSTC_WRAPPER set (it is cargo-specific).
+    #[test]
+    fn test_create_command_non_cargo_does_not_set_rustc_wrapper() {
+        let td = tempdir().unwrap();
+        let sandbox = Sandbox::new(
+            vec![td.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let result = sandbox.create_command("echo", &["hello".to_string()], td.path());
+        assert!(result.is_ok());
+        let cmd = result.unwrap();
+
+        let std_cmd = cmd.as_std();
+        let envs: std::collections::HashMap<_, _> = std_cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
+            .collect();
+
+        assert!(
+            !envs.contains_key(std::ffi::OsStr::new("RUSTC_WRAPPER")),
+            "RUSTC_WRAPPER should not be set for non-cargo commands"
         );
     }
 

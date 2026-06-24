@@ -552,7 +552,7 @@ impl Default for ToolSettings {
             minimize_tokens: false,
             small_model_harness: false,
             mutex_groups: default_mutex_groups(),
-            separate_cargo_target: false,
+            separate_cargo_target: true,
         }
     }
 }
@@ -1156,8 +1156,11 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # Add more groups for other slow exclusive tools, e.g.:
 #   { name = "gradle", prefixes = ["gradle", "./gradlew"], max_wait_secs = 600 }
 #
-# separate_cargo_target = false  # use target/ahma/ instead of target/ for ahma's cargo builds,
-#                                # eliminating cross-process file-lock contention with IDE background checks
+# separate_cargo_target = true   # default: true — sandbox builds write to target/ahma/ instead of target/,
+#                                # preventing com.apple.provenance xattr contamination (macOS Seatbelt stamps
+#                                # every file it writes; those files cannot be overwritten by other processes)
+#                                # and eliminating cross-process file-lock contention with IDE background checks.
+#                                # Set to false only if you want sandbox and IDE builds to share target/.
 
 # ── LM Studio (local OpenAI-compatible server) ──────────────────────────────
 # Start the LM Studio Local Server (Developer tab), or headless: lms server start
