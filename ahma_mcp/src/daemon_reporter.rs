@@ -508,3 +508,357 @@ fn result_summary_from(op: &Operation) -> Option<String> {
         Some(summary)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operation_monitor::{Operation, OperationStatus};
+    use ahma_common::daemon_hub::DaemonEvent;
+    use ahma_common::event_dispatcher::OperationEvent;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    // ── daemon_event_for ──────────────────────────────────────────────────────
+
+    #[test]
+    fn daemon_event_for_started() {
+        let ev = OperationEvent::Started {
+            operation_id: "op-1".into(),
+            tool_name: "cargo_build".into(),
+            description: "Build release".into(),
+        };
+        let result = daemon_event_for(&ev, "workspace/root");
+        let Some(DaemonEvent::OpStarted {
+            id,
+            tool_name,
+            description,
+            scope,
+        }) = result
+        else {
+            panic!("expected OpStarted, got {result:?}");
+        };
+        assert_eq!(id, "op-1");
+        assert_eq!(tool_name, "cargo_build");
+        assert_eq!(description, "Build release");
+        assert_eq!(scope, "workspace/root");
+    }
+
+    #[test]
+    fn daemon_event_for_output_line() {
+        let ev = OperationEvent::OutputLine {
+            operation_id: "op-2".into(),
+            line: "hello stdout".into(),
+            is_stderr: false,
+        };
+        let result = daemon_event_for(&ev, "ws");
+        let Some(DaemonEvent::OpOutput {
+            id,
+            line,
+            is_stderr,
+        }) = result
+        else {
+            panic!("expected OpOutput, got {result:?}");
+        };
+        assert_eq!(id, "op-2");
+        assert_eq!(line, "hello stdout");
+        assert!(!is_stderr);
+    }
+
+    #[test]
+    fn daemon_event_for_output_line_stderr() {
+        let ev = OperationEvent::OutputLine {
+            operation_id: "op-3".into(),
+            line: "err msg".into(),
+            is_stderr: true,
+        };
+        let Some(DaemonEvent::OpOutput { is_stderr, .. }) = daemon_event_for(&ev, "ws") else {
+            panic!("expected OpOutput");
+        };
+        assert!(is_stderr);
+    }
+
+    #[test]
+    fn daemon_event_for_alert() {
+        let ev = OperationEvent::Alert {
+            operation_id: "op-4".into(),
+            message: "disk full".into(),
+        };
+        let Some(DaemonEvent::LogLine { level, message }) = daemon_event_for(&ev, "ws") else {
+            panic!("expected LogLine");
+        };
+        assert_eq!(level, "alert");
+        assert!(message.contains("op-4"));
+        assert!(message.contains("disk full"));
+    }
+
+    #[test]
+    fn daemon_event_for_completed() {
+        let ev = OperationEvent::Completed {
+            operation_id: "op-5".into(),
+            result: json!({ "message": "ok" }),
+            duration_ms: 42,
+        };
+        let Some(DaemonEvent::OpFinished {
+            id,
+            status,
+            duration_ms,
+            result_summary,
+        }) = daemon_event_for(&ev, "ws")
+        else {
+            panic!("expected OpFinished");
+        };
+        assert_eq!(id, "op-5");
+        assert_eq!(status, "Completed");
+        assert_eq!(duration_ms, 42);
+        assert_eq!(result_summary, Some("ok".into()));
+    }
+
+    #[test]
+    fn daemon_event_for_failed() {
+        let ev = OperationEvent::Failed {
+            operation_id: "op-6".into(),
+            error: "permission denied".into(),
+            duration_ms: 10,
+        };
+        let Some(DaemonEvent::OpFinished {
+            status,
+            result_summary,
+            ..
+        }) = daemon_event_for(&ev, "ws")
+        else {
+            panic!("expected OpFinished");
+        };
+        assert_eq!(status, "Failed");
+        assert_eq!(result_summary, Some("permission denied".into()));
+    }
+
+    #[test]
+    fn daemon_event_for_cancelled() {
+        let ev = OperationEvent::Cancelled {
+            operation_id: "op-7".into(),
+            reason: "user cancelled".into(),
+            duration_ms: 5,
+        };
+        let Some(DaemonEvent::OpFinished {
+            status,
+            result_summary,
+            ..
+        }) = daemon_event_for(&ev, "ws")
+        else {
+            panic!("expected OpFinished");
+        };
+        assert_eq!(status, "Cancelled");
+        assert_eq!(result_summary, Some("user cancelled".into()));
+    }
+
+    #[test]
+    fn daemon_event_for_timed_out() {
+        let ev = OperationEvent::TimedOut {
+            operation_id: "op-8".into(),
+            duration_ms: 30_000,
+        };
+        let Some(DaemonEvent::OpFinished {
+            status,
+            result_summary,
+            duration_ms,
+            ..
+        }) = daemon_event_for(&ev, "ws")
+        else {
+            panic!("expected OpFinished");
+        };
+        assert_eq!(status, "TimedOut");
+        assert_eq!(result_summary, Some("operation timed out".into()));
+        assert_eq!(duration_ms, 30_000);
+    }
+
+    #[test]
+    fn daemon_event_for_progress_is_none() {
+        let ev = OperationEvent::Progress {
+            operation_id: "op-9".into(),
+            message: "50%".into(),
+            percent: Some(0.5),
+        };
+        assert!(
+            daemon_event_for(&ev, "ws").is_none(),
+            "Progress should map to None"
+        );
+    }
+
+    #[test]
+    fn daemon_event_for_mcp_notification_is_none() {
+        let ev = OperationEvent::McpNotification {
+            operation_id: "op-10".into(),
+            method: "notifications/message".into(),
+            params: None,
+        };
+        assert!(
+            daemon_event_for(&ev, "ws").is_none(),
+            "McpNotification should map to None"
+        );
+    }
+
+    // ── clip_summary ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn clip_summary_short_unchanged() {
+        let s = "hello world".to_string();
+        assert_eq!(clip_summary(s.clone()), s);
+    }
+
+    #[test]
+    fn clip_summary_exactly_200_unchanged() {
+        let s = "x".repeat(200);
+        let result = clip_summary(s.clone());
+        assert_eq!(result, s, "200-char string must not be clipped");
+    }
+
+    #[test]
+    fn clip_summary_over_200_appends_ellipsis() {
+        let s = "a".repeat(250);
+        let result = clip_summary(s);
+        assert!(result.ends_with("..."), "should end with ...");
+        assert!(
+            result.len() <= 201,
+            "clipped + '...' should stay short (got {})",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn clip_summary_unicode_does_not_split_char() {
+        // '€' is 3 bytes. Place it so its start byte is before 197 but its end
+        // byte would be past 197, verifying that the function never slices mid-char.
+        let prefix = "x".repeat(196);
+        let suffix = "€".repeat(20); // 3 bytes each
+        let s = format!("{prefix}{suffix}");
+        assert!(s.len() > 200);
+        let result = clip_summary(s.clone());
+        // Verify the result is valid UTF-8 (would panic on invalid slice)
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+        assert!(result.ends_with("..."));
+    }
+
+    // ── summary_from_value ───────────────────────────────────────────────────
+
+    #[test]
+    fn summary_from_value_message_field() {
+        let v = json!({ "message": "all good" });
+        assert_eq!(summary_from_value(&v), Some("all good".into()));
+    }
+
+    #[test]
+    fn summary_from_value_error_string_field() {
+        let v = json!({ "error": "something failed" });
+        assert_eq!(summary_from_value(&v), Some("something failed".into()));
+    }
+
+    #[test]
+    fn summary_from_value_nested_error_message() {
+        let v = json!({ "error": { "message": "nested error" } });
+        assert_eq!(summary_from_value(&v), Some("nested error".into()));
+    }
+
+    #[test]
+    fn summary_from_value_fallback_serializes_json() {
+        let v = json!({ "code": 42 });
+        let result = summary_from_value(&v).unwrap();
+        // The exact serialization is platform-stable: check it's non-empty JSON.
+        assert!(result.contains("42"), "fallback should serialize the value");
+    }
+
+    #[test]
+    fn summary_from_value_long_message_is_clipped() {
+        let long = "z".repeat(300);
+        let v = json!({ "message": long });
+        let result = summary_from_value(&v).unwrap();
+        assert!(result.len() <= 203, "summary must be clipped");
+        assert!(result.ends_with("..."));
+    }
+
+    // ── status_label ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn status_label_all_variants() {
+        assert_eq!(status_label(OperationStatus::Pending), "Pending");
+        assert_eq!(status_label(OperationStatus::InProgress), "InProgress");
+        assert_eq!(status_label(OperationStatus::Completed), "Completed");
+        assert_eq!(status_label(OperationStatus::Failed), "Failed");
+        assert_eq!(status_label(OperationStatus::Cancelled), "Cancelled");
+        assert_eq!(status_label(OperationStatus::TimedOut), "TimedOut");
+    }
+
+    // ── result_summary_from ──────────────────────────────────────────────────
+
+    #[test]
+    fn result_summary_from_no_result_is_none() {
+        let op = Operation::new("id".into(), "tool".into(), "desc".into(), None);
+        assert!(result_summary_from(&op).is_none());
+    }
+
+    #[test]
+    fn result_summary_from_message_field() {
+        let op = Operation::new(
+            "id".into(),
+            "tool".into(),
+            "desc".into(),
+            Some(json!({ "message": "build succeeded" })),
+        );
+        assert_eq!(result_summary_from(&op), Some("build succeeded".into()));
+    }
+
+    #[test]
+    fn result_summary_from_long_result_clipped() {
+        let long_msg = "y".repeat(300);
+        let op = Operation::new(
+            "id".into(),
+            "tool".into(),
+            "desc".into(),
+            Some(json!({ "message": long_msg })),
+        );
+        let result = result_summary_from(&op).unwrap();
+        assert!(result.len() <= 203);
+        assert!(result.ends_with("..."));
+    }
+
+    // ── recv_optional_grant ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn recv_optional_grant_none_is_pending() {
+        // With no receiver, the future must never resolve within the timeout.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            recv_optional_grant(None),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "None receiver should remain pending indefinitely"
+        );
+    }
+
+    #[tokio::test]
+    async fn recv_optional_grant_some_returns_value() {
+        use ahma_common::config::ScopeAccess;
+        use ahma_common::scope_grant::{GrantReason, ScopeGrantRequest};
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<ScopeGrantRequest>();
+        let req = ScopeGrantRequest {
+            decision_id: "d-1".into(),
+            path: std::path::PathBuf::from("/tmp/test"),
+            access: ScopeAccess::Ro,
+            reason: GrantReason::PreExecViolation,
+            tool: Some("cargo_build".into()),
+        };
+        tx.send(req.clone()).unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            recv_optional_grant(Some(&mut rx)),
+        )
+        .await
+        .expect("should resolve");
+        let got = result.expect("should have a value");
+        assert_eq!(got.decision_id, "d-1");
+        assert_eq!(got.access, ScopeAccess::Ro);
+    }
+}
