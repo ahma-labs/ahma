@@ -10,9 +10,21 @@ fn load(json: &str) -> ToolConfig {
     serde_json::from_str(json).unwrap_or_else(|e| panic!("{json} failed to parse: {e}"))
 }
 
-fn load_file(path: &str) -> ToolConfig {
-    let content =
-        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("could not read {path}: {e}"));
+/// Load a tool config from a path **relative to the workspace root**.
+///
+/// The `.ahma/` tool configs live at the workspace root, but cargo/nextest run
+/// integration tests with the current directory set to the package dir
+/// (`ahma_mcp/`), so a bare relative path like `.ahma/adb-devices.json` does not
+/// resolve. Anchor to the workspace root via `CARGO_MANIFEST_DIR` (which is
+/// `<workspace>/ahma_mcp`; its parent is the workspace root) so the tests pass
+/// regardless of the process working directory.
+fn load_file(rel: &str) -> ToolConfig {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("CARGO_MANIFEST_DIR has a parent (the workspace root)")
+        .join(rel);
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
     load(&content)
 }
 
