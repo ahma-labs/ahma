@@ -94,7 +94,8 @@ fn persist_resolved_grant(
                 Ok(_) => tracing::info!(
                     path = %path.display(),
                     access = access.label(),
-                    "scope grant approved and persisted; effective on the next server start"
+                    "scope grant approved and persisted; restart the bridge (the `restart` \
+                     tool) to apply it now, otherwise it takes effect on the next server start"
                 ),
                 Err(e) => warn!(
                     "daemon_reporter: failed to persist scope grant for {}: {e:#}",

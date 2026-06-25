@@ -17,13 +17,61 @@
 //! detection is observable in logs before any UI exists. The TUI and MCP surfaces
 //! plug real notifiers into the same trait in later PRs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use ahma_common::config::ScopeAccess;
 use ahma_common::scope_grant::{GrantCoordinator, GrantReason};
+
+/// The directory to actually offer for a denied `path` (P1c).
+///
+/// Granting a single *file* is nearly useless — the next sibling file in the
+/// same cache trips the kernel again and re-prompts. So when a denial names a
+/// file, offer its **parent directory** instead, which covers the whole cache
+/// in one grant. A directory (or a path that already looks like one) is offered
+/// as-is. This only ever walks up to the *immediate* parent and never suggests a
+/// filesystem root, and the result is still only a suggestion the human approves
+/// at the prompt — so it cannot widen scope on its own.
+fn grant_dir_for(path: &Path) -> PathBuf {
+    let looks_like_file = if path.is_dir() {
+        false
+    } else if path.is_file() {
+        true
+    } else {
+        // Nonexistent (e.g. a cache file about to be created): treat a final
+        // component bearing an extension as a file.
+        path.extension().is_some()
+    };
+
+    if looks_like_file
+        && let Some(parent) = path.parent()
+        // `parent.parent().is_some()` is false only for a filesystem root, so
+        // this refuses to ever suggest `/` (or a bare drive root) as a grant.
+        && parent.parent().is_some()
+    {
+        return parent.to_path_buf();
+    }
+    path.to_path_buf()
+}
+
+/// Shared actionable tail for the "blocked out-of-scope path" log lines: how to
+/// allow it and how to make the grant take effect.
+fn grant_hint(path: &Path, access: ScopeAccess) -> String {
+    let ro_flag = if access == ScopeAccess::Ro {
+        " --read-only"
+    } else {
+        ""
+    };
+    format!(
+        "run `ahma sandbox grant {}{}`. The grant is saved to settings — restart the \
+         bridge (the `restart` tool) to apply it now, otherwise it takes effect on the \
+         next server start.",
+        path.display(),
+        ro_flag,
+    )
+}
 
 /// Delivers a scope-grant request to a human approval surface. Implementors own
 /// (a clone of) the shared [`GrantCoordinator`] and call
@@ -67,18 +115,11 @@ impl ScopeGrantNotifier for LoggingGrantNotifier {
         tool: Option<String>,
     ) {
         if let Some(req) = self.coordinator.begin(path, access, reason, tool) {
-            let ro_flag = if req.access == ScopeAccess::Ro {
-                " --read-only"
-            } else {
-                ""
-            };
             tracing::warn!(
                 path = %req.path.display(),
                 access = req.access.label(),
-                "Sandbox blocked an out-of-scope path. To allow it, run \
-                 `ahma sandbox grant {}{}` — takes effect on the next server start.",
-                req.path.display(),
-                ro_flag,
+                "Sandbox blocked an out-of-scope path. To allow it, {}",
+                grant_hint(&req.path, req.access),
             );
         }
     }
@@ -123,18 +164,11 @@ impl ScopeGrantNotifier for HubGrantNotifier {
             return;
         };
         // Log unconditionally so the violation is visible even with no TUI attached.
-        let ro_flag = if req.access == ScopeAccess::Ro {
-            " --read-only"
-        } else {
-            ""
-        };
         tracing::warn!(
             path = %req.path.display(),
             access = req.access.label(),
-            "Sandbox blocked an out-of-scope path. Approve the prompt, or run \
-             `ahma sandbox grant {}{}` — takes effect on the next server start.",
-            req.path.display(),
-            ro_flag,
+            "Sandbox blocked an out-of-scope path. Approve the prompt, or {}",
+            grant_hint(&req.path, req.access),
         );
         // Deliver to the hub; if the channel is closed (no reporter yet) the log
         // above is the fallback.
@@ -155,8 +189,11 @@ pub async fn notify_pre_exec(
     if let Some(super::SandboxError::PathOutsideSandbox { path, .. }) =
         err.downcast_ref::<super::SandboxError>()
     {
+        // Offer the enclosing directory when the argument is a file (P1c), so one
+        // grant covers it and its siblings.
+        let target = grant_dir_for(path);
         n.notify_violation(
-            path,
+            &target,
             ScopeAccess::Rw,
             GrantReason::PreExecViolation,
             Some(tool.to_string()),
@@ -182,8 +219,11 @@ pub async fn notify_stderr_denial(
     if sandbox.is_path_in_scope(&hit.path) {
         return;
     }
+    // The denial usually names a single cache file; offer its parent directory so
+    // one grant covers the whole cache rather than re-prompting per file (P1c).
+    let target = grant_dir_for(&hit.path);
     n.notify_violation(
-        &hit.path,
+        &target,
         hit.access,
         GrantReason::StderrHeuristic,
         Some(tool.to_string()),
@@ -349,5 +389,62 @@ mod tests {
         notify_stderr_denial(&sandbox, None, "/x: Permission denied", "t").await;
         let err = anyhow::anyhow!("x");
         notify_pre_exec(None, &err, "t").await;
+    }
+
+    // ── P1c: parent-directory suggestion ──────────────────────────────────────
+
+    #[test]
+    fn grant_dir_for_existing_file_returns_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cache.bin");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(grant_dir_for(&file), dir.path());
+    }
+
+    #[test]
+    fn grant_dir_for_existing_dir_returns_self() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(grant_dir_for(dir.path()), dir.path());
+    }
+
+    #[test]
+    fn grant_dir_for_nonexistent_file_like_path_returns_parent() {
+        // A cache file about to be created: extension ⇒ treat as file.
+        let p = Path::new("/home/u/.cache/sccache/0/abc.o");
+        assert_eq!(grant_dir_for(p), Path::new("/home/u/.cache/sccache/0"));
+    }
+
+    #[test]
+    fn grant_dir_for_nonexistent_dir_like_path_returns_self() {
+        // No extension ⇒ treat as a directory to create; offer it directly.
+        let p = Path::new("/home/u/.cache/sccache/shard0");
+        assert_eq!(grant_dir_for(p), p);
+    }
+
+    #[test]
+    fn grant_dir_for_never_suggests_filesystem_root() {
+        // A file directly under root must not collapse the suggestion to `/`.
+        let p = Path::new("/lonely.bin");
+        assert_eq!(grant_dir_for(p), p);
+    }
+
+    #[tokio::test]
+    async fn stderr_denial_offers_parent_dir_for_a_file() {
+        let scope = tempfile::tempdir().unwrap();
+        let sandbox = test_sandbox(scope.path());
+        let rec = Arc::new(RecordingNotifier::default());
+        let notifier: Arc<dyn ScopeGrantNotifier> = rec.clone();
+        // A write denial naming a specific out-of-scope cache *file*.
+        let stderr =
+            "error writing `/opt/ext/sccache/0/object.o`: Operation not permitted (os error 1)";
+        notify_stderr_denial(&sandbox, Some(&notifier), stderr, "sccache").await;
+
+        let seen = rec.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].0,
+            PathBuf::from("/opt/ext/sccache/0"),
+            "the cache file's parent dir is offered, not the leaf file"
+        );
     }
 }

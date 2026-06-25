@@ -1701,14 +1701,16 @@ fn resolve_scope_grant(
         GrantDecision::GrantRo => (
             LogLevel::Info,
             format!(
-                "Granted read-only access to {} — effective on the next server start",
+                "Granted read-only access to {} — restart the bridge to apply now, else \
+                 it takes effect on the next server start",
                 gate.path
             ),
         ),
         GrantDecision::GrantRw => (
             LogLevel::Info,
             format!(
-                "Granted read+write access to {} — effective on the next server start",
+                "Granted read+write access to {} — restart the bridge to apply now, else \
+                 it takes effect on the next server start",
                 gate.path
             ),
         ),
