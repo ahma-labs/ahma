@@ -832,11 +832,18 @@ fn interpret_sync_command_output(output: std::process::Output) -> Result<String,
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if !output.status.success() {
+        // Append a remediation line when the failure is sandbox build
+        // contamination (in-scope EPERM / sccache), so the CLI user sees what to
+        // do instead of a bare `os error 1`. See `sandbox::build_diagnostics`.
+        let remediation = sandbox::build_diagnostics::diagnose(&stderr)
+            .map(|h| format!("\n\nhint: {}", h.remediation))
+            .unwrap_or_default();
         return Err(anyhow::anyhow!(
-            "Command failed with exit code {}: stderr: {}, stdout: {}",
+            "Command failed with exit code {}: stderr: {}, stdout: {}{}",
             output.status.code().unwrap_or(-1),
             stderr,
-            stdout
+            stdout,
+            remediation
         ));
     }
     Ok(combine_stdout_stderr(stdout, stderr))
@@ -1170,14 +1177,26 @@ async fn cancel_operation_timed_out(
         .await;
 }
 
-/// Kill a spawned command and its entire process group, then reap the direct child.
+/// Grace period for [`kill_process_tree`] to confirm the direct child was reaped
+/// after SIGKILL. A child stuck in an uninterruptible kernel wait (D-state: a
+/// denied write being retried, a held file lock) will not die promptly even on
+/// SIGKILL; bounding the reap keeps the executor from blocking forever on it.
+const KILL_REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// Kill a spawned command and its entire process group, then **verify** the
+/// direct child was reaped within [`KILL_REAP_GRACE`].
 ///
 /// Commands are spawned as process-group leaders (see `Sandbox::base_command`),
 /// so on Unix `kill(-pgid)` takes down the whole descendant tree — e.g.
 /// `sandbox-exec → sh → cargo → rustc` — instead of orphaning the grandchildren
 /// when only the direct child is signalled. On non-Unix it falls back to killing
-/// the direct child. Always `await`s the reap so the direct child does not zombie.
-async fn kill_process_tree(child: &mut tokio::process::Child) {
+/// the direct child.
+///
+/// Returns `true` if the child was confirmed dead, `false` if it did not reap
+/// within the grace window (it is likely suspended or wedged in the kernel, and
+/// may linger as an orphan). The boolean lets callers log the difference instead
+/// of silently assuming the kill worked.
+async fn kill_process_tree(child: &mut tokio::process::Child) -> bool {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // Negative pid targets the process group led by the child.
@@ -1185,9 +1204,25 @@ async fn kill_process_tree(child: &mut tokio::process::Child) {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
     }
-    // Idempotent on Unix after the group kill; reaps the direct child (and on
-    // non-Unix performs the actual kill).
-    let _ = child.kill().await;
+    // `start_kill` sends SIGKILL to the direct child (idempotent on Unix after the
+    // group kill); the bounded `wait` confirms the reap rather than blocking
+    // unboundedly on an unresponsive child.
+    let _ = child.start_kill();
+    match tokio::time::timeout(KILL_REAP_GRACE, child.wait()).await {
+        Ok(Ok(_status)) => true,
+        Ok(Err(e)) => {
+            tracing::warn!("kill_process_tree: error reaping child: {}", e);
+            false
+        }
+        Err(_) => {
+            tracing::error!(
+                "kill_process_tree: child did not exit within {:.0}s of SIGKILL — \
+                 it is likely suspended or wedged in the kernel and may orphan",
+                KILL_REAP_GRACE.as_secs_f64()
+            );
+            false
+        }
+    }
 }
 
 /// Execute a command with line-by-line streaming and optional log monitoring.
@@ -1260,7 +1295,9 @@ async fn execute_with_streaming(
             // Check cancellation
             _ = cancellation_token.cancelled() => {
                 tracing::info!("Operation {} cancelled during streaming", op_id);
-                kill_process_tree(&mut child).await;
+                if !kill_process_tree(&mut child).await {
+                    tracing::warn!("Operation {} cancelled but its process did not reap cleanly", op_id);
+                }
                 spill.finish().await;
                 handle_cancellation(op_monitor, op_id).await;
                 return;
@@ -1269,7 +1306,9 @@ async fn execute_with_streaming(
             // Timeout
             _ = tokio::time::sleep_until(timeout_deadline) => {
                 tracing::warn!("Operation {} timed out during streaming", op_id);
-                kill_process_tree(&mut child).await;
+                if !kill_process_tree(&mut child).await {
+                    tracing::warn!("Operation {} timed out but its process did not reap cleanly", op_id);
+                }
                 spill.finish().await;
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 cancel_operation_timed_out(op_monitor, op_id, duration_ms).await;
@@ -1415,6 +1454,21 @@ async fn finalize_streaming_operation(
             tool,
         )
         .await;
+
+        // The grant flow above only fires for *out-of-scope* denials. The
+        // sibling failure — an in-scope EPERM from macOS provenance/sccache
+        // contamination — produces no kernel event and would otherwise surface
+        // as a bare `os error 1`. Diagnose it and attach the remediation as an
+        // alert so the user gets an actionable line, not an errno.
+        if let Some(hint) = sandbox::build_diagnostics::diagnose(&stderr_str) {
+            tracing::warn!(
+                "Operation {} failed with sandbox build contamination ({:?}): {}",
+                op_id,
+                hint.kind,
+                hint.remediation
+            );
+            op_monitor.append_alert(op_id, hint.remediation).await;
+        }
     }
 
     let final_output = json!({
@@ -1589,7 +1643,11 @@ mod tests {
             "grandchild should be alive before kill"
         );
 
-        kill_process_tree(&mut child).await;
+        let reaped = kill_process_tree(&mut child).await;
+        assert!(
+            reaped,
+            "kill_process_tree should confirm the direct child was reaped"
+        );
 
         // The grandchild should die (and be reaped) shortly after the group kill.
         let mut dead = false;
@@ -1604,6 +1662,89 @@ mod tests {
             dead,
             "grandchild (pid {gpid}) must be killed via process-group kill, not orphaned"
         );
+    }
+
+    /// The verified-kill contract: `kill_process_tree` returns `true` once the
+    /// direct child is confirmed reaped, and does so well within the grace window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_process_tree_confirms_reap_of_direct_child() {
+        use std::time::Duration;
+
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let mut child = cmd.spawn().expect("spawn sleep");
+
+        let start = std::time::Instant::now();
+        let reaped = kill_process_tree(&mut child).await;
+        let elapsed = start.elapsed();
+
+        assert!(reaped, "a plain killable child must be confirmed reaped");
+        assert!(
+            elapsed < Duration::from_secs(KILL_REAP_GRACE.as_secs()),
+            "reap should be near-instant for a killable child, took {elapsed:?}"
+        );
+    }
+
+    // ============= interpret_sync_command_output tests =============
+    // Gated to Unix: these synthesise an `ExitStatus` via the Unix-only
+    // `ExitStatusExt::from_raw` (Windows uses an incompatible u32 encoding). The
+    // remediation logic under test is itself platform-agnostic.
+
+    #[cfg(unix)]
+    #[test]
+    fn interpret_sync_output_appends_contamination_hint_on_provenance_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256), // exit code 1
+            stdout: b"   Compiling foo".to_vec(),
+            stderr: b"error: error writing dependencies to `/w/target/debug/deps/x.d`: \
+                Operation not permitted (os error 1)"
+                .to_vec(),
+        };
+        let err = interpret_sync_command_output(output)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("hint:"),
+            "expected a remediation hint, got: {err}"
+        );
+        assert!(err.contains("com.apple.provenance"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interpret_sync_output_no_hint_for_ordinary_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: b"error[E0382]: borrow of moved value".to_vec(),
+        };
+        let err = interpret_sync_command_output(output)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("hint:"),
+            "ordinary failure should not add a hint"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interpret_sync_output_ok_on_success() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: b"done".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(interpret_sync_command_output(output).is_ok());
     }
 
     // ============= generate_id tests =============

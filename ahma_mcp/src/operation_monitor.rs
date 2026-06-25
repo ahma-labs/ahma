@@ -108,6 +108,14 @@ pub struct Operation {
     /// complete output and can be queried with the file tools (tail/grep).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_file: Option<std::path::PathBuf>,
+    /// Wall-clock time of this operation's most recent output line, used by the
+    /// idle-output watchdog (Phase 0 liveness). Initialised to `start_time`,
+    /// bumped on every [`OperationMonitor::append_output_line`], and reset
+    /// forward when a system suspend is detected so a laptop sleep is never
+    /// mistaken for a wedged build. Wall-clock (`SystemTime`, not the monotonic
+    /// `Instant`) precisely so the check survives system sleep.
+    #[serde(with = "time", default = "SystemTime::now")]
+    pub last_activity: SystemTime,
 }
 
 /// Default factory for `completion_watch` used during serde deserialisation.
@@ -133,6 +141,7 @@ impl Operation {
             stdout_tail: Vec::new(),
             alerts: Vec::new(),
             output_file: None,
+            last_activity: SystemTime::now(),
         }
     }
 
@@ -159,6 +168,7 @@ impl Operation {
             stdout_tail: Vec::new(),
             alerts: Vec::new(),
             output_file: None,
+            last_activity: SystemTime::now(),
         }
     }
 
@@ -198,6 +208,13 @@ impl Operation {
     }
 }
 
+/// Wall-clock gap between background-monitor ticks beyond which the machine is
+/// assumed to have suspended (laptop sleep, VM pause). The monitor loop ticks
+/// every second; a gap this large means wall time jumped while the process was
+/// frozen. On detection the idle-output watchdog is forgiven for all in-flight
+/// operations (a sleep is not a wedge) and each is flagged as suspect.
+pub const SLEEP_DETECT_THRESHOLD: Duration = Duration::from_secs(30);
+
 /// Configuration for operation monitoring
 #[derive(Debug, Clone)]
 pub struct MonitorConfig {
@@ -205,6 +222,12 @@ pub struct MonitorConfig {
     pub default_timeout: Duration,
     /// Maximum time to await for graceful shutdown
     pub shutdown_timeout: Duration,
+    /// Idle-output watchdog: if set, an operation that produces no output for
+    /// this long is timed out as **stalled**, distinct from exceeding its total
+    /// runtime budget. Catches a build wedged on a lock or a denied write that
+    /// has gone silent but not exited. `None` disables the watchdog (the
+    /// historical behaviour; total-runtime timeout still applies).
+    pub idle_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +243,7 @@ impl MonitorConfig {
         Self {
             default_timeout: timeout,
             shutdown_timeout: Duration::from_secs(30), // Reduced from 360s to 30s
+            idle_timeout: None,
         }
     }
 
@@ -228,7 +252,16 @@ impl MonitorConfig {
         Self {
             default_timeout: operation_timeout,
             shutdown_timeout,
+            idle_timeout: None,
         }
+    }
+
+    /// Enable (or disable, with `None`) the idle-output watchdog. Builder-style
+    /// so existing `with_timeout`/`with_timeouts` call sites keep their exact
+    /// behaviour; the production server opts in explicitly (see `service_builder`).
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
     }
 }
 
@@ -349,6 +382,8 @@ impl OperationMonitor {
                 op.stdout_tail.remove(0);
             }
             op.stdout_tail.push(line.clone());
+            // Output is proof of life: reset the idle-output watchdog clock.
+            op.last_activity = SystemTime::now();
         } else {
             return;
         }
@@ -399,12 +434,24 @@ impl OperationMonitor {
     }
 
     /// Starts a background task that periodically checks for timed-out operations.
+    ///
+    /// Liveness is anchored to **wall-clock** time (`SystemTime`), not the
+    /// monotonic `Instant` the in-process streaming timeout uses, so total-runtime
+    /// and idle-output timeouts still fire correctly across a system suspend. Each
+    /// tick also measures the actual wall-clock gap since the previous tick: a gap
+    /// far larger than the 1s interval means the machine slept, which
+    /// [`note_monitor_tick`](Self::note_monitor_tick) turns into a forgive-and-flag.
     pub fn start_background_monitor(monitor: Arc<Self>) {
         let weak_monitor = Arc::downgrade(&monitor);
         tokio::spawn(async move {
             let check_interval = Duration::from_secs(1);
+            let mut last_tick = SystemTime::now();
             loop {
                 if let Some(monitor) = weak_monitor.upgrade() {
+                    let now = SystemTime::now();
+                    let gap = now.duration_since(last_tick).unwrap_or(Duration::ZERO);
+                    last_tick = now;
+                    monitor.note_monitor_tick(gap).await;
                     monitor.check_timeouts().await;
                 } else {
                     tracing::debug!("OperationMonitor dropped, stopping background monitor task");
@@ -415,7 +462,60 @@ impl OperationMonitor {
         });
     }
 
+    /// React to the wall-clock `gap` since the previous background-monitor tick.
+    ///
+    /// When `gap` exceeds [`SLEEP_DETECT_THRESHOLD`] the process was almost
+    /// certainly frozen (laptop sleep / VM pause). Operations in flight across a
+    /// suspend are *suspect*, not provably wedged, so this:
+    ///   1. resets each active op's idle-output clock to now — a sleep must never
+    ///      be counted as silence and trigger a false "stalled" timeout; and
+    ///   2. appends a one-line alert to each, surfacing the suspend to the user so
+    ///      they can judge/recover rather than silently waiting.
+    ///
+    /// Total-runtime timeouts are deliberately left honest (a suspended op really
+    /// has been pending that long). Returns the detected suspend duration, or
+    /// `None` when the gap was normal. Factored out of the loop so it is unit
+    /// testable without spawning the background task.
+    pub async fn note_monitor_tick(&self, gap: Duration) -> Option<Duration> {
+        if gap < SLEEP_DETECT_THRESHOLD {
+            return None;
+        }
+        let now = SystemTime::now();
+        let mut flagged = Vec::new();
+        {
+            let mut ops = self.operations.write().await;
+            for op in ops.values_mut().filter(|op| !op.state.is_terminal()) {
+                op.last_activity = now;
+                let alert = format!(
+                    "⚠ system appears to have slept ~{:.0}s while this operation was running; \
+                     it may be wedged — idle-output watchdog was reset for it",
+                    gap.as_secs_f64()
+                );
+                op.alerts.push(alert.clone());
+                flagged.push((op.id.clone(), alert));
+            }
+        }
+        tracing::warn!(
+            "Detected ~{:.0}s wall-clock gap between monitor ticks (system suspend?); \
+             forgave idle watchdog for {} in-flight operation(s)",
+            gap.as_secs_f64(),
+            flagged.len()
+        );
+        for (id, message) in flagged {
+            self.events.emit(OperationEvent::Alert {
+                operation_id: id,
+                message,
+            });
+        }
+        Some(gap)
+    }
+
     /// Checks all active operations for timeouts and cancels them if necessary.
+    ///
+    /// Two independent budgets, both wall-clock: the **total-runtime** timeout
+    /// (`timeout_duration` / `default_timeout`) and, when configured, the
+    /// **idle-output** watchdog (`idle_timeout`) measured from `last_activity`.
+    /// Whichever trips first times the operation out, with a reason naming which.
     pub async fn check_timeouts(&self) {
         let now = SystemTime::now();
         let timed_out_ops = {
@@ -425,17 +525,33 @@ impl OperationMonitor {
                 .filter_map(|op| {
                     let timeout = op.timeout_duration.unwrap_or(self.config.default_timeout);
                     let elapsed = now.duration_since(op.start_time).ok()?;
-                    (elapsed > timeout).then_some((op.id.clone(), elapsed, timeout))
+                    if elapsed > timeout {
+                        let reason = format!(
+                            "Operation timed out after {:.1}s (limit: {:.1}s)",
+                            elapsed.as_secs_f64(),
+                            timeout.as_secs_f64()
+                        );
+                        return Some((op.id.clone(), reason));
+                    }
+                    // Idle-output watchdog: silent for longer than allowed ⇒ stalled.
+                    if let Some(idle_limit) = self.config.idle_timeout {
+                        let idle = now.duration_since(op.last_activity).ok()?;
+                        if idle > idle_limit {
+                            let reason = format!(
+                                "Operation stalled: no output for {:.1}s (idle limit: {:.1}s) — \
+                                 likely wedged on a lock or a denied write",
+                                idle.as_secs_f64(),
+                                idle_limit.as_secs_f64()
+                            );
+                            return Some((op.id.clone(), reason));
+                        }
+                    }
+                    None
                 })
                 .collect::<Vec<_>>()
         };
 
-        for (op_id, elapsed, timeout) in timed_out_ops {
-            let reason = format!(
-                "Operation timed out after {:.1}s (limit: {:.1}s)",
-                elapsed.as_secs_f64(),
-                timeout.as_secs_f64()
-            );
+        for (op_id, reason) in timed_out_ops {
             self.timeout_operation(&op_id, reason).await;
         }
     }
@@ -1142,5 +1258,163 @@ mod tests {
             }
             other => panic!("expected OutputLine, got {other:?}"),
         }
+    }
+
+    // ── Phase 0 liveness: idle-output watchdog + sleep detection ──────────────
+
+    /// Insert an operation whose `start_time` and `last_activity` are backdated by
+    /// `age`, so timeout/idle checks see it as if it had been running that long.
+    async fn add_backdated_op(
+        monitor: &OperationMonitor,
+        id: &str,
+        age: Duration,
+        total_timeout: Option<Duration>,
+    ) {
+        let mut op = Operation::new_with_timeout(
+            id.to_string(),
+            "test_tool".to_string(),
+            "backdated op".to_string(),
+            None,
+            total_timeout,
+        );
+        let past = SystemTime::now() - age;
+        op.start_time = past;
+        op.last_activity = past;
+        op.state = OperationStatus::InProgress;
+        monitor.add_operation(op).await;
+    }
+
+    #[tokio::test]
+    async fn idle_watchdog_times_out_stalled_operation() {
+        init_test_logging();
+        // Large total timeout so only the idle watchdog can fire.
+        let monitor = OperationMonitor::new(
+            MonitorConfig::with_timeout(Duration::from_secs(3600))
+                .with_idle_timeout(Some(Duration::from_millis(50))),
+        );
+        add_backdated_op(&monitor, "stalled", Duration::from_secs(10), None).await;
+
+        monitor.check_timeouts().await;
+
+        assert!(
+            monitor.get_operation("stalled").await.is_none(),
+            "stalled op should no longer be active"
+        );
+        let completed = monitor.get_completed_operations().await;
+        let op = completed
+            .iter()
+            .find(|o| o.id == "stalled")
+            .expect("stalled op should be in history");
+        assert_eq!(op.state, OperationStatus::TimedOut);
+        let reason = op.result.as_ref().unwrap()["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("stalled") && reason.contains("no output"),
+            "reason should name the idle watchdog, got: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_watchdog_disabled_leaves_quiet_op_running() {
+        init_test_logging();
+        // No idle timeout configured ⇒ a long-silent op survives.
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(3600)));
+        add_backdated_op(&monitor, "quiet", Duration::from_secs(10), None).await;
+
+        monitor.check_timeouts().await;
+
+        assert!(
+            monitor.get_operation("quiet").await.is_some(),
+            "with idle watchdog off, a quiet op must keep running"
+        );
+    }
+
+    #[tokio::test]
+    async fn total_timeout_fires_independently_of_idle() {
+        init_test_logging();
+        // Idle disabled; short per-op total timeout still enforced.
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(3600)));
+        add_backdated_op(
+            &monitor,
+            "overrun",
+            Duration::from_secs(10),
+            Some(Duration::from_millis(50)),
+        )
+        .await;
+
+        monitor.check_timeouts().await;
+
+        let completed = monitor.get_completed_operations().await;
+        let op = completed.iter().find(|o| o.id == "overrun").unwrap();
+        assert_eq!(op.state, OperationStatus::TimedOut);
+        let reason = op.result.as_ref().unwrap()["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("limit") && !reason.contains("stalled"),
+            "should be a total-runtime timeout, got: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_resets_idle_clock() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(3600)));
+        add_backdated_op(&monitor, "op", Duration::from_secs(10), None).await;
+
+        monitor
+            .append_output_line("op", "progress".to_string(), false)
+            .await;
+
+        let op = monitor.get_operation("op").await.unwrap();
+        let idle = SystemTime::now()
+            .duration_since(op.last_activity)
+            .unwrap_or(Duration::ZERO);
+        assert!(
+            idle < Duration::from_secs(1),
+            "last_activity should be reset to ~now after output, idle was {idle:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_detection_forgives_idle_and_flags_op() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(
+            MonitorConfig::with_timeout(Duration::from_secs(3600))
+                .with_idle_timeout(Some(Duration::from_millis(50))),
+        );
+        // Op has been silent for 10s — would idle-timeout on the next check...
+        add_backdated_op(&monitor, "slept", Duration::from_secs(10), None).await;
+
+        // ...but a large tick gap means the machine slept, not the build wedged.
+        let detected = monitor
+            .note_monitor_tick(SLEEP_DETECT_THRESHOLD + Duration::from_secs(60))
+            .await;
+        assert!(
+            detected.is_some(),
+            "a large gap must be reported as a sleep"
+        );
+
+        // Idle clock was forgiven, so the next check does NOT time it out.
+        monitor.check_timeouts().await;
+        let op = monitor
+            .get_operation("slept")
+            .await
+            .expect("op should survive the forgiven sleep");
+        assert!(
+            op.alerts.iter().any(|a| a.contains("slept")),
+            "op should carry a suspend alert, got: {:?}",
+            op.alerts
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_tick_gap_is_not_treated_as_sleep() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(3600)));
+        add_backdated_op(&monitor, "op", Duration::from_secs(1), None).await;
+
+        let detected = monitor.note_monitor_tick(Duration::from_secs(1)).await;
+
+        assert!(detected.is_none(), "a 1s gap is normal, not a suspend");
+        let op = monitor.get_operation("op").await.unwrap();
+        assert!(op.alerts.is_empty(), "no alert for a normal tick");
     }
 }

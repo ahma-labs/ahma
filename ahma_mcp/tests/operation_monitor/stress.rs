@@ -11,6 +11,7 @@ async fn test_operation_monitor_concurrent_operations() -> Result<()> {
     let config = MonitorConfig {
         default_timeout: Duration::from_secs(30),
         shutdown_timeout: Duration::from_secs(60),
+        idle_timeout: None,
     };
 
     let monitor = OperationMonitor::new(config);
@@ -76,6 +77,7 @@ async fn test_operation_monitor_rapid_fire_operations() -> Result<()> {
     let config = MonitorConfig {
         default_timeout: Duration::from_secs(30),
         shutdown_timeout: Duration::from_secs(60),
+        idle_timeout: None,
     };
 
     let monitor = OperationMonitor::new(config);
@@ -136,6 +138,7 @@ async fn test_operation_monitor_mixed_operations() -> Result<()> {
     let config = MonitorConfig {
         default_timeout: Duration::from_secs(30),
         shutdown_timeout: Duration::from_secs(60),
+        idle_timeout: None,
     };
 
     let monitor = OperationMonitor::new(config);
@@ -210,6 +213,7 @@ async fn test_operation_monitor_basic_functionality() -> Result<()> {
     let config = MonitorConfig {
         default_timeout: Duration::from_secs(30),
         shutdown_timeout: Duration::from_secs(60),
+        idle_timeout: None,
     };
 
     let monitor = OperationMonitor::new(config);

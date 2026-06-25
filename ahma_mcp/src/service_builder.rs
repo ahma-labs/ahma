@@ -146,7 +146,14 @@ impl<'a> ServiceBuilder<'a> {
         let config = self.config;
         let sandbox = &self.sandbox;
 
-        let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(config.timeout_secs));
+        // Enable the idle-output watchdog in production: an async operation that
+        // goes completely silent for this long is timed out as *stalled*, well
+        // before any (much longer) total-runtime budget. Five minutes of total
+        // silence is a strong wedge signal even for a quiet link/codegen step,
+        // and a system suspend is forgiven separately (see `note_monitor_tick`),
+        // so this will not false-fire across laptop sleep.
+        let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(config.timeout_secs))
+            .with_idle_timeout(Some(Duration::from_secs(300)));
         let shutdown_timeout = monitor_config.shutdown_timeout;
         let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
 
