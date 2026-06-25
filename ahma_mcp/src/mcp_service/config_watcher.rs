@@ -773,4 +773,490 @@ mod tests {
     fn emit_sandbox_notification_with_error_does_not_panic() {
         emit_sandbox_notification("notifications/sandbox/failed", Some("something went wrong"));
     }
+
+    // ── service construction helper ──────────────────────────────────────────
+
+    /// Build a minimal `AhmaMcpService` scoped to `scope_dir` for unit tests.
+    /// Uses `SandboxMode::Test` so no kernel-level enforcement is applied.
+    async fn build_service_for_tests(scope_dir: &std::path::Path) -> AhmaMcpService {
+        use crate::adapter::Adapter;
+        use crate::operation_monitor::{MonitorConfig, OperationMonitor};
+        use crate::sandbox::{Sandbox, SandboxMode};
+        use crate::shell_pool::{ShellPoolConfig, ShellPoolManager};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));
+        let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
+        let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
+        let sandbox = Arc::new(
+            Sandbox::new(
+                vec![scope_dir.to_path_buf()],
+                SandboxMode::Test,
+                false,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+        let adapter =
+            Arc::new(Adapter::new(Arc::clone(&operation_monitor), shell_pool, sandbox).unwrap());
+        AhmaMcpService::new(
+            adapter,
+            operation_monitor,
+            Arc::new(HashMap::new()),
+            Arc::new(None),
+            false,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    // ── reload_tool_configs_from_dir ──────────────────────────────────────────
+
+    /// reload_tool_configs_from_dir with a valid tool file updates configs.
+    #[tokio::test]
+    async fn reload_tool_configs_from_dir_success_updates_configs() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+        let app_config = crate::shell::cli::AppConfig::default();
+
+        tokio::fs::write(
+            tmp.path().join("reload_tool.json"),
+            r#"{"name":"reload_tool","description":"Reload test","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        service
+            .reload_tool_configs_from_dir(&app_config, tmp.path(), "reload succeeded")
+            .await;
+
+        assert!(
+            service.configs.read().unwrap().contains_key("reload_tool"),
+            "reload_tool should be present after reload"
+        );
+    }
+
+    /// reload_tool_configs_from_dir with a reserved tool name propagates the
+    /// error gracefully — logs it and does NOT panic.
+    #[tokio::test]
+    async fn reload_tool_configs_from_dir_reserved_name_logs_error_no_panic() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+        let app_config = crate::shell::cli::AppConfig::default();
+
+        // "await" is a reserved name; load_tool_configs returns Err.
+        tokio::fs::write(
+            tmp.path().join("await.json"),
+            r#"{"name":"await","description":"reserved","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        // Must not panic even when the load returns an error.
+        service
+            .reload_tool_configs_from_dir(&app_config, tmp.path(), "should not print")
+            .await;
+    }
+
+    /// reload_tool_configs_from_dir with an empty directory removes tools that
+    /// were previously present.
+    #[tokio::test]
+    async fn reload_tool_configs_from_dir_empty_dir_clears_tools() {
+        let tmp = TempDir::new().unwrap();
+
+        // Pre-populate with one tool via the configs lock.
+        let service = build_service_for_tests(tmp.path()).await;
+        {
+            let mut lock = service.configs.write().unwrap();
+            lock.insert(
+                "old".to_string(),
+                crate::config::ToolConfig {
+                    name: "old".to_string(),
+                    description: "old".to_string(),
+                    command: "echo".to_string(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let app_config = crate::shell::cli::AppConfig::default();
+        service
+            .reload_tool_configs_from_dir(&app_config, tmp.path(), "cleared")
+            .await;
+
+        assert!(
+            !service.configs.read().unwrap().contains_key("old"),
+            "old tool should be gone after reload from empty dir"
+        );
+    }
+
+    // ── maybe_load_per_client_tools ───────────────────────────────────────────
+
+    /// None discovery_root → function returns immediately with no side-effects.
+    #[tokio::test]
+    async fn maybe_load_per_client_none_root_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+
+        service.maybe_load_per_client_tools(None).await;
+
+        assert!(
+            service.configs.read().unwrap().is_empty(),
+            "configs should be untouched when discovery_root is None"
+        );
+    }
+
+    /// Discovery root that has no `.ahma` subdirectory → function returns early.
+    #[tokio::test]
+    async fn maybe_load_per_client_no_ahma_subdir_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+
+        service
+            .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
+            .await;
+
+        assert!(
+            service.configs.read().unwrap().is_empty(),
+            "configs should be untouched when .ahma directory is absent"
+        );
+    }
+
+    /// `.ahma` path exists as a file (not a directory) → treated as absent.
+    #[tokio::test]
+    async fn maybe_load_per_client_ahma_is_file_not_dir_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+
+        // Create `.ahma` as a plain file, not a directory.
+        tokio::fs::write(tmp.path().join(".ahma"), b"not a directory")
+            .await
+            .unwrap();
+
+        service
+            .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
+            .await;
+
+        assert!(
+            service.configs.read().unwrap().is_empty(),
+            "configs should be untouched when .ahma is a file, not a directory"
+        );
+    }
+
+    /// Candidate `.ahma` directory is already the current_tools_dir → skip.
+    #[tokio::test]
+    async fn maybe_load_per_client_already_loaded_dir_skips_reload() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+
+        let ahma_dir = tmp.path().join(".ahma");
+        tokio::fs::create_dir_all(&ahma_dir).await.unwrap();
+
+        // Write a valid tool so we can verify it does NOT get loaded.
+        tokio::fs::write(
+            ahma_dir.join("skip_tool.json"),
+            r#"{"name":"skip_tool","description":"Should not be loaded","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        // Mark the .ahma directory as already loaded.
+        *service.current_tools_dir.write().unwrap() = Some(ahma_dir.clone());
+
+        service
+            .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
+            .await;
+
+        assert!(
+            !service.configs.read().unwrap().contains_key("skip_tool"),
+            "skip_tool must NOT be loaded because the directory is already loaded"
+        );
+    }
+
+    /// `app_config` is None → function skips the load and returns early.
+    #[tokio::test]
+    async fn maybe_load_per_client_no_app_config_skips_reload() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+
+        let ahma_dir = tmp.path().join(".ahma");
+        tokio::fs::create_dir_all(&ahma_dir).await.unwrap();
+        tokio::fs::write(
+            ahma_dir.join("no_cfg_tool.json"),
+            r#"{"name":"no_cfg_tool","description":"Skipped","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        // Do NOT call service.set_app_config() → app_config stays None.
+        service
+            .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
+            .await;
+
+        assert!(
+            !service.configs.read().unwrap().contains_key("no_cfg_tool"),
+            "tool should NOT be loaded when app_config is absent"
+        );
+    }
+
+    /// Happy path: `.ahma` directory with a valid tool → tool is loaded and
+    /// `current_tools_dir` is updated to the `.ahma` path.
+    #[tokio::test]
+    async fn maybe_load_per_client_success_loads_tool_and_updates_dir() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+
+        let ahma_dir = tmp.path().join(".ahma");
+        tokio::fs::create_dir_all(&ahma_dir).await.unwrap();
+        tokio::fs::write(
+            ahma_dir.join("pclient.json"),
+            r#"{"name":"pclient","description":"Per-client tool","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        // Provide app_config so the load proceeds.
+        service.set_app_config(std::sync::Arc::new(crate::shell::cli::AppConfig::default()));
+
+        service
+            .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
+            .await;
+
+        assert!(
+            service.configs.read().unwrap().contains_key("pclient"),
+            "per-client tool 'pclient' should be present after successful load"
+        );
+        assert_eq!(
+            service.current_tools_dir.read().unwrap().as_deref(),
+            Some(ahma_dir.as_path()),
+            "current_tools_dir should point to the .ahma directory that was just loaded"
+        );
+    }
+
+    /// Error path: a reserved tool name inside `.ahma/` causes load_tool_configs
+    /// to return Err → warning is logged but function does not panic.
+    #[tokio::test]
+    async fn maybe_load_per_client_reserved_name_logs_warning_no_panic() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+
+        let ahma_dir = tmp.path().join(".ahma");
+        tokio::fs::create_dir_all(&ahma_dir).await.unwrap();
+
+        // "status" is a reserved tool name; load_tool_configs returns Err.
+        tokio::fs::write(
+            ahma_dir.join("status.json"),
+            r#"{"name":"status","description":"reserved","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        service.set_app_config(std::sync::Arc::new(crate::shell::cli::AppConfig::default()));
+
+        // Should log a warning but not panic.
+        service
+            .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
+            .await;
+    }
+
+    // ── start_config_watcher ─────────────────────────────────────────────────
+
+    /// Calling start_config_watcher on an empty directory must not panic.
+    /// The background task starts, takes a snapshot of zero files, runs an
+    /// initial sync (empty result), and enters the event loop.
+    #[tokio::test]
+    async fn start_config_watcher_empty_dir_does_not_panic() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+        let app_config = crate::shell::cli::AppConfig::default();
+
+        service.start_config_watcher(tmp.path().to_path_buf(), app_config);
+
+        // Give the background task time to complete the startup sync.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    /// Files written BEFORE start_config_watcher is called are picked up by the
+    /// initial startup sync inside the spawned task.
+    #[tokio::test]
+    async fn start_config_watcher_startup_sync_loads_existing_tools() {
+        let tmp = TempDir::new().unwrap();
+
+        // Write the tool file BEFORE starting the watcher.
+        tokio::fs::write(
+            tmp.path().join("pre_existing.json"),
+            r#"{"name":"pre_existing","description":"was here at start","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        let service = build_service_for_tests(tmp.path()).await;
+        let app_config = crate::shell::cli::AppConfig::default();
+        service.start_config_watcher(tmp.path().to_path_buf(), app_config);
+
+        // Wait for the startup sync to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert!(
+            service.configs.read().unwrap().contains_key("pre_existing"),
+            "pre_existing tool must be loaded by the startup sync"
+        );
+    }
+
+    /// A new JSON file added after the watcher starts is detected and reloaded.
+    #[tokio::test]
+    async fn start_config_watcher_detects_new_json_file() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+        let app_config = crate::shell::cli::AppConfig::default();
+        service.start_config_watcher(tmp.path().to_path_buf(), app_config);
+
+        // Let the startup sync complete first.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Add a new tool file.
+        tokio::fs::write(
+            tmp.path().join("dynamic_tool.json"),
+            r#"{"name":"dynamic_tool","description":"added dynamically","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        // Wait for debounce (200 ms in watcher) + reload time + margin.
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+        assert!(
+            service.configs.read().unwrap().contains_key("dynamic_tool"),
+            "dynamic_tool must be detected and loaded by the fs watcher"
+        );
+    }
+
+    /// Deleting a JSON file after the watcher starts removes that tool from configs.
+    #[tokio::test]
+    async fn start_config_watcher_detects_removed_json_file() {
+        let tmp = TempDir::new().unwrap();
+        let tool_path = tmp.path().join("remove_me.json");
+        tokio::fs::write(
+            &tool_path,
+            r#"{"name":"remove_me","description":"will be deleted","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        let service = build_service_for_tests(tmp.path()).await;
+        let app_config = crate::shell::cli::AppConfig::default();
+        service.start_config_watcher(tmp.path().to_path_buf(), app_config);
+
+        // Wait for startup sync to pick up the existing tool.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            service.configs.read().unwrap().contains_key("remove_me"),
+            "remove_me should be loaded by startup sync"
+        );
+
+        // Delete the file.
+        tokio::fs::remove_file(&tool_path).await.unwrap();
+
+        // Wait for watcher to fire and reload.
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+        assert!(
+            !service.configs.read().unwrap().contains_key("remove_me"),
+            "remove_me must disappear after the file is deleted"
+        );
+    }
+
+    /// Modifying a JSON file is detected and the description is updated.
+    #[tokio::test]
+    async fn start_config_watcher_detects_modified_json_file() {
+        let tmp = TempDir::new().unwrap();
+        let tool_path = tmp.path().join("editable.json");
+        tokio::fs::write(
+            &tool_path,
+            r#"{"name":"editable","description":"original","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        let service = build_service_for_tests(tmp.path()).await;
+        let app_config = crate::shell::cli::AppConfig::default();
+        service.start_config_watcher(tmp.path().to_path_buf(), app_config);
+
+        // Wait for startup sync.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Overwrite with updated description.
+        tokio::fs::write(
+            &tool_path,
+            r#"{"name":"editable","description":"modified","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        // Wait for watcher to detect and reload.
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+        let configs = service.configs.read().unwrap();
+        let desc = configs
+            .get("editable")
+            .map(|c| c.description.as_str())
+            .unwrap_or("");
+        assert_eq!(
+            desc, "modified",
+            "description should reflect the updated file content after reload"
+        );
+    }
+
+    /// Non-JSON files (readme, txt, hidden) in the watched directory do not
+    /// introduce any tools into the service configs.
+    #[tokio::test]
+    async fn start_config_watcher_ignores_non_json_files() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+        let app_config = crate::shell::cli::AppConfig::default();
+        service.start_config_watcher(tmp.path().to_path_buf(), app_config);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Write non-JSON files.
+        tokio::fs::write(tmp.path().join("readme.md"), b"# readme")
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("notes.txt"), b"some notes")
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+        // Only the synthetic run_terminal_command config should be present
+        // (inserted by load_tool_configs itself), not any user tools.
+        let configs = service.configs.read().unwrap();
+        assert!(
+            !configs
+                .values()
+                .any(|c| c.name == "readme" || c.name == "notes"),
+            "non-JSON files must not produce tool configs"
+        );
+    }
+
+    /// start_config_watcher with a non-existent directory logs an error inside
+    /// the spawned task and exits gracefully without panicking.
+    #[tokio::test]
+    async fn start_config_watcher_nonexistent_dir_exits_gracefully() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+        let app_config = crate::shell::cli::AppConfig::default();
+
+        // The directory we pass in does not exist.
+        let nonexistent = tmp.path().join("does_not_exist_ever");
+        service.start_config_watcher(nonexistent, app_config);
+
+        // Give the task a moment to attempt and fail gracefully.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // If we reach here without a panic the test passes.
+    }
 }

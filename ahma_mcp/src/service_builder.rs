@@ -313,3 +313,674 @@ fn log_loaded_tools(configs: &HashMap<String, ToolConfig>, tools_dir: Option<&st
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::load_tool_configs_sync,
+        sandbox::{LoggingGrantNotifier, Sandbox, SandboxMode},
+        shell::cli::AppConfig,
+        tool_availability::{AvailabilitySummary, DisabledSubcommand, DisabledTool},
+    };
+    use ahma_common::scope_grant::GrantCoordinator;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    // ─── Test helpers ────────────────────────────────────────────────────────
+
+    /// Create a `SandboxMode::Test` sandbox scoped to `scope`.
+    fn make_test_sandbox(scope: std::path::PathBuf) -> Arc<Sandbox> {
+        Arc::new(
+            Sandbox::new(vec![scope], SandboxMode::Test, false, false, false)
+                .expect("test sandbox creation should never fail"),
+        )
+    }
+
+    /// Minimal `AppConfig` for tests: probes skipped, sensible defaults.
+    fn make_test_config() -> AppConfig {
+        AppConfig {
+            skip_availability_probes: true,
+            ..AppConfig::default()
+        }
+    }
+
+    // ─── ServiceBuilder::new ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_service_builder_new_builds_with_default_config() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let result = ServiceBuilder::new(&config, sandbox).build().await;
+
+        assert!(result.is_ok(), "build should succeed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_service_builder_new_inherits_force_sync_from_config() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = AppConfig {
+            skip_availability_probes: true,
+            force_sync: true,
+            ..AppConfig::default()
+        };
+
+        // Builder picks up force_sync from config; build should still succeed.
+        let result = ServiceBuilder::new(&config, sandbox).build().await;
+
+        assert!(result.is_ok(), "build with force_sync=true should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_service_builder_new_inherits_monitor_rate_limit_from_config() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = AppConfig {
+            skip_availability_probes: true,
+            monitor_rate_limit_secs: 120,
+            ..AppConfig::default()
+        };
+
+        let built = ServiceBuilder::new(&config, sandbox).build().await.unwrap();
+
+        assert_eq!(built.service.monitor_rate_limit_seconds, 120);
+    }
+
+    // ─── with_guidance ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_with_guidance_default_builds_successfully() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let result = ServiceBuilder::new(&config, sandbox)
+            .with_guidance(GuidanceConfig::default())
+            .build()
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "with_guidance should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // ─── with_scope_grant_notifier ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_with_scope_grant_notifier_custom_builds_successfully() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let notifier: Arc<dyn crate::sandbox::ScopeGrantNotifier> =
+            Arc::new(LoggingGrantNotifier::new(Arc::new(GrantCoordinator::new())));
+
+        let result = ServiceBuilder::new(&config, sandbox)
+            .with_scope_grant_notifier(notifier)
+            .build()
+            .await;
+
+        assert!(result.is_ok(), "with_scope_grant_notifier should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_without_scope_grant_notifier_uses_default_logging_notifier() {
+        // When no notifier is provided, build falls back to LoggingGrantNotifier
+        // internally. Verify the service still builds successfully.
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let result = ServiceBuilder::new(&config, sandbox).build().await;
+
+        assert!(result.is_ok());
+    }
+
+    // ─── skip_availability_probes ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_skip_availability_probes_true_bypasses_probe_phase() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = AppConfig {
+            skip_availability_probes: false, // start as false
+            ..AppConfig::default()
+        };
+
+        // Override to skip probes explicitly.
+        let result = ServiceBuilder::new(&config, sandbox)
+            .skip_availability_probes(true)
+            .build()
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "skipping probes should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_skip_availability_probes_false_runs_probe_phase() {
+        // With the default config (no custom tools, only synthetic run_terminal_command
+        // which has no availability_check), running probes is a fast no-op.
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = AppConfig {
+            skip_availability_probes: true,
+            ..AppConfig::default()
+        };
+
+        let result = ServiceBuilder::new(&config, sandbox)
+            .skip_availability_probes(false)
+            .build()
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "probes with no-check tools should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // ─── force_synchronous ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_force_synchronous_true_builds_successfully() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let result = ServiceBuilder::new(&config, sandbox)
+            .force_synchronous(true)
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_force_synchronous_false_builds_successfully() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let result = ServiceBuilder::new(&config, sandbox)
+            .force_synchronous(false)
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    // ─── defer_sandbox ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_defer_sandbox_true_builds_successfully() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let result = ServiceBuilder::new(&config, sandbox)
+            .defer_sandbox(true)
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_defer_sandbox_false_builds_successfully() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let result = ServiceBuilder::new(&config, sandbox)
+            .defer_sandbox(false)
+            .build()
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    // ─── monitor_rate_limit ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_monitor_rate_limit_override_reflected_in_service() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let built = ServiceBuilder::new(&config, sandbox)
+            .monitor_rate_limit(300)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(built.service.monitor_rate_limit_seconds, 300);
+    }
+
+    #[tokio::test]
+    async fn test_monitor_rate_limit_zero_is_accepted() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let built = ServiceBuilder::new(&config, sandbox)
+            .monitor_rate_limit(0)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(built.service.monitor_rate_limit_seconds, 0);
+    }
+
+    #[tokio::test]
+    async fn test_monitor_rate_limit_large_value_is_accepted() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let built = ServiceBuilder::new(&config, sandbox)
+            .monitor_rate_limit(u64::MAX)
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(built.service.monitor_rate_limit_seconds, u64::MAX);
+    }
+
+    // ─── BuiltService fields ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_built_service_loaded_tools_count_matches_configs_len() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let built = ServiceBuilder::new(&config, sandbox).build().await.unwrap();
+
+        assert_eq!(built.loaded_tools_count, built.configs.len());
+    }
+
+    #[tokio::test]
+    async fn test_built_service_configs_contains_run_terminal_command() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let built = ServiceBuilder::new(&config, sandbox).build().await.unwrap();
+
+        assert!(
+            built.configs.contains_key("run_terminal_command"),
+            "configs must include the synthetic run_terminal_command tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_built_service_shutdown_timeout_is_positive() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let built = ServiceBuilder::new(&config, sandbox).build().await.unwrap();
+
+        assert!(
+            built.shutdown_timeout > Duration::ZERO,
+            "shutdown_timeout must be positive, got {:?}",
+            built.shutdown_timeout
+        );
+    }
+
+    #[tokio::test]
+    async fn test_built_service_adapter_sandbox_is_accessible() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let built = ServiceBuilder::new(&config, sandbox).build().await.unwrap();
+
+        // Verify the adapter's sandbox is reachable (no panic).
+        let _sandbox_ref = built.adapter.sandbox();
+    }
+
+    #[tokio::test]
+    async fn test_built_service_arcs_have_positive_strong_count() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let built = ServiceBuilder::new(&config, sandbox).build().await.unwrap();
+
+        assert!(Arc::strong_count(&built.operation_monitor) >= 1);
+        assert!(Arc::strong_count(&built.configs) >= 1);
+        assert!(Arc::strong_count(&built.adapter) >= 1);
+    }
+
+    // ─── tools_dir loading ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_build_with_tools_dir_loads_custom_tool() {
+        let temp = tempdir().unwrap();
+        let tools_dir = temp.path().join(".ahma");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        // NOTE: CommandOption uses #[serde(rename = "type")] so the JSON key must be "type".
+        std::fs::write(
+            tools_dir.join("echo.json"),
+            r#"{
+                "name": "echo",
+                "description": "Echo a message",
+                "command": "echo",
+                "timeout_seconds": 10,
+                "enabled": true,
+                "subcommand": [
+                    {
+                        "name": "default",
+                        "description": "echo the message",
+                        "positional_args": [
+                            {
+                                "name": "message",
+                                "type": "string",
+                                "description": "message to echo",
+                                "required": true
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = AppConfig {
+            skip_availability_probes: true,
+            tools_dir: Some(tools_dir),
+            ..AppConfig::default()
+        };
+
+        let built = ServiceBuilder::new(&config, sandbox).build().await.unwrap();
+
+        assert!(
+            built.configs.contains_key("echo"),
+            "custom echo tool should be loaded from tools_dir"
+        );
+        // At minimum: echo + run_terminal_command
+        assert!(built.loaded_tools_count >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_build_with_empty_tools_dir_yields_only_synthetic_tools() {
+        let temp = tempdir().unwrap();
+        let tools_dir = temp.path().join(".ahma");
+        std::fs::create_dir_all(&tools_dir).unwrap(); // empty dir
+
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = AppConfig {
+            skip_availability_probes: true,
+            tools_dir: Some(tools_dir),
+            ..AppConfig::default()
+        };
+
+        let built = ServiceBuilder::new(&config, sandbox).build().await.unwrap();
+
+        // Only run_terminal_command (synthetic) should be present.
+        assert_eq!(built.configs.len(), 1);
+        assert!(built.configs.contains_key("run_terminal_command"));
+    }
+
+    #[tokio::test]
+    async fn test_build_with_tools_dir_and_probes_enabled() {
+        // echo has no availability_check, so no actual shell probes are run.
+        let temp = tempdir().unwrap();
+        let tools_dir = temp.path().join(".ahma");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        // NOTE: CommandOption uses #[serde(rename = "type")] so JSON key must be "type".
+        std::fs::write(
+            tools_dir.join("echo.json"),
+            r#"{
+                "name": "echo",
+                "description": "Echo a message",
+                "command": "echo",
+                "timeout_seconds": 10,
+                "enabled": true,
+                "subcommand": [
+                    {
+                        "name": "default",
+                        "description": "echo the message",
+                        "positional_args": [
+                            {
+                                "name": "message",
+                                "type": "string",
+                                "description": "message to echo",
+                                "required": true
+                            }
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = AppConfig {
+            skip_availability_probes: false,
+            tools_dir: Some(tools_dir),
+            ..AppConfig::default()
+        };
+
+        let result = ServiceBuilder::new(&config, sandbox)
+            .skip_availability_probes(false)
+            .build()
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "build with probes and echo tool should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    // ─── Chained builder ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_service_builder_all_methods_chained_builds_successfully() {
+        let temp = tempdir().unwrap();
+        let sandbox = make_test_sandbox(temp.path().to_path_buf());
+        let config = make_test_config();
+
+        let notifier: Arc<dyn crate::sandbox::ScopeGrantNotifier> =
+            Arc::new(LoggingGrantNotifier::new(Arc::new(GrantCoordinator::new())));
+
+        let result = ServiceBuilder::new(&config, sandbox)
+            .with_scope_grant_notifier(notifier)
+            .with_guidance(GuidanceConfig::default())
+            .skip_availability_probes(true)
+            .force_synchronous(true)
+            .defer_sandbox(false)
+            .monitor_rate_limit(42)
+            .build()
+            .await;
+
+        assert!(result.is_ok(), "all-methods-chained build should succeed");
+        let built = result.unwrap();
+        assert_eq!(built.service.monitor_rate_limit_seconds, 42);
+    }
+
+    // ─── Private helper: log_availability_warnings ───────────────────────────
+
+    #[test]
+    fn test_log_availability_warnings_empty_summary_is_noop() {
+        let summary = AvailabilitySummary {
+            filtered_configs: HashMap::new(),
+            disabled_tools: vec![],
+            disabled_subcommands: vec![],
+        };
+        // Must not panic.
+        log_availability_warnings(&summary);
+    }
+
+    #[test]
+    fn test_log_availability_warnings_disabled_tool_without_instructions() {
+        let summary = AvailabilitySummary {
+            filtered_configs: HashMap::new(),
+            disabled_tools: vec![DisabledTool {
+                name: "cargo".to_string(),
+                message: "command not found".to_string(),
+                install_instructions: None,
+            }],
+            disabled_subcommands: vec![],
+        };
+        log_availability_warnings(&summary);
+    }
+
+    #[test]
+    fn test_log_availability_warnings_disabled_tool_with_instructions() {
+        let summary = AvailabilitySummary {
+            filtered_configs: HashMap::new(),
+            disabled_tools: vec![DisabledTool {
+                name: "rustfmt".to_string(),
+                message: "not installed".to_string(),
+                install_instructions: Some("rustup component add rustfmt".to_string()),
+            }],
+            disabled_subcommands: vec![],
+        };
+        log_availability_warnings(&summary);
+    }
+
+    #[test]
+    fn test_log_availability_warnings_disabled_subcommand_without_instructions() {
+        let summary = AvailabilitySummary {
+            filtered_configs: HashMap::new(),
+            disabled_tools: vec![],
+            disabled_subcommands: vec![DisabledSubcommand {
+                tool: "git".to_string(),
+                subcommand_path: "commit".to_string(),
+                message: "git not found".to_string(),
+                install_instructions: None,
+            }],
+        };
+        log_availability_warnings(&summary);
+    }
+
+    #[test]
+    fn test_log_availability_warnings_disabled_subcommand_with_instructions() {
+        let summary = AvailabilitySummary {
+            filtered_configs: HashMap::new(),
+            disabled_tools: vec![],
+            disabled_subcommands: vec![DisabledSubcommand {
+                tool: "gh".to_string(),
+                subcommand_path: "pr create".to_string(),
+                message: "gh not installed".to_string(),
+                install_instructions: Some("brew install gh".to_string()),
+            }],
+        };
+        log_availability_warnings(&summary);
+    }
+
+    #[test]
+    fn test_log_availability_warnings_both_disabled_tools_and_subcommands() {
+        let summary = AvailabilitySummary {
+            filtered_configs: HashMap::new(),
+            disabled_tools: vec![DisabledTool {
+                name: "cargo".to_string(),
+                message: "not found".to_string(),
+                install_instructions: Some("Install Rust via rustup".to_string()),
+            }],
+            disabled_subcommands: vec![DisabledSubcommand {
+                tool: "cargo".to_string(),
+                subcommand_path: "fmt".to_string(),
+                message: "rustfmt missing".to_string(),
+                install_instructions: Some("rustup component add rustfmt".to_string()),
+            }],
+        };
+        log_availability_warnings(&summary);
+    }
+
+    #[test]
+    fn test_log_availability_warnings_multiple_disabled_tools() {
+        let summary = AvailabilitySummary {
+            filtered_configs: HashMap::new(),
+            disabled_tools: vec![
+                DisabledTool {
+                    name: "tool_a".to_string(),
+                    message: "missing".to_string(),
+                    install_instructions: None,
+                },
+                DisabledTool {
+                    name: "tool_b".to_string(),
+                    message: "also missing".to_string(),
+                    install_instructions: Some("install_b".to_string()),
+                },
+            ],
+            disabled_subcommands: vec![],
+        };
+        log_availability_warnings(&summary);
+    }
+
+    #[test]
+    fn test_log_availability_warnings_multiple_disabled_subcommands() {
+        let summary = AvailabilitySummary {
+            filtered_configs: HashMap::new(),
+            disabled_tools: vec![],
+            disabled_subcommands: vec![
+                DisabledSubcommand {
+                    tool: "tool_x".to_string(),
+                    subcommand_path: "sub1".to_string(),
+                    message: "sub1 missing".to_string(),
+                    install_instructions: None,
+                },
+                DisabledSubcommand {
+                    tool: "tool_x".to_string(),
+                    subcommand_path: "sub2".to_string(),
+                    message: "sub2 missing".to_string(),
+                    install_instructions: Some("install instructions".to_string()),
+                },
+            ],
+        };
+        log_availability_warnings(&summary);
+    }
+
+    // ─── Private helper: log_loaded_tools ────────────────────────────────────
+
+    #[test]
+    fn test_log_loaded_tools_empty_configs_no_dir_logs_error() {
+        let configs: HashMap<String, ToolConfig> = HashMap::new();
+        // Must not panic; logs an error-level message.
+        log_loaded_tools(&configs, None);
+    }
+
+    #[test]
+    fn test_log_loaded_tools_empty_configs_with_dir_logs_error_and_dir() {
+        let temp = tempdir().unwrap();
+        let configs: HashMap<String, ToolConfig> = HashMap::new();
+        log_loaded_tools(&configs, Some(temp.path()));
+    }
+
+    #[test]
+    fn test_log_loaded_tools_nonempty_configs_logs_info() {
+        let configs = load_tool_configs_sync(&AppConfig::default(), None)
+            .expect("load_tool_configs_sync should succeed with default config");
+        assert!(
+            !configs.is_empty(),
+            "should include at least run_terminal_command"
+        );
+        log_loaded_tools(&configs, None);
+    }
+
+    #[test]
+    fn test_log_loaded_tools_nonempty_configs_with_dir() {
+        let temp = tempdir().unwrap();
+        let configs = load_tool_configs_sync(&AppConfig::default(), None).unwrap();
+        log_loaded_tools(&configs, Some(temp.path()));
+    }
+}

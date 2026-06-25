@@ -583,9 +583,153 @@ pub async fn run_file_monitor_pipeline(
     info!("file_monitor[{}]: pipeline finished", op_id);
 }
 
+// ===========================================================================
+// Unit tests for private helpers (`process_new_bytes`, `push_if_match`,
+// `apply_env`).  Integration-level tests for the two public pipelines live in
+// `ahma_mcp/tests/livelog_pipeline_test.rs` and
+// `ahma_mcp/tests/livelog_file_monitor_test.rs`.
+// ===========================================================================
+
 #[cfg(test)]
 mod tests {
-    use super::{StructuredVerdict, classify_structured_response};
+    use super::*;
+    use std::time::Duration;
+
+    use crate::operation_monitor::{MonitorConfig, OperationMonitor};
+
+    fn make_monitor() -> std::sync::Arc<OperationMonitor> {
+        std::sync::Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(60),
+        )))
+    }
+
+    // -----------------------------------------------------------------------
+    // push_if_match
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_push_if_match_no_prefilter_always_pushes() {
+        let mut chunk: Vec<String> = Vec::new();
+        push_if_match(&mut chunk, "any line".to_string(), &None);
+        assert_eq!(chunk, vec!["any line"]);
+    }
+
+    #[test]
+    fn test_push_if_match_with_matching_regex_pushes_line() {
+        let re = regex::Regex::new(r"ERROR").unwrap();
+        let mut chunk: Vec<String> = Vec::new();
+        push_if_match(&mut chunk, "ERROR: crash detected".to_string(), &Some(re));
+        assert_eq!(chunk.len(), 1, "matching line should be pushed");
+    }
+
+    #[test]
+    fn test_push_if_match_with_non_matching_regex_drops_line() {
+        let re = regex::Regex::new(r"ERROR").unwrap();
+        let mut chunk: Vec<String> = Vec::new();
+        push_if_match(
+            &mut chunk,
+            "INFO: everything is fine".to_string(),
+            &Some(re),
+        );
+        assert!(chunk.is_empty(), "non-matching line must be dropped");
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_env
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_env_with_empty_slice_is_noop() {
+        let mut cmd = tokio::process::Command::new("echo");
+        // Must not panic with an empty env list.
+        apply_env(&mut cmd, &[]);
+    }
+
+    #[test]
+    fn test_apply_env_sets_each_variable() {
+        let mut cmd = tokio::process::Command::new("echo");
+        let env = vec![
+            ("AHMA_TEST_KEY1".to_string(), "value1".to_string()),
+            ("AHMA_TEST_KEY2".to_string(), "value2".to_string()),
+        ];
+        // Exercises the for-loop body — the call succeeding without panic is the
+        // observable assertion; Command does not expose a public env accessor.
+        apply_env(&mut cmd, &env);
+    }
+
+    // -----------------------------------------------------------------------
+    // process_new_bytes
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_process_new_bytes_returns_all_complete_lines() {
+        let monitor = make_monitor();
+        let data = b"line1\nline2\nline3\n";
+        let mut remainder = String::new();
+        let result = process_new_bytes(data, data.len(), &mut remainder, "op-test", &monitor).await;
+        assert_eq!(result, vec!["line1", "line2", "line3"]);
+        assert!(remainder.is_empty(), "trailing newline leaves no remainder");
+    }
+
+    #[tokio::test]
+    async fn test_process_new_bytes_retains_partial_last_line_as_remainder() {
+        let monitor = make_monitor();
+        let data = b"complete\npartial";
+        let mut remainder = String::new();
+        let result = process_new_bytes(data, data.len(), &mut remainder, "op-test", &monitor).await;
+        assert_eq!(result, vec!["complete"]);
+        assert_eq!(remainder, "partial");
+    }
+
+    #[tokio::test]
+    async fn test_process_new_bytes_prepends_existing_remainder() {
+        let monitor = make_monitor();
+        let data = b"_suffix\nnext_line\n";
+        let mut remainder = "prefix".to_string();
+        let result = process_new_bytes(data, data.len(), &mut remainder, "op-test", &monitor).await;
+        assert_eq!(result, vec!["prefix_suffix", "next_line"]);
+        assert!(remainder.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_new_bytes_strips_carriage_returns() {
+        let monitor = make_monitor();
+        let data = b"windows_line\r\nanother\r\n";
+        let mut remainder = String::new();
+        let result = process_new_bytes(data, data.len(), &mut remainder, "op-test", &monitor).await;
+        assert_eq!(result, vec!["windows_line", "another"]);
+        assert!(remainder.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_new_bytes_single_line_without_newline_becomes_remainder() {
+        let monitor = make_monitor();
+        let data = b"no newline here";
+        let mut remainder = String::new();
+        let result = process_new_bytes(data, data.len(), &mut remainder, "op-test", &monitor).await;
+        assert!(
+            result.is_empty(),
+            "no complete lines without trailing newline"
+        );
+        assert_eq!(remainder, "no newline here");
+    }
+
+    #[tokio::test]
+    async fn test_process_new_bytes_respects_n_boundary() {
+        let monitor = make_monitor();
+        // The buffer contains more data than `n` — only the first `n` bytes should
+        // be processed; the tail must be ignored.
+        let data = b"line1\nline2\nignored_suffix";
+        let n = b"line1\nline2\n".len();
+        let mut remainder = String::new();
+        let result = process_new_bytes(data, n, &mut remainder, "op-test", &monitor).await;
+        assert_eq!(result, vec!["line1", "line2"]);
+        assert!(remainder.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_structured_response
+    // -----------------------------------------------------------------------
 
     #[test]
     fn issue_false_is_clean() {

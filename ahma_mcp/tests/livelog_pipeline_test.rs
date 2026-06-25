@@ -633,6 +633,150 @@ async fn test_livelog_invalid_prefilter_falls_back_to_pass_all() {
 }
 
 // ---------------------------------------------------------------------------
+// Additional branch-coverage tests
+// ---------------------------------------------------------------------------
+
+/// When `config.llm_provider` has an unresolvable `${VAR}` reference, the
+/// pipeline exits immediately at the `resolve()` call without spawning anything.
+#[tokio::test]
+async fn test_livelog_pipeline_llm_resolve_error_exits_early() {
+    let temp_dir = tempdir().unwrap();
+    let sandbox = make_sandbox(temp_dir.path());
+
+    let mut config = make_config("echo", vec!["hello".to_string()], "http://unused", "prompt");
+    // Point api_key to a var that is guaranteed not to be set in the environment.
+    config.llm_provider.api_key = Some("${_AHMA_LIVELOG_COVER_MISSING_KEY_XYZ789_}".to_string());
+
+    let token = CancellationToken::new();
+    let monitor = make_monitor();
+    register_op(&monitor, "op-resolve-err").await;
+
+    let runtime = default_runtime(&config);
+
+    run_livelog_pipeline(
+        "op-resolve-err",
+        &config,
+        &runtime,
+        &sandbox,
+        temp_dir.path(),
+        token,
+        monitor.clone(),
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+    )
+    .await;
+
+    assert!(
+        alerts_for(&monitor, "op-resolve-err").await.is_empty(),
+        "LLM resolve error must produce no alerts"
+    );
+}
+
+/// When `config.clear_command` is set and `runtime.clear = true`, the pipeline
+/// runs the clear command (using `source_command` as the binary) before starting
+/// the source process.  The clear command's output is discarded — any non-zero
+/// exit is logged but does not abort monitoring.
+///
+/// Also exercises `apply_env` with a non-empty `runtime.env` (covering the
+/// for-loop body in that helper).
+#[tokio::test]
+async fn test_livelog_pipeline_clear_command_executes_before_source() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(make_llm_response("CLEAN")))
+        .mount(&server)
+        .await;
+
+    let temp_dir = tempdir().unwrap();
+    let sandbox = make_sandbox(temp_dir.path());
+
+    // source_command = "echo"; clear_command = ["--cleared"] → runs `echo --cleared`
+    // which exits 0.  The source itself outputs one line that the LLM marks CLEAN.
+    let mut config = make_config(
+        "echo",
+        vec!["source output".to_string()],
+        &server.uri(),
+        "detect issues",
+    );
+    config.clear_command = Some(vec!["--cleared".to_string()]);
+
+    let token = CancellationToken::new();
+    let monitor = make_monitor();
+    register_op(&monitor, "op-clear-cmd").await;
+
+    // Construct a runtime with `clear = true` (default) AND a non-empty `env`
+    // so that `apply_env`'s for-loop body is executed for coverage.
+    let mut runtime = default_runtime(&config);
+    runtime.clear = true;
+    runtime.env = vec![("AHMA_LIVELOG_CLEAR_TEST".to_string(), "1".to_string())];
+
+    run_livelog_pipeline(
+        "op-clear-cmd",
+        &config,
+        &runtime,
+        &sandbox,
+        temp_dir.path(),
+        token,
+        monitor.clone(),
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+    )
+    .await;
+
+    // Monitoring ran to completion without panic; CLEAN → no alert.
+    assert!(
+        alerts_for(&monitor, "op-clear-cmd").await.is_empty(),
+        "clear command + CLEAN LLM response should produce no alert"
+    );
+}
+
+/// `clear = false` in the runtime disables the clear command even when
+/// `config.clear_command` is present.  No crash, no alert.
+#[tokio::test]
+async fn test_livelog_pipeline_clear_command_skipped_when_runtime_clear_false() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(make_llm_response("CLEAN")))
+        .mount(&server)
+        .await;
+
+    let temp_dir = tempdir().unwrap();
+    let sandbox = make_sandbox(temp_dir.path());
+
+    let mut config = make_config(
+        "echo",
+        vec!["one line".to_string()],
+        &server.uri(),
+        "detect issues",
+    );
+    config.clear_command = Some(vec!["--skipped".to_string()]);
+
+    let mut runtime = default_runtime(&config);
+    runtime.clear = false; // disable clear
+
+    let token = CancellationToken::new();
+    let monitor = make_monitor();
+    register_op(&monitor, "op-no-clear").await;
+
+    run_livelog_pipeline(
+        "op-no-clear",
+        &config,
+        &runtime,
+        &sandbox,
+        temp_dir.path(),
+        token,
+        monitor.clone(),
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+    )
+    .await;
+
+    assert!(
+        alerts_for(&monitor, "op-no-clear").await.is_empty(),
+        "clear=false + CLEAN response should produce no alert"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Structured output tests
 // ---------------------------------------------------------------------------
 

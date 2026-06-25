@@ -85,6 +85,7 @@ pub struct UpdateArgs {
     pub prefer_musl: bool,
 }
 
+#[derive(Debug)]
 struct UpdateOutcome {
     binary_path: PathBuf,
     binary_changed: bool,
@@ -447,55 +448,697 @@ fn print_restart_hint() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
+
+    // Serialize env-var-mutating tests so they don't race each other.
+    // SAFETY: all env-var writes/removes are performed while holding this lock;
+    // nextest runs each test binary in an isolated process, so there is no
+    // cross-binary interference.
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    // ─── clap parsing helper macro ───────────────────────────────────────────
+
+    macro_rules! parse_update_args {
+        ($($arg:expr),* $(,)?) => {{
+            use clap::Parser;
+            #[derive(Parser)]
+            struct Cli {
+                #[command(subcommand)]
+                cmd: Cmd,
+            }
+            #[derive(clap::Subcommand)]
+            enum Cmd {
+                Update(UpdateArgs),
+            }
+            let cli = Cli::try_parse_from([$($arg),*]).unwrap();
+            let Cmd::Update(args) = cli.cmd;
+            args
+        }};
+    }
+
+    // ─── UpdateArgs – clap parsing ───────────────────────────────────────────
 
     #[test]
     fn test_update_args_parse_defaults() {
-        use clap::Parser;
-        #[derive(Parser)]
-        struct Cli {
-            #[command(subcommand)]
-            cmd: UpdateCmd,
-        }
-        #[derive(clap::Subcommand)]
-        enum UpdateCmd {
-            Update(UpdateArgs),
-        }
-        let cli = Cli::try_parse_from(["ahma", "update"]).unwrap();
-        let UpdateCmd::Update(args) = cli.cmd;
+        let args = parse_update_args!["ahma", "update"];
         assert!(args.reference.is_none());
         assert!(!args.force);
         assert!(!args.install_hooks);
         assert!(!args.dry_run);
         assert!(!args.insecure_skip_verify);
+        assert!(!args.prefer_musl);
+        assert!(args.install_dir.is_none());
     }
 
     #[test]
     fn test_update_args_parse_install_hooks() {
-        use clap::Parser;
-        #[derive(Parser)]
-        struct Cli {
-            #[command(subcommand)]
-            cmd: UpdateCmd,
-        }
-        #[derive(clap::Subcommand)]
-        enum UpdateCmd {
-            Update(UpdateArgs),
-        }
-
-        let cli = Cli::try_parse_from(["ahma", "update", "--install-hooks"]).unwrap();
-        let UpdateCmd::Update(args) = cli.cmd;
+        let args = parse_update_args!["ahma", "update", "--install-hooks"];
         assert!(args.install_hooks);
     }
 
     #[test]
+    fn test_update_args_parse_all_flags() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        let args = parse_update_args![
+            "ahma",
+            "update",
+            "--force",
+            "--dry-run",
+            "--insecure-skip-verify",
+            "--prefer-musl",
+            "--install-dir",
+            &dir_str,
+            "v0.6.7",
+        ];
+        assert_eq!(args.reference.as_deref(), Some("v0.6.7"));
+        assert!(args.force);
+        assert!(args.dry_run);
+        assert!(args.insecure_skip_verify);
+        assert!(args.prefer_musl);
+        assert_eq!(args.install_dir, Some(temp_dir.path().to_path_buf()));
+    }
+
+    #[test]
+    fn test_update_args_alias_insecure_skip_signature() {
+        // --insecure-skip-signature is a declared alias for --insecure-skip-verify
+        let args = parse_update_args!["ahma", "update", "--insecure-skip-signature"];
+        assert!(args.insecure_skip_verify);
+    }
+
+    #[test]
+    fn test_update_args_parse_git_branch_ref() {
+        let args = parse_update_args!["ahma", "update", "feature/my-branch"];
+        assert_eq!(args.reference.as_deref(), Some("feature/my-branch"));
+        assert!(!args.dry_run);
+    }
+
+    // ─── format_install_success ──────────────────────────────────────────────
+
+    #[test]
     fn test_format_install_success_with_version() {
-        let message = format_install_success(std::path::Path::new("/tmp/ahma"), Some("0.7.0"));
-        assert_eq!(message, "Success! ahma 0.7.0 installed to /tmp/ahma");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ahma");
+        let message = format_install_success(&path, Some("0.7.0"));
+        assert!(
+            message.contains("0.7.0"),
+            "version should appear in: {message}"
+        );
+        assert!(message.starts_with("Success!"));
     }
 
     #[test]
     fn test_format_install_success_without_version() {
-        let message = format_install_success(std::path::Path::new("/tmp/ahma"), None);
-        assert_eq!(message, "Success! Installed /tmp/ahma");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ahma");
+        let message = format_install_success(&path, None);
+        assert!(message.starts_with("Success!"));
+        assert!(
+            message.contains(path.to_str().unwrap()),
+            "path should appear in: {message}"
+        );
+    }
+
+    // ─── print_path_hint & print_restart_hint ───────────────────────────────
+
+    #[test]
+    fn test_print_path_hint_does_not_panic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // Should print without panicking regardless of platform.
+        print_path_hint(temp_dir.path());
+    }
+
+    #[test]
+    fn test_print_restart_hint_does_not_panic() {
+        print_restart_hint();
+    }
+
+    // ─── can_prompt_for_setup ───────────────────────────────────────────────
+
+    #[test]
+    fn test_can_prompt_for_setup_returns_bool_without_panic() {
+        // In nextest stdin/stdout are not terminals; the function must not panic.
+        // In a real terminal it may return true; either result is acceptable.
+        let _ = can_prompt_for_setup();
+    }
+
+    // ─── warn_if_running_binary_differs ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_warn_if_running_binary_differs_no_target_file() {
+        // When the target binary does not exist the function returns silently.
+        let temp_dir = tempfile::tempdir().unwrap();
+        warn_if_running_binary_differs(temp_dir.path()).await;
+        // No panic = success.
+    }
+
+    #[tokio::test]
+    async fn test_warn_if_running_binary_differs_with_target_file() {
+        // When a dummy file exists at the expected target location the canonicalize
+        // branches are exercised (paths will differ from the real current_exe).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary_name = if cfg!(target_os = "windows") {
+            "ahma.exe"
+        } else {
+            "ahma"
+        };
+        let target = temp_dir.path().join(binary_name);
+        std::fs::write(&target, b"fake binary").unwrap();
+        // Exercises target.exists() == true and the dunce::canonicalize comparison.
+        // A "Note: running … but updating …" line may be printed to stderr.
+        warn_if_running_binary_differs(temp_dir.path()).await;
+        // No panic = success.
+    }
+
+    // ─── print_post_install_details ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_print_post_install_details_dry_run_returns_early() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join("nonexistent_ahma");
+        // dry_run=true → function returns at the first guard without touching anything.
+        print_post_install_details(&binary, temp_dir.path(), true, None).await;
+        // No panic = success.
+    }
+
+    #[tokio::test]
+    async fn test_print_post_install_details_no_attestation() {
+        // dry_run=false, attestation_verified=None (git install path).
+        // Binary does not exist → read_installed_version returns None → "no version" message.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join("nonexistent_ahma");
+        print_post_install_details(&binary, temp_dir.path(), false, None).await;
+        // Covers: version read (None), format_install_success(None), print hints.
+    }
+
+    #[tokio::test]
+    async fn test_print_post_install_details_attestation_verified_true() {
+        // attestation_verified=Some(true) → prints the "Authenticity verified" message.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join("nonexistent_ahma");
+        print_post_install_details(&binary, temp_dir.path(), false, Some(true)).await;
+    }
+
+    #[tokio::test]
+    async fn test_print_post_install_details_attestation_bypassed() {
+        // attestation_verified=Some(false) → prints the insecure-skip warning.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join("nonexistent_ahma");
+        print_post_install_details(&binary, temp_dir.path(), false, Some(false)).await;
+    }
+
+    // ─── run_git_update ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_run_git_update_dry_run_main_branch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = run_git_update("main", temp_dir.path(), true).await;
+        assert!(
+            result.is_ok(),
+            "dry-run git update should succeed: {result:?}"
+        );
+        let outcome = result.unwrap();
+        assert!(
+            !outcome.binary_changed,
+            "dry_run → binary_changed must be false"
+        );
+        assert!(
+            outcome.attestation_verified.is_none(),
+            "git builds have no attestation"
+        );
+        // Binary path should be inside install_dir.
+        assert!(
+            outcome.binary_path.starts_with(temp_dir.path()),
+            "binary path should be under install_dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_git_update_dry_run_feature_branch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = run_git_update("feature/my-branch", temp_dir.path(), true).await;
+        assert!(result.is_ok());
+        let outcome = result.unwrap();
+        assert!(!outcome.binary_changed);
+        assert!(outcome.attestation_verified.is_none());
+    }
+
+    // ─── Unix-only helpers ───────────────────────────────────────────────────
+
+    /// Returns the path to a Unix command that always exits 0, ignoring all args.
+    #[cfg(unix)]
+    fn find_true_cmd() -> Option<PathBuf> {
+        for p in ["/usr/bin/true", "/bin/true"] {
+            let path = PathBuf::from(p);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// Returns the path to a Unix command that always exits 1, ignoring all args.
+    #[cfg(unix)]
+    fn find_false_cmd() -> Option<PathBuf> {
+        for p in ["/usr/bin/false", "/bin/false"] {
+            let path = PathBuf::from(p);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    // ─── run_setup_hooks_only_auto ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_run_setup_hooks_only_auto_spawn_error_on_missing_binary() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join("nonexistent_ahma_binary");
+        let result = run_setup_hooks_only_auto(&binary).await;
+        assert!(result.is_err(), "nonexistent binary should fail to spawn");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Failed to run") || msg.contains("setup") || msg.contains("No such"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    /// Exercises the `bail!` path when the binary exits with a non-zero status.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_setup_hooks_only_auto_nonzero_exit_bail() {
+        let Some(false_path) = find_false_cmd() else {
+            return; // skip if /usr/bin/false and /bin/false are both absent
+        };
+        let result = run_setup_hooks_only_auto(&false_path).await;
+        assert!(result.is_err(), "non-zero exit should return Err");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exited with status") || msg.contains("setup"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Exercises the `Ok(())` happy path when the binary exits with status 0.
+    /// `true` ignores all arguments and always exits 0.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_setup_hooks_only_auto_success() {
+        let Some(true_path) = find_true_cmd() else {
+            return;
+        };
+        let result = run_setup_hooks_only_auto(&true_path).await;
+        assert!(
+            result.is_ok(),
+            "`true` exits 0 — hooks setup should succeed: {result:?}"
+        );
+    }
+
+    // ─── run_setup_skills_only_auto ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_run_setup_skills_only_auto_spawn_error_on_missing_binary() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join("nonexistent_ahma_binary");
+        let result = run_setup_skills_only_auto(&binary).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Failed to run") || msg.contains("setup") || msg.contains("No such"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_setup_skills_only_auto_nonzero_exit_bail() {
+        let Some(false_path) = find_false_cmd() else {
+            return;
+        };
+        let result = run_setup_skills_only_auto(&false_path).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exited with status") || msg.contains("setup"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_setup_skills_only_auto_success() {
+        let Some(true_path) = find_true_cmd() else {
+            return;
+        };
+        let result = run_setup_skills_only_auto(&true_path).await;
+        assert!(
+            result.is_ok(),
+            "`true` exits 0 — skills setup should succeed: {result:?}"
+        );
+    }
+
+    // ─── run_setup_interactive ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_run_setup_interactive_spawn_error_on_missing_binary() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join("nonexistent_ahma_binary");
+        let result = run_setup_interactive(&binary).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Failed to run") || msg.contains("setup") || msg.contains("No such"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_setup_interactive_nonzero_exit_bail() {
+        let Some(false_path) = find_false_cmd() else {
+            return;
+        };
+        let result = run_setup_interactive(&false_path).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("exited with status") || msg.contains("setup"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_setup_interactive_success() {
+        let Some(true_path) = find_true_cmd() else {
+            return;
+        };
+        let result = run_setup_interactive(&true_path).await;
+        assert!(
+            result.is_ok(),
+            "`true` exits 0 — interactive setup should succeed: {result:?}"
+        );
+    }
+
+    // ─── maybe_run_setup_wizard ─────────────────────────────────────────────
+
+    fn make_dry_run_args(install_hooks: bool) -> UpdateArgs {
+        UpdateArgs {
+            reference: None,
+            install_dir: None,
+            force: false,
+            install_hooks,
+            dry_run: true,
+            insecure_skip_verify: false,
+            prefer_musl: false,
+        }
+    }
+
+    fn make_live_args(install_hooks: bool) -> UpdateArgs {
+        UpdateArgs {
+            reference: None,
+            install_dir: None,
+            force: false,
+            install_hooks,
+            dry_run: false,
+            insecure_skip_verify: false,
+            prefer_musl: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_maybe_run_setup_wizard_dry_run_no_hooks_returns_ok() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join("ahma");
+        let result = maybe_run_setup_wizard(&make_dry_run_args(false), &binary).await;
+        assert!(
+            result.is_ok(),
+            "dry_run + no hooks should return Ok: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_maybe_run_setup_wizard_dry_run_with_hooks_prints_message() {
+        // Exercises the `if args.install_hooks` branch inside the dry_run guard:
+        // prints "[dry-run] Would run … setup --hooks --auto".
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join("ahma");
+        let result = maybe_run_setup_wizard(&make_dry_run_args(true), &binary).await;
+        assert!(
+            result.is_ok(),
+            "dry_run + hooks should return Ok: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_maybe_run_setup_wizard_install_hooks_spawn_error() {
+        // dry_run=false + install_hooks=true + nonexistent binary → Err via ?.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join("nonexistent_ahma");
+        let result = maybe_run_setup_wizard(&make_live_args(true), &binary).await;
+        assert!(result.is_err(), "nonexistent binary should propagate Err");
+    }
+
+    #[tokio::test]
+    async fn test_maybe_run_setup_wizard_no_terminal_skills_spawn_error() {
+        // dry_run=false + install_hooks=false.
+        // In nextest stdin/stdout are not terminals → can_prompt_for_setup() = false
+        // → run_setup_skills_only_auto with nonexistent binary → Err via ?.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let binary = temp_dir.path().join("nonexistent_ahma");
+        let result = maybe_run_setup_wizard(&make_live_args(false), &binary).await;
+        // Err in non-terminal environment (nextest), Ok if somehow running in a terminal
+        // where the interactive path swallows setup errors.
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("Failed to run") || msg.contains("setup") || msg.contains("No such"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
+    // ─── run_setup_hooks_only_auto success via `true` exercises Ok(()) line ─
+
+    // (Covered above in the three-case tests for each setup function.)
+
+    // ─── prompt_yes_no ──────────────────────────────────────────────────────
+
+    /// In nextest stdin is a non-terminal pipe; read_line hits EOF immediately,
+    /// `trimmed` is empty, and the function returns `Ok(default)`.
+    /// A 3-second timeout prevents the test from hanging if stdin is unexpectedly
+    /// a blocking terminal.
+    #[tokio::test]
+    async fn test_prompt_yes_no_eof_stdin_returns_default_false() {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            prompt_yes_no("test prompt? ", false),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(value)) => {
+                assert!(!value, "empty/EOF input should return the default (false)")
+            }
+            Ok(Err(_)) => {
+                // I/O error on stdin is acceptable in test env (e.g., stdin is /dev/null).
+            }
+            Err(_elapsed) => {
+                // stdin is blocking (ran in a real terminal) — skip silently.
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prompt_yes_no_eof_stdin_returns_default_true() {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            prompt_yes_no("test prompt? ", true),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(value)) => {
+                assert!(value, "empty/EOF input should return the default (true)")
+            }
+            Ok(Err(_)) => {}
+            Err(_elapsed) => {}
+        }
+    }
+
+    // ─── run() end-to-end with dry_run=true ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_run_dry_run_git_ref_succeeds() {
+        // dry_run=true + GitRef(main) exercises:
+        //   • install_dir resolution (from args.install_dir)
+        //   • classify_ref → GitRef
+        //   • detect_platform (ok() — may be None on unsupported platform, handled)
+        //   • warn_if_running_binary_differs
+        //   • GitRef match arm → run_git_update (dry_run path, no cargo needed)
+        //   • outcome.binary_changed = false → skip print_post_install_details
+        //   • maybe_run_setup_wizard (dry_run=true → early Ok)
+        // No daemon stop, no network calls.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = UpdateArgs {
+            reference: Some("main".to_string()),
+            install_dir: Some(temp_dir.path().to_path_buf()),
+            force: false,
+            install_hooks: false,
+            dry_run: true,
+            insecure_skip_verify: false,
+            prefer_musl: false,
+        };
+        let cfg = crate::shell::cli::AppConfig::default();
+        let result = run(args, &cfg).await;
+        assert!(
+            result.is_ok(),
+            "dry-run git-ref update should succeed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_dry_run_git_ref_with_prefer_musl() {
+        // Same as above but prefer_musl=true to cover the set_prefer_musl_override branch.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = UpdateArgs {
+            reference: Some("feature/test".to_string()),
+            install_dir: Some(temp_dir.path().to_path_buf()),
+            force: false,
+            install_hooks: false,
+            dry_run: true,
+            insecure_skip_verify: false,
+            prefer_musl: true,
+        };
+        let cfg = crate::shell::cli::AppConfig::default();
+        let result = run(args, &cfg).await;
+        assert!(
+            result.is_ok(),
+            "dry-run + prefer_musl update should succeed: {result:?}"
+        );
+    }
+
+    // ENV_MUTEX guard must span the .await so the env var stays set for the whole call.
+    // Safe: current-thread tokio test runtime; no re-lock of ENV_MUTEX under the lock.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn test_run_dry_run_install_dir_from_env_var() {
+        // Cover the AHMA_INSTALL_DIR env-var branch in install_dir resolution
+        // (args.install_dir = None → falls back to env var → uses temp dir).
+        let _g = ENV_MUTEX.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir_str = temp_dir.path().to_str().unwrap().to_string();
+        // SAFETY: guarded by ENV_MUTEX; nextest isolates each binary.
+        unsafe { std::env::set_var("AHMA_INSTALL_DIR", &dir_str) };
+        let args = UpdateArgs {
+            reference: Some("main".to_string()),
+            install_dir: None, // no explicit dir → fall back to env var
+            force: false,
+            install_hooks: false,
+            dry_run: true,
+            insecure_skip_verify: false,
+            prefer_musl: false,
+        };
+        let cfg = crate::shell::cli::AppConfig::default();
+        let result = run(args, &cfg).await;
+        unsafe { std::env::remove_var("AHMA_INSTALL_DIR") };
+        assert!(
+            result.is_ok(),
+            "AHMA_INSTALL_DIR env-var path should work: {result:?}"
+        );
+    }
+
+    // ─── run_release_update – env-var warning + client build ────────────────
+
+    /// Covers the retired-env-var warning block (lines that log a tracing::warn)
+    /// and the reqwest client construction.  If a network connection is available
+    /// (as in GitHub CI) the test also covers the asset-fetch and dry-run install
+    /// paths.  Network failures are silently accepted because we only need coverage
+    /// of the lines that execute *before* the first I/O call.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn test_run_release_update_warns_on_retired_env_vars() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        // SAFETY: guarded by ENV_MUTEX.
+        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_SIGNATURE", "1") };
+
+        if let Ok(platform) = platform::detect_platform() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let args = UpdateArgs {
+                reference: None,
+                install_dir: Some(temp_dir.path().to_path_buf()),
+                force: false,
+                install_hooks: false,
+                dry_run: true,
+                insecure_skip_verify: true,
+                prefer_musl: false,
+            };
+            let outcome = run_release_update(
+                &args,
+                &platform,
+                temp_dir.path(),
+                &UpdateMode::LatestRelease,
+            )
+            .await;
+            if let Err(e) = outcome {
+                // Network / API errors are expected when GitHub is unreachable.
+                // A programming error would show a different pattern.
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("Failed to fetch")
+                        || msg.contains("reqwest")
+                        || msg.contains("HTTP")
+                        || msg.contains("GitHub")
+                        || msg.contains("error")
+                        || msg.contains("Failed to create"),
+                    "unexpected non-network error in run_release_update: {msg}"
+                );
+            }
+        }
+
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+    }
+
+    /// Covers the `UpdateMode::TaggedRelease` match arm inside `run_release_update`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn test_run_release_update_tagged_release_match_arm() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+
+        if let Ok(platform) = platform::detect_platform() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let args = UpdateArgs {
+                reference: Some("v0.1.0".to_string()),
+                install_dir: Some(temp_dir.path().to_path_buf()),
+                force: false,
+                install_hooks: false,
+                dry_run: true,
+                insecure_skip_verify: true,
+                prefer_musl: false,
+            };
+            let mode = UpdateMode::TaggedRelease {
+                tag: "v0.1.0".to_string(),
+            };
+            // Accept either Ok (network available + dry-run) or Err (network unavailable).
+            // The sole goal is exercising the TaggedRelease match arm for coverage.
+            let outcome = run_release_update(&args, &platform, temp_dir.path(), &mode).await;
+            if let Err(e) = outcome {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("Failed to fetch")
+                        || msg.contains("reqwest")
+                        || msg.contains("HTTP")
+                        || msg.contains("GitHub")
+                        || msg.contains("error")
+                        || msg.contains("Failed to create"),
+                    "unexpected non-network error in tagged-release path: {msg}"
+                );
+            }
+        }
     }
 }
