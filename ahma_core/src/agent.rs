@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -309,22 +310,35 @@ pub fn spawn_chat_task(
             return;
         }
 
+        let base_url = client.base_url().to_string();
+        info!(
+            provider = %base_url,
+            messages = messages.len(),
+            "chat: starting stream"
+        );
         let stream = client.chat_stream(messages, system_prompt.as_deref());
         tokio::pin!(stream);
         use futures::StreamExt;
+        let mut first_token = true;
         while let Some(res) = stream.next().await {
             match res {
                 Ok(token) => {
                     if !token.is_empty() {
+                        if first_token {
+                            info!(provider = %base_url, "chat: first token received");
+                            first_token = false;
+                        }
                         let _ = tx.send(AgentEvent::Token(token)).await;
                     }
                 }
                 Err(e) => {
+                    warn!(provider = %base_url, error = %e, "chat: stream error");
                     let _ = tx.send(AgentEvent::Error(e.to_string())).await;
                     return;
                 }
             }
         }
+        info!(provider = %base_url, "chat: stream complete");
         let _ = tx.send(AgentEvent::Done).await;
     });
 }

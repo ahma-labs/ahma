@@ -4,7 +4,7 @@ use futures::Stream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use ahma_common::config::warn_if_looks_like_literal_secret;
 
@@ -419,6 +419,12 @@ impl LlmClient {
         let http = self.http.clone();
         let api_key = self.api_key.clone();
         let flavor = self.flavor;
+        info!(
+            model = %self.model,
+            messages = messages.len(),
+            url = %url,
+            "llm: starting chat stream"
+        );
 
         stream::unfold(
             ChatStreamState::Starting {
@@ -620,19 +626,24 @@ async fn chat_stream_start(
     };
 
     let resp = match req.send().await {
-        Err(e) => return Some((Err(LlmMonitorError::Http(e)), ChatStreamState::Done)),
+        Err(e) => {
+            warn!(error = %e, "llm: chat stream request failed");
+            return Some((Err(LlmMonitorError::Http(e)), ChatStreamState::Done));
+        }
         Ok(resp) => resp,
     };
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        warn!(status = %status, body = %body, "llm: HTTP error from LLM endpoint");
         return Some((
             Err(LlmMonitorError::Parse(format!("HTTP {status}: {body}"))),
             ChatStreamState::Done,
         ));
     }
 
+    debug!("llm: streaming response started");
     use futures::TryStreamExt as _;
     let byte_stream = resp.bytes_stream().map_err(LlmMonitorError::Http);
     Some((
@@ -681,8 +692,14 @@ async fn chat_stream_poll(
         }
 
         match stream.next().await {
-            None => return None,
-            Some(Err(e)) => return Some((Err(e), ChatStreamState::Done)),
+            None => {
+                debug!("llm: byte stream ended (no [DONE] sentinel)");
+                return None;
+            }
+            Some(Err(e)) => {
+                warn!(error = %e, "llm: byte stream error");
+                return Some((Err(e), ChatStreamState::Done));
+            }
             Some(Ok(bytes)) => buffer.push_str(&String::from_utf8_lossy(&bytes)),
         }
     }

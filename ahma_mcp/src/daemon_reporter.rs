@@ -21,7 +21,7 @@ use ahma_common::scope_grant::{
 };
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc::UnboundedReceiver;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// The shared scope-grant plumbing handed to the reporter. The `coordinator` is
 /// the same instance the [`crate::sandbox::HubGrantNotifier`] uses, so a request it
@@ -300,7 +300,12 @@ async fn run_reporter_loop(
                             }
                         }
                         Ok(DaemonMsg::RunPrompt { messages, system_prompt, provider, model }) => {
-                            debug!("daemon_reporter: received RunPrompt");
+                            info!(
+                                provider = ?provider,
+                                model = ?model,
+                                messages = messages.len(),
+                                "daemon_reporter: RunPrompt received"
+                            );
                             if let Some(runner) = get_global_prompt_runner() {
                                 let runner = runner.clone();
                                 let hub_tx = hub_tx.clone();
