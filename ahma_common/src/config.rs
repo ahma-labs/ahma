@@ -714,6 +714,21 @@ pub struct SandboxSettings {
     /// Default: empty list
     #[serde(default)]
     pub persistent_scopes: Vec<PersistentScope>,
+    /// Opt in to automatically granting detected external **build caches**
+    /// (sccache, ccache) read+write access to the sandbox scope *before* it
+    /// locks, so cached builds work for the whole session without a per-failure
+    /// grant + restart.
+    ///
+    /// Secure by default (`false`): when off, ahma only *detects and logs* a
+    /// build cache that is outside the scope (with the exact command to allow
+    /// it) and never widens the sandbox on its own. When on, each session
+    /// re-detects the active caches (from `RUSTC_WRAPPER`/`SCCACHE_DIR`/
+    /// `CCACHE_DIR` and platform defaults) and folds their directories into the
+    /// writable scope set at startup. The directories are still only those the
+    /// user's own environment points at.
+    /// Default: `false`
+    #[serde(default)]
+    pub trust_build_caches: bool,
 }
 
 impl SandboxSettings {
@@ -769,6 +784,7 @@ impl Default for SandboxSettings {
             sandbox_directory: default_sandbox_directory(),
             use_sandbox_directory: false,
             persistent_scopes: Vec::new(),
+            trust_build_caches: false,
         }
     }
 }
@@ -1202,6 +1218,14 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # persistent_scopes = [
 #   { path = "~/Library/Caches/Mozilla.sccache", access = "rw", granted_by = "sccache", note = "compiler cache" },
 # ]
+#
+# trust_build_caches: opt in to auto-granting *detected* external build caches
+# (sccache/ccache, found via RUSTC_WRAPPER/SCCACHE_DIR/CCACHE_DIR + platform
+# defaults) read+write access before the sandbox locks — so cached builds work
+# all session without a per-failure grant + restart. Off by default: when off,
+# such a cache is only detected and logged (with the command to allow it), never
+# auto-granted.
+# trust_build_caches = false
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # [logging]

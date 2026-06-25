@@ -141,6 +141,11 @@ pub struct AppConfig {
     /// survive `roots/list` replacement — the persistence behind `ahma sandbox
     /// grant`. Resolved into the sandbox's writable/read-only scope sets.
     pub persistent_scopes: Vec<ahma_common::config::PersistentScope>,
+    /// Opt in to auto-granting detected external build caches (sccache/ccache)
+    /// to the sandbox scope before lock (from `[sandbox].trust_build_caches`).
+    /// When off (default), such caches are only detected and logged, never
+    /// auto-granted. See [`sandbox::build_cache`].
+    pub trust_build_caches: bool,
 
     // ── HTTP serve mode ─────────────────────────────────────────────────────
     /// Bind host for HTTP mode (default 127.0.0.1).
@@ -230,6 +235,7 @@ impl Default for AppConfig {
             monitor_rate_limit_secs: 60,
             package_cache_write: true,
             persistent_scopes: vec![],
+            trust_build_caches: false,
             http_host: "127.0.0.1".to_string(),
             http_port: 3000,
             no_quic: false,
@@ -588,6 +594,65 @@ fn resolve_persistent_scopes(cfg: &AppConfig) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (write, read)
 }
 
+/// P1a pre-lock build-cache consent.
+///
+/// Detect external build caches active in this environment (sccache/ccache).
+/// When the user has opted in via `sandbox.trust_build_caches`, fold each
+/// detected cache directory into `write_scopes` (the writable persistent scopes
+/// that are applied before the sandbox locks and survive `roots/list`), so a
+/// sandboxed `cargo` build can use the cache for the whole session. When **not**
+/// opted in, emit an actionable hint per cache and grant nothing — the sandbox is
+/// never widened without explicit consent (secure by default).
+///
+/// Pure aside from logging + directory creation: detection is environment-driven
+/// and the merge is exercised directly in tests via the public seam.
+fn merge_trusted_build_caches(cfg: &AppConfig, write_scopes: &mut Vec<PathBuf>) {
+    let caches = sandbox::build_cache::detect();
+    apply_build_cache_consent(cfg.trust_build_caches, &caches, write_scopes);
+}
+
+/// Testable core of [`merge_trusted_build_caches`]: apply the opt-in decision to
+/// a concrete list of detected caches. When `trust`, each cache directory is
+/// created-if-missing, canonicalized, and appended to `write_scopes` (deduped);
+/// otherwise each is only logged with the command to allow it.
+fn apply_build_cache_consent(
+    trust: bool,
+    caches: &[sandbox::build_cache::BuildCache],
+    write_scopes: &mut Vec<PathBuf>,
+) {
+    for cache in caches {
+        if trust {
+            match ahma_common::config::ensure_sandbox_directory(&cache.dir) {
+                Ok(canonical) => {
+                    if !write_scopes.contains(&canonical) {
+                        tracing::info!(
+                            "Trusted build cache granted (read+write): {} [{}]",
+                            canonical.display(),
+                            cache.tool
+                        );
+                        write_scopes.push(canonical);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "Could not grant {} build cache {}: {e}",
+                    cache.tool,
+                    cache.dir.display()
+                ),
+            }
+        } else {
+            tracing::warn!(
+                "Detected {} cache at {} outside the sandbox scope; sandboxed builds may \
+                 fail (denied cache access / provenance contamination). To allow it for \
+                 this and future sessions, set `sandbox.trust_build_caches = true` in \
+                 ~/.ahma/settings.toml (or run `ahma sandbox grant {}`), then restart.",
+                cache.tool,
+                cache.dir.display(),
+                cache.dir.display()
+            );
+        }
+    }
+}
+
 fn create_sandbox_instance(
     scopes: Option<Vec<PathBuf>>,
     policy: &SandboxPolicy,
@@ -633,7 +698,14 @@ fn create_sandbox_instance(
     // Folded into the sandbox now (so initial enforcement covers them) and
     // re-applied on every roots/list update so a client's workspace root cannot
     // silently drop them.
-    let (persistent_write_scopes, persistent_read_scopes) = resolve_persistent_scopes(cfg);
+    let (mut persistent_write_scopes, persistent_read_scopes) = resolve_persistent_scopes(cfg);
+
+    // P1a: pre-lock build-cache consent. Detect external build caches (sccache/
+    // ccache) and, only when the user has opted in, fold them into the writable
+    // persistent scopes *before* the sandbox locks — so cached builds work all
+    // session without a per-failure grant + restart. Without consent this only
+    // logs an actionable hint; it never widens the sandbox on its own.
+    merge_trusted_build_caches(cfg, &mut persistent_write_scopes);
 
     let s = sandbox::Sandbox::new(
         scopes.clone(),
@@ -2435,6 +2507,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         // Loaded from settings.toml (honors --no-settings via `s`); survives
         // roots/list because the subprocess reads it directly, not via the bridge.
         persistent_scopes: s.sandbox.persistent_scopes.clone(),
+        trust_build_caches: s.sandbox.trust_build_caches,
         http_host: serve.http_host,
         http_port: serve.http_port,
         no_quic,
@@ -2543,6 +2616,81 @@ mod tests {
 
     fn init_test() {
         crate::utils::logging::init_test_logging();
+    }
+
+    // ─── apply_build_cache_consent (P1a pre-lock build-cache consent) ─────────
+
+    fn fake_cache(dir: PathBuf) -> sandbox::build_cache::BuildCache {
+        sandbox::build_cache::BuildCache {
+            tool: "sccache",
+            dir,
+            source: sandbox::build_cache::CacheSource::Env("SCCACHE_DIR"),
+        }
+    }
+
+    #[test]
+    fn build_cache_consent_grants_when_trusted() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let cache_dir = tmp.path().join("sccache-cache");
+        let caches = vec![fake_cache(cache_dir.clone())];
+        let mut write_scopes = Vec::new();
+
+        apply_build_cache_consent(true, &caches, &mut write_scopes);
+
+        assert_eq!(write_scopes.len(), 1, "trusted cache should be granted");
+        // ensure_sandbox_directory creates + canonicalizes the dir.
+        assert!(cache_dir.exists(), "cache dir should be created");
+        let canonical = dunce::canonicalize(&cache_dir).unwrap();
+        assert_eq!(write_scopes[0], canonical);
+    }
+
+    #[test]
+    fn build_cache_consent_denies_when_not_trusted() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let cache_dir = tmp.path().join("sccache-cache");
+        let caches = vec![fake_cache(cache_dir.clone())];
+        let mut write_scopes = Vec::new();
+
+        apply_build_cache_consent(false, &caches, &mut write_scopes);
+
+        assert!(
+            write_scopes.is_empty(),
+            "without opt-in the sandbox must not be widened"
+        );
+        assert!(
+            !cache_dir.exists(),
+            "a non-trusted cache dir must not be auto-created"
+        );
+    }
+
+    #[test]
+    fn build_cache_consent_dedupes_already_present_scope() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let cache_dir = tmp.path().join("sccache-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let canonical = dunce::canonicalize(&cache_dir).unwrap();
+        let caches = vec![fake_cache(cache_dir.clone())];
+        // Scope already contains the (canonical) cache dir.
+        let mut write_scopes = vec![canonical.clone()];
+
+        apply_build_cache_consent(true, &caches, &mut write_scopes);
+
+        assert_eq!(
+            write_scopes.len(),
+            1,
+            "an already-present cache must not be added twice"
+        );
+    }
+
+    #[test]
+    fn build_cache_consent_empty_caches_is_noop() {
+        init_test();
+        let mut write_scopes = vec![PathBuf::from("/existing")];
+        apply_build_cache_consent(true, &[], &mut write_scopes);
+        assert_eq!(write_scopes, vec![PathBuf::from("/existing")]);
     }
 
     // ─── env_flag_enabled ───────────────────────────────────────────────────
@@ -2659,6 +2807,7 @@ mod tests {
             monitor_rate_limit_secs: 60,
             package_cache_write: true,
             persistent_scopes: vec![],
+            trust_build_caches: false,
             http_host: "127.0.0.1".to_string(),
             http_port: 3000,
             no_quic: false,
