@@ -89,8 +89,29 @@ fn scan_line(line: &str) -> Option<DenialHit> {
         });
     }
 
+    // Windows (Job Object / AppContainer) denial: `Access is denied. (os error 5)`.
+    // Like `Permission denied` it does not reveal read-vs-write, so suggest the
+    // safer `Ro`. Note `os error 5` is `ACCESS_DENIED` on Windows but `EIO` on
+    // Unix, so a bare `os error 5` (no "Access is denied" text) is only trusted
+    // when the path is a Windows path — otherwise a Unix I/O error would be
+    // misread as a grant prompt.
+    if (line.contains("Access is denied") || line.contains("os error 5"))
+        && let Some(path) = extract_abs_path(line)
+    {
+        let is_access_denied =
+            line.contains("Access is denied") || is_windows_abs(path.to_str().unwrap_or(""));
+        if is_access_denied {
+            return Some(DenialHit {
+                path,
+                access: ScopeAccess::Ro,
+                pattern: "windows access-denied",
+            });
+        }
+    }
+
     // Ambiguous: a read or a write may have been denied. Suggest the safer `Ro`;
-    // the human can choose read+write at the prompt.
+    // the human can choose read+write at the prompt. (Linux Landlock surfaces as
+    // `EACCES` ⇒ "Permission denied", caught here.)
     if line.contains("Permission denied")
         && let Some(path) = extract_abs_path(line)
     {
@@ -104,25 +125,40 @@ fn scan_line(line: &str) -> Option<DenialHit> {
     None
 }
 
-/// Pull the first absolute (`/`-rooted) path token out of a line, trimming
-/// surrounding quotes/backticks and trailing punctuation. Returns `None` when the
-/// line has no plausible absolute path (a bare `/` does not count).
+/// Pull the first absolute path token out of a line, trimming surrounding
+/// quotes/backticks and trailing punctuation. Recognises both Unix (`/`-rooted)
+/// and Windows (drive-letter `C:\…` / `C:/…`, or UNC `\\server\share`) absolute
+/// paths. Returns `None` when the line has no plausible absolute path (a bare
+/// `/` does not count). Paths containing spaces cannot be recovered (the scan is
+/// whitespace-tokenised) — an accepted heuristic limitation.
 fn extract_abs_path(line: &str) -> Option<PathBuf> {
     for raw in line.split_whitespace() {
         // Trim the message's own grammar from both ends in one pass: surrounding
         // quotes/brackets and trailing punctuation can be interleaved (e.g. the
-        // token `` `/path`: `` ends with a backtick *then* a colon).
+        // token `` `/path`: `` ends with a backtick *then* a colon). A Windows
+        // drive colon (`C:`) is internal, so end-trimming `:` never harms it.
         let token = raw.trim_matches(|c| {
             matches!(
                 c,
                 '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '<' | '>' | ':' | ',' | '.' | ';'
             )
         });
-        if token.len() > 1 && token.starts_with('/') {
+        if (token.len() > 1 && token.starts_with('/')) || is_windows_abs(token) {
             return Some(PathBuf::from(token));
         }
     }
     None
+}
+
+/// True for a Windows absolute path: a drive-letter root (`X:\…` or `X:/…`) or a
+/// UNC path (`\\server\share`).
+fn is_windows_abs(token: &str) -> bool {
+    let b = token.as_bytes();
+    let drive_rooted = b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/');
+    drive_rooted || token.starts_with("\\\\")
 }
 
 #[cfg(test)]
@@ -217,5 +253,66 @@ warning: something
     fn trailing_punctuation_is_trimmed() {
         let hit = scan_denial("could not open '/var/db/x'. Permission denied").unwrap();
         assert_eq!(hit.path, PathBuf::from("/var/db/x"));
+    }
+
+    // ── Windows / cross-platform denial signatures (Phase 3) ──────────────────
+
+    #[test]
+    fn windows_access_denied_with_drive_path_is_ro() {
+        let stderr =
+            r"error writing `C:\Users\me\.cache\sccache\0`: Access is denied. (os error 5)";
+        let hit = scan_denial(stderr).expect("windows access-denied line matches");
+        assert_eq!(hit.access, ScopeAccess::Ro, "ambiguous denial suggests Ro");
+        assert_eq!(hit.path, PathBuf::from(r"C:\Users\me\.cache\sccache\0"));
+        assert_eq!(hit.pattern, "windows access-denied");
+    }
+
+    #[test]
+    fn windows_os_error_5_alone_matches() {
+        let stderr = r"failed to create C:\build\target\x.rlib (os error 5)";
+        let hit = scan_denial(stderr).expect("os error 5 with a path matches");
+        assert_eq!(hit.path, PathBuf::from(r"C:\build\target\x.rlib"));
+    }
+
+    #[test]
+    fn windows_forward_slash_drive_path_matches() {
+        let stderr = "open C:/Users/me/cache: Access is denied";
+        let hit = scan_denial(stderr).unwrap();
+        assert_eq!(hit.path, PathBuf::from("C:/Users/me/cache"));
+    }
+
+    #[test]
+    fn windows_unc_path_matches() {
+        let stderr = r"write \\server\share\cache: Access is denied. (os error 5)";
+        let hit = scan_denial(stderr).unwrap();
+        assert_eq!(hit.path, PathBuf::from(r"\\server\share\cache"));
+    }
+
+    #[test]
+    fn windows_access_denied_without_path_yields_none() {
+        assert!(scan_denial("Access is denied. (os error 5)").is_none());
+    }
+
+    #[test]
+    fn bare_drive_root_is_not_a_path() {
+        // `C:\` alone is a filesystem root, too broad to suggest.
+        assert!(!is_windows_abs("C:"));
+        assert!(is_windows_abs(r"C:\x"));
+    }
+
+    #[test]
+    fn linux_landlock_eacces_is_caught_as_permission_denied() {
+        // Landlock surfaces a blocked access as EACCES → "Permission denied".
+        let stderr = "/opt/ext/cache/obj: Permission denied (os error 13)";
+        let hit = scan_denial(stderr).expect("EACCES is caught");
+        assert_eq!(hit.path, PathBuf::from("/opt/ext/cache/obj"));
+        assert_eq!(hit.access, ScopeAccess::Ro);
+    }
+
+    #[test]
+    fn unix_os_error_5_on_unix_path_is_not_an_access_denial() {
+        // `os error 5` is EIO on Unix (an I/O error), not access-denied — a bare
+        // `os error 5` on a Unix path must NOT raise a grant prompt.
+        assert!(scan_denial("read /mnt/disk/file failed (os error 5)").is_none());
     }
 }

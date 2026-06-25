@@ -87,6 +87,11 @@ pub(crate) fn run_settings_command(args: SettingsArgs) -> Result<()> {
                 s.sandbox.use_sandbox_directory,
                 d.sandbox.use_sandbox_directory
             );
+            show_field!(
+                "trust_build_caches",
+                s.sandbox.trust_build_caches,
+                d.sandbox.trust_build_caches
+            );
             println!();
             println!("[logging]");
             show_field!("target", &s.logging.target, &d.logging.target);
@@ -381,6 +386,29 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
             println!("# Persistent sandbox scopes");
             println!("# File: {}", file.display());
             println!();
+
+            // P1a build-cache trust: show the opt-in state and what it detects in
+            // this environment, so the grant surface is auditable.
+            let trust = settings.sandbox.trust_build_caches;
+            println!(
+                "Build-cache trust (sccache/ccache): {}",
+                if trust {
+                    "ON  (sandbox.trust_build_caches = true)"
+                } else {
+                    "off (set sandbox.trust_build_caches = true to auto-grant detected caches)"
+                }
+            );
+            let caches = crate::sandbox::build_cache::detect();
+            if caches.is_empty() {
+                println!("  (no external build cache detected in this environment)");
+            } else {
+                for c in &caches {
+                    let state = if trust { "auto-granted" } else { "NOT granted" };
+                    println!("  • {} → {}  [{state}]", c.tool, c.dir.display());
+                }
+            }
+            println!();
+
             if scopes.is_empty() {
                 println!("(none granted)");
                 println!();
