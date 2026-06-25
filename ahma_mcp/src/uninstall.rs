@@ -1213,4 +1213,779 @@ mod tests {
         let result = parse_selection_string("1,3", 4);
         assert_eq!(result, vec![0, 2]);
     }
+
+    // ── Env-serialized helpers ────────────────────────────────────────────────
+
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Override HOME (and USERPROFILE on Windows) so `dirs::home_dir()` resolves
+    /// into a temp directory.  Returns the previous values for restoration.
+    fn set_home(tmp: &Path) -> (Option<String>, Option<String>) {
+        let prev_home = std::env::var("HOME").ok();
+        let prev_userprofile = std::env::var("USERPROFILE").ok();
+        // SAFETY: test-only, serialized via ENV_MUTEX.
+        unsafe {
+            std::env::set_var("HOME", tmp);
+            std::env::set_var("USERPROFILE", tmp);
+        }
+        (prev_home, prev_userprofile)
+    }
+
+    fn restore_home(prev: (Option<String>, Option<String>)) {
+        // SAFETY: test-only, serialized via ENV_MUTEX.
+        unsafe {
+            match prev.0 {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev.1 {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+
+    // ── remove_mcp_entry edge branches ────────────────────────────────────────
+
+    #[test]
+    fn remove_mcp_entry_malformed_json_is_noop() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("mcp.json");
+        let original = "{not valid json";
+        std::fs::write(&path, original)?;
+        // Malformed → falls back to empty object → no servers key → Ok, no write.
+        remove_mcp_entry(&path, "mcpServers", false)?;
+        assert_eq!(std::fs::read_to_string(&path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_mcp_entry_non_object_top_level_is_noop() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("mcp.json");
+        let original = "[1,2,3]";
+        std::fs::write(&path, original)?;
+        remove_mcp_entry(&path, "mcpServers", false)?;
+        assert_eq!(std::fs::read_to_string(&path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_mcp_entry_servers_not_object_is_noop() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("mcp.json");
+        let original = r#"{"mcpServers":"oops"}"#;
+        std::fs::write(&path, original)?;
+        remove_mcp_entry(&path, "mcpServers", false)?;
+        assert_eq!(std::fs::read_to_string(&path)?, original);
+        Ok(())
+    }
+
+    // ── remove_codex_mcp edge branches ────────────────────────────────────────
+
+    #[test]
+    fn remove_codex_mcp_noop_when_file_missing() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("missing.toml");
+        remove_codex_mcp(&path, false)?;
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_codex_mcp_ahma_absent_preserved() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("config.toml");
+        let original = "[mcp_servers.Other]\ncommand = \"x\"\n";
+        std::fs::write(&path, original)?;
+        remove_codex_mcp(&path, false)?;
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+        assert!(parsed["mcp_servers"]["Other"].get("command").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_codex_mcp_malformed_is_noop() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("config.toml");
+        let original = "this is = = not toml [[[";
+        std::fs::write(&path, original)?;
+        // Parse failure → empty table → no mcp_servers → Ok, no write.
+        remove_codex_mcp(&path, false)?;
+        assert_eq!(std::fs::read_to_string(&path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_codex_mcp_servers_not_table() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "mcp_servers = \"scalar\"\n")?;
+        // mcp_servers present but not a table → if-let skipped → re-serialize unchanged.
+        remove_codex_mcp(&path, false)?;
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(parsed["mcp_servers"].as_str(), Some("scalar"));
+        Ok(())
+    }
+
+    // ── installed_plugins / disable edge branches ─────────────────────────────
+
+    #[test]
+    fn remove_installed_plugin_entry_noop_when_missing() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("missing.json");
+        remove_installed_plugin_entry(&path, "ahma@local", false)?;
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_installed_plugin_entry_key_absent_preserved() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("installed_plugins.json");
+        let original = r#"{"version":2,"plugins":{"other@local":[{}]}}"#;
+        std::fs::write(&path, original)?;
+        remove_installed_plugin_entry(&path, "ahma@local", false)?;
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert!(!parsed["plugins"]["other@local"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_installed_plugin_entry_plugins_not_object() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("installed_plugins.json");
+        let original = r#"{"version":2,"plugins":"oops"}"#;
+        std::fs::write(&path, original)?;
+        remove_installed_plugin_entry(&path, "ahma@local", false)?;
+        assert_eq!(std::fs::read_to_string(&path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_installed_plugin_entry_dry_run_no_write() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("installed_plugins.json");
+        let original = r#"{"version":2,"plugins":{"ahma@local":[{}]}}"#;
+        std::fs::write(&path, original)?;
+        remove_installed_plugin_entry(&path, "ahma@local", true)?;
+        assert_eq!(std::fs::read_to_string(&path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn disable_claude_plugin_noop_when_missing() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("missing.json");
+        disable_claude_plugin(&path, "ahma@local", false)?;
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn disable_claude_plugin_enabled_section_absent() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("settings.json");
+        let original = r#"{"hooks":{}}"#;
+        std::fs::write(&path, original)?;
+        disable_claude_plugin(&path, "ahma@local", false)?;
+        assert_eq!(std::fs::read_to_string(&path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn disable_claude_plugin_key_absent_preserved() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("settings.json");
+        let original = r#"{"enabledPlugins":{"other@local":true}}"#;
+        std::fs::write(&path, original)?;
+        disable_claude_plugin(&path, "ahma@local", false)?;
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(parsed["enabledPlugins"]["other@local"], true);
+        Ok(())
+    }
+
+    // ── remove_claude_plugin (home-injected) ──────────────────────────────────
+
+    #[test]
+    fn remove_claude_plugin_full_teardown() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        let plugins_cache = home
+            .join(".claude")
+            .join("plugins")
+            .join("cache")
+            .join("local")
+            .join("ahma")
+            .join("0.1.0");
+        std::fs::create_dir_all(&plugins_cache)?;
+        std::fs::write(plugins_cache.join("marker.txt"), "x")?;
+
+        let installed = home
+            .join(".claude")
+            .join("plugins")
+            .join("installed_plugins.json");
+        std::fs::write(
+            &installed,
+            r#"{"version":2,"plugins":{"ahma@local":[{}],"keep@local":[{}]}}"#,
+        )?;
+
+        let settings = home.join(".claude").join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"enabledPlugins":{"ahma@local":true,"keep@local":true}}"#,
+        )?;
+
+        remove_claude_plugin(home, false, false)?;
+
+        let cache_root = home
+            .join(".claude")
+            .join("plugins")
+            .join("cache")
+            .join("local")
+            .join("ahma");
+        assert!(!cache_root.exists(), "plugin cache tree removed");
+
+        let installed_parsed: Value = serde_json::from_str(&std::fs::read_to_string(&installed)?)?;
+        assert!(installed_parsed["plugins"]["ahma@local"].is_null());
+        assert!(!installed_parsed["plugins"]["keep@local"].is_null());
+
+        let settings_parsed: Value = serde_json::from_str(&std::fs::read_to_string(&settings)?)?;
+        assert!(settings_parsed["enabledPlugins"]["ahma@local"].is_null());
+        assert_eq!(settings_parsed["enabledPlugins"]["keep@local"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_claude_plugin_dry_run_keeps_cache() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        let plugins_cache = home
+            .join(".claude")
+            .join("plugins")
+            .join("cache")
+            .join("local")
+            .join("ahma");
+        std::fs::create_dir_all(&plugins_cache)?;
+        remove_claude_plugin(home, true, false)?;
+        assert!(plugins_cache.exists(), "dry-run must not remove cache");
+        Ok(())
+    }
+
+    #[test]
+    fn remove_claude_plugin_nothing_present_is_ok() -> Result<()> {
+        let tmp = tempdir()?;
+        // No ~/.claude tree at all — should succeed silently.
+        remove_claude_plugin(tmp.path(), false, true)?;
+        Ok(())
+    }
+
+    // ── remove_platform_mcp per-platform branches ─────────────────────────────
+
+    fn write_json(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn remove_platform_mcp_claude_code() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        write_json(
+            &home.join(".claude.json"),
+            r#"{"mcpServers":{"Ahma":{"type":"stdio"}}}"#,
+        );
+        let name = remove_platform_mcp(Platform::ClaudeCode, home, false)?;
+        assert_eq!(name, Some("Claude Code"));
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json"))?)?;
+        assert!(parsed.as_object().unwrap().get("mcpServers").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_platform_mcp_cursor() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        write_json(
+            &home.join(".cursor").join("mcp.json"),
+            r#"{"mcpServers":{"Ahma":{"type":"stdio"},"Keep":{"type":"stdio"}}}"#,
+        );
+        let name = remove_platform_mcp(Platform::Cursor, home, false)?;
+        assert_eq!(name, Some("Cursor"));
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(
+            home.join(".cursor").join("mcp.json"),
+        )?)?;
+        assert!(parsed["mcpServers"]["Ahma"].is_null());
+        assert!(!parsed["mcpServers"]["Keep"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_platform_mcp_antigravity() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        write_json(
+            &home.join(".gemini").join("config").join("mcp_config.json"),
+            r#"{"mcpServers":{"Ahma":{"type":"stdio"}}}"#,
+        );
+        let name = remove_platform_mcp(Platform::Antigravity, home, false)?;
+        assert_eq!(name, Some("Antigravity"));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_platform_mcp_lmstudio() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        write_json(
+            &home.join(".lmstudio").join("mcp.json"),
+            r#"{"mcpServers":{"Ahma":{"type":"stdio"}}}"#,
+        );
+        let name = remove_platform_mcp(Platform::LmStudio, home, false)?;
+        assert_eq!(name, Some("LM Studio"));
+        Ok(())
+    }
+
+    #[test]
+    fn remove_platform_mcp_codex() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        let cfg = home.join(".codex").join("config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap())?;
+        std::fs::write(&cfg, "[mcp_servers.Ahma]\ncommand = \"ahma\"\n")?;
+        let name = remove_platform_mcp(Platform::Codex, home, false)?;
+        assert_eq!(name, Some("Codex CLI"));
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&cfg)?)?;
+        assert!(parsed.get("mcp_servers").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_platform_mcp_copilot_is_none() -> Result<()> {
+        let tmp = tempdir()?;
+        let name = remove_platform_mcp(Platform::Copilot, tmp.path(), false)?;
+        assert_eq!(name, None);
+        Ok(())
+    }
+
+    #[test]
+    fn remove_platform_mcp_vscode_and_desktop_dry_run() -> Result<()> {
+        // These use real-home-derived paths internally; drive with dry_run so no
+        // mutation occurs, but the branch returning Some(name) is exercised.
+        let tmp = tempdir()?;
+        assert_eq!(
+            remove_platform_mcp(Platform::VsCode, tmp.path(), true)?,
+            Some("VS Code (GitHub Copilot Chat)")
+        );
+        assert_eq!(
+            remove_platform_mcp(Platform::ClaudeDesktop, tmp.path(), true)?,
+            Some("Claude Desktop")
+        );
+        Ok(())
+    }
+
+    // ── uninstall_mcp_config (home-injected via HOME) ─────────────────────────
+
+    #[test]
+    fn uninstall_mcp_config_collects_removed_names() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempdir()?;
+        let prev = set_home(tmp.path());
+        write_json(
+            &tmp.path().join(".cursor").join("mcp.json"),
+            r#"{"mcpServers":{"Ahma":{"type":"stdio"}}}"#,
+        );
+        let result = uninstall_mcp_config(&[Platform::Cursor, Platform::Copilot], false);
+        restore_home(prev);
+        let removed = result?;
+        // Copilot has no MCP path (filtered by supports_mcp); Cursor yields a name.
+        assert_eq!(removed, vec!["Cursor"]);
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_mcp_config_empty_platforms() -> Result<()> {
+        let removed = uninstall_mcp_config(&[], false)?;
+        assert!(removed.is_empty());
+        Ok(())
+    }
+
+    // ── uninstall_terminal_hooks ──────────────────────────────────────────────
+
+    #[test]
+    fn uninstall_terminal_hooks_empty_when_no_hook_platforms() -> Result<()> {
+        // VsCode does not support hooks → hook_platforms empty → early return.
+        let removed = uninstall_terminal_hooks(&[Platform::VsCode], false)?;
+        assert!(removed.is_empty());
+        Ok(())
+    }
+
+    // ── uninstall_agent_skills (home-injected) ────────────────────────────────
+
+    #[test]
+    fn uninstall_agent_skills_removes_skill_dir() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempdir()?;
+        let prev = set_home(tmp.path());
+        let skill_dir = tmp.path().join(".agents").join("skills").join("ahma");
+        std::fs::create_dir_all(&skill_dir).ok();
+        std::fs::write(skill_dir.join("SKILL.md"), "x").ok();
+        let result = uninstall_agent_skills(false, false);
+        let still_there = skill_dir.exists();
+        restore_home(prev);
+        result?;
+        assert!(!still_there, "skill dir should be removed");
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_agent_skills_dry_run_keeps_dir() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempdir()?;
+        let prev = set_home(tmp.path());
+        let skill_dir = tmp.path().join(".agents").join("skills").join("ahma");
+        std::fs::create_dir_all(&skill_dir).ok();
+        let result = uninstall_agent_skills(true, true);
+        let still_there = skill_dir.exists();
+        restore_home(prev);
+        result?;
+        assert!(still_there, "dry-run keeps skill dir");
+        Ok(())
+    }
+
+    // ── purge_ahma_dir (home-injected) ────────────────────────────────────────
+
+    #[test]
+    fn purge_ahma_dir_removes_data_and_empty_sandbox() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempdir()?;
+        let prev = set_home(tmp.path());
+        let ahma_dir = tmp.path().join(".ahma");
+        std::fs::create_dir_all(&ahma_dir).ok();
+        std::fs::write(ahma_dir.join("settings.json"), "{}").ok();
+        let sandbox = tmp.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox).ok();
+        let result = purge_ahma_dir(false);
+        let ahma_gone = !ahma_dir.exists();
+        let sandbox_gone = !sandbox.exists();
+        restore_home(prev);
+        result?;
+        assert!(ahma_gone, ".ahma removed");
+        assert!(sandbox_gone, "empty sandbox removed");
+        Ok(())
+    }
+
+    #[test]
+    fn purge_ahma_dir_keeps_nonempty_sandbox() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempdir()?;
+        let prev = set_home(tmp.path());
+        let sandbox = tmp.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox).ok();
+        std::fs::write(sandbox.join("important.txt"), "user data").ok();
+        let result = purge_ahma_dir(false);
+        let still_there = sandbox.exists();
+        restore_home(prev);
+        result?;
+        assert!(still_there, "non-empty sandbox preserved");
+        Ok(())
+    }
+
+    #[test]
+    fn purge_ahma_dir_dry_run_keeps_everything() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempdir()?;
+        let prev = set_home(tmp.path());
+        let ahma_dir = tmp.path().join(".ahma");
+        std::fs::create_dir_all(&ahma_dir).ok();
+        let result = purge_ahma_dir(true);
+        let still_there = ahma_dir.exists();
+        restore_home(prev);
+        result?;
+        assert!(still_there, "dry-run keeps .ahma");
+        Ok(())
+    }
+
+    // ── resolve_install_dir / uninstall_binary ────────────────────────────────
+
+    #[test]
+    fn resolve_install_dir_honors_env() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempdir()?;
+        let prev = std::env::var("AHMA_INSTALL_DIR").ok();
+        // SAFETY: test-only, serialized via ENV_MUTEX.
+        unsafe { std::env::set_var("AHMA_INSTALL_DIR", tmp.path()) };
+        let dir = resolve_install_dir();
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AHMA_INSTALL_DIR", v),
+                None => std::env::remove_var("AHMA_INSTALL_DIR"),
+            }
+        }
+        assert_eq!(dir?, tmp.path());
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_binary_dry_run_keeps_binary() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempdir()?;
+        let prev = std::env::var("AHMA_INSTALL_DIR").ok();
+        // SAFETY: test-only, serialized via ENV_MUTEX.
+        unsafe { std::env::set_var("AHMA_INSTALL_DIR", tmp.path()) };
+        let binary_name = if cfg!(windows) { "ahma.exe" } else { "ahma" };
+        let bin = tmp.path().join(binary_name);
+        std::fs::write(&bin, "binary").ok();
+        let result = uninstall_binary(true);
+        let still_there = bin.exists();
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AHMA_INSTALL_DIR", v),
+                None => std::env::remove_var("AHMA_INSTALL_DIR"),
+            }
+        }
+        result?;
+        assert!(still_there, "dry-run keeps binary");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_binary_removes_binary_and_old() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempdir()?;
+        let prev = std::env::var("AHMA_INSTALL_DIR").ok();
+        // SAFETY: test-only, serialized via ENV_MUTEX.
+        unsafe { std::env::set_var("AHMA_INSTALL_DIR", tmp.path()) };
+        let bin = tmp.path().join("ahma");
+        let old = tmp.path().join("ahma.old");
+        std::fs::write(&bin, "binary").ok();
+        std::fs::write(&old, "old").ok();
+        let result = uninstall_binary(false);
+        let bin_gone = !bin.exists();
+        let old_gone = !old.exists();
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AHMA_INSTALL_DIR", v),
+                None => std::env::remove_var("AHMA_INSTALL_DIR"),
+            }
+        }
+        result?;
+        assert!(bin_gone, "binary removed");
+        assert!(old_gone, "ahma.old removed");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_binary_missing_binary_is_ok() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempdir()?;
+        let prev = std::env::var("AHMA_INSTALL_DIR").ok();
+        // SAFETY: test-only, serialized via ENV_MUTEX.
+        unsafe { std::env::set_var("AHMA_INSTALL_DIR", tmp.path()) };
+        let result = uninstall_binary(false);
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AHMA_INSTALL_DIR", v),
+                None => std::env::remove_var("AHMA_INSTALL_DIR"),
+            }
+        }
+        result?;
+        Ok(())
+    }
+
+    // ── execute_actions dispatcher (dry-run, home-injected) ───────────────────
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn execute_actions_dry_run_dispatches_all() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = tempdir()?;
+        let prev = set_home(tmp.path());
+        // Seed a cursor MCP config so the MCP branch finds something.
+        write_json(
+            &tmp.path().join(".cursor").join("mcp.json"),
+            r#"{"mcpServers":{"Ahma":{"type":"stdio"}}}"#,
+        );
+        // AHMA_INSTALL_DIR points at temp so binary teardown is harmless.
+        let prev_install = std::env::var("AHMA_INSTALL_DIR").ok();
+        // SAFETY: test-only, serialized via ENV_MUTEX.
+        unsafe { std::env::set_var("AHMA_INSTALL_DIR", tmp.path()) };
+
+        let result = execute_actions(
+            &[
+                UninstallAction::Mcp,
+                UninstallAction::Skills,
+                UninstallAction::Binary,
+            ],
+            &[Platform::Cursor],
+            true, // dry_run
+            true, // purge
+            false,
+        )
+        .await;
+
+        // SAFETY: restore.
+        unsafe {
+            match prev_install {
+                Some(v) => std::env::set_var("AHMA_INSTALL_DIR", v),
+                None => std::env::remove_var("AHMA_INSTALL_DIR"),
+            }
+        }
+        // Cursor config must be untouched in dry-run.
+        let unchanged = std::fs::read_to_string(tmp.path().join(".cursor").join("mcp.json"))?;
+        restore_home(prev);
+        result?;
+        assert!(unchanged.contains("Ahma"), "dry-run leaves config intact");
+        Ok(())
+    }
+
+    // ── select_actions / select_platforms additional coverage ─────────────────
+
+    #[test]
+    fn select_actions_all_flags() {
+        let args = UninstallArgs {
+            auto: false,
+            mcp: true,
+            hooks: true,
+            skills: true,
+            binary: true,
+            platforms: Vec::new(),
+            purge: false,
+            dry_run: false,
+        };
+        let actions = select_actions(&args, false);
+        assert_eq!(actions.len(), 4);
+        assert!(actions.contains(&UninstallAction::Skills));
+        assert!(actions.contains(&UninstallAction::Binary));
+    }
+
+    #[test]
+    fn select_platforms_no_filter_non_interactive_returns_relevant() {
+        // Hooks action only → relevant platforms are those supporting hooks.
+        let actions = vec![UninstallAction::Hooks];
+        let platforms = select_platforms(&actions, &[], false);
+        assert!(!platforms.is_empty());
+        assert!(platforms.iter().all(|p| p.supports_hooks()));
+        // VS Code does not support hooks → excluded.
+        assert!(!platforms.iter().any(|p| p.cli_name() == "vscode"));
+    }
+
+    #[test]
+    fn select_platforms_filter_by_label_case_insensitive() {
+        let actions = vec![UninstallAction::Mcp];
+        let platforms = select_platforms(&actions, &["claude code".to_string()], false);
+        assert_eq!(platforms.len(), 1);
+        assert_eq!(platforms[0].cli_name(), "claude");
+    }
+
+    #[test]
+    fn select_platforms_filter_no_match_empty() {
+        let actions = vec![UninstallAction::Mcp];
+        let platforms = select_platforms(&actions, &["does-not-exist".to_string()], false);
+        assert!(platforms.is_empty());
+    }
+
+    #[test]
+    fn select_platforms_mcp_excludes_copilot() {
+        let actions = vec![UninstallAction::Mcp];
+        let platforms = select_platforms(&actions, &[], false);
+        assert!(!platforms.iter().any(|p| p.cli_name() == "copilot"));
+    }
+
+    // ── enum metadata coverage ────────────────────────────────────────────────
+
+    #[test]
+    fn action_labels_and_platform_specificity() {
+        for &a in UNINSTALL_ACTIONS {
+            assert!(!a.label().is_empty());
+        }
+        assert!(UninstallAction::Mcp.is_platform_specific());
+        assert!(UninstallAction::Hooks.is_platform_specific());
+        assert!(!UninstallAction::Skills.is_platform_specific());
+        assert!(!UninstallAction::Binary.is_platform_specific());
+    }
+
+    #[test]
+    fn platform_metadata_is_consistent() {
+        for &p in PLATFORMS {
+            assert!(!p.label().is_empty());
+            assert!(!p.cli_name().is_empty());
+            // Every hook-supporting platform must map to a HookPlatform, and
+            // hook_platform() is None for non-hook platforms in this set.
+            if p.hook_platform().is_some() {
+                assert!(p.supports_hooks());
+            }
+        }
+        assert!(!Platform::Copilot.supports_mcp());
+        assert!(Platform::Cursor.supports_mcp());
+        assert!(!Platform::VsCode.supports_hooks());
+        assert!(!Platform::ClaudeDesktop.supports_hooks());
+        assert!(!Platform::LmStudio.supports_hooks());
+        assert!(Platform::ClaudeCode.supports_hooks());
+    }
+
+    // ── parse helpers additional coverage ─────────────────────────────────────
+
+    #[test]
+    fn parse_digit_sequence_dedups_and_bounds() {
+        // "1123" with max 4 → indices [0,1,2], duplicates ignored, 3 in range.
+        let result = parse_selection_string("1123", 4);
+        assert_eq!(result, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn parse_separated_list_ignores_out_of_range_and_dups() {
+        // max 3 → "1 2 5 2" → [0,1] (5 out of range, second 2 deduped).
+        let result = parse_selection_string("1 2 5 2", 3);
+        assert_eq!(result, vec![0, 1]);
+    }
+
+    #[test]
+    fn parse_selection_string_large_max_uses_separated() {
+        // max_val >= 10 forces the separated-list path even for pure digits.
+        let result = parse_selection_string("12", 20);
+        assert_eq!(result, vec![11]);
+    }
+
+    #[test]
+    fn parse_selection_string_empty_is_empty() {
+        assert!(parse_selection_string("", 4).is_empty());
+        assert!(parse_selection_string("   ", 4).is_empty());
+    }
+
+    #[test]
+    fn parse_selection_string_dotted_and_semicolon_separators() {
+        let result = parse_selection_string("1.3;2", 4);
+        assert_eq!(result, vec![0, 2, 1]);
+    }
+
+    // ── prompt_multi_select_all non-interactive ───────────────────────────────
+
+    #[test]
+    fn prompt_multi_select_all_non_interactive_selects_all() {
+        let labels = ["a", "b", "c"];
+        let result = prompt_multi_select_all(false, "q", &labels);
+        assert_eq!(result, vec![0, 1, 2]);
+    }
+
+    // ── print_restart_hints (smoke, no panic) ─────────────────────────────────
+
+    #[test]
+    fn print_restart_hints_variants_do_not_panic() {
+        print_restart_hints(true, &["Cursor", "Claude Code"], false);
+        print_restart_hints(false, &[], false);
+        print_restart_hints(true, &[], false);
+        print_restart_hints(true, &["Cursor"], true); // dry_run branch
+    }
 }

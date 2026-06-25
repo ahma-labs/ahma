@@ -1076,4 +1076,534 @@ mod tests {
         // The assertion that failClosed is false lives in hooks/mod.rs:
         //   test_cursor_hook_default_has_fail_closed_false
     }
+
+    // ─── Test helpers ─────────────────────────────────────────────────────────
+
+    fn setup_args(auto: bool, mcp: bool, hooks: bool, skills: bool, tls: bool) -> SetupArgs {
+        SetupArgs {
+            auto,
+            mcp,
+            hooks,
+            skills,
+            tls,
+        }
+    }
+
+    // ─── mcp_shared_transport_url ─────────────────────────────────────────────
+
+    #[test]
+    fn test_mcp_shared_transport_url_variants() {
+        assert_eq!(
+            mcp_shared_transport_url("http"),
+            Some("http://localhost:3000/mcp")
+        );
+        assert_eq!(
+            mcp_shared_transport_url("unix"),
+            Some("unix:///tmp/ahma.sock#/mcp")
+        );
+        assert_eq!(mcp_shared_transport_url("stdio"), None);
+        assert_eq!(mcp_shared_transport_url("bogus"), None);
+    }
+
+    // ─── build_mcp_servers_entry ──────────────────────────────────────────────
+
+    #[test]
+    fn test_build_mcp_servers_entry_http() {
+        let entry = build_mcp_servers_entry("http");
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "http://localhost:3000/mcp");
+        assert!(entry.get("args").is_none());
+    }
+
+    #[test]
+    fn test_build_mcp_servers_entry_unix() {
+        let entry = build_mcp_servers_entry("unix");
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "unix:///tmp/ahma.sock#/mcp");
+    }
+
+    #[test]
+    fn test_build_mcp_servers_entry_stdio() {
+        let entry = build_mcp_servers_entry("stdio");
+        assert_eq!(entry["type"], "stdio");
+        assert_eq!(entry["command"], "ahma");
+        let args = entry["args"].as_array().unwrap();
+        assert_eq!(args[0], "serve");
+        assert_eq!(args[1], "stdio");
+        assert!(args.iter().any(|a| a == "--log-monitor"));
+    }
+
+    // ─── build_scoped_servers_entry ───────────────────────────────────────────
+
+    #[test]
+    fn test_build_scoped_servers_entry_http_returns_url_only() {
+        let tmp = tempdir().unwrap();
+        let entry = build_scoped_servers_entry("http", tmp.path());
+        assert_eq!(entry["url"], "http://localhost:3000/mcp");
+        assert!(entry.get("command").is_none());
+        // Shared-transport path must NOT pre-create the sandbox directory.
+        assert!(!tmp.path().join("sandbox").exists());
+    }
+
+    #[test]
+    fn test_build_scoped_servers_entry_unix_returns_url_only() {
+        let tmp = tempdir().unwrap();
+        let entry = build_scoped_servers_entry("unix", tmp.path());
+        assert_eq!(entry["url"], "unix:///tmp/ahma.sock#/mcp");
+        assert!(entry.get("command").is_none());
+    }
+
+    // ─── build_claude_desktop_mcp_entry ───────────────────────────────────────
+
+    #[test]
+    fn test_build_claude_desktop_mcp_entry_http() {
+        let tmp = tempdir().unwrap();
+        let entry = build_claude_desktop_mcp_entry("http", tmp.path());
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "http://localhost:3000/mcp");
+    }
+
+    #[test]
+    fn test_build_claude_desktop_mcp_entry_unix() {
+        let tmp = tempdir().unwrap();
+        let entry = build_claude_desktop_mcp_entry("unix", tmp.path());
+        assert_eq!(entry["type"], "http");
+        assert_eq!(entry["url"], "unix:///tmp/ahma.sock#/mcp");
+    }
+
+    #[test]
+    fn test_build_claude_desktop_mcp_entry_stdio_has_no_type() {
+        let tmp = tempdir().unwrap();
+        let entry = build_claude_desktop_mcp_entry("stdio", tmp.path());
+        assert!(entry.get("type").is_none());
+        assert_eq!(entry["command"], "ahma");
+        assert_eq!(entry["args"][0], "serve");
+    }
+
+    // ─── build_codex_toml_value ───────────────────────────────────────────────
+
+    #[test]
+    fn test_build_codex_toml_value_http() {
+        let v = build_codex_toml_value("http");
+        let t = v.as_table().unwrap();
+        assert_eq!(
+            t.get("url").unwrap().as_str(),
+            Some("http://localhost:3000/mcp")
+        );
+        assert!(t.get("command").is_none());
+    }
+
+    #[test]
+    fn test_build_codex_toml_value_unix() {
+        let v = build_codex_toml_value("unix");
+        let t = v.as_table().unwrap();
+        assert_eq!(
+            t.get("url").unwrap().as_str(),
+            Some("unix:///tmp/ahma.sock#/mcp")
+        );
+    }
+
+    #[test]
+    fn test_build_codex_toml_value_stdio() {
+        let v = build_codex_toml_value("stdio");
+        let t = v.as_table().unwrap();
+        assert_eq!(t.get("command").unwrap().as_str(), Some("ahma"));
+        let args = t.get("args").unwrap().as_array().unwrap();
+        assert_eq!(args[0].as_str(), Some("serve"));
+        assert!(args.iter().any(|a| a.as_str() == Some("--sandbox")));
+    }
+
+    // ─── merge_mcp_json edge cases ────────────────────────────────────────────
+
+    #[test]
+    fn test_merge_mcp_json_malformed_existing_resets_to_object() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("mcp.json");
+        // Not valid JSON at all -> from_str fails -> falls back to empty object.
+        std::fs::write(&path, "this is not json {{")?;
+        merge_mcp_json(&path, "mcpServers", json!({"command": "ahma"}))?;
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(parsed["mcpServers"]["Ahma"]["command"], "ahma");
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_mcp_json_non_object_root_resets() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("mcp.json");
+        // Valid JSON but a top-level array, not an object.
+        std::fs::write(&path, "[1, 2, 3]")?;
+        merge_mcp_json(&path, "mcpServers", json!({"command": "ahma"}))?;
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert!(parsed.is_object());
+        assert_eq!(parsed["mcpServers"]["Ahma"]["command"], "ahma");
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_mcp_json_servers_key_not_object_is_replaced() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("mcp.json");
+        // mcpServers exists but is a string, not an object -> replaced.
+        std::fs::write(&path, r#"{"mcpServers": "oops"}"#)?;
+        merge_mcp_json(&path, "mcpServers", json!({"command": "ahma"}))?;
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        assert!(parsed["mcpServers"].is_object());
+        assert_eq!(parsed["mcpServers"]["Ahma"]["command"], "ahma");
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_mcp_json_creates_parent_dirs() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("nested").join("deeper").join("mcp.json");
+        merge_mcp_json(&path, "mcpServers", json!({"command": "ahma"}))?;
+        assert!(path.exists());
+        Ok(())
+    }
+
+    // ─── merge_codex_toml edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn test_merge_codex_toml_malformed_existing_resets() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "this = = = not valid toml [[[")?;
+        merge_codex_toml(&path, build_codex_toml_value("stdio"))?;
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+        assert_eq!(
+            parsed["mcp_servers"]["Ahma"]["command"].as_str(),
+            Some("ahma")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_merge_codex_toml_servers_key_not_table_is_replaced() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("config.toml");
+        // mcp_servers exists but is a string.
+        std::fs::write(&path, "mcp_servers = \"oops\"")?;
+        merge_codex_toml(&path, build_codex_toml_value("stdio"))?;
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+        assert!(parsed["mcp_servers"].is_table());
+        assert_eq!(
+            parsed["mcp_servers"]["Ahma"]["command"].as_str(),
+            Some("ahma")
+        );
+        Ok(())
+    }
+
+    // ─── select_actions ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_select_actions_explicit_flags() {
+        let args = setup_args(false, true, false, true, false);
+        let actions = select_actions(&args, false);
+        // Order is skills, mcp, hooks, tls per the flag checks.
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0] == SetupAction::Skills);
+        assert!(actions[1] == SetupAction::Mcp);
+    }
+
+    #[test]
+    fn test_select_actions_single_flag() {
+        let args = setup_args(false, false, false, false, true);
+        let actions = select_actions(&args, false);
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0] == SetupAction::Tls);
+    }
+
+    #[test]
+    fn test_select_actions_no_flags_noninteractive_selects_all() {
+        let args = setup_args(true, false, false, false, false);
+        let actions = select_actions(&args, false);
+        assert_eq!(actions.len(), SETUP_ACTIONS.len());
+        assert!(actions.contains(&SetupAction::Mcp));
+        assert!(actions.contains(&SetupAction::Tls));
+    }
+
+    // ─── select_platforms ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_select_platforms_mcp_excludes_copilot() {
+        let platforms = select_platforms(&[SetupAction::Mcp], false);
+        // Every platform supports MCP except Copilot.
+        assert_eq!(platforms.len(), PLATFORMS.len() - 1);
+        assert!(!platforms.contains(&Platform::Copilot));
+        assert!(platforms.contains(&Platform::ClaudeCode));
+    }
+
+    #[test]
+    fn test_select_platforms_hooks_only() {
+        let platforms = select_platforms(&[SetupAction::Hooks], false);
+        // Hooks unsupported by VsCode, ClaudeDesktop, LmStudio.
+        assert!(!platforms.contains(&Platform::VsCode));
+        assert!(!platforms.contains(&Platform::ClaudeDesktop));
+        assert!(!platforms.contains(&Platform::LmStudio));
+        assert!(platforms.contains(&Platform::Copilot));
+        assert!(platforms.contains(&Platform::ClaudeCode));
+    }
+
+    #[test]
+    fn test_select_platforms_union_of_mcp_and_hooks() {
+        let platforms = select_platforms(&[SetupAction::Mcp, SetupAction::Hooks], false);
+        // Union covers everything (Copilot via hooks, VsCode via mcp).
+        assert_eq!(platforms.len(), PLATFORMS.len());
+    }
+
+    // ─── prompt_multi_select_all (non-interactive) ────────────────────────────
+
+    #[test]
+    fn test_prompt_multi_select_all_noninteractive_returns_full_range() {
+        let labels = ["a", "b", "c"];
+        let chosen = prompt_multi_select_all(false, "q?", &labels);
+        assert_eq!(chosen, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_prompt_multi_select_all_noninteractive_empty_labels() {
+        let chosen = prompt_multi_select_all(false, "q?", &[]);
+        assert!(chosen.is_empty());
+    }
+
+    // ─── parse helpers: extra boundary cases ──────────────────────────────────
+
+    #[test]
+    fn test_parse_selection_string_empty_input() {
+        // Empty (after trim) is not "all", not pure digits -> separated list -> empty.
+        assert!(parse_selection_string("", 5).is_empty());
+        assert!(parse_selection_string("   ", 5).is_empty());
+    }
+
+    #[test]
+    fn test_parse_selection_string_dedups() {
+        // Repeated digits are deduplicated.
+        assert_eq!(parse_selection_string("112233", 5), vec![0, 1, 2]);
+        assert_eq!(parse_selection_string("1 1 2 2", 5), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_parse_selection_string_pure_digits_large_max_uses_separated() {
+        // max_val >= 10 forces the separated-list parser even for pure digits,
+        // so "12" is read as the single number twelve, not 1 and 2.
+        assert_eq!(parse_selection_string("12", 15), vec![11]);
+    }
+
+    #[test]
+    fn test_parse_digit_sequence_filters_out_of_range() {
+        // Only digits within 1..=max survive.
+        assert_eq!(parse_digit_sequence("0192", 5), vec![0, 1]);
+    }
+
+    #[test]
+    fn test_parse_separated_list_ignores_nonnumeric() {
+        assert_eq!(parse_separated_list("1 foo 3 bar", 5), vec![0, 2]);
+        assert!(parse_separated_list("foo bar", 5).is_empty());
+    }
+
+    // ─── claude_desktop_config_path / vscode_mcp_path ─────────────────────────
+
+    #[test]
+    fn test_claude_desktop_config_path_points_at_claude() {
+        let p = claude_desktop_config_path().expect("home dir resolvable in test env");
+        let s = p.to_string_lossy();
+        assert!(s.contains("Claude"), "path should mention Claude: {s}");
+        assert!(s.ends_with("claude_desktop_config.json"));
+    }
+
+    #[test]
+    fn test_vscode_mcp_path_points_at_code_mcp_json() {
+        let p = vscode_mcp_path().expect("home dir resolvable in test env");
+        let s = p.to_string_lossy();
+        assert!(s.contains("Code"), "path should mention Code: {s}");
+        assert!(s.ends_with("mcp.json"));
+    }
+
+    // ─── SetupAction methods ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_setup_action_labels_and_platform_specificity() {
+        assert_eq!(SetupAction::Skills.label(), "Agent skills");
+        assert_eq!(SetupAction::Mcp.label(), "MCP servers");
+        assert_eq!(SetupAction::Hooks.label(), "Terminal hooks");
+        assert_eq!(SetupAction::Tls.label(), "TLS certificates");
+
+        assert!(SetupAction::Mcp.is_platform_specific());
+        assert!(SetupAction::Hooks.is_platform_specific());
+        assert!(!SetupAction::Skills.is_platform_specific());
+        assert!(!SetupAction::Tls.is_platform_specific());
+    }
+
+    // ─── Platform methods ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_platform_labels_unique_and_nonempty() {
+        for p in PLATFORMS.iter().copied() {
+            assert!(!p.label().is_empty());
+        }
+        assert_eq!(Platform::Copilot.label(), "GitHub Copilot CLI");
+        assert_eq!(Platform::VsCode.label(), "VS Code (GitHub Copilot Chat)");
+    }
+
+    #[test]
+    fn test_platform_supports_mcp() {
+        assert!(!Platform::Copilot.supports_mcp());
+        for p in PLATFORMS
+            .iter()
+            .copied()
+            .filter(|p| *p != Platform::Copilot)
+        {
+            assert!(p.supports_mcp(), "{} should support MCP", p.label());
+        }
+    }
+
+    #[test]
+    fn test_platform_supports_hooks() {
+        assert!(!Platform::VsCode.supports_hooks());
+        assert!(!Platform::ClaudeDesktop.supports_hooks());
+        assert!(!Platform::LmStudio.supports_hooks());
+        assert!(Platform::ClaudeCode.supports_hooks());
+        assert!(Platform::Codex.supports_hooks());
+        assert!(Platform::Cursor.supports_hooks());
+        assert!(Platform::Antigravity.supports_hooks());
+        assert!(Platform::Copilot.supports_hooks());
+    }
+
+    #[test]
+    fn test_platform_hook_platform_mapping() {
+        // Platforms with no terminal-hook wrapper map to None.
+        assert!(Platform::ClaudeDesktop.hook_platform().is_none());
+        assert!(Platform::LmStudio.hook_platform().is_none());
+        assert!(Platform::VsCode.hook_platform().is_none());
+        // The rest map to Some.
+        assert!(Platform::Antigravity.hook_platform().is_some());
+        assert!(Platform::ClaudeCode.hook_platform().is_some());
+        assert!(Platform::Codex.hook_platform().is_some());
+        assert!(Platform::Cursor.hook_platform().is_some());
+        assert!(Platform::Copilot.hook_platform().is_some());
+    }
+
+    // ─── configure_mcp (home-parameterized platforms; safe in tempdir) ────────
+
+    #[test]
+    fn test_configure_mcp_claude_code_writes_claude_json() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        let servers = build_mcp_servers_entry("stdio");
+        let scoped = build_scoped_servers_entry("stdio", home);
+        let name = Platform::ClaudeCode.configure_mcp("stdio", &servers, &scoped, home)?;
+        assert_eq!(name, Some("Claude Code"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json"))?)?;
+        assert_eq!(parsed["mcpServers"]["Ahma"]["type"], "stdio");
+        Ok(())
+    }
+
+    #[test]
+    fn test_configure_mcp_cursor_writes_cursor_mcp_json() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        let servers = build_mcp_servers_entry("stdio");
+        let scoped = build_scoped_servers_entry("stdio", home);
+        let name = Platform::Cursor.configure_mcp("stdio", &servers, &scoped, home)?;
+        assert_eq!(name, Some("Cursor"));
+        let path = home.join(".cursor").join("mcp.json");
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        assert_eq!(parsed["mcpServers"]["Ahma"]["command"], "ahma");
+        Ok(())
+    }
+
+    #[test]
+    fn test_configure_mcp_antigravity_uses_scoped_entry() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        let servers = build_mcp_servers_entry("stdio");
+        let scoped = build_scoped_servers_entry("stdio", home);
+        let name = Platform::Antigravity.configure_mcp("stdio", &servers, &scoped, home)?;
+        assert_eq!(name, Some("Antigravity"));
+        let path = home.join(".gemini").join("config").join("mcp_config.json");
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        // Scoped entry has a --sandbox-scope arg (and no "type" field).
+        let args = parsed["mcpServers"]["Ahma"]["args"].as_array().unwrap();
+        assert!(args.iter().any(|a| a == "--sandbox-scope"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_configure_mcp_lmstudio_uses_scoped_entry() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        let servers = build_mcp_servers_entry("stdio");
+        let scoped = build_scoped_servers_entry("stdio", home);
+        let name = Platform::LmStudio.configure_mcp("stdio", &servers, &scoped, home)?;
+        assert_eq!(name, Some("LM Studio"));
+        let path = home.join(".lmstudio").join("mcp.json");
+        assert!(path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn test_configure_mcp_codex_writes_toml() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        let servers = build_mcp_servers_entry("http");
+        let scoped = build_scoped_servers_entry("http", home);
+        let name = Platform::Codex.configure_mcp("http", &servers, &scoped, home)?;
+        assert_eq!(name, Some("Codex CLI"));
+        let path = home.join(".codex").join("config.toml");
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(path)?)?;
+        assert_eq!(
+            parsed["mcp_servers"]["Ahma"]["url"].as_str(),
+            Some("http://localhost:3000/mcp")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_configure_mcp_copilot_returns_none() -> Result<()> {
+        let tmp = tempdir()?;
+        let home = tmp.path();
+        let servers = build_mcp_servers_entry("stdio");
+        let scoped = build_scoped_servers_entry("stdio", home);
+        let name = Platform::Copilot.configure_mcp("stdio", &servers, &scoped, home)?;
+        assert_eq!(name, None);
+        Ok(())
+    }
+
+    // ─── setup_terminal_hooks: early-return when no platform supports hooks ────
+
+    #[tokio::test]
+    async fn test_setup_terminal_hooks_no_hook_platforms_is_noop() -> Result<()> {
+        // VsCode/ClaudeDesktop/LmStudio do not support hooks, so the install
+        // path is skipped and the function returns Ok without touching the FS.
+        setup_terminal_hooks(
+            &[
+                Platform::VsCode,
+                Platform::ClaudeDesktop,
+                Platform::LmStudio,
+            ],
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    // ─── print_mcp_restart_hints (smoke; covers transport match arms) ─────────
+
+    #[test]
+    fn test_print_mcp_restart_hints_noninteractive_is_noop() {
+        // Non-interactive returns early; just exercise the guard.
+        print_mcp_restart_hints(false, &["Cursor"], "http");
+    }
+
+    #[test]
+    fn test_print_mcp_restart_hints_interactive_transport_arms() {
+        // Exercise each transport branch (http / unix / stdio default).
+        print_mcp_restart_hints(true, &["Cursor"], "http");
+        print_mcp_restart_hints(true, &["Cursor"], "unix");
+        print_mcp_restart_hints(true, &["Cursor"], "stdio");
+        // Empty configured list returns early even when interactive.
+        print_mcp_restart_hints(true, &[], "http");
+    }
 }

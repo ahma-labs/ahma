@@ -1174,3 +1174,618 @@ async fn forward_request_sse(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peer::{BoxFuture, PeerFactory, PeerStreams};
+    use crate::session::SessionManagerConfig;
+    use ahma_common::sandbox_state::SandboxState;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    // ─── Test helpers ────────────────────────────────────────────────────
+
+    /// A peer whose "stdout" never reaches EOF, so the bridge I/O loop blocks
+    /// and the session stays alive (not terminated) for the duration of a test.
+    struct KeepAlivePeerFactory;
+    impl PeerFactory for KeepAlivePeerFactory {
+        fn create(&self) -> BoxFuture<anyhow::Result<PeerStreams>> {
+            Box::pin(async move {
+                let (bridge_end, peer_end) = tokio::io::duplex(1024);
+                // Leak the peer end so the bridge read side never sees EOF.
+                std::mem::forget(peer_end);
+                let (bridge_read, bridge_write) = tokio::io::split(bridge_end);
+                Ok(PeerStreams {
+                    stdin: Box::new(bridge_write),
+                    stdout: Box::new(bridge_read),
+                    stderr: None,
+                    shutdown_fn: None,
+                })
+            })
+        }
+    }
+
+    /// A peer factory that always fails to construct.
+    struct FailingPeerFactory;
+    impl PeerFactory for FailingPeerFactory {
+        fn create(&self) -> BoxFuture<anyhow::Result<PeerStreams>> {
+            Box::pin(async move { Err(anyhow::anyhow!("peer construction failed")) })
+        }
+    }
+
+    fn manager_with(
+        default_scope: Option<PathBuf>,
+        max_sessions: usize,
+        handshake_timeout_secs: u64,
+        factory: Arc<dyn PeerFactory>,
+    ) -> Arc<SessionManager> {
+        Arc::new(SessionManager::new(SessionManagerConfig {
+            server_command: String::new(),
+            server_args: vec![],
+            default_scope,
+            enable_colored_output: false,
+            handshake_timeout_secs,
+            max_sessions,
+            peer_factory: Some(factory),
+        }))
+    }
+
+    fn keepalive_manager() -> Arc<SessionManager> {
+        manager_with(None, 10, 3600, Arc::new(KeepAlivePeerFactory))
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body bytes");
+        serde_json::from_slice(&bytes).expect("body is valid JSON")
+    }
+
+    async fn body_string(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body bytes");
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
+    fn header_session_id(resp: &Response) -> Option<String> {
+        resp.headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    }
+
+    fn content_type(resp: &Response) -> String {
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn headers_with_session(id: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(MCP_SESSION_ID_HEADER, HeaderValue::from_str(id).unwrap());
+        h
+    }
+
+    // ─── Pure response builders ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn json_response_is_ok_with_json_body() {
+        let resp = json_response(json!({"a": 1, "b": "x"}));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(content_type(&resp).contains("application/json"));
+        assert_eq!(body_json(resp).await, json!({"a": 1, "b": "x"}));
+    }
+
+    #[tokio::test]
+    async fn json_response_with_status_uses_given_status() {
+        let resp = json_response_with_status(StatusCode::IM_A_TEAPOT, json!({"k": true}));
+        assert_eq!(resp.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(body_json(resp).await, json!({"k": true}));
+    }
+
+    #[test]
+    fn json_rpc_error_value_has_code_and_message() {
+        let v = json_rpc_error_value(-32000, "boom");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["error"]["code"], -32000);
+        assert_eq!(v["error"]["message"], "boom");
+    }
+
+    #[test]
+    fn with_session_header_attaches_valid_id() {
+        let resp = with_session_header(json_response(json!({})), "session-abc");
+        assert_eq!(header_session_id(&resp).as_deref(), Some("session-abc"));
+    }
+
+    #[test]
+    fn with_session_header_falls_back_on_invalid_id() {
+        // Newline is not a valid header value character.
+        let resp = with_session_header(json_response(json!({})), "bad\nvalue");
+        assert_eq!(header_session_id(&resp).as_deref(), Some("invalid"));
+    }
+
+    #[tokio::test]
+    async fn error_response_defaults_to_500() {
+        let resp = error_response(-32603, "internal");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32603);
+        assert_eq!(body["error"]["message"], "internal");
+    }
+
+    #[tokio::test]
+    async fn error_response_with_status_honors_status() {
+        let resp = error_response_with_status(StatusCode::FORBIDDEN, -32000, "nope");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(resp).await["error"]["code"], -32000);
+    }
+
+    #[tokio::test]
+    async fn missing_session_id_response_is_400() {
+        let resp = missing_session_id_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32600);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_not_found_response_is_403() {
+        let resp = session_not_found_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32600);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not found")
+        );
+    }
+
+    // ─── validate_initialize_payload ────────────────────────────────────
+
+    #[tokio::test]
+    async fn validate_initialize_payload_rejects_missing_protocol_version() {
+        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let resp = validate_initialize_payload(&payload).expect("should reject");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn validate_initialize_payload_accepts_valid() {
+        let payload = json!({"params": {"protocolVersion": "2025-03-26"}});
+        assert!(validate_initialize_payload(&payload).is_none());
+    }
+
+    // ─── is_client_response ─────────────────────────────────────────────
+
+    #[test]
+    fn is_client_response_true_for_result_without_method() {
+        let payload = json!({"id": 1, "result": {}});
+        assert!(is_client_response(None, &payload));
+    }
+
+    #[test]
+    fn is_client_response_true_for_error_without_method() {
+        let payload = json!({"id": 1, "error": {"code": -1}});
+        assert!(is_client_response(None, &payload));
+    }
+
+    #[test]
+    fn is_client_response_false_when_method_present() {
+        let payload = json!({"id": 1, "result": {}});
+        assert!(!is_client_response(Some("tools/call"), &payload));
+    }
+
+    #[test]
+    fn is_client_response_false_without_result_or_error() {
+        let payload = json!({"id": 1});
+        assert!(!is_client_response(None, &payload));
+    }
+
+    #[test]
+    fn is_client_response_false_without_id() {
+        let payload = json!({"result": {}});
+        assert!(!is_client_response(None, &payload));
+    }
+
+    // ─── get_conflict_message / handshake_timeout_message ───────────────
+
+    #[test]
+    fn get_conflict_message_branches() {
+        assert!(get_conflict_message(true).contains("configure --sandbox-scope"));
+        assert!(get_conflict_message(false).contains("explicit fallback scope"));
+    }
+
+    #[test]
+    fn handshake_timeout_message_branches() {
+        let req = handshake_timeout_message(12, true, false, true);
+        assert!(req.contains("client roots/list is required"));
+        assert!(req.contains("12s"));
+        let fallback = handshake_timeout_message(7, false, true, false);
+        assert!(fallback.contains("explicit fallback sandbox scope"));
+    }
+
+    // ─── should_lock_sandbox / roots parsing ────────────────────────────
+
+    #[test]
+    fn should_lock_sandbox_only_when_non_empty() {
+        assert!(!should_lock_sandbox(&[]));
+        let roots = vec![McpRoot {
+            uri: "file:///a".into(),
+            name: None,
+        }];
+        assert!(should_lock_sandbox(&roots));
+    }
+
+    #[test]
+    fn collect_valid_mcp_roots_keeps_only_parseable() {
+        let all_valid = vec![
+            json!({"uri": "file:///a"}),
+            json!({"uri": "file:///b", "name": "b"}),
+        ];
+        assert_eq!(collect_valid_mcp_roots("sid", &all_valid).len(), 2);
+
+        let mixed = vec![
+            json!({"uri": "file:///a"}),
+            json!({"name": "missing uri"}),
+            json!(42),
+        ];
+        assert_eq!(collect_valid_mcp_roots("sid", &mixed).len(), 1);
+
+        let none_valid = vec![json!({"name": "x"}), json!("a string")];
+        assert_eq!(collect_valid_mcp_roots("sid", &none_valid).len(), 0);
+    }
+
+    #[test]
+    fn parse_roots_list_result_handles_all_shapes() {
+        let with_roots = json!({"roots": [{"uri": "file:///a"}, {"uri": "file:///b"}]});
+        assert_eq!(
+            parse_roots_list_result("sid", &with_roots).unwrap().len(),
+            2
+        );
+
+        let no_roots = json!({"something": "else"});
+        assert!(
+            parse_roots_list_result("sid", &no_roots)
+                .unwrap()
+                .is_empty()
+        );
+
+        let roots_not_array = json!({"roots": "oops"});
+        assert!(
+            parse_roots_list_result("sid", &roots_not_array)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // ─── calculate_tool_timeout ─────────────────────────────────────────
+
+    #[test]
+    fn calculate_tool_timeout_uses_argument_value() {
+        let payload = json!({"params": {"arguments": {"timeout_seconds": 30}}});
+        assert_eq!(calculate_tool_timeout(&payload), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn calculate_tool_timeout_caps_at_600() {
+        let payload = json!({"params": {"arguments": {"timeout_seconds": 9999}}});
+        assert_eq!(calculate_tool_timeout(&payload), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn calculate_tool_timeout_defaults_without_arguments() {
+        let payload = json!({"params": {"arguments": {}}});
+        assert_eq!(
+            calculate_tool_timeout(&payload),
+            Duration::from_secs(tool_call_timeout_secs())
+        );
+        let no_params = json!({"method": "tools/call"});
+        assert_eq!(
+            calculate_tool_timeout(&no_params),
+            Duration::from_secs(tool_call_timeout_secs())
+        );
+    }
+
+    // ─── SSE helpers ────────────────────────────────────────────────────
+
+    #[test]
+    fn serialize_sse_data_serializes_value() {
+        assert_eq!(serialize_sse_data(&json!({"x": 1})), "{\"x\":1}");
+    }
+
+    #[tokio::test]
+    async fn sse_single_event_response_carries_data_and_id() {
+        let resp = sse_single_event_response_with_id(7, "payload-data".to_string());
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(content_type(&resp).contains("text/event-stream"));
+        let body = body_string(resp).await;
+        assert!(body.contains("payload-data"), "body was: {body}");
+        assert!(body.contains('7'), "body was: {body}");
+    }
+
+    // ─── build_handshake_timeout_response ───────────────────────────────
+
+    #[tokio::test]
+    async fn build_handshake_timeout_response_is_504_with_header() {
+        let mgr = manager_with(None, 10, 3600, Arc::new(KeepAlivePeerFactory));
+        let resp = build_handshake_timeout_response(&mgr, "sid-x", 50, false, false);
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(header_session_id(&resp).as_deref(), Some("sid-x"));
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32002);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Handshake timeout")
+        );
+    }
+
+    // ─── check_session_exists ───────────────────────────────────────────
+
+    #[test]
+    fn check_session_exists_returns_403_for_unknown() {
+        let mgr = keepalive_manager();
+        let resp = check_session_exists(&mgr, "does-not-exist").expect("should be Some");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn check_session_exists_none_for_live_session() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        assert!(check_session_exists(&mgr, &id).is_none());
+    }
+
+    // ─── check_sandbox_lock ─────────────────────────────────────────────
+
+    #[test]
+    fn check_sandbox_lock_none_for_unknown_session() {
+        let mgr = keepalive_manager();
+        assert!(check_sandbox_lock(&mgr, "missing").is_none());
+    }
+
+    #[tokio::test]
+    async fn check_sandbox_lock_conflict_while_awaiting_roots() {
+        let mgr = manager_with(None, 10, 3600, Arc::new(KeepAlivePeerFactory));
+        let id = mgr.create_session().await.expect("create session");
+        let resp = check_sandbox_lock(&mgr, &id).expect("should be Some");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+        assert_eq!(body_json(resp).await["error"]["code"], -32001);
+    }
+
+    #[tokio::test]
+    async fn check_sandbox_lock_times_out_when_handshake_expired() {
+        // handshake_timeout_secs = 0 → immediately timed out.
+        let mgr = manager_with(None, 10, 0, Arc::new(KeepAlivePeerFactory));
+        let id = mgr.create_session().await.expect("create session");
+        let resp = check_sandbox_lock(&mgr, &id).expect("should be Some");
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body_json(resp).await["error"]["code"], -32002);
+    }
+
+    // ─── Top-level entry points ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn isolated_request_missing_session_is_400() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let resp = handle_session_isolated_request(mgr, HeaderMap::new(), payload).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"]["code"], -32600);
+    }
+
+    #[tokio::test]
+    async fn isolated_request_unknown_session_is_403() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let resp =
+            handle_session_isolated_request(mgr, headers_with_session("nope"), payload).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn isolated_sse_request_missing_session_is_400() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let resp = handle_session_isolated_request_sse(mgr, HeaderMap::new(), payload).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn isolated_sse_request_unknown_session_is_403() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let resp =
+            handle_session_isolated_request_sse(mgr, headers_with_session("nope"), payload).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ─── handle_initialize validation paths ─────────────────────────────
+
+    #[tokio::test]
+    async fn handle_initialize_rejects_invalid_payload() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let resp = handle_initialize(&mgr, &payload).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn handle_initialize_sse_rejects_invalid_payload() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let resp = handle_initialize_sse(&mgr, &payload).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"]["code"], -32602);
+    }
+
+    // ─── create_session_or_error ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn create_session_or_error_returns_429_on_limit() {
+        let mgr = manager_with(None, 0, 3600, Arc::new(KeepAlivePeerFactory));
+        let err = create_session_or_error(&mgr)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body_json(err).await["error"]["code"], -32002);
+    }
+
+    #[tokio::test]
+    async fn create_session_or_error_returns_500_on_factory_failure() {
+        let mgr = manager_with(None, 10, 3600, Arc::new(FailingPeerFactory));
+        let err = create_session_or_error(&mgr)
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(err).await["error"]["code"], -32603);
+    }
+
+    #[tokio::test]
+    async fn create_session_or_error_ok_returns_id() {
+        let mgr = keepalive_manager();
+        let id = create_session_or_error(&mgr).await.expect("should succeed");
+        assert!(!id.is_empty());
+    }
+
+    // ─── sampling routing ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_target_session_for_sampling_none_when_empty() {
+        let mgr = keepalive_manager();
+        assert!(
+            find_target_session_for_sampling(&mgr, "sid", None)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_sampling_request_errors_without_target() {
+        let mgr = keepalive_manager();
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sampling/createMessage",
+            "params": {}
+        });
+        let resp = handle_routed_sampling_request(&mgr, "sid", &payload, false).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32603);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("No active IDE session")
+        );
+    }
+
+    // ─── roots changed handling ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn roots_changed_request_proceeds_while_awaiting_roots() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        // AwaitingRoots → Ok(false) → None (proceed with normal handshake).
+        assert!(handle_roots_changed_request(&mgr, &id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn roots_changed_request_noop_after_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = manager_with(
+            Some(temp.path().to_path_buf()),
+            10,
+            3600,
+            Arc::new(KeepAlivePeerFactory),
+        );
+        let id = mgr.create_session().await.expect("create session");
+        // Lock the sandbox via the default scope (empty roots).
+        assert!(mgr.lock_sandbox(&id, &[]).await.expect("lock"));
+        let resp = handle_roots_changed_request(&mgr, &id)
+            .await
+            .expect("locked → Some(202)");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn roots_changed_request_errors_for_unknown_session() {
+        let mgr = keepalive_manager();
+        let resp = handle_roots_changed_request(&mgr, "missing")
+            .await
+            .expect("err → Some(403)");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ─── handle_client_response ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_client_response_acks_forwarded_response() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({"jsonrpc": "2.0", "id": "abc", "result": {}});
+        let resp = handle_client_response(&mgr, &id, &payload).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn handle_client_response_errors_when_session_terminated() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        // Force the forward to fail.
+        mgr.get_session(&id).unwrap().set_terminated(true);
+        let payload = json!({"jsonrpc": "2.0", "id": "abc", "result": {}});
+        let resp = handle_client_response(&mgr, &id, &payload).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"]["code"], -32603);
+    }
+
+    // ─── try_lock_sandbox_from_roots ────────────────────────────────────
+
+    #[tokio::test]
+    async fn try_lock_sandbox_from_empty_roots_does_not_lock() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let result = json!({"roots": []});
+        try_lock_sandbox_from_roots(&mgr, &id, &result).await;
+        // Sandbox must remain unlocked (still AwaitingRoots) for empty roots.
+        assert!(matches!(
+            mgr.get_session(&id).unwrap().current_sandbox_state(),
+            SandboxState::AwaitingRoots
+        ));
+    }
+
+    // ─── forward_notification_sse ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn forward_notification_sse_returns_202() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        // A notification (no id) → send_request returns immediately with null.
+        let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        let resp =
+            forward_notification_sse(&mgr, &id, Some("notifications/initialized"), &payload, true)
+                .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+    }
+}

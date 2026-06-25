@@ -867,4 +867,199 @@ mod tests {
         assert_eq!(got.decision_id, "d-1");
         assert_eq!(got.access, ScopeAccess::Ro);
     }
+
+    #[tokio::test]
+    async fn recv_optional_grant_some_closed_returns_none() {
+        use ahma_common::scope_grant::ScopeGrantRequest;
+        // When the sender is dropped, recv() resolves to None (channel closed).
+        let (tx, mut rx) = mpsc::unbounded_channel::<ScopeGrantRequest>();
+        drop(tx);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            recv_optional_grant(Some(&mut rx)),
+        )
+        .await
+        .expect("closed channel should resolve immediately");
+        assert!(result.is_none(), "closed channel yields None");
+    }
+
+    // ── daemon_event_for: clip paths in Failed / Cancelled arms ───────────────
+
+    #[test]
+    fn daemon_event_for_failed_long_error_is_clipped() {
+        let ev = OperationEvent::Failed {
+            operation_id: "op-f".into(),
+            error: "e".repeat(300),
+            duration_ms: 1,
+        };
+        let Some(DaemonEvent::OpFinished { result_summary, .. }) = daemon_event_for(&ev, "ws")
+        else {
+            panic!("expected OpFinished");
+        };
+        let s = result_summary.expect("summary present");
+        assert!(s.ends_with("..."), "long error must be clipped");
+        assert!(s.len() <= 201);
+    }
+
+    #[test]
+    fn daemon_event_for_cancelled_long_reason_is_clipped() {
+        let ev = OperationEvent::Cancelled {
+            operation_id: "op-c".into(),
+            reason: "r".repeat(300),
+            duration_ms: 2,
+        };
+        let Some(DaemonEvent::OpFinished { result_summary, .. }) = daemon_event_for(&ev, "ws")
+        else {
+            panic!("expected OpFinished");
+        };
+        let s = result_summary.expect("summary present");
+        assert!(s.ends_with("..."));
+    }
+
+    // ── summary_from_value: message field is non-string falls through ─────────
+
+    #[test]
+    fn summary_from_value_non_string_message_falls_through() {
+        // `message` exists but is not a string → as_str() is None → fall to error,
+        // then nested, then JSON fallback.
+        let v = json!({ "message": 7 });
+        let result = summary_from_value(&v).expect("fallback summary");
+        assert!(
+            result.contains('7') && result.contains("message"),
+            "should serialize whole value as fallback, got {result}"
+        );
+    }
+
+    // ── result_summary_from: error-string and nested-error branches ───────────
+
+    #[test]
+    fn result_summary_from_error_string_branch() {
+        let op = Operation::new(
+            "id".into(),
+            "tool".into(),
+            "desc".into(),
+            Some(json!({ "error": "boom" })),
+        );
+        assert_eq!(result_summary_from(&op), Some("boom".into()));
+    }
+
+    #[test]
+    fn result_summary_from_nested_error_message_branch() {
+        let op = Operation::new(
+            "id".into(),
+            "tool".into(),
+            "desc".into(),
+            Some(json!({ "error": { "message": "deep boom" } })),
+        );
+        assert_eq!(result_summary_from(&op), Some("deep boom".into()));
+    }
+
+    #[test]
+    fn result_summary_from_json_fallback_branch() {
+        let op = Operation::new(
+            "id".into(),
+            "tool".into(),
+            "desc".into(),
+            Some(json!({ "code": 99 })),
+        );
+        let s = result_summary_from(&op).expect("fallback");
+        assert!(s.contains("99"), "fallback serializes the JSON, got {s}");
+    }
+
+    // ── persist_resolved_grant ────────────────────────────────────────────────
+    //
+    // `persist_resolved_grant` resolves the settings path via `settings_path()`,
+    // which derives from the home directory. On Unix the home directory is the
+    // `HOME` env var, so we redirect it to a TempDir. (On Windows `dirs::home_dir`
+    // uses the Known-Folder API and ignores env vars, so these write-path tests
+    // are genuinely Unix-only.)
+    #[cfg(unix)]
+    static HOME_ENV_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[cfg(unix)]
+    fn with_home<R>(home: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        let _guard = HOME_ENV_MUTEX.lock().unwrap();
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home) };
+        let out = f();
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_resolved_grant_writes_settings_with_tool_provenance() {
+        use ahma_common::config::ScopeAccess;
+        let home = tempfile::tempdir().unwrap();
+        let grant_dir = tempfile::tempdir().unwrap();
+        let settings = home.path().join(".ahma").join("settings.toml");
+
+        with_home(home.path(), || {
+            persist_resolved_grant(
+                grant_dir.path(),
+                ScopeAccess::Rw,
+                Some("sccache".to_string()),
+            );
+        });
+
+        assert!(settings.exists(), "settings.toml must be created");
+        let contents = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            contents.contains(&grant_dir.path().display().to_string()),
+            "granted path must be recorded, got:\n{contents}"
+        );
+        assert!(
+            contents.contains("sccache"),
+            "granted_by provenance from tool must be recorded, got:\n{contents}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_resolved_grant_defaults_granted_by_when_no_tool() {
+        use ahma_common::config::ScopeAccess;
+        let home = tempfile::tempdir().unwrap();
+        let grant_dir = tempfile::tempdir().unwrap();
+        let settings = home.path().join(".ahma").join("settings.toml");
+
+        with_home(home.path(), || {
+            persist_resolved_grant(grant_dir.path(), ScopeAccess::Ro, None);
+        });
+
+        let contents = std::fs::read_to_string(&settings).unwrap();
+        assert!(
+            contents.contains("scope-grant prompt"),
+            "granted_by must default to the prompt label, got:\n{contents}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_resolved_grant_corrupt_settings_is_non_fatal_and_preserved() {
+        use ahma_common::config::ScopeAccess;
+        let home = tempfile::tempdir().unwrap();
+        let grant_dir = tempfile::tempdir().unwrap();
+        let ahma_dir = home.path().join(".ahma");
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+        let settings = ahma_dir.join("settings.toml");
+        // Invalid TOML so the strict loader errors → persist_grant returns Err →
+        // persist_resolved_grant logs a warning and does NOT overwrite the file.
+        let corrupt = "this = is = not valid toml {{{";
+        std::fs::write(&settings, corrupt).unwrap();
+
+        with_home(home.path(), || {
+            // Must not panic even though persistence fails.
+            persist_resolved_grant(grant_dir.path(), ScopeAccess::Rw, Some("t".to_string()));
+        });
+
+        let after = std::fs::read_to_string(&settings).unwrap();
+        assert_eq!(
+            after, corrupt,
+            "corrupt settings file must be left untouched on the error path"
+        );
+    }
 }
