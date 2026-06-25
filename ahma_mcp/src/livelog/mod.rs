@@ -288,14 +288,35 @@ struct AnalysisCtx<'a> {
     structured_output: bool,
 }
 
-/// Format an alert message from a structured JSON response.
+/// The outcome of interpreting an LLM response in `structured_output` mode.
 ///
-/// Parses `{issue, level, summary, exception_class?, top_frame?}` and returns
-/// `None` when `issue` is false (treat as CLEAN), or `Some(formatted)` string.
-fn format_structured_alert(text: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+/// Three states, deliberately distinct: a parsed-clean verdict and an
+/// *unparseable* response both used to collapse to `None`, which silently
+/// dropped any crash the model reported as prose instead of JSON. Keeping them
+/// apart lets the caller drop only the genuinely-clean case and fall back to a
+/// plain-text alert for prose — never losing a detection.
+#[derive(Debug, PartialEq, Eq)]
+enum StructuredVerdict {
+    /// Valid JSON with `issue: false` — the model looked and found nothing.
+    Clean,
+    /// Valid JSON describing an issue — a formatted alert.
+    Alert(String),
+    /// Not valid JSON (the model answered in prose). The caller must fall back
+    /// to treating the raw text as a plain-text alert rather than discard it.
+    Unparseable,
+}
+
+/// Classify a structured-mode LLM response into a [`StructuredVerdict`].
+///
+/// Parses `{issue, level, summary, exception_class?, top_frame?}`. A non-JSON
+/// body yields [`StructuredVerdict::Unparseable`] (NOT clean) so a prose crash
+/// report is never silently dropped.
+fn classify_structured_response(text: &str) -> StructuredVerdict {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+        return StructuredVerdict::Unparseable;
+    };
     if v.get("issue").and_then(|b| b.as_bool()) == Some(false) {
-        return None;
+        return StructuredVerdict::Clean;
     }
     let level = v.get("level").and_then(|b| b.as_str()).unwrap_or("ERROR");
     let summary = v.get("summary").and_then(|b| b.as_str()).unwrap_or(text);
@@ -306,7 +327,7 @@ fn format_structured_alert(text: &str) -> Option<String> {
     if let Some(frame) = v.get("top_frame").and_then(|b| b.as_str()) {
         alert.push_str(&format!("\n  at {frame}"));
     }
-    Some(alert)
+    StructuredVerdict::Alert(alert)
 }
 
 /// Send `chunk` to the LLM for analysis; record an `Alert` if issues are found.
@@ -351,13 +372,23 @@ async fn maybe_analyze(
     {
         Ok(Some(raw)) => {
             // In structured mode, parse JSON and short-circuit on `issue:false`.
-            // If JSON parsing fails, fall through to the plain-text path.
+            // A response that is *not* valid JSON (model answered in prose) must
+            // NOT be treated as clean — it falls through to the plain-text path
+            // so a prose-reported crash is still surfaced, never dropped.
             let summary = if ctx.structured_output {
-                match format_structured_alert(&raw) {
-                    Some(s) => s,
-                    None => {
+                match classify_structured_response(&raw) {
+                    StructuredVerdict::Alert(s) => s,
+                    StructuredVerdict::Clean => {
                         debug!("livelog[{}]: structured response: clean", op_id);
                         return;
+                    }
+                    StructuredVerdict::Unparseable => {
+                        debug!(
+                            "livelog[{}]: structured response was not JSON; \
+                             treating as plain-text alert",
+                            op_id
+                        );
+                        raw.clone()
                     }
                 }
             } else {
@@ -550,4 +581,75 @@ pub async fn run_file_monitor_pipeline(
     }
 
     info!("file_monitor[{}]: pipeline finished", op_id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StructuredVerdict, classify_structured_response};
+
+    #[test]
+    fn issue_false_is_clean() {
+        assert_eq!(
+            classify_structured_response(r#"{"issue":false}"#),
+            StructuredVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn issue_true_formats_alert_with_fields() {
+        let v = classify_structured_response(
+            r#"{"issue":true,"level":"FATAL","summary":"NPE in MainActivity",
+                "exception_class":"java.lang.NullPointerException",
+                "top_frame":"MainActivity.onCreate(MainActivity.kt:42)"}"#,
+        );
+        match v {
+            StructuredVerdict::Alert(s) => {
+                assert!(s.contains("[FATAL]"), "level should appear: {s}");
+                assert!(
+                    s.contains("NPE in MainActivity"),
+                    "summary should appear: {s}"
+                );
+                assert!(s.contains("java.lang.NullPointerException"));
+                assert!(s.contains("MainActivity.kt:42"));
+            }
+            other => panic!("expected Alert, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_true_without_optional_fields_uses_defaults() {
+        let v = classify_structured_response(r#"{"issue":true,"summary":"boom"}"#);
+        assert_eq!(
+            v,
+            StructuredVerdict::Alert("[ERROR] boom".to_string()),
+            "missing level defaults to ERROR; no exception/frame lines"
+        );
+    }
+
+    #[test]
+    fn non_json_prose_is_unparseable_not_clean() {
+        // The regression this fix targets: a prose crash report must NOT be
+        // silently dropped — it is Unparseable so the caller falls back to a
+        // plain-text alert.
+        assert_eq!(
+            classify_structured_response("FATAL: NPE in com.example.app"),
+            StructuredVerdict::Unparseable
+        );
+    }
+
+    #[test]
+    fn empty_response_is_unparseable() {
+        assert_eq!(
+            classify_structured_response(""),
+            StructuredVerdict::Unparseable
+        );
+    }
+
+    #[test]
+    fn json_array_without_issue_field_is_treated_as_alert() {
+        // Valid JSON that isn't our object shape still parses; absent `issue`
+        // means "not explicitly clean", so it surfaces as an alert (fail-safe).
+        let v = classify_structured_response(r#"{"unexpected":"shape"}"#);
+        assert!(matches!(v, StructuredVerdict::Alert(_)));
+    }
 }
