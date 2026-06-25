@@ -5,14 +5,15 @@ author: Paul Houghton
 description: >
    Repo-local development skill for the ahma workspace. NOT distributed.
    USE THIS SKILL to drive a single feature from branch to squash-merged-on-main
-   (/ahmadev land), cut a release (/ahmadev release), hunt a regression
+   (/ahmadev land), cut a release (/ahmadev release, alias /ahmadev publish), hunt a regression
    (/ahmadev bisect), add test coverage where it matters most
    (/ahmadev coverage), update dependencies safely (/ahmadev update), bump the
    version (/ahmadev bump), install a local build (/ahmadev install), configure
    git for the squash-only workflow (/ahmadev gitconfig), and help
    (/ahmadev help), and simplify the changed code with before/after metrics
    (/ahmadev simplify).
-   Trigger phrases: "ahmadev", "ahmadev land", "ahmadev release",
+   Trigger phrases: "ahmadev", "ahmadev land", "ahmadev release", "ahmadev publish",
+   "publish", "publish this", "publish it", "publish the release",
    "ahmadev bisect", "ahmadev coverage", "add test coverage", "improve coverage",
    "where do we need tests", "raise coverage", "coverage report", "ahmadev update", "ahmadev help", "land this feature",
    "ahmadev gitconfig", "configure git", "git setup", "set up git config",
@@ -52,7 +53,7 @@ Two commands carry the day-to-day loop; the rest are occasional specialists.
 | Command | Purpose |
 |---------|---------|
 | `/ahmadev land` | Drive one feature branch → PR → squash-merge on `main` through the CI gate. **This is how a fix reaches `main`.** |
-| `/ahmadev release` | Land any pending work, bump the version on `main`, and watch CI publish the GitHub Release. **This is how you ship to users.** |
+| `/ahmadev release` *(alias: `/ahmadev publish`)* | Land any pending work, bump the version on `main`, and watch CI publish the GitHub Release after the full cross-platform test matrix passes. **This is how you ship to users.** |
 
 **Occasional (specialists):**
 
@@ -149,6 +150,7 @@ landed behind it. It's a good idea here precisely because:
 /ahmadev help      — Show this overview + subcommand list
 /ahmadev land      — Branch → PR → auto squash-merge on main when Fast Tier passes  ← drive a fix to main
 /ahmadev release   — Land pending work + bump version on main; CI publishes the GitHub Release  ← ship to users
+                     (alias: /ahmadev publish — "publish" and "release" mean the same thing here)
 /ahmadev simplify  — Review the diff for cleanup opportunities, apply fixes, report before/after metrics table
 /ahmadev bisect    — git bisect run a repro to find the commit that introduced a regression (local, free)
 /ahmadev coverage  — Fan out parallel subagents (3–10 files), close all holes per file (≥80% each), land one batch PR
@@ -283,7 +285,11 @@ git revert <sha>     # then land the revert via a PR (or /ahmadev release to shi
 
 ---
 
-## `/ahmadev release` — Land + Bump + Publish
+## `/ahmadev release` (alias `/ahmadev publish`) — Land + Bump + Publish
+
+> **`publish` is an alias for `release`.** "Publish this", "publish the release", or a bare
+> "publish" all mean exactly this command — there is no separate publish step. Treat them
+> identically.
 
 ### What it does
 
@@ -292,6 +298,15 @@ release binaries and `job-publish-release` creates the GitHub Release `v<version
 the push bumps to a version whose tag does not already exist** (decided by `job-release-gate`).
 An ordinary land that doesn't change the version skips the 6-platform release build and
 attestation altogether. So a release = landing a version bump on `main`.
+
+> **The full heavy test cycle gates every publish.** `job-publish-release` `needs: ci-green`,
+> and `ci-green` only passes when the entire cross-platform matrix is green on the exact bump
+> commit: `job-cargo-nextest` (Linux/macOS/Windows full + ARM64 smoke), `job-android-nextest`
+> (Android/Kotlin), and `job-security` (`cargo deny`). If any leg is red the release is **not**
+> published — the tag is never created (`ahma update` keeps serving the previous release). Note
+> the bump *lands* on `main` gated only on Fast Tier (like any land), but it only *publishes*
+> after the heavy matrix passes post-merge. So a released `v<X.Y.Z>` has always cleared the full
+> suite on every supported platform.
 
 > **`cargo xtask bump-version` now also refreshes `Cargo.lock`** (every workspace member
 > carries its version there, and all CI builds `--locked`). A bump commit therefore builds
