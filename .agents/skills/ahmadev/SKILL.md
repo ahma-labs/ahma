@@ -116,9 +116,11 @@ You don't hand-merge; you don't babysit. The full cross-platform matrix then run
 *after* the merge (it can't gate the PR — it doesn't run on PRs) as a safety net.
 
 **Q: What do I type to publish a new release?**
-→ `/ahmadev release`. The **version number is the release trigger**: every push to `main`
-builds release binaries, but the publish step creates `v<X.Y.Z>` *only if that tag doesn't
-already exist yet*. So a release = landing a version bump on `main`. `release` syncs `main`,
+→ `/ahmadev release`. The **version number is the release trigger**: a push to `main` builds
+the 6-platform release binaries and publishes `v<X.Y.Z>` *only when it bumps Cargo.toml to a
+version whose tag doesn't exist yet* (the `job-release-gate` check). An ordinary land that
+doesn't touch the version runs the test matrix but skips the release build entirely. So a
+release = landing a version bump on `main`. `release` syncs `main`,
 asks you to confirm the version (default: patch bump), lands the bump through the same gate,
 then watches CI publish the GitHub Release. (You almost never type `/ahmadev bump` directly —
 `release` runs it for you.)
@@ -285,9 +287,11 @@ git revert <sha>     # then land the revert via a PR (or /ahmadev release to shi
 
 ### What it does
 
-Ships a release. The **version number is the release trigger**: every push to `main` builds
-release binaries, but `job-publish-release` creates the GitHub Release `v<version>` **only if
-that tag does not already exist**. So a release = landing a version bump on `main`.
+Ships a release. The **version number is the release trigger**: a push to `main` builds the
+release binaries and `job-publish-release` creates the GitHub Release `v<version>` **only when
+the push bumps to a version whose tag does not already exist** (decided by `job-release-gate`).
+An ordinary land that doesn't change the version skips the 6-platform release build and
+attestation altogether. So a release = landing a version bump on `main`.
 
 > **`cargo xtask bump-version` now also refreshes `Cargo.lock`** (every workspace member
 > carries its version there, and all CI builds `--locked`). A bump commit therefore builds
@@ -719,7 +723,7 @@ Bumps the version of the `ahma` workspace. This updates the version in `Cargo.to
 
 ### Why a bump is required to ship
 
-**The version number is the release trigger.** Every push to `main` builds and attests release binaries, but the CI publish step (`job-publish-release` in `.github/workflows/build.yml`) creates a GitHub Release *only when the tag `v<version>` does not already exist*. If you push to `main` without bumping, the build runs but no new release is published — so `ahma update` and the install scripts keep serving the **previous** release artifact, and your merged changes never reach users.
+**The version number is the release trigger.** A push to `main` builds and attests the release binaries — and the CI publish step (`job-publish-release` in `.github/workflows/build.yml`) creates a GitHub Release — *only when the push bumps to a version whose tag `v<version>` does not already exist* (gated by `job-release-gate`). If you push to `main` without bumping, the test matrix still runs but the 6-platform release build is skipped and no new release is published — so `ahma update` and the install scripts keep serving the **previous** release artifact, and your merged changes never reach users.
 
 Practical rule: **any push to `main` with user-facing changes needs a version bump in the same push.** Batching a session's merges and bumping once at the end is fine; just don't leave `main` with shipped changes under an already-released version.
 

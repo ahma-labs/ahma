@@ -38,7 +38,9 @@ concurrency:
 #   - Pull requests run the FAST tier only (Linux fmt + clippy + nextest `smoke`), ~5 min.
 #   - This full cross-platform matrix runs at the MERGE GATE via the merge queue
 #     (`merge_group`) — once per landed feature, not on every iteration push — and on
-#     every push to main/production (which also builds + publishes the release).
+#     every push to main/production. The release binaries are built + published only when
+#     the push bumps Cargo.toml to an as-yet-unreleased version (see job-release-gate): an
+#     ordinary land runs the test matrix + coverage but skips the 6-platform release build.
 # This is why `pull_request` is intentionally NOT a trigger here: the full matrix is the
 # gate to LAND, the fast tier is the gate to ITERATE.
 on:
@@ -576,10 +578,50 @@ jobs:
 
   #######################################
 
+  # Release gate: the version number is the release trigger. This cheap job (~10s) decides
+  # ONCE whether the version in Cargo.toml has already been released, and gates the expensive
+  # 6-platform release build + publish below. A push to main that does NOT bump the version
+  # (an ordinary land) therefore skips the release builds entirely — it only runs the test
+  # matrix + coverage. Release binaries are built (and Sigstore-attested) exactly once per
+  # version, at the bump that ships it, so there are never two different binaries claiming the
+  # same version.
+  job-release-gate:
+    name: Release Gate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          token: ${{ github.token }}
+          persist-credentials: true
+
+      - name: Decide whether this version is unreleased
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed -E 's/^version = "(.*)"/\1/')
+          TAG="v${VERSION}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if gh release view "${TAG}" --json tagName > /dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} already exists — skipping release builds for this push."
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG} not found — this push will build and publish it."
+          fi
+
+  #######################################
+
   job-release-binaries:
     name: Release Binaries (${{ matrix.platform }})
-    # Run only on main branch pushes
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Run only on main pushes that bump to an as-yet-unreleased version (see job-release-gate).
+    needs: job-release-gate
+    if: needs.job-release-gate.outputs.should_release == 'true'
     permissions:
       id-token: write      # for Sigstore OIDC token (GitHub attestation)
       attestations: write  # to write SLSA provenance to GitHub's attestation API
@@ -789,8 +831,9 @@ jobs:
     # in parallel without blocking the publish.
     needs:
       - ci-green
+      - job-release-gate
       - job-release-binaries
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: needs.job-release-gate.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
