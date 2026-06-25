@@ -552,6 +552,37 @@ A file previously at 20% should be at ≥80% when you are done with it. A small 
 should be at 100%. Stopping at 50% is not acceptable unless the remaining lines require
 network I/O, a real platform binary, or a refactor (explain which, and why).
 
+### Build economics: fan-out writes, the orchestrator verifies once
+
+The single most important rule for parallel fan-out: **subagents WRITE, they do not BUILD.**
+Each subagent reads source and returns test code; the orchestrator compiles and runs the suite
+**exactly once**, after consolidating every subagent's output.
+
+Why this matters: N subagents each running `cargo` means **N cold builds of the entire
+dependency graph in parallel** — CPU/disk saturation, and on macOS N× the
+`com.apple.provenance` contamination surface (a build wedged on a denied write is the classic
+symptom). The agents in a coverage batch write *disjoint* files (a different `#[cfg(test)]`
+block each), so there is nothing a per-agent build verifies that the single consolidated build
+does not verify better, and once.
+
+Corollaries:
+
+- **Do NOT give coverage subagents `isolation: worktree`.** Worktree isolation exists for
+  agents that mutate the *same* files concurrently. Coverage agents touch different files, so
+  they share one branch and the orchestrator merges their `#[cfg(test)]` blocks. A worktree per
+  agent only buys a redundant cold build and its own contaminated `target/`. Reserve worktrees
+  for genuinely conflicting parallel edits.
+- **If parallel builds are ever truly unavoidable, lean on sccache — never a shared
+  `CARGO_TARGET_DIR`.** sccache (which ahma now supports inside the sandbox; set
+  `sandbox.trust_build_caches = true`) shares *compiled artifacts* content-addressably and
+  concurrency-safely, so a second build of `ring` is a cache hit instead of a recompile. A
+  shared target dir is the wrong tool: concurrent writers to one `target/` reintroduce the very
+  provenance contamination above.
+
+This generalizes beyond coverage: **any** fan-out of file-writing subagents should separate the
+write phase (parallel, no builds) from a single consolidated verify phase. Isolation and
+per-agent builds are costs to justify, not defaults.
+
 ### Parallel subagent workflow (one Agent per file)
 
 After selecting the batch, fan out one `Agent` tool call per file. All agents run concurrently.
@@ -568,12 +599,15 @@ Each subagent's prompt must include:
   - In-module `#[cfg(test)]` block for pure unit logic; crate `tests/` dir for integration tests
   - HTTP bridge: follow the exact 5-step handshake sequence documented in Hard Invariants
   - Env-var tests: use `LazyLock<Mutex<()>>` guard (see `update/source.rs` for the pattern)
-- Instruction to run `cargo nextest run -E 'test(<filter>)'` and confirm all tests pass
+- **Instruction to WRITE the tests and RETURN the code — NOT to build or run them.** The
+  subagent must not invoke `cargo build`/`cargo nextest`/`cargo clippy`; the orchestrator
+  compiles and runs the suite once, after consolidation (see *Build economics* below).
 - Instruction to **return the complete test code** and a summary: test count, which lines
   each test covers, and expected new coverage %
 
 After all agents complete, apply their output to your branch. Where agents edited the same
-file, merge their `#[cfg(test)]` blocks. Run the full suite on the consolidated result.
+file, merge their `#[cfg(test)]` blocks. Then run the full suite **once** on the consolidated
+result — that single build is the verification for the whole batch.
 
 **Up to 10 files per invocation.** Launching 10 agents in parallel is normal and expected —
 that is the whole point of this command. Do not serialize them; do not do this file-by-file
@@ -602,12 +636,13 @@ yourself. The agent fan-out IS the work.
    Total the "lines uncovered" column. That is the impact of this PR.
 
 3. **Fan out subagents.** One `Agent` call per file, all in the same response (parallel).
-   Each agent writes tests, verifies them, and returns the test code + summary.
+   Each agent **writes** tests and returns the test code + summary — it does **not** build or
+   run them, and is **not** given `isolation: worktree` (see *Build economics* above).
 
 4. **Consolidate.** Apply all subagent edits to your branch. Merge any overlapping `#[cfg(test)]`
    blocks. Resolve any naming conflicts between test functions.
 
-5. **Verify the full batch:**
+5. **Verify the full batch — the single build for the whole fan-out:**
    ```bash
    cargo nextest run  # all tests in the workspace (or scope to touched crates)
    cargo fmt --all && cargo clippy --all-targets
@@ -641,6 +676,10 @@ yourself. The agent fan-out IS the work.
   pure `println!` is not the same as a file at 2% with 500 lines of branching logic. Read first.
 - **Skipping the HTML per-file page.** The compact summary gives % and line counts. The HTML gives
   you the exact red lines. You need both: the summary to pick targets, the HTML to close the holes.
+- **Letting subagents build/run cargo, or giving them `isolation: worktree`.** This is the most
+  expensive anti-pattern: N agents each cold-building the dependency graph saturates the machine
+  and multiplies macOS provenance contamination. Subagents write; the orchestrator builds once.
+  See *Build economics* above.
 
 ---
 
