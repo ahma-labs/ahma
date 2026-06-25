@@ -23,7 +23,7 @@ source_command  →  chunk accumulator  →  LLM  →  ProgressUpdate::LogAlert
 - **ADB** installed and on `PATH` (`brew install android-platform-tools` or via Android Studio)
 - Device or emulator connected (`adb devices` should show it)
 - **Ollama** running locally: `brew install ollama && ollama serve`
-- `llama3.2` model pulled: `ollama pull llama3.2`
+- `lfm2.5:8b` model pulled: `ollama pull lfm2.5:8b` (the default; a modern 8B model triages crash-vs-noise far better than an older 3B one). To use a smaller/faster model, pull it and set `AHMA_LIVELOG_MODEL`, e.g. `AHMA_LIVELOG_MODEL=llama3.2`.
 - `--livelog` flag added to your Ahma `mcp.json` args (enables the livelog symlink sandbox feature)
 
 ### Setup
@@ -64,11 +64,18 @@ Or create `.ahma/android-logcat.json` with the content below.
     "enabled": true,
     "livelog": {
         "source_command": "adb",
-        "source_args": ["-d", "logcat", "-v", "threadtime"],
+        "source_args": ["logcat", "-b", "main,crash,system", "-v", "threadtime", "--pid=${pid}"],
+        "parameters": [
+            {"name": "serial", "description": "Target device serial (from `adb devices`). Sets ANDROID_SERIAL; required when more than one device is connected."},
+            {"name": "pid", "description": "Restrict to one process id (logcat --pid). Resolve with `adb shell pidof -s <package>`."}
+        ],
+        "env": {"ANDROID_SERIAL": "${serial}"},
+        "clear_command": ["logcat", "-c"],
+        "prefilter_regex": "(?i)(FATAL|ANR\\b|Exception|SIGSEGV|SIGABRT|beginning of crash|tombstone|\\sE\\s|\\sF\\s)",
         "detection_prompt": "Look for crashes (FATAL EXCEPTION, NullPointerException, IllegalStateException), Application Not Responding (ANR) errors, native crashes (SIGSEGV, SIGABRT), or any log line at level E (ERROR) or F (FATAL) that indicates a real problem rather than a known-harmless library warning.",
         "llm_provider": {
-            "base_url": "http://localhost:11434/v1",
-            "model": "llama3.2"
+            "base_url": "${AHMA_LIVELOG_BASE_URL:-http://localhost:11434/v1}",
+            "model": "${AHMA_LIVELOG_MODEL:-lfm2.5:8b}"
         },
         "chunk_max_lines": 50,
         "chunk_max_seconds": 30,
@@ -77,13 +84,22 @@ Or create `.ahma/android-logcat.json` with the content below.
     },
     "hints": {
         "custom": {
-            "usage": "Call this tool to start live monitoring of Android logs. The tool returns an operation ID immediately. You will receive progress notifications when the LLM detects crashes or errors.",
-            "prerequisites": "ADB must be installed and on PATH. Device/emulator connected (`adb devices`). Ollama running locally on port 11434 with `llama3.2` available (`ollama pull llama3.2`).",
+            "usage": "Call this tool to start live monitoring of Android logs. The tool returns an operation ID immediately. You will receive progress notifications when the LLM detects crashes or errors. Optional params: `serial`, `pid`, `clear`.",
+            "prerequisites": "ADB must be installed and on PATH. Device/emulator connected (`adb devices`). Ollama running locally on port 11434 with `lfm2.5:8b` available (`ollama pull lfm2.5:8b`).",
             "stopping": "Use `cancel <operation_id>` to stop monitoring gracefully."
         }
     }
 }
 ```
+
+Key fields that make this usable against a real device:
+
+- **`-b main,crash,system`** — monitors the dedicated `crash` and `system` buffers (where `FATAL`/native crashes and ANRs land), not just `main`.
+- **`parameters` + `${...}` substitution** — `source_args` and `env` may reference declared parameters. When a parameter is omitted, the **whole argument token** referencing it is dropped, so `--pid=${pid}` cleanly disappears (full-device logcat) until you pass a `pid`.
+- **`env: { "ANDROID_SERIAL": "${serial}" }`** — the clean way to target one of several connected devices; the entry is skipped entirely when no `serial` is passed.
+- **`clear_command`** — runs `adb logcat -c` first so a stale crash from a previous run is not replayed as a fresh alert. Pass `clear: false` to keep the existing buffer.
+- **`prefilter_regex`** — only lines matching this cheap regex are forwarded to the LLM (the full log is still recorded), keeping token cost and latency low. An invalid pattern is ignored rather than fatal.
+- **Env-driven provider** — `base_url`/`model` support `${VAR}` and `${VAR:-default}`, so you can repoint the endpoint/model via `AHMA_LIVELOG_BASE_URL` / `AHMA_LIVELOG_MODEL` without editing the file.
 
 ### Starting Monitoring
 
@@ -91,6 +107,15 @@ In your MCP client (VS Code, Cursor, etc.), call the `android-logcat` tool:
 
 ```
 Use the android-logcat tool to start monitoring my device logs for crashes.
+```
+
+**With multiple devices / scoped to one app:**
+
+```
+List devices:           adb devices
+Target one device:      call android-logcat with serial="emulator-5554"
+Scope to your app:      adb shell pidof -s com.example.app   → call with pid="<that pid>"
+Keep buffered history:  call with clear=false
 ```
 
 The tool returns immediately with an operation ID, for example:

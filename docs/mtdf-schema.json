@@ -516,7 +516,7 @@
           "type": "string"
         },
         "source_args": {
-          "description": "Arguments for the source command (e.g. `[\"logcat\", \"-v\", \"threadtime\"]`).",
+          "description": "Arguments for the source command (e.g. `[\"logcat\", \"-v\", \"threadtime\"]`).\n\nEach argument may reference a runtime parameter declared in\n[`LivelogConfig::parameters`] with `${name}` syntax. When the caller\nsupplies the parameter, every `${name}` is substituted with its value;\nwhen the parameter is omitted (or empty), the **entire argument token**\nthat referenced it is dropped. This lets an optional flag such as\n`\"--pid=${pid}\"` disappear cleanly when no pid is supplied, rather than\nexpanding to an invalid `--pid=`.",
           "type": "array",
           "items": {
             "type": "string"
@@ -530,6 +530,39 @@
         "llm_provider": {
           "description": "LLM provider connection details.",
           "$ref": "#/$defs/LlmProviderConfig"
+        },
+        "parameters": {
+          "description": "Runtime parameters the caller may pass when starting the tool. These are\nsurfaced in the tool's MCP input schema and substituted into\n[`LivelogConfig::source_args`] and [`LivelogConfig::env`] via `${name}`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LivelogParameter"
+          },
+          "default": []
+        },
+        "env": {
+          "description": "Environment variables to set on the source (and clear) process. Values\nmay reference runtime parameters with `${name}`; an entry whose value\nreferences a parameter the caller did not supply is dropped entirely.\nExample: `{ \"ANDROID_SERIAL\": \"${serial}\" }` targets a specific device\nonly when a `serial` parameter is passed.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "clear_command": {
+          "description": "Optional command run once before the source process starts (e.g.\n`[\"logcat\", \"-c\"]` to clear Android's log buffers so stale crashes are\nnot replayed as fresh alerts). Runs with the same `env` applied and is\nbest-effort — a failure is logged but does not abort monitoring. The\ncaller can skip it by passing `clear: false`.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "prefilter_regex": {
+          "description": "Optional regular expression used to pre-filter lines before they are sent\nto the LLM. When set, only lines matching the pattern are accumulated\ninto a chunk for analysis (the full, unfiltered output is still recorded\non the operation). This keeps token cost and latency low by never sending\nobviously-benign noise to the model. An invalid pattern is logged and\nignored (all lines pass through).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "chunk_max_lines": {
           "description": "Maximum number of lines to accumulate before sending a chunk to the LLM.\nDefaults to 50.",
@@ -589,6 +622,29 @@
       "required": [
         "base_url",
         "model"
+      ]
+    },
+    "LivelogParameter": {
+      "description": "A runtime parameter a livelog tool accepts when started.\n\nParameters are surfaced in the tool's MCP input schema (as optional string\nproperties unless `required`) and substituted into the source command's\narguments and environment via `${name}`.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Parameter name, referenced in `source_args`/`env` as `${name}`.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Human-readable description shown to MCP clients.",
+          "type": "string"
+        },
+        "required": {
+          "description": "Whether the caller must supply this parameter. Defaults to `false`.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "name",
+        "description"
       ]
     }
   }

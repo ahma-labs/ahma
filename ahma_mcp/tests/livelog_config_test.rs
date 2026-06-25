@@ -301,3 +301,113 @@ fn test_livelog_tool_type_without_block_deserializes() {
     assert_eq!(config.tool_type, Some(ToolType::Livelog));
     assert!(config.livelog.is_none(), "livelog block should be absent");
 }
+
+// ---------------------------------------------------------------------------
+// Device-scoping: runtime parameters, env mapping, clear, pre-filter
+// ---------------------------------------------------------------------------
+
+use serde_json::{Map, Value, json};
+
+fn livelog_with_params() -> LivelogConfig {
+    let json = r#"{
+        "source_command": "adb",
+        "source_args": ["logcat", "-v", "threadtime", "--pid=${pid}"],
+        "parameters": [
+            {"name": "serial", "description": "device serial"},
+            {"name": "pid", "description": "process id"},
+            {"name": "token", "description": "required thing", "required": true}
+        ],
+        "env": {"ANDROID_SERIAL": "${serial}"},
+        "clear_command": ["logcat", "-c"],
+        "prefilter_regex": "(?i)error",
+        "detection_prompt": "crashes",
+        "llm_provider": {"base_url": "http://x/v1", "model": "m"}
+    }"#;
+    serde_json::from_str(json).expect("livelog config with params should parse")
+}
+
+#[test]
+fn test_new_fields_default_to_empty_when_absent() {
+    // The original minimal config (no new fields) still parses with sane defaults.
+    let json = r#"{
+        "source_command": "adb",
+        "source_args": ["logcat"],
+        "detection_prompt": "crashes",
+        "llm_provider": {"base_url": "http://x/v1", "model": "m"}
+    }"#;
+    let lc: LivelogConfig = serde_json::from_str(json).unwrap();
+    assert!(lc.parameters.is_empty());
+    assert!(lc.env.is_empty());
+    assert!(lc.clear_command.is_none());
+    assert!(lc.prefilter_regex.is_none());
+}
+
+#[test]
+fn test_resolve_runtime_requires_required_param() {
+    let lc = livelog_with_params();
+    // `token` is required and absent → error.
+    let err = lc.resolve_runtime(&Map::new()).unwrap_err();
+    assert!(
+        err.to_string().contains("token"),
+        "error should name the missing required param: {err}"
+    );
+}
+
+#[test]
+fn test_resolve_runtime_substitutes_and_drops_tokens() {
+    let lc = livelog_with_params();
+    let mut args = Map::new();
+    args.insert("token".to_string(), json!("present")); // satisfy required
+    args.insert("pid".to_string(), json!("99"));
+    let rt = lc.resolve_runtime(&args).unwrap();
+    assert!(rt.source_args.contains(&"--pid=99".to_string()));
+    // serial omitted → ANDROID_SERIAL entry dropped entirely.
+    assert!(rt.env.is_empty(), "no serial → no env, got {:?}", rt.env);
+}
+
+#[test]
+fn test_resolve_runtime_drops_pid_token_when_absent() {
+    let lc = livelog_with_params();
+    let mut args = Map::new();
+    args.insert("token".to_string(), json!("present"));
+    let rt = lc.resolve_runtime(&args).unwrap();
+    assert!(
+        !rt.source_args.iter().any(|a| a.contains("--pid")),
+        "pid token must drop when pid not supplied: {:?}",
+        rt.source_args
+    );
+    // The non-templated args survive in order.
+    assert_eq!(
+        rt.source_args,
+        vec!["logcat", "-v", "threadtime"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_resolve_runtime_empty_param_value_treated_as_absent() {
+    let lc = livelog_with_params();
+    let mut args = Map::new();
+    args.insert("token".to_string(), json!("present"));
+    args.insert("serial".to_string(), json!("")); // empty string == not supplied
+    args.insert("pid".to_string(), json!(""));
+    let rt = lc.resolve_runtime(&args).unwrap();
+    assert!(rt.env.is_empty(), "empty serial should not set env");
+    assert!(!rt.source_args.iter().any(|a| a.contains("--pid")));
+}
+
+#[test]
+fn test_resolve_runtime_clear_defaults_true_and_can_disable() {
+    let lc = livelog_with_params();
+    let mut args = Map::new();
+    args.insert("token".to_string(), json!("present"));
+    assert!(
+        lc.resolve_runtime(&args).unwrap().clear,
+        "clear defaults true"
+    );
+
+    args.insert("clear".to_string(), Value::Bool(false));
+    assert!(!lc.resolve_runtime(&args).unwrap().clear);
+}

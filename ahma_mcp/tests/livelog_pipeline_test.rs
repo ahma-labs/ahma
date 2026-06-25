@@ -42,12 +42,25 @@ fn make_config(
             model: "test-model".to_string(),
             api_key: None,
         },
+        parameters: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        clear_command: None,
+        prefilter_regex: None,
         // Use a tiny chunk so the single echo output is flushed quickly.
         chunk_max_lines: 1,
         chunk_max_seconds: 5,
         cooldown_seconds: 0, // no cooldown between alerts in tests
         llm_timeout_seconds: 10,
     }
+}
+
+/// Build a default runtime (no caller parameters) for tests that exercise the
+/// pipeline directly. Mirrors what `handle_livelog_start` does for a call with
+/// no extra arguments.
+fn default_runtime(config: &LivelogConfig) -> ahma_mcp::config::LivelogRuntime {
+    config
+        .resolve_runtime(&serde_json::Map::new())
+        .expect("default runtime resolves")
 }
 
 fn make_llm_response(content: &str) -> serde_json::Value {
@@ -128,6 +141,7 @@ async fn test_livelog_pipeline_clean_response_no_alert() {
     run_livelog_pipeline(
         "test-op-clean",
         &config,
+        &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
@@ -174,6 +188,7 @@ async fn test_livelog_pipeline_issue_detected_sends_alert() {
     run_livelog_pipeline(
         "test-op-issue",
         &config,
+        &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
@@ -227,6 +242,7 @@ async fn test_livelog_pipeline_cooldown_suppresses_second_alert() {
     run_livelog_pipeline(
         "test-op-cooldown",
         &config,
+        &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
@@ -278,6 +294,7 @@ async fn test_livelog_pipeline_cancellation_stops_pipeline() {
     run_livelog_pipeline(
         "test-op-cancel",
         &config,
+        &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
@@ -328,6 +345,7 @@ async fn test_livelog_pipeline_llm_http_500_graceful() {
     run_livelog_pipeline(
         "test-op-500",
         &config,
+        &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
@@ -370,6 +388,7 @@ async fn test_livelog_pipeline_llm_malformed_json_graceful() {
     run_livelog_pipeline(
         "test-op-bad-json",
         &config,
+        &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
@@ -414,6 +433,7 @@ async fn test_livelog_pipeline_zero_cooldown_fires_all_alerts() {
     run_livelog_pipeline(
         "test-op-zero-cd",
         &config,
+        &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
@@ -455,6 +475,7 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
     run_livelog_pipeline(
         "test-op-not-found",
         &config,
+        &default_runtime(&config),
         &sandbox,
         temp_dir.path(),
         token,
@@ -466,5 +487,146 @@ async fn test_livelog_pipeline_source_not_found_graceful() {
     assert!(
         alerts_for(&monitor, "test-op-not-found").await.is_empty(),
         "no alerts expected when source command not found"
+    );
+}
+
+/// A pre-filter that excludes every emitted line means the LLM is never asked,
+/// so no alert fires even though the mock would flag anything it received.
+#[tokio::test]
+async fn test_livelog_prefilter_excludes_all_lines_no_llm_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(make_llm_response("ISSUE: would-be crash detected")),
+        )
+        .expect(0) // the LLM must NOT be called when nothing passes the filter
+        .mount(&server)
+        .await;
+
+    let temp_dir = tempdir().unwrap();
+    let sandbox = make_sandbox(temp_dir.path());
+
+    let mut config = make_config(
+        "echo",
+        vec!["INFO perfectly benign line".to_string()],
+        &server.uri(),
+        "look for crashes",
+    );
+    // Only forward lines that look like errors; the benign INFO line is dropped.
+    config.prefilter_regex = Some(r"(?i)\b(FATAL|error|exception)\b".to_string());
+
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-prefilter-none").await;
+
+    run_livelog_pipeline(
+        "test-op-prefilter-none",
+        &config,
+        &default_runtime(&config),
+        &sandbox,
+        temp_dir.path(),
+        CancellationToken::new(),
+        monitor.clone(),
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+    )
+    .await;
+
+    assert!(
+        alerts_for(&monitor, "test-op-prefilter-none")
+            .await
+            .is_empty(),
+        "filtered-out lines must not reach the LLM"
+    );
+}
+
+/// A line that matches the pre-filter still reaches the LLM and produces an alert.
+#[tokio::test]
+async fn test_livelog_prefilter_passes_matching_line() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(make_llm_response("Crash: NPE in onCreate")),
+        )
+        .mount(&server)
+        .await;
+
+    let temp_dir = tempdir().unwrap();
+    let sandbox = make_sandbox(temp_dir.path());
+
+    let mut config = make_config(
+        "echo",
+        vec!["FATAL EXCEPTION: boom".to_string()],
+        &server.uri(),
+        "look for crashes",
+    );
+    config.prefilter_regex = Some(r"(?i)\bFATAL\b".to_string());
+
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-prefilter-pass").await;
+
+    run_livelog_pipeline(
+        "test-op-prefilter-pass",
+        &config,
+        &default_runtime(&config),
+        &sandbox,
+        temp_dir.path(),
+        CancellationToken::new(),
+        monitor.clone(),
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+    )
+    .await;
+
+    let alerts = alerts_for(&monitor, "test-op-prefilter-pass").await;
+    assert_eq!(
+        alerts.len(),
+        1,
+        "matching line should produce an alert: {alerts:?}"
+    );
+    assert!(alerts[0].contains("NPE in onCreate"));
+}
+
+/// An invalid pre-filter pattern is non-fatal: monitoring proceeds with every
+/// line forwarded (the bad regex is ignored, not a hard error).
+#[tokio::test]
+async fn test_livelog_invalid_prefilter_falls_back_to_pass_all() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(make_llm_response("Issue: boom")))
+        .mount(&server)
+        .await;
+
+    let temp_dir = tempdir().unwrap();
+    let sandbox = make_sandbox(temp_dir.path());
+
+    let mut config = make_config(
+        "echo",
+        vec!["FATAL boom".to_string()],
+        &server.uri(),
+        "look for crashes",
+    );
+    config.prefilter_regex = Some("(unclosed".to_string()); // invalid regex
+
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-prefilter-bad").await;
+
+    run_livelog_pipeline(
+        "test-op-prefilter-bad",
+        &config,
+        &default_runtime(&config),
+        &sandbox,
+        temp_dir.path(),
+        CancellationToken::new(),
+        monitor.clone(),
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+    )
+    .await;
+
+    assert_eq!(
+        alerts_for(&monitor, "test-op-prefilter-bad").await.len(),
+        1,
+        "invalid regex should not suppress monitoring"
     );
 }

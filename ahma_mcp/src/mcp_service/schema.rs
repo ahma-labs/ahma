@@ -270,6 +270,38 @@ fn add_blocking_property(properties: &mut Map<String, Value>) {
     );
 }
 
+/// Add a livelog tool's declared runtime parameters to its MCP input schema.
+///
+/// Each declared parameter becomes an optional (or required) string property,
+/// and a `clear` boolean is added when the tool defines a `clear_command`.
+fn add_livelog_parameters(
+    properties: &mut Map<String, Value>,
+    required: &mut Vec<Value>,
+    tool_config: &ToolConfig,
+) {
+    let Some(livelog) = tool_config.livelog.as_ref() else {
+        return;
+    };
+    for param in &livelog.parameters {
+        properties.insert(
+            param.name.clone(),
+            json!({ "type": "string", "description": param.description }),
+        );
+        if param.required {
+            required.push(Value::String(param.name.clone()));
+        }
+    }
+    if livelog.clear_command.is_some() {
+        properties.insert(
+            "clear".to_string(),
+            json!({
+                "type": "boolean",
+                "description": "Run the tool's clear command (e.g. clear the log buffer) before monitoring starts. Default true.",
+            }),
+        );
+    }
+}
+
 fn build_schema_object(properties: Map<String, Value>, required: Vec<Value>) -> Map<String, Value> {
     let mut schema = Map::new();
     schema.insert("type".to_string(), Value::String("object".to_string()));
@@ -285,12 +317,13 @@ fn generate_single_command_schema(
     leaf_subcommand: &(String, &SubcommandConfig),
 ) -> Map<String, Value> {
     let (_, sub_config) = leaf_subcommand;
-    let (mut properties, required) = get_schema_for_options(sub_config);
+    let (mut properties, mut required) = get_schema_for_options(sub_config);
 
     if tool_config.name != "cargo" {
         add_working_directory_property(&mut properties);
     }
     add_blocking_property(&mut properties);
+    add_livelog_parameters(&mut properties, &mut required, tool_config);
 
     build_schema_object(properties, required)
 }
@@ -353,11 +386,12 @@ fn generate_multi_command_schema(
     }
     add_blocking_property(&mut all_properties);
 
-    let required = if has_subcommands {
+    let mut required = if has_subcommands {
         vec![Value::String("subcommand".to_string())]
     } else {
         vec![]
     };
+    add_livelog_parameters(&mut all_properties, &mut required, tool_config);
     let mut schema = build_schema_object(all_properties, required);
     if !one_of.is_empty() {
         schema.insert("oneOf".to_string(), Value::Array(one_of));
@@ -396,6 +430,75 @@ mod tests {
         assert_eq!(normalize_option_type("unknown"), "string");
         assert_eq!(normalize_option_type("foo"), "string");
         assert_eq!(normalize_option_type(""), "string");
+    }
+
+    // ============= livelog runtime-parameter schema =============
+
+    fn livelog_tool_config_with_params() -> ToolConfig {
+        use crate::config::{LivelogConfig, LivelogParameter, LlmProviderConfig};
+        ToolConfig {
+            name: "android-logcat".to_string(),
+            description: "logs".to_string(),
+            command: "adb".to_string(),
+            tool_type: Some(crate::config::ToolType::Livelog),
+            livelog: Some(LivelogConfig {
+                source_command: "adb".to_string(),
+                source_args: vec!["logcat".to_string(), "--pid=${pid}".to_string()],
+                detection_prompt: "crashes".to_string(),
+                llm_provider: LlmProviderConfig {
+                    base_url: "http://x/v1".to_string(),
+                    model: "m".to_string(),
+                    api_key: None,
+                },
+                parameters: vec![
+                    LivelogParameter {
+                        name: "serial".to_string(),
+                        description: "device serial".to_string(),
+                        required: false,
+                    },
+                    LivelogParameter {
+                        name: "pid".to_string(),
+                        description: "process id".to_string(),
+                        required: true,
+                    },
+                ],
+                env: std::collections::BTreeMap::new(),
+                clear_command: Some(vec!["logcat".to_string(), "-c".to_string()]),
+                prefilter_regex: None,
+                chunk_max_lines: 50,
+                chunk_max_seconds: 30,
+                cooldown_seconds: 60,
+                llm_timeout_seconds: 30,
+            }),
+            ..ToolConfig::default()
+        }
+    }
+
+    #[test]
+    fn test_livelog_parameters_appear_in_schema() {
+        let tool = livelog_tool_config_with_params();
+        let schema = generate_schema_for_tool_config(&tool, &None);
+        let props = schema["properties"].as_object().expect("properties object");
+
+        // Declared params become string properties with their descriptions.
+        assert_eq!(props["serial"]["type"], "string");
+        assert_eq!(props["serial"]["description"], "device serial");
+        assert_eq!(props["pid"]["type"], "string");
+
+        // A clear_command surfaces a `clear` boolean control.
+        assert_eq!(props["clear"]["type"], "boolean");
+
+        // Standard livelog props are still present.
+        assert!(props.contains_key("working_directory"));
+        assert!(props.contains_key("blocking"));
+
+        // The required `pid` param is marked required; optional `serial` is not.
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(required.contains(&"pid"), "pid is required: {required:?}");
+        assert!(!required.contains(&"serial"));
     }
 
     // ============= build_items_schema tests =============

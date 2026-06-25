@@ -58,6 +58,13 @@ pub async fn handle_livelog_start(
         .validate_path(std::path::Path::new(working_dir))
         .map_err(|e| anyhow::anyhow!("Invalid working directory '{}': {}", working_dir, e))?;
 
+    // Resolve caller-supplied runtime parameters (device serial, pid, clear, …)
+    // into concrete source args + environment. A missing *required* parameter is
+    // surfaced to the caller here, before any process is spawned.
+    let runtime = livelog
+        .resolve_runtime(params)
+        .map_err(|e| anyhow::anyhow!("Invalid parameters for tool '{}': {}", config.name, e))?;
+
     let timeout = config.timeout_seconds.map(Duration::from_secs);
 
     let operation = Operation::new_with_timeout(
@@ -86,6 +93,7 @@ pub async fn handle_livelog_start(
     // Clone everything that needs to move into the background task.
     let op_id_task = op_id.clone();
     let livelog_config = livelog.clone();
+    let runtime_task = runtime;
     let monitor_task = monitor.clone();
     let sandbox_task = sandbox.clone();
     let llm_service_task = llm_service.clone();
@@ -111,6 +119,7 @@ pub async fn handle_livelog_start(
         run_livelog_pipeline(
             &op_id_task,
             &livelog_config,
+            &runtime_task,
             &sandbox_task,
             &safe_wd,
             cancellation_token,

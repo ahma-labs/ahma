@@ -197,9 +197,12 @@ impl LlmProviderConfig {
             .as_deref()
             .map(interpolate_env_vars)
             .transpose()?;
+        // `base_url` and `model` also support `${VAR}` / `${VAR:-default}` so an
+        // operator can point a tool at a different endpoint or model via the
+        // environment without editing the tool definition file.
         Ok(ResolvedLlmProvider {
-            base_url: self.base_url.clone(),
-            model: self.model.clone(),
+            base_url: interpolate_env_vars(&self.base_url)?,
+            model: interpolate_env_vars(&self.model)?,
             api_key,
         })
     }
@@ -224,6 +227,14 @@ pub struct LivelogConfig {
     /// The executable to run as the log source (e.g. `"adb"`, `"ssh"`, `"tail"`).
     pub source_command: String,
     /// Arguments for the source command (e.g. `["logcat", "-v", "threadtime"]`).
+    ///
+    /// Each argument may reference a runtime parameter declared in
+    /// [`LivelogConfig::parameters`] with `${name}` syntax. When the caller
+    /// supplies the parameter, every `${name}` is substituted with its value;
+    /// when the parameter is omitted (or empty), the **entire argument token**
+    /// that referenced it is dropped. This lets an optional flag such as
+    /// `"--pid=${pid}"` disappear cleanly when no pid is supplied, rather than
+    /// expanding to an invalid `--pid=`.
     #[serde(default)]
     pub source_args: Vec<String>,
     /// Plain-English description of what to look for, passed to the LLM as the
@@ -231,6 +242,33 @@ pub struct LivelogConfig {
     pub detection_prompt: String,
     /// LLM provider connection details.
     pub llm_provider: LlmProviderConfig,
+    /// Runtime parameters the caller may pass when starting the tool. These are
+    /// surfaced in the tool's MCP input schema and substituted into
+    /// [`LivelogConfig::source_args`] and [`LivelogConfig::env`] via `${name}`.
+    #[serde(default)]
+    pub parameters: Vec<LivelogParameter>,
+    /// Environment variables to set on the source (and clear) process. Values
+    /// may reference runtime parameters with `${name}`; an entry whose value
+    /// references a parameter the caller did not supply is dropped entirely.
+    /// Example: `{ "ANDROID_SERIAL": "${serial}" }` targets a specific device
+    /// only when a `serial` parameter is passed.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Optional command run once before the source process starts (e.g.
+    /// `["logcat", "-c"]` to clear Android's log buffers so stale crashes are
+    /// not replayed as fresh alerts). Runs with the same `env` applied and is
+    /// best-effort — a failure is logged but does not abort monitoring. The
+    /// caller can skip it by passing `clear: false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clear_command: Option<Vec<String>>,
+    /// Optional regular expression used to pre-filter lines before they are sent
+    /// to the LLM. When set, only lines matching the pattern are accumulated
+    /// into a chunk for analysis (the full, unfiltered output is still recorded
+    /// on the operation). This keeps token cost and latency low by never sending
+    /// obviously-benign noise to the model. An invalid pattern is logged and
+    /// ignored (all lines pass through).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefilter_regex: Option<String>,
     /// Maximum number of lines to accumulate before sending a chunk to the LLM.
     /// Defaults to 50.
     #[serde(default = "default_chunk_max_lines")]
@@ -247,6 +285,123 @@ pub struct LivelogConfig {
     /// Defaults to 30.
     #[serde(default = "default_llm_timeout_seconds")]
     pub llm_timeout_seconds: u64,
+}
+
+/// A runtime parameter a livelog tool accepts when started.
+///
+/// Parameters are surfaced in the tool's MCP input schema (as optional string
+/// properties unless `required`) and substituted into the source command's
+/// arguments and environment via `${name}`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LivelogParameter {
+    /// Parameter name, referenced in `source_args`/`env` as `${name}`.
+    pub name: String,
+    /// Human-readable description shown to MCP clients.
+    pub description: String,
+    /// Whether the caller must supply this parameter. Defaults to `false`.
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// Runtime values resolved from the caller's MCP arguments for a livelog start.
+///
+/// Produced by [`LivelogConfig::resolve_runtime`] and consumed by the livelog
+/// pipeline. Keeps all caller-driven substitution out of the generic pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct LivelogRuntime {
+    /// `source_args` with `${param}` placeholders substituted and tokens that
+    /// referenced an unsupplied parameter dropped.
+    pub source_args: Vec<String>,
+    /// Environment variables to set on spawned processes (placeholder values
+    /// resolved; entries referencing unsupplied parameters omitted).
+    pub env: Vec<(String, String)>,
+    /// Whether to run `clear_command` before starting the source process.
+    pub clear: bool,
+}
+
+impl LivelogConfig {
+    /// Resolve the caller's runtime arguments against this config.
+    ///
+    /// `args` is the MCP `tools/call` argument map. Declared parameters are read
+    /// from it (string values), substituted into `source_args` and `env`, and a
+    /// missing **required** parameter produces an error. The boolean `clear`
+    /// argument (default `true`) controls whether `clear_command` runs.
+    pub fn resolve_runtime(
+        &self,
+        args: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<LivelogRuntime> {
+        use anyhow::bail;
+
+        // Collect supplied, non-empty parameter values keyed by declared name.
+        let mut supplied: std::collections::HashMap<&str, String> =
+            std::collections::HashMap::new();
+        for param in &self.parameters {
+            match args.get(&param.name).and_then(|v| v.as_str()) {
+                Some(v) if !v.is_empty() => {
+                    supplied.insert(param.name.as_str(), v.to_string());
+                }
+                _ => {
+                    if param.required {
+                        bail!("required parameter '{}' was not supplied", param.name);
+                    }
+                }
+            }
+        }
+
+        let source_args = substitute_tokens(&self.source_args, &supplied);
+
+        let mut env = Vec::new();
+        for (key, raw) in &self.env {
+            if let Some(value) = substitute_value(raw, &supplied) {
+                env.push((key.clone(), value));
+            }
+        }
+
+        // `clear` defaults to true; only an explicit `false` disables it.
+        let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(true);
+
+        Ok(LivelogRuntime {
+            source_args,
+            env,
+            clear,
+        })
+    }
+}
+
+/// Substitute `${name}` placeholders in each token, dropping any token that
+/// references a parameter not present in `supplied`.
+fn substitute_tokens(
+    tokens: &[String],
+    supplied: &std::collections::HashMap<&str, String>,
+) -> Vec<String> {
+    tokens
+        .iter()
+        .filter_map(|tok| substitute_value(tok, supplied))
+        .collect()
+}
+
+/// Substitute `${name}` placeholders in `raw`. Returns `None` (signalling the
+/// caller to drop the value) if `raw` references any `${name}` whose parameter
+/// was not supplied; returns `Some` with all placeholders replaced otherwise.
+fn substitute_value(
+    raw: &str,
+    supplied: &std::collections::HashMap<&str, String>,
+) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find('}')?;
+        let name = &after[..end];
+        match supplied.get(name) {
+            Some(value) => out.push_str(value),
+            None => return None,
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 fn default_chunk_max_lines() -> usize {

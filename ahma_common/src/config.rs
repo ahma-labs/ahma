@@ -69,7 +69,11 @@ use tracing::{debug, warn};
 
 /// Expand `${VAR_NAME}` placeholders in `s` using the process environment.
 ///
-/// Returns `Err` if any referenced variable is not set.
+/// Two forms are supported:
+/// - `${VAR}` — required: returns `Err` if `VAR` is not set.
+/// - `${VAR:-default}` — optional: uses `default` when `VAR` is unset or empty
+///   (the default may itself be empty, e.g. `${VAR:-}`).
+///
 /// After expansion, warns via [`tracing::warn!`] if the resulting string looks
 /// like a literal API key (`sk-`, `AKIA`, `xoxb-`, `ghp_`).
 pub fn interpolate_env_vars(s: &str) -> Result<String> {
@@ -84,10 +88,19 @@ pub fn interpolate_env_vars(s: &str) -> Result<String> {
             .find('}')
             .with_context(|| format!("Unclosed '${{{rest}' in config value"))?;
 
-        let var_name = &rest[..end];
-        let value = std::env::var(var_name).with_context(|| {
-            format!("Environment variable '{var_name}' referenced in config is not set")
-        })?;
+        let placeholder = &rest[..end];
+        // Support `${VAR:-default}`: use `default` when `VAR` is unset or empty,
+        // instead of erroring. A bare `${VAR}` (no `:-`) still errors when unset,
+        // preserving the original fail-loud behaviour for required references.
+        let value = match placeholder.split_once(":-") {
+            Some((var_name, default)) => match std::env::var(var_name) {
+                Ok(v) if !v.is_empty() => v,
+                _ => default.to_string(),
+            },
+            None => std::env::var(placeholder).with_context(|| {
+                format!("Environment variable '{placeholder}' referenced in config is not set")
+            })?,
+        };
 
         out.push_str(&value);
         rest = &rest[end + 1..];
@@ -1269,6 +1282,50 @@ mod tests {
     fn interpolate_unclosed_brace_returns_err() {
         let err = interpolate_env_vars("${UNCLOSED").unwrap_err();
         assert!(err.to_string().contains("Unclosed"));
+    }
+
+    #[test]
+    fn interpolate_default_used_when_var_unset() {
+        unsafe {
+            std::env::remove_var("AHMA_TEST_DEFAULT_UNSET");
+        }
+        let result =
+            interpolate_env_vars("${AHMA_TEST_DEFAULT_UNSET:-http://localhost:11434/v1}").unwrap();
+        assert_eq!(result, "http://localhost:11434/v1");
+    }
+
+    #[test]
+    fn interpolate_default_used_when_var_empty() {
+        unsafe {
+            std::env::set_var("AHMA_TEST_DEFAULT_EMPTY", "");
+        }
+        let result = interpolate_env_vars("${AHMA_TEST_DEFAULT_EMPTY:-fallback}").unwrap();
+        unsafe {
+            std::env::remove_var("AHMA_TEST_DEFAULT_EMPTY");
+        }
+        assert_eq!(result, "fallback");
+    }
+
+    #[test]
+    fn interpolate_set_variable_overrides_default() {
+        unsafe {
+            std::env::set_var("AHMA_TEST_DEFAULT_SET", "lfm2.5:8b");
+        }
+        let result = interpolate_env_vars("${AHMA_TEST_DEFAULT_SET:-llama3.2}").unwrap();
+        unsafe {
+            std::env::remove_var("AHMA_TEST_DEFAULT_SET");
+        }
+        assert_eq!(result, "lfm2.5:8b");
+    }
+
+    #[test]
+    fn interpolate_empty_default_is_allowed() {
+        unsafe {
+            std::env::remove_var("AHMA_TEST_EMPTY_DEFAULT");
+        }
+        // `${VAR:-}` with no default text resolves to the empty string rather than erroring.
+        let result = interpolate_env_vars("prefix-${AHMA_TEST_EMPTY_DEFAULT:-}-suffix").unwrap();
+        assert_eq!(result, "prefix--suffix");
     }
 
     #[test]

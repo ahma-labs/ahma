@@ -268,6 +268,12 @@ mod tests {
         );
     }
 
+    // Holds the std `ENV_MUTEX` guard across the `.await`: the process-global env
+    // var must stay set for the whole call, so the lock has to span the await to
+    // keep concurrent env-mutating tests out. Safe here — `#[tokio::test]` uses a
+    // current-thread runtime (the guard never moves between threads) and nothing
+    // under the lock re-acquires `ENV_MUTEX`, so it cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn verify_artifact_ok_when_skip_env_set() {
         let _g = ENV_MUTEX.lock().unwrap();
@@ -281,6 +287,10 @@ mod tests {
         );
     }
 
+    // See `verify_artifact_ok_when_skip_env_set`: the `ENV_MUTEX` guard must span
+    // the await so the cleared env vars stay cleared for the whole `run_cli` call.
+    // Safe for the same reasons (current-thread test runtime, no re-lock).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn run_cli_errors_on_missing_artifact() {
         use std::path::PathBuf;

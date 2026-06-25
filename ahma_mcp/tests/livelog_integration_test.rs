@@ -69,6 +69,10 @@ fn make_livelog_config(
             model: "test-model".to_string(),
             api_key: None,
         },
+        parameters: Vec::new(),
+        env: std::collections::BTreeMap::new(),
+        clear_command: None,
+        prefilter_regex: None,
         chunk_max_lines: 1,
         chunk_max_seconds: 5,
         cooldown_seconds: 0, // disabled so each chunk can trigger independently

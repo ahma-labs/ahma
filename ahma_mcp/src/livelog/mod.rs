@@ -28,11 +28,27 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
-    config::{LivelogConfig, LlmProviderConfig},
+    config::{LivelogConfig, LivelogRuntime, LlmProviderConfig},
     sandbox::Sandbox,
 };
 
 use crate::operation_monitor::OperationMonitor;
+
+/// Apply caller-resolved environment variables to a sandboxed command.
+fn apply_env(cmd: &mut tokio::process::Command, env: &[(String, String)]) {
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+}
+
+/// Push `line` into the LLM analysis `chunk` only when it passes the optional
+/// pre-filter. The full output is recorded on the operation separately; this
+/// gates only what is forwarded to the (comparatively expensive) LLM.
+fn push_if_match(chunk: &mut Vec<String>, line: String, prefilter: &Option<regex::Regex>) {
+    if prefilter.as_ref().is_none_or(|re| re.is_match(&line)) {
+        chunk.push(line);
+    }
+}
 
 /// Run the live-log pipeline until cancelled or the source process exits.
 ///
@@ -48,6 +64,7 @@ use crate::operation_monitor::OperationMonitor;
 pub async fn run_livelog_pipeline(
     op_id: &str,
     config: &LivelogConfig,
+    runtime: &LivelogRuntime,
     sandbox: &Arc<Sandbox>,
     working_dir: &std::path::Path,
     cancellation_token: CancellationToken,
@@ -65,11 +82,49 @@ pub async fn run_livelog_pipeline(
         }
     };
 
+    // Compile the optional pre-filter once. An invalid pattern is non-fatal:
+    // log it and let every line through rather than aborting monitoring.
+    let prefilter = config.prefilter_regex.as_deref().and_then(|pat| {
+        match regex::Regex::new(pat) {
+            Ok(re) => Some(re),
+            Err(e) => {
+                warn!(
+                    "livelog[{}]: invalid prefilter_regex {:?}: {} — sending all lines to the LLM",
+                    op_id, pat, e
+                );
+                None
+            }
+        }
+    });
+
+    // Best-effort buffer clear (e.g. `adb logcat -c`) so stale crashes from a
+    // previous run are not replayed as fresh alerts. Skipped when the caller
+    // passed `clear: false` or the tool defines no `clear_command`.
+    if runtime.clear
+        && let Some(clear_args) = config.clear_command.as_deref()
+    {
+        match sandbox.create_command(&config.source_command, clear_args, working_dir) {
+            Ok(mut cmd) => {
+                apply_env(&mut cmd, &runtime.env);
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::null());
+                match cmd.status().await {
+                    Ok(status) => {
+                        debug!("livelog[{}]: clear command exited with {}", op_id, status)
+                    }
+                    Err(e) => warn!("livelog[{}]: clear command failed: {}", op_id, e),
+                }
+            }
+            Err(e) => warn!("livelog[{}]: failed to create clear command: {}", op_id, e),
+        }
+    }
+
     let cmd_result =
-        sandbox.create_command(&config.source_command, &config.source_args, working_dir);
+        sandbox.create_command(&config.source_command, &runtime.source_args, working_dir);
 
     let mut child = match cmd_result {
         Ok(mut cmd) => {
+            apply_env(&mut cmd, &runtime.env);
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             match cmd.spawn() {
@@ -88,7 +143,7 @@ pub async fn run_livelog_pipeline(
 
     info!(
         "livelog[{}]: source process started ({} {:?})",
-        op_id, config.source_command, config.source_args
+        op_id, config.source_command, runtime.source_args
     );
 
     let stdout = child.stdout.take().expect("stdout was piped");
@@ -146,7 +201,7 @@ pub async fn run_livelog_pipeline(
                     Ok(Some(line)) => {
                         debug!("livelog[{}] stderr: {}", op_id, line);
                         monitor.append_stdout_line(op_id, line.clone()).await;
-                        chunk.push(line);
+                        push_if_match(&mut chunk, line, &prefilter);
                     }
                     Ok(None) => {
                         debug!("livelog[{}]: stderr closed", op_id);
@@ -165,7 +220,7 @@ pub async fn run_livelog_pipeline(
                     Ok(Some(line)) => {
                         debug!("livelog[{}] stdout: {}", op_id, line);
                         monitor.append_stdout_line(op_id, line.clone()).await;
-                        chunk.push(line);
+                        push_if_match(&mut chunk, line, &prefilter);
                     }
                     Ok(None) => {
                         debug!("livelog[{}]: stdout closed", op_id);
