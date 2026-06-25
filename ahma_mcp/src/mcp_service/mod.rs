@@ -1285,6 +1285,12 @@ impl ServerHandler for AhmaMcpService {
                 )
                 .with_title("restart"),
                 Tool::new(
+                    "cancel",
+                    "Cancel a running background operation by `id`, or cancel EVERY in-flight operation with `all: true`. Each cancellation reaps the operation's full process tree (cargo/rustc/sccache) — the clean way to stop wedged work without killing and restarting the server.",
+                    handlers::cancel_tool::cancel_schema(),
+                )
+                .with_title("cancel"),
+                Tool::new(
                     "read_file",
                     "Read UTF-8 text from a scoped file, with optional line slicing.",
                     handlers::harness_tools::read_file_schema(),
@@ -2325,13 +2331,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_cancel_requires_id() {
+    async fn handle_cancel_requires_id_or_all() {
         let service = make_service().await;
         let err = service
             .handle_cancel(serde_json::Map::new())
             .await
             .unwrap_err();
-        assert!(format!("{err:?}").contains("id parameter is required"));
+        assert!(format!("{err:?}").contains("either `id` or `all: true` is required"));
     }
 
     #[tokio::test]
@@ -2372,6 +2378,48 @@ mod tests {
                 .filter_map(|c| c.as_text())
                 .any(|t| t.text.contains("\"tool_hint\""))
         );
+    }
+
+    #[tokio::test]
+    async fn handle_cancel_all_cancels_every_in_flight_operation() {
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(30),
+        )));
+        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+
+        for id in ["op_x", "op_y"] {
+            let mut op = Operation::new(id.to_string(), "t".to_string(), "d".to_string(), None);
+            op.state = OperationStatus::InProgress;
+            monitor.add_operation(op).await;
+        }
+
+        let args = json!({"all": true, "reason": "stop everything"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let result = service.handle_cancel(args).await.expect("cancel all");
+        let text = first_text(&result);
+        assert!(
+            text.contains("Cancelled 2 in-flight operation"),
+            "got: {text}"
+        );
+        assert!(text.contains("reason='stop everything'"));
+        assert!(
+            monitor.get_active_operations().await.is_empty(),
+            "cancel-all must leave no active operations"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_cancel_all_with_nothing_running_is_graceful() {
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(30),
+        )));
+        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+
+        let args = json!({"all": true}).as_object().unwrap().clone();
+        let result = service.handle_cancel(args).await.expect("cancel all");
+        assert!(first_text(&result).contains("No in-flight operations to cancel"));
     }
 
     #[tokio::test]

@@ -697,6 +697,48 @@ impl OperationMonitor {
         self.cancel_operation_with_reason(id, None).await
     }
 
+    /// Cancel **every** in-flight (non-terminal) operation, returning the IDs
+    /// that were cancelled (in no particular order).
+    ///
+    /// This is the interactive teardown primitive behind "cancel all" — the
+    /// clean alternative to killing and restarting the whole server when one or
+    /// more operations wedge. Each cancellation signals that operation's
+    /// cancellation token, which drives the streaming executor down its
+    /// `cancelled()` branch into `kill_process_tree` — so this reaps the entire
+    /// descendant process tree of every operation (the `cargo → rustc → sccache`
+    /// chain), not merely the monitor's bookkeeping. The reap is verified with a
+    /// bounded grace (Phase 0), so a stuck child is logged rather than silently
+    /// orphaned.
+    ///
+    /// A snapshot of active IDs is taken under a read lock first, then each is
+    /// cancelled individually, so the per-operation "first terminal writer wins"
+    /// invariant and history/notification bookkeeping are reused unchanged. Ops
+    /// that reach a terminal state between the snapshot and their turn are simply
+    /// skipped (their cancel returns `false`).
+    pub async fn cancel_all_operations(&self, reason: Option<String>) -> Vec<String> {
+        let active_ids: Vec<String> = {
+            let ops = self.operations.read().await;
+            ops.values()
+                .filter(|op| !op.state.is_terminal())
+                .map(|op| op.id.clone())
+                .collect()
+        };
+
+        let mut cancelled = Vec::with_capacity(active_ids.len());
+        for id in active_ids {
+            if self.cancel_operation_with_reason(&id, reason.clone()).await {
+                cancelled.push(id);
+            }
+        }
+        if !cancelled.is_empty() {
+            tracing::info!(
+                "cancel_all_operations: cancelled {} operation(s)",
+                cancelled.len()
+            );
+        }
+        cancelled
+    }
+
     pub async fn get_active_operations(&self) -> Vec<Operation> {
         let ops = self.operations.read().await;
         ops.values()
@@ -1416,5 +1458,72 @@ mod tests {
         assert!(detected.is_none(), "a 1s gap is normal, not a suspend");
         let op = monitor.get_operation("op").await.unwrap();
         assert!(op.alerts.is_empty(), "no alert for a normal tick");
+    }
+
+    // ── P2b: cancel-all teardown ──────────────────────────────────────────────
+
+    async fn add_active_op(monitor: &OperationMonitor, id: &str) {
+        let mut op = Operation::new(
+            id.to_string(),
+            "test_tool".to_string(),
+            "active op".to_string(),
+            None,
+        );
+        op.state = OperationStatus::InProgress;
+        monitor.add_operation(op).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_all_cancels_every_active_operation() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(3600)));
+        for id in ["op_a", "op_b", "op_c"] {
+            add_active_op(&monitor, id).await;
+        }
+        assert_eq!(monitor.get_active_operations().await.len(), 3);
+
+        let mut cancelled = monitor
+            .cancel_all_operations(Some("test teardown".to_string()))
+            .await;
+        cancelled.sort();
+
+        assert_eq!(cancelled, vec!["op_a", "op_b", "op_c"]);
+        assert!(
+            monitor.get_active_operations().await.is_empty(),
+            "no operation should remain active after cancel-all"
+        );
+        // Each cancelled op landed in history as Cancelled with the reason.
+        let completed = monitor.get_completed_operations().await;
+        for id in ["op_a", "op_b", "op_c"] {
+            let op = completed.iter().find(|o| o.id == id).expect("in history");
+            assert_eq!(op.state, OperationStatus::Cancelled);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_all_on_empty_monitor_returns_empty() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(3600)));
+        assert!(monitor.cancel_all_operations(None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_all_skips_already_terminal_operations() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(3600)));
+        add_active_op(&monitor, "live").await;
+        add_active_op(&monitor, "done").await;
+        // Drive one to a terminal state before the bulk cancel.
+        monitor
+            .update_status("done", OperationStatus::Completed, None)
+            .await;
+
+        let cancelled = monitor.cancel_all_operations(None).await;
+
+        assert_eq!(
+            cancelled,
+            vec!["live"],
+            "only the still-active op is cancelled"
+        );
     }
 }
