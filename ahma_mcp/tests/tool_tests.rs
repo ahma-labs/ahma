@@ -82,3 +82,6 @@ mod comprehensive_tool_json_coverage_test;
 
 #[path = "tool_suite/tool_execution_integration_test.rs"]
 mod tool_execution_integration_test;
+
+#[path = "tool_suite/adb_tools_test.rs"]
+mod adb_tools_test;

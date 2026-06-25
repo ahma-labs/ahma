@@ -51,6 +51,7 @@ fn make_config(
         chunk_max_seconds: 5,
         cooldown_seconds: 0, // no cooldown between alerts in tests
         llm_timeout_seconds: 10,
+        structured_output: false,
     }
 }
 
@@ -628,5 +629,173 @@ async fn test_livelog_invalid_prefilter_falls_back_to_pass_all() {
         alerts_for(&monitor, "test-op-prefilter-bad").await.len(),
         1,
         "invalid regex should not suppress monitoring"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Structured output tests
+// ---------------------------------------------------------------------------
+
+/// When `structured_output: true` and the LLM returns `{"issue":false}`, no
+/// alert is emitted — that JSON means "clean", not a prose issue report.
+#[tokio::test]
+async fn test_structured_output_issue_false_no_alert() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(make_llm_response(r#"{"issue":false}"#)),
+        )
+        .mount(&server)
+        .await;
+
+    let temp_dir = tempdir().unwrap();
+    let sandbox = make_sandbox(temp_dir.path());
+
+    let mut config = make_config(
+        "echo",
+        vec!["INFO perfectly fine".to_string()],
+        &server.uri(),
+        "look for crashes",
+    );
+    config.structured_output = true;
+
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-struct-clean").await;
+
+    run_livelog_pipeline(
+        "test-op-struct-clean",
+        &config,
+        &default_runtime(&config),
+        &sandbox,
+        temp_dir.path(),
+        CancellationToken::new(),
+        monitor.clone(),
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+    )
+    .await;
+
+    assert!(
+        alerts_for(&monitor, "test-op-struct-clean")
+            .await
+            .is_empty(),
+        "structured issue:false must not produce an alert"
+    );
+}
+
+/// When `structured_output: true` and the LLM returns a JSON object with
+/// `issue:true`, the alert is formatted with level, summary, and optional fields.
+#[tokio::test]
+async fn test_structured_output_issue_true_formats_alert() {
+    let server = MockServer::start().await;
+    let json_resp = r#"{"issue":true,"level":"FATAL","summary":"NullPointerException in MainActivity","exception_class":"java.lang.NullPointerException","top_frame":"MainActivity.onCreate(MainActivity.kt:42)"}"#;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(make_llm_response(json_resp)))
+        .mount(&server)
+        .await;
+
+    let temp_dir = tempdir().unwrap();
+    let sandbox = make_sandbox(temp_dir.path());
+
+    let mut config = make_config(
+        "echo",
+        vec!["FATAL EXCEPTION: NPE".to_string()],
+        &server.uri(),
+        "look for crashes",
+    );
+    config.structured_output = true;
+
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-struct-issue").await;
+
+    run_livelog_pipeline(
+        "test-op-struct-issue",
+        &config,
+        &default_runtime(&config),
+        &sandbox,
+        temp_dir.path(),
+        CancellationToken::new(),
+        monitor.clone(),
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+    )
+    .await;
+
+    let alerts = alerts_for(&monitor, "test-op-struct-issue").await;
+    assert_eq!(
+        alerts.len(),
+        1,
+        "structured issue:true must produce an alert"
+    );
+    let alert = &alerts[0];
+    assert!(
+        alert.contains("[FATAL]"),
+        "alert must include the level: {alert}"
+    );
+    assert!(
+        alert.contains("NullPointerException in MainActivity"),
+        "alert must include the summary: {alert}"
+    );
+    assert!(
+        alert.contains("java.lang.NullPointerException"),
+        "alert must include exception_class: {alert}"
+    );
+    assert!(
+        alert.contains("MainActivity.kt:42"),
+        "alert must include top_frame: {alert}"
+    );
+}
+
+/// When `structured_output: true` but the LLM response is not valid JSON
+/// (model fell back to prose), the response is still treated as a plain-text
+/// alert so no alert is silently dropped.
+#[tokio::test]
+async fn test_structured_output_non_json_falls_back_to_plain_text_alert() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(make_llm_response("FATAL: NPE in com.example.app")),
+        )
+        .mount(&server)
+        .await;
+
+    let temp_dir = tempdir().unwrap();
+    let sandbox = make_sandbox(temp_dir.path());
+
+    let mut config = make_config(
+        "echo",
+        vec!["FATAL EXCEPTION main".to_string()],
+        &server.uri(),
+        "look for crashes",
+    );
+    config.structured_output = true;
+
+    let monitor = make_monitor();
+    register_op(&monitor, "test-op-struct-prose").await;
+
+    run_livelog_pipeline(
+        "test-op-struct-prose",
+        &config,
+        &default_runtime(&config),
+        &sandbox,
+        temp_dir.path(),
+        CancellationToken::new(),
+        monitor.clone(),
+        Arc::new(ahma_mcp::llm_service::DefaultLlmCompletionService),
+    )
+    .await;
+
+    let alerts = alerts_for(&monitor, "test-op-struct-prose").await;
+    assert_eq!(
+        alerts.len(),
+        1,
+        "non-JSON response in structured mode should fall through to plain-text alert"
+    );
+    assert!(
+        alerts[0].contains("NPE in com.example.app"),
+        "plain-text body should appear in alert: {:?}",
+        alerts[0]
     );
 }

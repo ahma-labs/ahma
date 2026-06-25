@@ -285,6 +285,13 @@ pub struct LivelogConfig {
     /// Defaults to 30.
     #[serde(default = "default_llm_timeout_seconds")]
     pub llm_timeout_seconds: u64,
+    /// When `true`, instruct the LLM to return a structured JSON object instead of
+    /// plain-English prose.  The pipeline parses the JSON and emits a rich alert
+    /// with discrete fields (`level`, `summary`, `exception_class`, `top_frame`).
+    /// If the LLM returns un-parseable JSON the response is treated as plain text.
+    /// Defaults to `false` for backward-compatibility.
+    #[serde(default)]
+    pub structured_output: bool,
 }
 
 /// A runtime parameter a livelog tool accepts when started.

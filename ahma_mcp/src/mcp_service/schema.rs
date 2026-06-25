@@ -469,6 +469,7 @@ mod tests {
                 chunk_max_seconds: 30,
                 cooldown_seconds: 60,
                 llm_timeout_seconds: 30,
+                structured_output: false,
             }),
             ..ToolConfig::default()
         }

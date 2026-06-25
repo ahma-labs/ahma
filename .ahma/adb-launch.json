@@ -1,0 +1,33 @@
+{
+    "name": "adb-launch",
+    "description": "Launch an Android app on the connected device via `adb shell am start -n <component>`. The component is `<package>/<activity>` (e.g. `com.example.app/.MainActivity`). Set ANDROID_SERIAL in the environment to target a specific device.",
+    "command": "adb shell am start -n",
+    "enabled": true,
+    "timeout_seconds": 30,
+    "subcommand": [
+        {
+            "name": "default",
+            "description": "Start the specified Activity on the connected device. Combine with adb-pid-of afterward to get the PID for scoped android-logcat monitoring.",
+            "positional_args": [
+                {
+                    "name": "component",
+                    "type": "string",
+                    "description": "Activity component in the form <package>/<activity>, e.g. com.example.app/.MainActivity or com.example.app/com.example.app.MainActivity.",
+                    "required": true
+                }
+            ],
+            "synchronous": true,
+            "availability_check": {
+                "command": "adb",
+                "args": ["version"]
+            },
+            "install_instructions": "Install ADB via Android Studio or: brew install android-platform-tools"
+        }
+    ],
+    "hints": {
+        "custom": {
+            "usage": "After installing (adb-install or gradle-install-debug), launch the app, then call adb-pid-of to get its PID for scoped android-logcat monitoring.",
+            "workflow": "gradle-install-debug → adb-launch → adb-pid-of → android-logcat (with pid)"
+        }
+    }
+}

@@ -77,6 +77,7 @@ fn make_livelog_config(
         chunk_max_seconds: 5,
         cooldown_seconds: 0, // disabled so each chunk can trigger independently
         llm_timeout_seconds: 10,
+        structured_output: false,
     }
 }
 

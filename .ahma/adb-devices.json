@@ -1,0 +1,32 @@
+{
+    "name": "adb-devices",
+    "description": "List all Android devices and emulators currently connected via ADB. Use this to find the serial number you need to pass to android-logcat, adb-pid-of, adb-install, or adb-launch when more than one device is connected.",
+    "command": "adb",
+    "enabled": true,
+    "timeout_seconds": 15,
+    "subcommand": [
+        {
+            "name": "devices",
+            "description": "Print the list of attached Android devices and emulators with their serials and state.",
+            "options": [
+                {
+                    "name": "long",
+                    "alias": "l",
+                    "type": "boolean",
+                    "description": "Show extended information (model, product, transport) for each device."
+                }
+            ],
+            "synchronous": true,
+            "availability_check": {
+                "command": "adb",
+                "args": ["version"]
+            },
+            "install_instructions": "Install ADB via Android Studio or: brew install android-platform-tools"
+        }
+    ],
+    "hints": {
+        "custom": {
+            "usage": "Call this first when multiple devices are connected to find the serial for adb-pid-of, adb-install, adb-launch, or the android-logcat `serial` parameter."
+        }
+    }
+}

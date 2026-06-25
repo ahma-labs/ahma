@@ -1,0 +1,33 @@
+{
+    "name": "adb-pid-of",
+    "description": "Resolve an Android package name to its current process ID via `adb shell pidof -s <package>`. Returns the PID as a single number, or empty output when the process is not running. Pass the result as the `pid` parameter to android-logcat to scope monitoring to one app. Set ANDROID_SERIAL in the environment to target a specific device when multiple are connected.",
+    "command": "adb shell pidof -s",
+    "enabled": true,
+    "timeout_seconds": 10,
+    "subcommand": [
+        {
+            "name": "default",
+            "description": "Print the PID for the given Android package, or nothing when the package is not running.",
+            "positional_args": [
+                {
+                    "name": "package",
+                    "type": "string",
+                    "description": "Android package name (e.g. com.example.myapp).",
+                    "required": true
+                }
+            ],
+            "synchronous": true,
+            "availability_check": {
+                "command": "adb",
+                "args": ["version"]
+            },
+            "install_instructions": "Install ADB via Android Studio or: brew install android-platform-tools"
+        }
+    ],
+    "hints": {
+        "custom": {
+            "usage": "Use to get the PID before calling android-logcat with `pid` parameter: adb-pid-of com.example.myapp → pass that PID as `pid` to android-logcat.",
+            "note": "Set ANDROID_SERIAL=<serial> (from adb-devices) in the environment to target a specific device."
+        }
+    }
+}

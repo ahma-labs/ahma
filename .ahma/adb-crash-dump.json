@@ -1,0 +1,37 @@
+{
+    "name": "adb-crash-dump",
+    "description": "Capture all entries currently in the Android crash and system log buffers via `adb logcat -b crash,system -d`. Returns immediately with the full crash log — use this for one-shot diagnosis after a crash rather than for live monitoring (see android-logcat for live monitoring). Set ANDROID_SERIAL in the environment to target a specific device.",
+    "command": "adb logcat -b crash,system -d",
+    "enabled": true,
+    "timeout_seconds": 30,
+    "subcommand": [
+        {
+            "name": "default",
+            "description": "Dump the current crash and system log buffers. Output includes FATAL exceptions, ANR traces, native crashes, and tombstone markers.",
+            "options": [
+                {
+                    "name": "v",
+                    "type": "string",
+                    "description": "Output format. Defaults to 'threadtime' (timestamp + thread). Other useful values: 'brief', 'long', 'tag'."
+                },
+                {
+                    "name": "pid",
+                    "type": "string",
+                    "description": "Restrict output to a single PID. Resolve with adb-pid-of."
+                }
+            ],
+            "synchronous": true,
+            "availability_check": {
+                "command": "adb",
+                "args": ["version"]
+            },
+            "install_instructions": "Install ADB via Android Studio or: brew install android-platform-tools"
+        }
+    ],
+    "hints": {
+        "custom": {
+            "usage": "Call after a crash to retrieve the full stack trace. Pass the output to the LLM for diagnosis and suggested fixes.",
+            "deobfuscation": "If the stack trace contains obfuscated class/method names, apply `retrace` using the R8/ProGuard mapping.txt from your build output: java -jar retrace.jar mapping.txt <stacktrace_file>"
+        }
+    }
+}

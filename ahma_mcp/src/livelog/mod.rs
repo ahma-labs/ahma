@@ -50,6 +50,15 @@ fn push_if_match(chunk: &mut Vec<String>, line: String, prefilter: &Option<regex
     }
 }
 
+// JSON output instruction appended to the detection prompt when `structured_output: true`.
+// Modern LLMs follow user-message JSON instructions even when the system prompt specifies a
+// different format, overriding the default "CLEAN or prose" response.
+const STRUCTURED_OUTPUT_INSTRUCTION: &str = "\n\n\
+IMPORTANT: Respond ONLY with valid JSON — no other text, no markdown, no explanation.\n\
+  No issue found : {\"issue\":false}\n\
+  Issue found    : {\"issue\":true,\"level\":\"FATAL|ERROR|WARN\",\"summary\":\"one sentence\",\
+\"exception_class\":\"optional.FullyQualifiedClass\",\"top_frame\":\"optional File.kt:42\"}";
+
 /// Run the live-log pipeline until cancelled or the source process exits.
 ///
 /// # Arguments
@@ -154,15 +163,26 @@ pub async fn run_livelog_pipeline(
 
     let chunk_max_lines = config.chunk_max_lines;
     let chunk_max_duration = Duration::from_secs(config.chunk_max_seconds);
+    // When structured output is requested, append JSON format instructions to the
+    // detection prompt so the LLM returns a parseable object instead of prose.
+    let effective_prompt: String = if config.structured_output {
+        format!(
+            "{}{}",
+            config.detection_prompt, STRUCTURED_OUTPUT_INSTRUCTION
+        )
+    } else {
+        config.detection_prompt.clone()
+    };
     let ctx = AnalysisCtx {
         llm_service: llm_service.as_ref(),
         base_url: provider.base_url,
         model: provider.model,
         api_key: provider.api_key,
-        detection_prompt: &config.detection_prompt,
+        detection_prompt: &effective_prompt,
         llm_timeout: Duration::from_secs(config.llm_timeout_seconds),
         cooldown: Duration::from_secs(config.cooldown_seconds),
         monitor: &monitor,
+        structured_output: config.structured_output,
     };
 
     let mut chunk: Vec<String> = Vec::new();
@@ -263,6 +283,30 @@ struct AnalysisCtx<'a> {
     llm_timeout: Duration,
     cooldown: Duration,
     monitor: &'a Arc<OperationMonitor>,
+    /// When true, parse the LLM response as a structured JSON object rather
+    /// than treating it as opaque prose.  See `STRUCTURED_OUTPUT_INSTRUCTION`.
+    structured_output: bool,
+}
+
+/// Format an alert message from a structured JSON response.
+///
+/// Parses `{issue, level, summary, exception_class?, top_frame?}` and returns
+/// `None` when `issue` is false (treat as CLEAN), or `Some(formatted)` string.
+fn format_structured_alert(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v.get("issue").and_then(|b| b.as_bool()) == Some(false) {
+        return None;
+    }
+    let level = v.get("level").and_then(|b| b.as_str()).unwrap_or("ERROR");
+    let summary = v.get("summary").and_then(|b| b.as_str()).unwrap_or(text);
+    let mut alert = format!("[{level}] {summary}");
+    if let Some(exc) = v.get("exception_class").and_then(|b| b.as_str()) {
+        alert.push_str(&format!("\n  Exception: {exc}"));
+    }
+    if let Some(frame) = v.get("top_frame").and_then(|b| b.as_str()) {
+        alert.push_str(&format!("\n  at {frame}"));
+    }
+    Some(alert)
 }
 
 /// Send `chunk` to the LLM for analysis; record an `Alert` if issues are found.
@@ -305,7 +349,21 @@ async fn maybe_analyze(
         )
         .await
     {
-        Ok(Some(summary)) => {
+        Ok(Some(raw)) => {
+            // In structured mode, parse JSON and short-circuit on `issue:false`.
+            // If JSON parsing fails, fall through to the plain-text path.
+            let summary = if ctx.structured_output {
+                match format_structured_alert(&raw) {
+                    Some(s) => s,
+                    None => {
+                        debug!("livelog[{}]: structured response: clean", op_id);
+                        return;
+                    }
+                }
+            } else {
+                raw.clone()
+            };
+
             info!("livelog[{}]: LLM detected issue: {}", op_id, summary);
             *last_alert = Some(Instant::now());
 
@@ -421,6 +479,7 @@ pub async fn run_file_monitor_pipeline(
         llm_timeout: Duration::from_secs(30),
         cooldown: Duration::from_secs(60),
         monitor: &monitor,
+        structured_output: false, // file monitor uses plain-text alerts
     };
 
     let mut chunk: Vec<String> = Vec::new();

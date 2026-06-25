@@ -1,0 +1,54 @@
+{
+    "name": "adb-install",
+    "description": "Install an APK on a connected Android device or emulator via `adb install`. Set ANDROID_SERIAL in the environment to target a specific device when multiple are connected. Prefer gradle-install-debug for debug builds built from a Gradle project.",
+    "command": "adb",
+    "enabled": true,
+    "timeout_seconds": 120,
+    "subcommand": [
+        {
+            "name": "install",
+            "description": "Install the given APK file onto the connected device.",
+            "positional_args": [
+                {
+                    "name": "apk_path",
+                    "type": "string",
+                    "description": "Path to the APK file to install.",
+                    "required": true,
+                    "format": "path"
+                }
+            ],
+            "options": [
+                {
+                    "name": "r",
+                    "alias": "r",
+                    "type": "boolean",
+                    "description": "Replace an existing application (keep data and cache)."
+                },
+                {
+                    "name": "t",
+                    "alias": "t",
+                    "type": "boolean",
+                    "description": "Allow test APKs to be installed (required for APKs built with testOnly=true)."
+                },
+                {
+                    "name": "g",
+                    "alias": "g",
+                    "type": "boolean",
+                    "description": "Grant all requested runtime permissions."
+                }
+            ],
+            "synchronous": true,
+            "availability_check": {
+                "command": "adb",
+                "args": ["version"]
+            },
+            "install_instructions": "Install ADB via Android Studio or: brew install android-platform-tools"
+        }
+    ],
+    "hints": {
+        "custom": {
+            "usage": "Pass -r to reinstall over an existing installation while preserving app data.",
+            "tip": "For Gradle projects, prefer gradle-install-debug (handles the build step too)."
+        }
+    }
+}

@@ -33,6 +33,7 @@
         ],
         "prefilter_regex": "(?i)(FATAL|ANR\\b|Exception|SIGSEGV|SIGABRT|SIGILL|NativeCrash|beginning of crash|backtrace|tombstone|StrictMode|\\sE\\s|\\sF\\s|/E\\s|/F\\s)",
         "detection_prompt": "Look for crashes (FATAL EXCEPTION, NullPointerException, IllegalStateException), Application Not Responding (ANR) errors, native crashes (SIGSEGV, SIGABRT), or any log line at level E (ERROR) or F (FATAL) that indicates a real problem rather than a known-harmless library warning.",
+        "structured_output": true,
         "llm_provider": {
             "base_url": "${AHMA_LIVELOG_BASE_URL:-http://localhost:11434/v1}",
             "model": "${AHMA_LIVELOG_MODEL:-lfm2.5:8b}"

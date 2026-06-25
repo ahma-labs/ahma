@@ -1,0 +1,36 @@
+{
+    "name": "gradle-install-debug",
+    "description": "Build and install the debug APK on a connected Android device via `./gradlew installDebug`. Runs from the project root (or the provided working_directory). Requires a connected device or emulator — check with adb-devices first. After installation, use adb-launch to start the app and android-logcat to monitor it.",
+    "command": "./gradlew",
+    "enabled": true,
+    "timeout_seconds": 300,
+    "subcommand": [
+        {
+            "name": "installDebug",
+            "description": "Compile the debug variant and install it on all connected Android devices. Fails if no device is connected.",
+            "options": [
+                {
+                    "name": "offline",
+                    "type": "boolean",
+                    "description": "Build without network access (uses the Gradle dependency cache)."
+                },
+                {
+                    "name": "stacktrace",
+                    "type": "boolean",
+                    "description": "Print the full stack trace if the build fails."
+                }
+            ],
+            "availability_check": {
+                "command": "adb",
+                "args": ["version"]
+            },
+            "install_instructions": "Android Studio includes the Android Gradle Plugin. ADB must be installed: brew install android-platform-tools"
+        }
+    ],
+    "hints": {
+        "custom": {
+            "workflow": "adb-devices → gradle-install-debug → adb-launch → adb-pid-of → android-logcat (with pid+serial)",
+            "tip": "If the build fails with a Gradle wrapper error, ensure gradlew is executable: chmod +x gradlew"
+        }
+    }
+}

@@ -591,6 +591,11 @@
           "format": "uint64",
           "minimum": 0,
           "default": 30
+        },
+        "structured_output": {
+          "description": "When `true`, instruct the LLM to return a structured JSON object instead of\nplain-English prose.  The pipeline parses the JSON and emits a rich alert\nwith discrete fields (`level`, `summary`, `exception_class`, `top_frame`).\nIf the LLM returns un-parseable JSON the response is treated as plain text.\nDefaults to `false` for backward-compatibility.",
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [

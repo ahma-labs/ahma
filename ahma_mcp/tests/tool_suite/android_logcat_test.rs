@@ -130,6 +130,18 @@ fn test_android_logcat_runtime_applies_serial_and_pid() {
     assert!(!rt.clear, "explicit clear:false disables clearing");
 }
 
+/// android-logcat enables structured output so alerts carry discrete fields
+/// (level, summary, exception_class, top_frame) instead of opaque prose.
+#[test]
+fn test_android_logcat_has_structured_output_enabled() {
+    let config = load_config();
+    let lc = config.livelog.unwrap();
+    assert!(
+        lc.structured_output,
+        "android-logcat should enable structured_output for machine-readable alerts"
+    );
+}
+
 /// The `clear` arg is read regardless of declared parameters; sanity-check that
 /// an unrelated extra arg does not get treated as a parameter.
 #[test]
