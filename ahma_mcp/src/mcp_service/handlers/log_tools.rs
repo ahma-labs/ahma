@@ -669,4 +669,402 @@ mod tests {
         assert!(res.is_err());
         assert!(res.unwrap_err().message.contains("does not exist"));
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Test helpers (added)
+    // ─────────────────────────────────────────────────────────────────────
+
+    use crate::test_utils::in_process::build_test_service;
+
+    /// Restores an env var to its previous value on drop (panic-safe). Env
+    /// mutation is process-global; under `cargo nextest` each test runs in its
+    /// own process so this is isolated. Under plain `cargo test` parallel tests
+    /// touching the same key could race — nextest is the project's standard runner.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, val: &Path) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, val);
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn text_of(result: &CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default()
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Schema functions
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_logs_list_schema() {
+        let schema = logs_list_schema();
+        assert_eq!(
+            schema.get("type").and_then(Value::as_str),
+            Some("object"),
+            "list schema must be an object schema"
+        );
+        // No properties and no required keys.
+        let props = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties must be present");
+        assert!(props.is_empty(), "logs_list takes no parameters");
+        assert!(
+            !schema.contains_key("required"),
+            "logs_list has no required keys; the 'required' key must be omitted"
+        );
+    }
+
+    #[test]
+    fn test_logs_read_schema() {
+        let schema = logs_read_schema();
+        assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
+        let props = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties");
+        for key in ["file", "offset", "limit", "raw"] {
+            assert!(props.contains_key(key), "missing property '{key}'");
+        }
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("required")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(required, vec!["file"]);
+    }
+
+    #[test]
+    fn test_logs_search_schema() {
+        let schema = logs_search_schema();
+        assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
+        let props = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties");
+        for key in ["file", "pattern", "max_results", "case_sensitive", "raw"] {
+            assert!(props.contains_key(key), "missing property '{key}'");
+        }
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("required")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(required, vec!["file", "pattern"]);
+    }
+
+    #[test]
+    fn test_logs_approve_schema() {
+        let schema = logs_approve_schema();
+        assert_eq!(schema.get("type").and_then(Value::as_str), Some("object"));
+        let props = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("properties");
+        assert!(props.contains_key("file"));
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("required")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(required, vec!["file"]);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // require_safe_log_path — additional branches
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn require_safe_log_path_missing_arg_errors() {
+        let dir = tempdir().unwrap();
+        let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let args = Map::new(); // no "file" key
+        let err = require_safe_log_path(&args, &canonical_dir).unwrap_err();
+        assert!(err.message.contains("'file' parameter is required"));
+    }
+
+    #[test]
+    fn require_safe_log_path_nonexistent_log_dir_errors() {
+        // A valid plain filename but the log directory itself does not exist.
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist-subdir");
+        let mut args = Map::new();
+        args.insert("file".to_string(), Value::String("ahma.log".to_string()));
+        let err = require_safe_log_path(&args, &missing).unwrap_err();
+        assert!(
+            err.message.contains("does not exist"),
+            "expected missing-log-dir error, got: {}",
+            err.message
+        );
+    }
+
+    /// A symlink that exists inside the log dir but resolves to an external path
+    /// must be rejected as "outside the log directory" (covers the existing-file
+    /// canonicalisation escape branch).
+    #[cfg(unix)]
+    #[test]
+    fn require_safe_log_path_existing_symlink_escaping_dir_rejected() {
+        use std::os::unix::fs::symlink;
+        let log_dir = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let external_file = external.path().join("outside.log");
+        std::fs::write(&external_file, "secret").unwrap();
+        symlink(&external_file, log_dir.path().join("escape.log")).unwrap();
+
+        let canonical_dir = std::fs::canonicalize(log_dir.path()).unwrap();
+        let mut args = Map::new();
+        args.insert("file".to_string(), Value::String("escape.log".to_string()));
+        let err = require_safe_log_path(&args, &canonical_dir).unwrap_err();
+        assert!(
+            err.message.contains("outside the log directory"),
+            "expected outside-dir rejection, got: {}",
+            err.message
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // read_log_window / search_log_file — additional edge cases
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_log_window_offset_beyond_eof_and_zero_limit() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("edge.log");
+        std::fs::write(&file, "a\nb\nc").unwrap();
+
+        // Offset past the end → empty string.
+        let beyond = read_log_window(&file, 100, 10, true).unwrap();
+        assert_eq!(beyond, "");
+
+        // Zero limit → no lines.
+        let none = read_log_window(&file, 0, 0, false).unwrap();
+        assert_eq!(none, "");
+    }
+
+    #[test]
+    fn search_log_file_no_match_and_special_chars() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("special.log");
+        std::fs::write(&file, "value = (a+b)*c\nplain line").unwrap();
+
+        // Absent pattern → "No lines matching".
+        let miss = search_log_file(&file, "zzz-not-here", 10, true, false).unwrap();
+        assert!(miss.contains("No lines matching"));
+
+        // Regex-special chars are treated literally (substring match).
+        let hit = search_log_file(&file, "(a+b)*c", 10, true, false).unwrap();
+        assert!(hit.contains("1 match(es)"));
+        assert!(hit.contains("(a+b)*c"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // collect_log_sources — additional branches
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn collect_log_sources_missing_dir_returns_empty() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir");
+        let sources = collect_log_sources(&missing, &[], &[]).unwrap();
+        assert!(sources.is_empty());
+    }
+
+    /// A dangling symlink (target does not resolve) is reported but not approved.
+    #[cfg(unix)]
+    #[test]
+    fn collect_log_sources_dangling_symlink_not_approved() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        // Also include a real file so the dir is non-trivial.
+        std::fs::write(dir.path().join("real.log"), "x").unwrap();
+        symlink(
+            dir.path().join("missing-target.log"),
+            dir.path().join("dangling.log"),
+        )
+        .unwrap();
+
+        let sources = collect_log_sources(dir.path(), &[], &[]).unwrap();
+        // The dangling symlink's real metadata cannot be read, so the entry is
+        // dropped entirely (std::fs::metadata follows the broken link and fails).
+        // The real file must still be present and approved.
+        let real = sources.iter().find(|s| s.name == "real.log").unwrap();
+        assert!(real.is_approved);
+        assert!(!real.is_symlink);
+        assert!(
+            sources.iter().all(|s| s.name != "dangling.log"),
+            "broken symlink should not surface as a readable source"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Async handlers
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_logs_list_read_search_end_to_end() {
+        let (service, _scope) = build_test_service().await.unwrap();
+        let log_dir = tempdir().unwrap();
+        std::fs::write(log_dir.path().join("alpha.log"), "first line\nsecond line").unwrap();
+        std::fs::write(log_dir.path().join("beta.log"), "needle here\nother").unwrap();
+        let _guard = EnvVarGuard::set("AHMA_LOG_DIR", log_dir.path());
+
+        // list
+        let list = service.handle_logs_list(Map::new()).await.unwrap();
+        let list_text = text_of(&list);
+        assert!(list_text.contains("alpha.log"), "list: {list_text}");
+        assert!(list_text.contains("beta.log"), "list: {list_text}");
+
+        // read
+        let mut read_args = Map::new();
+        read_args.insert("file".to_string(), Value::String("alpha.log".to_string()));
+        read_args.insert("limit".to_string(), Value::from(1u64));
+        read_args.insert("raw".to_string(), Value::Bool(true));
+        let read = service.handle_logs_read(read_args).await.unwrap();
+        assert_eq!(text_of(&read), "first line");
+
+        // search — hit
+        let mut search_args = Map::new();
+        search_args.insert("file".to_string(), Value::String("beta.log".to_string()));
+        search_args.insert("pattern".to_string(), Value::String("needle".to_string()));
+        let search = service.handle_logs_search(search_args).await.unwrap();
+        let search_text = text_of(&search);
+        assert!(search_text.contains("1 match(es)"), "search: {search_text}");
+        assert!(search_text.contains("needle here"));
+
+        // search — miss
+        let mut miss_args = Map::new();
+        miss_args.insert("file".to_string(), Value::String("beta.log".to_string()));
+        miss_args.insert(
+            "pattern".to_string(),
+            Value::String("absent-xyz".to_string()),
+        );
+        let miss = service.handle_logs_search(miss_args).await.unwrap();
+        assert!(text_of(&miss).contains("No lines matching"));
+    }
+
+    #[tokio::test]
+    async fn handle_logs_read_invalid_path_errors() {
+        let (service, _scope) = build_test_service().await.unwrap();
+        // A path separator fails validation before any filesystem access, so no
+        // valid log dir is required — but set one anyway for determinism.
+        let log_dir = tempdir().unwrap();
+        let _guard = EnvVarGuard::set("AHMA_LOG_DIR", log_dir.path());
+
+        let mut args = Map::new();
+        args.insert(
+            "file".to_string(),
+            Value::String("../../etc/passwd".to_string()),
+        );
+        let err = service.handle_logs_read(args).await.unwrap_err();
+        assert!(
+            err.message.contains("must be a plain filename"),
+            "expected path-rejection error, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_logs_search_missing_pattern_errors() {
+        let (service, _scope) = build_test_service().await.unwrap();
+        let log_dir = tempdir().unwrap();
+        std::fs::write(log_dir.path().join("x.log"), "content").unwrap();
+        let _guard = EnvVarGuard::set("AHMA_LOG_DIR", log_dir.path());
+
+        let mut args = Map::new();
+        args.insert("file".to_string(), Value::String("x.log".to_string()));
+        // no "pattern"
+        let err = service.handle_logs_search(args).await.unwrap_err();
+        assert!(err.message.contains("'pattern' is required"));
+    }
+
+    #[tokio::test]
+    async fn handle_logs_approve_invalid_inputs() {
+        let (service, _scope) = build_test_service().await.unwrap();
+        let log_dir = tempdir().unwrap();
+        std::fs::write(log_dir.path().join("plain.log"), "not a symlink").unwrap();
+        let _guard = EnvVarGuard::set("AHMA_LOG_DIR", log_dir.path());
+
+        // Path-like name rejected before touching the filesystem.
+        let mut bad = Map::new();
+        bad.insert(
+            "file".to_string(),
+            Value::String("sub/evil.log".to_string()),
+        );
+        let err = service.handle_logs_approve(bad).await.unwrap_err();
+        assert!(err.message.contains("must be a plain filename"));
+
+        // Missing file.
+        let mut missing = Map::new();
+        missing.insert("file".to_string(), Value::String("ghost.log".to_string()));
+        let err = service.handle_logs_approve(missing).await.unwrap_err();
+        assert!(err.message.contains("does not exist"));
+
+        // Regular file is not a symlink.
+        let mut regular = Map::new();
+        regular.insert("file".to_string(), Value::String("plain.log".to_string()));
+        let err = service.handle_logs_approve(regular).await.unwrap_err();
+        assert!(err.message.contains("not a symbolic link"));
+    }
+
+    /// Approving an out-of-scope symlink persists an exception and returns a
+    /// success message. The exceptions file is redirected to a temp dir via
+    /// `AHMA_CONFIG_DIR` so the real user config is never touched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handle_logs_approve_success() {
+        use std::os::unix::fs::symlink;
+        let (service, _scope) = build_test_service().await.unwrap();
+        let log_dir = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let config = tempdir().unwrap();
+        let external_file = external.path().join("sys.log");
+        std::fs::write(&external_file, "external content").unwrap();
+        symlink(&external_file, log_dir.path().join("sys.log")).unwrap();
+
+        let _log_guard = EnvVarGuard::set("AHMA_LOG_DIR", log_dir.path());
+        let _cfg_guard = EnvVarGuard::set("AHMA_CONFIG_DIR", config.path());
+
+        let mut args = Map::new();
+        args.insert("file".to_string(), Value::String("sys.log".to_string()));
+        let result = service.handle_logs_approve(args).await.unwrap();
+        let text = text_of(&result);
+        assert!(
+            text.contains("Successfully approved symlink target"),
+            "approve: {text}"
+        );
+
+        // Exception file was written under the redirected config dir.
+        let exceptions = config.path().join("ahma").join("log_exceptions.json");
+        assert!(exceptions.exists(), "exceptions file must be persisted");
+    }
 }

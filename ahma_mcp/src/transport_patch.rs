@@ -267,4 +267,192 @@ mod tests {
         let summary = summarize_jsonrpc_payload("not-json");
         assert!(summary.contains("parse=invalid"));
     }
+
+    #[test]
+    fn summarize_jsonrpc_notification_without_id() {
+        // Notification: method present but no `id` -> id falls back to "-".
+        let json = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let summary = summarize_jsonrpc_payload(json);
+        assert!(summary.contains("id=-"), "summary was: {summary}");
+        assert!(summary.contains("method=notifications/initialized"));
+    }
+
+    #[test]
+    fn summarize_jsonrpc_valid_json_without_method() {
+        // Response-shaped payload: id present, method absent -> method "-".
+        let json = r#"{"jsonrpc":"2.0","id":5,"result":{}}"#;
+        let summary = summarize_jsonrpc_payload(json);
+        assert!(summary.contains("id=5"), "summary was: {summary}");
+        assert!(summary.contains("method=-"), "summary was: {summary}");
+    }
+
+    // ---- Transport<RoleServer> tests using in-memory buffers (no real stdio) ----
+
+    use super::PatchedTransport;
+    use rmcp::service::{RoleServer, TxJsonRpcMessage};
+    use rmcp::transport::Transport;
+    use serde_json::json;
+    use std::io::Cursor;
+    use tokio::io::{AsyncReadExt, BufReader};
+
+    /// Build an in-memory AsyncBufRead from a string.
+    fn reader_from(input: &str) -> BufReader<Cursor<Vec<u8>>> {
+        BufReader::new(Cursor::new(input.as_bytes().to_vec()))
+    }
+
+    /// Build a transport whose reader replays `input` and whose writer is an
+    /// in-memory `Vec<u8>` (used when the test only exercises `receive`).
+    fn transport_from(input: &str) -> PatchedTransport<BufReader<Cursor<Vec<u8>>>, Vec<u8>> {
+        PatchedTransport::new(reader_from(input), Vec::<u8>::new())
+    }
+
+    #[tokio::test]
+    async fn receive_line_mode_returns_message() {
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n";
+        let mut t = transport_from(input);
+        let msg = t.receive().await;
+        assert!(msg.is_some(), "line-mode message should parse");
+    }
+
+    #[tokio::test]
+    async fn receive_content_length_header_mode_returns_message() {
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}";
+        let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let mut t = transport_from(&input);
+        let msg = t.receive().await;
+        assert!(msg.is_some(), "Content-Length framed body should parse");
+    }
+
+    #[tokio::test]
+    async fn receive_content_length_with_extra_headers() {
+        // Exercises the header-skip loop with a non-empty extra header line.
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{}}";
+        let input = format!(
+            "Content-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut t = transport_from(&input);
+        let msg = t.receive().await;
+        assert!(msg.is_some(), "framed body with extra headers should parse");
+    }
+
+    #[tokio::test]
+    async fn receive_content_length_invalid_length_falls_back_to_zero() {
+        // Non-numeric Content-Length -> parse().unwrap_or(0) -> empty body ->
+        // empty parse is skipped (no error log) -> loop continues to next message.
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\",\"params\":{}}";
+        let input = format!("Content-Length: not-a-number\r\n\r\n{}\n", body);
+        let mut t = transport_from(&input);
+        let msg = t.receive().await;
+        assert!(msg.is_some(), "should recover and parse the following line");
+    }
+
+    #[tokio::test]
+    async fn receive_initialize_strips_tasks_capability_object() {
+        // `params.capabilities.tasks` is an object -> patch removes it, then the
+        // message deserializes successfully.
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tasks": { "listChanged": true } },
+                "clientInfo": { "name": "test-client", "version": "1.0.0" }
+            }
+        });
+        let input = format!("{}\n", serde_json::to_string(&req).unwrap());
+        let mut t = transport_from(&input);
+        let msg = t.receive().await;
+        assert!(
+            msg.is_some(),
+            "initialize should parse after tasks capability is stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_initialize_tasks_not_object_hits_else_branch() {
+        // `tasks` is a string (not an object) -> else branch logs and leaves it,
+        // so deserialization of capabilities fails -> the message is skipped.
+        // A following valid line is then returned.
+        let bad = json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": { "tasks": "not-an-object" },
+                "clientInfo": { "name": "test-client", "version": "1.0.0" }
+            }
+        });
+        let good = json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/list",
+            "params": {}
+        });
+        let input = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&bad).unwrap(),
+            serde_json::to_string(&good).unwrap()
+        );
+        let mut t = transport_from(&input);
+        let msg = t.receive().await;
+        assert!(
+            msg.is_some(),
+            "should skip the un-deserializable initialize and return the next message"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_skips_invalid_json_then_returns_valid() {
+        // First line is garbage (invalid JSON) -> `continue`; second is valid.
+        let input = "this is not json\n{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/list\",\"params\":{}}\n";
+        let mut t = transport_from(input);
+        let msg = t.receive().await;
+        assert!(msg.is_some(), "invalid JSON line should be skipped");
+    }
+
+    #[tokio::test]
+    async fn receive_eof_returns_none() {
+        let mut t = transport_from("");
+        let msg = t.receive().await;
+        assert!(msg.is_none(), "EOF should yield None");
+    }
+
+    #[tokio::test]
+    async fn send_writes_json_followed_by_newline() {
+        // A JSON-RPC error response is a valid TxJsonRpcMessage<RoleServer>
+        // regardless of the request/result/notification generics.
+        let msg: TxJsonRpcMessage<RoleServer> = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": -32600, "message": "boom" }
+        }))
+        .expect("error response should deserialize as a server Tx message");
+
+        let (mut client_end, server_end) = tokio::io::duplex(64 * 1024);
+        let mut t = PatchedTransport::new(reader_from(""), server_end);
+
+        t.send(msg).await.expect("send should succeed");
+
+        let mut buf = vec![0u8; 4096];
+        let n = client_end.read(&mut buf).await.expect("read framed bytes");
+        let written = String::from_utf8(buf[..n].to_vec()).expect("utf8 output");
+        assert!(written.ends_with('\n'), "output must end with newline");
+        assert!(written.contains("\"error\""), "output: {written}");
+        assert!(written.contains("boom"), "output: {written}");
+        // The framed payload itself (minus the trailing newline) must be valid JSON.
+        let parsed: serde_json::Value = serde_json::from_str(written.trim_end()).unwrap();
+        assert_eq!(parsed["error"]["message"], "boom");
+    }
+
+    #[tokio::test]
+    async fn close_flushes_and_shuts_down_ok() {
+        let (_client_end, server_end) = tokio::io::duplex(1024);
+        let mut t = PatchedTransport::new(reader_from(""), server_end);
+        let result = t.close().await;
+        assert!(result.is_ok(), "close on in-memory writer should succeed");
+    }
 }

@@ -345,4 +345,183 @@ mod tests {
     fn telemetry_guard_none_is_cheap() {
         let _guard = TelemetryGuard::none(); // should be a no-op, trivially droppable
     }
+
+    use std::sync::{LazyLock, Mutex};
+
+    /// Serializes every test that reads or writes process environment variables,
+    /// since env is process-global and these tests run in the same binary.
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Save the current value of an env var, returning a closure-free snapshot.
+    fn snapshot(key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+
+    /// Restore a previously snapshotted env var (set or remove as appropriate).
+    fn restore(key: &str, prior: Option<String>) {
+        match prior {
+            // SAFETY: env mutation is serialized by ENV_MUTEX in every test that mutates env.
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn from_env_service_name_overridden_by_env_var() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let prior_name = snapshot("OTEL_SERVICE_NAME");
+        let prior_endpoint = snapshot("OTEL_EXPORTER_OTLP_ENDPOINT");
+
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe {
+            std::env::set_var("OTEL_SERVICE_NAME", "from-env-service");
+            std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        }
+
+        let cfg = ObservabilityConfig::from_env("arg-service");
+        // OTEL_SERVICE_NAME wins over the argument.
+        assert_eq!(cfg.service_name, "from-env-service");
+        // No endpoint set -> tracing disabled.
+        assert!(cfg.endpoint.is_none());
+
+        restore("OTEL_SERVICE_NAME", prior_name);
+        restore("OTEL_EXPORTER_OTLP_ENDPOINT", prior_endpoint);
+    }
+
+    #[test]
+    fn from_env_endpoint_enables_tracing() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let prior_name = snapshot("OTEL_SERVICE_NAME");
+        let prior_endpoint = snapshot("OTEL_EXPORTER_OTLP_ENDPOINT");
+
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("OTEL_SERVICE_NAME");
+            std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318");
+        }
+
+        let cfg = ObservabilityConfig::from_env("fallback-service");
+        assert_eq!(cfg.endpoint.as_deref(), Some("http://localhost:4318"));
+        // No OTEL_SERVICE_NAME -> falls back to the argument.
+        assert_eq!(cfg.service_name, "fallback-service");
+
+        restore("OTEL_SERVICE_NAME", prior_name);
+        restore("OTEL_EXPORTER_OTLP_ENDPOINT", prior_endpoint);
+    }
+
+    #[test]
+    fn create_otel_layer_none_endpoint_returns_no_layer() {
+        let cfg = ObservabilityConfig::default(); // endpoint: None
+        let (layer, guard) = create_otel_layer::<tracing_subscriber::Registry>(&cfg);
+        assert!(layer.is_none(), "no endpoint should yield no layer");
+        // Dropping the none-guard must be a trivial no-op.
+        drop(guard);
+    }
+
+    #[test]
+    fn create_otel_layer_with_endpoint_builds_layer_and_guard() {
+        // The batch HTTP exporter is constructed lazily and does NOT connect on
+        // build, so this succeeds even without a live collector. This also
+        // exercises ObservabilityGuard::drop() on teardown.
+        let cfg = ObservabilityConfig {
+            endpoint: Some("http://localhost:4318".to_string()),
+            service_name: "otel-layer-test".to_string(),
+        };
+        let (layer, guard) = create_otel_layer::<tracing_subscriber::Registry>(&cfg);
+        assert!(
+            layer.is_some(),
+            "a configured endpoint should produce an OTEL layer"
+        );
+        // Drop exercises ObservabilityGuard::drop -> tracer_provider.shutdown().
+        drop(guard);
+    }
+
+    #[test]
+    fn create_otel_layer_trims_trailing_slash_endpoint() {
+        // Endpoint with a trailing slash must still build successfully.
+        let cfg = ObservabilityConfig {
+            endpoint: Some("http://localhost:4318/".to_string()),
+            service_name: "trim-test".to_string(),
+        };
+        let (layer, guard) = create_otel_layer::<tracing_subscriber::Registry>(&cfg);
+        assert!(layer.is_some());
+        drop(guard);
+    }
+
+    #[test]
+    fn env_traceparent_valid_value_is_returned() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let prior = snapshot("TRACEPARENT");
+
+        // Valid W3C traceparent: "00-" + 32 hex trace id + "-" + 16 hex span id
+        // + "-" + 2 hex flags = exactly 55 chars.
+        let valid = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        assert_eq!(valid.len(), 55);
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe { std::env::set_var("TRACEPARENT", valid) };
+
+        assert_eq!(env_traceparent().as_deref(), Some(valid));
+
+        restore("TRACEPARENT", prior);
+    }
+
+    #[test]
+    fn env_traceparent_too_short_is_none() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let prior = snapshot("TRACEPARENT");
+
+        // Starts with "00-" but well under 55 chars -> rejected.
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe { std::env::set_var("TRACEPARENT", "00-tooshort") };
+        assert!(env_traceparent().is_none());
+
+        // Long enough but wrong prefix -> also rejected.
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe {
+            std::env::set_var(
+                "TRACEPARENT",
+                "ff-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            )
+        };
+        assert!(env_traceparent().is_none());
+
+        restore("TRACEPARENT", prior);
+    }
+
+    #[test]
+    fn env_traceparent_unset_is_none() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let prior = snapshot("TRACEPARENT");
+
+        // SAFETY: serialized by ENV_MUTEX.
+        unsafe { std::env::remove_var("TRACEPARENT") };
+        assert!(env_traceparent().is_none());
+
+        restore("TRACEPARENT", prior);
+    }
+
+    #[test]
+    fn current_traceparent_without_active_span_is_none() {
+        // Outside any OTEL-instrumented span there is no valid span context.
+        assert!(current_traceparent().is_none());
+    }
+
+    #[test]
+    fn record_tool_call_is_noop_without_provider() {
+        // No meter provider registered -> these must not panic for any outcome.
+        for outcome in [
+            ToolCallOutcome::Success,
+            ToolCallOutcome::Error,
+            ToolCallOutcome::Cancelled,
+            ToolCallOutcome::Timeout,
+        ] {
+            record_tool_call("test_tool", outcome, 42);
+        }
+    }
+
+    #[test]
+    fn record_sandbox_gating_failure_is_noop_without_provider() {
+        // No meter provider registered -> must not panic.
+        record_sandbox_gating_failure();
+    }
 }

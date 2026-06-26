@@ -779,4 +779,419 @@ mod tests {
         );
         assert_eq!(manager.resolve_tool_name("not_namespaced"), None);
     }
+
+    // ── Env redirection helper (serializes HOME-touching tests) ───────────────
+
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Redirects the platform "home" lookup (`std::env::home_dir`) to a temp
+    /// directory for the lifetime of the guard, then restores the prior values.
+    /// Holds the env mutex so concurrent env-touching tests don't interleave.
+    struct HomeGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev_home: Option<std::ffi::OsString>,
+        prev_userprofile: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(path: &Path) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_home = std::env::var_os("HOME");
+            let prev_userprofile = std::env::var_os("USERPROFILE");
+            // SAFETY: env mutation is serialized by ENV_MUTEX held in `lock`.
+            unsafe {
+                std::env::set_var("HOME", path);
+                std::env::set_var("USERPROFILE", path);
+            }
+            Self {
+                _lock: lock,
+                prev_home,
+                prev_userprofile,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: still holding ENV_MUTEX via `_lock`.
+            unsafe {
+                match &self.prev_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.prev_userprofile {
+                    Some(v) => std::env::set_var("USERPROFILE", v),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+            }
+        }
+    }
+
+    // ── load / save ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_absent_config_returns_empty() {
+        // Redirect home to an empty temp dir so IDE discovery contributes nothing
+        // and the result is deterministic.
+        let home = tempfile::tempdir().unwrap();
+        let _g = HomeGuard::set(home.path());
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mgr = McpConnectionManager::load(cwd.path()).expect("load should succeed when absent");
+        assert!(
+            mgr.servers.is_empty(),
+            "no config + empty home should yield zero servers"
+        );
+        assert_eq!(mgr.workspace_root, cwd.path());
+        assert!(mgr.tools_by_server.is_empty());
+    }
+
+    #[test]
+    fn save_writes_file_and_round_trips() {
+        let home = tempfile::tempdir().unwrap();
+        let _g = HomeGuard::set(home.path());
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut mgr = McpConnectionManager::default();
+        mgr.add_server(McpServerConfig {
+            name: "alpha".to_string(),
+            enabled: true,
+            kind: McpServerKind::Http {
+                url: "http://localhost:1234".to_string(),
+            },
+        });
+        mgr.save(cwd.path()).expect("save should succeed");
+
+        // The config file must exist at the documented path.
+        let expected = cwd.path().join(".ahma").join("mcp-clients.toml");
+        assert!(expected.exists(), "save must write {}", expected.display());
+
+        let loaded = McpConnectionManager::load(cwd.path()).unwrap();
+        assert!(
+            loaded.servers.iter().any(|s| s.name == "alpha"),
+            "round-tripped config must contain 'alpha'"
+        );
+    }
+
+    #[test]
+    fn load_malformed_config_errors() {
+        let cwd = tempfile::tempdir().unwrap();
+        let dir = cwd.path().join(".ahma");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mcp-clients.toml"),
+            "this is = = not valid toml [[[",
+        )
+        .unwrap();
+
+        let err = McpConnectionManager::load(cwd.path());
+        assert!(err.is_err(), "malformed TOML must produce a parse error");
+        let msg = format!("{:#}", err.unwrap_err());
+        assert!(
+            msg.contains("Failed to parse"),
+            "error context should mention parse failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn local_config_takes_precedence_over_ide() {
+        // IDE config supplies "shared" (http) and "ideonly" (stdio).
+        let home = tempfile::tempdir().unwrap();
+        let cursor_dir = home.path().join(".cursor");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        std::fs::write(
+            cursor_dir.join("mcp.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "shared": { "url": "http://ide-shared" },
+                    "ideonly": { "command": "npx", "args": ["x"] }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let _g = HomeGuard::set(home.path());
+
+        // Local config supplies "shared" (stdio) — it must win.
+        let cwd = tempfile::tempdir().unwrap();
+        let mut local = McpConnectionManager::default();
+        local.add_server(McpServerConfig {
+            name: "shared".to_string(),
+            enabled: true,
+            kind: McpServerKind::Stdio {
+                command: "echo".to_string(),
+                args: vec![],
+            },
+        });
+        local.save(cwd.path()).unwrap();
+
+        let merged = McpConnectionManager::load(cwd.path()).unwrap();
+        let shared: Vec<_> = merged
+            .servers
+            .iter()
+            .filter(|s| s.name == "shared")
+            .collect();
+        assert_eq!(shared.len(), 1, "'shared' must not be duplicated");
+        assert!(
+            matches!(shared[0].kind, McpServerKind::Stdio { .. }),
+            "local stdio definition must win over IDE http"
+        );
+        assert!(
+            merged.servers.iter().any(|s| s.name == "ideonly"),
+            "IDE-only servers must be merged in"
+        );
+    }
+
+    // ── add / remove / list ──────────────────────────────────────────────────
+
+    #[test]
+    fn add_remove_list_servers() {
+        let mut mgr = McpConnectionManager::default();
+        mgr.add_server(McpServerConfig {
+            name: "b-srv".to_string(),
+            enabled: true,
+            kind: McpServerKind::Http {
+                url: "http://b".to_string(),
+            },
+        });
+        mgr.add_server(McpServerConfig {
+            name: "a-srv".to_string(),
+            enabled: true,
+            kind: McpServerKind::Http {
+                url: "http://a".to_string(),
+            },
+        });
+        assert_eq!(mgr.list_servers().len(), 2);
+        // add_server keeps the list sorted by name.
+        assert_eq!(mgr.list_servers()[0].name, "a-srv");
+
+        // Re-adding the same name replaces (deduplicates) rather than grows.
+        mgr.add_server(McpServerConfig {
+            name: "a-srv".to_string(),
+            enabled: false,
+            kind: McpServerKind::Http {
+                url: "http://a2".to_string(),
+            },
+        });
+        assert_eq!(mgr.list_servers().len(), 2, "re-add must dedupe by name");
+        assert!(!mgr.list_servers()[0].enabled, "re-add replaces the entry");
+
+        // remove_server also clears any cached tools for that server.
+        mgr.tools_by_server.insert(
+            "a-srv".to_string(),
+            vec![ToolInfo {
+                name: "t".to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+            }],
+        );
+        mgr.remove_server("a-srv");
+        assert_eq!(mgr.list_servers().len(), 1);
+        assert_eq!(mgr.list_servers()[0].name, "b-srv");
+        assert!(!mgr.tools_by_server.contains_key("a-srv"));
+
+        // Removing a non-existent server is a no-op.
+        mgr.remove_server("does-not-exist");
+        assert_eq!(mgr.list_servers().len(), 1);
+    }
+
+    // ── aggregation ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn aggregate_tools_namespaces_and_sorts() {
+        let mut mgr = McpConnectionManager::default();
+        mgr.tools_by_server.insert(
+            "zeta".to_string(),
+            vec![ToolInfo {
+                name: "build".to_string(),
+                description: Some("desc".to_string()),
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
+        );
+        mgr.tools_by_server.insert(
+            "alpha".to_string(),
+            vec![ToolInfo {
+                name: "run".to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+            }],
+        );
+
+        let tools = mgr.aggregate_tools();
+        let names: Vec<_> = tools.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha::run".to_string(), "zeta::build".to_string()],
+            "aggregate_tools must namespace and sort by full name"
+        );
+        // Non-name fields are preserved through aggregation.
+        let zeta_build = tools.iter().find(|t| t.name == "zeta::build").unwrap();
+        assert_eq!(zeta_build.description.as_deref(), Some("desc"));
+        assert_eq!(
+            zeta_build.input_schema,
+            serde_json::json!({"type":"object"})
+        );
+    }
+
+    // ── call_tool error paths (no network) ───────────────────────────────────
+
+    #[tokio::test]
+    async fn call_tool_rejects_unnamespaced_name() {
+        let mgr = McpConnectionManager::default();
+        let err = mgr
+            .call_tool("noseparator", serde_json::json!({}))
+            .await
+            .expect_err("name without '::' must error before any network call");
+        assert!(
+            format!("{err}").contains("server namespace"),
+            "error should explain the required namespace, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_rejects_unknown_server() {
+        let mgr = McpConnectionManager::default(); // no servers registered
+        let err = mgr
+            .call_tool("ghost::tool", serde_json::json!({}))
+            .await
+            .expect_err("unknown server must error before any network call");
+        assert!(
+            format!("{err}").contains("Unknown MCP server"),
+            "error should name the missing server, got: {err}"
+        );
+    }
+
+    // ── IDE entry parsing ────────────────────────────────────────────────────
+
+    #[test]
+    fn ide_entry_http_url_becomes_http_kind() {
+        let entry = serde_json::json!({ "url": "https://example.com/mcp" });
+        let server = ide_entry_to_server("remote", &entry).expect("url entry should parse");
+        assert_eq!(server.name, "remote");
+        assert!(server.enabled);
+        match server.kind {
+            McpServerKind::Http { url } => assert_eq!(url, "https://example.com/mcp"),
+            _ => panic!("expected Http kind"),
+        }
+    }
+
+    #[test]
+    fn ide_entry_without_url_or_command_is_none() {
+        let entry = serde_json::json!({ "something": "else" });
+        assert!(ide_entry_to_server("bad", &entry).is_none());
+    }
+
+    #[test]
+    fn ide_entry_stdio_defaults_args_when_missing() {
+        let entry = serde_json::json!({ "command": "mytool" });
+        let server = ide_entry_to_server("t", &entry).expect("command-only entry should parse");
+        match server.kind {
+            McpServerKind::Stdio { command, args } => {
+                assert_eq!(command, "mytool");
+                assert!(args.is_empty(), "missing args should default to empty");
+            }
+            _ => panic!("expected Stdio kind"),
+        }
+    }
+
+    #[test]
+    fn parse_ide_mcp_json_reads_both_keys_and_dedupes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "mcpServers": { "one": { "url": "http://one" } },
+                "servers": {
+                    "one": { "url": "http://one-dup" },
+                    "two": { "command": "two-cmd" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        parse_ide_mcp_json(&path, &mut out);
+        let names: std::collections::BTreeSet<_> = out.iter().map(|s| s.name.clone()).collect();
+        assert!(names.contains("one"));
+        assert!(names.contains("two"));
+        assert_eq!(
+            out.iter().filter(|s| s.name == "one").count(),
+            1,
+            "duplicate names across keys must be deduped (first wins)"
+        );
+        // The first-seen "one" (from mcpServers) wins.
+        let one = out.iter().find(|s| s.name == "one").unwrap();
+        match &one.kind {
+            McpServerKind::Http { url } => assert_eq!(url, "http://one"),
+            _ => panic!("expected Http"),
+        }
+    }
+
+    #[test]
+    fn parse_ide_mcp_json_missing_or_invalid_is_silent() {
+        // Missing file: no entries, no panic.
+        let mut out = Vec::new();
+        parse_ide_mcp_json(Path::new("/no/such/path/mcp.json"), &mut out);
+        assert!(out.is_empty());
+
+        // Invalid JSON: no entries, no panic.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        parse_ide_mcp_json(&path, &mut out);
+        assert!(out.is_empty());
+    }
+
+    // ── discover_ide_servers ─────────────────────────────────────────────────
+
+    #[test]
+    fn discover_ide_servers_empty_home_returns_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let _g = HomeGuard::set(home.path());
+        let servers = discover_ide_servers();
+        assert!(
+            servers.is_empty(),
+            "no IDE config under home should yield no servers"
+        );
+    }
+
+    #[test]
+    fn discover_ide_servers_finds_cursor_config() {
+        let home = tempfile::tempdir().unwrap();
+        let cursor_dir = home.path().join(".cursor");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        std::fs::write(
+            cursor_dir.join("mcp.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "myremote": { "url": "http://discovered" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let _g = HomeGuard::set(home.path());
+
+        let servers = discover_ide_servers();
+        assert!(
+            servers.iter().any(|s| s.name == "myremote"),
+            "cursor mcp.json server should be discovered"
+        );
+    }
+
+    // ── misc trait impls ─────────────────────────────────────────────────────
+
+    #[test]
+    fn manager_debug_redacts_stdio_clients() {
+        let mgr = McpConnectionManager::default();
+        let dbg = format!("{mgr:?}");
+        assert!(dbg.contains("McpConnectionManager"));
+        assert!(
+            dbg.contains("<stdio clients>"),
+            "Debug must redact live stdio clients"
+        );
+    }
 }

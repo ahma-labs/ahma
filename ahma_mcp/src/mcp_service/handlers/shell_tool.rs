@@ -565,3 +565,365 @@ impl AhmaMcpService {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::AhmaMcpService;
+    use crate::adapter::ExecutionMode;
+    use crate::shell::cli::AppConfig;
+    use crate::test_utils::in_process::{build_test_service, create_in_process_mcp_empty};
+    use rmcp::model::{CallToolRequestParams, CallToolResult};
+    use serde_json::json;
+    use std::borrow::Cow;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Concatenate all text content of a `CallToolResult` into one String.
+    fn result_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect()
+    }
+
+    /// Call `run_terminal_command` over the in-process MCP wire with a real
+    /// `RequestContext` constructed by the server, returning the result.
+    async fn call_run_terminal(
+        args: serde_json::Value,
+    ) -> Result<CallToolResult, rmcp::ServiceError> {
+        let mcp = create_in_process_mcp_empty()
+            .await
+            .expect("in-process MCP pair must build");
+        let params = CallToolRequestParams::new(Cow::Borrowed("run_terminal_command"))
+            .with_arguments(args.as_object().unwrap().clone());
+        let out = tokio::time::timeout(Duration::from_secs(30), mcp.client.call_tool(params))
+            .await
+            .expect("call_tool must not time out");
+        let _ = mcp.client.cancel().await;
+        out
+    }
+
+    // ── generate_input_schema_for_run_terminal_command ───────────────────────
+
+    #[tokio::test]
+    async fn generate_input_schema_has_expected_properties_and_required() {
+        let (service, _temp) = build_test_service().await.unwrap();
+        let schema = service.generate_input_schema_for_run_terminal_command();
+
+        assert_eq!(
+            schema.get("type").and_then(|v| v.as_str()),
+            Some("object"),
+            "schema type must be object"
+        );
+        let props = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("schema must have properties");
+        for key in [
+            "command",
+            "working_directory",
+            "monitor_level",
+            "monitor_stream",
+            "session_id",
+            "pty",
+        ] {
+            assert!(props.contains_key(key), "missing property: {key}");
+        }
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("schema must have required array");
+        assert!(
+            required.iter().any(|v| v.as_str() == Some("command")),
+            "command must be required"
+        );
+    }
+
+    // ── build_shell_subcommand_config ────────────────────────────────────────
+
+    #[test]
+    fn build_shell_subcommand_config_synchronous_sets_true() {
+        let cfg =
+            AhmaMcpService::build_shell_subcommand_config(Some(42), &ExecutionMode::Synchronous);
+        assert_eq!(cfg.name, "run_terminal_command");
+        assert_eq!(cfg.synchronous, Some(true));
+        assert_eq!(cfg.timeout_seconds, Some(42));
+        assert_eq!(cfg.positional_args_first, Some(false));
+        assert!(cfg.enabled);
+
+        let positionals = cfg.positional_args.expect("positional args present");
+        assert_eq!(positionals.len(), 1);
+        assert_eq!(positionals[0].name, "command");
+        assert_eq!(positionals[0].required, Some(true));
+
+        let options = cfg.options.expect("options present");
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].name, "c_flag");
+        assert_eq!(options[0].alias.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn build_shell_subcommand_config_async_sets_false() {
+        let cfg =
+            AhmaMcpService::build_shell_subcommand_config(None, &ExecutionMode::AsyncResultPush);
+        assert_eq!(cfg.synchronous, Some(false));
+        assert_eq!(cfg.timeout_seconds, None);
+    }
+
+    // ── command_has_shell_metacharacters (private, in-module access) ─────────
+
+    #[test]
+    fn metacharacters_detected_for_each_special_char() {
+        for cmd in [
+            "echo a | b",
+            "echo a; b",
+            "echo a & b",
+            "echo a > b",
+            "echo a < b",
+            "echo `whoami`",
+            "echo $HOME",
+            "echo a\nb",
+            "echo a\rb",
+        ] {
+            assert!(
+                AhmaMcpService::command_has_shell_metacharacters(cmd),
+                "expected metachar detection for: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn metacharacters_absent_for_plain_command() {
+        assert!(!AhmaMcpService::command_has_shell_metacharacters(
+            "rm foo bar"
+        ));
+    }
+
+    // ── parse_rm_targets_from_command (private, in-module access) ─────────────
+
+    #[test]
+    fn parse_rm_targets_plain_two_targets() {
+        let targets = AhmaMcpService::parse_rm_targets_from_command("rm foo bar");
+        assert_eq!(targets, Some(vec!["foo".to_string(), "bar".to_string()]));
+    }
+
+    #[test]
+    fn parse_rm_targets_filters_flags() {
+        let targets = AhmaMcpService::parse_rm_targets_from_command("rm -rf foo");
+        assert_eq!(targets, Some(vec!["foo".to_string()]));
+    }
+
+    #[test]
+    fn parse_rm_targets_non_rm_is_none() {
+        assert_eq!(
+            AhmaMcpService::parse_rm_targets_from_command("ls foo"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_rm_targets_metachar_is_none() {
+        assert_eq!(
+            AhmaMcpService::parse_rm_targets_from_command("rm | foo"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_rm_targets_no_targets_is_none() {
+        assert_eq!(AhmaMcpService::parse_rm_targets_from_command("rm"), None);
+        assert_eq!(
+            AhmaMcpService::parse_rm_targets_from_command("rm -rf"),
+            None
+        );
+    }
+
+    // ── maybe_stage_run_terminal_rm (private, in-module access) ───────────────
+
+    #[tokio::test]
+    async fn maybe_stage_returns_none_without_task_vault() {
+        let (service, temp) = build_test_service().await.unwrap();
+        let wd = temp.path().to_string_lossy().to_string();
+        let result = service
+            .maybe_stage_run_terminal_rm("rm foo", &wd)
+            .await
+            .expect("must not error");
+        assert!(
+            result.is_none(),
+            "no task vault configured => no staging => Ok(None)"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_stage_moves_target_into_vault_trash() {
+        let (service, temp) = build_test_service().await.unwrap();
+
+        // Configure a task vault so task_vault_root() becomes Some.
+        let vault_dir = temp.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        service.set_app_config(Arc::new(AppConfig {
+            task_vault: Some(vault_dir.clone()),
+            ..AppConfig::default()
+        }));
+
+        // Working directory with a victim file to be staged.
+        let work_dir = temp.path().join("work");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let victim = work_dir.join("victim.txt");
+        std::fs::write(&victim, b"bye").unwrap();
+
+        let result = service
+            .maybe_stage_run_terminal_rm("rm victim.txt", &work_dir.to_string_lossy())
+            .await
+            .expect("staging must not error")
+            .expect("staging path must return Some(result)");
+
+        let text = result_text(&result);
+        assert!(
+            text.contains("Staged 1 path"),
+            "expected staged message, got: {text:?}"
+        );
+        assert!(
+            !victim.exists(),
+            "victim file must be moved out of work dir"
+        );
+        let trash = vault_dir.join("trash");
+        let staged_count = std::fs::read_dir(&trash).map(|rd| rd.count()).unwrap_or(0);
+        assert_eq!(staged_count, 1, "exactly one file staged into vault trash");
+    }
+
+    #[tokio::test]
+    async fn maybe_stage_non_rm_command_returns_none_even_with_vault() {
+        let (service, temp) = build_test_service().await.unwrap();
+        let vault_dir = temp.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        service.set_app_config(Arc::new(AppConfig {
+            task_vault: Some(vault_dir),
+            ..AppConfig::default()
+        }));
+        let wd = temp.path().to_string_lossy().to_string();
+        let result = service
+            .maybe_stage_run_terminal_rm("ls foo", &wd)
+            .await
+            .expect("must not error");
+        assert!(result.is_none(), "non-rm command must not stage");
+    }
+
+    // ── handle_run_terminal_command via the in-process MCP wire ──────────────
+    // These exercise the async handlers with a real server-built RequestContext.
+
+    #[tokio::test]
+    async fn handle_default_async_echo_succeeds() {
+        let result = call_run_terminal(json!({"command": "echo hello_default"}))
+            .await
+            .expect("default async run_terminal_command must return Ok");
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "echo should not be an error result"
+        );
+        let text = result_text(&result);
+        assert!(
+            text.contains("hello_default") || text.contains("AHMA ID:"),
+            "expected echoed output or an AHMA ID, got: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_synchronous_execution_mode_echo_succeeds() {
+        // execution_mode = Synchronous routes through execute_shell_sync.
+        let result = call_run_terminal(json!({
+            "command": "echo hello_sync",
+            "execution_mode": "Synchronous"
+        }))
+        .await
+        .expect("synchronous run_terminal_command must return Ok");
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result_text(&result);
+        assert!(
+            text.contains("hello_sync"),
+            "synchronous path must return the command output, got: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_unknown_execution_mode_defaults_to_async() {
+        // An unrecognised execution_mode falls through to AsyncResultPush.
+        let result = call_run_terminal(json!({
+            "command": "echo hello_bogus",
+            "execution_mode": "totally-bogus"
+        }))
+        .await
+        .expect("unknown execution_mode must still return Ok via async default");
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result_text(&result);
+        assert!(
+            text.contains("hello_bogus") || text.contains("AHMA ID:"),
+            "expected echoed output or an AHMA ID, got: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_with_monitor_level_succeeds() {
+        // Exercises the Some(log_monitor_config) branch + monitor_stream parse.
+        let result = call_run_terminal(json!({
+            "command": "echo hello_monitor",
+            "monitor_level": "error",
+            "monitor_stream": "stdout"
+        }))
+        .await
+        .expect("monitored run_terminal_command must return Ok");
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result_text(&result);
+        assert!(
+            text.contains("hello_monitor") || text.contains("AHMA ID:"),
+            "expected echoed output or an AHMA ID, got: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_with_session_id_runs_special_path() {
+        // session_id routes through execute_shell_special's session branch.
+        let result = call_run_terminal(json!({
+            "command": "echo hello_session",
+            "session_id": "unit-test-session"
+        }))
+        .await
+        .expect("session run_terminal_command must return Ok");
+        assert!(!result.is_error.unwrap_or(false));
+        let text = result_text(&result);
+        assert!(
+            text.contains("hello_session") || text.contains("AHMA ID:"),
+            "expected echoed output or an AHMA ID, got: {text:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handle_with_pty_runs_special_path() {
+        // pty=true routes through execute_shell_special's PTY branch (Unix only).
+        let result = call_run_terminal(json!({
+            "command": "echo hello_pty",
+            "pty": true
+        }))
+        .await
+        .expect("pty run_terminal_command must return Ok");
+        // The PTY branch returns an operation id immediately (or inlines fast
+        // output); either way the handler returns a non-empty result.
+        let text = result_text(&result);
+        assert!(
+            !text.is_empty(),
+            "pty path must return some content (output or AHMA ID), got empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_missing_command_is_error() {
+        // require_str fails when no command is provided.
+        let outcome = call_run_terminal(json!({})).await;
+        assert!(
+            outcome.is_err(),
+            "missing required 'command' must surface an error"
+        );
+    }
+}
