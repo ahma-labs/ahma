@@ -37,7 +37,6 @@
 //! policy and is used by the [`Adapter`](crate::adapter::Adapter) to validate paths
 //! and wrap command executions in platform-appropriate security wrappers.
 
-pub mod build_cache;
 pub mod build_diagnostics;
 mod command;
 pub(crate) mod core;

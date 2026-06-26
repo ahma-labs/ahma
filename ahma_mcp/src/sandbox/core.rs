@@ -242,11 +242,6 @@ pub struct Sandbox {
     /// Allow package-manager caches (cargo registry/git) to be written.
     /// Default `true`; disable with `--no-package-cache-write`.
     pub(super) package_cache_write: bool,
-    /// When true, cargo commands spawned by ahma use `target/ahma/` instead of
-    /// `target/`, isolating ahma's build artefacts from the IDE's background
-    /// `cargo check` and preventing cross-process file-lock contention.
-    /// Default `false`.
-    pub(super) separate_cargo_target: bool,
     /// The scope commit latch and roots-received flag, modeled as an explicit
     /// state machine (SPEC R23). Owns the one-shot lock semantics and the memory
     /// ordering that the commit decision must not be reordered past the scopes
@@ -268,7 +263,6 @@ impl Clone for Sandbox {
             explicit_scopes: self.explicit_scopes,
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
-            separate_cargo_target: self.separate_cargo_target,
             scope_lock: self.scope_lock.clone(),
         }
     }
@@ -288,7 +282,6 @@ impl std::fmt::Debug for Sandbox {
             .field("explicit_scopes", &self.explicit_scopes)
             .field("livelog", &self.livelog)
             .field("package_cache_write", &self.package_cache_write)
-            .field("separate_cargo_target", &self.separate_cargo_target)
             .field("scope_lock", &self.scope_lock)
             .finish()
     }
@@ -328,7 +321,6 @@ impl Sandbox {
             explicit_scopes: false,
             livelog,
             package_cache_write: true,
-            separate_cargo_target: false,
             scope_lock: super::scope_lock::ScopeLock::new(true),
         })
     }
@@ -342,23 +334,6 @@ impl Sandbox {
     pub fn with_package_cache_write(mut self, enabled: bool) -> Self {
         self.package_cache_write = enabled;
         self
-    }
-
-    /// Use a dedicated `target/ahma/` subdirectory for cargo builds.
-    ///
-    /// When `true`, ahma sets `CARGO_TARGET_DIR=<working_dir>/target/ahma` for
-    /// every cargo command it spawns.  This isolates ahma's build artefacts from
-    /// the IDE's background `cargo check`, eliminating cross-process file-lock
-    /// contention at the cost of a separate build cache.
-    #[must_use]
-    pub fn with_separate_cargo_target(mut self, enabled: bool) -> Self {
-        self.separate_cargo_target = enabled;
-        self
-    }
-
-    /// Returns `true` when ahma uses `target/ahma/` for cargo builds.
-    pub fn is_separate_cargo_target(&self) -> bool {
-        self.separate_cargo_target
     }
 
     /// Mark whether the initial scopes were explicitly provided by the user.

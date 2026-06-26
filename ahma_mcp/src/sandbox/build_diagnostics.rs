@@ -22,9 +22,9 @@
 //!
 //! Compounding it, an `RUSTC_WRAPPER=sccache` inherited from the environment runs
 //! sccache *inside* the sandbox, where its out-of-scope cache writes both fail and
-//! re-seed the contamination. ahma neutralises `RUSTC_WRAPPER` for `cargo` it
-//! launches (see `sandbox::command`), but a build started by a *different* tool
-//! (an agent's native `cargo`, a `Makefile`) bypasses that.
+//! re-seed the contamination. The sccache cache lives outside the workspace scope,
+//! so a sandboxed build that uses it is denied unless that cache directory is
+//! granted to the sandbox (or the wrapper is cleared for the build).
 //!
 //! This detector recognises that exact signature and returns a remediation hint,
 //! so the failure reads as "here is what happened and what to do" instead of a
@@ -108,15 +108,14 @@ const PROVENANCE_REMEDIATION: &str = "Build failed with `Operation not permitted
 inside the workspace `target/` directory. This is macOS `com.apple.provenance` contamination: a \
 file written by one sandboxed build cannot be overwritten by another process (a parallel build, an \
 IDE background `cargo check`, or a build whose compiler wrapper changed). Fix: remove the \
-contaminated build directory and rebuild — `rm -rf target/ahma` (ahma's separate target dir) or \
-`rm -rf target`. Avoid running a second sandboxed build against the same target dir concurrently.";
+contaminated build directory and rebuild — `rm -rf target`. Avoid running a second sandboxed build \
+against the same target dir concurrently.";
 
 const SCCACHE_REMEDIATION: &str = "Build failed and `sccache` (via RUSTC_WRAPPER) was active inside \
 the sandbox — its cache lives outside the workspace, so its reads/writes are denied and can \
-contaminate the target dir. ahma neutralises RUSTC_WRAPPER for the `cargo` it launches, but a build \
-started by another tool inherits it. Fix: run the build through ahma's `run_terminal_command`, or \
-clear the wrapper for this build (`RUSTC_WRAPPER=\"\" cargo …`). To keep using sccache, grant its \
-cache directory to the sandbox scope (a Phase 1 pre-lock consent will make this seamless).";
+contaminate the target dir. Fix: grant the sccache cache directory to the sandbox scope (e.g. \
+`ahma sandbox grant <cache-dir>`) so the build can read/write it, or clear the wrapper for this \
+build (`RUSTC_WRAPPER=\"\" cargo …`).";
 
 #[cfg(test)]
 mod tests {

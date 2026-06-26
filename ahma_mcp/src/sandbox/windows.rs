@@ -276,16 +276,7 @@ fn create_appcontainer_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    let mut cmd = tokio::process::Command::from(std_cmd);
-
-    // Enforce scope via CARGO_TARGET_DIR to prevent cargo from writing
-    // build artifacts outside the workspace.
-    if std::path::Path::new(program)
-        .file_name()
-        .is_some_and(|n| n == "cargo" || n == "cargo.exe")
-    {
-        cmd.env("CARGO_TARGET_DIR", working_dir.join("target"));
-    }
+    let cmd = tokio::process::Command::from(std_cmd);
 
     Ok(cmd)
 }

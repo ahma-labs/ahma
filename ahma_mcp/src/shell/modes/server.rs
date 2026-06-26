@@ -1029,8 +1029,6 @@ mod tests {
             minimize_tokens: false,
             small_model_harness: false,
             mutex_groups: ahma_common::config::default_mutex_groups(),
-            separate_cargo_target: false,
-            trust_build_caches: false,
         }
     }
 

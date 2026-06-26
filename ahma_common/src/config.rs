@@ -566,12 +566,6 @@ pub struct ToolSettings {
     /// Default: `[{ name = "cargo", prefixes = ["cargo"], max_wait_secs = 600 }]`
     #[serde(default = "default_mutex_groups")]
     pub mutex_groups: Vec<MutexGroupConfig>,
-    /// Use a dedicated `target/ahma` subdirectory for cargo builds spawned by
-    /// ahma, completely isolating them from the IDE's background `cargo check`.
-    /// Eliminates cross-process file-lock contention at the cost of a cold
-    /// build cache on the first run after a restart.
-    /// Default: `false`
-    pub separate_cargo_target: bool,
 }
 
 impl Default for ToolSettings {
@@ -586,7 +580,6 @@ impl Default for ToolSettings {
             minimize_tokens: false,
             small_model_harness: false,
             mutex_groups: default_mutex_groups(),
-            separate_cargo_target: true,
         }
     }
 }
@@ -735,21 +728,6 @@ pub struct SandboxSettings {
     /// Default: empty list
     #[serde(default)]
     pub persistent_scopes: Vec<PersistentScope>,
-    /// Opt in to automatically granting detected external **build caches**
-    /// (sccache, ccache) read+write access to the sandbox scope *before* it
-    /// locks, so cached builds work for the whole session without a per-failure
-    /// grant + restart.
-    ///
-    /// Secure by default (`false`): when off, ahma only *detects and logs* a
-    /// build cache that is outside the scope (with the exact command to allow
-    /// it) and never widens the sandbox on its own. When on, each session
-    /// re-detects the active caches (from `RUSTC_WRAPPER`/`SCCACHE_DIR`/
-    /// `CCACHE_DIR` and platform defaults) and folds their directories into the
-    /// writable scope set at startup. The directories are still only those the
-    /// user's own environment points at.
-    /// Default: `false`
-    #[serde(default)]
-    pub trust_build_caches: bool,
 }
 
 impl SandboxSettings {
@@ -805,7 +783,6 @@ impl Default for SandboxSettings {
             sandbox_directory: default_sandbox_directory(),
             use_sandbox_directory: false,
             persistent_scopes: Vec::new(),
-            trust_build_caches: false,
         }
     }
 }
@@ -1205,12 +1182,6 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # ]
 # Add more groups for other slow exclusive tools, e.g.:
 #   { name = "gradle", prefixes = ["gradle", "./gradlew"], max_wait_secs = 600 }
-#
-# separate_cargo_target = true   # default: true — sandbox builds write to target/ahma/ instead of target/,
-#                                # preventing com.apple.provenance xattr contamination (macOS Seatbelt stamps
-#                                # every file it writes; those files cannot be overwritten by other processes)
-#                                # and eliminating cross-process file-lock contention with IDE background checks.
-#                                # Set to false only if you want sandbox and IDE builds to share target/.
 
 # ── LM Studio (local OpenAI-compatible server) ──────────────────────────────
 # Start the LM Studio Local Server (Developer tab), or headless: lms server start
@@ -1239,14 +1210,6 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 # persistent_scopes = [
 #   { path = "~/Library/Caches/Mozilla.sccache", access = "rw", granted_by = "sccache", note = "compiler cache" },
 # ]
-#
-# trust_build_caches: opt in to auto-granting *detected* external build caches
-# (sccache/ccache, found via RUSTC_WRAPPER/SCCACHE_DIR/CCACHE_DIR + platform
-# defaults) read+write access before the sandbox locks — so cached builds work
-# all session without a per-failure grant + restart. Off by default: when off,
-# such a cache is only detected and logged (with the command to allow it), never
-# auto-granted.
-# trust_build_caches = false
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # [logging]

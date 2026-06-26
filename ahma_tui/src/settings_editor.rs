@@ -407,14 +407,6 @@ impl SettingsEditor {
                 default_value: SettingValue::Bool(d.small_model_harness),
                 security_tier: false,
             },
-            SettingItem {
-                key: "tools.separate_cargo_target",
-                label: "Separate cargo target",
-                description: "Use target/ahma/ to avoid IDE contention",
-                value: SettingValue::Bool(t.separate_cargo_target),
-                default_value: SettingValue::Bool(d.separate_cargo_target),
-                security_tier: false,
-            },
         ]
     }
 
@@ -629,11 +621,6 @@ impl SettingsEditor {
             5 => {
                 if let SettingValue::Bool(v) = value {
                     t.small_model_harness = *v;
-                }
-            }
-            6 => {
-                if let SettingValue::Bool(v) = value {
-                    t.separate_cargo_target = *v;
                 }
             }
             _ => {}
@@ -1095,7 +1082,7 @@ mod tests {
             editor.items_for_category(SettingsCategory::Features).len(),
             6
         );
-        assert_eq!(editor.items_for_category(SettingsCategory::Tools).len(), 7);
+        assert_eq!(editor.items_for_category(SettingsCategory::Tools).len(), 6);
         assert_eq!(
             editor.items_for_category(SettingsCategory::Sandbox).len(),
             5
@@ -1196,7 +1183,6 @@ mod tests {
         e.apply_tool(3, &SettingValue::Bool(true));
         e.apply_tool(4, &SettingValue::Bool(true));
         e.apply_tool(5, &SettingValue::Bool(true));
-        e.apply_tool(6, &SettingValue::Bool(false));
         let t = &e.settings().tools;
         assert_eq!(t.timeout_secs, 123);
         assert!(t.force_sync);
@@ -1204,7 +1190,6 @@ mod tests {
         assert!(t.skip_probes);
         assert!(t.minimize_tokens);
         assert!(t.small_model_harness);
-        assert!(!t.separate_cargo_target);
         // Wrong value types are ignored for each arm.
         e.apply_tool(0, &SettingValue::Bool(true));
         assert_eq!(e.settings().tools.timeout_secs, 123);
