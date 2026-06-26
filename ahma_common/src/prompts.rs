@@ -117,8 +117,12 @@ pub const DEFAULT_SPLIT_PROMPT: &str = r#"Break the following question into at m
 Question: {question}"#;
 
 /// Path to the global prompts config file.
+///
+/// Uses [`crate::config::ahma_home_dir`] for home resolution so that tests can
+/// redirect it cross-platform (see that function for why `HOME` alone does not
+/// work on Windows).
 pub fn global_prompts_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".ahma").join("prompts.toml"))
+    crate::config::ahma_home_dir().map(|h| h.join(".ahma").join("prompts.toml"))
 }
 
 /// Structure representing prompts for the task tree module.

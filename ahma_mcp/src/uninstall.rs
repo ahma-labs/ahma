@@ -291,7 +291,8 @@ async fn execute_actions(
 // ── MCP teardown ──────────────────────────────────────────────────────────────
 
 fn uninstall_mcp_config(platforms: &[Platform], dry_run: bool) -> Result<Vec<&'static str>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
+    let home = ahma_common::config::ahma_home_dir()
+        .ok_or_else(|| anyhow!("Could not resolve home directory"))?;
     let mut removed = Vec::new();
 
     for platform in platforms.iter().copied().filter(|p| p.supports_mcp()) {
@@ -502,7 +503,8 @@ ahma hooks uninstall --scope project"
 // ── Skills / Claude plugin teardown ───────────────────────────────────────────
 
 fn uninstall_agent_skills(dry_run: bool, interactive: bool) -> Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
+    let home = ahma_common::config::ahma_home_dir()
+        .ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
     let skill_dir = home.join(".agents").join("skills").join("ahma");
     if skill_dir.exists() {
@@ -728,7 +730,8 @@ fn resolve_install_dir() -> Result<PathBuf> {
 // ── Purge ~/.ahma ─────────────────────────────────────────────────────────────
 
 fn purge_ahma_dir(dry_run: bool) -> Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
+    let home = ahma_common::config::ahma_home_dir()
+        .ok_or_else(|| anyhow!("Could not resolve home directory"))?;
     let ahma_dir = home.join(".ahma");
     // The Antigravity setup creates ~/sandbox for the stdio MCP entry.
     let sandbox_dir = home.join("sandbox");
@@ -877,7 +880,7 @@ fn parse_separated_list(input: &str, max_val: usize) -> Vec<usize> {
 // ── Platform path helpers (mirrors setup.rs) ──────────────────────────────────
 
 fn vscode_mcp_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
+    let home = ahma_common::config::ahma_home_dir()?;
     #[cfg(target_os = "macos")]
     {
         Some(home.join("Library/Application Support/Code/User/mcp.json"))
@@ -893,7 +896,7 @@ fn vscode_mcp_path() -> Option<PathBuf> {
 }
 
 fn claude_desktop_config_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
+    let home = ahma_common::config::ahma_home_dir()?;
     #[cfg(target_os = "macos")]
     {
         Some(home.join("Library/Application Support/Claude/claude_desktop_config.json"))
@@ -1220,29 +1223,28 @@ mod tests {
 
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    /// Override HOME (and USERPROFILE on Windows) so `dirs::home_dir()` resolves
-    /// into a temp directory.  Returns the previous values for restoration.
-    fn set_home(tmp: &Path) -> (Option<String>, Option<String>) {
-        let prev_home = std::env::var("HOME").ok();
-        let prev_userprofile = std::env::var("USERPROFILE").ok();
+    /// Override the home directory so [`ahma_common::config::ahma_home_dir`]
+    /// resolves into a temp directory.  Returns the previous value for
+    /// restoration.
+    ///
+    /// Uses the `AHMA_TEST_HOME` override rather than `HOME`/`USERPROFILE`
+    /// because `dirs::home_dir()` ignores both env vars on Windows (it calls
+    /// `SHGetKnownFolderPath`), so they cannot redirect home resolution there.
+    fn set_home(tmp: &Path) -> Option<std::ffi::OsString> {
+        let prev = std::env::var_os("AHMA_TEST_HOME");
         // SAFETY: test-only, serialized via ENV_MUTEX.
         unsafe {
-            std::env::set_var("HOME", tmp);
-            std::env::set_var("USERPROFILE", tmp);
+            std::env::set_var("AHMA_TEST_HOME", tmp);
         }
-        (prev_home, prev_userprofile)
+        prev
     }
 
-    fn restore_home(prev: (Option<String>, Option<String>)) {
+    fn restore_home(prev: Option<std::ffi::OsString>) {
         // SAFETY: test-only, serialized via ENV_MUTEX.
         unsafe {
-            match prev.0 {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev.1 {
-                Some(v) => std::env::set_var("USERPROFILE", v),
-                None => std::env::remove_var("USERPROFILE"),
+            match prev {
+                Some(v) => std::env::set_var("AHMA_TEST_HOME", v),
+                None => std::env::remove_var("AHMA_TEST_HOME"),
             }
         }
     }

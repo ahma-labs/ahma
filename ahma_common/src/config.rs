@@ -413,16 +413,37 @@ impl AhmaConfig {
     }
 }
 
+/// Resolve the user's home directory for locating the `~/.ahma` directory.
+///
+/// Identical to [`dirs::home_dir`] in **release** builds. In debug/test builds
+/// (`cfg(debug_assertions)`) it first honors the `AHMA_TEST_HOME` environment
+/// variable, giving tests a *cross-platform* way to redirect home resolution.
+///
+/// This override exists because `dirs::home_dir()` on Windows resolves via
+/// `SHGetKnownFolderPath(FOLDERID_Profile)` and **ignores** the `HOME` and
+/// `USERPROFILE` environment variables — so unit tests cannot redirect it on
+/// Windows the way they can on Unix (where `$HOME` is honored). The override is
+/// compiled out of release binaries (`--release` disables `debug_assertions`),
+/// so shipped `ahma` always uses the real OS home directory and the location of
+/// the scope-grant store / settings is never influenced by the environment.
+pub fn ahma_home_dir() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(p) = std::env::var_os("AHMA_TEST_HOME") {
+        return Some(PathBuf::from(p));
+    }
+    dirs::home_dir()
+}
+
 /// Returns the canonical path to `~/.ahma/config.toml`, or `None` if the home
 /// directory cannot be determined.
 pub fn ahma_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".ahma").join("config.toml"))
+    ahma_home_dir().map(|h| h.join(".ahma").join("config.toml"))
 }
 
 /// Returns the canonical path to `~/.ahma/settings.toml`, or `None` if the home
 /// directory cannot be determined.
 pub fn settings_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".ahma").join("settings.toml"))
+    ahma_home_dir().map(|h| h.join(".ahma").join("settings.toml"))
 }
 
 // ---------------------------------------------------------------------------

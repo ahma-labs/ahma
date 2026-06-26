@@ -820,13 +820,17 @@ mod tests {
     use std::sync::{LazyLock, Mutex, MutexGuard};
     use tempfile::TempDir;
 
-    // Serialise every test that mutates process-global env (HOME) or the current
-    // working directory. `unsafe { std::env::set_var }` requires no concurrent
-    // readers; nextest also isolates each test binary in its own process.
+    // Serialise every test that mutates process-global env (AHMA_TEST_HOME) or
+    // the current working directory. `unsafe { std::env::set_var }` requires no
+    // concurrent readers; nextest also isolates each test binary in its own
+    // process.
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    /// RAII guard: overrides `HOME` (so `dirs::home_dir()` → `tempdir`) for the
-    /// duration of a test and restores the previous value on drop.
+    /// RAII guard: overrides the home directory (so `ahma_common::config::ahma_home_dir()`
+    /// → `tempdir`) for the duration of a test and restores the previous value on
+    /// drop. Uses the `AHMA_TEST_HOME` override rather than `HOME` because
+    /// `dirs::home_dir()` ignores `HOME`/`USERPROFILE` on Windows — see
+    /// [`ahma_common::config::ahma_home_dir`].
     struct HomeGuard<'a> {
         _lock: MutexGuard<'a, ()>,
         prev: Option<std::ffi::OsString>,
@@ -835,11 +839,11 @@ mod tests {
     impl<'a> HomeGuard<'a> {
         fn new(home: &std::path::Path) -> Self {
             let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os("HOME");
+            let prev = std::env::var_os("AHMA_TEST_HOME");
             // SAFETY: guarded by ENV_MUTEX; the only env mutators in this module
             // hold the same lock, and nextest isolates each binary in a process.
             unsafe {
-                std::env::set_var("HOME", home);
+                std::env::set_var("AHMA_TEST_HOME", home);
             }
             Self { _lock: lock, prev }
         }
@@ -850,8 +854,8 @@ mod tests {
             // SAFETY: still holding ENV_MUTEX for the lifetime of this guard.
             unsafe {
                 match &self.prev {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
+                    Some(v) => std::env::set_var("AHMA_TEST_HOME", v),
+                    None => std::env::remove_var("AHMA_TEST_HOME"),
                 }
             }
         }
@@ -1071,11 +1075,11 @@ mod tests {
         let cwd = TempDir::new().unwrap();
         let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Global prompts file (valid override) under HOME.
-        let prev_home = std::env::var_os("HOME");
+        // Global prompts file (valid override) under the test home.
+        let prev_home = std::env::var_os("AHMA_TEST_HOME");
         // SAFETY: guarded by ENV_MUTEX.
         unsafe {
-            std::env::set_var("HOME", home.path());
+            std::env::set_var("AHMA_TEST_HOME", home.path());
         }
         let global_dir = home.path().join(".ahma");
         std::fs::create_dir_all(&global_dir).unwrap();
@@ -1104,8 +1108,8 @@ mod tests {
         // SAFETY: guarded by ENV_MUTEX.
         unsafe {
             match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
+                Some(v) => std::env::set_var("AHMA_TEST_HOME", v),
+                None => std::env::remove_var("AHMA_TEST_HOME"),
             }
         }
         result.unwrap();
