@@ -288,4 +288,219 @@ mod tests {
             "missing parent dir should produce an error"
         );
     }
+
+    #[tokio::test]
+    async fn vault_created_serializes_expected_fields() {
+        // Covers AuditWriter::vault_created and the
+        // AuditEventKind::VaultCreated serialization arm.
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("audit.jsonl");
+        let writer = AuditWriter::new(&log_path);
+
+        writer
+            .vault_created("/vaults/my-task", "my-task")
+            .await
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = contents.trim().split('\n').collect();
+        assert_eq!(lines.len(), 1, "expected exactly 1 JSONL line");
+
+        let ev: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(ev["type"], "vault_created");
+        assert_eq!(ev["vault_path"], "/vaults/my-task");
+        assert_eq!(ev["slug"], "my-task");
+        assert!(
+            ev["timestamp"].as_str().is_some_and(|s| !s.is_empty()),
+            "timestamp should be present and non-empty"
+        );
+        // trace_id is None -> skipped during serialization.
+        assert!(ev.get("trace_id").is_none(), "trace_id should be omitted");
+    }
+
+    #[tokio::test]
+    async fn tool_call_serializes_expected_fields() {
+        // Covers AuditWriter::tool_call and the
+        // AuditEventKind::ToolCall serialization arm.
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("audit.jsonl");
+        let writer = AuditWriter::new(&log_path);
+
+        writer
+            .tool_call("op_42", "git_status", "--porcelain")
+            .await
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let ev: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(ev["type"], "tool_call");
+        assert_eq!(ev["operation_id"], "op_42");
+        assert_eq!(ev["tool_name"], "git_status");
+        assert_eq!(ev["args_summary"], "--porcelain");
+        assert!(ev["timestamp"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn tool_complete_serializes_expected_fields() {
+        // Covers AuditWriter::tool_complete and the
+        // AuditEventKind::ToolComplete serialization arm.
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("audit.jsonl");
+        let writer = AuditWriter::new(&log_path);
+
+        writer.tool_complete("op_99", false, 1234).await.unwrap();
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let ev: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(ev["type"], "tool_complete");
+        assert_eq!(ev["operation_id"], "op_99");
+        assert_eq!(ev["success"], false);
+        assert_eq!(ev["duration_ms"], 1234);
+        assert!(ev["timestamp"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn renewal_checkpoint_serializes_expected_fields() {
+        // Covers AuditWriter::renewal_checkpoint and the
+        // AuditEventKind::RenewalCheckpoint serialization arm.
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("audit.jsonl");
+        let writer = AuditWriter::new(&log_path);
+
+        writer
+            .renewal_checkpoint("op_7", 3600, "checkpoints/op_7.json")
+            .await
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let ev: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(ev["type"], "renewal_checkpoint");
+        assert_eq!(ev["operation_id"], "op_7");
+        assert_eq!(ev["elapsed_secs"], 3600);
+        assert_eq!(ev["checkpoint_path"], "checkpoints/op_7.json");
+        assert!(ev["timestamp"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn task_halted_serializes_expected_fields() {
+        // Covers AuditWriter::task_halted and the
+        // AuditEventKind::TaskHalted serialization arm.
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("audit.jsonl");
+        let writer = AuditWriter::new(&log_path);
+
+        writer
+            .task_halted("op_5", "awaiting re-approval")
+            .await
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let ev: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(ev["type"], "task_halted");
+        assert_eq!(ev["operation_id"], "op_5");
+        assert_eq!(ev["reason"], "awaiting re-approval");
+        assert!(ev["timestamp"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn emit_appends_multiple_events_in_order() {
+        // Covers append semantics in emit: each event is a distinct line,
+        // appended in call order.
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("audit.jsonl");
+        let writer = AuditWriter::new(&log_path);
+
+        writer.vault_created("/v/t", "t").await.unwrap();
+        writer
+            .tool_call("op_1", "cargo_build", "--release")
+            .await
+            .unwrap();
+        writer.tool_complete("op_1", true, 10).await.unwrap();
+        writer
+            .renewal_checkpoint("op_1", 60, "cp.json")
+            .await
+            .unwrap();
+        writer.task_halted("op_1", "halt").await.unwrap();
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = contents.trim().split('\n').collect();
+        assert_eq!(lines.len(), 5, "expected exactly 5 appended JSONL lines");
+
+        let kinds: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "vault_created",
+                "tool_call",
+                "tool_complete",
+                "renewal_checkpoint",
+                "task_halted",
+            ],
+            "events must be appended in call order"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_deserializes_round_trip_into_audit_event() {
+        // Exercises the Deserialize path of AuditEvent / AuditEventKind, ensuring
+        // the #[serde(flatten)] + tag = "type" round-trips through a real type.
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("audit.jsonl");
+        let writer = AuditWriter::new(&log_path);
+
+        writer
+            .tool_call("op_x", "rustfmt", "--check")
+            .await
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        let event: AuditEvent = serde_json::from_str(contents.trim()).unwrap();
+        assert!(!event.timestamp.is_empty());
+        assert!(event.trace_id.is_none());
+        match event.kind {
+            AuditEventKind::ToolCall {
+                operation_id,
+                tool_name,
+                args_summary,
+            } => {
+                assert_eq!(operation_id, "op_x");
+                assert_eq!(tool_name, "rustfmt");
+                assert_eq!(args_summary, "--check");
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_returns_configured_path() {
+        // Covers AuditWriter::path and AuditWriter::new.
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("nested").join("audit.jsonl");
+        let writer = AuditWriter::new(&log_path);
+        assert_eq!(writer.path(), log_path.as_path());
+    }
+
+    #[tokio::test]
+    async fn emit_errors_when_path_is_a_directory() {
+        // Reaches the I/O error branch of emit: OpenOptions fails because the
+        // target path is an existing directory, not a file.
+        let tmp = TempDir::new().unwrap();
+        let dir_as_log = tmp.path().join("audit.jsonl");
+        std::fs::create_dir(&dir_as_log).unwrap();
+        let writer = AuditWriter::new(&dir_as_log);
+
+        let result = writer.vault_created("/v", "v").await;
+        assert!(
+            result.is_err(),
+            "opening a directory for append should error"
+        );
+    }
 }

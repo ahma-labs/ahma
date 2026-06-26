@@ -307,4 +307,121 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    // Covers `verify_self` (lines 120-124): resolves `current_exe()` and delegates
+    // to `verify_artifact`. With the skip env var set, `verify_artifact` returns
+    // before any network call, so this exercises the resolve+delegate path offline.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn verify_self_ok_when_skip_env_set() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+        let result = verify_self().await;
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        assert!(
+            result.is_ok(),
+            "expected Ok from verify_self when skip env var is set: {result:?}"
+        );
+    }
+
+    // Covers `run_cli` happy path with an explicit existing artifact:
+    // the `args.path.filter(|_| !args.self_check)` Some-branch (line 128-129),
+    // the `path.exists()` true case (skips the bail at 137-138), and the success
+    // println!/verify/println! tail (lines 141-149). Offline via skip env var.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn run_cli_ok_with_existing_artifact_and_skip_env() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+
+        let dir = tempdir().unwrap();
+        let artifact = dir.path().join("ahma-release.tar.gz");
+        std::fs::write(&artifact, b"pretend-archive-bytes").unwrap();
+
+        let args = VerifyArgs {
+            path: Some(artifact.clone()),
+            self_check: false,
+        };
+        let result = run_cli(args).await;
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        assert!(
+            result.is_ok(),
+            "expected Ok from run_cli on existing artifact with skip env set: {result:?}"
+        );
+    }
+
+    // Covers `run_cli`'s self-check branch: with `self_check == true` the
+    // `filter(|_| !args.self_check)` drops the provided path (line 128 false arm),
+    // falling through to `current_exe()` resolution (lines 130-135). The running
+    // test binary exists, so it proceeds through the success tail with skip set.
+    // Also confirms an explicit `path` is ignored when `self_check` is true.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn run_cli_self_check_uses_current_exe_and_ignores_path() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+
+        // Provide a bogus, non-existent path: it must be ignored because self_check
+        // is true, so resolution falls back to current_exe (which exists).
+        let args = VerifyArgs {
+            path: Some(PathBuf::from("/nonexistent/should/be/ignored.bin")),
+            self_check: true,
+        };
+        let result = run_cli(args).await;
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        assert!(
+            result.is_ok(),
+            "expected Ok from run_cli --self (current_exe) with skip env set: {result:?}"
+        );
+    }
+
+    // Covers `run_cli` self-check with no explicit path (None) — the other entry
+    // into the `current_exe()` fallback. Distinct from the test above which passes
+    // Some(..) + self_check; here `args.path` is None outright.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn run_cli_self_check_with_no_path_uses_current_exe() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_SIGNATURE") };
+        unsafe { std::env::set_var("AHMA_INSECURE_SKIP_VERIFY", "1") };
+        let args = VerifyArgs {
+            path: None,
+            self_check: true,
+        };
+        let result = run_cli(args).await;
+        unsafe { std::env::remove_var("AHMA_INSECURE_SKIP_VERIFY") };
+        assert!(
+            result.is_ok(),
+            "expected Ok from run_cli --self with None path and skip env set: {result:?}"
+        );
+    }
+
+    // Exercises `sha256_hex` on a larger, multi-kilobyte input (existing tests only
+    // use <=5 byte inputs) and asserts the hex formatting invariant: 64 lowercase
+    // hex chars, fully deterministic across repeated calls.
+    #[test]
+    fn sha256_larger_file_is_deterministic_64_hex() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.bin");
+        // ~256 KiB of a repeating, non-trivial byte pattern.
+        let mut data = Vec::with_capacity(256 * 1024);
+        for i in 0..(256 * 1024) {
+            data.push((i % 251) as u8);
+        }
+        std::fs::write(&path, &data).unwrap();
+
+        let first = sha256_hex(&path).unwrap();
+        let second = sha256_hex(&path).unwrap();
+        assert_eq!(first, second, "sha256_hex must be deterministic");
+        assert_eq!(first.len(), 64, "sha256 hex must be 64 chars: {first}");
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "sha256 hex must be lowercase hex: {first}"
+        );
+    }
 }

@@ -368,3 +368,294 @@ mod unix {
             .await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operation_monitor::{MonitorConfig, Operation, OperationMonitor, OperationStatus};
+    use crate::sandbox::{Sandbox, SandboxMode};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    /// `pty_available()` must run without panicking and return a `bool`.
+    /// On Unix it should report `true` on a normal dev/CI box that can
+    /// allocate a PTY; if PTY allocation is denied (nested sandbox) it returns
+    /// `false`. Either way the call itself must not panic.
+    #[test]
+    fn pty_available_is_callable_and_returns_bool() {
+        // The call itself must not panic; on Unix a normal dev/CI box that can
+        // allocate a PTY reports `true`, otherwise `false`. On non-Unix it is
+        // always `false`.
+        let available = pty_available();
+        #[cfg(unix)]
+        {
+            // Calling twice must be stable (no side effects flip the result).
+            assert_eq!(available, pty_available());
+        }
+        #[cfg(not(unix))]
+        assert!(!available, "non-Unix always reports PTY unavailable");
+    }
+
+    /// Build a `Sandbox` scoped to `dir` in test mode, mirroring
+    /// `test_utils::in_process` so command execution works without an
+    /// OS-level kernel sandbox.
+    #[cfg(unix)]
+    fn test_sandbox(dir: &std::path::Path) -> Sandbox {
+        let sandbox = Sandbox::new(
+            vec![dir.to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .expect("sandbox construction");
+        sandbox.set_roots_received(true);
+        sandbox
+    }
+
+    #[cfg(unix)]
+    fn test_monitor() -> Arc<OperationMonitor> {
+        Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(30),
+        )))
+    }
+
+    /// Happy path: run `echo hello` through the PTY pipeline and assert the
+    /// operation completes successfully with the expected captured output.
+    ///
+    /// Covers `run_pty_operation` Unix dispatch (lines 92-102), `unix::run`
+    /// setup + select-loop `line_rx`/`exit_rx` arms and terminal Completed
+    /// status (lines 263-368), plus `setup_pty` Ok path (lines 140-251).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_pty_echo_completes_with_output() {
+        if !pty_available() {
+            eprintln!("skipping: PTY allocation denied in this environment");
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let sandbox = test_sandbox(temp.path());
+        let monitor = test_monitor();
+        let op_id = "pty-echo-op";
+        monitor
+            .add_operation(Operation::new(
+                op_id.to_string(),
+                "pty_test".to_string(),
+                "echo".to_string(),
+                None,
+            ))
+            .await;
+        let token = CancellationToken::new();
+
+        run_pty_operation(
+            &sandbox,
+            "echo hello",
+            temp.path(),
+            10_000,
+            &token,
+            op_id,
+            &monitor,
+        )
+        .await;
+
+        let op = monitor
+            .check_completion_history_pub(op_id)
+            .await
+            .expect("operation should be in completion history");
+        assert_eq!(op.state, OperationStatus::Completed);
+        let result = op.result.expect("completed op carries a result payload");
+        let stdout = result
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            stdout.contains("hello"),
+            "expected captured stdout to contain 'hello', got: {stdout:?}"
+        );
+        assert_eq!(result.get("exit_code").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(result.get("pty").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    /// A command that exits non-zero must end in `Failed` with the non-zero
+    /// exit code recorded. Covers the `success == false` branch (lines
+    /// 349-365) of `unix::run`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_pty_nonzero_exit_marks_failed() {
+        if !pty_available() {
+            eprintln!("skipping: PTY allocation denied in this environment");
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let sandbox = test_sandbox(temp.path());
+        let monitor = test_monitor();
+        let op_id = "pty-exit-op";
+        monitor
+            .add_operation(Operation::new(
+                op_id.to_string(),
+                "pty_test".to_string(),
+                "exit".to_string(),
+                None,
+            ))
+            .await;
+        let token = CancellationToken::new();
+
+        // `exit 3` is portable across the POSIX shells used on Unix.
+        run_pty_operation(
+            &sandbox,
+            "exit 3",
+            temp.path(),
+            10_000,
+            &token,
+            op_id,
+            &monitor,
+        )
+        .await;
+
+        let op = monitor
+            .check_completion_history_pub(op_id)
+            .await
+            .expect("operation should be in completion history");
+        assert_eq!(op.state, OperationStatus::Failed);
+        let result = op.result.expect("failed op carries a result payload");
+        assert_eq!(result.get("exit_code").and_then(|v| v.as_i64()), Some(3));
+    }
+
+    /// An already-cancelled token makes the biased `select!` take the
+    /// cancellation arm immediately, ending in `Cancelled`. Covers lines
+    /// 297-309 of `unix::run`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_pty_cancelled_token_yields_cancelled() {
+        if !pty_available() {
+            eprintln!("skipping: PTY allocation denied in this environment");
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let sandbox = test_sandbox(temp.path());
+        let monitor = test_monitor();
+        let op_id = "pty-cancel-op";
+        monitor
+            .add_operation(Operation::new(
+                op_id.to_string(),
+                "pty_test".to_string(),
+                "sleep".to_string(),
+                None,
+            ))
+            .await;
+        let token = CancellationToken::new();
+        token.cancel();
+
+        run_pty_operation(
+            &sandbox,
+            "sleep 30",
+            temp.path(),
+            60_000,
+            &token,
+            op_id,
+            &monitor,
+        )
+        .await;
+
+        let op = monitor
+            .check_completion_history_pub(op_id)
+            .await
+            .expect("operation should be in completion history");
+        assert_eq!(op.state, OperationStatus::Cancelled);
+    }
+
+    /// A tiny timeout against a long-running command makes the
+    /// `sleep_until(deadline)` arm fire, ending in `TimedOut`. Covers lines
+    /// 311-326 of `unix::run`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_pty_timeout_yields_timed_out() {
+        if !pty_available() {
+            eprintln!("skipping: PTY allocation denied in this environment");
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let sandbox = test_sandbox(temp.path());
+        let monitor = test_monitor();
+        let op_id = "pty-timeout-op";
+        monitor
+            .add_operation(Operation::new(
+                op_id.to_string(),
+                "pty_test".to_string(),
+                "sleep".to_string(),
+                None,
+            ))
+            .await;
+        let token = CancellationToken::new();
+
+        run_pty_operation(
+            &sandbox,
+            "sleep 30",
+            temp.path(),
+            50,
+            &token,
+            op_id,
+            &monitor,
+        )
+        .await;
+
+        let op = monitor
+            .check_completion_history_pub(op_id)
+            .await
+            .expect("operation should be in completion history");
+        assert_eq!(op.state, OperationStatus::TimedOut);
+        let result = op.result.expect("timed-out op carries a result payload");
+        let msg = result.as_str().unwrap_or_default();
+        assert!(
+            msg.contains("timed out"),
+            "expected a timeout message, got: {msg:?}"
+        );
+    }
+
+    /// A non-existent working directory makes the child spawn fail inside
+    /// `setup_pty`, so `unix::run` reports `Failed` with the start-error
+    /// message. Covers the `setup_pty` `Err` arm (lines 277-286) of `run`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_pty_bad_working_dir_marks_failed() {
+        let temp = TempDir::new().unwrap();
+        let sandbox = test_sandbox(temp.path());
+        let monitor = test_monitor();
+        let op_id = "pty-baddir-op";
+        monitor
+            .add_operation(Operation::new(
+                op_id.to_string(),
+                "pty_test".to_string(),
+                "baddir".to_string(),
+                None,
+            ))
+            .await;
+        let token = CancellationToken::new();
+        let missing = temp.path().join("does-not-exist-subdir");
+
+        run_pty_operation(
+            &sandbox,
+            "echo nope",
+            &missing,
+            10_000,
+            &token,
+            op_id,
+            &monitor,
+        )
+        .await;
+
+        let op = monitor
+            .check_completion_history_pub(op_id)
+            .await
+            .expect("operation should be in completion history");
+        assert_eq!(op.state, OperationStatus::Failed);
+        let result = op.result.expect("failed op carries a result payload");
+        let msg = result.as_str().unwrap_or_default();
+        assert!(
+            msg.contains("Failed to start PTY command"),
+            "expected start-failure message, got: {msg:?}"
+        );
+    }
+}

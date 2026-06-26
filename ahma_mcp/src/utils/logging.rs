@@ -530,6 +530,178 @@ mod tests {
         }
     }
 
+    use std::sync::{LazyLock, Mutex as StdMutex};
+
+    /// Serializes tests that mutate process-global state (env vars + cwd),
+    /// since `project_log_dir`, `bridge_capture_paths`, `try_create_file_appender`,
+    /// and `detect_log_role_from_startup` all read the environment / current dir.
+    static ENV_MUTEX: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+
+    #[test]
+    fn test_detect_log_role_from_startup_server_child_env() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let prev = std::env::var("AHMA_SERVER_CHILD").ok();
+        unsafe {
+            std::env::set_var("AHMA_SERVER_CHILD", "1");
+        }
+        // The env check short-circuits before argv inspection (lines 56-57).
+        let role = detect_log_role_from_startup();
+        // Restore before releasing the lock.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AHMA_SERVER_CHILD", v),
+                None => std::env::remove_var("AHMA_SERVER_CHILD"),
+            }
+        }
+        assert_eq!(role, "bridge");
+    }
+
+    #[test]
+    fn test_read_log_tail_missing_file_returns_empty() {
+        let temp = tempdir().unwrap();
+        let missing = temp.path().join("does_not_exist.log");
+        // File::open fails -> empty string (lines 367-369).
+        assert_eq!(read_log_tail(&missing, 64), "");
+    }
+
+    #[test]
+    fn test_read_log_tail_empty_file_returns_empty() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("empty.log");
+        fs::write(&path, "").unwrap();
+        // len == 0 -> start == 0 -> read yields empty buffer.
+        assert_eq!(read_log_tail(&path, 64), "");
+    }
+
+    #[test]
+    fn test_read_log_tail_max_bytes_exceeds_length_returns_whole_file() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("short.log");
+        fs::write(&path, "abc").unwrap();
+        // max_bytes > len -> saturating_sub clamps start to 0 (line 373).
+        assert_eq!(read_log_tail(&path, 4096), "abc");
+    }
+
+    #[test]
+    fn test_cleanup_old_logs_missing_dir_is_noop() {
+        let temp = tempdir().unwrap();
+        let missing = temp.path().join("no_such_logs_dir");
+        // read_dir fails -> early return, must not panic (lines 337-339).
+        cleanup_old_logs(&missing);
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn test_cleanup_old_logs_skips_directories_and_unmanaged_files() {
+        let temp = tempdir().unwrap();
+        let log_dir = temp.path().join("logs");
+        fs::create_dir_all(&log_dir).unwrap();
+
+        // A directory whose name matches a managed prefix: is_managed == true
+        // but meta.is_file() == false -> continue (lines 345-347).
+        let managed_dir = log_dir.join("ahma_bridge.subdir");
+        fs::create_dir_all(&managed_dir).unwrap();
+
+        // A regular file that is NOT a managed log -> is_managed == false skip (line 351).
+        let unmanaged = log_dir.join("notes.txt");
+        fs::write(&unmanaged, "keep me").unwrap();
+
+        cleanup_old_logs(&log_dir);
+
+        assert!(
+            managed_dir.exists(),
+            "managed-named directory must be skipped"
+        );
+        assert!(unmanaged.exists(), "unmanaged file must be skipped");
+    }
+
+    #[test]
+    fn test_prepare_bridge_capture_files_idempotent_does_not_duplicate_header() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let temp = tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        let temp_canon = dunce::canonicalize(temp.path()).unwrap();
+        std::env::set_current_dir(&temp_canon).unwrap();
+
+        let (out1, err1) = prepare_bridge_capture_files().expect("first prepare");
+        // Second call: files already exist -> path.exists() true skips write (line 177).
+        let (out2, err2) = prepare_bridge_capture_files().expect("second prepare");
+
+        assert_eq!(out1, out2);
+        assert_eq!(err1, err2);
+        let out_content = fs::read_to_string(&out1).unwrap();
+        let err_content = fs::read_to_string(&err1).unwrap();
+
+        let _ = std::env::set_current_dir(prev);
+
+        // Header written exactly once (no append on the idempotent call).
+        assert_eq!(out_content, BRIDGE_CAPTURE_HEADER);
+        assert_eq!(err_content, BRIDGE_CAPTURE_HEADER);
+    }
+
+    #[test]
+    fn test_bridge_capture_paths_live_under_project_log_dir() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let temp = tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        let temp_canon = dunce::canonicalize(temp.path()).unwrap();
+        std::env::set_current_dir(&temp_canon).unwrap();
+
+        let (out, err) = bridge_capture_paths();
+
+        let _ = std::env::set_current_dir(prev);
+
+        let expected_dir = temp_canon.join("logs");
+        assert_eq!(out, expected_dir.join(BRIDGE_STDOUT_NAME));
+        assert_eq!(err, expected_dir.join(BRIDGE_STDERR_NAME));
+    }
+
+    #[test]
+    fn test_test_write_permission_creates_dir_and_returns_true() {
+        let temp = tempdir().unwrap();
+        // Non-existent nested path: create_dir_all succeeds, write probe succeeds (lines 391-401).
+        let nested = temp.path().join("a").join("b").join("logs");
+        assert!(test_write_permission(&nested));
+        assert!(
+            nested.exists(),
+            "test_write_permission should create the dir"
+        );
+        // Probe file must be cleaned up.
+        assert!(!nested.join(".ahma_log_test").exists());
+    }
+
+    #[test]
+    fn test_try_create_file_appender_returns_some_for_writeable_cwd() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let temp = tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        let temp_canon = dunce::canonicalize(temp.path()).unwrap();
+        std::env::set_current_dir(&temp_canon).unwrap();
+
+        // project_log_dir() -> <cwd>/logs which is writeable -> Some(appender).
+        // Exercises cleanup_old_logs + daily appender construction (+ unix symlink).
+        let appender = try_create_file_appender();
+        let log_dir = temp_canon.join("logs");
+
+        let _ = std::env::set_current_dir(prev);
+
+        assert!(
+            appender.is_some(),
+            "writeable cwd/logs should yield an appender"
+        );
+        assert!(log_dir.exists(), "log dir should be created");
+
+        #[cfg(unix)]
+        {
+            // try_update_current_log_symlink creates a symlink named MCP_LOG_BASENAME.
+            let symlink_path = log_dir.join(MCP_LOG_BASENAME);
+            assert!(
+                std::fs::symlink_metadata(&symlink_path).is_ok(),
+                "current-log symlink should exist on unix"
+            );
+        }
+    }
+
     fn role_for_args(args: &[&str]) -> &'static str {
         match args.first().copied() {
             None => "cli",

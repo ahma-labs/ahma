@@ -738,4 +738,286 @@ mod tests {
         assert!(properties.contains_key("tools"));
         assert!(properties.contains_key("id"));
     }
+
+    // ===================================================================
+    // Additional coverage: async handler paths exercising a real service +
+    // operation_monitor. Targets branches in handle_await,
+    // handle_await_specific_operation, format_already_completed_or_not_found,
+    // handle_await_no_pending_ops (recently-completed branch),
+    // handle_await_timeout, pending_operations_for_filters,
+    // wait_for_pending_operations, calculate_intelligent_timeout (filter
+    // branches), and spawn_progress_warnings message emission.
+    // ===================================================================
+
+    use crate::AhmaMcpService;
+
+    fn await_params(args: serde_json::Value) -> CallToolRequestParams {
+        let mut params = CallToolRequestParams::new("await".to_string());
+        if let Some(a) = args.as_object().cloned() {
+            params = params.with_arguments(a);
+        }
+        params
+    }
+
+    async fn add_active_op(service: &AhmaMcpService, id: &str, tool: &str) {
+        let mut op = Operation::new(id.to_string(), tool.to_string(), String::new(), None);
+        op.state = OperationStatus::InProgress;
+        service.operation_monitor.add_operation(op).await;
+    }
+
+    async fn add_completed_op(service: &AhmaMcpService, id: &str, tool: &str) {
+        // Add as Pending, then drive Pending -> Completed so the op lands in the
+        // monitor's completion history (the path real completions take).
+        let op = Operation::new(id.to_string(), tool.to_string(), String::new(), None);
+        service.operation_monitor.add_operation(op).await;
+        service
+            .operation_monitor
+            .update_status(
+                id,
+                OperationStatus::Completed,
+                Some(serde_json::json!({"ok": true})),
+            )
+            .await;
+    }
+
+    // ----- handle_await: empty args, no pending ops, empty filters -----
+    // Covers handle_await lines 34-53 (id None, empty pending) and
+    // handle_await_no_pending_ops empty-filter text branch (136-137).
+    #[tokio::test]
+    async fn test_handle_await_empty_no_pending_ops() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        let result = service
+            .handle_await(await_params(serde_json::json!({})))
+            .await
+            .unwrap();
+        let text = result.content.first().unwrap().as_text().unwrap();
+        assert!(text.text.contains("No pending operations to await for"));
+    }
+
+    // ----- handle_await with id that does not exist anywhere -----
+    // Covers handle_await id branch (40-42), handle_await_specific_operation
+    // early return (150-152), and format_already_completed_or_not_found
+    // not-found branch (183-185).
+    #[tokio::test]
+    async fn test_handle_await_id_not_found() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        let result = service
+            .handle_await(await_params(serde_json::json!({"id": "ghost-op-999"})))
+            .await
+            .unwrap();
+        let text = result.content.first().unwrap().as_text().unwrap();
+        assert!(text.text.contains("not found"));
+        assert!(text.text.contains("ghost-op-999"));
+    }
+
+    // ----- handle_await with id of an already-completed (history) op -----
+    // Covers format_already_completed_or_not_found already-completed branch
+    // (181-193): get_operation returns None (op moved to history) and the op is
+    // found in get_completed_operations.
+    #[tokio::test]
+    async fn test_handle_await_id_already_completed() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_completed_op(&service, "done-1", "cargo_build").await;
+        let result = service
+            .handle_await(await_params(serde_json::json!({"id": "done-1"})))
+            .await
+            .unwrap();
+        let text = result.content.first().unwrap().as_text().unwrap();
+        assert!(text.text.contains("already completed"));
+        assert!(text.text.contains("done-1"));
+    }
+
+    // ----- handle_await id: op active at call time, completes during wait -----
+    // Covers handle_await_specific_operation Ok(Some) branch (164-168) plus
+    // build_completion_result success path via the specific-operation route.
+    #[tokio::test]
+    async fn test_handle_await_id_completes_during_wait() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_active_op(&service, "wait-1", "echo_demo").await;
+
+        // Complete the op shortly after handle_await snapshots/subscribes.
+        let mon = service.operation_monitor.clone();
+        let completer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            mon.update_status(
+                "wait-1",
+                OperationStatus::Completed,
+                Some(serde_json::json!({"ok": true})),
+            )
+            .await;
+        });
+
+        let result = service
+            .handle_await(await_params(serde_json::json!({"id": "wait-1"})))
+            .await
+            .unwrap();
+        completer.await.unwrap();
+
+        let text = result.content.first().unwrap().as_text().unwrap();
+        assert!(text.text.contains("Completed"));
+    }
+
+    // ----- handle_await with tool filter: op completes during wait -----
+    // Covers handle_await wait path (55-81), pending_operations_for_filters
+    // (196-205), wait_for_pending_operations (207-225), and the Ok(contents)
+    // -> build_completion_result branch (74-75).
+    #[tokio::test]
+    async fn test_handle_await_filter_completes_during_wait() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_active_op(&service, "wf-1", "echo_demo").await;
+
+        let mon = service.operation_monitor.clone();
+        let completer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            mon.update_status(
+                "wf-1",
+                OperationStatus::Completed,
+                Some(serde_json::json!({"ok": true})),
+            )
+            .await;
+        });
+
+        let result = service
+            .handle_await(await_params(serde_json::json!({"tools": "echo"})))
+            .await
+            .unwrap();
+        completer.await.unwrap();
+
+        let text = result.content.first().unwrap().as_text().unwrap();
+        assert!(text.text.contains("Completed"));
+    }
+
+    // ----- handle_await: no pending, but recently completed matches filter ---
+    // Covers handle_await_no_pending_ops recently-completed branch (132-133)
+    // and recently_completed_contents Some path (244-249).
+    #[tokio::test]
+    async fn test_handle_await_filter_recently_completed() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_completed_op(&service, "rc-1", "cargo_build").await;
+        let result = service
+            .handle_await(await_params(serde_json::json!({"tools": "cargo"})))
+            .await
+            .unwrap();
+        let text = result.content.first().unwrap().as_text().unwrap();
+        assert!(text.text.contains("recently completed"));
+    }
+
+    // ----- handle_await_timeout: direct (the 600s+ real timeout can't be
+    // awaited in a fast unit test, so exercise the handler directly). -----
+    // Covers handle_await_timeout (83-108), generate_remediation_suggestions
+    // (252-260), collect_lock_file_suggestions (262-269), and the
+    // format_timeout_error_message running-ops branch.
+    #[tokio::test]
+    async fn test_handle_await_timeout_direct() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_active_op(&service, "run-1", "git_clone").await;
+
+        let pending = vec![
+            make_op("run-1", "git_clone", OperationStatus::InProgress),
+            make_op("gone-1", "cargo_build", OperationStatus::Completed),
+        ];
+        let start = Instant::now();
+        let result = service
+            .handle_await_timeout(start, 60.0, &pending)
+            .await
+            .unwrap();
+        let text = result.content.first().unwrap().as_text().unwrap();
+        assert!(text.text.contains("timed out"));
+        // One of the two pending ops (gone-1) is no longer active -> "1/2".
+        assert!(text.text.contains("1/2"));
+        assert!(text.text.contains("run-1"));
+        // git_clone is a network keyword -> network remediation suggestion.
+        assert!(text.text.contains("Network") || text.text.contains("Suggestions"));
+    }
+
+    // ----- calculate_intelligent_timeout: filter matches an op with a long
+    // per-op timeout, so the returned timeout exceeds the 600s floor. -----
+    // Covers the filter (line 119), filter_map/map/fold chain (121-125) with a
+    // non-zero max_op_timeout.
+    #[tokio::test]
+    async fn test_calculate_intelligent_timeout_with_matching_timeout_op() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        let mut op = Operation::new(
+            "ct-1".to_string(),
+            "cargo_build".to_string(),
+            String::new(),
+            None,
+        );
+        op.state = OperationStatus::InProgress;
+        op.timeout_duration = Some(std::time::Duration::from_secs(900));
+        service.operation_monitor.add_operation(op).await;
+
+        let timeout = service
+            .calculate_intelligent_timeout(&["cargo".to_string()])
+            .await;
+        assert_eq!(timeout, 900.0);
+    }
+
+    // ----- calculate_intelligent_timeout: filter excludes the op, so the op's
+    // long timeout is ignored and the 600s floor wins. -----
+    // Covers the filter false branch (line 119 -> excluded).
+    #[tokio::test]
+    async fn test_calculate_intelligent_timeout_filter_excludes_op() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        let mut op = Operation::new(
+            "ce-1".to_string(),
+            "cargo_build".to_string(),
+            String::new(),
+            None,
+        );
+        op.state = OperationStatus::InProgress;
+        op.timeout_duration = Some(std::time::Duration::from_secs(900));
+        service.operation_monitor.add_operation(op).await;
+
+        let timeout = service
+            .calculate_intelligent_timeout(&["npm".to_string()])
+            .await;
+        assert_eq!(timeout, 600.0);
+    }
+
+    // ----- pending_operations_for_filters: matching vs non-matching ops -----
+    // Covers pending_operations_for_filters (196-205) directly, including the
+    // terminal/non-matching filter exclusions.
+    #[tokio::test]
+    async fn test_pending_operations_for_filters_direct() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_active_op(&service, "p-cargo", "cargo_build").await;
+        add_active_op(&service, "p-npm", "npm_install").await;
+
+        let only_cargo = service
+            .pending_operations_for_filters(&["cargo".to_string()])
+            .await;
+        assert_eq!(only_cargo.len(), 1);
+        assert_eq!(only_cargo[0].id, "p-cargo");
+
+        let all = service.pending_operations_for_filters(&[]).await;
+        assert_eq!(all.len(), 2);
+    }
+
+    // ----- format_already_completed_or_not_found: direct not-found path -----
+    // Covers format_already_completed_or_not_found 183-185 directly.
+    #[tokio::test]
+    async fn test_format_already_completed_or_not_found_missing() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        let result = service
+            .format_already_completed_or_not_found("nope-1")
+            .await;
+        let text = result.content.first().unwrap().as_text().unwrap();
+        assert!(text.text.contains("not found"));
+    }
+
+    // ----- spawn_progress_warnings: actually receive an emitted message -----
+    // Covers the task body (320-330): sleep -> tx.send(format!(...)).
+    #[tokio::test]
+    async fn test_spawn_progress_warnings_emits_message() {
+        // 0.04s total budget: first message fires at 0.02s (50%, factor 0.5).
+        let (handle, mut rx) = spawn_progress_warnings(0.04);
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("should not time out waiting for a progress message");
+        handle.abort();
+        let msg = msg.expect("channel should yield at least one message");
+        assert!(msg.contains("complete"));
+        assert!(msg.contains("remaining"));
+    }
 }
