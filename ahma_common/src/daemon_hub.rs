@@ -1795,4 +1795,639 @@ mod tests {
         hub.op_history.lock().await.remove("i1");
         assert!(hub.replay_events().await.is_empty());
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Added coverage tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Serializes env-var mutation across the env-dependent unit tests below.
+    static ENV_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    // ── daemon_port / default_socket_path (env-driven) ────────────────────────
+
+    #[test]
+    fn daemon_port_default_and_override() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let prev = std::env::var_os("AHMA_DAEMON_PORT");
+
+        // Valid override is honored.
+        unsafe { std::env::set_var("AHMA_DAEMON_PORT", "54321") };
+        assert_eq!(daemon_port(), 54321);
+
+        // Unparseable value falls back to the platform default.
+        unsafe { std::env::set_var("AHMA_DAEMON_PORT", "not-a-port") };
+        assert_eq!(
+            daemon_port(),
+            WINDOWS_DAEMON_PORT,
+            "invalid AHMA_DAEMON_PORT must fall back to the default"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AHMA_DAEMON_PORT", v) },
+            None => unsafe { std::env::remove_var("AHMA_DAEMON_PORT") },
+        }
+    }
+
+    #[test]
+    fn default_socket_path_returns_env_var_path() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        // A CLI override (process-wide OnceLock) takes precedence over the env
+        // var; if some other test installed one, this assertion does not apply.
+        if SOCKET_PATH_OVERRIDE.get().is_some() {
+            return;
+        }
+        let prev = std::env::var_os("AHMA_DAEMON_SOCK");
+        let want = std::env::temp_dir().join("ahma_dsp_unit_test.sock");
+        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &want) };
+
+        assert_eq!(
+            default_socket_path(),
+            want,
+            "AHMA_DAEMON_SOCK should be returned verbatim in test builds"
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AHMA_DAEMON_SOCK", v) },
+            None => unsafe { std::env::remove_var("AHMA_DAEMON_SOCK") },
+        }
+    }
+
+    // ── record_op_event eviction / no-op branches ─────────────────────────────
+
+    #[tokio::test]
+    async fn record_op_event_evicts_oldest_finished_when_over_cap() {
+        let (hub, _rx) = DaemonHub::new(None);
+
+        // Fill to the cap with fully-finished ops.
+        for i in 0..MAX_OPS_PER_INSTANCE {
+            let id = format!("op-{i}");
+            hub.record_op_event(
+                "i1",
+                &DaemonEvent::OpStarted {
+                    id: id.clone(),
+                    tool_name: "t".into(),
+                    description: "d".into(),
+                    scope: "/w".into(),
+                },
+            )
+            .await;
+            hub.record_op_event(
+                "i1",
+                &DaemonEvent::OpFinished {
+                    id,
+                    status: "Completed".into(),
+                    result_summary: None,
+                    duration_ms: 1,
+                },
+            )
+            .await;
+        }
+        assert_eq!(
+            hub.op_history.lock().await.get("i1").unwrap().len(),
+            MAX_OPS_PER_INSTANCE
+        );
+
+        // One more started op pushes over the cap → oldest finished (op-0) evicted.
+        hub.record_op_event(
+            "i1",
+            &DaemonEvent::OpStarted {
+                id: "op-new".into(),
+                tool_name: "t".into(),
+                description: "d".into(),
+                scope: "/w".into(),
+            },
+        )
+        .await;
+
+        let hist = hub.op_history.lock().await;
+        let inst = hist.get("i1").unwrap();
+        assert_eq!(
+            inst.len(),
+            MAX_OPS_PER_INSTANCE,
+            "cap maintained by eviction"
+        );
+        assert!(!inst.contains_key("op-0"), "oldest finished op is evicted");
+        assert!(
+            inst.contains_key("op-new"),
+            "the new running op is retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_op_event_keeps_all_when_none_finished_to_evict() {
+        let (hub, _rx) = DaemonHub::new(None);
+
+        // Insert cap+1 *running* ops — none are eligible for eviction, so the
+        // history is allowed to exceed the cap (running ops are never dropped).
+        for i in 0..=MAX_OPS_PER_INSTANCE {
+            hub.record_op_event(
+                "i1",
+                &DaemonEvent::OpStarted {
+                    id: format!("op-{i}"),
+                    tool_name: "t".into(),
+                    description: "d".into(),
+                    scope: "/w".into(),
+                },
+            )
+            .await;
+        }
+
+        assert_eq!(
+            hub.op_history.lock().await.get("i1").unwrap().len(),
+            MAX_OPS_PER_INSTANCE + 1,
+            "running ops are never evicted even past the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_op_finished_for_unknown_op_is_ignored() {
+        let (hub, _rx) = DaemonHub::new(None);
+
+        // OpFinished for a never-started op on an unknown instance is a no-op.
+        hub.record_op_event(
+            "i1",
+            &DaemonEvent::OpFinished {
+                id: "ghost".into(),
+                status: "Failed".into(),
+                result_summary: None,
+                duration_ms: 0,
+            },
+        )
+        .await;
+        assert!(hub.replay_events().await.is_empty());
+
+        // OpFinished for a different id than the started one leaves it running.
+        hub.record_op_event(
+            "i1",
+            &DaemonEvent::OpStarted {
+                id: "real".into(),
+                tool_name: "t".into(),
+                description: "d".into(),
+                scope: "/w".into(),
+            },
+        )
+        .await;
+        hub.record_op_event(
+            "i1",
+            &DaemonEvent::OpFinished {
+                id: "other".into(),
+                status: "Failed".into(),
+                result_summary: None,
+                duration_ms: 0,
+            },
+        )
+        .await;
+        let replay = hub.replay_events().await;
+        assert_eq!(
+            replay.len(),
+            1,
+            "only the started op replays; the mismatched finish is ignored"
+        );
+        assert!(matches!(
+            &replay[0],
+            DaemonMsg::Event {
+                payload: DaemonEvent::OpStarted { id, .. },
+                ..
+            } if id == "real"
+        ));
+    }
+
+    // ── resolve_target ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_target_prefers_explicit_then_falls_back_to_first() {
+        let (hub, _rx) = DaemonHub::new(None);
+
+        // No explicit target and no instances → None.
+        assert_eq!(resolve_target(&hub, None).await, None);
+
+        // Explicit target is returned verbatim, even with no instances registered.
+        assert_eq!(
+            resolve_target(&hub, Some("explicit")).await,
+            Some("explicit".to_string())
+        );
+
+        // No explicit target → first registered instance.
+        hub.instances.lock().await.insert(
+            "only".into(),
+            InstanceInfo {
+                id: "only".into(),
+                pid: 1,
+                mode: "stdio".into(),
+                scope: "/w".into(),
+                label: "L".into(),
+            },
+        );
+        assert_eq!(resolve_target(&hub, None).await, Some("only".to_string()));
+    }
+
+    // ── EmbeddedHub bind/None/stale/drop ──────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn embedded_hub_second_bind_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("embed.sock");
+        let _hub = try_start_hub_server_at(sock.clone())
+            .await
+            .unwrap()
+            .expect("first bind should succeed on a fresh socket");
+
+        // A second attempt finds a live server → caller should subscribe instead.
+        let again = try_start_hub_server_at(sock.clone()).await.unwrap();
+        assert!(
+            again.is_none(),
+            "second bind on a live socket must return None"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn embedded_hub_removes_stale_socket_and_binds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("stale_embed.sock");
+
+        // Leave a stale socket file with nothing listening.
+        {
+            let _l = tokio::net::UnixListener::bind(&sock).unwrap();
+        }
+        assert!(sock.exists());
+
+        let hub = try_start_hub_server_at(sock.clone()).await.unwrap();
+        assert!(
+            hub.is_some(),
+            "a stale socket should be cleaned up and bound successfully"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn embedded_hub_drop_removes_socket_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("droptest.sock");
+        let hub = try_start_hub_server_at(sock.clone())
+            .await
+            .unwrap()
+            .expect("bind");
+        assert!(sock.exists(), "socket file exists while the hub is alive");
+
+        drop(hub);
+        assert!(!sock.exists(), "socket file is removed on hub drop");
+    }
+
+    // ── serve_instance event forwarding ───────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_forwards_instance_events_to_subscriber() {
+        use crate::scope_grant::{GrantReason, ScopeGrantRequest};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("events.sock");
+        let s2 = sock.clone();
+        tokio::spawn(async move {
+            let _ = run_daemon_at(s2).await;
+        });
+        wait_for_daemon(&sock).await;
+
+        // Subscriber connects first.
+        let sub = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (sr, mut sw) = tokio::io::split(sub);
+        let mut srdr = BufReader::new(sr);
+        send_msg(&mut sw, &ClientMsg::Subscribe).await.unwrap();
+        assert!(matches!(
+            recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap(),
+            DaemonMsg::InstanceList { .. }
+        ));
+
+        // Instance registers.
+        let inst = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (_ir, mut iw) = tokio::io::split(inst);
+        send_msg(
+            &mut iw,
+            &ClientMsg::Register {
+                pid: 9,
+                mode: "stdio".into(),
+                scope: "/w".into(),
+                label: "L".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap(),
+            DaemonMsg::InstanceRegistered { .. }
+        ));
+
+        // ChatToken → ChatToken.
+        send_msg(
+            &mut iw,
+            &ClientMsg::ChatToken {
+                token: "tok".into(),
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::ChatToken { token } => assert_eq!(token, "tok"),
+            other => panic!("expected ChatToken, got {other:?}"),
+        }
+
+        // ApprovalRequested → ApprovalRequested.
+        send_msg(
+            &mut iw,
+            &ClientMsg::ApprovalRequested {
+                id: "c1".into(),
+                tool: "sh".into(),
+                args: "ls".into(),
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::ApprovalRequested { id, tool, args } => {
+                assert_eq!(id, "c1");
+                assert_eq!(tool, "sh");
+                assert_eq!(args, "ls");
+            }
+            other => panic!("expected ApprovalRequested, got {other:?}"),
+        }
+
+        // ScopeGrantRequested → ScopeGrantRequested.
+        let req = ScopeGrantRequest {
+            decision_id: "d9".into(),
+            path: std::path::PathBuf::from("/opt/x"),
+            access: crate::config::ScopeAccess::Rw,
+            reason: GrantReason::StderrHeuristic,
+            tool: Some("sccache".into()),
+        };
+        send_msg(&mut iw, &ClientMsg::ScopeGrantRequested { request: req })
+            .await
+            .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::ScopeGrantRequested { request } => {
+                assert_eq!(request.decision_id, "d9")
+            }
+            other => panic!("expected ScopeGrantRequested, got {other:?}"),
+        }
+
+        // ScopeGrantResolved → ScopeGrantDismiss.
+        send_msg(
+            &mut iw,
+            &ClientMsg::ScopeGrantResolved {
+                decision_id: "d9".into(),
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::ScopeGrantDismiss { decision_id } => assert_eq!(decision_id, "d9"),
+            other => panic!("expected ScopeGrantDismiss, got {other:?}"),
+        }
+
+        // Pong produces NO broadcast; the next AgentDone proves it was swallowed.
+        send_msg(&mut iw, &ClientMsg::Pong { seq: 5 })
+            .await
+            .unwrap();
+        send_msg(&mut iw, &ClientMsg::AgentDone).await.unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::AgentDone => {}
+            other => panic!("expected AgentDone (Pong must not broadcast), got {other:?}"),
+        }
+
+        // AgentError → AgentError.
+        send_msg(
+            &mut iw,
+            &ClientMsg::AgentError {
+                error: "boom".into(),
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::AgentError { error } => assert_eq!(error, "boom"),
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+    }
+
+    // ── handle_connection routing arms ────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_routes_tui_requests_to_instance() {
+        use crate::scope_grant::GrantDecision;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("route.sock");
+        let s2 = sock.clone();
+        tokio::spawn(async move {
+            let _ = run_daemon_at(s2).await;
+        });
+        wait_for_daemon(&sock).await;
+
+        // Instance registers and keeps its connection to receive routed messages.
+        let inst = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (ir, mut iw) = tokio::io::split(inst);
+        let mut irdr = BufReader::new(ir);
+        send_msg(
+            &mut iw,
+            &ClientMsg::Register {
+                pid: 7,
+                mode: "stdio".into(),
+                scope: "/w".into(),
+                label: "L".into(),
+            },
+        )
+        .await
+        .unwrap();
+        // Let the registration land in instance_txs before routing to it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // SubmitPrompt with no explicit target → routed (delivered) to the only instance.
+        let mut tui = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        send_msg(
+            &mut tui,
+            &ClientMsg::SubmitPrompt {
+                messages: vec![DaemonChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                system_prompt: Some("sys".into()),
+                provider: Some("p".into()),
+                model: Some("m".into()),
+                target_instance_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
+            DaemonMsg::RunPrompt {
+                messages,
+                system_prompt,
+                provider,
+                model,
+            } => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(system_prompt.as_deref(), Some("sys"));
+                assert_eq!(provider.as_deref(), Some("p"));
+                assert_eq!(model.as_deref(), Some("m"));
+            }
+            other => panic!("expected RunPrompt, got {other:?}"),
+        }
+
+        // SubmitApproval routed.
+        let mut tui2 = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        send_msg(
+            &mut tui2,
+            &ClientMsg::SubmitApproval {
+                approved: true,
+                target_instance_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
+            DaemonMsg::SubmitApproval { approved } => assert!(approved),
+            other => panic!("expected SubmitApproval, got {other:?}"),
+        }
+
+        // SubmitScopeGrant routed.
+        let mut tui3 = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        send_msg(
+            &mut tui3,
+            &ClientMsg::SubmitScopeGrant {
+                decision_id: "d1".into(),
+                decision: GrantDecision::GrantRo,
+                target_instance_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
+            DaemonMsg::SubmitScopeGrant {
+                decision_id,
+                decision,
+            } => {
+                assert_eq!(decision_id, "d1");
+                assert!(matches!(decision, GrantDecision::GrantRo));
+            }
+            other => panic!("expected SubmitScopeGrant, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_unexpected_first_message_closes_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("unexpected.sock");
+        let s2 = sock.clone();
+        tokio::spawn(async move {
+            let _ = run_daemon_at(s2).await;
+        });
+        wait_for_daemon(&sock).await;
+
+        // Pong is not a valid first/role message → server hits the `_` arm and closes.
+        let client = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (cr, mut cw) = tokio::io::split(client);
+        let mut crdr = BufReader::new(cr);
+        send_msg(&mut cw, &ClientMsg::Pong { seq: 1 })
+            .await
+            .unwrap();
+
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(2), crdr.read_line(&mut line))
+            .await
+            .expect("read should complete promptly")
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "server should close the connection after an unexpected first message"
+        );
+    }
+
+    // ── serve_subscriber replay path ──────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_replays_history_to_late_subscriber() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("replay.sock");
+        let s2 = sock.clone();
+        tokio::spawn(async move {
+            let _ = run_daemon_at(s2).await;
+        });
+        wait_for_daemon(&sock).await;
+
+        // Instance registers and runs one op to completion BEFORE any subscriber.
+        let inst = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (_ir, mut iw) = tokio::io::split(inst);
+        send_msg(
+            &mut iw,
+            &ClientMsg::Register {
+                pid: 3,
+                mode: "stdio".into(),
+                scope: "/w".into(),
+                label: "L".into(),
+            },
+        )
+        .await
+        .unwrap();
+        send_msg(
+            &mut iw,
+            &ClientMsg::Event {
+                payload: DaemonEvent::OpStarted {
+                    id: "op-A".into(),
+                    tool_name: "cargo_build".into(),
+                    description: "b".into(),
+                    scope: "/w".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        send_msg(
+            &mut iw,
+            &ClientMsg::Event {
+                payload: DaemonEvent::OpFinished {
+                    id: "op-A".into(),
+                    status: "Completed".into(),
+                    result_summary: Some("ok".into()),
+                    duration_ms: 5,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        // Allow the daemon to register the instance and record both events.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // A late subscriber must receive the instance list AND the replayed history.
+        let sub = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        let (sr, mut sw) = tokio::io::split(sub);
+        let mut srdr = BufReader::new(sr);
+        send_msg(&mut sw, &ClientMsg::Subscribe).await.unwrap();
+
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::InstanceList { instances } => assert_eq!(instances.len(), 1),
+            other => panic!("expected InstanceList, got {other:?}"),
+        }
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::Event {
+                payload: DaemonEvent::OpStarted { id, .. },
+                ..
+            } => assert_eq!(id, "op-A"),
+            other => panic!("expected replayed OpStarted, got {other:?}"),
+        }
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::Event {
+                payload: DaemonEvent::OpFinished { id, status, .. },
+                ..
+            } => {
+                assert_eq!(id, "op-A");
+                assert_eq!(status, "Completed");
+            }
+            other => panic!("expected replayed OpFinished, got {other:?}"),
+        }
+    }
 }

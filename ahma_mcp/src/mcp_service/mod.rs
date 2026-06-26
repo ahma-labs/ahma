@@ -2949,4 +2949,953 @@ mod tests {
         let info = service.get_info();
         assert_eq!(info.server_info.name, env!("CARGO_PKG_NAME"));
     }
+
+    use ahma_common::keepalive::{HeartbeatPayload, KeepAlive};
+    use std::borrow::Cow;
+    use tempfile::tempdir;
+
+    // ==================== shared helpers (new) ====================
+
+    async fn make_service_with_adapter(adapter: Arc<Adapter>) -> AhmaMcpService {
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(30),
+        )));
+        AhmaMcpService::new(
+            adapter,
+            monitor,
+            Arc::new(HashMap::new()),
+            Arc::new(None),
+            false,
+            false,
+        )
+        .await
+        .expect("service")
+    }
+
+    async fn make_service_force_sync() -> AhmaMcpService {
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(30),
+        )));
+        let adapter =
+            crate::test_utils::client::create_test_config(Path::new(".")).expect("adapter");
+        AhmaMcpService::new(
+            adapter,
+            monitor,
+            Arc::new(HashMap::new()),
+            Arc::new(None),
+            true,
+            false,
+        )
+        .await
+        .expect("service")
+    }
+
+    fn cfg_from(v: serde_json::Value) -> ToolConfig {
+        serde_json::from_value(v).expect("tool config")
+    }
+
+    fn sub_from(v: serde_json::Value) -> SubcommandConfig {
+        serde_json::from_value(v).expect("subcommand config")
+    }
+
+    fn insert_config(service: &AhmaMcpService, config: ToolConfig) {
+        service
+            .configs
+            .write()
+            .unwrap()
+            .insert(config.name.clone(), config);
+    }
+
+    fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().cloned().unwrap_or_default()
+    }
+
+    // ==================== pure static helpers ====================
+
+    #[test]
+    fn is_sync_meta_tool_for_protocol_cancel_matches_meta_tools() {
+        for name in [
+            "await",
+            "status",
+            "cancel",
+            "logs_list",
+            "logs_approve",
+            "logs_read",
+            "logs_search",
+            "restart",
+        ] {
+            assert!(
+                AhmaMcpService::is_sync_meta_tool_for_protocol_cancel(name),
+                "{name} should be a sync/meta tool"
+            );
+        }
+        assert!(!AhmaMcpService::is_sync_meta_tool_for_protocol_cancel(
+            "run_terminal_command"
+        ));
+        assert!(!AhmaMcpService::is_sync_meta_tool_for_protocol_cancel(
+            "cargo_build"
+        ));
+    }
+
+    #[test]
+    fn summarize_arguments_serializes_map() {
+        let empty = serde_json::Map::new();
+        assert_eq!(AhmaMcpService::summarize_arguments(&empty), "{}");
+
+        let args = obj(json!({"a": 1}));
+        assert_eq!(AhmaMcpService::summarize_arguments(&args), "{\"a\":1}");
+    }
+
+    #[test]
+    fn sync_tool_progress_description_formats_command_and_dir() {
+        let s = AhmaMcpService::sync_tool_progress_description("cargo", "/work");
+        assert_eq!(s, "Execute cargo in /work");
+    }
+
+    #[test]
+    fn flattened_subcommand_description_falls_back_to_tool_description() {
+        let cfg = cfg_from(json!({
+            "name": "t", "description": "TOOLDESC", "command": "c"
+        }));
+        let empty_sub = sub_from(json!({"name": "x", "description": ""}));
+        assert_eq!(
+            AhmaMcpService::flattened_subcommand_description(&cfg, &empty_sub),
+            "TOOLDESC"
+        );
+
+        let described_sub = sub_from(json!({"name": "x", "description": "SUBDESC"}));
+        assert_eq!(
+            AhmaMcpService::flattened_subcommand_description(&cfg, &described_sub),
+            "SUBDESC"
+        );
+    }
+
+    #[test]
+    fn leaf_subcommands_and_creates_single_tool() {
+        // No subcommands -> empty leaves -> single tool.
+        let single = cfg_from(json!({"name": "s", "description": "d", "command": "c"}));
+        let leaves = AhmaMcpService::leaf_subcommands(&single);
+        assert!(leaves.is_empty());
+        assert!(AhmaMcpService::creates_single_tool(&leaves));
+
+        // A lone "default" subcommand -> still a single tool.
+        let default_only = cfg_from(json!({
+            "name": "s", "description": "d", "command": "c",
+            "subcommand": [{"name": "default", "description": "d"}]
+        }));
+        let leaves = AhmaMcpService::leaf_subcommands(&default_only);
+        assert_eq!(leaves.len(), 1);
+        assert!(AhmaMcpService::creates_single_tool(&leaves));
+
+        // Multiple named subcommands -> NOT a single tool.
+        let multi = cfg_from(json!({
+            "name": "s", "description": "d", "command": "c",
+            "subcommand": [
+                {"name": "hello", "description": "h"},
+                {"name": "world", "description": "w"}
+            ]
+        }));
+        let leaves = AhmaMcpService::leaf_subcommands(&multi);
+        assert_eq!(leaves.len(), 2);
+        assert!(!AhmaMcpService::creates_single_tool(&leaves));
+    }
+
+    #[test]
+    fn subcommand_not_found_error_reports_available_subcommands() {
+        let cfg = cfg_from(json!({
+            "name": "mytool", "description": "d", "command": "c",
+            "subcommand": [{"name": "build", "description": "b"}]
+        }));
+        let err =
+            AhmaMcpService::subcommand_not_found_error("mytool", &cfg, Some("nope".to_string()));
+        let dbg = format!("{err:?}");
+        assert!(dbg.contains("not found or invalid"), "got: {dbg}");
+        assert!(dbg.contains("mytool"));
+        assert!(dbg.contains("build (enabled=true)"));
+    }
+
+    // ==================== tool building / descriptions ====================
+
+    #[tokio::test]
+    async fn create_tools_from_config_flattens_multiple_subcommands() {
+        let service = make_service().await;
+        let cfg = cfg_from(json!({
+            "name": "mytool", "description": "d", "command": "echo",
+            "subcommand": [
+                {"name": "hello", "description": "h"},
+                {"name": "world", "description": "w"}
+            ]
+        }));
+        let tools = service.create_tools_from_config(&cfg);
+        let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"mytool_hello".to_string()));
+        assert!(names.contains(&"mytool_world".to_string()));
+    }
+
+    #[tokio::test]
+    async fn build_single_and_flattened_tool_names() {
+        let service = make_service().await;
+        let cfg = cfg_from(json!({
+            "name": "mytool", "description": "d", "command": "echo",
+            "subcommand": [{"name": "hello", "description": "h"}]
+        }));
+        let single = service.build_single_tool_from_config(&cfg);
+        assert_eq!(&*single.name, "mytool");
+
+        let sub = &cfg.subcommand.as_ref().unwrap()[0];
+        let flat = service.build_flattened_tool_from_config(&cfg, "hello", sub);
+        assert_eq!(&*flat.name, "mytool_hello");
+    }
+
+    #[tokio::test]
+    async fn tool_description_prepends_guidance_by_key_override() {
+        let mut guidance_blocks = std::collections::HashMap::new();
+        guidance_blocks.insert("gk".to_string(), "GUIDE".to_string());
+        let guidance = GuidanceConfig {
+            guidance_blocks,
+            templates: std::collections::HashMap::new(),
+            legacy_guidance: None,
+        };
+        let service = make_service_with_monitor(
+            Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+                Duration::from_secs(30),
+            ))),
+            Arc::new(Some(guidance)),
+        )
+        .await;
+
+        let cfg = cfg_from(json!({
+            "name": "mytool", "description": "DESC", "command": "echo",
+            "guidance_key": "gk"
+        }));
+        // guidance_key overrides the supplied key, so even a bogus key resolves "gk".
+        let d = service.tool_description(&cfg, "unused_key");
+        assert_eq!(d, "GUIDE\n\nDESC");
+
+        let dt = service.tool_description_text(&cfg, "unused_key", "BASE");
+        assert_eq!(dt, "GUIDE\n\nBASE");
+    }
+
+    #[tokio::test]
+    async fn tool_description_without_guidance_returns_base() {
+        let service = make_service().await;
+        let cfg = cfg_from(json!({"name": "t", "description": "DESC", "command": "c"}));
+        assert_eq!(service.tool_description(&cfg, "t"), "DESC");
+        assert_eq!(service.tool_description_text(&cfg, "t", "BASE"), "BASE");
+    }
+
+    // ==================== config visibility / resolution ====================
+
+    #[tokio::test]
+    async fn is_config_visible_to_client_filters_hardcoded_and_disabled() {
+        let service = make_service().await;
+
+        let hardcoded = cfg_from(json!({"name": "await", "description": "d", "command": "c"}));
+        assert!(!service.is_config_visible_to_client(&hardcoded));
+
+        let disabled = cfg_from(json!({
+            "name": "dt", "description": "d", "command": "c", "enabled": false
+        }));
+        assert!(!service.is_config_visible_to_client(&disabled));
+
+        let normal = cfg_from(json!({"name": "ok", "description": "d", "command": "c"}));
+        assert!(service.is_config_visible_to_client(&normal));
+    }
+
+    #[tokio::test]
+    async fn find_tool_config_direct_flattened_and_missing() {
+        let service = make_service().await;
+        insert_config(
+            &service,
+            cfg_from(json!({"name": "mytool", "description": "d", "command": "echo"})),
+        );
+        insert_config(
+            &service,
+            cfg_from(json!({
+                "name": "file-tools", "description": "d", "command": "ls",
+                "subcommand": [{"name": "hello", "description": "h"}]
+            })),
+        );
+
+        let (cfg, sub) = service.find_tool_config("mytool").expect("direct");
+        assert_eq!(cfg.name, "mytool");
+        assert!(sub.is_none());
+
+        let (cfg, sub) = service.find_tool_config("file-tools_hello").expect("flat");
+        assert_eq!(cfg.name, "file-tools");
+        assert_eq!(sub.as_deref(), Some("hello"));
+
+        assert!(service.find_tool_config("does_not_exist").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_configured_tool_not_found_and_disabled() {
+        let service = make_service().await;
+
+        let err = service.resolve_configured_tool("ghost").unwrap_err();
+        assert!(format!("{err:?}").contains("not found"));
+
+        insert_config(
+            &service,
+            cfg_from(json!({
+                "name": "dt", "description": "d", "command": "c", "enabled": false
+            })),
+        );
+        let err = service.resolve_configured_tool("dt").unwrap_err();
+        assert!(format!("{err:?}").contains("availability probe failed"));
+
+        insert_config(
+            &service,
+            cfg_from(json!({"name": "ok", "description": "d", "command": "c"})),
+        );
+        let (cfg, _) = service.resolve_configured_tool("ok").expect("ok");
+        assert_eq!(cfg.name, "ok");
+    }
+
+    // ==================== execution mode ====================
+
+    #[tokio::test]
+    async fn determine_execution_mode_variants() {
+        use crate::adapter::ExecutionMode;
+        let service = make_service().await;
+        let cfg = cfg_from(json!({"name": "t", "description": "d", "command": "c"}));
+        let sub = sub_from(json!({"name": "default", "description": "d"}));
+
+        // Default -> async.
+        assert_eq!(
+            service.determine_execution_mode(&sub, &cfg, &serde_json::Map::new()),
+            ExecutionMode::AsyncResultPush
+        );
+        // Dynamic blocking arg -> sync.
+        assert_eq!(
+            service.determine_execution_mode(&sub, &cfg, &obj(json!({"blocking": true}))),
+            ExecutionMode::Synchronous
+        );
+        // Explicit execution_mode string -> sync.
+        assert_eq!(
+            service.determine_execution_mode(
+                &sub,
+                &cfg,
+                &obj(json!({"execution_mode": "Synchronous"}))
+            ),
+            ExecutionMode::Synchronous
+        );
+
+        // Subcommand-level synchronous override true / false.
+        let sync_sub =
+            sub_from(json!({"name": "default", "description": "d", "synchronous": true}));
+        assert_eq!(
+            service.determine_execution_mode(&sync_sub, &cfg, &serde_json::Map::new()),
+            ExecutionMode::Synchronous
+        );
+        let async_sub =
+            sub_from(json!({"name": "default", "description": "d", "synchronous": false}));
+        assert_eq!(
+            service.determine_execution_mode(&async_sub, &cfg, &serde_json::Map::new()),
+            ExecutionMode::AsyncResultPush
+        );
+    }
+
+    #[tokio::test]
+    async fn determine_execution_mode_force_synchronous_service() {
+        use crate::adapter::ExecutionMode;
+        let service = make_service_force_sync().await;
+        let cfg = cfg_from(json!({"name": "t", "description": "d", "command": "c"}));
+        let sub = sub_from(json!({"name": "default", "description": "d"}));
+        assert_eq!(
+            service.determine_execution_mode(&sub, &cfg, &serde_json::Map::new()),
+            ExecutionMode::Synchronous
+        );
+    }
+
+    // ==================== subcommand resolution ====================
+
+    #[tokio::test]
+    async fn resolve_subcommand_default_explicit_and_missing() {
+        let service = make_service().await;
+        let cfg = cfg_from(json!({
+            "name": "mytool", "description": "d", "command": "echo",
+            "subcommand": [
+                {"name": "default", "description": "dd"},
+                {"name": "build", "description": "b"}
+            ]
+        }));
+
+        // No subcommand argument -> "default".
+        let mut args = serde_json::Map::new();
+        let (sub, _parts) = service
+            .resolve_subcommand(&cfg, "mytool", &mut args, None)
+            .expect("default");
+        assert_eq!(sub.name, "default");
+
+        // "subcommand" arg is consumed and resolved.
+        let mut args = obj(json!({"subcommand": "build"}));
+        let (sub, _parts) = service
+            .resolve_subcommand(&cfg, "mytool", &mut args, None)
+            .expect("build");
+        assert_eq!(sub.name, "build");
+        assert!(!args.contains_key("subcommand"), "subcommand key consumed");
+
+        // Unknown flattened subcommand -> error.
+        let mut args = serde_json::Map::new();
+        let err = service
+            .resolve_subcommand(&cfg, "mytool", &mut args, Some("nope".to_string()))
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("not found or invalid"));
+    }
+
+    // ==================== working directory / sandbox guards ====================
+
+    #[tokio::test]
+    async fn resolve_working_directory_explicit_and_scope() {
+        let service = make_service().await;
+
+        let explicit = obj(json!({"working_directory": "/explicit/path"}));
+        assert_eq!(
+            service.resolve_working_directory(&explicit),
+            "/explicit/path"
+        );
+
+        // No arg -> first sandbox scope (strict test adapter has one rooted scope).
+        let wd = service.resolve_working_directory(&serde_json::Map::new());
+        let scope = service
+            .adapter
+            .sandbox()
+            .scopes()
+            .first()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap();
+        assert_eq!(wd, scope);
+    }
+
+    #[tokio::test]
+    async fn guard_and_skip_roots_defaults() {
+        let service = make_service().await;
+        // Strict test adapter has a rooted scope -> ready.
+        assert!(service.guard_sandbox_ready_for_tool_calls().is_ok());
+        // Not explicit, not test mode -> we still ask the client for roots.
+        assert!(!service.should_skip_client_roots_sandbox_setup());
+    }
+
+    // ==================== extension key / registration ====================
+
+    #[tokio::test]
+    async fn get_extension_key_for_builtin_extension_types() {
+        let service = make_service().await;
+
+        let plain = cfg_from(json!({"name": "t", "description": "d", "command": "c"}));
+        assert_eq!(service.get_extension_key(&plain), None);
+
+        let tt = cfg_from(json!({
+            "name": "t", "description": "d", "command": "c",
+            "tool_type": "ext", "task_tree": {}
+        }));
+        assert_eq!(service.get_extension_key(&tt).as_deref(), Some("task_tree"));
+
+        let dc = cfg_from(json!({
+            "name": "t", "description": "d", "command": "c",
+            "tool_type": "ext", "decompose": {}
+        }));
+        assert_eq!(service.get_extension_key(&dc).as_deref(), Some("decompose"));
+
+        let wk = cfg_from(json!({
+            "name": "t", "description": "d", "command": "c",
+            "tool_type": "ext", "worker": {}
+        }));
+        assert_eq!(service.get_extension_key(&wk).as_deref(), Some("worker"));
+    }
+
+    struct DummyExtHandler;
+    #[async_trait::async_trait]
+    impl ExtensionToolHandler for DummyExtHandler {
+        async fn call(
+            &self,
+            _params: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+            _config: ToolConfig,
+            _adapter: Arc<crate::adapter::Adapter>,
+            _operation_monitor: Arc<crate::operation_monitor::OperationMonitor>,
+        ) -> Result<CallToolResult, McpError> {
+            Ok(handlers::common::text_result("dummy"))
+        }
+    }
+
+    #[tokio::test]
+    async fn register_extension_handler_enables_custom_key_lookup() {
+        let service = make_service().await;
+        service.register_extension_handler("myext".to_string(), Arc::new(DummyExtHandler));
+
+        // Extension config whose extra map carries the registered key.
+        let cfg = cfg_from(json!({
+            "name": "x", "description": "d", "command": "c",
+            "tool_type": "customext", "myext": {"foo": 1}
+        }));
+        assert_eq!(service.get_extension_key(&cfg).as_deref(), Some("myext"));
+    }
+
+    // ==================== llm provider resolution ====================
+
+    #[tokio::test]
+    async fn parse_llm_provider_uses_explicit_args_when_complete() {
+        let service = make_service().await;
+        let args = obj(json!({
+            "llm_base_url": "http://x/v1", "llm_model": "m", "llm_api_key": "secret"
+        }));
+        let p = service.parse_llm_provider(&args);
+        assert_eq!(p.base_url, "http://x/v1");
+        assert_eq!(p.model, "m");
+        assert_eq!(p.api_key.as_deref(), Some("secret"));
+    }
+
+    #[tokio::test]
+    async fn parse_llm_provider_falls_back_when_incomplete() {
+        let service = make_service().await;
+        // base_url present but model missing -> fallback (no livelog configs -> default).
+        let args = obj(json!({"llm_base_url": "http://x/v1"}));
+        let p = service.parse_llm_provider(&args);
+        assert_eq!(p.base_url, "http://localhost:11434/v1");
+        assert_eq!(p.model, "llama3.2");
+        assert!(p.api_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn fallback_llm_provider_prefers_livelog_config() {
+        let service = make_service().await;
+        insert_config(
+            &service,
+            cfg_from(json!({
+                "name": "l", "description": "d", "command": "x",
+                "tool_type": "livelog",
+                "livelog": {
+                    "source_command": "tail",
+                    "detection_prompt": "p",
+                    "llm_provider": {"base_url": "http://found/v1", "model": "foundmodel"}
+                }
+            })),
+        );
+        let p = service.fallback_llm_provider();
+        assert_eq!(p.base_url, "http://found/v1");
+        assert_eq!(p.model, "foundmodel");
+    }
+
+    // ==================== tool listing ====================
+
+    #[tokio::test]
+    async fn list_tool_names_includes_visible_excludes_hidden() {
+        let service = make_service().await;
+        insert_config(
+            &service,
+            cfg_from(json!({"name": "mytool", "description": "d", "command": "c"})),
+        );
+        insert_config(
+            &service,
+            cfg_from(json!({
+                "name": "dt", "description": "d", "command": "c", "enabled": false
+            })),
+        );
+        insert_config(
+            &service,
+            cfg_from(json!({"name": "await", "description": "d", "command": "c"})),
+        );
+
+        let names = service.list_tool_names();
+        assert!(names.contains(&"status".to_string()));
+        assert!(names.contains(&"run_terminal_command".to_string()));
+        assert!(names.contains(&"mytool".to_string()));
+        assert!(!names.contains(&"dt".to_string()));
+        // "await" appears only as the hard-wired builtin, not via the config.
+        assert_eq!(names.iter().filter(|n| *n == "await").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_all_available_tools_lists_builtins_and_configs() {
+        let service = make_service().await;
+        insert_config(
+            &service,
+            cfg_from(json!({"name": "mytool", "description": "d", "command": "c"})),
+        );
+
+        let tools = service.get_all_available_tools().await;
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        for expected in [
+            "await",
+            "status",
+            "run_terminal_command",
+            "logs_list",
+            "read_file",
+            "log_monitor",
+            "mytool",
+        ] {
+            assert!(names.contains(&expected), "missing tool: {expected}");
+        }
+    }
+
+    // ==================== vault audit append helpers ====================
+
+    #[tokio::test]
+    async fn append_audit_line_creates_parents_and_appends() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested").join("audit.jsonl");
+
+        AhmaMcpService::append_audit_line(&path, json!({"k": "v"}))
+            .await
+            .unwrap();
+        AhmaMcpService::append_audit_line(&path, json!({"k": "v2"}))
+            .await
+            .unwrap();
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"k\":\"v\""));
+        assert!(lines[1].contains("\"k\":\"v2\""));
+    }
+
+    #[tokio::test]
+    async fn append_tool_call_and_complete_events() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        AhmaMcpService::append_tool_call_event(&path, "op1", "mytool", "argsum")
+            .await
+            .unwrap();
+        AhmaMcpService::append_tool_complete_event(&path, "op1", true, 42)
+            .await
+            .unwrap();
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(content.contains("\"type\":\"tool_call\""));
+        assert!(content.contains("\"operation_id\":\"op1\""));
+        assert!(content.contains("\"tool_name\":\"mytool\""));
+        assert!(content.contains("\"type\":\"tool_complete\""));
+        assert!(content.contains("\"success\":true"));
+        assert!(content.contains("\"duration_ms\":42"));
+    }
+
+    // ==================== vault emit (task_vault wired via AppConfig) ====================
+
+    fn app_config_with_vault(vault: std::path::PathBuf) -> crate::shell::cli::AppConfig {
+        crate::shell::cli::AppConfig {
+            task_vault: Some(vault),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn task_vault_paths_none_by_default() {
+        let service = make_service().await;
+        assert!(service.task_vault_root().is_none());
+        assert!(service.task_vault_audit_log_path().is_none());
+        assert!(service.task_vault_trash_dir().is_none());
+    }
+
+    #[tokio::test]
+    async fn task_vault_paths_from_app_config() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let service = make_service().await;
+        service.set_app_config(Arc::new(app_config_with_vault(vault.clone())));
+
+        assert_eq!(service.task_vault_root(), Some(vault.clone()));
+        assert_eq!(
+            service.task_vault_audit_log_path(),
+            Some(vault.join("audit.jsonl"))
+        );
+        assert_eq!(service.task_vault_trash_dir(), Some(vault.join("trash")));
+    }
+
+    #[tokio::test]
+    async fn task_vault_root_derived_from_workdir_scope() {
+        let dir = tempdir().unwrap();
+        let workdir = dir.path().join("workdir");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let adapter = crate::test_utils::client::create_test_config(&workdir).expect("adapter");
+        let service = make_service_with_adapter(adapter).await;
+
+        let root = service.task_vault_root().expect("root from workdir");
+        let scope = service.adapter.sandbox().scopes().first().unwrap().clone();
+        assert_eq!(Some(root.as_path()), scope.parent());
+    }
+
+    #[tokio::test]
+    async fn emit_vault_tool_call_is_noop_without_vault() {
+        let service = make_service().await;
+        service.emit_vault_tool_call("op1", "tool", "args").await;
+        assert!(service.vault_audited_ops.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn emit_vault_tool_call_then_complete_writes_audit_and_tracks_ops() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let service = make_service().await;
+        service.set_app_config(Arc::new(app_config_with_vault(vault.clone())));
+
+        service.emit_vault_tool_call("op1", "tool", "argsum").await;
+        assert!(service.vault_audited_ops.lock().unwrap().contains("op1"));
+
+        service.emit_vault_tool_complete("op1", true, 10).await;
+        assert!(!service.vault_audited_ops.lock().unwrap().contains("op1"));
+
+        let content = tokio::fs::read_to_string(vault.join("audit.jsonl"))
+            .await
+            .unwrap();
+        assert!(content.contains("\"type\":\"tool_call\""));
+        assert!(content.contains("\"type\":\"tool_complete\""));
+    }
+
+    #[tokio::test]
+    async fn emit_vault_file_staged_writes_event() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let service = make_service().await;
+        service.set_app_config(Arc::new(app_config_with_vault(vault.clone())));
+
+        service
+            .emit_vault_file_staged("/orig/path", "/trash/path")
+            .await;
+
+        let content = tokio::fs::read_to_string(vault.join("audit.jsonl"))
+            .await
+            .unwrap();
+        assert!(content.contains("\"type\":\"file_staged\""));
+        assert!(content.contains("/orig/path"));
+        assert!(content.contains("/trash/path"));
+    }
+
+    // ==================== rm staging interception ====================
+
+    #[tokio::test]
+    async fn maybe_stage_configured_delete_skips_non_rm() {
+        let service = make_service().await;
+        let args = obj(json!({"path": "x"}));
+        let r = service
+            .maybe_stage_configured_delete("ls", ".", &args)
+            .await
+            .unwrap();
+        assert!(r.is_none());
+    }
+
+    #[tokio::test]
+    async fn maybe_stage_configured_delete_noop_without_vault() {
+        let service = make_service().await;
+        let args = obj(json!({"path": "x"}));
+        let r = service
+            .maybe_stage_configured_delete("rm", ".", &args)
+            .await
+            .unwrap();
+        assert!(r.is_none());
+    }
+
+    #[tokio::test]
+    async fn maybe_stage_configured_delete_empty_targets_returns_none() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let service = make_service().await;
+        service.set_app_config(Arc::new(app_config_with_vault(vault)));
+
+        // Only a meta argument -> no deletion targets.
+        let args = obj(json!({"timeout_seconds": 5}));
+        let r = service
+            .maybe_stage_configured_delete("rm", ".", &args)
+            .await
+            .unwrap();
+        assert!(r.is_none());
+    }
+
+    #[tokio::test]
+    async fn maybe_stage_configured_delete_moves_file_into_trash() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let victim = workdir.join("victim.txt");
+        std::fs::write(&victim, b"data").unwrap();
+
+        let service = make_service().await;
+        service.set_app_config(Arc::new(app_config_with_vault(vault.clone())));
+
+        let args = obj(json!({"victim": "victim.txt"}));
+        let result = service
+            .maybe_stage_configured_delete("rm", workdir.to_str().unwrap(), &args)
+            .await
+            .unwrap()
+            .expect("staged result");
+        assert!(first_text(&result).contains("Staged 1 path"));
+        assert!(
+            !victim.exists(),
+            "victim should be moved out of working dir"
+        );
+        assert!(vault.join("trash").exists());
+    }
+
+    // ==================== set_app_config side effects ====================
+
+    #[tokio::test]
+    async fn set_app_config_propagates_flags_and_tools_dir() {
+        let dir = tempdir().unwrap();
+        let tools_dir = dir.path().join("tools");
+        let service = make_service().await;
+
+        let cfg = crate::shell::cli::AppConfig {
+            tools_dir: Some(tools_dir.clone()),
+            minimize_tokens: true,
+            small_model_harness: true,
+            ..Default::default()
+        };
+        service.set_app_config(Arc::new(cfg));
+
+        assert_eq!(*service.current_tools_dir.read().unwrap(), Some(tools_dir));
+        assert!(service.output_optimizer.lock().await.enabled);
+        assert!(service.harness_guard.lock().await.enabled);
+    }
+
+    // ==================== cancel most-recent background op ====================
+
+    #[tokio::test]
+    async fn cancel_most_recent_background_op_empty_is_noop() {
+        let service = make_service().await;
+        // No panic, nothing to cancel.
+        service
+            .cancel_most_recent_background_op(&[], "req", "reason")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn cancel_most_recent_background_op_cancels_latest() {
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(30),
+        )));
+        let service = make_service_with_monitor(monitor.clone(), Arc::new(None)).await;
+
+        let mut op = Operation::new(
+            "bg1".to_string(),
+            "cargo_build".to_string(),
+            "d".to_string(),
+            None,
+        );
+        op.state = OperationStatus::InProgress;
+        monitor.add_operation(op).await;
+
+        let active = monitor.get_all_active_operations().await;
+        let refs: Vec<&Operation> = active.iter().collect();
+        service
+            .cancel_most_recent_background_op(&refs, "req1", "user-stop")
+            .await;
+
+        // Cancellation removes the op from the active map and moves it to history.
+        assert!(
+            monitor.get_operation("bg1").await.is_none(),
+            "cancelled op is no longer active"
+        );
+        let completed = monitor.get_completed_operations().await;
+        let op = completed
+            .iter()
+            .find(|o| o.id == "bg1")
+            .expect("cancelled op moved to completion history");
+        assert_eq!(op.state, OperationStatus::Cancelled);
+    }
+
+    // ==================== harness guard preprocessing ====================
+
+    #[tokio::test]
+    async fn harness_guard_preprocess_passthrough_returns_none() {
+        let service = make_service().await;
+        let mut name: Cow<'static, str> = Cow::Owned("status".to_string());
+        let mut args: Option<serde_json::Map<String, Value>> = None;
+        assert!(
+            service
+                .harness_guard_preprocess(&mut name, &mut args)
+                .is_none()
+        );
+        assert_eq!(&*name, "status");
+    }
+
+    #[tokio::test]
+    async fn harness_guard_preprocess_heals_name_and_args() {
+        let service = make_service().await;
+        insert_config(
+            &service,
+            cfg_from(json!({"name": "mytool", "description": "d", "command": "c"})),
+        );
+
+        // Typo within edit distance 2 of a hard-coded tool.
+        let mut name: Cow<'static, str> = Cow::Owned("run_terminal_commnd".to_string());
+        let mut args = Some(obj(json!({"args": "echo hi"})));
+        let early = service.harness_guard_preprocess(&mut name, &mut args);
+        assert!(early.is_none());
+        assert_eq!(&*name, "run_terminal_command");
+        // String "args" healed into a singleton array.
+        assert_eq!(args.unwrap().get("args").unwrap(), &json!(["echo hi"]));
+    }
+
+    #[tokio::test]
+    async fn harness_guard_preprocess_detects_loop() {
+        let service = make_service().await;
+        {
+            let mut g = service.harness_guard.lock().await;
+            g.loop_detector.record_failure("status", "");
+            g.loop_detector.record_failure("status", "");
+            g.loop_detector.record_failure("status", "");
+        }
+        let mut name: Cow<'static, str> = Cow::Owned("status".to_string());
+        let mut args: Option<serde_json::Map<String, Value>> = None;
+        let early = service
+            .harness_guard_preprocess(&mut name, &mut args)
+            .expect("loop detected");
+        assert!(first_text(&early).contains("LOOP_DETECTED"));
+        assert_eq!(early.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn record_result_in_loop_detector_tracks_failures() {
+        let service = make_service().await;
+        let args = Some(obj(json!({"x": 1})));
+        let args_str = serde_json::Value::Object(args.clone().unwrap()).to_string();
+
+        let err_result: Result<CallToolResult, McpError> =
+            Ok(CallToolResult::error(vec![rmcp::model::Content::text(
+                "boom",
+            )]));
+        for _ in 0..3 {
+            service.record_result_in_loop_detector("mytool", &args, &err_result);
+        }
+        {
+            let g = service.harness_guard.lock().await;
+            assert!(g.loop_detector.is_loop("mytool", &args_str));
+        }
+
+        // A success clears the detector.
+        let ok_result: Result<CallToolResult, McpError> = Ok(handlers::common::text_result("done"));
+        service.record_result_in_loop_detector("mytool", &args, &ok_result);
+        {
+            let g = service.harness_guard.lock().await;
+            assert!(!g.loop_detector.is_loop("mytool", &args_str));
+        }
+    }
+
+    // ==================== KeepAlive trait impl ====================
+
+    #[tokio::test]
+    async fn keepalive_basic_accessors() {
+        let service = make_service().await;
+        assert!(!service.is_ahma_peer());
+        assert_eq!(service.heartbeat_timeout().as_secs(), 60);
+        // last_received_signal was set at construction -> small elapsed time.
+        assert!(service.time_since_last_received() < Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn keepalive_send_without_peer_is_ok() {
+        let service = make_service().await;
+        // No peer captured yet -> both sends are graceful no-ops.
+        assert!(service.send_standard_ping().await.is_ok());
+        let payload = HeartbeatPayload {
+            version: "0.0.0".to_string(),
+            hash: "abc".to_string(),
+            timestamp: 1,
+        };
+        assert!(service.send_enhanced_heartbeat(payload).await.is_ok());
+    }
 }

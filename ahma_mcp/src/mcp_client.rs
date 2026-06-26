@@ -1194,4 +1194,170 @@ mod tests {
             "Debug must redact live stdio clients"
         );
     }
+
+    // ── refresh_tools (clear / enabled-filter / fetch-failure branches) ──────
+
+    #[tokio::test]
+    async fn refresh_tools_clears_and_skips_disabled() {
+        // A disabled server must be skipped by the `.filter(|s| s.enabled)`,
+        // and any previously-cached tools must be cleared first. Because the
+        // only server is disabled, no fetch (and thus no network) happens.
+        let mut mgr = McpConnectionManager::default();
+        mgr.add_server(McpServerConfig {
+            name: "off".to_string(),
+            enabled: false,
+            kind: McpServerKind::Http {
+                url: "http://127.0.0.1:1".to_string(),
+            },
+        });
+        // Pre-populate stale tools that refresh must wipe.
+        mgr.tools_by_server.insert(
+            "stale".to_string(),
+            vec![ToolInfo {
+                name: "old".to_string(),
+                description: None,
+                input_schema: serde_json::json!({}),
+            }],
+        );
+
+        mgr.refresh_tools().await;
+
+        assert!(
+            mgr.tools_by_server.is_empty(),
+            "refresh_tools must clear stale tools and skip disabled servers"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_tools_drops_unreachable_server() {
+        // An *enabled* server whose endpoint is unreachable makes
+        // fetch_server_tools return Err, so the `if let Ok(..)` arm is skipped
+        // and the server contributes no tools. Port 1 on loopback is refused
+        // immediately (fast, deterministic, no real network dependency).
+        let mut mgr = McpConnectionManager::default();
+        mgr.add_server(McpServerConfig {
+            name: "dead".to_string(),
+            enabled: true,
+            kind: McpServerKind::Http {
+                url: "http://127.0.0.1:1".to_string(),
+            },
+        });
+
+        mgr.refresh_tools().await;
+
+        assert!(
+            !mgr.tools_by_server.contains_key("dead"),
+            "an unreachable server must not register any tools"
+        );
+        assert!(
+            mgr.tools_by_server.is_empty(),
+            "no tools should be aggregated when every fetch fails"
+        );
+    }
+
+    // ── call_tool dispatch arms (error paths, no live server) ────────────────
+
+    #[tokio::test]
+    async fn call_tool_http_unreachable_errors() {
+        // Exercises the McpServerKind::Http dispatch arm -> call_mcp_tool_http
+        // -> initialize_mcp_session, which fails to connect on a dead port.
+        let mut mgr = McpConnectionManager::default();
+        mgr.add_server(McpServerConfig {
+            name: "h".to_string(),
+            enabled: true,
+            kind: McpServerKind::Http {
+                url: "http://127.0.0.1:1".to_string(),
+            },
+        });
+
+        let err = mgr
+            .call_tool("h::do", serde_json::json!({}))
+            .await
+            .expect_err("call against an unreachable HTTP server must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("initialize"),
+            "HTTP failure should surface the initialize-request context, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_stdio_missing_command_errors() {
+        // Exercises the McpServerKind::Stdio dispatch arm ->
+        // get_or_spawn_stdio_client, whose process spawn fails for a binary
+        // that does not exist on PATH.
+        let mut mgr = McpConnectionManager::default();
+        mgr.add_server(McpServerConfig {
+            name: "s".to_string(),
+            enabled: true,
+            kind: McpServerKind::Stdio {
+                command: "ahma_definitely_missing_binary_xyz".to_string(),
+                args: vec!["serve".to_string()],
+            },
+        });
+
+        let err = mgr
+            .call_tool("s::do", serde_json::json!({"k": "v"}))
+            .await
+            .expect_err("spawning a nonexistent stdio command must error");
+        assert!(
+            !format!("{err}").is_empty(),
+            "spawn failure must produce a non-empty error message"
+        );
+    }
+
+    // ── is_self_ahma_serve current-executable-stem branch ────────────────────
+
+    #[test]
+    fn is_self_ahma_serve_matches_current_executable() {
+        // Referencing the *currently running* binary by its full path, with a
+        // `serve` argument, must be recognized as a self-reference — covering
+        // the current_exe() stem comparison branch (and, if the test binary is
+        // literally named "ahma", the bare-name branch). Either way: true.
+        let exe = std::env::current_exe().expect("current_exe available in tests");
+        let cmd = exe.to_string_lossy().to_string();
+
+        assert!(
+            is_self_ahma_serve(&cmd, &["serve".to_string()]),
+            "the running binary invoked with `serve` must be detected as self"
+        );
+        // Without a `serve` arg it is not a self-serve invocation.
+        assert!(
+            !is_self_ahma_serve(&cmd, &["--version".to_string()]),
+            "no `serve` argument means it cannot self-recurse"
+        );
+    }
+
+    // ── save: existing .ahma directory branch ────────────────────────────────
+
+    #[test]
+    fn save_twice_reuses_existing_ahma_dir() {
+        // First save creates `.ahma`; second save hits the `dir.exists()` ==
+        // true branch (no create_dir_all). Both must succeed and the file must
+        // remain present and parseable.
+        let cwd = tempfile::tempdir().unwrap();
+        let mut mgr = McpConnectionManager::default();
+        mgr.add_server(McpServerConfig {
+            name: "persist".to_string(),
+            enabled: true,
+            kind: McpServerKind::Http {
+                url: "http://localhost:9".to_string(),
+            },
+        });
+
+        mgr.save(cwd.path()).expect("first save creates .ahma");
+        mgr.save(cwd.path())
+            .expect("second save reuses existing .ahma");
+
+        let path = cwd.path().join(".ahma").join("mcp-clients.toml");
+        assert!(
+            path.exists(),
+            "config file must persist after repeated saves"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("persist"),
+            "saved config must contain the registered server name"
+        );
+    }
 }

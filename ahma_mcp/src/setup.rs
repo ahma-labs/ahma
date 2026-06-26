@@ -1606,4 +1606,174 @@ mod tests {
         // Empty configured list returns early even when interactive.
         print_mcp_restart_hints(true, &[], "http");
     }
+
+    // ─── env seam helper (AHMA_TEST_HOME redirects ahma_home_dir in debug) ─────
+
+    use std::sync::{LazyLock, Mutex};
+
+    static SETUP_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Run `f` with `AHMA_TEST_HOME` pointed at `home`, restoring the prior value
+    /// afterwards. Serialized so concurrent tests don't clobber the env var.
+    fn with_test_home<R>(home: &Path, f: impl FnOnce() -> R) -> R {
+        let _guard = SETUP_ENV_MUTEX.lock().unwrap();
+        let prev = std::env::var_os("AHMA_TEST_HOME");
+        // SAFETY: test-only; SETUP_ENV_MUTEX serializes env access in this module.
+        unsafe { std::env::set_var("AHMA_TEST_HOME", home) };
+        let result = f();
+        // SAFETY: test-only; mutex held.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AHMA_TEST_HOME", v),
+                None => std::env::remove_var("AHMA_TEST_HOME"),
+            }
+        }
+        result
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    // ─── execute_actions: empty set is a no-op ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_execute_actions_empty_is_noop() -> Result<()> {
+        // No action selected -> all four guards are false -> Ok with no side effects.
+        execute_actions(&[], &[], "stdio", false).await?;
+        Ok(())
+    }
+
+    // ─── setup_llm_prompts (via AHMA_TEST_HOME seam) ──────────────────────────
+
+    #[test]
+    fn test_setup_llm_prompts_creates_when_missing() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        with_test_home(home, || {
+            block_on(setup_llm_prompts(false)).expect("should create prompts file");
+        });
+        let path = home.join(".ahma").join("prompts.toml");
+        assert!(path.exists(), "prompts.toml must be created");
+        let written = std::fs::read_to_string(&path).unwrap();
+        let template = ahma_common::prompts::AhmaPrompts::generate_template();
+        assert_eq!(
+            written, template,
+            "created file must hold the default template"
+        );
+    }
+
+    #[test]
+    fn test_setup_llm_prompts_creates_when_missing_interactive() {
+        // interactive=true exercises the success print branch as well.
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        with_test_home(home, || {
+            block_on(setup_llm_prompts(true)).expect("should create prompts file");
+        });
+        assert!(home.join(".ahma").join("prompts.toml").exists());
+    }
+
+    #[test]
+    fn test_setup_llm_prompts_existing_identical_is_noop() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let dir = home.join(".ahma");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prompts.toml");
+        let template = ahma_common::prompts::AhmaPrompts::generate_template();
+        std::fs::write(&path, &template).unwrap();
+
+        with_test_home(home, || {
+            block_on(setup_llm_prompts(false)).expect("identical content is a no-op");
+        });
+        // Content is unchanged.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), template);
+    }
+
+    #[test]
+    fn test_setup_llm_prompts_existing_differs_noninteractive_keeps_file() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let dir = home.join(".ahma");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prompts.toml");
+        std::fs::write(&path, "# user-modified prompts\n").unwrap();
+
+        with_test_home(home, || {
+            block_on(setup_llm_prompts(false))
+                .expect("non-interactive divergent content only prints a notice");
+        });
+        // Non-interactive must NOT overwrite the user's file.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# user-modified prompts\n"
+        );
+    }
+
+    // ─── prompt_and_backup_prompts_file (no env needed; path is a parameter) ──
+
+    #[tokio::test]
+    async fn test_prompt_and_backup_identical_is_noop() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("prompts.toml");
+        std::fs::write(&path, "SAME")?;
+        prompt_and_backup_prompts_file(&path, "SAME", true).await?;
+        // Unchanged and no backup created.
+        assert_eq!(std::fs::read_to_string(&path)?, "SAME");
+        assert!(!path.with_extension("toml.bak").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompt_and_backup_noninteractive_differs_keeps_file() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("prompts.toml");
+        std::fs::write(&path, "OLD")?;
+        prompt_and_backup_prompts_file(&path, "NEW", false).await?;
+        // Non-interactive: notice only, original retained, no backup.
+        assert_eq!(std::fs::read_to_string(&path)?, "OLD");
+        assert!(!path.with_extension("toml.bak").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_prompt_and_backup_interactive_eof_declines() -> Result<()> {
+        // Interactive but stdin is at EOF (nextest null stdin) -> prompt_yes_no_setup
+        // returns false -> the "keep existing" branch retains the original file.
+        let tmp = tempdir()?;
+        let path = tmp.path().join("prompts.toml");
+        std::fs::write(&path, "OLD")?;
+        prompt_and_backup_prompts_file(&path, "NEW", true).await?;
+        assert_eq!(std::fs::read_to_string(&path)?, "OLD");
+        assert!(!path.with_extension("toml.bak").exists());
+        Ok(())
+    }
+
+    // ─── stdin-reading prompts: EOF falls back to defaults ────────────────────
+    // Under `cargo nextest` stdin is redirected to null, so read_line yields EOF
+    // immediately and these return their documented default without blocking.
+
+    #[test]
+    fn test_prompt_transport_eof_defaults_to_stdio() {
+        assert_eq!(prompt_transport(), "stdio");
+    }
+
+    #[test]
+    fn test_prompt_multi_select_eof_uses_default_all() {
+        // Empty input (EOF) -> default "all" -> every option selected.
+        let chosen = prompt_multi_select("Pick:", &["a", "b", "c"], "all");
+        assert_eq!(chosen, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_yes_no_setup_eof_is_false() -> Result<()> {
+        // EOF / empty line is treated as "no".
+        assert!(!prompt_yes_no_setup("Proceed? [y/N]: ").await?);
+        Ok(())
+    }
 }

@@ -1062,4 +1062,334 @@ mod tests {
             "corrupt settings file must be left untouched on the error path"
         );
     }
+
+    // ── run_reporter_loop: end-to-end over an in-process Unix socket ───────────
+    //
+    // These tests exercise the long-running reporter loop without a real daemon
+    // by binding our OWN UnixListener in a temp path and pointing
+    // `AHMA_DAEMON_SOCK` at it. `ensure_daemon_running` then connects to our
+    // listener (so it never spawns the `ahma daemon` subprocess), and we read the
+    // framed `ClientMsg`s the reporter emits to assert on register/replay/dispatch.
+    //
+    // Unix-only: the listener is a UnixListener (Windows uses TCP). The socket
+    // path is process-global state, so we serialize with a mutex and restore the
+    // env var on drop.
+
+    #[cfg(unix)]
+    static DAEMON_SOCK_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(unix)]
+    static DAEMON_SOCK_COUNTER: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// Restores `AHMA_DAEMON_SOCK` to its prior value when dropped.
+    #[cfg(unix)]
+    struct EnvGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+    #[cfg(unix)]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var("AHMA_DAEMON_SOCK", v) },
+                None => unsafe { std::env::remove_var("AHMA_DAEMON_SOCK") },
+            }
+        }
+    }
+
+    /// Read and parse one newline-framed `ClientMsg` the reporter sent us.
+    #[cfg(unix)]
+    async fn read_client_msg<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> ClientMsg {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("timed out waiting for a ClientMsg from the reporter")
+            .expect("io error reading ClientMsg");
+        assert!(n > 0, "reporter closed the connection unexpectedly (EOF)");
+        serde_json::from_str(line.trim()).expect("failed to parse ClientMsg JSON")
+    }
+
+    /// Accept connections until one sends a first message (the real reporter
+    /// connection), skipping the probe connection from `ensure_daemon_running`
+    /// (which connects then immediately drops → EOF).
+    #[cfg(unix)]
+    async fn accept_register(
+        listener: &tokio::net::UnixListener,
+    ) -> (
+        tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+        tokio::net::unix::OwnedWriteHalf,
+        ClientMsg,
+    ) {
+        use tokio::io::AsyncBufReadExt;
+        loop {
+            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("timed out waiting for the reporter to connect")
+                .expect("accept failed");
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = tokio::io::BufReader::new(read_half);
+            let mut line = String::new();
+            match tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    let msg: ClientMsg =
+                        serde_json::from_str(line.trim()).expect("parse first ClientMsg");
+                    return (reader, write_half, msg);
+                }
+                // Probe connection (EOF) or timeout — wait for the next connection.
+                _ => continue,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // The std Mutex deliberately serializes this whole async test (the daemon
+    // socket path is process-global state); holding it across awaits is the point.
+    #[allow(clippy::await_holding_lock)]
+    async fn reporter_loop_register_replay_dispatch_and_reconnect_over_unix_socket() {
+        use crate::operation_monitor::MonitorConfig;
+        use ahma_common::config::ScopeAccess;
+        use ahma_common::scope_grant::{GrantCoordinator, GrantDecision, GrantReason};
+
+        // Serialize: the socket path is global state shared by the whole process.
+        let _lock = DAEMON_SOCK_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Unique short socket path under the system temp dir (kept short to stay
+        // under the platform's sockaddr_un path limit).
+        let unique = DAEMON_SOCK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sock =
+            std::env::temp_dir().join(format!("ahma_rep_{}_{}.sock", std::process::id(), unique));
+        let _ = std::fs::remove_file(&sock);
+
+        // Point the reporter's socket resolution at our listener and bind it
+        // BEFORE spawning the reporter so `ensure_daemon_running` connects
+        // immediately instead of spawning a subprocess.
+        let prev = std::env::var_os("AHMA_DAEMON_SOCK");
+        unsafe { std::env::set_var("AHMA_DAEMON_SOCK", &sock) };
+        let _env_guard = EnvGuard { prev };
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind temp daemon socket");
+
+        // ── Seed the monitor: one completed op (replayed as Started+Finished) and
+        //    one active op (replayed as Started). ─────────────────────────────────
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(60),
+        )));
+        monitor
+            .add_operation(Operation::new(
+                "comp-1".into(),
+                "cargo_build".into(),
+                "Build".into(),
+                None,
+            ))
+            .await;
+        monitor
+            .update_status(
+                "comp-1",
+                OperationStatus::Completed,
+                Some(json!({ "message": "done" })),
+            )
+            .await;
+        monitor
+            .add_operation(Operation::new(
+                "act-1".into(),
+                "cargo_test".into(),
+                "Test".into(),
+                None,
+            ))
+            .await;
+
+        // ── Grant plumbing shared with the reporter. ─────────────────────────────
+        let coord = Arc::new(GrantCoordinator::new());
+        let (grant_tx, grant_rx) = mpsc::unbounded_channel::<ScopeGrantRequest>();
+        let grant = GrantReporting {
+            coordinator: coord.clone(),
+            req_rx: grant_rx,
+        };
+
+        // ── Run the loop in the background. ──────────────────────────────────────
+        let reporter = tokio::spawn(run_reporter_loop(
+            monitor.clone(),
+            "stdio".to_string(),
+            "ws-scope".to_string(),
+            "VSCode".to_string(),
+            Some(grant),
+        ));
+
+        // ── Register + replay ────────────────────────────────────────────────────
+        let (mut server_reader, mut server_writer, reg) = accept_register(&listener).await;
+        match reg {
+            ClientMsg::Register {
+                mode, scope, label, ..
+            } => {
+                assert_eq!(mode, "stdio");
+                assert_eq!(scope, "ws-scope");
+                assert_eq!(label, "VSCode");
+            }
+            other => panic!("expected Register first, got {other:?}"),
+        }
+
+        // Completed op: OpStarted then OpFinished.
+        match read_client_msg(&mut server_reader).await {
+            ClientMsg::Event {
+                payload: DaemonEvent::OpStarted { id, scope, .. },
+            } => {
+                assert_eq!(id, "comp-1");
+                assert_eq!(scope, "ws-scope");
+            }
+            other => panic!("expected replayed completed OpStarted, got {other:?}"),
+        }
+        match read_client_msg(&mut server_reader).await {
+            ClientMsg::Event {
+                payload:
+                    DaemonEvent::OpFinished {
+                        id,
+                        status,
+                        result_summary,
+                        ..
+                    },
+            } => {
+                assert_eq!(id, "comp-1");
+                assert_eq!(status, "Completed");
+                assert_eq!(result_summary, Some("done".into()));
+            }
+            other => panic!("expected replayed completed OpFinished, got {other:?}"),
+        }
+        // Active op: OpStarted.
+        match read_client_msg(&mut server_reader).await {
+            ClientMsg::Event {
+                payload: DaemonEvent::OpStarted { id, .. },
+            } => assert_eq!(id, "act-1"),
+            other => panic!("expected replayed active OpStarted, got {other:?}"),
+        }
+
+        // Small helper to assert a Ping is answered with a matching Pong, proving
+        // the select loop kept running past whatever we sent before it.
+        async fn ping_pong(
+            w: &mut tokio::net::unix::OwnedWriteHalf,
+            r: &mut tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+            seq: u32,
+        ) {
+            send_msg(w, &DaemonMsg::Ping { seq })
+                .await
+                .expect("send ping");
+            match read_client_msg(r).await {
+                ClientMsg::Pong { seq: got } => assert_eq!(got, seq, "pong seq mismatch"),
+                other => panic!("expected Pong({seq}), got {other:?}"),
+            }
+        }
+
+        // ── 1. Forward a fresh scope-grant request (branch 2b, Some). ────────────
+        let fwd_dir = tempfile::tempdir().unwrap();
+        grant_tx
+            .send(ScopeGrantRequest {
+                decision_id: "fwd-1".into(),
+                path: fwd_dir.path().to_path_buf(),
+                access: ScopeAccess::Rw,
+                reason: GrantReason::PreExecViolation,
+                tool: Some("rustc".into()),
+            })
+            .unwrap();
+        match read_client_msg(&mut server_reader).await {
+            ClientMsg::ScopeGrantRequested { request } => {
+                assert_eq!(request.decision_id, "fwd-1");
+                assert_eq!(request.access, ScopeAccess::Rw);
+            }
+            other => panic!("expected forwarded ScopeGrantRequested, got {other:?}"),
+        }
+
+        // ── 2. Ping/Pong. ────────────────────────────────────────────────────────
+        ping_pong(&mut server_writer, &mut server_reader, 11).await;
+
+        // ── 3. Catch-all DaemonMsg (ignored), then confirm loop continues. ───────
+        send_msg(&mut server_writer, &DaemonMsg::AgentDone)
+            .await
+            .expect("send AgentDone");
+        ping_pong(&mut server_writer, &mut server_reader, 12).await;
+
+        // ── 4. SubmitApproval with no pending sender (debug arm). ─────────────────
+        send_msg(
+            &mut server_writer,
+            &DaemonMsg::SubmitApproval { approved: true },
+        )
+        .await
+        .expect("send SubmitApproval");
+        ping_pong(&mut server_writer, &mut server_reader, 13).await;
+
+        // ── 5. SubmitScopeGrant for an unknown decision (Unknown arm, no reply). ──
+        send_msg(
+            &mut server_writer,
+            &DaemonMsg::SubmitScopeGrant {
+                decision_id: "ghost".into(),
+                decision: GrantDecision::Deny,
+            },
+        )
+        .await
+        .expect("send unknown SubmitScopeGrant");
+        ping_pong(&mut server_writer, &mut server_reader, 14).await;
+
+        // ── 6. SubmitScopeGrant → Denied arm → ScopeGrantResolved. ───────────────
+        let grant_dir = tempfile::tempdir().unwrap();
+        let req = coord
+            .begin(
+                grant_dir.path(),
+                ScopeAccess::Ro,
+                GrantReason::PreExecViolation,
+                Some("cargo".into()),
+            )
+            .expect("begin should mint an in-flight request");
+        let did = req.decision_id.clone();
+        send_msg(
+            &mut server_writer,
+            &DaemonMsg::SubmitScopeGrant {
+                decision_id: did.clone(),
+                decision: GrantDecision::Deny,
+            },
+        )
+        .await
+        .expect("send Deny SubmitScopeGrant");
+        match read_client_msg(&mut server_reader).await {
+            ClientMsg::ScopeGrantResolved { decision_id } => assert_eq!(decision_id, did),
+            other => panic!("expected ScopeGrantResolved after Deny, got {other:?}"),
+        }
+
+        // ── 7. Emit a Progress event → daemon_event_for None → continue. ─────────
+        monitor.note_progress("act-1", "tick".into());
+        ping_pong(&mut server_writer, &mut server_reader, 15).await;
+
+        // ── 8. Drop the grant sender → branch 2b None arm sets grant_req_rx=None. ─
+        drop(grant_tx);
+        ping_pong(&mut server_writer, &mut server_reader, 16).await;
+
+        // ── 9. Live operation event forwarded through the unified stream. ────────
+        monitor
+            .add_operation(Operation::new(
+                "live-1".into(),
+                "cargo_clippy".into(),
+                "Lint".into(),
+                None,
+            ))
+            .await;
+        match read_client_msg(&mut server_reader).await {
+            ClientMsg::Event {
+                payload: DaemonEvent::OpStarted { id, .. },
+            } => assert_eq!(id, "live-1"),
+            other => panic!("expected live OpStarted, got {other:?}"),
+        }
+
+        // ── 10. Disconnect → recv_msg EOF → back-off → reconnect & re-register. ──
+        drop(server_reader);
+        drop(server_writer);
+        let (_r2, _w2, reg2) = accept_register(&listener).await;
+        match reg2 {
+            ClientMsg::Register { label, .. } => assert_eq!(label, "VSCode"),
+            other => panic!("expected re-Register after reconnect, got {other:?}"),
+        }
+        // Keep _r2/_w2 alive so the reporter parks in select rather than
+        // reconnecting (which would otherwise spawn a daemon subprocess).
+
+        // ── Teardown. ────────────────────────────────────────────────────────────
+        reporter.abort();
+        let _ = std::fs::remove_file(&sock);
+        // _env_guard restores AHMA_DAEMON_SOCK; _lock releases the serialization.
+    }
 }

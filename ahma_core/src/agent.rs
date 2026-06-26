@@ -2438,4 +2438,654 @@ mod tests {
         assert_eq!(model, "", "missing model defaults to empty string");
         assert!(key.is_none());
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Added coverage: MCP sampling routing, tool dispatch, HTTP tool calls,
+    // session reuse, approval gates, agent-turn branches, completion fallback.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    struct RejectGate;
+    #[async_trait::async_trait]
+    impl AgentApprovalGate for RejectGate {
+        async fn request_approval(&self, _id: &str, _tool: &str, _args: &str) -> bool {
+            false
+        }
+    }
+
+    /// Bind an ephemeral loopback port and serve `router`, returning its base URL.
+    /// The listener is bound before the accept loop spawns, so the OS backlog
+    /// accepts client connections immediately (no startup race).
+    async fn serve_router(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
+
+    /// A mock `/mcp` endpoint that always answers POSTs with a fixed JSON body.
+    async fn mock_post_json(body: serde_json::Value) -> String {
+        let router = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(move || {
+                let body = body.clone();
+                async move { axum::Json(body) }
+            }),
+        );
+        serve_router(router).await
+    }
+
+    /// A mock `/mcp` endpoint that always answers POSTs with a fixed status.
+    async fn mock_post_status(status: axum::http::StatusCode) -> String {
+        let router = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(move || async move { (status, "boom-body") }),
+        );
+        serve_router(router).await
+    }
+
+    /// A minimal MCP tool server: initialize (optionally returning a session
+    /// header), notifications/initialized, and a tools/call that returns text.
+    fn mcp_tool_router(with_session_header: bool) -> axum::Router {
+        axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    use axum::response::IntoResponse;
+                    let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    match method {
+                        "initialize" => {
+                            if with_session_header {
+                                let mut headers = axum::http::HeaderMap::new();
+                                headers.insert(
+                                    "mcp-session-id",
+                                    axum::http::HeaderValue::from_static("ext-sess"),
+                                );
+                                (headers, axum::Json(serde_json::json!({}))).into_response()
+                            } else {
+                                axum::Json(serde_json::json!({})).into_response()
+                            }
+                        }
+                        "notifications/initialized" => {
+                            axum::http::StatusCode::ACCEPTED.into_response()
+                        }
+                        "tools/call" => axum::Json(serde_json::json!({
+                            "result": { "content": [{"type": "text", "text": "TOOL_OK"}] }
+                        }))
+                        .into_response(),
+                        _ => axum::http::StatusCode::OK.into_response(),
+                    }
+                },
+            ),
+        )
+    }
+
+    /// Config whose `session_id` is preset, so `get_or_create_session` returns
+    /// immediately without performing the SSE/roots handshake.
+    fn cfg_session(base_url: &str) -> McpChatConfig {
+        let mut c = empty_mcp_config(base_url);
+        c.session_id = Some("preset-sid".to_string());
+        c
+    }
+
+    // ── call_mcp_sampling_routed ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn call_mcp_sampling_routed_joins_text_content() {
+        let base = mock_post_json(serde_json::json!({
+            "result": { "content": [
+                {"type": "text", "text": "Hello"},
+                {"type": "image", "data": "ignored"},
+                {"type": "text", "text": " World"},
+            ]}
+        }))
+        .await;
+        let cfg = cfg_session(&base);
+        let resp = call_mcp_sampling_routed(
+            &cfg,
+            "label",
+            vec![serde_json::json!({"role": "user", "content": "hi"})],
+            None,
+        )
+        .await
+        .expect("sampling should succeed");
+        assert_eq!(
+            resp.content, "Hello World",
+            "text items concatenated, non-text skipped"
+        );
+        assert!(resp.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_mcp_sampling_routed_http_error() {
+        let base = mock_post_status(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        let cfg = cfg_session(&base);
+        let err = call_mcp_sampling_routed(&cfg, "label", vec![], None)
+            .await
+            .expect_err("non-2xx must error");
+        assert!(err.contains("HTTP 500"), "{err}");
+        assert!(err.contains("boom-body"), "body surfaced: {err}");
+    }
+
+    #[tokio::test]
+    async fn call_mcp_sampling_routed_json_error_field() {
+        let base = mock_post_json(serde_json::json!({"error": {"message": "nope"}})).await;
+        let cfg = cfg_session(&base);
+        let err = call_mcp_sampling_routed(&cfg, "label", vec![], Some("sys"))
+            .await
+            .expect_err("JSON-RPC error must propagate");
+        assert_eq!(err, "nope");
+    }
+
+    #[tokio::test]
+    async fn call_mcp_sampling_routed_missing_result() {
+        let base = mock_post_json(serde_json::json!({})).await;
+        let cfg = cfg_session(&base);
+        let err = call_mcp_sampling_routed(&cfg, "label", vec![], None)
+            .await
+            .expect_err("missing result must error");
+        assert_eq!(err, "Missing result in response");
+    }
+
+    #[tokio::test]
+    async fn call_mcp_sampling_routed_missing_content() {
+        let base = mock_post_json(serde_json::json!({"result": {}})).await;
+        let cfg = cfg_session(&base);
+        let err = call_mcp_sampling_routed(&cfg, "label", vec![], None)
+            .await
+            .expect_err("missing content array must error");
+        assert_eq!(err, "Missing or invalid content in result");
+    }
+
+    // ── call_mcp_tool_http error & retry paths ────────────────────────────────
+
+    #[tokio::test]
+    async fn call_mcp_tool_http_http_error_status() {
+        let base = mock_post_status(axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+        let url = format!("{}/mcp", base);
+        let err = call_mcp_tool_http(
+            &reqwest::Client::new(),
+            &url,
+            "sid",
+            "t",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("500 must error");
+        assert!(err.contains("HTTP 500"), "{err}");
+        assert!(err.contains("boom-body"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn call_mcp_tool_http_malformed_json() {
+        let router =
+            axum::Router::new().route("/mcp", axum::routing::post(|| async { "not json at all" }));
+        let base = serve_router(router).await;
+        let url = format!("{}/mcp", base);
+        let err = call_mcp_tool_http(
+            &reqwest::Client::new(),
+            &url,
+            "sid",
+            "t",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("unparseable body must error");
+        assert!(err.contains("Failed to parse tool response JSON"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn call_mcp_tool_http_retries_on_conflict() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+        let router = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(move || {
+                let c = c.clone();
+                async move {
+                    use axum::response::IntoResponse;
+                    let n = c.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // First attempt: sandbox not yet locked.
+                        (
+                            axum::http::StatusCode::CONFLICT,
+                            axum::Json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "error": { "code": -32001, "message": "Sandbox initializing" }
+                            })),
+                        )
+                            .into_response()
+                    } else {
+                        axum::Json(serde_json::json!({
+                            "result": { "content": [{"type": "text", "text": "retried-ok"}] }
+                        }))
+                        .into_response()
+                    }
+                }
+            }),
+        );
+        let base = serve_router(router).await;
+        let url = format!("{}/mcp", base);
+        let (text, is_err) = call_mcp_tool_http(
+            &reqwest::Client::new(),
+            &url,
+            "sid",
+            "t",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("retry should eventually succeed");
+        assert!(!is_err);
+        assert_eq!(text, "retried-ok");
+        assert!(
+            counter.load(Ordering::SeqCst) >= 2,
+            "must have retried after 409"
+        );
+    }
+
+    // ── dispatch_tool_execution (local / external / missing-header) ────────────
+
+    #[tokio::test]
+    async fn dispatch_local_tool_success() {
+        let base = serve_router(mcp_tool_router(true)).await;
+        let cfg = cfg_session(&base);
+        let (text, failed) = dispatch_tool_execution("status", serde_json::json!({}), &cfg)
+            .await
+            .expect("local dispatch succeeds");
+        assert!(!failed);
+        assert_eq!(text, "TOOL_OK");
+    }
+
+    #[tokio::test]
+    async fn dispatch_external_http_tool_success() {
+        let base = serve_router(mcp_tool_router(true)).await;
+        let mut cfg = empty_mcp_config("http://127.0.0.1:9");
+        cfg.external_http_servers.insert("ext".to_string(), base);
+        let (text, failed) = dispatch_tool_execution("ext::do", serde_json::json!({}), &cfg)
+            .await
+            .expect("external dispatch succeeds");
+        assert!(!failed);
+        assert_eq!(text, "TOOL_OK");
+    }
+
+    #[tokio::test]
+    async fn dispatch_external_missing_session_header_errors() {
+        let base = serve_router(mcp_tool_router(false)).await;
+        let mut cfg = empty_mcp_config("http://127.0.0.1:9");
+        cfg.external_http_servers.insert("ext".to_string(), base);
+        let err = dispatch_tool_execution("ext::do", serde_json::json!({}), &cfg)
+            .await
+            .expect_err("missing session header must error");
+        assert!(
+            err.contains("No mcp-session-id header in external initialize response"),
+            "{err}"
+        );
+    }
+
+    // ── spawn_chat_task (mcp:// routing) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn spawn_chat_task_mcp_without_config_errors() {
+        let client = LlmClient::new("mcp://lbl", "m", None);
+        let (tx, mut rx) = mpsc::channel(8);
+        spawn_chat_task(client, vec![ChatMessage::user("hi")], None, None, tx);
+        match rx.recv().await.unwrap() {
+            AgentEvent::Error(e) => assert!(e.contains("MCP config missing"), "{e}"),
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_chat_task_mcp_routes_and_completes() {
+        let base = mock_post_json(serde_json::json!({
+            "result": { "content": [{"type": "text", "text": "routed-reply"}] }
+        }))
+        .await;
+        let cfg = cfg_session(&base);
+        let client = LlmClient::new("mcp://lbl", "m", None);
+        let (tx, mut rx) = mpsc::channel(8);
+        spawn_chat_task(
+            client,
+            vec![ChatMessage::user("q")],
+            Some("sys".to_string()),
+            Some(cfg),
+            tx,
+        );
+        match rx.recv().await.unwrap() {
+            AgentEvent::Token(t) => assert_eq!(t, "routed-reply"),
+            o => panic!("unexpected {o:?}"),
+        }
+        match rx.recv().await.unwrap() {
+            AgentEvent::Done => {}
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    // ── get_or_create_session reuse fast-path ─────────────────────────────────
+
+    #[tokio::test]
+    async fn get_or_create_session_reuses_existing_id() {
+        let mut cfg = empty_mcp_config("http://127.0.0.1:9");
+        cfg.session_id = Some("already-have".to_string());
+        // No server is contacted because the id is preset and non-empty.
+        let sid = get_or_create_session(&reqwest::Client::new(), "http://127.0.0.1:9/mcp", &cfg)
+            .await
+            .expect("preset session id is returned verbatim");
+        assert_eq!(sid, "already-have");
+    }
+
+    // ── HubApprovalGate ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hub_approval_gate_returns_false_when_hub_closed() {
+        let (hub_tx, hub_rx) = mpsc::channel(1);
+        drop(hub_rx); // hub side gone → send fails → denied.
+        let session = Arc::new(tokio::sync::Mutex::new(
+            ahma_mcp::ActiveAgentSession::default(),
+        ));
+        let gate = HubApprovalGate { hub_tx, session };
+        assert!(!gate.request_approval("id", "write_file", "{}").await);
+    }
+
+    #[tokio::test]
+    async fn hub_approval_gate_resolves_with_session_decision() {
+        let (hub_tx, mut hub_rx) = mpsc::channel(8);
+        let session = Arc::new(tokio::sync::Mutex::new(
+            ahma_mcp::ActiveAgentSession::default(),
+        ));
+        let gate = HubApprovalGate {
+            hub_tx,
+            session: session.clone(),
+        };
+        let handle = tokio::spawn(async move {
+            gate.request_approval("id7", "write_file", "{\"p\":1}")
+                .await
+        });
+
+        // The gate emits an approval request before awaiting the decision.
+        match hub_rx.recv().await.unwrap() {
+            ClientMsg::ApprovalRequested { id, tool, args } => {
+                assert_eq!(id, "id7");
+                assert_eq!(tool, "write_file");
+                assert_eq!(args, "{\"p\":1}");
+            }
+            _ => panic!("expected ApprovalRequested"),
+        }
+
+        // Answer via the oneshot the gate parked on the session.
+        let tx = session
+            .lock()
+            .await
+            .approval_tx
+            .take()
+            .expect("gate registered an approval_tx");
+        tx.send(true).unwrap();
+
+        assert!(handle.await.unwrap(), "decision propagates back to caller");
+    }
+
+    // ── execute_single_tool_call (rejection & dispatch-error branches) ─────────
+
+    #[tokio::test]
+    async fn execute_single_tool_call_rejection_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = empty_mcp_config("http://127.0.0.1:9");
+        cfg.workspace_root = tmp.path().to_path_buf(); // fresh dir: no prior approvals
+        let call = ahma_llm_monitor::client::ChatToolCall {
+            id: "call_x".to_string(),
+            name: "write_file".to_string(), // mutating → requires approval
+            arguments: serde_json::json!({"path": "a"}),
+            arguments_raw: "{}".to_string(),
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let (id, name, payload, failed) =
+            execute_single_tool_call(call, cfg, tx, Arc::new(RejectGate)).await;
+        assert!(failed);
+        assert_eq!(id, "call_x");
+        assert_eq!(name, "write_file");
+        assert!(payload["error"].as_str().unwrap().contains("rejected"));
+        match rx.recv().await.unwrap() {
+            AgentEvent::ToolCallFinished { result, failed, .. } => {
+                assert!(failed);
+                assert!(result.contains("rejected"), "{result}");
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_single_tool_call_dispatch_error_is_reported() {
+        // Port 1 refuses connections, so the local tool dispatch fails fast.
+        let cfg = empty_mcp_config("http://127.0.0.1:1");
+        let call = ahma_llm_monitor::client::ChatToolCall {
+            id: "cerr".to_string(),
+            name: "status".to_string(), // read-only → auto-approved
+            arguments: serde_json::json!({}),
+            arguments_raw: "{}".to_string(),
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let (id, name, payload, failed) =
+            execute_single_tool_call(call, cfg, tx, Arc::new(AutoApproveGate)).await;
+        assert!(failed);
+        assert_eq!(id, "cerr");
+        assert_eq!(name, "status");
+        assert!(payload["error"].as_str().unwrap().starts_with("Error:"));
+
+        let mut saw_started = false;
+        let mut saw_failed_finish = false;
+        while let Ok(evt) = rx.try_recv() {
+            match evt {
+                AgentEvent::ToolCallStarted { .. } => saw_started = true,
+                AgentEvent::ToolCallFinished { failed, .. } if failed => saw_failed_finish = true,
+                _ => {}
+            }
+        }
+        assert!(saw_started, "approved tool emits ToolCallStarted");
+        assert!(
+            saw_failed_finish,
+            "dispatch error emits a failed ToolCallFinished"
+        );
+    }
+
+    // ── execute_agent_turn branches ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn execute_agent_turn_mcp_content_completes() {
+        let base = mock_post_json(serde_json::json!({
+            "result": { "content": [{"type": "text", "text": "final answer"}] }
+        }))
+        .await;
+        let cfg = cfg_session(&base);
+        let client = LlmClient::new("mcp://lbl", "m", None);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut msg_json = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let mut read_hinted = false;
+        let mut error_hinted = false;
+
+        let cont = execute_agent_turn(
+            &client,
+            &mut msg_json,
+            &[],
+            &Some(cfg),
+            &tx,
+            &[],
+            &None,
+            &mut read_hinted,
+            &mut error_hinted,
+            Arc::new(AutoApproveGate),
+        )
+        .await;
+
+        assert!(!cont, "no tool calls → turn signals completion");
+        let last = msg_json.last().unwrap();
+        assert_eq!(last["role"], "assistant");
+        assert_eq!(last["content"], "final answer");
+        match rx.recv().await.unwrap() {
+            AgentEvent::Token(t) => assert_eq!(t, "final answer"),
+            o => panic!("unexpected {o:?}"),
+        }
+        match rx.recv().await.unwrap() {
+            AgentEvent::Done => {}
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_agent_turn_tools_without_mcp_errors() {
+        let router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "c1",
+                                "type": "function",
+                                "function": {"name": "t", "arguments": "{}"}
+                            }]
+                        }
+                    }]
+                }))
+            }),
+        );
+        let base = serve_router(router).await;
+        let client = LlmClient::new(base, "m", None);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut msg_json = vec![serde_json::json!({"role": "user", "content": "go"})];
+        let mut read_hinted = false;
+        let mut error_hinted = false;
+
+        let cont = execute_agent_turn(
+            &client,
+            &mut msg_json,
+            &[],
+            &None, // model wants tools but MCP is not configured
+            &tx,
+            &[],
+            &None,
+            &mut read_hinted,
+            &mut error_hinted,
+            Arc::new(AutoApproveGate),
+        )
+        .await;
+
+        assert!(!cont);
+        match rx.recv().await.unwrap() {
+            AgentEvent::Error(e) => assert!(e.contains("MCP is not configured"), "{e}"),
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    // ── fetch_completion branches ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fetch_completion_mcp_missing_config_errors() {
+        let client = LlmClient::new("mcp://x", "m", None);
+        let (tx, mut rx) = mpsc::channel(8);
+        let res = fetch_completion(&client, &[], &[], &None, &tx, &[], &None).await;
+        assert!(res.is_none());
+        match rx.recv().await.unwrap() {
+            AgentEvent::Error(e) => assert!(e.contains("MCP config missing"), "{e}"),
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_completion_mcp_routes_completion() {
+        let base = mock_post_json(serde_json::json!({
+            "result": { "content": [{"type": "text", "text": "ROUTED"}] }
+        }))
+        .await;
+        let cfg = cfg_session(&base);
+        let client = LlmClient::new("mcp://lbl", "m", None);
+        let (tx, _rx) = mpsc::channel(8);
+        let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let res = fetch_completion(
+            &client,
+            &msgs,
+            &[],
+            &Some(cfg),
+            &tx,
+            &[],
+            &Some("sys".to_string()),
+        )
+        .await;
+        let resp = res.expect("mcp routing returns a completion");
+        assert_eq!(resp.content, "ROUTED");
+    }
+
+    #[tokio::test]
+    async fn fetch_completion_tool_unsupported_triggers_fallback() {
+        let router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "tools are not supported by this model",
+                )
+            }),
+        );
+        let base = serve_router(router).await;
+        let client = LlmClient::new(base, "m", None);
+        let (tx, mut rx) = mpsc::channel(16);
+        let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let res = fetch_completion(
+            &client,
+            &msgs,
+            &[],
+            &None,
+            &tx,
+            &[ChatMessage::user("hi")],
+            &None,
+        )
+        .await;
+        assert!(res.is_none());
+        // The fallback emits an explanatory error before re-dispatching as chat.
+        match rx.recv().await.unwrap() {
+            AgentEvent::Error(e) => assert!(e.contains("does not support tools"), "{e}"),
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_completion_other_error_no_fallback() {
+        let router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "server exploded",
+                )
+            }),
+        );
+        let base = serve_router(router).await;
+        let client = LlmClient::new(base, "m", None);
+        let (tx, mut rx) = mpsc::channel(16);
+        let msgs = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let res = fetch_completion(
+            &client,
+            &msgs,
+            &[],
+            &None,
+            &tx,
+            &[ChatMessage::user("hi")],
+            &None,
+        )
+        .await;
+        assert!(res.is_none());
+        match rx.recv().await.unwrap() {
+            AgentEvent::Error(e) => {
+                assert!(e.contains("500"), "raw error surfaced: {e}");
+                assert!(
+                    !e.contains("does not support tools"),
+                    "no tool fallback for 500"
+                );
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+    }
 }
