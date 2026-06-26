@@ -88,3 +88,87 @@ pub fn build_quic_tls_config(cert: &SelfSignedCert) -> Result<Arc<rustls::Server
 
     Ok(Arc::new(tls_config))
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Install the ring crypto provider as process default if not already set.
+    /// `build_quic_tls_config` passes the provider explicitly, so this is only a
+    /// defensive no-op guard; harmless if a provider is already installed.
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[test]
+    fn generate_self_signed_cert_produces_valid_der() {
+        let cert = generate_self_signed_cert().expect("generation should succeed");
+        assert!(!cert.cert_der.is_empty(), "cert_der must be non-empty");
+        assert!(!cert.key_der.is_empty(), "key_der must be non-empty");
+        // A DER-encoded X.509 certificate is a SEQUENCE, whose tag byte is 0x30.
+        assert_eq!(
+            cert.cert_der[0], 0x30,
+            "cert_der should start with the DER SEQUENCE tag 0x30"
+        );
+    }
+
+    #[test]
+    fn build_quic_tls_config_sets_h3_alpn_and_early_data() {
+        ensure_crypto_provider();
+        let cert = generate_self_signed_cert().expect("generation should succeed");
+        let config = build_quic_tls_config(&cert).expect("valid cert should build a config");
+
+        assert!(
+            config.alpn_protocols.contains(&b"h3".to_vec()),
+            "alpn_protocols must contain the h3 token"
+        );
+        assert_eq!(
+            config.max_early_data_size,
+            u32::MAX,
+            "max_early_data_size must be u32::MAX for 0-RTT"
+        );
+    }
+
+    #[test]
+    fn build_quic_tls_config_rejects_invalid_key() {
+        ensure_crypto_provider();
+        let cert = generate_self_signed_cert().expect("generation should succeed");
+        // Replace the private key with garbage DER so the build chain
+        // (PrivateKeyDer::try_from / with_single_cert) fails.
+        let bad = SelfSignedCert {
+            cert_der: cert.cert_der,
+            key_der: vec![0, 1, 2, 3],
+        };
+        let result = build_quic_tls_config(&bad);
+        assert!(
+            result.is_err(),
+            "invalid private key DER must produce an Err"
+        );
+    }
+
+    #[test]
+    fn load_or_generate_returns_non_empty_cert() {
+        // `LocalTlsConfig::from_env()` deliberately has NO env injection seam
+        // (AHMA_TLS_DIR is retired/ignored). The only injectable seam is the
+        // process-wide `set_dir_override`, which we point at a tempdir so the
+        // Ok branch (load/generate persistent material) is exercised
+        // deterministically without touching the real ~/.ahma/tls directory.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        ahma_common::local_tls::LocalTlsConfig::set_dir_override(tmp.path().join("tls"));
+
+        let cert = load_or_generate();
+        assert!(!cert.cert_der.is_empty(), "cert_der must be non-empty");
+        assert!(!cert.key_der.is_empty(), "key_der must be non-empty");
+        assert_eq!(
+            cert.cert_der[0], 0x30,
+            "cert_der should start with the DER SEQUENCE tag 0x30"
+        );
+
+        // Keep the tempdir alive until after the cert has been read.
+        drop(tmp);
+    }
+}

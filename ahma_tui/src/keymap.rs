@@ -276,3 +276,1073 @@ pub fn map_key(
 ) -> Action {
     Action::Unknown
 }
+
+// ─── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "tui"))]
+mod tests {
+    use super::*;
+    use crate::state::{CommandNavigator, Focus, ModalState, Mode, PaletteState};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// Build a KeyEvent with the given code and modifiers.
+    fn k(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    /// Build a KeyEvent with no modifiers.
+    fn kn(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn navigator_modal() -> ModalState {
+        ModalState::Navigator(CommandNavigator::default())
+    }
+
+    fn palette_modal() -> ModalState {
+        ModalState::Palette(PaletteState::default())
+    }
+
+    fn logfiles_modal() -> ModalState {
+        ModalState::LogFiles { selected: 0 }
+    }
+
+    fn none_modal() -> ModalState {
+        ModalState::None
+    }
+
+    // ─── Navigator modal dispatch (map_navigator_key) ───────────────────────────
+
+    #[test]
+    fn navigator_esc() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Esc),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::NavEsc
+        );
+    }
+
+    #[test]
+    fn navigator_enter() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Enter),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::NavSubmit
+        );
+    }
+
+    #[test]
+    fn navigator_tab() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Tab),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::NavComplete
+        );
+    }
+
+    #[test]
+    fn navigator_up_and_k() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Up),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::NavUp
+        );
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('k')),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::NavUp
+        );
+    }
+
+    #[test]
+    fn navigator_down_and_j() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Down),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::NavDown
+        );
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('j')),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::NavDown
+        );
+    }
+
+    #[test]
+    fn navigator_backspace() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Backspace),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::NavBackspace
+        );
+    }
+
+    #[test]
+    fn navigator_char_none_and_shift() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('x')),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::NavChar('x')
+        );
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('X'), KeyModifiers::SHIFT),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::NavChar('X')
+        );
+    }
+
+    #[test]
+    fn navigator_unknown_fallthrough() {
+        // A control char that matches no arm.
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                false
+            ),
+            Action::Unknown
+        );
+    }
+
+    // ─── Log switcher modal dispatch (map_log_modal_key) ────────────────────────
+
+    #[test]
+    fn log_modal_esc() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Esc),
+                Mode::Chat,
+                Focus::Chat,
+                &logfiles_modal(),
+                false
+            ),
+            Action::CloseLogSwitcher
+        );
+    }
+
+    #[test]
+    fn log_modal_enter() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Enter),
+                Mode::Chat,
+                Focus::Chat,
+                &logfiles_modal(),
+                false
+            ),
+            Action::SubmitLogSwitcher
+        );
+    }
+
+    #[test]
+    fn log_modal_up_and_k() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Up),
+                Mode::Chat,
+                Focus::Chat,
+                &logfiles_modal(),
+                false
+            ),
+            Action::Up
+        );
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('k')),
+                Mode::Chat,
+                Focus::Chat,
+                &logfiles_modal(),
+                false
+            ),
+            Action::Up
+        );
+    }
+
+    #[test]
+    fn log_modal_down_and_j() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Down),
+                Mode::Chat,
+                Focus::Chat,
+                &logfiles_modal(),
+                false
+            ),
+            Action::Down
+        );
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('j')),
+                Mode::Chat,
+                Focus::Chat,
+                &logfiles_modal(),
+                false
+            ),
+            Action::Down
+        );
+    }
+
+    #[test]
+    fn log_modal_unknown_fallthrough() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('z')),
+                Mode::Chat,
+                Focus::Chat,
+                &logfiles_modal(),
+                false
+            ),
+            Action::Unknown
+        );
+    }
+
+    // ─── Palette modal dispatch (map_palette_key) ───────────────────────────────
+
+    #[test]
+    fn palette_esc() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Esc),
+                Mode::Chat,
+                Focus::Chat,
+                &palette_modal(),
+                false
+            ),
+            Action::PaletteEsc
+        );
+    }
+
+    #[test]
+    fn palette_enter() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Enter),
+                Mode::Chat,
+                Focus::Chat,
+                &palette_modal(),
+                false
+            ),
+            Action::PaletteSubmit
+        );
+    }
+
+    #[test]
+    fn palette_tab() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Tab),
+                Mode::Chat,
+                Focus::Chat,
+                &palette_modal(),
+                false
+            ),
+            Action::PaletteComplete
+        );
+    }
+
+    #[test]
+    fn palette_backtab() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::BackTab),
+                Mode::Chat,
+                Focus::Chat,
+                &palette_modal(),
+                false
+            ),
+            Action::PaletteDown
+        );
+    }
+
+    #[test]
+    fn palette_up() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Up),
+                Mode::Chat,
+                Focus::Chat,
+                &palette_modal(),
+                false
+            ),
+            Action::PaletteUp
+        );
+    }
+
+    #[test]
+    fn palette_down() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Down),
+                Mode::Chat,
+                Focus::Chat,
+                &palette_modal(),
+                false
+            ),
+            Action::PaletteDown
+        );
+    }
+
+    #[test]
+    fn palette_backspace() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Backspace),
+                Mode::Chat,
+                Focus::Chat,
+                &palette_modal(),
+                false
+            ),
+            Action::PaletteBackspace
+        );
+    }
+
+    #[test]
+    fn palette_char_none_and_shift() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('p')),
+                Mode::Chat,
+                Focus::Chat,
+                &palette_modal(),
+                false
+            ),
+            Action::PaletteChar('p')
+        );
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('P'), KeyModifiers::SHIFT),
+                Mode::Chat,
+                Focus::Chat,
+                &palette_modal(),
+                false
+            ),
+            Action::PaletteChar('P')
+        );
+    }
+
+    #[test]
+    fn palette_unknown_fallthrough() {
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                Mode::Chat,
+                Focus::Chat,
+                &palette_modal(),
+                false
+            ),
+            Action::Unknown
+        );
+    }
+
+    // ─── Log filter dispatch (map_filter_key) ───────────────────────────────────
+
+    #[test]
+    fn filter_esc() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Esc),
+                Mode::Chat,
+                Focus::Log,
+                &none_modal(),
+                true
+            ),
+            Action::FilterEsc
+        );
+    }
+
+    #[test]
+    fn filter_enter_commits() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Enter),
+                Mode::Chat,
+                Focus::Log,
+                &none_modal(),
+                true
+            ),
+            Action::FilterEsc
+        );
+    }
+
+    #[test]
+    fn filter_backspace() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Backspace),
+                Mode::Chat,
+                Focus::Log,
+                &none_modal(),
+                true
+            ),
+            Action::FilterBackspace
+        );
+    }
+
+    #[test]
+    fn filter_char_none_and_shift() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('f')),
+                Mode::Chat,
+                Focus::Log,
+                &none_modal(),
+                true
+            ),
+            Action::FilterChar('f')
+        );
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('F'), KeyModifiers::SHIFT),
+                Mode::Chat,
+                Focus::Log,
+                &none_modal(),
+                true
+            ),
+            Action::FilterChar('F')
+        );
+    }
+
+    #[test]
+    fn filter_unknown_fallthrough() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Tab),
+                Mode::Chat,
+                Focus::Log,
+                &none_modal(),
+                true
+            ),
+            Action::Unknown
+        );
+    }
+
+    // ─── Chat input dispatch (map_chat_input_key) ───────────────────────────────
+
+    #[test]
+    fn chat_input_submit() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Enter),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::InputSubmit
+        );
+    }
+
+    #[test]
+    fn chat_input_newline_shift_enter() {
+        assert_eq!(
+            map_key(
+                k(KeyCode::Enter, KeyModifiers::SHIFT),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::InputNewline
+        );
+    }
+
+    #[test]
+    fn chat_input_ctrl_c_quits() {
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn chat_input_esc_clears() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Esc),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::InputClear
+        );
+    }
+
+    #[test]
+    fn chat_input_backspace() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Backspace),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::InputBackspace
+        );
+    }
+
+    #[test]
+    fn chat_input_tab() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Tab),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::Tab
+        );
+    }
+
+    #[test]
+    fn chat_input_backtab() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::BackTab),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::BackTab
+        );
+    }
+
+    #[test]
+    fn chat_input_char_none_and_shift() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('h')),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::InputChar('h')
+        );
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('H'), KeyModifiers::SHIFT),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::InputChar('H')
+        );
+    }
+
+    #[test]
+    fn chat_input_slash_emits_inputchar() {
+        // `/` in the chat box is emitted as InputChar; app.rs intercepts it.
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('/')),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::InputChar('/')
+        );
+    }
+
+    #[test]
+    fn chat_input_unknown_fallthrough() {
+        // Ctrl + non-'c' char hits no arm in the chat input map.
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::Unknown
+        );
+    }
+
+    // ─── Global / monitor dispatch (map_global_key) ─────────────────────────────
+
+    #[test]
+    fn global_quit_q() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('q')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn global_quit_ctrl_c() {
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Mode::Monitor,
+                Focus::AiActivity,
+                &none_modal(),
+                false
+            ),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn global_up_arrow_and_k() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Up),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Up
+        );
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('k')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Up
+        );
+    }
+
+    #[test]
+    fn global_down_arrow_and_j() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Down),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Down
+        );
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('j')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Down
+        );
+    }
+
+    #[test]
+    fn global_top_g() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('g')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Top
+        );
+    }
+
+    #[test]
+    fn global_bottom_g_shift_and_none() {
+        assert_eq!(
+            map_key(
+                k(KeyCode::Char('G'), KeyModifiers::SHIFT),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Bottom
+        );
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('G')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Bottom
+        );
+    }
+
+    #[test]
+    fn global_tab_and_backtab() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Tab),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Tab
+        );
+        assert_eq!(
+            map_key(
+                kn(KeyCode::BackTab),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::BackTab
+        );
+    }
+
+    #[test]
+    fn global_enter_on_log_is_zoom() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Enter),
+                Mode::Monitor,
+                Focus::Log,
+                &none_modal(),
+                false
+            ),
+            Action::ToggleZoom
+        );
+    }
+
+    #[test]
+    fn global_enter_elsewhere_is_enter() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Enter),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Enter
+        );
+    }
+
+    #[test]
+    fn global_log_toggle_wrap_w() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('w')),
+                Mode::Monitor,
+                Focus::Log,
+                &none_modal(),
+                false
+            ),
+            Action::ToggleWrap
+        );
+    }
+
+    #[test]
+    fn global_log_open_switcher_l() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('l')),
+                Mode::Monitor,
+                Focus::Log,
+                &none_modal(),
+                false
+            ),
+            Action::OpenLogSwitcher
+        );
+    }
+
+    #[test]
+    fn global_log_approve_symlink_a() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('a')),
+                Mode::Monitor,
+                Focus::Log,
+                &none_modal(),
+                false
+            ),
+            Action::ApproveSymlink
+        );
+    }
+
+    #[test]
+    fn global_approve_y() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('y')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Approve
+        );
+    }
+
+    #[test]
+    fn global_reject_n() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('n')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Reject
+        );
+    }
+
+    #[test]
+    fn global_opsdag_cancel_c() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('c')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::CancelOp
+        );
+    }
+
+    #[test]
+    fn global_opsdag_await_a() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('a')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::AwaitOp
+        );
+    }
+
+    #[test]
+    fn global_opsdag_pin_p() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('p')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::PinOp
+        );
+    }
+
+    #[test]
+    fn global_toggle_help() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('?')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::ToggleHelp
+        );
+    }
+
+    #[test]
+    fn global_toggle_detail_d() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('d')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::ToggleDetail
+        );
+    }
+
+    #[test]
+    fn global_open_palette_colon() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char(':')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::OpenPalette
+        );
+    }
+
+    #[test]
+    fn global_slash_opens_navigator_when_not_log() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('/')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::OpenNavigator
+        );
+    }
+
+    #[test]
+    fn global_slash_starts_filter_when_log() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('/')),
+                Mode::Monitor,
+                Focus::Log,
+                &none_modal(),
+                false
+            ),
+            Action::StartFilter
+        );
+    }
+
+    #[test]
+    fn global_esc_focuses_chat() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Esc),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::FocusChat
+        );
+    }
+
+    #[test]
+    fn global_unknown_fallthrough() {
+        // 'z' with no modifier matches no global arm.
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('z')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::Unknown
+        );
+    }
+
+    #[test]
+    fn global_w_off_log_is_unknown() {
+        // 'w' only special on Log focus; elsewhere falls through.
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('w')),
+                Mode::Monitor,
+                Focus::AiActivity,
+                &none_modal(),
+                false
+            ),
+            Action::Unknown
+        );
+    }
+
+    #[test]
+    fn modal_priority_navigator_beats_filter_and_chat() {
+        // Even with log_filter_active and Chat focus, an open Navigator modal wins.
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Esc),
+                Mode::Chat,
+                Focus::Chat,
+                &navigator_modal(),
+                true
+            ),
+            Action::NavEsc
+        );
+    }
+
+    #[test]
+    fn filter_beats_chat_focus() {
+        // log_filter_active takes priority over Chat focus when no modal is open.
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('a')),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                true
+            ),
+            Action::FilterChar('a')
+        );
+    }
+}

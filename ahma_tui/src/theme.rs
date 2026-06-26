@@ -170,3 +170,164 @@ impl Theme {
         Self { unicode }
     }
 }
+
+#[cfg(all(test, feature = "tui"))]
+mod tests {
+    use super::*;
+    use crate::state::{ActivityStatus, LogLevel, OpStatus};
+    use ratatui::style::{Color, Modifier, Style};
+
+    #[test]
+    fn new_sets_unicode_flag() {
+        assert!(Theme::new(true).unicode);
+        assert!(!Theme::new(false).unicode);
+    }
+
+    #[test]
+    fn status_colour_methods() {
+        let t = Theme::new(true);
+        assert_eq!(
+            t.running(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(t.success(), Style::default().fg(Color::Green));
+        assert_eq!(
+            t.failed(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(t.pending(), Style::default().fg(Color::Yellow));
+        assert_eq!(t.waiting(), Style::default().fg(Color::DarkGray));
+        assert_eq!(
+            t.cancelled(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn ui_chrome_methods() {
+        let t = Theme::new(false);
+        assert_eq!(
+            t.header_bar(),
+            Style::default().bg(Color::DarkGray).fg(Color::White)
+        );
+        assert_eq!(t.input_bg(), Style::default().bg(Color::Rgb(24, 28, 36)));
+        assert_eq!(
+            t.input_placeholder(),
+            Style::default().fg(Color::Rgb(100, 110, 120))
+        );
+        assert_eq!(
+            t.title(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            t.selected_item(),
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(t.normal(), Style::default());
+        assert_eq!(t.dim(), Style::default().fg(Color::DarkGray));
+        assert_eq!(
+            t.healthy(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            t.unhealthy(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(t.unknown_health(), Style::default().fg(Color::Yellow));
+        assert_eq!(
+            t.approval_border(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            t.approval_key(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(t.approval_note(), Style::default().fg(Color::Yellow));
+        assert_eq!(
+            t.footer(),
+            Style::default().bg(Color::DarkGray).fg(Color::DarkGray)
+        );
+        assert_eq!(
+            t.footer_key(),
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn border_and_scrollbar_methods() {
+        let t = Theme::new(true);
+        assert_eq!(t.border_focused(), Style::default().fg(Color::Cyan));
+        assert_eq!(t.border_unfocused(), Style::default().fg(Color::DarkGray));
+        assert_eq!(
+            t.scrollbar_thumb(),
+            Style::default().bg(Color::Rgb(110, 120, 132))
+        );
+        assert_eq!(
+            t.scrollbar_track(),
+            Style::default().bg(Color::Rgb(44, 50, 60))
+        );
+    }
+
+    #[test]
+    fn log_style_covers_every_level() {
+        let t = Theme::new(true);
+        assert_eq!(
+            t.log_style(&LogLevel::Info),
+            Style::default().fg(Color::White)
+        );
+        assert_eq!(
+            t.log_style(&LogLevel::Warn),
+            Style::default().fg(Color::Yellow)
+        );
+        assert_eq!(
+            t.log_style(&LogLevel::Error),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            t.log_style(&LogLevel::Debug),
+            Style::default().fg(Color::DarkGray)
+        );
+    }
+
+    #[test]
+    fn op_status_style_covers_every_variant() {
+        let t = Theme::new(true);
+        assert_eq!(t.op_status_style(&OpStatus::Running), t.running());
+        assert_eq!(t.op_status_style(&OpStatus::Succeeded), t.success());
+        assert_eq!(t.op_status_style(&OpStatus::Failed), t.failed());
+        assert_eq!(t.op_status_style(&OpStatus::Pending), t.pending());
+        assert_eq!(t.op_status_style(&OpStatus::Waiting), t.waiting());
+        assert_eq!(t.op_status_style(&OpStatus::Cancelled), t.cancelled());
+    }
+
+    #[test]
+    fn activity_status_style_covers_every_variant() {
+        let t = Theme::new(false);
+        assert_eq!(
+            t.activity_status_style(&ActivityStatus::Running),
+            t.running()
+        );
+        assert_eq!(
+            t.activity_status_style(&ActivityStatus::Success),
+            t.success()
+        );
+        assert_eq!(t.activity_status_style(&ActivityStatus::Failed), t.failed());
+        assert_eq!(
+            t.activity_status_style(&ActivityStatus::Cancelled),
+            t.cancelled()
+        );
+    }
+}

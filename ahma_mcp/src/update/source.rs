@@ -134,7 +134,11 @@ fn which_command(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{LazyLock, Mutex};
+    use tempfile::tempdir;
 
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -196,5 +200,155 @@ mod tests {
         let count = flags.matches("reqwest_unstable").count();
         assert_eq!(count, 1, "flag should appear exactly once, got: '{flags}'");
         unsafe { std::env::remove_var("RUSTFLAGS") };
+    }
+
+    #[tokio::test]
+    async fn test_install_from_git_ref_dry_run_returns_binary_path() {
+        let dir = tempdir().unwrap();
+        let install_dir = dir.path();
+        let result = install_from_git_ref("main", install_dir, true).await;
+        assert!(
+            result.is_ok(),
+            "dry-run should succeed without spawning cargo"
+        );
+        let path = result.unwrap();
+        let expected_name = if cfg!(target_os = "windows") {
+            "ahma.exe"
+        } else {
+            "ahma"
+        };
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some(expected_name),
+            "dry-run path should end in the platform binary name, got {}",
+            path.display()
+        );
+        assert!(
+            path.starts_with(install_dir),
+            "binary path {} should be under install_dir {}",
+            path.display(),
+            install_dir.display()
+        );
+        assert_eq!(path, install_dir.join(expected_name));
+    }
+
+    #[test]
+    fn test_which_command_finds_file_on_path() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let saved_path = std::env::var_os("PATH");
+
+        let dir = tempdir().unwrap();
+        // The code checks `is_file()` on `dir.join(name)`; on Windows it also
+        // checks `{name}.exe`. Create both so the lookup is deterministic
+        // regardless of platform.
+        let bin = dir.path().join("fakebin");
+        fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&bin, perms).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            fs::write(dir.path().join("fakebin.exe"), b"").unwrap();
+        }
+
+        // SAFETY: test-only; ENV_MUTEX serializes env access in this module.
+        unsafe { std::env::set_var("PATH", dir.path()) };
+
+        let found = which_command("fakebin");
+        assert!(found.is_some(), "fakebin should be found on PATH");
+
+        let missing = which_command("definitely_not_a_real_binary_xyz");
+        assert!(missing.is_none(), "nonexistent binary should not be found");
+
+        // Restore PATH for other tests.
+        // SAFETY: test-only; ENV_MUTEX held.
+        unsafe {
+            match saved_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_which_command_none_when_path_empty() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let saved_path = std::env::var_os("PATH");
+
+        let dir = tempdir().unwrap(); // empty dir, no matching file
+        // SAFETY: test-only; ENV_MUTEX held.
+        unsafe { std::env::set_var("PATH", dir.path()) };
+
+        assert!(
+            which_command("fakebin").is_none(),
+            "no binary present in PATH dir, expected None"
+        );
+
+        // SAFETY: test-only; ENV_MUTEX held.
+        unsafe {
+            match saved_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_which_cargo_uses_which_command() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let saved_path = std::env::var_os("PATH");
+
+        let dir = tempdir().unwrap();
+        let cargo_name = if cfg!(target_os = "windows") {
+            "cargo.exe"
+        } else {
+            "cargo"
+        };
+        let bin = dir.path().join(cargo_name);
+        fs::write(&bin, b"").unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&bin, perms).unwrap();
+        }
+
+        // SAFETY: test-only; ENV_MUTEX held.
+        unsafe { std::env::set_var("PATH", dir.path()) };
+
+        let found = which_cargo();
+        assert!(found.is_some(), "cargo placed on PATH should be found");
+        assert_eq!(
+            found.unwrap().file_name().and_then(|n| n.to_str()),
+            Some(cargo_name)
+        );
+
+        // SAFETY: test-only; ENV_MUTEX held.
+        unsafe {
+            match saved_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_cargo_install_command_has_locked_force_and_bin() {
+        let cmd = build_cargo_install_command("main", Path::new("/opt/tools"));
+        assert!(cmd.contains(&"--locked".to_string()), "expected --locked");
+        assert!(cmd.contains(&"--force".to_string()), "expected --force");
+        assert!(cmd.contains(&"--bin".to_string()), "expected --bin");
+        assert!(
+            cmd.contains(&"ahma".to_string()),
+            "expected ahma bin target"
+        );
+        assert!(cmd.contains(&"--git".to_string()), "expected --git");
+        assert!(cmd.contains(&GIT_REPO_URL.to_string()), "expected repo URL");
+        // --git must be immediately followed by the repo URL.
+        let git_idx = cmd.iter().position(|s| s == "--git").unwrap();
+        assert_eq!(cmd[git_idx + 1], GIT_REPO_URL);
     }
 }
