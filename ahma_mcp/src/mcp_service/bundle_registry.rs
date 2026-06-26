@@ -78,3 +78,157 @@ pub fn find_bundle(name: &str) -> Option<&'static BundleInfo> {
 pub fn bundle_config_name(name: &str) -> Option<&'static str> {
     find_bundle(name).map(|b| b.config_tool_name)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Every entry the registry is expected to ship, as (name, config_tool_name).
+    const EXPECTED: &[(&str, &str)] = &[
+        ("rust", "cargo"),
+        ("fileutils", "file-tools"),
+        ("github", "gh"),
+        ("git", "git"),
+        ("python", "python"),
+        ("simplify", "simplify"),
+    ];
+
+    #[test]
+    fn bundles_constant_is_non_empty() {
+        assert!(!BUNDLES.is_empty(), "BUNDLES must not be empty");
+    }
+
+    #[test]
+    fn bundles_contains_every_known_bundle_with_correct_config_name() {
+        for (name, config) in EXPECTED {
+            let found = BUNDLES
+                .iter()
+                .find(|b| b.name == *name)
+                .unwrap_or_else(|| panic!("bundle '{name}' missing from BUNDLES"));
+            assert_eq!(
+                found.config_tool_name, *config,
+                "bundle '{name}' has wrong config_tool_name"
+            );
+        }
+    }
+
+    #[test]
+    fn bundles_count_matches_expected() {
+        assert_eq!(
+            BUNDLES.len(),
+            EXPECTED.len(),
+            "BUNDLES length changed; update EXPECTED to match"
+        );
+    }
+
+    #[test]
+    fn bundle_fields_are_populated() {
+        for b in BUNDLES {
+            assert!(!b.name.is_empty(), "name must be non-empty");
+            assert!(
+                !b.config_tool_name.is_empty(),
+                "config_tool_name must be non-empty"
+            );
+            assert!(!b.description.is_empty(), "description must be non-empty");
+            assert!(!b.ai_hint.is_empty(), "ai_hint must be non-empty");
+        }
+    }
+
+    #[test]
+    fn bundle_info_is_debug_and_clone() {
+        // Exercise the derived Debug + Clone impls.
+        let original = &BUNDLES[0];
+        let cloned = original.clone();
+        assert_eq!(cloned.name, original.name);
+        assert_eq!(cloned.config_tool_name, original.config_tool_name);
+        let dbg = format!("{cloned:?}");
+        assert!(
+            dbg.contains(original.name),
+            "Debug output should include name"
+        );
+    }
+
+    #[test]
+    fn loaded_bundle_names_returns_matching_subset() {
+        let mut keys = HashSet::new();
+        keys.insert("cargo".to_string());
+        keys.insert("git".to_string());
+
+        let loaded = loaded_bundle_names(&keys);
+        let names: Vec<&str> = loaded.iter().map(|b| b.name).collect();
+
+        assert_eq!(loaded.len(), 2, "expected exactly two matching bundles");
+        assert!(
+            names.contains(&"rust"),
+            "cargo key should yield 'rust' bundle"
+        );
+        assert!(names.contains(&"git"), "git key should yield 'git' bundle");
+        assert!(
+            !names.contains(&"python"),
+            "python should not be loaded when its key is absent"
+        );
+    }
+
+    #[test]
+    fn loaded_bundle_names_empty_set_returns_empty() {
+        let keys: HashSet<String> = HashSet::new();
+        let loaded = loaded_bundle_names(&keys);
+        assert!(loaded.is_empty(), "empty key set must yield no bundles");
+    }
+
+    #[test]
+    fn loaded_bundle_names_unrelated_key_returns_empty() {
+        let mut keys = HashSet::new();
+        keys.insert("does-not-exist".to_string());
+        // A config_tool_name is "file-tools", so the bundle NAME "fileutils"
+        // must NOT match a key lookup.
+        keys.insert("fileutils".to_string());
+
+        let loaded = loaded_bundle_names(&keys);
+        assert!(
+            loaded.is_empty(),
+            "unrelated keys (incl. bundle name, not config name) must yield no bundles"
+        );
+    }
+
+    #[test]
+    fn loaded_bundle_names_matches_on_config_name_not_human_name() {
+        let mut keys = HashSet::new();
+        keys.insert("file-tools".to_string()); // config_tool_name for the "fileutils" bundle
+        let loaded = loaded_bundle_names(&keys);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "fileutils");
+    }
+
+    #[test]
+    fn find_bundle_known_name_returns_some() {
+        let b = find_bundle("rust").expect("'rust' bundle should exist");
+        assert_eq!(b.name, "rust");
+        assert_eq!(b.config_tool_name, "cargo");
+    }
+
+    #[test]
+    fn find_bundle_unknown_name_returns_none() {
+        assert!(find_bundle("nonexistent").is_none());
+        // Looking up by config name (not human name) must also miss.
+        assert!(find_bundle("cargo").is_none());
+    }
+
+    #[test]
+    fn bundle_config_name_known_returns_config_tool_name() {
+        for (name, config) in EXPECTED {
+            assert_eq!(
+                bundle_config_name(name),
+                Some(*config),
+                "bundle_config_name('{name}') mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_config_name_unknown_returns_none() {
+        assert!(bundle_config_name("nonexistent").is_none());
+        assert!(bundle_config_name("").is_none());
+    }
+}

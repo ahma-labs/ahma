@@ -157,4 +157,87 @@ mod tests {
         assert_eq!(loaded.bundles.len(), 1);
         assert_eq!(loaded.bundles[0].name, "rust");
     }
+
+    #[test]
+    fn builtin_index_is_well_formed() {
+        let idx = BundleIndex::builtin();
+        // version field is the compiled-in v1 schema
+        assert_eq!(idx.version, 1);
+        // Built-in index must not be empty (the unwrap_or empty fallback is the failure case)
+        assert!(!idx.bundles.is_empty(), "builtin index should list bundles");
+
+        // Known first-party bundles are present and well-formed.
+        for name in ["rust", "python", "git", "fileutils", "github"] {
+            let entry = idx
+                .find(name)
+                .unwrap_or_else(|| panic!("builtin index should contain `{name}`"));
+            assert_eq!(entry.name, name);
+            assert!(!entry.version.is_empty());
+            assert!(!entry.description.is_empty());
+            assert_eq!(entry.author, "ahma-project");
+            assert_eq!(entry.sha256, "builtin");
+            assert!(entry.url.is_none());
+        }
+
+        // Spot-check a specific description so the field is load-bearing.
+        assert_eq!(
+            idx.find("rust").unwrap().description,
+            "Rust/Cargo build and test tools"
+        );
+    }
+
+    #[test]
+    fn load_from_file_missing_path_is_err() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("does_not_exist.json");
+        let result = BundleIndex::load_from_file(&missing);
+        assert!(result.is_err(), "loading a non-existent path must error");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("Failed to read bundle index"),
+            "error should carry read context, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_from_file_malformed_json_is_err() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("garbage.json");
+        std::fs::write(&path, b"{ this is not valid json ]").unwrap();
+        let result = BundleIndex::load_from_file(&path);
+        assert!(result.is_err(), "malformed JSON must error");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("Failed to parse bundle index JSON"),
+            "error should carry parse context, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn save_creates_missing_parent_directories() {
+        let tmp = TempDir::new().unwrap();
+        // Nested path whose parent dirs do not yet exist -> exercises create_dir_all branch.
+        let path = tmp.path().join("a").join("b").join("c").join("index.json");
+        let idx = sample_index();
+        idx.save(&path).unwrap();
+
+        assert!(path.exists(), "save should have created the nested file");
+        let loaded = BundleIndex::load_from_file(&path).unwrap();
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.bundles.len(), 1);
+        assert_eq!(loaded.bundles[0].name, "rust");
+        assert_eq!(loaded.bundles[0].sha256, "aabbccdd");
+    }
+
+    #[test]
+    fn find_and_is_trusted_negative_branches() {
+        let idx = sample_index();
+        // find returns None for an unknown name.
+        assert!(idx.find("nonexistent").is_none());
+        // is_trusted false for unknown name AND for known name with wrong hash.
+        assert!(!idx.is_trusted("nonexistent", "aabbccdd"));
+        assert!(!idx.is_trusted("rust", "00000000"));
+        // Sanity: the positive case still holds.
+        assert!(idx.is_trusted("rust", "aabbccdd"));
+    }
 }
