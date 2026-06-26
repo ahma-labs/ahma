@@ -1905,4 +1905,537 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    // ── Budget math edge cases (tool_result_char_cap / conversation_char_budget) ──
+
+    #[test]
+    fn budgets_clamp_to_minimum_for_tiny_context() {
+        // 100 tokens * 4 chars / 4 = 100 → clamped up to the 1_000 floor.
+        let cfg = cfg_with(Some(100), false);
+        assert_eq!(tool_result_char_cap(&cfg), 1_000);
+        // 100 * 4 * 3 / 4 = 300 → clamped up to the 4_000 floor.
+        assert_eq!(conversation_char_budget(&cfg), 4_000);
+    }
+
+    #[test]
+    fn budgets_zero_context_uses_floor() {
+        let cfg = cfg_with(Some(0), false);
+        assert_eq!(tool_result_char_cap(&cfg), 1_000);
+        assert_eq!(conversation_char_budget(&cfg), 4_000);
+    }
+
+    #[test]
+    fn budgets_default_caps_without_context_or_harness() {
+        let cfg = cfg_with(None, false);
+        assert_eq!(tool_result_char_cap(&cfg), DEFAULT_TOOL_RESULT_CHAR_CAP);
+        assert_eq!(
+            conversation_char_budget(&cfg),
+            DEFAULT_CONVERSATION_CHAR_BUDGET
+        );
+    }
+
+    #[test]
+    fn budgets_small_harness_specific_caps() {
+        let cfg = cfg_with(None, true);
+        assert_eq!(tool_result_char_cap(&cfg), SMALL_MODEL_TOOL_RESULT_CHAR_CAP);
+        assert_eq!(
+            conversation_char_budget(&cfg),
+            SMALL_MODEL_CONVERSATION_CHAR_BUDGET
+        );
+    }
+
+    #[test]
+    fn budgets_context_length_overrides_harness_flag() {
+        // When context_length is Some, the harness flag is ignored entirely.
+        let cfg = cfg_with(Some(8192), true);
+        assert_eq!(tool_result_char_cap(&cfg), 8192);
+        assert_eq!(conversation_char_budget(&cfg), 24_576);
+    }
+
+    // ── truncate_middle ──
+
+    #[test]
+    fn truncate_middle_exact_cap_and_empty_are_noops() {
+        assert_eq!(truncate_middle("abcde", 5), "abcde");
+        assert_eq!(truncate_middle("", 0), "");
+        assert!(truncate_middle("a", 0).contains("characters elided"));
+    }
+
+    #[test]
+    fn truncate_middle_respects_unicode_char_boundaries() {
+        // Mix of 2-byte (é, ü) and 4-byte (😀) characters; truncation works on
+        // char counts, so this must never split a multi-byte char or panic.
+        let s: String = "é".repeat(1000) + "😀😀😀" + &"ü".repeat(1000);
+        let out = truncate_middle(&s, 50);
+        assert!(out.contains("characters elided"), "marker present");
+        assert!(out.starts_with('é'), "head keeps leading multibyte char");
+        assert!(out.ends_with('ü'), "tail keeps trailing multibyte char");
+        // Valid UTF-8 round-trips losslessly through chars().
+        assert_eq!(out.chars().collect::<String>(), out);
+    }
+
+    // ── trim_conversation without a system prompt ──
+
+    #[test]
+    fn trim_conversation_without_system_keeps_two_recent() {
+        let mut msgs = Vec::new();
+        for i in 0..10 {
+            msgs.push(
+                serde_json::json!({"role": "user", "content": format!("m{i}-{}", "y".repeat(500))}),
+            );
+        }
+        trim_conversation(&mut msgs, 1_500);
+        // protected_head == 0: oldest messages dropped, elision notice prepended.
+        assert_eq!(msgs[0]["role"], "user");
+        assert!(
+            msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("removed to fit"),
+            "elision notice present"
+        );
+        assert!(
+            msgs.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("m9"),
+            "latest message preserved"
+        );
+    }
+
+    #[test]
+    fn trim_conversation_stops_at_protected_floor() {
+        // Even an over-budget conversation never drops below the protected
+        // head (system) + 2 most recent messages.
+        let mut msgs = vec![
+            serde_json::json!({"role": "system", "content": "S".repeat(2000)}),
+            serde_json::json!({"role": "user", "content": "U".repeat(2000)}),
+            serde_json::json!({"role": "assistant", "content": "A".repeat(2000)}),
+        ];
+        trim_conversation(&mut msgs, 10);
+        // system + 2 recent are all protected; nothing droppable, no notice added.
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "system");
+    }
+
+    // ── prepare_tool_definitions ──
+
+    #[test]
+    fn prepare_tool_definitions_maps_and_defaults_description() {
+        let tools = vec![
+            ahma_mcp::mcp_client::ToolInfo {
+                name: "with_desc".to_string(),
+                description: Some("does X".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ahma_mcp::mcp_client::ToolInfo {
+                name: "no_desc".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object", "required": ["a"]}),
+            },
+        ];
+        let defs = prepare_tool_definitions(tools);
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0]["type"], "function");
+        assert_eq!(defs[0]["function"]["name"], "with_desc");
+        assert_eq!(defs[0]["function"]["description"], "does X");
+        assert_eq!(defs[0]["function"]["parameters"]["type"], "object");
+        // None description falls back to the canned text.
+        assert_eq!(
+            defs[1]["function"]["description"],
+            "MCP tool callable from ahma"
+        );
+        assert_eq!(defs[1]["function"]["parameters"]["required"][0], "a");
+    }
+
+    #[test]
+    fn prepare_tool_definitions_empty_input() {
+        assert!(prepare_tool_definitions(Vec::new()).is_empty());
+    }
+
+    // ── plan_harness_hints ──
+
+    #[test]
+    fn plan_harness_hints_flags_error_and_read() {
+        let results = vec![
+            (
+                "id1".to_string(),
+                "read_file".to_string(),
+                serde_json::json!({}),
+                false,
+            ),
+            (
+                "id2".to_string(),
+                "other".to_string(),
+                serde_json::json!({}),
+                true,
+            ),
+        ];
+        let (err, read) = plan_harness_hints(&results, false, false);
+        assert!(err, "a failed call triggers the error hint");
+        assert!(read, "a read_file call triggers the read hint");
+    }
+
+    #[test]
+    fn plan_harness_hints_list_dir_triggers_read() {
+        let results = vec![(
+            "id".to_string(),
+            "list_dir".to_string(),
+            serde_json::json!({}),
+            false,
+        )];
+        let (err, read) = plan_harness_hints(&results, false, false);
+        assert!(!err);
+        assert!(read);
+    }
+
+    #[test]
+    fn plan_harness_hints_respects_already_hinted() {
+        let results = vec![(
+            "id".to_string(),
+            "read_file".to_string(),
+            serde_json::json!({}),
+            true,
+        )];
+        let (err, read) = plan_harness_hints(&results, true, true);
+        assert!(!err, "error already hinted earlier");
+        assert!(!read, "read already hinted earlier");
+    }
+
+    #[test]
+    fn plan_harness_hints_no_triggers_for_plain_success() {
+        let results = vec![(
+            "id".to_string(),
+            "build".to_string(),
+            serde_json::json!({}),
+            false,
+        )];
+        let (err, read) = plan_harness_hints(&results, false, false);
+        assert!(!err);
+        assert!(!read);
+    }
+
+    // ── append_hint_to_field ──
+
+    #[test]
+    fn append_hint_to_field_appends_only_to_existing_string() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("output".to_string(), serde_json::json!("base"));
+        obj.insert("num".to_string(), serde_json::json!(5));
+        append_hint_to_field(&mut obj, "output", "+hint");
+        assert_eq!(obj["output"], "base+hint");
+        // Non-string field is untouched.
+        append_hint_to_field(&mut obj, "num", "+hint");
+        assert_eq!(obj["num"], 5);
+        // Missing key is a no-op (no panic, no insertion).
+        append_hint_to_field(&mut obj, "missing", "+hint");
+        assert!(obj.get("missing").is_none());
+    }
+
+    // ── push_tool_message_with_hints ──
+
+    #[test]
+    fn push_tool_message_injects_error_hint_into_error_key() {
+        let mut msgs = Vec::new();
+        let mut error_hinted = false;
+        let mut read_hinted = false;
+        push_tool_message_with_hints(
+            &mut msgs,
+            "call1".to_string(),
+            "build",
+            serde_json::json!({"error": "boom"}),
+            true, // failed
+            true, // inject_error_hint
+            false,
+            &mut error_hinted,
+            &mut read_hinted,
+            100_000,
+        );
+        assert!(error_hinted, "error_hinted latch flips");
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["tool_call_id"], "call1");
+        let content = msgs[0]["content"].as_str().unwrap();
+        assert!(content.contains("Harness Hint"), "hint injected: {content}");
+        assert!(content.contains("boom"), "original error retained");
+    }
+
+    #[test]
+    fn push_tool_message_error_hint_uses_output_key_when_no_error_key() {
+        let mut msgs = Vec::new();
+        let mut error_hinted = false;
+        let mut read_hinted = false;
+        push_tool_message_with_hints(
+            &mut msgs,
+            "c".to_string(),
+            "build",
+            serde_json::json!({"output": "stuff"}),
+            true,
+            true,
+            false,
+            &mut error_hinted,
+            &mut read_hinted,
+            100_000,
+        );
+        assert!(error_hinted);
+        let content = msgs[0]["content"].as_str().unwrap();
+        assert!(content.contains("Harness Hint"));
+        assert!(content.contains("stuff"));
+    }
+
+    #[test]
+    fn push_tool_message_injects_read_hint_for_read_tools() {
+        for tool in ["read_file", "list_dir"] {
+            let mut msgs = Vec::new();
+            let mut error_hinted = false;
+            let mut read_hinted = false;
+            push_tool_message_with_hints(
+                &mut msgs,
+                "c".to_string(),
+                tool,
+                serde_json::json!({"output": "file contents"}),
+                false,
+                false,
+                true,
+                &mut error_hinted,
+                &mut read_hinted,
+                100_000,
+            );
+            assert!(read_hinted, "read latch flips for {tool}");
+            let content = msgs[0]["content"].as_str().unwrap();
+            assert!(
+                content.contains("replace_in_file"),
+                "read hint mentions replace_in_file for {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn push_tool_message_no_hints_when_flags_off() {
+        let mut msgs = Vec::new();
+        let mut error_hinted = false;
+        let mut read_hinted = false;
+        push_tool_message_with_hints(
+            &mut msgs,
+            "c".to_string(),
+            "build",
+            serde_json::json!({"output": "ok"}),
+            false,
+            false,
+            false,
+            &mut error_hinted,
+            &mut read_hinted,
+            100_000,
+        );
+        assert!(!error_hinted);
+        assert!(!read_hinted);
+        let content = msgs[0]["content"].as_str().unwrap();
+        assert!(!content.contains("Harness Hint"));
+    }
+
+    #[test]
+    fn push_tool_message_skips_error_hint_when_already_hinted() {
+        let mut msgs = Vec::new();
+        let mut error_hinted = true; // a prior tool already emitted the hint
+        let mut read_hinted = false;
+        push_tool_message_with_hints(
+            &mut msgs,
+            "c".to_string(),
+            "build",
+            serde_json::json!({"error": "boom"}),
+            true,
+            true,
+            false,
+            &mut error_hinted,
+            &mut read_hinted,
+            100_000,
+        );
+        let content = msgs[0]["content"].as_str().unwrap();
+        assert!(!content.contains("Harness Hint"), "no double hint");
+        assert!(content.contains("boom"));
+    }
+
+    #[test]
+    fn push_tool_message_truncates_large_payload() {
+        let mut msgs = Vec::new();
+        let mut error_hinted = false;
+        let mut read_hinted = false;
+        let big = "x".repeat(5000);
+        push_tool_message_with_hints(
+            &mut msgs,
+            "c".to_string(),
+            "build",
+            serde_json::json!({"output": big}),
+            false,
+            false,
+            false,
+            &mut error_hinted,
+            &mut read_hinted,
+            500,
+        );
+        let content = msgs[0]["content"].as_str().unwrap();
+        assert!(content.contains("characters elided"), "truncation applied");
+        assert!(content.chars().count() < 800, "capped near the budget");
+    }
+
+    // ── encode_file_uri ──
+
+    #[test]
+    fn encode_file_uri_produces_file_scheme() {
+        let uri = encode_file_uri(std::path::Path::new("/a/b/c"));
+        assert!(uri.starts_with("file://"), "got {uri}");
+        assert!(uri.ends_with("/a/b/c"), "got {uri}");
+    }
+
+    #[test]
+    fn encode_file_uri_normalizes_backslashes() {
+        let uri = encode_file_uri(std::path::Path::new(r"a\b\c"));
+        assert!(uri.contains("a/b/c"), "separators normalized: {uri}");
+        assert!(!uri.contains('\\'), "no backslashes remain: {uri}");
+    }
+
+    // ── SSE framing: first_sse_event_boundary / pop_next_sse_event / event_data_to_json ──
+
+    #[test]
+    fn first_sse_event_boundary_lf_crlf_and_none() {
+        assert_eq!(first_sse_event_boundary("ab\n\ncd"), Some((2, 2)));
+        assert_eq!(first_sse_event_boundary("ab\r\n\r\ncd"), Some((2, 4)));
+        assert_eq!(first_sse_event_boundary("no boundary here"), None);
+    }
+
+    #[test]
+    fn first_sse_event_boundary_prefers_earliest() {
+        // CRLF boundary precedes a later LF boundary.
+        assert_eq!(first_sse_event_boundary("a\r\n\r\nb\n\nc"), Some((1, 4)));
+        // LF boundary precedes a later CRLF boundary.
+        assert_eq!(first_sse_event_boundary("ab\n\nx\r\n\r\ny"), Some((2, 2)));
+    }
+
+    #[test]
+    fn pop_next_sse_event_extracts_and_leaves_remainder() {
+        let mut buf = "event1\n\nevent2\n\n".to_string();
+        assert_eq!(pop_next_sse_event(&mut buf).as_deref(), Some("event1"));
+        assert_eq!(buf, "event2\n\n");
+        assert_eq!(pop_next_sse_event(&mut buf).as_deref(), Some("event2"));
+        assert_eq!(buf, "");
+        // No remaining boundary → None, buffer untouched.
+        assert_eq!(pop_next_sse_event(&mut buf), None);
+    }
+
+    #[test]
+    fn event_data_to_json_parses_single_and_multiline() {
+        let v = event_data_to_json("data: {\"a\":1}").unwrap();
+        assert_eq!(v["a"], 1);
+        // Multi-line data with CRLF endings is joined and parsed as one value.
+        let raw = "data: {\r\ndata: \"k\": 1\r\ndata: }";
+        let v2 = event_data_to_json(raw).unwrap();
+        assert_eq!(v2["k"], 1);
+    }
+
+    #[test]
+    fn event_data_to_json_none_for_no_data_or_invalid() {
+        // No `data:` lines at all.
+        assert!(event_data_to_json("event: ping\nid: 1").is_none());
+        // Present but unparseable JSON.
+        assert!(event_data_to_json("data: not json {").is_none());
+    }
+
+    // ── parse_mcp_response / parse_error_message / extract_content_text ──
+
+    #[test]
+    fn parse_mcp_response_error_field() {
+        let resp = serde_json::json!({"error": {"message": "bad"}});
+        let (text, is_err) = parse_mcp_response(&resp);
+        assert!(is_err);
+        assert_eq!(text, "Error: bad");
+    }
+
+    #[test]
+    fn parse_mcp_response_error_without_message_defaults() {
+        let (text, is_err) = parse_mcp_response(&serde_json::json!({"error": {}}));
+        assert!(is_err);
+        assert_eq!(text, "Error: unknown error");
+    }
+
+    #[test]
+    fn parse_mcp_response_is_error_flag_with_content() {
+        let resp = serde_json::json!({
+            "result": {"isError": true, "content": [{"type": "text", "text": "oops"}]}
+        });
+        let (text, is_err) = parse_mcp_response(&resp);
+        assert!(is_err, "isError flag surfaces as error");
+        assert_eq!(text, "oops");
+    }
+
+    #[test]
+    fn parse_mcp_response_success_joins_content_lines() {
+        let resp = serde_json::json!({
+            "result": {"content": [
+                {"type": "text", "text": "line1"},
+                {"type": "text", "text": "line2"},
+            ]}
+        });
+        let (text, is_err) = parse_mcp_response(&resp);
+        assert!(!is_err);
+        assert_eq!(text, "line1\nline2");
+    }
+
+    #[test]
+    fn parse_mcp_response_empty_result_object() {
+        let (text, is_err) = parse_mcp_response(&serde_json::json!({}));
+        assert!(!is_err);
+        assert_eq!(text, "Empty result");
+    }
+
+    #[test]
+    fn parse_mcp_response_result_without_content_pretty_prints() {
+        let resp = serde_json::json!({"result": {"foo": "bar"}});
+        let (text, is_err) = parse_mcp_response(&resp);
+        assert!(!is_err);
+        assert!(text.contains("\"foo\""), "pretty JSON: {text}");
+        assert!(text.contains("\"bar\""), "pretty JSON: {text}");
+    }
+
+    // ── needs_approval ──
+
+    #[test]
+    fn needs_approval_when_globally_enabled_is_always_true() {
+        assert!(needs_approval("read_file", true));
+        assert!(needs_approval("anything_at_all", true));
+    }
+
+    #[test]
+    fn needs_approval_disabled_only_for_mutating_tools() {
+        assert!(needs_approval("write_file", false));
+        assert!(needs_approval("replace_in_file", false));
+        assert!(needs_approval("server::write_file", false));
+        assert!(needs_approval("server::replace_in_file", false));
+        // Read-only / unrelated tools do not require approval.
+        assert!(!needs_approval("read_file", false));
+        assert!(!needs_approval("status", false));
+        assert!(!needs_approval("server::read_file", false));
+    }
+
+    // ── resolve_llm_connection (URL fast-path, no config dependency) ──
+
+    #[test]
+    fn resolve_llm_connection_url_provider_bypasses_config() {
+        let (base, model, key) = resolve_llm_connection(
+            Some("http://localhost:1234/v1".to_string()),
+            Some("my-model".to_string()),
+        )
+        .expect("URL provider resolves without config");
+        assert_eq!(base, "http://localhost:1234/v1");
+        assert_eq!(model, "my-model");
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn resolve_llm_connection_url_provider_uses_empty_default_model() {
+        let (base, model, key) =
+            resolve_llm_connection(Some("unix:///run/ahma.sock".to_string()), None)
+                .expect("unix URL provider resolves");
+        assert_eq!(base, "unix:///run/ahma.sock");
+        assert_eq!(model, "", "missing model defaults to empty string");
+        assert!(key.is_none());
+    }
 }

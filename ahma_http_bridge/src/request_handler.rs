@@ -1788,4 +1788,748 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
     }
+
+    // ─── Additional helpers for sampling / roots tests ──────────────────
+
+    /// Build a cross-platform `file://` URI for an absolute path.
+    fn path_to_file_uri(path: &std::path::Path) -> String {
+        let s = path.to_string_lossy().replace('\\', "/");
+        if s.starts_with('/') {
+            // Unix: "/abs" → "file:///abs"
+            format!("file://{s}")
+        } else {
+            // Windows drive path: "C:/Users/.." → "file:///C:/Users/.."
+            format!("file:///{s}")
+        }
+    }
+
+    async fn make_sampling_session(
+        mgr: &Arc<SessionManager>,
+        name: &str,
+    ) -> Arc<crate::session::Session> {
+        let id = mgr.create_session().await.expect("create session");
+        let session = mgr.get_session(&id).expect("session exists");
+        session
+            .set_client_info(json!({ "name": name }), json!({ "sampling": {} }))
+            .await;
+        session
+    }
+
+    // ─── session_has_sampling / session_name_matches_label ──────────────
+
+    #[tokio::test]
+    async fn session_has_sampling_reflects_capabilities() {
+        let mgr = keepalive_manager();
+        let with = make_sampling_session(&mgr, "Cursor").await;
+        assert!(session_has_sampling(&with).await);
+
+        let id = mgr.create_session().await.expect("create session");
+        let without = mgr.get_session(&id).unwrap();
+        // No capabilities set at all → no sampling.
+        assert!(!session_has_sampling(&without).await);
+
+        without
+            .set_client_info(json!({"name": "x"}), json!({"roots": {}}))
+            .await;
+        assert!(!session_has_sampling(&without).await);
+    }
+
+    #[tokio::test]
+    async fn session_name_matches_label_is_case_insensitive() {
+        let mgr = keepalive_manager();
+        let s = make_sampling_session(&mgr, "Cursor IDE").await;
+        assert!(session_name_matches_label(&s, "cursor").await);
+        assert!(session_name_matches_label(&s, "IDE").await);
+        assert!(!session_name_matches_label(&s, "zed").await);
+
+        // Session without client_info → empty name → only matches empty target.
+        let id = mgr.create_session().await.expect("create session");
+        let bare = mgr.get_session(&id).unwrap();
+        assert!(!session_name_matches_label(&bare, "anything").await);
+    }
+
+    // ─── find_target_session_for_sampling ───────────────────────────────
+
+    #[tokio::test]
+    async fn find_target_session_prefers_label_match() {
+        let mgr = keepalive_manager();
+        let cursor = make_sampling_session(&mgr, "Cursor").await;
+        let _vscode = make_sampling_session(&mgr, "VSCode").await;
+
+        let found = find_target_session_for_sampling(&mgr, "current", Some("cursor"))
+            .await
+            .expect("should find a session");
+        assert_eq!(found.id, cursor.id);
+    }
+
+    #[tokio::test]
+    async fn find_target_session_falls_back_when_label_unmatched() {
+        let mgr = keepalive_manager();
+        let _a = make_sampling_session(&mgr, "VSCode").await;
+        let _b = make_sampling_session(&mgr, "Zed").await;
+
+        // No session named "cursor" → fallback to any session with sampling.
+        let found = find_target_session_for_sampling(&mgr, "current", Some("cursor")).await;
+        assert!(found.is_some());
+        assert!(session_has_sampling(&found.unwrap()).await);
+    }
+
+    #[tokio::test]
+    async fn find_target_session_none_when_no_sampling() {
+        let mgr = keepalive_manager();
+        // A session that exists but advertises no sampling.
+        let id = mgr.create_session().await.expect("create session");
+        mgr.get_session(&id)
+            .unwrap()
+            .set_client_info(json!({"name": "n"}), json!({"roots": {}}))
+            .await;
+        assert!(
+            find_target_session_for_sampling(&mgr, "current", None)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn find_target_session_excludes_current_session() {
+        let mgr = keepalive_manager();
+        let only = make_sampling_session(&mgr, "Cursor").await;
+        // When the only sampling session IS the current one, it is excluded.
+        assert!(
+            find_target_session_for_sampling(&mgr, &only.id, None)
+                .await
+                .is_none()
+        );
+    }
+
+    // ─── handle_routed_sampling_request: broadcast closed ───────────────
+
+    #[tokio::test]
+    async fn routed_sampling_errors_when_target_sse_channel_closed() {
+        let mgr = keepalive_manager();
+        let current = mgr.create_session().await.expect("create session");
+        // Target has sampling but no SSE subscriber → broadcast fails.
+        let _target = make_sampling_session(&mgr, "Cursor").await;
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "sampling/createMessage",
+            "params": {}
+        });
+        let resp = handle_routed_sampling_request(&mgr, &current, &payload, false).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32603);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("SSE channel is closed")
+        );
+    }
+
+    // ─── handle_routed_sampling_request: success (json + sse) ───────────
+
+    async fn drive_routed_response(target: Arc<crate::session::Session>, result: Value) {
+        tokio::spawn(async move {
+            for _ in 0..400 {
+                let key = target
+                    .routed_requests
+                    .iter()
+                    .next()
+                    .map(|e| e.key().clone());
+                if let Some(key) = key
+                    && let Some((_, sender)) = target.routed_requests.remove(&key)
+                {
+                    let _ = sender.send(result.clone());
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn routed_sampling_success_returns_json_with_original_id() {
+        let mgr = keepalive_manager();
+        let current = mgr.create_session().await.expect("create session");
+        let target = make_sampling_session(&mgr, "Cursor").await;
+        // Keep an SSE subscriber alive so broadcast succeeds.
+        let _rx = target.subscribe();
+        drive_routed_response(
+            target.clone(),
+            json!({"jsonrpc": "2.0", "result": {"ok": true}}),
+        )
+        .await;
+
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "sampling/createMessage",
+            "params": {}
+        });
+        let resp = handle_routed_sampling_request(&mgr, &current, &payload, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        // The original request id is restored onto the response.
+        assert_eq!(body["id"], 42);
+        assert_eq!(body["result"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn routed_sampling_success_returns_sse_event() {
+        let mgr = keepalive_manager();
+        let current = mgr.create_session().await.expect("create session");
+        let target = make_sampling_session(&mgr, "Cursor").await;
+        let _rx = target.subscribe();
+        drive_routed_response(
+            target.clone(),
+            json!({"jsonrpc": "2.0", "result": {"answer": 7}}),
+        )
+        .await;
+
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": "req-1",
+            "method": "sampling/createMessage",
+            "params": { "__route_target_label": "cursor" }
+        });
+        let resp = handle_routed_sampling_request(&mgr, &current, &payload, true).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(content_type(&resp).contains("text/event-stream"));
+        assert_eq!(header_session_id(&resp).as_deref(), Some(current.as_str()));
+        let body = body_string(resp).await;
+        assert!(body.contains("answer"), "body was: {body}");
+        assert!(body.contains("req-1"), "body was: {body}");
+    }
+
+    // ─── handle_session_isolated_request routing branches ───────────────
+
+    #[tokio::test]
+    async fn isolated_request_initialize_validates_payload() {
+        let mgr = keepalive_manager();
+        // initialize with no session id but invalid params → -32602.
+        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let resp = handle_session_isolated_request(mgr, HeaderMap::new(), payload).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn isolated_request_routes_sampling_without_target() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sampling/createMessage",
+            "params": {}
+        });
+        let resp = handle_session_isolated_request(mgr, headers_with_session(&id), payload).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body_json(resp).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("No active IDE session")
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_sse_request_routes_sampling_without_target() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sampling/createMessage",
+            "params": {}
+        });
+        let resp =
+            handle_session_isolated_request_sse(mgr, headers_with_session(&id), payload).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"]["code"], -32603);
+    }
+
+    // ─── handle_initialize_error ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_initialize_error_terminates_session_and_returns_500() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        assert!(mgr.session_exists(&id));
+        let resp = handle_initialize_error(
+            &mgr,
+            &id,
+            crate::error::BridgeError::Communication("boom".to_string()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"]["code"], -32603);
+        // Session is terminated/removed by the error handler.
+        assert!(!mgr.session_exists(&id));
+    }
+
+    // ─── register_session_details ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn register_session_details_stores_client_info_and_capabilities() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "clientInfo": {"name": "Cursor"},
+                "capabilities": {"sampling": {}}
+            }
+        });
+        register_session_details(&mgr, &id, &payload).await;
+        let session = mgr.get_session(&id).unwrap();
+        assert_eq!(
+            session.client_info.lock().await.clone().unwrap()["name"],
+            "Cursor"
+        );
+        assert!(session.capabilities.lock().await.clone().unwrap()["sampling"].is_object());
+    }
+
+    #[tokio::test]
+    async fn register_session_details_defaults_to_null_when_missing() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({"params": {"protocolVersion": "2025-03-26"}});
+        register_session_details(&mgr, &id, &payload).await;
+        let session = mgr.get_session(&id).unwrap();
+        assert!(session.client_info.lock().await.clone().unwrap().is_null());
+        assert!(session.capabilities.lock().await.clone().unwrap().is_null());
+    }
+
+    // ─── try_lock_sandbox_from_roots: non-empty roots ───────────────────
+
+    #[tokio::test]
+    async fn try_lock_sandbox_locks_from_valid_roots() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let temp = tempfile::tempdir().unwrap();
+        let uri = path_to_file_uri(temp.path());
+        let result = json!({"roots": [{"uri": uri}]});
+
+        try_lock_sandbox_from_roots(&mgr, &id, &result).await;
+        assert!(matches!(
+            mgr.get_session(&id).unwrap().current_sandbox_state(),
+            SandboxState::Configuring { .. }
+        ));
+
+        // Second call is a no-op (already locked → lock_sandbox Ok(false)).
+        try_lock_sandbox_from_roots(&mgr, &id, &result).await;
+        assert!(matches!(
+            mgr.get_session(&id).unwrap().current_sandbox_state(),
+            SandboxState::Configuring { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_lock_sandbox_warns_when_roots_have_no_valid_file_uri() {
+        // No default_scope and roots with a non-file URI → resolve fails → Err
+        // branch (logged warning, sandbox stays AwaitingRoots).
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let result = json!({"roots": [{"uri": "https://example.com/not-a-file"}]});
+        try_lock_sandbox_from_roots(&mgr, &id, &result).await;
+        assert!(matches!(
+            mgr.get_session(&id).unwrap().current_sandbox_state(),
+            SandboxState::AwaitingRoots
+        ));
+    }
+
+    // ─── handle_roots_list_response ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_roots_list_response_locks_on_roots_list_method() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let temp = tempfile::tempdir().unwrap();
+        let response = json!({"result": {"roots": [{"uri": path_to_file_uri(temp.path())}]}});
+        handle_roots_list_response(&mgr, &id, Some("roots/list"), &response).await;
+        assert!(matches!(
+            mgr.get_session(&id).unwrap().current_sandbox_state(),
+            SandboxState::Configuring { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_roots_list_response_ignores_other_methods() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let temp = tempfile::tempdir().unwrap();
+        let response = json!({"result": {"roots": [{"uri": path_to_file_uri(temp.path())}]}});
+        handle_roots_list_response(&mgr, &id, Some("tools/list"), &response).await;
+        // Not a roots/list method → no lock.
+        assert!(matches!(
+            mgr.get_session(&id).unwrap().current_sandbox_state(),
+            SandboxState::AwaitingRoots
+        ));
+    }
+
+    // ─── handle_client_response: routed + roots/list paths ──────────────
+
+    #[tokio::test]
+    async fn handle_client_response_resolves_routed_request() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let session = mgr.get_session(&id).unwrap();
+        let (tx, rx) = oneshot::channel();
+        session.routed_requests.insert("route-xyz".to_string(), tx);
+
+        let payload = json!({"jsonrpc": "2.0", "id": "route-xyz", "result": {"v": 9}});
+        let resp = handle_client_response(&mgr, &id, &payload).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        // The routed sender received the payload.
+        let received = rx.await.expect("sender delivered");
+        assert_eq!(received["result"]["v"], 9);
+    }
+
+    #[tokio::test]
+    async fn handle_client_response_locks_sandbox_on_roots_list_reply() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let session = mgr.get_session(&id).unwrap();
+        // Register the pending server→client roots/list request.
+        session
+            .pending_client_requests
+            .insert("rl-7".to_string(), "roots/list".to_string());
+
+        let temp = tempfile::tempdir().unwrap();
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": "rl-7",
+            "result": {"roots": [{"uri": path_to_file_uri(temp.path())}]}
+        });
+        let resp = handle_client_response(&mgr, &id, &payload).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            mgr.get_session(&id).unwrap().current_sandbox_state(),
+            SandboxState::Configuring { .. }
+        ));
+    }
+
+    // ─── mark_session_initialized ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn mark_session_initialized_noop_when_not_a_notification() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        mark_session_initialized(&mgr, &id, false).await;
+        assert!(!mgr.get_session(&id).unwrap().is_mcp_initialized());
+    }
+
+    #[tokio::test]
+    async fn mark_session_initialized_sets_flag_and_auto_locks_default_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let mgr = manager_with(
+            Some(temp.path().to_path_buf()),
+            10,
+            3600,
+            Arc::new(KeepAlivePeerFactory),
+        );
+        let id = mgr.create_session().await.expect("create session");
+        mark_session_initialized(&mgr, &id, true).await;
+        let session = mgr.get_session(&id).unwrap();
+        assert!(session.is_mcp_initialized());
+        // default_scope present → auto-locked into Configuring.
+        assert!(matches!(
+            session.current_sandbox_state(),
+            SandboxState::Configuring { .. }
+        ));
+    }
+
+    // ─── forward_request ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn forward_request_ok_for_notification_returns_200() {
+        // A notification (no id) returns immediately from send_request.
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        let resp =
+            forward_request(&mgr, &id, Some("notifications/initialized"), &payload, true).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+        assert!(mgr.get_session(&id).unwrap().is_mcp_initialized());
+    }
+
+    #[tokio::test]
+    async fn forward_request_tools_call_branch_uses_tool_timeout() {
+        // tools/call with no id exercises the calculate_tool_timeout branch and
+        // still returns immediately (notification semantics).
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"arguments": {"timeout_seconds": 5}}
+        });
+        let resp = forward_request(&mgr, &id, Some("tools/call"), &payload, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forward_request_errors_when_session_terminated() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        mgr.get_session(&id).unwrap().set_terminated(true);
+        let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        let resp =
+            forward_request(&mgr, &id, Some("notifications/initialized"), &payload, true).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"]["code"], -32603);
+    }
+
+    // ─── handle_existing_session_request branches ───────────────────────
+
+    #[tokio::test]
+    async fn existing_session_tools_call_blocked_before_sandbox_lock() {
+        // HARD INVARIANT: tools/call before sandbox lock → HTTP 409 / -32001.
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}});
+        let resp = handle_existing_session_request(&mgr, &id, Some("tools/call"), &payload).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(resp).await["error"]["code"], -32001);
+    }
+
+    #[tokio::test]
+    async fn existing_session_handles_client_response() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({"jsonrpc": "2.0", "id": "abc", "result": {}});
+        let resp = handle_existing_session_request(&mgr, &id, None, &payload).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn existing_session_unknown_is_403() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let resp =
+            handle_existing_session_request(&mgr, "missing", Some("tools/list"), &payload).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ─── check_initialization_required / wait_for_initialization ────────
+
+    #[tokio::test]
+    async fn check_initialization_required_none_for_notification() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        assert!(
+            check_initialization_required(
+                &mgr,
+                &id,
+                Some("notifications/initialized"),
+                true,
+                false
+            )
+            .await
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn check_initialization_required_none_for_client_response() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        assert!(
+            check_initialization_required(&mgr, &id, None, false, true)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn check_initialization_required_none_for_unknown_session() {
+        let mgr = keepalive_manager();
+        assert!(
+            check_initialization_required(&mgr, "missing", Some("tools/list"), false, false)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn check_initialization_required_none_when_already_initialized() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        mgr.get_session(&id)
+            .unwrap()
+            .mark_mcp_initialized()
+            .await
+            .unwrap();
+        assert!(
+            check_initialization_required(&mgr, &id, Some("tools/list"), false, false)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_initialization_returns_none_when_already_initialized() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let session = mgr.get_session(&id).unwrap();
+        session.mark_mcp_initialized().await.unwrap();
+        assert!(
+            wait_for_initialization(&session, &id, Some("tools/list"))
+                .await
+                .is_none()
+        );
+    }
+
+    // ─── session_sse_event / build_initialize_sse_response ──────────────
+
+    #[tokio::test]
+    async fn session_sse_event_assigns_id_and_serializes() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let session = mgr.get_session(&id).unwrap();
+        let (event_id, json_str) = session_sse_event(&session, &json!({"k": "v"}));
+        assert!(event_id >= 1);
+        assert_eq!(json_str, "{\"k\":\"v\"}");
+    }
+
+    #[tokio::test]
+    async fn build_initialize_sse_response_uses_session_when_present() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let resp = build_initialize_sse_response(&mgr, &id, &json!({"hello": "world"}));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(content_type(&resp).contains("text/event-stream"));
+        let body = body_string(resp).await;
+        assert!(body.contains("hello"), "body was: {body}");
+    }
+
+    #[tokio::test]
+    async fn build_initialize_sse_response_falls_back_for_unknown_session() {
+        let mgr = keepalive_manager();
+        let resp = build_initialize_sse_response(&mgr, "missing", &json!({"fallback": 1}));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_string(resp).await;
+        assert!(body.contains("fallback"), "body was: {body}");
+        // Fallback id is 1.
+        assert!(
+            body.contains("id: 1") || body.contains('1'),
+            "body was: {body}"
+        );
+    }
+
+    // ─── build_interleaved_sse_stream ───────────────────────────────────
+
+    #[tokio::test]
+    async fn interleaved_sse_stream_emits_notifications_and_response() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let session = mgr.get_session(&id).unwrap();
+        let rx = session.subscribe();
+        // Buffer a notification into the broadcast channel before building.
+        session
+            .broadcast("{\"note\":\"interleaved\"}".to_string())
+            .expect("broadcast ok");
+
+        let stream =
+            build_interleaved_sse_stream(session, id.clone(), rx, json!({"resp": "final"}));
+        let resp = Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response();
+        let body = body_string(resp).await;
+        assert!(body.contains("interleaved"), "body was: {body}");
+        assert!(body.contains("final"), "body was: {body}");
+    }
+
+    // ─── check_sse_request_gating ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn sse_gating_returns_403_for_unknown_session() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let resp = check_sse_request_gating(&mgr, "missing", Some("tools/list"), &payload, false)
+            .await
+            .expect("should gate");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sse_gating_handles_client_response() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({"jsonrpc": "2.0", "id": "abc", "result": {}});
+        let resp = check_sse_request_gating(&mgr, &id, None, &payload, false)
+            .await
+            .expect("client response is handled in gating");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn sse_gating_blocks_tools_call_before_lock() {
+        // HARD INVARIANT mirror for the SSE path.
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}});
+        let resp = check_sse_request_gating(&mgr, &id, Some("tools/call"), &payload, false)
+            .await
+            .expect("tools/call gated");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(resp).await["error"]["code"], -32001);
+    }
+
+    #[tokio::test]
+    async fn sse_gating_returns_none_when_initialized_and_allowed() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        mgr.get_session(&id)
+            .unwrap()
+            .mark_mcp_initialized()
+            .await
+            .unwrap();
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        assert!(
+            check_sse_request_gating(&mgr, &id, Some("ping"), &payload, false)
+                .await
+                .is_none()
+        );
+    }
+
+    // ─── forward_request_sse ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn forward_request_sse_session_not_found_is_403() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+        let resp = forward_request_sse(&mgr, "missing", Some("tools/list"), &payload, false).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn forward_request_sse_ok_returns_sse_stream() {
+        // A no-id payload returns immediately from send_request, exercising the
+        // Ok branch and the interleaved stream construction.
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        let resp =
+            forward_request_sse(&mgr, &id, Some("notifications/initialized"), &payload, true).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(content_type(&resp).contains("text/event-stream"));
+        assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn forward_request_sse_errors_when_session_terminated() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        mgr.get_session(&id).unwrap().set_terminated(true);
+        let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        let resp =
+            forward_request_sse(&mgr, &id, Some("notifications/initialized"), &payload, true).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"]["code"], -32603);
+    }
 }

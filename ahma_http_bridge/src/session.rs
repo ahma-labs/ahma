@@ -1465,4 +1465,1033 @@ mod sandbox_configured_parse_tests {
         });
         assert!(parse_configured_scopes(&notif).is_empty());
     }
+
+    #[test]
+    fn parse_configured_scopes_non_array_write_is_empty() {
+        // `write` present but not an array → treated as missing → empty.
+        let notif = json!({
+            "method": "notifications/sandbox/configured",
+            "params": { "scope": { "write": "not-an-array" } }
+        });
+        assert!(parse_configured_scopes(&notif).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod session_logic_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    /// Build a bare `Session` for pure-logic unit tests, bypassing the
+    /// subprocess spawn entirely. The returned `mpsc::Receiver` is the
+    /// subprocess-bound channel; keep it alive so `send_*` calls succeed and so
+    /// the test can observe messages the session emits (e.g. roots/list_changed).
+    fn make_test_session_with_timeout(
+        handshake_timeout: Duration,
+    ) -> (Arc<Session>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>(100);
+        let (broadcast_tx, _) = broadcast::channel::<(u64, String)>(256);
+        let session = Arc::new(Session {
+            id: Uuid::new_v4().to_string(),
+            sender: Mutex::new(tx),
+            pending_requests: Arc::new(DashMap::new()),
+            broadcast_tx,
+            terminated: AtomicBool::new(false),
+            termination_reason: Mutex::new(None),
+            peer_shutdown: Mutex::new(None),
+            handshake_state: StateMachine::new(HandshakeState::AwaitingBoth),
+            mcp_initialized_notify: Notify::new(),
+            sandbox_state_machine: Arc::new(SandboxStateMachine::new()),
+            created_at: Instant::now(),
+            handshake_timeout,
+            lagged_events: AtomicU64::new(0),
+            event_id_counter: AtomicU64::new(0),
+            event_history: std::sync::Mutex::new(VecDeque::new()),
+            client_info: Mutex::new(None),
+            capabilities: Mutex::new(None),
+            session_manager: Mutex::new(None),
+            routed_requests: Arc::new(DashMap::new()),
+            pending_client_requests: Arc::new(DashMap::new()),
+            sampling_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
+        });
+        (session, rx)
+    }
+
+    fn make_test_session() -> (Arc<Session>, mpsc::Receiver<String>) {
+        make_test_session_with_timeout(Duration::from_secs(45))
+    }
+
+    // ── Handshake state machine: SSE connection ──────────────────────────────
+
+    #[tokio::test]
+    async fn mark_sse_connected_from_awaiting_both_is_partial() {
+        // AwaitingBoth -> AwaitingSseOnly (no action). transition_sse_connected
+        // arm `AwaitingBoth` (lines 430-434) / mark_sse_connected None arm (478).
+        let (session, _rx) = make_test_session();
+        let triggered = session.mark_sse_connected().await.unwrap();
+        assert!(
+            !triggered,
+            "first SSE alone must not complete the handshake"
+        );
+        assert_eq!(session.handshake_state(), HandshakeState::AwaitingSseOnly);
+        assert!(session.is_sse_connected());
+        assert!(!session.is_mcp_initialized());
+    }
+
+    #[tokio::test]
+    async fn mark_sse_connected_from_awaiting_mcp_only_completes() {
+        // AwaitingMcpOnly -> RootsRequested with SendRootsListChanged
+        // (transition_sse_connected lines 435-439, mark_sse_connected lines 474-477).
+        let (session, mut rx) = make_test_session();
+        // Drive to AwaitingMcpOnly first.
+        assert!(!session.mark_mcp_initialized().await.unwrap());
+        assert_eq!(session.handshake_state(), HandshakeState::AwaitingMcpOnly);
+
+        let triggered = session.mark_sse_connected().await.unwrap();
+        assert!(triggered, "SSE after MCP must complete the handshake");
+        assert_eq!(session.handshake_state(), HandshakeState::RootsRequested);
+        // The roots/list_changed notification was emitted to the subprocess.
+        let sent = rx.try_recv().expect("roots/list_changed must be sent");
+        let v: Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(v["method"], "notifications/roots/list_changed");
+    }
+
+    #[tokio::test]
+    async fn mark_sse_connected_when_already_advanced_is_noop() {
+        // `other` arm of transition_sse_connected (lines 440-443): a redundant SSE
+        // connect after the handshake already advanced is ignored.
+        let (session, _rx) = make_test_session();
+        session.mark_mcp_initialized().await.unwrap();
+        session.mark_sse_connected().await.unwrap(); // -> RootsRequested
+        let again = session.mark_sse_connected().await.unwrap();
+        assert!(!again, "redundant SSE connect must be a no-op");
+        assert_eq!(session.handshake_state(), HandshakeState::RootsRequested);
+    }
+
+    // ── Handshake state machine: MCP initialized ─────────────────────────────
+
+    #[tokio::test]
+    async fn mark_mcp_initialized_from_awaiting_both_is_partial() {
+        // AwaitingBoth -> AwaitingMcpOnly (transition_mcp_initialized lines 450-454).
+        let (session, _rx) = make_test_session();
+        let triggered = session.mark_mcp_initialized().await.unwrap();
+        assert!(!triggered);
+        assert_eq!(session.handshake_state(), HandshakeState::AwaitingMcpOnly);
+        assert!(session.is_mcp_initialized());
+        assert!(!session.is_sse_connected());
+    }
+
+    #[tokio::test]
+    async fn mark_mcp_initialized_from_awaiting_sse_only_completes() {
+        // AwaitingSseOnly -> RootsRequested with SendRootsListChanged
+        // (transition_mcp_initialized lines 455-459, mark_mcp_initialized 485-488).
+        let (session, mut rx) = make_test_session();
+        assert!(!session.mark_sse_connected().await.unwrap()); // -> AwaitingSseOnly
+        let triggered = session.mark_mcp_initialized().await.unwrap();
+        assert!(triggered);
+        assert_eq!(session.handshake_state(), HandshakeState::RootsRequested);
+        let sent = rx.try_recv().expect("roots/list_changed must be sent");
+        assert!(sent.contains("notifications/roots/list_changed"));
+    }
+
+    #[tokio::test]
+    async fn mark_mcp_initialized_when_already_advanced_is_noop() {
+        // `other` arm of transition_mcp_initialized (lines 460-463).
+        let (session, _rx) = make_test_session();
+        session.mark_sse_connected().await.unwrap();
+        session.mark_mcp_initialized().await.unwrap(); // -> RootsRequested
+        let again = session.mark_mcp_initialized().await.unwrap();
+        assert!(!again);
+        assert_eq!(session.handshake_state(), HandshakeState::RootsRequested);
+    }
+
+    // ── mark_handshake_complete ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn mark_handshake_complete_from_roots_requested() {
+        // RootsRequested -> Complete (lines 495-500).
+        let (session, _rx) = make_test_session();
+        session.mark_mcp_initialized().await.unwrap();
+        session.mark_sse_connected().await.unwrap(); // -> RootsRequested
+        session.mark_handshake_complete();
+        assert_eq!(session.handshake_state(), HandshakeState::Complete);
+        assert!(session.is_sse_connected());
+        assert!(session.is_mcp_initialized());
+    }
+
+    #[test]
+    fn mark_handshake_complete_noop_when_not_roots_requested() {
+        // The `if` guard in mark_handshake_complete is false → stays AwaitingBoth.
+        let (session, _rx) = make_test_session();
+        session.mark_handshake_complete();
+        assert_eq!(session.handshake_state(), HandshakeState::AwaitingBoth);
+    }
+
+    // ── wait_for_mcp_initialized ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wait_for_mcp_initialized_returns_immediately_when_set() {
+        let (session, _rx) = make_test_session();
+        session.mark_mcp_initialized().await.unwrap();
+        // Already initialized → the early return path (lines 291-293).
+        tokio::time::timeout(Duration::from_secs(1), session.wait_for_mcp_initialized())
+            .await
+            .expect("must return without waiting");
+    }
+
+    #[tokio::test]
+    async fn wait_for_mcp_initialized_wakes_on_notification() {
+        let (session, _rx) = make_test_session();
+        let s2 = session.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            s2.mark_mcp_initialized().await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), session.wait_for_mcp_initialized())
+            .await
+            .expect("notify must wake the waiter");
+        assert!(session.is_mcp_initialized());
+    }
+
+    // ── is_handshake_timed_out ───────────────────────────────────────────────
+
+    #[test]
+    fn handshake_times_out_when_elapsed_exceeds_timeout() {
+        // Zero timeout → elapsed >= timeout → Some(secs) (lines 325-330).
+        let (session, _rx) = make_test_session_with_timeout(Duration::ZERO);
+        assert!(session.is_handshake_timed_out().is_some());
+    }
+
+    #[test]
+    fn handshake_not_timed_out_within_window() {
+        let (session, _rx) = make_test_session_with_timeout(Duration::from_secs(3600));
+        assert!(session.is_handshake_timed_out().is_none());
+    }
+
+    #[test]
+    fn handshake_timeout_suppressed_while_configuring() {
+        // Configuring early-return arm (lines 321-323).
+        let (session, _rx) = make_test_session_with_timeout(Duration::ZERO);
+        session
+            .sandbox_state_machine
+            .transition_to_configuring(vec![std::env::temp_dir().join("p")])
+            .unwrap();
+        assert!(session.is_handshake_timed_out().is_none());
+    }
+
+    #[test]
+    fn handshake_timeout_suppressed_when_active() {
+        // Active early-return arm (lines 321-323).
+        let (session, _rx) = make_test_session_with_timeout(Duration::ZERO);
+        session
+            .sandbox_state_machine
+            .transition_to_active_with_scopes(vec![std::env::temp_dir().join("p")])
+            .unwrap();
+        assert!(session.is_handshake_timed_out().is_none());
+    }
+
+    // ── is_sse_connected / is_mcp_initialized state matrix ───────────────────
+
+    #[tokio::test]
+    async fn connection_predicates_track_state_transitions() {
+        let (session, _rx) = make_test_session();
+        // AwaitingBoth: neither.
+        assert!(!session.is_sse_connected());
+        assert!(!session.is_mcp_initialized());
+        // Complete: both.
+        session.mark_sse_connected().await.unwrap();
+        session.mark_mcp_initialized().await.unwrap();
+        session.mark_handshake_complete();
+        assert!(session.is_sse_connected());
+        assert!(session.is_mcp_initialized());
+    }
+
+    // ── Event replay buffer: assign_event_id / replay_events_after ───────────
+
+    #[test]
+    fn assign_event_id_is_monotonic_starting_at_one() {
+        let (session, _rx) = make_test_session();
+        assert_eq!(session.assign_event_id("a"), 1);
+        assert_eq!(session.assign_event_id("b"), 2);
+        assert_eq!(session.assign_event_id("c"), 3);
+    }
+
+    #[test]
+    fn replay_events_after_filters_by_id() {
+        let (session, _rx) = make_test_session();
+        session.assign_event_id("one");
+        session.assign_event_id("two");
+        session.assign_event_id("three");
+        let after_one = session.replay_events_after(1);
+        assert_eq!(
+            after_one,
+            vec![(2, "two".to_string()), (3, "three".to_string())]
+        );
+        // Nothing newer than the latest id.
+        assert!(session.replay_events_after(3).is_empty());
+        // Everything when last_id is 0.
+        assert_eq!(session.replay_events_after(0).len(), 3);
+    }
+
+    #[test]
+    fn replay_buffer_prunes_at_capacity() {
+        // Push one past capacity; the oldest entry is evicted (lines 379-381).
+        let (session, _rx) = make_test_session();
+        for i in 0..(EVENT_HISTORY_CAPACITY + 1) {
+            session.assign_event_id(&format!("e{i}"));
+        }
+        let all = session.replay_events_after(0);
+        assert_eq!(all.len(), EVENT_HISTORY_CAPACITY);
+        // id 1 was evicted; the lowest retained id is 2.
+        assert_eq!(all.first().unwrap().0, 2);
+        assert_eq!(all.last().unwrap().0, (EVENT_HISTORY_CAPACITY + 1) as u64);
+    }
+
+    // ── broadcast / subscribe / lag counters ─────────────────────────────────
+
+    #[test]
+    fn broadcast_assigns_id_and_delivers_to_subscriber() {
+        let (session, _rx) = make_test_session();
+        let mut sub = session.subscribe();
+        assert_eq!(session.sse_receivers(), 1);
+        let n = session.broadcast("hello".to_string()).unwrap();
+        assert_eq!(n, 1, "one receiver should receive the broadcast");
+        let (id, msg) = sub.try_recv().unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(msg, "hello");
+    }
+
+    #[test]
+    fn lagged_event_counter_accumulates() {
+        let (session, _rx) = make_test_session();
+        assert_eq!(session.total_lagged_events(), 0);
+        session.record_lagged_events(3);
+        session.record_lagged_events(4);
+        assert_eq!(session.total_lagged_events(), 7);
+    }
+
+    // ── terminated flag / sandbox predicates ─────────────────────────────────
+
+    #[test]
+    fn terminated_flag_round_trips() {
+        let (session, _rx) = make_test_session();
+        assert!(!session.is_terminated());
+        session.set_terminated(true);
+        assert!(session.is_terminated());
+        session.set_terminated(false);
+        assert!(!session.is_terminated());
+    }
+
+    #[test]
+    fn sandbox_predicates_reflect_state_machine() {
+        let (session, _rx) = make_test_session();
+        assert!(matches!(
+            session.current_sandbox_state(),
+            SandboxState::AwaitingRoots
+        ));
+        assert!(!session.is_sandbox_locked());
+        assert!(!session.is_sandbox_applied());
+
+        let scope = std::env::temp_dir().join("locked_proj");
+        session
+            .sandbox_state_machine
+            .transition_to_active_with_scopes(vec![scope.clone()])
+            .unwrap();
+        assert!(session.is_sandbox_locked());
+        assert!(session.is_sandbox_applied());
+        assert!(matches!(
+            session.current_sandbox_state(),
+            SandboxState::Active { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_sandbox_scope_and_scopes() {
+        let (session, _rx) = make_test_session();
+        assert!(session.get_sandbox_scope().await.is_none());
+        assert!(session.get_sandbox_scopes().await.is_none());
+
+        let a = std::env::temp_dir().join("a");
+        let b = std::env::temp_dir().join("b");
+        session
+            .sandbox_state_machine
+            .transition_to_configuring(vec![a.clone(), b.clone()])
+            .unwrap();
+        assert_eq!(session.get_sandbox_scope().await, Some(a.clone()));
+        assert_eq!(session.get_sandbox_scopes().await, Some(vec![a, b]));
+    }
+
+    #[tokio::test]
+    async fn wait_for_sandbox_active_returns_when_active() {
+        let (session, _rx) = make_test_session();
+        let scope = std::env::temp_dir().join("active_scope");
+        session
+            .sandbox_state_machine
+            .transition_to_active_with_scopes(vec![scope.clone()])
+            .unwrap();
+        let scopes = session.wait_for_sandbox_active().await.unwrap();
+        assert_eq!(scopes, vec![scope]);
+        // wait_for_sandbox_applied also short-circuits when already active.
+        tokio::time::timeout(Duration::from_secs(1), session.wait_for_sandbox_applied())
+            .await
+            .expect("should not block when active");
+    }
+
+    #[tokio::test]
+    async fn set_client_info_stores_values() {
+        let (session, _rx) = make_test_session();
+        let info = json!({"name": "test-client"});
+        let caps = json!({"roots": {"listChanged": true}});
+        session.set_client_info(info.clone(), caps.clone()).await;
+        assert_eq!(*session.client_info.lock().await, Some(info));
+        assert_eq!(*session.capabilities.lock().await, Some(caps));
+    }
+
+    // ── sandbox notification handlers ────────────────────────────────────────
+
+    #[test]
+    fn handle_sandbox_configured_drives_to_active() {
+        let (session, _rx) = make_test_session();
+        let notif = json!({
+            "method": "notifications/sandbox/configured",
+            "params": { "scope": { "write": ["/work/p"] } }
+        });
+        handle_sandbox_configured(&session, &notif);
+        assert!(session.is_sandbox_locked());
+        assert_eq!(
+            session.current_sandbox_state().scopes().map(<[_]>::to_vec),
+            Some(vec![PathBuf::from("/work/p")])
+        );
+    }
+
+    #[test]
+    fn handle_sandbox_configured_on_terminal_state_warns_no_panic() {
+        // Failed → configured cannot resurrect; transition errors, handler warns.
+        let (session, _rx) = make_test_session();
+        session
+            .sandbox_state_machine
+            .transition_to_failed("boom".to_string())
+            .unwrap();
+        let notif = json!({"method": "notifications/sandbox/configured"});
+        handle_sandbox_configured(&session, &notif);
+        assert!(matches!(
+            session.current_sandbox_state(),
+            SandboxState::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn handle_sandbox_failed_drives_to_failed_with_message() {
+        let (session, _rx) = make_test_session();
+        let notif = json!({
+            "method": "notifications/sandbox/failed",
+            "params": { "error": "scope denied" }
+        });
+        handle_sandbox_failed(&session, &notif);
+        assert!(matches!(
+            session.current_sandbox_state(),
+            SandboxState::Failed { error } if error == "scope denied"
+        ));
+    }
+
+    #[test]
+    fn handle_sandbox_failed_defaults_error_message() {
+        // No params.error → "Unknown error" default branch.
+        let (session, _rx) = make_test_session();
+        handle_sandbox_failed(&session, &json!({"method": "notifications/sandbox/failed"}));
+        assert!(matches!(
+            session.current_sandbox_state(),
+            SandboxState::Failed { error } if error == "Unknown error"
+        ));
+    }
+
+    #[test]
+    fn handle_sandbox_failed_on_terminal_state_warns_no_panic() {
+        let (session, _rx) = make_test_session();
+        session
+            .sandbox_state_machine
+            .transition_to_terminated()
+            .unwrap();
+        handle_sandbox_failed(&session, &json!({"method": "notifications/sandbox/failed"}));
+        assert!(matches!(
+            session.current_sandbox_state(),
+            SandboxState::Terminated
+        ));
+    }
+
+    #[test]
+    fn handle_sandbox_notification_routes_by_method() {
+        // configured → Active
+        let (s1, _r1) = make_test_session();
+        handle_sandbox_notification(
+            &s1,
+            &json!({"method": "notifications/sandbox/configured",
+                    "params": {"scope": {"write": ["/x"]}}}),
+        );
+        assert!(s1.is_sandbox_locked());
+
+        // failed → Failed
+        let (s2, _r2) = make_test_session();
+        handle_sandbox_notification(
+            &s2,
+            &json!({"method": "notifications/sandbox/failed", "params": {"error": "e"}}),
+        );
+        assert!(matches!(
+            s2.current_sandbox_state(),
+            SandboxState::Failed { .. }
+        ));
+
+        // unrelated string method → ignored (still AwaitingRoots)
+        let (s3, _r3) = make_test_session();
+        handle_sandbox_notification(&s3, &json!({"method": "notifications/progress"}));
+        assert!(matches!(
+            s3.current_sandbox_state(),
+            SandboxState::AwaitingRoots
+        ));
+
+        // non-string method → warn branch, ignored
+        let (s4, _r4) = make_test_session();
+        handle_sandbox_notification(&s4, &json!({"method": 42}));
+        assert!(matches!(
+            s4.current_sandbox_state(),
+            SandboxState::AwaitingRoots
+        ));
+
+        // no method key → no-op
+        let (s5, _r5) = make_test_session();
+        handle_sandbox_notification(&s5, &json!({"id": 1, "result": null}));
+        assert!(matches!(
+            s5.current_sandbox_state(),
+            SandboxState::AwaitingRoots
+        ));
+    }
+
+    // ── dispatch_subprocess_line ─────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_routes_response_to_pending_request() {
+        let (session, _rx) = make_test_session();
+        let (tx, mut resp_rx) = oneshot::channel();
+        session.pending_requests.insert("req-1".to_string(), tx);
+
+        dispatch_subprocess_line(
+            &session,
+            &json!({"jsonrpc": "2.0", "id": "req-1", "result": {"ok": true}}).to_string(),
+            false,
+        );
+        let received = resp_rx.try_recv().expect("response routed to caller");
+        assert_eq!(received["result"]["ok"], true);
+        // Pending entry consumed.
+        assert!(!session.pending_requests.contains_key("req-1"));
+    }
+
+    #[test]
+    fn dispatch_stores_server_to_client_request_method() {
+        let (session, _rx) = make_test_session();
+        // An id present but no matching pending request, and a method → recorded
+        // in pending_client_requests (lines 798-803).
+        dispatch_subprocess_line(
+            &session,
+            &json!({"jsonrpc": "2.0", "id": "srv-7", "method": "roots/list"}).to_string(),
+            false,
+        );
+        assert_eq!(
+            session
+                .pending_client_requests
+                .get("srv-7")
+                .map(|m| m.value().clone()),
+            Some("roots/list".to_string())
+        );
+    }
+
+    #[test]
+    fn dispatch_broadcasts_notification_and_assigns_event_id() {
+        let (session, _rx) = make_test_session();
+        let mut sub = session.subscribe();
+        dispatch_subprocess_line(
+            &session,
+            &json!({"jsonrpc": "2.0", "method": "notifications/progress"}).to_string(),
+            false,
+        );
+        let (id, msg) = sub.try_recv().expect("notification broadcast");
+        assert_eq!(id, 1);
+        assert!(msg.contains("notifications/progress"));
+    }
+
+    #[test]
+    fn dispatch_drives_sandbox_state_from_notification() {
+        let (session, _rx) = make_test_session();
+        dispatch_subprocess_line(
+            &session,
+            &json!({"method": "notifications/sandbox/configured",
+                    "params": {"scope": {"write": ["/w"]}}})
+            .to_string(),
+            false,
+        );
+        assert!(session.is_sandbox_locked());
+    }
+
+    #[test]
+    fn dispatch_ignores_invalid_json() {
+        // Unparseable line → warn + early return, no state change, no panic.
+        let (session, _rx) = make_test_session();
+        dispatch_subprocess_line(&session, "this is not json", false);
+        assert!(matches!(
+            session.current_sandbox_state(),
+            SandboxState::AwaitingRoots
+        ));
+    }
+
+    // ── free helpers: request id / pending maps ──────────────────────────────
+
+    #[test]
+    fn extract_request_id_variants() {
+        assert_eq!(
+            extract_request_id(&json!({"id": "abc"})),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            extract_request_id(&json!({"id": 42})),
+            Some("42".to_string())
+        );
+        assert_eq!(extract_request_id(&json!({"id": null})), None);
+        assert_eq!(extract_request_id(&json!({"method": "x"})), None);
+    }
+
+    #[test]
+    fn register_and_take_pending_request() {
+        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let id = Some("r1".to_string());
+        let rx = register_pending_request(&pending, id.as_ref());
+        assert!(rx.is_some());
+        assert!(pending.contains_key("r1"));
+
+        let sender = take_pending_request(&pending, "r1");
+        assert!(sender.is_some());
+        assert!(!pending.contains_key("r1"));
+        // Taking again returns None.
+        assert!(take_pending_request(&pending, "r1").is_none());
+    }
+
+    #[test]
+    fn register_pending_request_none_id_registers_nothing() {
+        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        assert!(register_pending_request(&pending, None).is_none());
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[test]
+    fn clear_pending_request_removes_and_tolerates_none() {
+        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let (tx, _rx) = oneshot::channel();
+        pending.insert("c1".to_string(), tx);
+        clear_pending_request(&pending, Some("c1"));
+        assert!(!pending.contains_key("c1"));
+        // None id is a no-op (does not panic).
+        clear_pending_request(&pending, None);
+    }
+
+    // ── await_response ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn await_response_none_rx_returns_null_result() {
+        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let res = await_response(None, None, &None, &pending).await.unwrap();
+        assert_eq!(res["result"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn await_response_returns_delivered_value() {
+        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let (tx, rx) = oneshot::channel();
+        tx.send(json!({"jsonrpc": "2.0", "id": "1", "result": "done"}))
+            .unwrap();
+        let res = await_response(
+            Some(rx),
+            Some(Duration::from_secs(1)),
+            &Some("1".to_string()),
+            &pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res["result"], "done");
+    }
+
+    #[tokio::test]
+    async fn await_response_channel_closed_errors() {
+        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let (tx, rx) = oneshot::channel::<Value>();
+        drop(tx); // sender dropped → recv yields Err
+        let err = await_response(Some(rx), Some(Duration::from_secs(1)), &None, &pending)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Response channel closed"));
+    }
+
+    #[tokio::test]
+    async fn await_response_timeout_clears_pending() {
+        let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
+        let (tx, rx) = oneshot::channel::<Value>();
+        // Keep tx alive so the channel never delivers and never closes.
+        let id = "timeout-id".to_string();
+        pending.insert(id.clone(), oneshot::channel().0);
+        let err = await_response(
+            Some(rx),
+            Some(Duration::from_millis(20)),
+            &Some(id.clone()),
+            &pending,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        // The pending entry was cleared on timeout.
+        assert!(!pending.contains_key(&id));
+        drop(tx);
+    }
+
+    // ── timeout env helpers ──────────────────────────────────────────────────
+
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[test]
+    fn request_timeout_secs_defaults_and_overrides() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let key = "AHMA_HTTP_BRIDGE_REQUEST_TIMEOUT_SECS";
+        let prev = std::env::var(key).ok();
+
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(request_timeout_secs(), 60);
+
+        unsafe { std::env::set_var(key, "123") };
+        assert_eq!(request_timeout_secs(), 123);
+
+        // Invalid value falls back to default.
+        unsafe { std::env::set_var(key, "not-a-number") };
+        assert_eq!(request_timeout_secs(), 60);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn tool_call_timeout_secs_defaults_and_overrides() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let key = "AHMA_HTTP_BRIDGE_TOOL_CALL_TIMEOUT_SECS";
+        let prev = std::env::var(key).ok();
+
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(tool_call_timeout_secs(), 60);
+
+        unsafe { std::env::set_var(key, "5") };
+        assert_eq!(tool_call_timeout_secs(), 5);
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    // ── SessionManager: config-only / in-memory peer logic ───────────────────
+
+    /// A `PeerFactory` backed by in-memory duplex pipes. It retains the peer
+    /// ends so the bridge's stdout reader does not see EOF (which would mark the
+    /// session terminated) and stdin writes never block.
+    struct DuplexPeerFactory {
+        peer_ends: std::sync::Mutex<Vec<(tokio::io::DuplexStream, tokio::io::DuplexStream)>>,
+    }
+
+    impl DuplexPeerFactory {
+        fn new() -> Self {
+            Self {
+                peer_ends: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PeerFactory for DuplexPeerFactory {
+        fn create(&self) -> crate::peer::BoxFuture<anyhow::Result<PeerStreams>> {
+            let (bridge_stdin, peer_reader) = tokio::io::duplex(8192);
+            let (peer_writer, bridge_stdout) = tokio::io::duplex(8192);
+            self.peer_ends
+                .lock()
+                .unwrap()
+                .push((peer_reader, peer_writer));
+            Box::pin(async move {
+                Ok(PeerStreams {
+                    stdin: Box::new(bridge_stdin),
+                    stdout: Box::new(bridge_stdout),
+                    stderr: None,
+                    shutdown_fn: None,
+                })
+            })
+        }
+    }
+
+    fn test_config(default_scope: Option<PathBuf>, max_sessions: usize) -> SessionManagerConfig {
+        SessionManagerConfig {
+            server_command: "unused".to_string(),
+            server_args: vec![],
+            default_scope,
+            enable_colored_output: false,
+            handshake_timeout_secs: 45,
+            max_sessions,
+            peer_factory: Some(Arc::new(DuplexPeerFactory::new())),
+        }
+    }
+
+    #[test]
+    fn requires_client_roots_depends_on_default_scope() {
+        let mgr_none = SessionManager::new(test_config(None, 8));
+        assert!(mgr_none.requires_client_roots());
+        let mgr_some = SessionManager::new(test_config(Some(std::env::temp_dir().join("p")), 8));
+        assert!(!mgr_some.requires_client_roots());
+    }
+
+    #[test]
+    fn resolve_sandbox_scopes_parses_file_uris() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let dir = std::env::temp_dir().join("ahma_scope_dir");
+        let uri = format!("file://{}", dir.to_string_lossy());
+        let roots = vec![McpRoot {
+            uri,
+            name: Some("proj".to_string()),
+        }];
+        let scopes = mgr.resolve_sandbox_scopes("sid", &roots).unwrap();
+        assert_eq!(scopes.len(), 1);
+    }
+
+    #[test]
+    fn resolve_sandbox_scopes_empty_uses_default_scope() {
+        let scope = std::env::temp_dir().join("fallback");
+        let mgr = SessionManager::new(test_config(Some(scope.clone()), 8));
+        let scopes = mgr.resolve_sandbox_scopes("sid", &[]).unwrap();
+        assert_eq!(scopes, vec![scope]);
+    }
+
+    #[test]
+    fn resolve_sandbox_scopes_empty_no_default_errors() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let err = mgr.resolve_sandbox_scopes("sid", &[]).unwrap_err();
+        assert!(err.to_string().contains("did not provide roots"));
+    }
+
+    #[test]
+    fn resolve_sandbox_scopes_invalid_uris_error() {
+        // Non-empty roots, but none parse to a file:// path → error branch.
+        let mgr = SessionManager::new(test_config(None, 8));
+        let roots = vec![McpRoot {
+            uri: "https://example.com/x".to_string(),
+            name: None,
+        }];
+        let err = mgr.resolve_sandbox_scopes("sid", &roots).unwrap_err();
+        assert!(err.to_string().contains("No valid file://"));
+    }
+
+    #[tokio::test]
+    async fn create_session_tracks_counts_and_active_counter() {
+        let mut mgr = SessionManager::new(test_config(None, 8));
+        let counter = Arc::new(AtomicUsize::new(0));
+        mgr.active_sessions = Some(counter.clone());
+
+        let id = mgr.create_session().await.unwrap();
+        assert_eq!(mgr.session_count(), 1);
+        assert!(mgr.session_exists(&id));
+        assert!(mgr.get_session(&id).is_some());
+        assert_eq!(mgr.get_all_sessions().len(), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        mgr.terminate_session(&id, SessionTerminationReason::ClientRequested)
+            .await
+            .unwrap();
+        assert_eq!(mgr.session_count(), 0);
+        assert!(!mgr.session_exists(&id));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn create_session_enforces_max_sessions() {
+        let mgr = SessionManager::new(test_config(None, 1));
+        mgr.create_session().await.unwrap();
+        let err = mgr.create_session().await.unwrap_err();
+        assert!(err.to_string().contains("Session limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn lock_sandbox_locks_once_then_noop() {
+        let scope = std::env::temp_dir().join("lock_proj");
+        let mgr = SessionManager::new(test_config(Some(scope.clone()), 8));
+        let id = mgr.create_session().await.unwrap();
+
+        let first = mgr.lock_sandbox(&id, &[]).await.unwrap();
+        assert!(first, "first lock returns true");
+        let session = mgr.get_session(&id).unwrap();
+        assert!(matches!(
+            session.current_sandbox_state(),
+            SandboxState::Configuring { .. }
+        ));
+
+        // Second lock is a no-op (already past AwaitingRoots).
+        let second = mgr.lock_sandbox(&id, &[]).await.unwrap();
+        assert!(!second);
+    }
+
+    #[tokio::test]
+    async fn lock_sandbox_unknown_session_errors() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let err = mgr.lock_sandbox("does-not-exist", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("Session not found"));
+    }
+
+    #[tokio::test]
+    async fn auto_lock_if_default_scope_behaviour() {
+        // None scope → no-op, stays AwaitingRoots.
+        let mgr_none = SessionManager::new(test_config(None, 8));
+        let id_n = mgr_none.create_session().await.unwrap();
+        mgr_none.auto_lock_if_default_scope(&id_n).await;
+        assert!(matches!(
+            mgr_none.get_session(&id_n).unwrap().current_sandbox_state(),
+            SandboxState::AwaitingRoots
+        ));
+
+        // Some scope → locks into Configuring.
+        let scope = std::env::temp_dir().join("auto_lock");
+        let mgr_some = SessionManager::new(test_config(Some(scope), 8));
+        let id_s = mgr_some.create_session().await.unwrap();
+        mgr_some.auto_lock_if_default_scope(&id_s).await;
+        assert!(matches!(
+            mgr_some.get_session(&id_s).unwrap().current_sandbox_state(),
+            SandboxState::Configuring { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_roots_changed_before_and_after_lock() {
+        let scope = std::env::temp_dir().join("roots_changed");
+        let mgr = SessionManager::new(test_config(Some(scope), 8));
+        let id = mgr.create_session().await.unwrap();
+
+        // Before lock: AwaitingRoots → false (normal handshake, forward it).
+        assert!(!mgr.handle_roots_changed(&id).await.unwrap());
+
+        mgr.lock_sandbox(&id, &[]).await.unwrap();
+        // After lock: tolerated no-op → true (do not forward).
+        assert!(mgr.handle_roots_changed(&id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn handle_roots_changed_unknown_session_errors() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let err = mgr.handle_roots_changed("nope").await.unwrap_err();
+        assert!(err.to_string().contains("Session not found"));
+    }
+
+    #[tokio::test]
+    async fn send_message_validates_session_state() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        // Unknown session.
+        assert!(
+            mgr.send_message("nope", &json!({"method": "ping"}))
+                .await
+                .is_err()
+        );
+
+        let id = mgr.create_session().await.unwrap();
+        // Live session accepts the message.
+        mgr.send_message(&id, &json!({"jsonrpc": "2.0", "method": "ping"}))
+            .await
+            .unwrap();
+
+        // Terminated session rejects.
+        mgr.get_session(&id).unwrap().set_terminated(true);
+        let err = mgr
+            .send_message(&id, &json!({"method": "ping"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("terminated"));
+    }
+
+    #[tokio::test]
+    async fn send_request_notification_returns_null() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let id = mgr.create_session().await.unwrap();
+        // A request with no id is a notification: await_response short-circuits.
+        let res = mgr
+            .send_request(&id, &json!({"jsonrpc": "2.0", "method": "ping"}), None)
+            .await
+            .unwrap();
+        assert_eq!(res["result"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn send_request_terminated_and_unknown_session_error() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        assert!(
+            mgr.send_request("nope", &json!({"id": 1, "method": "ping"}), None)
+                .await
+                .is_err()
+        );
+
+        let id = mgr.create_session().await.unwrap();
+        mgr.get_session(&id).unwrap().set_terminated(true);
+        let err = mgr
+            .send_request(&id, &json!({"id": 1, "method": "ping"}), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("terminated"));
+    }
+
+    #[tokio::test]
+    async fn terminate_session_unknown_is_ok() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        // Removing a session that does not exist is a no-op success.
+        mgr.terminate_session("ghost", SessionTerminationReason::Timeout)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminate_all_clears_sessions() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        mgr.create_session().await.unwrap();
+        mgr.create_session().await.unwrap();
+        assert_eq!(mgr.session_count(), 2);
+        mgr.terminate_all(SessionTerminationReason::ClientRequested)
+            .await;
+        assert_eq!(mgr.session_count(), 0);
+    }
+
+    #[test]
+    fn config_debug_renders_peer_factory_state() {
+        let with_factory = test_config(None, 4);
+        let dbg_some = format!("{with_factory:?}");
+        assert!(dbg_some.contains("Some(<PeerFactory>)"));
+
+        let without = SessionManagerConfig {
+            server_command: "x".to_string(),
+            server_args: vec![],
+            default_scope: None,
+            enable_colored_output: false,
+            handshake_timeout_secs: 45,
+            max_sessions: 1,
+            peer_factory: None,
+        };
+        let dbg_none = format!("{without:?}");
+        assert!(dbg_none.contains("peer_factory: \"None\""));
+    }
+
+    #[test]
+    fn handshake_state_fsm_names_and_terminal() {
+        assert_eq!(HandshakeState::AwaitingBoth.name(), "AwaitingBoth");
+        assert_eq!(HandshakeState::AwaitingSseOnly.name(), "AwaitingSseOnly");
+        assert_eq!(HandshakeState::AwaitingMcpOnly.name(), "AwaitingMcpOnly");
+        assert_eq!(HandshakeState::RootsRequested.name(), "RootsRequested");
+        assert_eq!(HandshakeState::Complete.name(), "Complete");
+        assert!(HandshakeState::Complete.is_terminal());
+        assert!(!HandshakeState::RootsRequested.is_terminal());
+    }
 }

@@ -304,4 +304,223 @@ mod tests {
 
         upstream_task.await.unwrap();
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Helpers for driving requests through a running proxy.
+    //
+    // The connection handlers (`handle_connection`, `handle_connect`,
+    // `handle_plain_http`) operate on real `TcpStream`s, so their branches are
+    // exercised by connecting to a started proxy and sending crafted requests,
+    // then asserting on the bytes written back (or the connection being closed).
+    // ─────────────────────────────────────────────────────────────────────
+
+    use std::time::Duration;
+
+    /// Read one chunk of the proxy's response with a timeout.
+    /// Returns the bytes read (may be empty if the proxy closed the connection).
+    async fn read_chunk(client: &mut TcpStream) -> Vec<u8> {
+        let mut resp = vec![0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut resp))
+            .await
+            .expect("read timed out")
+            .expect("read failed");
+        resp.truncate(n);
+        resp
+    }
+
+    async fn start_proxy(allowlist: EgressAllowlist) -> EgressProxy {
+        EgressProxy::start(EgressProxyConfig { allowlist })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_to_blocked_host_returns_407() {
+        // deny-all allowlist → CONNECT must be rejected with 407.
+        let proxy = start_proxy(EgressAllowlist::deny_all()).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        client
+            .write_all(b"CONNECT blocked.example.com:443 HTTP/1.1\r\nHost: blocked.example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("407 Proxy Authentication Required"),
+            "expected 407 block response, got: {resp_str:?}"
+        );
+        assert!(
+            !resp_str.contains("200 Connection Established"),
+            "blocked host must not be tunnelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_missing_target_closes_connection() {
+        // "CONNECT " with no target → handle_connect returns an error before any
+        // response is written, so the client sees an immediate EOF.
+        let proxy = start_proxy(EgressAllowlist::from_str("*")).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        client.write_all(b"CONNECT \r\n\r\n").await.unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        assert!(
+            resp.is_empty(),
+            "missing CONNECT target must close without a response, got: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_allowed_but_upstream_unreachable_closes() {
+        // Host is allowed, but the upstream port has no listener, so
+        // `TcpStream::connect` fails and the handler returns an error *before*
+        // sending "200 Connection Established".
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead); // free the port so connects fail
+
+        let proxy = start_proxy(EgressAllowlist::from_str("127.0.0.1")).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        // Host "127.0.0.1" is allowed; the connect target points at a freed
+        // port, so `TcpStream::connect` fails after the allow check.
+        let req = format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", dead_addr.port());
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            !resp_str.contains("200 Connection Established"),
+            "unreachable upstream must not yield a 200, got: {resp_str:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_allowed_tunnels_bidirectionally() {
+        // Stand up an upstream that, once connected, reads a request and replies.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let proxy = start_proxy(EgressAllowlist::from_str("127.0.0.1")).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        let req = format!(
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n",
+            upstream_addr.port()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        // First the proxy confirms the tunnel.
+        let established = read_chunk(&mut client).await;
+        let established_str = String::from_utf8_lossy(&established);
+        assert!(
+            established_str.contains("200 Connection Established"),
+            "expected tunnel confirmation, got: {established_str:?}"
+        );
+
+        // Now the tunnel is spliced: send through it and read the upstream reply.
+        client.write_all(b"ping").await.unwrap();
+        let echoed = read_chunk(&mut client).await;
+        assert_eq!(&echoed[..], b"pong", "tunnel must forward upstream bytes");
+
+        upstream_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plain_http_missing_host_header_returns_400() {
+        let proxy = start_proxy(EgressAllowlist::from_str("*")).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        // No Host header at all → host_header is empty → 400.
+        client
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("400 Bad Request"),
+            "missing Host header must yield 400, got: {resp_str:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_blocked_host_returns_403() {
+        let proxy = start_proxy(EgressAllowlist::deny_all()).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        client
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com:8080\r\n\r\n")
+            .await
+            .unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("403 Forbidden"),
+            "blocked host must yield 403, got: {resp_str:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_host_without_port_blocked_returns_403() {
+        // Host header has no ':' → split_once returns None → default port 80.
+        // Host is still blocked, so the 403 path runs (exercising the None arm).
+        let proxy = start_proxy(EgressAllowlist::deny_all()).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        client
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("403 Forbidden"),
+            "host without port should still resolve and be blocked, got: {resp_str:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_bad_port_falls_back_to_80_and_blocked_returns_403() {
+        // Host has a ':' but a non-numeric port → parse::<u16>() fails →
+        // unwrap_or(80). Host is blocked, so we still observe a 403, having
+        // exercised the parse-failure fallback branch.
+        let proxy = start_proxy(EgressAllowlist::deny_all()).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        client
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com:not-a-port\r\n\r\n")
+            .await
+            .unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("403 Forbidden"),
+            "bad port should fall back and host be blocked, got: {resp_str:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_request_closes_gracefully() {
+        // Client connects then closes its write half without sending anything.
+        // The handler reads 0 bytes and returns Ok(()), dropping the stream.
+        let proxy = start_proxy(EgressAllowlist::from_str("*")).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        assert!(
+            resp.is_empty(),
+            "empty request must be handled without a response, got: {:?}",
+            String::from_utf8_lossy(&resp)
+        );
+    }
 }

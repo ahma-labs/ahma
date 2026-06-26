@@ -1069,6 +1069,7 @@ fn detect_project_root() -> Result<PathBuf> {
     Ok(cwd)
 }
 
+#[derive(Debug)]
 struct ExtractedToolArgs {
     tool_input: Map<String, Value>,
     command: String,
@@ -2438,6 +2439,1039 @@ mod tests {
         assert!(
             all.contains(&HookPlatform::Cursor),
             "Cursor must be in the default install set"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Env-var serialization guard. `AHMA_HOOKS` / `AHMA_DISABLE_HOOKS` are
+    // process-global; serialize the tests that mutate them and restore after.
+    // ----------------------------------------------------------------------
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    struct EnvGuard {
+        hooks: Option<String>,
+        disable: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            Self {
+                hooks: std::env::var("AHMA_HOOKS").ok(),
+                disable: std::env::var("AHMA_DISABLE_HOOKS").ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.hooks {
+                    Some(v) => std::env::set_var("AHMA_HOOKS", v),
+                    None => std::env::remove_var("AHMA_HOOKS"),
+                }
+                match &self.disable {
+                    Some(v) => std::env::set_var("AHMA_DISABLE_HOOKS", v),
+                    None => std::env::remove_var("AHMA_DISABLE_HOOKS"),
+                }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // HookPlatform / HookScope metadata
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_hook_platform_labels_and_cli_names() {
+        for (platform, label, cli) in [
+            (HookPlatform::Cursor, "Cursor", "cursor"),
+            (HookPlatform::Claude, "Claude Code", "claude"),
+            (HookPlatform::Codex, "Codex", "codex"),
+            (HookPlatform::Copilot, "GitHub Copilot CLI", "copilot"),
+            (HookPlatform::Antigravity, "Antigravity", "antigravity"),
+        ] {
+            assert_eq!(platform.label(), label);
+            assert_eq!(platform.cli_name(), cli);
+        }
+    }
+
+    #[test]
+    fn test_hook_platform_event_keys() {
+        assert_eq!(HookPlatform::Cursor.event_key(), "preToolUse");
+        assert_eq!(HookPlatform::Copilot.event_key(), "preToolUse");
+        assert_eq!(HookPlatform::Claude.event_key(), "PreToolUse");
+        assert_eq!(HookPlatform::Codex.event_key(), "PreToolUse");
+        assert_eq!(HookPlatform::Antigravity.event_key(), "PreToolUse");
+    }
+
+    #[test]
+    fn test_hook_platform_config_relative_paths() {
+        assert_eq!(
+            HookPlatform::Cursor.config_relative_path(HookScope::User),
+            PathBuf::from(".cursor/hooks.json")
+        );
+        assert_eq!(
+            HookPlatform::Claude.config_relative_path(HookScope::Project),
+            PathBuf::from(".claude/settings.json")
+        );
+        assert_eq!(
+            HookPlatform::Codex.config_relative_path(HookScope::User),
+            PathBuf::from(".codex/hooks.json")
+        );
+        // Copilot differs by scope
+        assert_eq!(
+            HookPlatform::Copilot.config_relative_path(HookScope::User),
+            PathBuf::from(".copilot/hooks/ahma.json")
+        );
+        assert_eq!(
+            HookPlatform::Copilot.config_relative_path(HookScope::Project),
+            PathBuf::from(".github/hooks/ahma.json")
+        );
+        // Antigravity differs by scope
+        assert_eq!(
+            HookPlatform::Antigravity.config_relative_path(HookScope::User),
+            PathBuf::from(".gemini/config/hooks.json")
+        );
+        assert_eq!(
+            HookPlatform::Antigravity.config_relative_path(HookScope::Project),
+            PathBuf::from(".agents/hooks.json")
+        );
+    }
+
+    #[test]
+    fn test_hook_scope_labels_and_cli_names() {
+        assert_eq!(HookScope::User.label(), "user");
+        assert_eq!(HookScope::Project.label(), "project");
+        assert_eq!(HookScope::User.cli_name(), "user");
+        assert_eq!(HookScope::Project.cli_name(), "project");
+    }
+
+    #[test]
+    fn test_hook_environment_scope_root_and_config_path() {
+        let env = test_env();
+        assert_eq!(env.scope_root(HookScope::User), env.home_dir.as_path());
+        assert_eq!(
+            env.scope_root(HookScope::Project),
+            env.project_root.as_path()
+        );
+        assert_eq!(
+            env.config_path(HookPlatform::Cursor, HookScope::User),
+            env.home_dir.join(".cursor").join("hooks.json")
+        );
+        assert_eq!(
+            env.config_path(HookPlatform::Claude, HookScope::Project),
+            env.project_root.join(".claude").join("settings.json")
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // BinaryReference
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_binary_reference_for_scope_user_is_absolute() {
+        let env = test_env();
+        match BinaryReference::for_scope(&env, HookScope::User) {
+            BinaryReference::Absolute(p) => assert_eq!(p, env.current_exe),
+            other => panic!("expected Absolute, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_binary_reference_for_scope_project_is_path_lookup() {
+        let env = test_env();
+        assert!(matches!(
+            BinaryReference::for_scope(&env, HookScope::Project),
+            BinaryReference::PathLookup
+        ));
+    }
+
+    #[test]
+    fn test_binary_reference_build_command_path_lookup() {
+        let cmd =
+            BinaryReference::PathLookup.build_command(&["hooks".to_string(), "exec".to_string()]);
+        assert_eq!(cmd, "ahma hooks exec");
+    }
+
+    #[test]
+    fn test_binary_reference_build_command_absolute_quotes_spaces() {
+        let env = test_env();
+        let cmd =
+            BinaryReference::for_scope(&env, HookScope::User).build_command(&["hooks".to_string()]);
+        // Contains the binary path with the "bin space" directory, quoted.
+        assert!(cmd.contains("bin space"));
+        assert!(cmd.contains("hooks"));
+    }
+
+    // ----------------------------------------------------------------------
+    // action_message & selected_platforms
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_action_message_all_combinations() {
+        assert_eq!(
+            action_message(FileAction::Created, true),
+            "would be created"
+        );
+        assert_eq!(
+            action_message(FileAction::Updated, true),
+            "would be updated"
+        );
+        assert_eq!(
+            action_message(FileAction::Unchanged, true),
+            "already matches"
+        );
+        assert_eq!(action_message(FileAction::Created, false), "installed");
+        assert_eq!(action_message(FileAction::Updated, false), "updated");
+        assert_eq!(
+            action_message(FileAction::Unchanged, false),
+            "already matches"
+        );
+    }
+
+    #[test]
+    fn test_selected_platforms_empty_returns_all() {
+        assert_eq!(selected_platforms(&[]), HookPlatform::all());
+    }
+
+    #[test]
+    fn test_selected_platforms_nonempty_returns_requested() {
+        let requested = vec![HookPlatform::Claude, HookPlatform::Codex];
+        assert_eq!(selected_platforms(&requested), requested);
+    }
+
+    // ----------------------------------------------------------------------
+    // extract_tool_args
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_extract_tool_args_no_field_returns_none() {
+        let input = json!({"tool_name": "foo"});
+        assert!(extract_tool_args(&input).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_extract_tool_args_object_command() {
+        let input = json!({"tool_input": {"command": "ls -la"}});
+        let extracted = extract_tool_args(&input).unwrap().unwrap();
+        assert_eq!(extracted.command, "ls -la");
+        assert_eq!(extracted.arg_key, "command");
+        assert_eq!(
+            extracted.tool_input.get("command").unwrap().as_str(),
+            Some("ls -la")
+        );
+    }
+
+    #[test]
+    fn test_extract_tool_args_command_line_key() {
+        let input = json!({"tool_input": {"CommandLine": "dir"}});
+        let extracted = extract_tool_args(&input).unwrap().unwrap();
+        assert_eq!(extracted.command, "dir");
+        assert_eq!(extracted.arg_key, "CommandLine");
+    }
+
+    #[test]
+    fn test_extract_tool_args_tool_args_alias_object() {
+        // `toolArgs` is the alternate top-level key.
+        let input = json!({"toolArgs": {"command": "make"}});
+        let extracted = extract_tool_args(&input).unwrap().unwrap();
+        assert_eq!(extracted.command, "make");
+    }
+
+    #[test]
+    fn test_extract_tool_args_string_payload_parsed() {
+        // `toolArgs` provided as a JSON *string* must be parsed.
+        let input = json!({"toolArgs": "{\"command\": \"echo hi\"}"});
+        let extracted = extract_tool_args(&input).unwrap().unwrap();
+        assert_eq!(extracted.command, "echo hi");
+    }
+
+    #[test]
+    fn test_extract_tool_args_string_payload_invalid_json_errors() {
+        let input = json!({"toolArgs": "{not valid json"});
+        let err = extract_tool_args(&input).unwrap_err();
+        assert!(err.to_string().contains("toolArgs"));
+    }
+
+    #[test]
+    fn test_extract_tool_args_non_object_errors() {
+        // tool_input that is an array (not an object) is rejected.
+        let input = json!({"tool_input": [1, 2, 3]});
+        let err = extract_tool_args(&input).unwrap_err();
+        assert!(err.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn test_extract_tool_args_no_command_field_returns_none() {
+        // Object present but no command/CommandLine → not a shell tool.
+        let input = json!({"tool_input": {"path": "src/main.rs"}});
+        assert!(extract_tool_args(&input).unwrap().is_none());
+    }
+
+    // ----------------------------------------------------------------------
+    // extract_command_cwd
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_extract_command_cwd_prefers_working_directory() {
+        let mut tool_input = Map::new();
+        tool_input.insert(
+            "working_directory".to_string(),
+            Value::String("/work/here".to_string()),
+        );
+        let input = json!({"cwd": "/other"});
+        assert_eq!(
+            extract_command_cwd(&input, &tool_input).unwrap(),
+            "/work/here"
+        );
+    }
+
+    #[test]
+    fn test_extract_command_cwd_falls_back_to_input_cwd() {
+        let tool_input = Map::new();
+        let input = json!({"cwd": "/top/level"});
+        assert_eq!(
+            extract_command_cwd(&input, &tool_input).unwrap(),
+            "/top/level"
+        );
+    }
+
+    #[test]
+    fn test_extract_command_cwd_falls_back_to_current_dir() {
+        let tool_input = Map::new();
+        let input = json!({});
+        let got = extract_command_cwd(&input, &tool_input).unwrap();
+        let expected = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(got, expected);
+    }
+
+    // ----------------------------------------------------------------------
+    // updated_tool_input
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_updated_tool_input_replaces_key_preserves_others() {
+        let mut tool_input = Map::new();
+        tool_input.insert("command".to_string(), Value::String("old".to_string()));
+        tool_input.insert("description".to_string(), Value::String("desc".to_string()));
+        let updated = updated_tool_input(&tool_input, "new".to_string(), "command");
+        assert_eq!(updated["command"].as_str(), Some("new"));
+        assert_eq!(updated["description"].as_str(), Some("desc"));
+    }
+
+    // ----------------------------------------------------------------------
+    // build_cursor_hook_output (all decision arms)
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_build_cursor_hook_output_allow_unchanged() {
+        let out = build_cursor_hook_output(HooksDecision::AllowUnchanged);
+        assert_eq!(out["permission"].as_str(), Some("allow"));
+        assert!(out.get("updated_input").is_none());
+    }
+
+    #[test]
+    fn test_build_cursor_hook_output_allow_rewrite() {
+        let updated = json!({"command": "wrapped"});
+        let out = build_cursor_hook_output(HooksDecision::AllowRewrite(updated));
+        assert_eq!(out["permission"].as_str(), Some("allow"));
+        assert_eq!(out["updated_input"]["command"].as_str(), Some("wrapped"));
+    }
+
+    #[test]
+    fn test_build_cursor_hook_output_allow_with_warning() {
+        let out = build_cursor_hook_output(HooksDecision::AllowWithWarning {
+            user_message: "u".to_string(),
+            agent_message: "a".to_string(),
+        });
+        assert_eq!(out["permission"].as_str(), Some("allow"));
+        assert_eq!(out["user_message"].as_str(), Some("u"));
+        assert_eq!(out["agent_message"].as_str(), Some("a"));
+    }
+
+    // ----------------------------------------------------------------------
+    // build_structured_hook_output (all decision arms)
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_build_structured_hook_output_allow_unchanged() {
+        let out = build_structured_hook_output(HooksDecision::AllowUnchanged);
+        let hs = &out["hookSpecificOutput"];
+        assert_eq!(hs["hookEventName"].as_str(), Some("PreToolUse"));
+        assert_eq!(hs["permissionDecision"].as_str(), Some("allow"));
+    }
+
+    #[test]
+    fn test_build_structured_hook_output_allow_rewrite_sets_both_keys() {
+        let updated = json!({"command": "wrapped"});
+        let out = build_structured_hook_output(HooksDecision::AllowRewrite(updated));
+        let hs = &out["hookSpecificOutput"];
+        assert_eq!(hs["updatedInput"]["command"].as_str(), Some("wrapped"));
+        assert_eq!(hs["modifiedArgs"]["command"].as_str(), Some("wrapped"));
+    }
+
+    #[test]
+    fn test_build_structured_hook_output_allow_with_warning() {
+        let out = build_structured_hook_output(HooksDecision::AllowWithWarning {
+            user_message: "sys".to_string(),
+            agent_message: "agent".to_string(),
+        });
+        let hs = &out["hookSpecificOutput"];
+        assert_eq!(hs["permissionDecision"].as_str(), Some("allow"));
+        assert_eq!(hs["agentMessage"].as_str(), Some("agent"));
+        assert_eq!(hs["systemMessage"].as_str(), Some("sys"));
+    }
+
+    // ----------------------------------------------------------------------
+    // wrapped shell command encode/decode
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_build_wrapped_shell_command_project_uses_path_lookup() {
+        let env = test_env();
+        let cmd =
+            build_wrapped_shell_command(HookScope::Project, &env, "/work", "cargo build").unwrap();
+        assert!(cmd.starts_with("ahma hooks run-shell"));
+        assert!(cmd.contains("--payload-base64"));
+        assert!(cmd.contains(WRAPPED_BY_MARKER));
+    }
+
+    #[test]
+    fn test_build_wrapped_shell_command_roundtrip_payload() {
+        let env = test_env();
+        let cmd =
+            build_wrapped_shell_command(HookScope::Project, &env, "/work/dir", "echo x").unwrap();
+        // Pull the base64 token (3rd whitespace-separated field after run-shell).
+        let token = cmd
+            .split_whitespace()
+            .skip_while(|t| *t != "--payload-base64")
+            .nth(1)
+            .unwrap();
+        let payload = decode_wrapped_shell_payload(token).unwrap();
+        assert_eq!(payload.cwd, "/work/dir");
+        assert_eq!(payload.command, "echo x");
+    }
+
+    #[test]
+    fn test_decode_wrapped_shell_payload_bad_base64_errors() {
+        let err = decode_wrapped_shell_payload("!!!not base64!!!").unwrap_err();
+        assert!(err.to_string().contains("decode"));
+    }
+
+    #[test]
+    fn test_decode_wrapped_shell_payload_valid_base64_bad_json_errors() {
+        let encoded = URL_SAFE_NO_PAD.encode(b"not json at all");
+        let err = decode_wrapped_shell_payload(&encoded).unwrap_err();
+        assert!(err.to_string().contains("parse"));
+    }
+
+    // ----------------------------------------------------------------------
+    // is_wrapped_shell_command
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_is_wrapped_shell_command_detects_markers() {
+        assert!(is_wrapped_shell_command(&format!(
+            "foo {WRAPPED_BY_MARKER}"
+        )));
+        assert!(is_wrapped_shell_command("ahma run_terminal_command --x"));
+        assert!(!is_wrapped_shell_command("cargo build --release"));
+    }
+
+    // ----------------------------------------------------------------------
+    // ensure_root_object / ensure_child_object / ensure_child_array
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_ensure_root_object_initializes_null() {
+        let mut doc = Value::Null;
+        ensure_root_object(&mut doc).unwrap();
+        assert!(doc.is_object());
+    }
+
+    #[test]
+    fn test_ensure_root_object_rejects_non_object() {
+        let mut doc = Value::String("nope".to_string());
+        let err = ensure_root_object(&mut doc).unwrap_err();
+        assert!(err.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn test_ensure_child_object_creates_and_reuses() {
+        let mut map = Map::new();
+        ensure_child_object(&mut map, "hooks").unwrap();
+        assert!(map["hooks"].is_object());
+        // Reuse path: existing object is returned, not overwritten.
+        map["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .insert("k".to_string(), Value::Bool(true));
+        ensure_child_object(&mut map, "hooks").unwrap();
+        assert_eq!(map["hooks"]["k"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_ensure_child_object_rejects_non_object_value() {
+        let mut map = Map::new();
+        map.insert("hooks".to_string(), Value::String("bad".to_string()));
+        let err = ensure_child_object(&mut map, "hooks").unwrap_err();
+        assert!(err.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn test_ensure_child_array_creates_and_rejects_non_array() {
+        let mut map = Map::new();
+        ensure_child_array(&mut map, "list").unwrap();
+        assert!(map["list"].is_array());
+
+        let mut bad = Map::new();
+        bad.insert("list".to_string(), Value::Bool(false));
+        let err = ensure_child_array(&mut bad, "list").unwrap_err();
+        assert!(err.to_string().contains("must be an array"));
+    }
+
+    // ----------------------------------------------------------------------
+    // cleanup_empty_hook_tree
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_cleanup_empty_hook_tree_removes_empty_event_and_hooks() {
+        let mut root = Map::new();
+        let mut hooks = Map::new();
+        hooks.insert("PreToolUse".to_string(), Value::Array(Vec::new()));
+        root.insert("hooks".to_string(), Value::Object(hooks));
+        cleanup_empty_hook_tree(&mut root, "PreToolUse");
+        assert!(!root.contains_key("hooks"), "empty hooks tree pruned");
+    }
+
+    #[test]
+    fn test_cleanup_empty_hook_tree_keeps_nonempty() {
+        let mut root = Map::new();
+        let mut hooks = Map::new();
+        hooks.insert(
+            "PreToolUse".to_string(),
+            Value::Array(vec![json!({"x": 1})]),
+        );
+        root.insert("hooks".to_string(), Value::Object(hooks));
+        cleanup_empty_hook_tree(&mut root, "PreToolUse");
+        assert!(root.contains_key("hooks"));
+        assert_eq!(root["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    }
+
+    // ----------------------------------------------------------------------
+    // is_managed_* predicates
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_is_managed_command_matches_id() {
+        assert!(is_managed_command(&format!(
+            "ahma hooks exec --managed-id {MANAGED_ID_DEFAULT_SHELL_V1}"
+        )));
+        assert!(!is_managed_command("some other command"));
+    }
+
+    #[test]
+    fn test_is_managed_cursor_entry_variants() {
+        let managed = json!({"command": format!("x {MANAGED_ID_DEFAULT_SHELL_V1}")});
+        assert!(is_managed_cursor_entry(&managed));
+        assert!(!is_managed_cursor_entry(&json!({"command": "echo"})));
+        assert!(!is_managed_cursor_entry(&json!("not an object")));
+    }
+
+    #[test]
+    fn test_is_managed_handler_via_args() {
+        let handler = json!({
+            "type": "command",
+            "command": "ahma",
+            "args": ["hooks", "exec", "--managed-id", MANAGED_ID_DEFAULT_SHELL_V1],
+        });
+        assert!(is_managed_handler(&handler));
+    }
+
+    #[test]
+    fn test_is_managed_handler_via_command_and_command_windows() {
+        let by_command = json!({"command": format!("ahma {MANAGED_ID_DEFAULT_SHELL_V1}")});
+        assert!(is_managed_handler(&by_command));
+        let by_windows = json!({"commandWindows": format!("ps {MANAGED_ID_DEFAULT_SHELL_V1}")});
+        assert!(is_managed_handler(&by_windows));
+        assert!(!is_managed_handler(&json!({"command": "plain"})));
+        assert!(!is_managed_handler(&json!("not object")));
+    }
+
+    #[test]
+    fn test_is_managed_group_entry() {
+        let entry = json!({
+            "hooks": [
+                {"command": format!("ahma {MANAGED_ID_DEFAULT_SHELL_V1}")}
+            ]
+        });
+        assert!(is_managed_group_entry(&entry));
+        assert!(!is_managed_group_entry(
+            &json!({"hooks": [{"command": "x"}]})
+        ));
+        assert!(!is_managed_group_entry(&json!({"no_hooks": true})));
+    }
+
+    #[test]
+    fn test_is_managed_copilot_entry_variants() {
+        let by_bash = json!({"bash": format!("ahma {MANAGED_ID_DEFAULT_SHELL_V1}")});
+        assert!(is_managed_copilot_entry(&by_bash));
+        let by_ps = json!({"powershell": format!("ps {MANAGED_ID_DEFAULT_SHELL_V1}")});
+        assert!(is_managed_copilot_entry(&by_ps));
+        assert!(!is_managed_copilot_entry(&json!({"bash": "echo"})));
+        assert!(!is_managed_copilot_entry(&json!(42)));
+    }
+
+    // ----------------------------------------------------------------------
+    // load_hook_document
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_load_hook_document_missing_returns_empty_object() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nope.json");
+        let doc = load_hook_document(&path).unwrap();
+        assert_eq!(doc, Value::Object(Map::new()));
+    }
+
+    #[test]
+    fn test_load_hook_document_empty_file_returns_empty_object() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty.json");
+        fs::write(&path, "   \n").unwrap();
+        let doc = load_hook_document(&path).unwrap();
+        assert_eq!(doc, Value::Object(Map::new()));
+    }
+
+    #[test]
+    fn test_load_hook_document_invalid_json_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        fs::write(&path, "{ this is not json").unwrap();
+        let err = load_hook_document(&path).unwrap_err();
+        assert!(err.to_string().contains("Failed to parse JSON hook config"));
+    }
+
+    #[test]
+    fn test_load_hook_document_valid_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ok.json");
+        fs::write(&path, r#"{"version":1}"#).unwrap();
+        let doc = load_hook_document(&path).unwrap();
+        assert_eq!(doc["version"].as_i64(), Some(1));
+    }
+
+    // ----------------------------------------------------------------------
+    // write_hook_document & backup_path
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_write_hook_document_unchanged() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        let same = json!({"a": 1});
+        let action = write_hook_document(&path, &same, &same, false, true).unwrap();
+        assert_eq!(action, FileAction::Unchanged);
+        assert!(!path.exists(), "unchanged must not write a file");
+    }
+
+    #[test]
+    fn test_write_hook_document_dry_run_created_does_not_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("d.json");
+        let action = write_hook_document(
+            &path,
+            &Value::Object(Map::new()),
+            &json!({"a": 1}),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(action, FileAction::Created);
+        assert!(!path.exists(), "dry run must not write");
+    }
+
+    #[test]
+    fn test_write_hook_document_dry_run_updated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("e.json");
+        let action =
+            write_hook_document(&path, &json!({"a": 1}), &json!({"a": 2}), true, true).unwrap();
+        assert_eq!(action, FileAction::Updated);
+    }
+
+    #[test]
+    fn test_write_hook_document_created_writes_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested").join("f.json");
+        let action = write_hook_document(
+            &path,
+            &Value::Object(Map::new()),
+            &json!({"hello": "world"}),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(action, FileAction::Created);
+        let written = load_hook_document(&path).unwrap();
+        assert_eq!(written["hello"].as_str(), Some("world"));
+    }
+
+    #[test]
+    fn test_write_hook_document_updated_creates_backup() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("g.json");
+        fs::write(&path, r#"{"a":1}"#).unwrap();
+        let action =
+            write_hook_document(&path, &json!({"a": 1}), &json!({"a": 2}), false, true).unwrap();
+        assert_eq!(action, FileAction::Updated);
+        let backup = backup_path(&path).unwrap();
+        assert!(
+            backup.exists(),
+            "an existing file must be backed up on update"
+        );
+        let updated = load_hook_document(&path).unwrap();
+        assert_eq!(updated["a"].as_i64(), Some(2));
+    }
+
+    #[test]
+    fn test_backup_path_appends_bak() {
+        let path = Path::new("/some/dir/settings.json");
+        let backup = backup_path(path).unwrap();
+        assert_eq!(backup, Path::new("/some/dir/settings.json.bak"));
+    }
+
+    // ----------------------------------------------------------------------
+    // remove_managed_hook_entries error/early-return paths
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_remove_managed_hook_entries_non_object_errors() {
+        let mut doc = Value::String("nope".to_string());
+        let err =
+            remove_managed_hook_entries(&mut doc, "Lbl", "PreToolUse", is_managed_group_entry)
+                .unwrap_err();
+        assert!(err.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn test_remove_managed_hook_entries_no_hooks_returns_false() {
+        let mut doc = json!({"version": 1});
+        let changed =
+            remove_managed_hook_entries(&mut doc, "Lbl", "PreToolUse", is_managed_group_entry)
+                .unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_remove_managed_hook_entries_hooks_not_object_errors() {
+        let mut doc = json!({"hooks": "bad"});
+        let err =
+            remove_managed_hook_entries(&mut doc, "Lbl", "PreToolUse", is_managed_group_entry)
+                .unwrap_err();
+        assert!(err.to_string().contains("'hooks' must be an object"));
+    }
+
+    #[test]
+    fn test_remove_managed_hook_entries_no_event_key_returns_false() {
+        let mut doc = json!({"hooks": {}});
+        let changed =
+            remove_managed_hook_entries(&mut doc, "Lbl", "PreToolUse", is_managed_group_entry)
+                .unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn test_remove_managed_hook_entries_event_not_array_errors() {
+        let mut doc = json!({"hooks": {"PreToolUse": "bad"}});
+        let err =
+            remove_managed_hook_entries(&mut doc, "Lbl", "PreToolUse", is_managed_group_entry)
+                .unwrap_err();
+        assert!(err.to_string().contains("hook list must be an array"));
+    }
+
+    // ----------------------------------------------------------------------
+    // hook_status_string
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_hook_status_string_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("absent.json");
+        assert_eq!(
+            hook_status_string(&path, HookPlatform::Cursor).unwrap(),
+            "missing"
+        );
+    }
+
+    #[test]
+    fn test_hook_status_string_installed_and_not_installed() {
+        let env = test_env();
+        let path = env.config_path(HookPlatform::Cursor, HookScope::User);
+        let mut document = Value::Object(Map::new());
+        install_platform_hook(&mut document, HookPlatform::Cursor, HookScope::User, &env).unwrap();
+        write_hook_document(&path, &Value::Object(Map::new()), &document, false, false).unwrap();
+        assert_eq!(
+            hook_status_string(&path, HookPlatform::Cursor).unwrap(),
+            "installed"
+        );
+
+        // A file that exists but has no managed entry → not installed.
+        let dir = tempdir().unwrap();
+        let other = dir.path().join("plain.json");
+        fs::write(&other, r#"{"hooks":{"preToolUse":[]}}"#).unwrap();
+        assert_eq!(
+            hook_status_string(&other, HookPlatform::Cursor).unwrap(),
+            "not installed"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // exec_args / exec_command_and_args / build_exec_command
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_exec_args_shape() {
+        let args = exec_args(HookPlatform::Claude, HookScope::Project);
+        assert_eq!(args[0], "hooks");
+        assert_eq!(args[1], "exec");
+        assert!(args.contains(&"--platform".to_string()));
+        assert!(args.contains(&"claude".to_string()));
+        assert!(args.contains(&"project".to_string()));
+        assert!(args.contains(&MANAGED_ID_DEFAULT_SHELL_V1.to_string()));
+    }
+
+    #[test]
+    fn test_exec_command_and_args_user_is_absolute_path() {
+        let env = test_env();
+        let (binary, args) = exec_command_and_args(HookPlatform::Claude, HookScope::User, &env);
+        assert!(binary.contains("bin space"));
+        assert_eq!(args[0], "hooks");
+    }
+
+    #[test]
+    fn test_exec_command_and_args_project_uses_path_lookup() {
+        let env = test_env();
+        let (binary, _) = exec_command_and_args(HookPlatform::Claude, HookScope::Project, &env);
+        assert_eq!(binary, "ahma");
+    }
+
+    #[test]
+    fn test_build_exec_command_project_is_ahma_prefixed() {
+        let env = test_env();
+        let cmd = build_exec_command(HookPlatform::Codex, HookScope::Project, &env);
+        assert!(cmd.starts_with("ahma hooks exec"));
+        assert!(cmd.contains("codex"));
+    }
+
+    // ----------------------------------------------------------------------
+    // codex_group_entry
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_codex_group_entry_user_scope_basic_handler() {
+        let env = test_env();
+        let entry = codex_group_entry(HookScope::User, &env);
+        assert_eq!(entry["matcher"].as_str(), Some("^Bash$"));
+        let handler = &entry["hooks"][0];
+        assert_eq!(handler["type"].as_str(), Some("command"));
+        assert!(handler["command"].as_str().unwrap().contains("bin space"));
+        assert_eq!(
+            handler["statusMessage"].as_str(),
+            Some("Routing Bash through ahma")
+        );
+        // Non-windows user scope should not add commandWindows.
+        #[cfg(not(target_os = "windows"))]
+        assert!(handler.get("commandWindows").is_none());
+    }
+
+    #[test]
+    fn test_codex_group_entry_project_scope_adds_command_windows() {
+        let env = test_env();
+        let entry = codex_group_entry(HookScope::Project, &env);
+        let handler = &entry["hooks"][0];
+        // Project scope always adds a Windows variant.
+        assert!(handler["commandWindows"].as_str().is_some());
+        assert!(handler["command"].as_str().unwrap().starts_with("ahma"));
+    }
+
+    #[test]
+    fn test_managed_group_entry_claude_matcher_bash() {
+        let env = test_env();
+        let entry = managed_group_entry(HookPlatform::Claude, HookScope::User, &env);
+        assert_eq!(entry["matcher"].as_str(), Some("Bash"));
+        assert!(is_managed_group_entry(&entry));
+    }
+
+    #[test]
+    fn test_managed_group_entry_antigravity_matcher_run_command() {
+        let env = test_env();
+        let entry = managed_group_entry(HookPlatform::Antigravity, HookScope::User, &env);
+        assert_eq!(entry["matcher"].as_str(), Some("run_command"));
+    }
+
+    // ----------------------------------------------------------------------
+    // shell quoting / absolute command builders
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_shell_quote_posix_escapes_single_quotes() {
+        assert_eq!(shell_quote_posix("plain"), "'plain'");
+        assert_eq!(shell_quote_posix("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn test_powershell_quote_doubles_single_quotes() {
+        assert_eq!(powershell_quote("plain"), "'plain'");
+        assert_eq!(powershell_quote("a'b"), "'a''b'");
+    }
+
+    #[test]
+    fn test_build_absolute_shell_command_quotes_path_and_args() {
+        let cmd = build_absolute_shell_command(
+            Path::new("/opt/bin space/ahma"),
+            &["hooks".to_string(), "exec".to_string()],
+        );
+        assert!(cmd.contains("bin space"));
+        assert!(cmd.contains("hooks"));
+        assert!(cmd.contains("exec"));
+    }
+
+    // ----------------------------------------------------------------------
+    // compute_exec_decision_internal: string-payload + non-shell + cwd fallback
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_compute_exec_decision_internal_string_payload_rewrites() {
+        let env = test_env();
+        let input = json!({
+            "cwd": "/proj",
+            "toolArgs": "{\"command\": \"cargo test\"}"
+        });
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
+        assert!(matches!(decision, HooksDecision::AllowRewrite(_)));
+    }
+
+    #[test]
+    fn test_compute_exec_decision_internal_malformed_args_allows_unchanged() {
+        let env = test_env();
+        // toolArgs string that is invalid JSON → extract_tool_args Err → allow.
+        let input = json!({"toolArgs": "{bad"});
+        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true, false);
+        assert!(matches!(decision, HooksDecision::AllowUnchanged));
+    }
+
+    #[test]
+    fn test_compute_exec_decision_internal_no_cwd_uses_current_dir_and_rewrites() {
+        let env = test_env();
+        // No `working_directory`/`cwd` → falls back to current_dir (succeeds) → rewrite.
+        let input = json!({"tool_input": {"command": "ls"}});
+        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true, false);
+        assert!(matches!(decision, HooksDecision::AllowRewrite(_)));
+    }
+
+    // ----------------------------------------------------------------------
+    // is_ahma_hooks_active_with_configs / describe_activation env precedence
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_is_ahma_hooks_active_env_off_overrides_active_configs() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _restore = EnvGuard::capture();
+        unsafe {
+            std::env::set_var("AHMA_HOOKS", "off");
+            std::env::remove_var("AHMA_DISABLE_HOOKS");
+        }
+        // Even with a configured MCP path, AHMA_HOOKS=off wins.
+        assert!(!is_ahma_hooks_active_with_configs(&[PathBuf::from("/x")]));
+    }
+
+    #[test]
+    fn test_is_ahma_hooks_active_env_on_overrides_no_configs() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _restore = EnvGuard::capture();
+        unsafe {
+            std::env::set_var("AHMA_HOOKS", "on");
+            std::env::remove_var("AHMA_DISABLE_HOOKS");
+        }
+        assert!(is_ahma_hooks_active_with_configs(&[]));
+    }
+
+    #[test]
+    fn test_is_ahma_hooks_active_disable_alias() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _restore = EnvGuard::capture();
+        unsafe {
+            std::env::remove_var("AHMA_HOOKS");
+            std::env::set_var("AHMA_DISABLE_HOOKS", "1");
+        }
+        assert!(!is_ahma_hooks_active_with_configs(&[PathBuf::from("/x")]));
+    }
+
+    #[test]
+    fn test_describe_activation_env_reasons() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _restore = EnvGuard::capture();
+
+        unsafe {
+            std::env::set_var("AHMA_HOOKS", "off");
+            std::env::remove_var("AHMA_DISABLE_HOOKS");
+        }
+        let (active, reason) = describe_activation(&[PathBuf::from("/x")]);
+        assert!(!active);
+        assert_eq!(reason, "AHMA_HOOKS=off");
+
+        unsafe { std::env::set_var("AHMA_HOOKS", "on") };
+        let (active, reason) = describe_activation(&[]);
+        assert!(active);
+        assert_eq!(reason, "AHMA_HOOKS=on");
+
+        unsafe {
+            std::env::remove_var("AHMA_HOOKS");
+            std::env::set_var("AHMA_DISABLE_HOOKS", "1");
+        }
+        let (active, reason) = describe_activation(&[PathBuf::from("/x")]);
+        assert!(!active);
+        assert_eq!(reason, "AHMA_DISABLE_HOOKS=1");
+    }
+
+    #[test]
+    fn test_describe_activation_auto_active_reason() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _restore = EnvGuard::capture();
+        unsafe {
+            std::env::remove_var("AHMA_HOOKS");
+            std::env::remove_var("AHMA_DISABLE_HOOKS");
+        }
+        let (active, reason) = describe_activation(&[PathBuf::from("/x/.claude.json")]);
+        assert!(active);
+        assert_eq!(reason, "auto: ahma MCP server detected in client config");
+    }
+
+    // ----------------------------------------------------------------------
+    // mcp_config_candidates includes project .vscode/mcp.json
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_mcp_config_candidates_includes_project_vscode() {
+        let home = Path::new("/home/user");
+        let project = Path::new("/proj");
+        let with_project = mcp_config_candidates(home, Some(project));
+        assert!(with_project.contains(&project.join(".vscode").join("mcp.json")));
+        // Without a project root the vscode project path is absent.
+        let without = mcp_config_candidates(home, None);
+        assert!(!without.contains(&project.join(".vscode").join("mcp.json")));
+        assert!(without.contains(&home.join(".cursor").join("mcp.json")));
+    }
+
+    // ----------------------------------------------------------------------
+    // grouped/cursor/copilot install round-trips through uninstall
+    // ----------------------------------------------------------------------
+    #[test]
+    fn test_cursor_install_then_uninstall_cleans_tree() {
+        let env = test_env();
+        let mut document = Value::Object(Map::new());
+        install_platform_hook(&mut document, HookPlatform::Cursor, HookScope::User, &env).unwrap();
+        assert!(cursor_hook_installed(&document));
+        let changed = uninstall_platform_hook(&mut document, HookPlatform::Cursor).unwrap();
+        assert!(changed);
+        assert!(!cursor_hook_installed(&document));
+    }
+
+    #[test]
+    fn test_install_grouped_hook_replaces_existing_managed_entry() {
+        let env = test_env();
+        let mut document = Value::Object(Map::new());
+        install_platform_hook(&mut document, HookPlatform::Claude, HookScope::User, &env).unwrap();
+        // Install again — must replace, not duplicate (retain drops old managed).
+        install_platform_hook(&mut document, HookPlatform::Claude, HookScope::User, &env).unwrap();
+        let entries = document["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "re-install must not duplicate the managed entry"
         );
     }
 }

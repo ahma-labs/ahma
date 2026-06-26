@@ -220,4 +220,141 @@ mod tests {
         assert!(!name.contains('/'));
         assert!(!name.contains('.'));
     }
+
+    #[test]
+    fn generate_name_truncates_slug_to_32_chars() {
+        // Covers the `.take(32)` truncation branch (lines 158-162).
+        let long = "a".repeat(50);
+        let name = TaskVault::generate_name(&long);
+        // Exactly 32 'a's must appear; 33 must not.
+        assert!(name.contains(&"a".repeat(32)), "slug should keep 32 chars");
+        assert!(
+            !name.contains(&"a".repeat(33)),
+            "slug must be truncated to 32 chars, got: {name}"
+        );
+    }
+
+    #[test]
+    fn generate_name_strips_unicode_and_keeps_ascii_word_chars() {
+        // Non-ASCII letters/symbols are filtered out; ASCII alnum/-/_ kept.
+        let name = TaskVault::generate_name("café-π_naïve9");
+        // The sanitized portion is between the timestamp and the hex suffix.
+        // It must consist only of the retained ASCII word characters.
+        assert!(name.contains("caf-_nave9"), "unexpected name: {name}");
+        // Multi-byte chars must be gone.
+        assert!(!name.contains('é'));
+        assert!(!name.contains('π'));
+        assert!(!name.contains('ï'));
+    }
+
+    #[test]
+    fn generate_name_empty_slug_yields_double_hyphen() {
+        // Empty sanitized slug => "<ts>--<hex>".
+        let name = TaskVault::generate_name("");
+        assert!(name.contains("--"), "empty slug should leave '--': {name}");
+    }
+
+    #[test]
+    fn generate_name_all_special_chars_yields_double_hyphen() {
+        // Every char filtered out -> sanitized is empty.
+        let name = TaskVault::generate_name("!@#$%^&*()/\\. ");
+        assert!(
+            name.contains("--"),
+            "all-special slug should leave '--': {name}"
+        );
+        // Hex suffix is 16 lowercase hex digits.
+        let hex = name.rsplit('-').next().unwrap();
+        assert_eq!(hex.len(), 16, "hex suffix must be 16 chars: {name}");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn generate_name_has_utc_timestamp_prefix() {
+        let name = TaskVault::generate_name("ts");
+        // Format "%Y%m%dT%H%M%SZ" => 8 digits, 'T', 6 digits, 'Z'.
+        let ts = &name[..16];
+        assert_eq!(ts.len(), 16);
+        assert_eq!(&ts[8..9], "T");
+        assert_eq!(&ts[15..16], "Z");
+        assert!(ts[..8].chars().all(|c| c.is_ascii_digit()));
+        assert!(ts[9..15].chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn generate_name_is_unique_across_calls() {
+        // The random hex suffix should differ between two calls.
+        let a = TaskVault::generate_name("same");
+        let b = TaskVault::generate_name("same");
+        assert_ne!(a, b, "random suffix should make names unique");
+    }
+
+    #[test]
+    fn from_root_derives_all_subpaths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("derive-root");
+        let vault = TaskVault::from_root(root.clone());
+        assert_eq!(vault.root, root);
+        assert_eq!(vault.inputs, root.join("inputs"));
+        assert_eq!(vault.workdir, root.join("workdir"));
+        assert_eq!(vault.outputs, root.join("outputs"));
+        assert_eq!(vault.trash, root.join("trash"));
+        assert_eq!(vault.audit_log, root.join("audit.jsonl"));
+        assert_eq!(vault.path(), root.as_path());
+    }
+
+    #[test]
+    fn audit_writer_bound_to_vault_audit_log() {
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_in_tempdir(&tmp, "audit-bind");
+        let writer = vault.audit_writer();
+        assert_eq!(writer.path(), vault.audit_log.as_path());
+    }
+
+    #[test]
+    fn trash_manager_bound_to_vault_trash_dir() {
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_in_tempdir(&tmp, "trash-bind");
+        let manager = vault.trash_manager();
+        assert_eq!(manager.path(), vault.trash.as_path());
+    }
+
+    #[test]
+    fn create_at_is_idempotent_and_preserves_audit_log() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("idempotent");
+        let vault = TaskVault::create_at(root.clone()).unwrap();
+        // Write content into the audit log to detect any overwrite.
+        std::fs::write(&vault.audit_log, b"existing-entry\n").unwrap();
+        // Re-create at the same root: the `if !audit_log.exists()` false branch
+        // (line 100) must skip the write and preserve content.
+        let again = TaskVault::create_at(root.clone()).unwrap();
+        assert_eq!(again.root, vault.root);
+        let contents = std::fs::read(&vault.audit_log).unwrap();
+        assert_eq!(contents, b"existing-entry\n", "audit log must be preserved");
+    }
+
+    #[test]
+    fn create_at_fresh_audit_log_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_in_tempdir(&tmp, "fresh-log");
+        let contents = std::fs::read(&vault.audit_log).unwrap();
+        assert!(contents.is_empty(), "fresh audit log must be empty");
+    }
+
+    #[test]
+    fn create_at_errors_when_parent_is_a_file() {
+        // Force a create_dir_all failure: make the would-be parent a regular file.
+        let tmp = TempDir::new().unwrap();
+        let file_path = tmp.path().join("not-a-dir");
+        std::fs::write(&file_path, b"blocker").unwrap();
+        // Root nested under a file path => create_dir_all(inputs) must fail,
+        // exercising the with_context error branch (lines 91-92).
+        let root = file_path.join("vault");
+        let err = TaskVault::create_at(root).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to create"),
+            "error should carry context, got: {msg}"
+        );
+    }
 }

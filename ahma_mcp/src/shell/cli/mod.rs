@@ -3705,4 +3705,719 @@ mod tests {
         assert_eq!(semver, "0.12.5");
         assert_eq!(build_id, None);
     }
+
+    // ─── expand_tilde ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_expand_tilde_bare_tilde_is_home() {
+        let home = dirs::home_dir().expect("home dir resolvable in test env");
+        let expanded = expand_tilde(PathBuf::from("~"));
+        assert_eq!(expanded, home, "bare ~ must expand to the home directory");
+    }
+
+    #[test]
+    fn test_expand_tilde_with_slash_subpath() {
+        let home = dirs::home_dir().expect("home dir resolvable in test env");
+        let expanded = expand_tilde(PathBuf::from("~/projects/foo"));
+        assert_eq!(expanded, home.join("projects/foo"));
+    }
+
+    #[test]
+    fn test_expand_tilde_with_backslash_subpath() {
+        // The `~\sub` branch is matched by a literal backslash and is pure string
+        // logic, so it behaves identically on every platform.
+        let home = dirs::home_dir().expect("home dir resolvable in test env");
+        let expanded = expand_tilde(PathBuf::from("~\\sub"));
+        assert_eq!(expanded, home.join("sub"));
+    }
+
+    #[test]
+    fn test_expand_tilde_non_tilde_path_unchanged() {
+        let p = PathBuf::from("/absolute/no/tilde");
+        assert_eq!(expand_tilde(p.clone()), p, "absolute paths pass through");
+    }
+
+    #[test]
+    fn test_expand_tilde_tilde_user_not_expanded() {
+        // `~user` (no separator) is NOT a home reference and must pass through.
+        let p = PathBuf::from("~someuser/dir");
+        assert_eq!(expand_tilde(p.clone()), p);
+    }
+
+    // ─── resolve_persistent_scopes ───────────────────────────────────────────
+
+    fn pscope(
+        path: PathBuf,
+        access: ahma_common::config::ScopeAccess,
+    ) -> ahma_common::config::PersistentScope {
+        ahma_common::config::PersistentScope {
+            path,
+            access,
+            granted_by: Some("test".to_string()),
+            granted_at: None,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_persistent_scopes_rw_creates_and_canonicalizes() {
+        init_test();
+        use ahma_common::config::ScopeAccess;
+        let tmp = tempdir().unwrap();
+        let rw_dir = tmp.path().join("rw-cache");
+        assert!(!rw_dir.exists());
+        let cfg = AppConfig {
+            persistent_scopes: vec![pscope(rw_dir.clone(), ScopeAccess::Rw)],
+            ..make_cfg()
+        };
+        let (write, read) = resolve_persistent_scopes(&cfg);
+        assert!(rw_dir.exists(), "rw scope dir must be auto-created");
+        assert_eq!(write, vec![dunce::canonicalize(&rw_dir).unwrap()]);
+        assert!(read.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_persistent_scopes_rw_dedupes() {
+        init_test();
+        use ahma_common::config::ScopeAccess;
+        let tmp = tempdir().unwrap();
+        let rw_dir = tmp.path().join("rw-cache");
+        let cfg = AppConfig {
+            persistent_scopes: vec![
+                pscope(rw_dir.clone(), ScopeAccess::Rw),
+                pscope(rw_dir.clone(), ScopeAccess::Rw),
+            ],
+            ..make_cfg()
+        };
+        let (write, _read) = resolve_persistent_scopes(&cfg);
+        assert_eq!(write.len(), 1, "duplicate rw scope must be deduped");
+    }
+
+    #[test]
+    fn test_resolve_persistent_scopes_ro_existing_canonicalized() {
+        init_test();
+        use ahma_common::config::ScopeAccess;
+        let tmp = tempdir().unwrap();
+        let ro_dir = tmp.path().join("ro-data");
+        std::fs::create_dir_all(&ro_dir).unwrap();
+        let cfg = AppConfig {
+            persistent_scopes: vec![pscope(ro_dir.clone(), ScopeAccess::Ro)],
+            ..make_cfg()
+        };
+        let (write, read) = resolve_persistent_scopes(&cfg);
+        assert!(write.is_empty());
+        assert_eq!(read, vec![dunce::canonicalize(&ro_dir).unwrap()]);
+    }
+
+    #[test]
+    fn test_resolve_persistent_scopes_ro_missing_skipped() {
+        init_test();
+        use ahma_common::config::ScopeAccess;
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist-ro");
+        let cfg = AppConfig {
+            persistent_scopes: vec![pscope(missing, ScopeAccess::Ro)],
+            ..make_cfg()
+        };
+        let (write, read) = resolve_persistent_scopes(&cfg);
+        assert!(write.is_empty());
+        assert!(
+            read.is_empty(),
+            "a missing read-only scope must be skipped, never created"
+        );
+    }
+
+    // ─── ensure_task_vault_layout ────────────────────────────────────────────
+
+    #[test]
+    fn test_ensure_task_vault_layout_creates_tree_and_returns_workdir() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        let workdir = ensure_task_vault_layout(&root).unwrap();
+        assert_eq!(workdir, dunce::canonicalize(root.join("workdir")).unwrap());
+        assert!(root.join("inputs").is_dir());
+        assert!(root.join("workdir").is_dir());
+        assert!(root.join("outputs").is_dir());
+        assert!(root.join("trash").is_dir());
+        assert!(root.join("audit.jsonl").is_file());
+    }
+
+    #[test]
+    fn test_ensure_task_vault_layout_preserves_existing_audit_log() {
+        init_test();
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        // First call creates the layout.
+        ensure_task_vault_layout(&root).unwrap();
+        // Write content into the audit log.
+        let audit = root.join("audit.jsonl");
+        std::fs::write(&audit, b"existing-entry\n").unwrap();
+        // Second call must NOT truncate the existing audit log (idempotent).
+        ensure_task_vault_layout(&root).unwrap();
+        let contents = std::fs::read_to_string(&audit).unwrap();
+        assert_eq!(
+            contents, "existing-entry\n",
+            "an existing audit log must be preserved, not overwritten"
+        );
+    }
+
+    // ─── extract_serve_fields ────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_serve_fields_http_custom() {
+        let cmd = Cli::parse_from([
+            "ahma", "serve", "http", "--host", "0.0.0.0", "--port", "9999",
+        ])
+        .command;
+        let fields = extract_serve_fields(&cmd);
+        assert_eq!(fields.http_host, "0.0.0.0");
+        assert_eq!(fields.http_port, 9999);
+    }
+
+    #[test]
+    fn test_extract_serve_fields_stdio_defaults() {
+        let cmd = Cli::parse_from(["ahma", "serve", "stdio"]).command;
+        let fields = extract_serve_fields(&cmd);
+        assert_eq!(fields.http_host, "127.0.0.1");
+        assert_eq!(fields.http_port, 3000);
+    }
+
+    #[test]
+    fn test_extract_serve_fields_serve_none_defaults() {
+        let cmd = Cli::parse_from(["ahma", "serve"]).command;
+        let fields = extract_serve_fields(&cmd);
+        assert_eq!(fields.http_host, "127.0.0.1");
+        assert_eq!(fields.http_port, 3000);
+    }
+
+    #[test]
+    fn test_extract_serve_fields_non_serve_defaults() {
+        let cmd = Cli::parse_from(["ahma", "tool", "list"]).command;
+        let fields = extract_serve_fields(&cmd);
+        assert_eq!(fields.http_host, "127.0.0.1");
+        assert_eq!(fields.http_port, 3000);
+    }
+
+    // ─── extract_tool_fields / default_tool_fields ───────────────────────────
+
+    #[test]
+    fn test_extract_tool_fields_list_with_server_args() {
+        let cmd = Cli::parse_from(["ahma", "tool", "list", "--", "./server", "-x", "y"]).command;
+        let fields = extract_tool_fields(&cmd);
+        assert_eq!(fields.run_tool.as_deref(), Some("./server"));
+        assert_eq!(
+            fields.run_tool_args,
+            vec!["-x".to_string(), "y".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_extract_tool_fields_list_with_server_and_format() {
+        let cmd = Cli::parse_from([
+            "ahma", "tool", "list", "--server", "foo", "--format", "json",
+        ])
+        .command;
+        let fields = extract_tool_fields(&cmd);
+        assert_eq!(fields.list_server.as_deref(), Some("foo"));
+        assert!(matches!(fields.list_format, list_tools::OutputFormat::Json));
+        assert!(fields.run_tool.is_none());
+    }
+
+    #[test]
+    fn test_extract_tool_fields_run() {
+        let cmd = Cli::parse_from(["ahma", "tool", "run", "mytool", "--", "-a"]).command;
+        let fields = extract_tool_fields(&cmd);
+        assert_eq!(fields.run_tool.as_deref(), Some("mytool"));
+        assert_eq!(fields.run_tool_args, vec!["-a".to_string()]);
+        assert_eq!(fields.mcp_config, PathBuf::from("mcp.json"));
+    }
+
+    #[test]
+    fn test_extract_tool_fields_validate_falls_back_to_defaults() {
+        let cmd = Cli::parse_from(["ahma", "tool", "validate"]).command;
+        let fields = extract_tool_fields(&cmd);
+        assert!(fields.run_tool.is_none());
+        assert!(fields.list_server.is_none());
+        assert!(fields.list_http.is_none());
+        assert_eq!(fields.mcp_config, PathBuf::from("mcp.json"));
+    }
+
+    #[test]
+    fn test_extract_tool_fields_non_tool_command_defaults() {
+        let cmd = Cli::parse_from(["ahma", "serve", "stdio"]).command;
+        let fields = extract_tool_fields(&cmd);
+        assert!(fields.run_tool.is_none());
+        assert_eq!(fields.mcp_config, PathBuf::from("mcp.json"));
+    }
+
+    // ─── load_settings ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_load_settings_no_settings_returns_defaults() {
+        let cli = Cli::parse_from(["ahma", "--no-settings", "serve", "stdio"]);
+        let s = load_settings(&cli);
+        assert_eq!(s.tools.timeout_secs, 600);
+    }
+
+    #[test]
+    fn test_load_settings_explicit_path_parses_file() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("custom-settings.toml");
+        std::fs::write(&path, "[tools]\ntimeout_secs = 1234\n").unwrap();
+        let cli = Cli::parse_from([
+            "ahma",
+            "--settings-path",
+            path.to_str().unwrap(),
+            "serve",
+            "stdio",
+        ]);
+        let s = load_settings(&cli);
+        assert_eq!(s.tools.timeout_secs, 1234);
+    }
+
+    #[test]
+    fn test_load_settings_explicit_missing_path_returns_defaults() {
+        let tmp = tempdir().unwrap();
+        let missing = tmp.path().join("nope.toml");
+        let cli = Cli::parse_from([
+            "ahma",
+            "--settings-path",
+            missing.to_str().unwrap(),
+            "serve",
+            "stdio",
+        ]);
+        let s = load_settings(&cli);
+        assert_eq!(
+            s.tools.timeout_secs, 600,
+            "a missing settings file is not an error; defaults are used"
+        );
+    }
+
+    // ─── parse_execution_settings ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_execution_settings_from_settings() {
+        init_test();
+        let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
+        let mut s = ahma_common::config::AhmaSettings::default();
+        s.tools.timeout_secs = 42;
+        s.tools.force_sync = true;
+        s.tools.hot_reload = true;
+        s.tools.skip_probes = true;
+        let (timeout, sync, hot, skip) = parse_execution_settings(&cli, &s);
+        assert_eq!(timeout, 42);
+        assert!(sync && hot && skip);
+    }
+
+    #[test]
+    fn test_parse_execution_settings_cli_overrides() {
+        init_test();
+        let cli = Cli::parse_from([
+            "ahma",
+            "--timeout",
+            "120",
+            "--sync",
+            "--hot-reload",
+            "--skip-probes",
+            "serve",
+            "stdio",
+        ]);
+        let s = ahma_common::config::AhmaSettings::default();
+        let (timeout, sync, hot, skip) = parse_execution_settings(&cli, &s);
+        assert_eq!(timeout, 120);
+        assert!(sync && hot && skip);
+    }
+
+    // ─── parse_sandbox_settings ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_sandbox_settings_from_settings() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        init_test();
+        let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
+        let mut s = ahma_common::config::AhmaSettings::default();
+        s.sandbox.disable = true;
+        s.sandbox.defer = true;
+        s.sandbox.tmp_access = true;
+        s.sandbox.use_sandbox_directory = true;
+        s.sandbox.disable_temp = true;
+        s.logging.log_monitor = true;
+        s.logging.monitor_rate_limit_secs = 30;
+        s.sandbox.package_cache_write = true;
+        let (no_sandbox, defer, tmp, use_dir, no_temp, mon, rate, pkg) =
+            parse_sandbox_settings(&cli, &s);
+        assert!(no_sandbox && defer && tmp && use_dir && no_temp && mon);
+        assert_eq!(rate, 30);
+        assert!(pkg, "package_cache_write follows settings when no CLI flag");
+    }
+
+    #[test]
+    fn test_parse_sandbox_settings_cli_overrides_and_pkg_cache_flag() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        init_test();
+        let cli = Cli::parse_from([
+            "ahma",
+            "--defer-sandbox",
+            "--tmp",
+            "--sandbox",
+            "--disable-temp-files",
+            "--log-monitor",
+            "--monitor-rate-limit",
+            "15",
+            "--no-package-cache-write",
+            "serve",
+            "stdio",
+        ]);
+        let s = ahma_common::config::AhmaSettings::default();
+        let (_no_sandbox, defer, tmp, use_dir, no_temp, mon, rate, pkg) =
+            parse_sandbox_settings(&cli, &s);
+        assert!(defer && tmp && use_dir && no_temp && mon);
+        assert_eq!(rate, 15);
+        assert!(
+            !pkg,
+            "--no-package-cache-write must disable package cache writes"
+        );
+    }
+
+    // ─── parse_http_settings ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_http_settings_from_settings() {
+        init_test();
+        let cli = Cli::parse_from(["ahma", "serve", "http"]);
+        let mut s = ahma_common::config::AhmaSettings::default();
+        s.http.disable_quic = true;
+        s.http.disable_http1_1 = true;
+        s.http.handshake_timeout_secs = 99;
+        let (no_quic, no_h1, hs) = parse_http_settings(&cli, &s);
+        assert!(no_quic && no_h1);
+        assert_eq!(hs, 99);
+    }
+
+    #[test]
+    fn test_parse_http_settings_cli_overrides() {
+        init_test();
+        let cli = Cli::parse_from([
+            "ahma",
+            "--disable-quic",
+            "--disable-http1-1",
+            "--handshake-timeout",
+            "7",
+            "serve",
+            "http",
+        ]);
+        let s = ahma_common::config::AhmaSettings::default();
+        let (no_quic, no_h1, hs) = parse_http_settings(&cli, &s);
+        assert!(no_quic && no_h1);
+        assert_eq!(hs, 7);
+    }
+
+    // ─── parse_auth_settings ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_auth_settings_from_settings() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        init_test();
+        let cli = Cli::parse_from(["ahma", "serve", "http"]);
+        let mut s = ahma_common::config::AhmaSettings::default();
+        s.auth.require_token = Some("secret".to_string());
+        s.auth.require_token_path = "/etc/token".to_string();
+        s.auth.rate_limit_rps = 50;
+        s.auth.rate_limit_burst = 25;
+        s.instance.label = "worker-7".to_string();
+        let (tok, tok_path, rps, burst, label) = parse_auth_settings(&cli, &s);
+        assert_eq!(tok.as_deref(), Some("secret"));
+        assert_eq!(tok_path, Some(PathBuf::from("/etc/token")));
+        assert_eq!(rps, 50);
+        assert_eq!(burst, 25);
+        assert_eq!(label, "worker-7");
+    }
+
+    #[test]
+    fn test_parse_auth_settings_empty_token_path_is_none() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        init_test();
+        let cli = Cli::parse_from(["ahma", "serve", "http"]);
+        let s = ahma_common::config::AhmaSettings::default();
+        let (tok, tok_path, rps, burst, label) = parse_auth_settings(&cli, &s);
+        assert!(tok.is_none());
+        assert!(
+            tok_path.is_none(),
+            "an empty require_token_path must resolve to None"
+        );
+        assert_eq!(rps, 0);
+        assert_eq!(burst, 10);
+        assert_eq!(label, "ahma");
+    }
+
+    #[test]
+    fn test_parse_auth_settings_cli_overrides() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        init_test();
+        let cli = Cli::parse_from([
+            "ahma",
+            "--require-token",
+            "clitoken",
+            "--require-token-path",
+            "/cli/token",
+            "--rate-limit-rps",
+            "3",
+            "--rate-limit-burst",
+            "9",
+            "--instance-label",
+            "cli-label",
+            "serve",
+            "http",
+        ]);
+        let s = ahma_common::config::AhmaSettings::default();
+        let (tok, tok_path, rps, burst, label) = parse_auth_settings(&cli, &s);
+        assert_eq!(tok.as_deref(), Some("clitoken"));
+        assert_eq!(tok_path, Some(PathBuf::from("/cli/token")));
+        assert_eq!(rps, 3);
+        assert_eq!(burst, 9);
+        assert_eq!(label, "cli-label");
+    }
+
+    // ─── resolve_tool_bundles ────────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_tool_bundles_cli_dedupes() {
+        let cli = Cli::parse_from(["ahma", "--tools", "rust,rust,python", "serve", "stdio"]);
+        let s = ahma_common::config::AhmaSettings::default();
+        let bundles = resolve_tool_bundles(&cli, &s);
+        assert_eq!(bundles, vec!["rust".to_string(), "python".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_tool_bundles_falls_back_to_settings() {
+        let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
+        let mut s = ahma_common::config::AhmaSettings::default();
+        s.tools.tool_bundles = vec!["git".to_string(), "git".to_string(), "kotlin".to_string()];
+        let bundles = resolve_tool_bundles(&cli, &s);
+        assert_eq!(bundles, vec!["git".to_string(), "kotlin".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_tool_bundles_empty_when_none() {
+        let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
+        let s = ahma_common::config::AhmaSettings::default();
+        assert!(resolve_tool_bundles(&cli, &s).is_empty());
+    }
+
+    // ─── resolve_sandbox_scopes_cli / resolve_working_dirs_cli ───────────────
+
+    #[test]
+    fn test_resolve_sandbox_scopes_cli_expands_tilde() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let home = dirs::home_dir().expect("home dir");
+        let cli = Cli::parse_from(["ahma", "--sandbox-scope", "~/foo", "serve", "stdio"]);
+        let s = ahma_common::config::AhmaSettings::default();
+        let scopes = resolve_sandbox_scopes_cli(&cli, &s);
+        assert_eq!(scopes, vec![home.join("foo")]);
+    }
+
+    #[test]
+    fn test_resolve_sandbox_scopes_cli_settings_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let home = dirs::home_dir().expect("home dir");
+        let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
+        let mut s = ahma_common::config::AhmaSettings::default();
+        s.sandbox.scopes = vec![PathBuf::from("~/bar")];
+        let scopes = resolve_sandbox_scopes_cli(&cli, &s);
+        assert_eq!(scopes, vec![home.join("bar")]);
+    }
+
+    #[test]
+    fn test_resolve_working_dirs_cli_expands_tilde() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let home = dirs::home_dir().expect("home dir");
+        let cli = Cli::parse_from(["ahma", "--working-dir", "~/wd", "serve", "stdio"]);
+        let s = ahma_common::config::AhmaSettings::default();
+        let dirs_ = resolve_working_dirs_cli(&cli, &s);
+        assert_eq!(dirs_, vec![home.join("wd")]);
+    }
+
+    #[test]
+    fn test_resolve_working_dirs_cli_settings_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
+        let mut s = ahma_common::config::AhmaSettings::default();
+        s.sandbox.working_dirs = vec![PathBuf::from("/abs/wd")];
+        let dirs_ = resolve_working_dirs_cli(&cli, &s);
+        assert_eq!(dirs_, vec![PathBuf::from("/abs/wd")]);
+    }
+
+    // ─── unix_socket_path_from_cli ───────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_socket_path_cli_flag_wins() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let cli = Cli::parse_from(["ahma", "--unix-socket-path", "/x/y.sock", "serve", "stdio"]);
+        let s = ahma_common::config::AhmaSettings::default();
+        assert_eq!(unix_socket_path_from_cli(&cli, &s), "/x/y.sock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_socket_path_serve_unix_socket_path() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let cli = Cli::parse_from(["ahma", "serve", "unix", "--socket-path", "/a/b.sock"]);
+        let s = ahma_common::config::AhmaSettings::default();
+        assert_eq!(unix_socket_path_from_cli(&cli, &s), "/a/b.sock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_socket_path_serve_unix_settings_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let cli = Cli::parse_from(["ahma", "serve", "unix"]);
+        let mut s = ahma_common::config::AhmaSettings::default();
+        s.http.unix_socket_path = Some("/from/settings.sock".to_string());
+        assert_eq!(unix_socket_path_from_cli(&cli, &s), "/from/settings.sock");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unix_socket_path_default_when_unset() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let cli = Cli::parse_from(["ahma", "serve", "http"]);
+        let s = ahma_common::config::AhmaSettings::default();
+        assert_eq!(unix_socket_path_from_cli(&cli, &s), "/tmp/ahma.sock");
+    }
+
+    // ─── build_app_config ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_app_config_defaults_with_no_settings() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        init_test();
+        unsafe { std::env::remove_var("AHMA_SERVER_CHILD") };
+        let cli = Cli::parse_from(["ahma", "--no-settings", "serve", "stdio"]);
+        let cfg = build_app_config(&cli);
+        assert_eq!(cfg.timeout_secs, 600);
+        assert!(!cfg.force_sync);
+        assert_eq!(cfg.http_host, "127.0.0.1");
+        assert_eq!(cfg.http_port, 3000);
+        assert!(!cfg.is_server_child);
+        assert_eq!(cfg.max_sessions, 10);
+        assert!(!cfg.explicit_tools_dir);
+    }
+
+    #[test]
+    fn test_build_app_config_threads_cli_flags() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        init_test();
+        unsafe { std::env::remove_var("AHMA_SERVER_CHILD") };
+        let cli = Cli::parse_from([
+            "ahma",
+            "--no-settings",
+            "--timeout",
+            "222",
+            "--sync",
+            "--max-sessions",
+            "3",
+            "--server-child",
+            "serve",
+            "http",
+            "--port",
+            "8081",
+        ]);
+        let cfg = build_app_config(&cli);
+        assert_eq!(cfg.timeout_secs, 222);
+        assert!(cfg.force_sync);
+        assert_eq!(cfg.http_port, 8081);
+        assert_eq!(cfg.max_sessions, 3);
+        assert!(
+            cfg.is_server_child,
+            "--server-child must set is_server_child"
+        );
+    }
+
+    #[test]
+    fn test_build_app_config_explicit_tools_dir() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        init_test();
+        unsafe { std::env::remove_var("AHMA_SERVER_CHILD") };
+        let tmp = tempdir().unwrap();
+        let cli = Cli::parse_from([
+            "ahma",
+            "--no-settings",
+            "--tools-dir",
+            tmp.path().to_str().unwrap(),
+            "serve",
+            "stdio",
+        ]);
+        let cfg = build_app_config(&cli);
+        assert!(
+            cfg.explicit_tools_dir,
+            "--tools-dir must mark the tools dir explicit"
+        );
+    }
+
+    // ─── dispatch_subcommand bail arms (crate-split stubs) ────────────────────
+
+    #[tokio::test]
+    async fn test_dispatch_subcommand_vault_bails() {
+        let err = dispatch_subcommand(
+            Subcommands::Vault(VaultArgs {
+                command: VaultCommand::List,
+            }),
+            make_cfg(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("vault commands are provided"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_subcommand_tui_bails() {
+        let err = dispatch_subcommand(
+            Subcommands::Tui(TuiArgs {
+                connect: None,
+                profile: None,
+                path: None,
+            }),
+            make_cfg(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("tui is provided"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_subcommand_llm_bails() {
+        let err = dispatch_subcommand(
+            Subcommands::Llm(LlmArgs {
+                command: LlmCommand::List,
+            }),
+            make_cfg(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("llm commands are provided"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_subcommand_cluster_bails() {
+        let err = dispatch_subcommand(
+            Subcommands::Cluster(ClusterArgs {
+                tls_dir: None,
+                command: ClusterCommand::List,
+            }),
+            make_cfg(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("cluster commands are provided"));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_subcommand_daemon_bails() {
+        let err = dispatch_subcommand(Subcommands::Daemon(DaemonArgs {}), make_cfg())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("daemon is provided"));
+    }
 }
