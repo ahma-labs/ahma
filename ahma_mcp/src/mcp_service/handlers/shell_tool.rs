@@ -385,11 +385,10 @@ impl AhmaMcpService {
 
         match result {
             Ok(output) => Ok(common::text_result(output)),
-            Err(e) => {
-                let error_message = format!("Synchronous execution failed: {}", e);
-                tracing::error!("{}", error_message);
-                Err(common::mcp_internal(error_message))
-            }
+            // On an out-of-scope path access this attaches a machine-readable
+            // `sandbox_denial` payload to the error's `data` field; otherwise a
+            // plain internal error. (Logs the failure internally.)
+            Err(e) => Err(common::execution_error(&e)),
         }
     }
 

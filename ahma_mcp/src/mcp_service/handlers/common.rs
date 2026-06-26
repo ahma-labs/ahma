@@ -67,6 +67,46 @@ pub fn mcp_internal(message: impl Into<String>) -> McpError {
     McpError::internal_error(message.into(), None)
 }
 
+/// Builds the MCP error for a failed synchronous tool execution.
+///
+/// When the failure is an out-of-sandbox-scope path access, the error's `data`
+/// field carries a machine-readable `sandbox_denial` payload
+/// (`{kind, path, access, reason, current_scopes, remediation}`) so an AI client
+/// can reason about — and act on — the blocked path instead of parsing the
+/// message text. The `path`/`access` shape mirrors the `ScopeGrantRequest` the
+/// TUI already receives, so both surfaces describe a denial the same way.
+/// Non-sandbox failures get a plain internal error (no `data`).
+pub fn execution_error(e: &anyhow::Error) -> McpError {
+    use crate::sandbox::SandboxError;
+
+    let message = format!("Synchronous execution failed: {e}");
+    tracing::error!("{message}");
+
+    if let Some(SandboxError::PathOutsideSandbox { path, scopes }) =
+        e.downcast_ref::<SandboxError>()
+    {
+        let data = serde_json::json!({
+            "kind": "sandbox_denial",
+            "path": path.to_string_lossy(),
+            // A working directory is used for both reads and writes.
+            "access": "write",
+            "reason": "path_outside_sandbox",
+            "current_scopes": scopes
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            "remediation": format!(
+                "'{path}' is outside the sandbox scope. To allow it, grant the path \
+                 (`ahma sandbox grant {path}`) and restart to apply.",
+                path = path.display()
+            ),
+        });
+        return McpError::internal_error(message, Some(data));
+    }
+
+    McpError::internal_error(message, None)
+}
+
 /// Builds an invalid-params MCP error with no extra data payload.
 pub fn mcp_invalid_params(message: impl Into<String>) -> McpError {
     McpError::invalid_params(message.into(), None)

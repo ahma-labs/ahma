@@ -17,6 +17,46 @@ fn make_op(id: &str, tool: &str, status: OperationStatus) -> Operation {
 }
 
 #[test]
+fn execution_error_attaches_structured_sandbox_denial() {
+    use crate::sandbox::SandboxError;
+    use std::path::PathBuf;
+
+    let err: anyhow::Error = SandboxError::PathOutsideSandbox {
+        path: PathBuf::from("/out/of/scope"),
+        scopes: vec![PathBuf::from("/work/space")],
+    }
+    .into();
+
+    let mcp = execution_error(&err);
+    let data = mcp.data.expect("sandbox denial must carry a data payload");
+    assert_eq!(data["kind"], "sandbox_denial");
+    assert_eq!(data["path"], "/out/of/scope");
+    assert_eq!(data["access"], "write");
+    assert_eq!(data["reason"], "path_outside_sandbox");
+    assert_eq!(data["current_scopes"][0], "/work/space");
+    assert!(
+        data["remediation"]
+            .as_str()
+            .unwrap()
+            .contains("ahma sandbox grant /out/of/scope"),
+        "remediation should name the grant command: {data}"
+    );
+    // The human-readable message is preserved alongside the structured data.
+    assert!(mcp.message.contains("Synchronous execution failed"));
+}
+
+#[test]
+fn execution_error_without_sandbox_cause_has_no_data() {
+    let err = anyhow::anyhow!("compilation failed: missing semicolon");
+    let mcp = execution_error(&err);
+    assert!(
+        mcp.data.is_none(),
+        "non-sandbox failures must not carry a denial payload"
+    );
+    assert!(mcp.message.contains("compilation failed"));
+}
+
+#[test]
 fn test_parse_comma_separated_filter_basic() {
     let args = make_map(&[("tools", "cargo,clippy,nextest")]);
     let result = parse_comma_separated_filter(&args, "tools");
