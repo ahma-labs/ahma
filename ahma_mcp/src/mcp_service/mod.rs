@@ -1291,6 +1291,12 @@ impl ServerHandler for AhmaMcpService {
                 )
                 .with_title("cancel"),
                 Tool::new(
+                    "sandbox_grant",
+                    "Propose adding an out-of-scope path as a persistent sandbox root in ~/.ahma/settings.toml. Call this when a command fails with a `sandbox_denial` error. WITHOUT `confirm: true` it only PREVIEWS — it returns the full settings-file path, the exact line it would add, and a risk assessment so you can show the human and get approval first. Catastrophic paths (filesystem root, $HOME, credential dirs, system dirs, workspace parents) are REFUSED even with confirmation. On `confirm: true` it writes the grant; run `restart` to apply, then re-run the blocked command.",
+                    handlers::sandbox_grant_tool::sandbox_grant_schema(),
+                )
+                .with_title("sandbox_grant"),
+                Tool::new(
                     "read_file",
                     "Read UTF-8 text from a scoped file, with optional line slicing.",
                     handlers::harness_tools::read_file_schema(),
@@ -1430,6 +1436,10 @@ impl ServerHandler for AhmaMcpService {
                 }
                 "cancel" => {
                     self.handle_cancel(run_params.arguments.unwrap_or_default())
+                        .await
+                }
+                "sandbox_grant" => {
+                    self.handle_sandbox_grant(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "logs_list" => {

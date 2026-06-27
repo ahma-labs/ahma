@@ -1,0 +1,473 @@
+//! The `sandbox_grant` MCP tool.
+//!
+//! When a tool hits an out-of-scope path, the server now attaches a structured
+//! `sandbox_denial` payload to the error (see [`super::common::execution_error`]).
+//! This tool is the AI-facing other half of that loop: given a path, it analyses
+//! the request, classifies its risk, shows the human the **exact** file and line
+//! that would be written, and — only on an explicit `confirm: true` — appends the
+//! grant to the user-global `~/.ahma/settings.toml`.
+//!
+//! ## Security model
+//!
+//! Two independent gates stand between a confused/adversarial model and a
+//! widened sandbox:
+//!
+//! 1. **A hard denylist** ([`classify_grant_risk`] → [`GrantRisk::Refused`]). The
+//!    filesystem root, the exact `$HOME`, any parent of the live workspace scope,
+//!    credential directories (`~/.ssh`, `~/.aws`, …), `~/.ahma` itself, and OS
+//!    system directories are refused **even with `confirm: true`**. The model
+//!    cannot override this; only a human editing the file by hand can.
+//! 2. **A two-phase confirm**. Without `confirm: true` the tool only *previews*
+//!    (writes nothing) and tells the AI to show the human the full path and line
+//!    first. The default is always Deny.
+//!
+//! The grant is written to `~/.ahma/settings.toml`, which lives outside every
+//! sandbox scope and only takes effect on the next server start — never the live
+//! session (SPEC R5.4.7 session-immutability). The tool converges on the same
+//! [`persist_grant`] code path as the CLI `ahma sandbox grant` and the TUI prompt.
+
+use super::common;
+use crate::AhmaMcpService;
+use crate::mcp_service::schema;
+use ahma_common::config::{GrantOutcome, ScopeAccess, ahma_home_dir, settings_path};
+use ahma_common::scope_grant::persist_grant;
+use rmcp::model::{CallToolResult, ErrorData as McpError};
+use serde_json::{Map, Value};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+/// The risk tier of a proposed grant, decided purely from the path, the user's
+/// home directory, and the live sandbox scopes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantRisk {
+    /// Catastrophic and never legitimate — refused even with `confirm: true`.
+    Refused(String),
+    /// Allowed with confirmation, but each reason is surfaced loudly first.
+    High(Vec<String>),
+    /// An ordinary grant (a build cache, a dependency source dir, a sibling
+    /// project, …).
+    Normal,
+}
+
+/// Build the JSON input schema advertised for the `sandbox_grant` tool.
+pub fn sandbox_grant_schema() -> Arc<Map<String, Value>> {
+    let mut props = Map::new();
+    props.insert(
+        "path".to_string(),
+        schema::path_property(
+            "Absolute path to grant as a persistent sandbox root (e.g. the path named in a \
+             `sandbox_denial` error). `~` is expanded to the home directory.",
+        ),
+    );
+    props.insert(
+        "access".to_string(),
+        schema::enum_string_property_with_default(
+            "`ro` for read-only (dependency source, toolchains) or `rw` for read+write \
+             (build caches, sibling projects).",
+            &["ro", "rw"],
+            "ro",
+        ),
+    );
+    props.insert(
+        "confirm".to_string(),
+        schema::boolean_property(
+            "Must be `true` to actually write the grant. Omit (or `false`) to PREVIEW only: the \
+             tool returns the full settings-file path and the exact line it would add so you can \
+             show the human and get approval first. The default is always Deny.",
+        ),
+    );
+    props.insert(
+        "note".to_string(),
+        schema::string_property("Optional provenance note recorded alongside the grant."),
+    );
+    schema::object_input_schema(props, &["path"])
+}
+
+impl AhmaMcpService {
+    /// Handle a `sandbox_grant` call. See the module docs for the security model.
+    pub async fn handle_sandbox_grant(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let raw = common::require_str(&args, "path", "sandbox_grant requires a `path` argument")?;
+        let access = parse_access(&args)?;
+        let confirm = args
+            .get("confirm")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let note = common::opt_str(&args, "note");
+
+        let home = ahma_home_dir();
+        let scopes = self.adapter.sandbox().scopes().to_vec();
+        let path = resolve_grant_path(&raw, home.as_deref(), scopes.first().map(|p| p.as_path()));
+
+        let settings_file = settings_path().ok_or_else(|| {
+            common::mcp_internal(
+                "cannot locate ~/.ahma/settings.toml (home directory unknown); set HOME and retry",
+            )
+        })?;
+        let granted_at = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let line = render_scope_line(&path, access, "sandbox_grant", &granted_at, note.as_deref());
+
+        let risk = classify_grant_risk(&path, home.as_deref(), &scopes);
+
+        // Gate 1: the hard denylist refuses outright, regardless of `confirm`.
+        if let GrantRisk::Refused(reason) = &risk {
+            return Err(common::mcp_invalid_params(format!(
+                "sandbox_grant REFUSED for {}: {reason}.\n\nThis path is on the hard denylist and \
+                 cannot be granted by the AI even with confirmation. If you genuinely need it, the \
+                 human must edit {} by hand.",
+                path.display(),
+                settings_file.display(),
+            )));
+        }
+
+        // Gate 2: without explicit confirmation, only preview — write nothing.
+        if !confirm {
+            return Ok(common::text_result(preview_text(
+                &path,
+                access,
+                &settings_file,
+                &line,
+                &risk,
+            )));
+        }
+
+        // Confirmed and not denylisted: persist to ~/.ahma/settings.toml.
+        let outcome = persist_grant(
+            &settings_file,
+            &path,
+            access,
+            Some("sandbox_grant".to_string()),
+            Some(granted_at),
+            note,
+        )
+        .map_err(|e| {
+            common::mcp_internal(format!(
+                "failed to persist grant to {}: {e:#}",
+                settings_file.display()
+            ))
+        })?;
+
+        Ok(common::text_result(success_text(
+            &path,
+            access,
+            &settings_file,
+            &line,
+            &outcome,
+            &risk,
+        )))
+    }
+}
+
+/// Parse the optional `access` argument, defaulting to read-only.
+fn parse_access(args: &Map<String, Value>) -> Result<ScopeAccess, McpError> {
+    match args.get("access").and_then(Value::as_str) {
+        None | Some("ro") => Ok(ScopeAccess::Ro),
+        Some("rw") => Ok(ScopeAccess::Rw),
+        Some(other) => Err(common::mcp_invalid_params(format!(
+            "invalid access {other:?}; use \"ro\" or \"rw\""
+        ))),
+    }
+}
+
+/// Expand `~`, make the path absolute, and resolve it as far as the filesystem
+/// allows. Existing paths are canonicalised (symlinks resolved); for a path that
+/// does not exist yet the lexical form is cleaned (`.`/`..` collapsed) so risk
+/// comparisons see a stable absolute path.
+pub fn resolve_grant_path(raw: &str, home: Option<&Path>, workspace: Option<&Path>) -> PathBuf {
+    let expanded = expand_tilde(raw, home);
+    let mut pb = PathBuf::from(expanded);
+    if pb.is_relative()
+        && let Some(base) = workspace
+    {
+        pb = base.join(pb);
+    }
+    match dunce::canonicalize(&pb) {
+        Ok(canon) => canon,
+        Err(_) => clean_path(&pb),
+    }
+}
+
+/// Expand a leading `~/` or `~\` (or a bare `~`) to `home`.
+fn expand_tilde(raw: &str, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return raw.to_string();
+    };
+    if raw == "~" {
+        return home.to_string_lossy().into_owned();
+    }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        return home.join(rest).to_string_lossy().into_owned();
+    }
+    raw.to_string()
+}
+
+/// Lexically clean a path: collapse `.` and resolve `..` without touching the
+/// filesystem. Used as the fallback for paths that do not exist yet.
+fn clean_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Classify the risk of granting `path`. Pure: depends only on the inputs.
+pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> GrantRisk {
+    // 1. A filesystem root has no parent — granting it exposes the whole drive.
+    if path.parent().is_none() {
+        return GrantRisk::Refused(
+            "it is a filesystem root — granting it would expose the entire drive".to_string(),
+        );
+    }
+
+    // 2. The exact home directory exposes every dotfile, key, and credential.
+    if let Some(home) = home
+        && path == home
+    {
+        return GrantRisk::Refused(
+            "it is your home directory — granting it would expose every dotfile, key, and \
+             credential under $HOME"
+                .to_string(),
+        );
+    }
+
+    // 3. A strict ancestor of a live scope would widen the sandbox above the
+    //    workspace. (Equality is merely redundant — handled as a High warning.)
+    for scope in scopes {
+        if scope != path && scope.starts_with(path) {
+            return GrantRisk::Refused(format!(
+                "it is a parent of the active sandbox scope {} — granting it would widen the \
+                 sandbox above your workspace",
+                scope.display()
+            ));
+        }
+    }
+
+    // 4. Credential directories and ahma's own settings directory.
+    if let Some(home) = home {
+        const SENSITIVE: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube", ".docker", ".ahma"];
+        if SENSITIVE.iter().any(|name| path == home.join(name))
+            || path == home.join(".config").join("gh")
+            || path == home.join(".config").join("gcloud")
+        {
+            return GrantRisk::Refused(format!(
+                "'{}' holds credentials/secrets (or ahma's own settings) and must never be \
+                 exposed to a sandboxed tool",
+                path.display()
+            ));
+        }
+    }
+
+    // 5. OS system directories.
+    if is_system_dir(path) {
+        return GrantRisk::Refused(format!(
+            "'{}' is a system directory — granting it is never required for a build and risks \
+             the OS",
+            path.display()
+        ));
+    }
+
+    // ── Not refused: collect elevated-risk warnings. ──
+    let mut warnings = Vec::new();
+
+    if scopes.iter().any(|s| s == path) {
+        warnings.push(
+            "this path is already inside the active sandbox scope; the grant is redundant"
+                .to_string(),
+        );
+    }
+
+    // A direct child of the filesystem root (e.g. `/data`, `/opt`).
+    if path.parent().is_some_and(|p| p.parent().is_none()) {
+        warnings.push(format!(
+            "'{}' sits directly under the filesystem root; double-check it is the specific \
+             directory you mean",
+            path.display()
+        ));
+    }
+
+    if !path.exists() {
+        warnings.push(format!(
+            "'{}' does not exist on disk — confirm the path is correct and not a typo",
+            path.display()
+        ));
+    }
+
+    // A hidden directory directly under home that is not a known build cache.
+    if let Some(home) = home
+        && path.parent() == Some(home)
+        && let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && name.starts_with('.')
+        && !is_known_cache_dir(name)
+    {
+        warnings.push(format!(
+            "'{}' is a hidden directory in your home folder; make sure it does not hold private \
+             data",
+            path.display()
+        ));
+    }
+
+    if warnings.is_empty() {
+        GrantRisk::Normal
+    } else {
+        GrantRisk::High(warnings)
+    }
+}
+
+/// Whether `path` is exactly an OS system directory that must never be granted.
+fn is_system_dir(path: &Path) -> bool {
+    // Exact matches only: `/usr/local/foo` is a legitimate grant, `/usr` is not.
+    const UNIX_SYSTEM_DIRS: &[&str] = &[
+        "/etc", "/usr", "/bin", "/sbin", "/var", "/boot", "/dev", "/proc", "/sys", "/root",
+        "/System", "/Library", "/opt", "/private",
+    ];
+    const WINDOWS_SYSTEM_DIRS: &[&str] = &[
+        "C:\\Windows",
+        "C:\\Program Files",
+        "C:\\Program Files (x86)",
+        "C:\\ProgramData",
+    ];
+    UNIX_SYSTEM_DIRS
+        .iter()
+        .chain(WINDOWS_SYSTEM_DIRS)
+        .any(|d| path == Path::new(d))
+}
+
+/// Whether `name` (a `~/<name>` hidden directory) is a well-known build cache,
+/// in which case a hidden-home-dir grant is unremarkable rather than elevated.
+fn is_known_cache_dir(name: &str) -> bool {
+    const CACHES: &[&str] = &[
+        ".cargo",
+        ".rustup",
+        ".cache",
+        ".npm",
+        ".gradle",
+        ".m2",
+        ".pub-cache",
+        ".cocoapods",
+        ".sccache",
+        ".ccache",
+        ".gem",
+        ".yarn",
+        ".pnpm-store",
+        ".nuget",
+        ".gradle-cache",
+        ".deno",
+        ".bun",
+    ];
+    CACHES.contains(&name)
+}
+
+/// Render the exact `persistent_scopes` array element that the grant would add,
+/// matching the inline-table form used in `settings.toml`.
+pub fn render_scope_line(
+    path: &Path,
+    access: ScopeAccess,
+    granted_by: &str,
+    granted_at: &str,
+    note: Option<&str>,
+) -> String {
+    let access_str = if access.is_write() { "rw" } else { "ro" };
+    let mut line = format!(
+        "{{ path = \"{}\", access = \"{}\", granted_by = \"{}\", granted_at = \"{}\"",
+        toml_escape(&path.to_string_lossy()),
+        access_str,
+        toml_escape(granted_by),
+        toml_escape(granted_at),
+    );
+    if let Some(note) = note {
+        line.push_str(&format!(", note = \"{}\"", toml_escape(note)));
+    }
+    line.push_str(" }");
+    line
+}
+
+/// Escape the characters that matter inside a TOML basic string.
+fn toml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn risk_banner(risk: &GrantRisk) -> String {
+    match risk {
+        GrantRisk::Normal => "Risk: NORMAL".to_string(),
+        GrantRisk::High(warnings) => {
+            let mut s = String::from("⚠ Risk: HIGH — review carefully before approving:");
+            for w in warnings {
+                s.push_str(&format!("\n  • {w}"));
+            }
+            s
+        }
+        // Refused never reaches the text builders.
+        GrantRisk::Refused(reason) => format!("REFUSED: {reason}"),
+    }
+}
+
+fn preview_text(
+    path: &Path,
+    access: ScopeAccess,
+    settings_file: &Path,
+    line: &str,
+    risk: &GrantRisk,
+) -> String {
+    format!(
+        "PREVIEW ONLY — nothing was written.\n\n\
+         Proposed grant: {access} access to\n  {path}\n\n\
+         {banner}\n\n\
+         Would append this line to {file}:\n  {line}\n\n\
+         This file lives outside every sandbox scope. Show the human the full path and the exact \
+         line above, and get their explicit approval. Only then call `sandbox_grant` again with \
+         `confirm: true` to write it. The default is Deny.",
+        access = access.label(),
+        path = path.display(),
+        banner = risk_banner(risk),
+        file = settings_file.display(),
+        line = line,
+    )
+}
+
+fn success_text(
+    path: &Path,
+    access: ScopeAccess,
+    settings_file: &Path,
+    line: &str,
+    outcome: &GrantOutcome,
+    risk: &GrantRisk,
+) -> String {
+    let headline = match outcome {
+        GrantOutcome::Added => format!("✓ Granted {} access to {}", access.label(), path.display()),
+        GrantOutcome::Updated(old) => format!(
+            "✓ Updated grant for {}: {} → {}",
+            path.display(),
+            old.access.label(),
+            access.label()
+        ),
+    };
+    let high_note = match risk {
+        GrantRisk::High(_) => format!("\n\n{}", risk_banner(risk)),
+        _ => String::new(),
+    };
+    format!(
+        "{headline}{high_note}\n\n\
+         Wrote to {file}:\n  {line}\n\n\
+         This takes effect on the next server start, NOT the live session. To apply it now, run \
+         the `restart` tool, then re-run the command that was blocked.",
+        headline = headline,
+        high_note = high_note,
+        file = settings_file.display(),
+        line = line,
+    )
+}
+
+#[cfg(test)]
+#[path = "sandbox_grant_tool_tests.rs"]
+mod tests;

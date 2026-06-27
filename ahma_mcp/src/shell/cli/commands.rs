@@ -364,8 +364,11 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
             }
             println!();
             println!("Recorded in: {}", file.display());
-            println!("  This file lives outside every sandbox scope, so a sandboxed tool — or the");
-            println!("  AI — cannot edit it; only you can. Edit it by hand, or run");
+            println!("  This file lives outside every sandbox scope, so a sandboxed *command*");
+            println!("  cannot touch it. Only you — or the AI's `sandbox_grant` tool, and only");
+            println!(
+                "  after you confirm a previewed line — can change it. Edit it by hand, or run"
+            );
             println!(
                 "  `ahma sandbox revoke {}` to remove this grant.",
                 dir.display()
