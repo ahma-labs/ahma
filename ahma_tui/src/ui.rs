@@ -1046,8 +1046,7 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     let is_empty = rendered_lines.len() == 1 && rendered_lines[0].is_empty();
 
     if is_empty {
-        let placeholder =
-            "Type a message... ($/%/! sandboxed cmd · !! UNSANDBOXED · # decompose · / commands)";
+        let placeholder = "Type a message... (! UNSANDBOXED cmd · # decompose · / commands)";
         let text = if focused {
             let cursor = if state.unicode { "│" } else { "|" };
             format!("{}{}", cursor, placeholder)

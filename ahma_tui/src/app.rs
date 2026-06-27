@@ -1037,31 +1037,16 @@ fn maybe_decompose_goal(
 }
 
 fn maybe_run_cli_command(text: &str, state: &mut crate::state::AppState) -> bool {
-    // `!!` — UNSANDBOXED escape hatch. Runs the command locally at the user's
-    // full privilege with NO sandbox. This is permitted ONLY because a human
-    // explicitly typed `!!` into the chat input. LLM/agent turns submit work via
-    // `SubmitPrompt` and never write to this input box, so there is no automated
-    // path to this branch — every invocation is a deliberate human-in-the-loop
-    // action. Must be matched before the single-`!` case it is a prefix of.
-    if let Some(stripped) = text.strip_prefix("!!") {
+    // `!` — UNSANDBOXED command. Runs the command locally at the user's full
+    // privilege with NO sandbox, like a shell `!` escape. This is permitted ONLY
+    // because a human explicitly typed `!` into the chat input. LLM/agent turns
+    // submit work via `SubmitPrompt` and never write to this input box, so there
+    // is no automated path to this branch — every invocation is a deliberate
+    // human-in-the-loop action.
+    if let Some(stripped) = text.strip_prefix('!') {
         let cmd_str = stripped.trim().to_string();
         if !cmd_str.is_empty() {
             run_unsandboxed_command(cmd_str, state);
-        }
-        return true;
-    }
-
-    // `$` / `%` / `!` — sandboxed terminal command. Routed through the daemon's
-    // `run_terminal_command` tool so the kernel sandbox confines writes to the
-    // workspace; the operation then appears in the operations panel.
-    if let Some(stripped) = text
-        .strip_prefix('%')
-        .or_else(|| text.strip_prefix('$'))
-        .or_else(|| text.strip_prefix('!'))
-    {
-        let cmd_str = stripped.trim().to_string();
-        if !cmd_str.is_empty() {
-            run_sandboxed_command(cmd_str, state);
         }
         return true;
     }
@@ -1070,7 +1055,7 @@ fn maybe_run_cli_command(text: &str, state: &mut crate::state::AppState) -> bool
 
 /// Run a command OUTSIDE the sandbox, locally, at full user privilege.
 ///
-/// SECURITY: reachable only via the human-typed `!!` prefix (see
+/// SECURITY: reachable only via the human-typed `!` prefix (see
 /// [`maybe_run_cli_command`]). Never call this from automated/agent code paths —
 /// it deliberately bypasses the kernel sandbox and is gated on explicit human
 /// intervention for every single command.
@@ -1081,7 +1066,7 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
     state.push_log(LogEntry {
         timestamp: chrono::Local::now(),
         level: LogLevel::Warn,
-        message: format!("UNSANDBOXED command (human-authorized via !!): {cmd_str}"),
+        message: format!("UNSANDBOXED command (human-authorized via !): {cmd_str}"),
     });
 
     let win_id = state.next_window_id;
@@ -1118,30 +1103,6 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
 
     if let Some(tx) = &state.bridge_tx {
         spawn_window_cli_task(win_id, cmd_str, working_dir, abort_rx, tx.clone());
-    }
-}
-
-/// Run a command INSIDE the sandbox by routing it through the daemon's
-/// `run_terminal_command` tool. The kernel sandbox confines the command to the
-/// workspace; the resulting async operation shows up in the operations panel.
-fn run_sandboxed_command(cmd_str: String, state: &mut crate::state::AppState) {
-    use crate::state::{LogEntry, LogLevel};
-
-    if let Some(tx) = &state.mcp_source_tx {
-        let _ = tx.try_send(crate::mcp_source::McpSourceCommand::RunTerminalCommand {
-            command: cmd_str.clone(),
-            working_dir: state.workspace.clone(),
-        });
-        state.push_log(LogEntry {
-            timestamp: chrono::Local::now(),
-            level: LogLevel::Info,
-            message: format!("Running (sandboxed): {cmd_str}"),
-        });
-    } else {
-        push_assistant_message(
-            state,
-            "No sandbox server connected — cannot run terminal command.",
-        );
     }
 }
 
