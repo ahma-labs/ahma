@@ -3891,7 +3891,14 @@ mod tests {
     async fn keepalive_basic_accessors() {
         let service = make_service().await;
         assert!(!service.is_ahma_peer());
-        assert_eq!(service.heartbeat_timeout().as_secs(), 60);
+        // heartbeat_timeout() scales the 60s base by the platform/coverage
+        // multiplier (×4 on Windows, ×2 under coverage), so compare against the
+        // same scaled value — never the raw 60s, which only holds at ×1.
+        assert_eq!(
+            service.heartbeat_timeout(),
+            ahma_common::timeouts::TestTimeouts::scale(Duration::from_secs(60)),
+            "heartbeat timeout should be the platform-scaled 60s base"
+        );
         // last_received_signal was set at construction -> small elapsed time.
         assert!(service.time_since_last_received() < Duration::from_secs(60));
     }
