@@ -304,6 +304,7 @@ jobs:
       - job-cargo-nextest
       - job-android-nextest
       - job-security
+      - job-coverage
     runs-on: ubuntu-latest
     steps:
       - name: Verify all required jobs succeeded
@@ -311,10 +312,19 @@ jobs:
           echo "nextest=${{ needs.job-cargo-nextest.result }}"
           echo "android=${{ needs.job-android-nextest.result }}"
           echo "security=${{ needs.job-security.result }}"
+          echo "coverage=${{ needs.job-coverage.result }}"
           fail=0
           [ "${{ needs.job-cargo-nextest.result }}" = "success" ] || { echo '::error::test matrix did not pass'; fail=1; }
           [ "${{ needs.job-android-nextest.result }}" = "success" ] || { echo '::error::android tests did not pass'; fail=1; }
           [ "${{ needs.job-security.result }}" = "success" ] || { echo '::error::security (cargo deny) did not pass'; fail=1; }
+          # job-coverage only runs on main-branch pushes (its own `if:`), so it is
+          # legitimately "skipped" on production pushes / workflow_dispatch. Gate on
+          # an actual failure, not on a skip — on the release path (main push) it
+          # always runs, so this still blocks a release when coverage fails.
+          case "${{ needs.job-coverage.result }}" in
+            success|skipped) ;;
+            *) echo '::error::coverage did not pass'; fail=1 ;;
+          esac
           exit $fail
 
   #######################################
