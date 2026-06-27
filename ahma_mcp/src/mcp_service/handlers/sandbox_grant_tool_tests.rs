@@ -187,10 +187,13 @@ fn render_line_escapes_quotes_and_backslashes() {
 #[test]
 fn expand_tilde_variants() {
     let home = PathBuf::from("/home/u");
-    assert_eq!(expand_tilde("~", Some(&home)), "/home/u");
+    assert_eq!(expand_tilde("~", Some(&home)), home.to_string_lossy());
+    // `expand_tilde` joins onto `home`, so the expected value must be built the
+    // same way — a hard-coded "/home/u/cache" uses a forward slash that differs
+    // from the platform separator `home.join` produces on Windows (`\`).
     assert_eq!(
         expand_tilde("~/cache", Some(&home)),
-        PathBuf::from("/home/u/cache").to_string_lossy()
+        home.join("cache").to_string_lossy()
     );
     // No tilde — passthrough.
     assert_eq!(expand_tilde("/abs/path", Some(&home)), "/abs/path");
