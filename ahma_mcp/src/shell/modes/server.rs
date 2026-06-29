@@ -981,7 +981,12 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
     use tempfile::tempdir;
+
+    /// Serializes tests that mutate process-global environment variables
+    /// (e.g. `AHMA_SERVER_CHILD`). See AGENTS.md env-var test conventions.
+    static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn base_cfg() -> AppConfig {
         AppConfig {
@@ -1101,6 +1106,647 @@ mod tests {
         assert!(
             args.iter().any(|a| a == "--sandbox-scope"),
             "--sandbox-scope must be present: {args:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // parse_version
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_version_valid() {
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("0.0.0"), Some((0, 0, 0)));
+    }
+
+    #[test]
+    fn test_parse_version_large_numbers() {
+        assert_eq!(
+            parse_version("4294967295.4294967295.4294967295"),
+            Some((u32::MAX, u32::MAX, u32::MAX))
+        );
+    }
+
+    #[test]
+    fn test_parse_version_overflow_is_none() {
+        // One past u32::MAX must fail to parse.
+        assert_eq!(parse_version("4294967296.0.0"), None);
+    }
+
+    #[test]
+    fn test_parse_version_too_few_parts() {
+        assert_eq!(parse_version("1"), None);
+        assert_eq!(parse_version("1.2"), None);
+    }
+
+    #[test]
+    fn test_parse_version_non_numeric() {
+        assert_eq!(parse_version("a.b.c"), None);
+        assert_eq!(parse_version("1.2.x"), None);
+        assert_eq!(parse_version("1.x.3"), None);
+    }
+
+    #[test]
+    fn test_parse_version_empty() {
+        assert_eq!(parse_version(""), None);
+    }
+
+    #[test]
+    fn test_parse_version_ignores_extra_parts() {
+        // Only the first three dot-separated components are consumed.
+        assert_eq!(parse_version("1.2.3.4"), Some((1, 2, 3)));
+    }
+
+    // ------------------------------------------------------------------
+    // split_version_and_build_id
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_split_version_with_build_id() {
+        assert_eq!(
+            split_version_and_build_id("0.12.5+abc1234"),
+            ("0.12.5", Some("abc1234"))
+        );
+    }
+
+    #[test]
+    fn test_split_version_without_build_id() {
+        assert_eq!(split_version_and_build_id("0.12.5"), ("0.12.5", None));
+    }
+
+    #[test]
+    fn test_split_version_empty() {
+        assert_eq!(split_version_and_build_id(""), ("", None));
+    }
+
+    #[test]
+    fn test_split_version_multiple_plus() {
+        // Only the first '+' splits; the remainder (incl. further '+') is the build id.
+        assert_eq!(
+            split_version_and_build_id("1.0.0+a+b"),
+            ("1.0.0", Some("a+b"))
+        );
+    }
+
+    #[test]
+    fn test_split_version_trailing_plus() {
+        assert_eq!(split_version_and_build_id("1.0.0+"), ("1.0.0", Some("")));
+    }
+
+    // ------------------------------------------------------------------
+    // sandbox_mode_name
+    // ------------------------------------------------------------------
+
+    fn make_test_sandbox(scope: &std::path::Path) -> sandbox::Sandbox {
+        sandbox::Sandbox::new(
+            vec![scope.to_path_buf()],
+            sandbox::SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_sandbox_mode_name_test_mode() {
+        let tmp = tempdir().unwrap();
+        let sb = make_test_sandbox(tmp.path());
+        assert_eq!(sandbox_mode_name(&sb), "DISABLED/TEST");
+    }
+
+    #[test]
+    fn test_sandbox_mode_name_strict_current_platform() {
+        let tmp = tempdir().unwrap();
+        let sb = sandbox::Sandbox::new(
+            vec![tmp.path().to_path_buf()],
+            sandbox::SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let name = sandbox_mode_name(&sb);
+        #[cfg(target_os = "linux")]
+        assert_eq!(name, "LANDLOCK");
+        #[cfg(target_os = "macos")]
+        assert_eq!(name, "SEATBELT");
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(name, "UNSUPPORTED");
+    }
+
+    // ------------------------------------------------------------------
+    // is_test_or_server_child
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_is_server_child_via_config_flag() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // SAFETY: test-only; ENV_MUTEX serializes env access in this module.
+        let prev = std::env::var("AHMA_SERVER_CHILD").ok();
+        unsafe { std::env::remove_var("AHMA_SERVER_CHILD") };
+
+        let cfg = AppConfig {
+            is_server_child: true,
+            ..base_cfg()
+        };
+        assert!(
+            is_test_or_server_child(&cfg),
+            "config.is_server_child=true must be detected"
+        );
+
+        // SAFETY: test-only; ENV_MUTEX held — restore prior state.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AHMA_SERVER_CHILD", v),
+                None => std::env::remove_var("AHMA_SERVER_CHILD"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_server_child_via_env_var() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let prev = std::env::var("AHMA_SERVER_CHILD").ok();
+        // SAFETY: test-only; ENV_MUTEX held.
+        unsafe { std::env::set_var("AHMA_SERVER_CHILD", "1") };
+
+        let cfg = base_cfg();
+        assert!(
+            is_test_or_server_child(&cfg),
+            "AHMA_SERVER_CHILD set must be detected even when config flag is false"
+        );
+
+        // SAFETY: test-only; ENV_MUTEX held — restore prior state.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AHMA_SERVER_CHILD", v),
+                None => std::env::remove_var("AHMA_SERVER_CHILD"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_server_child_unset_and_flag_false() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let prev = std::env::var("AHMA_SERVER_CHILD").ok();
+        // SAFETY: test-only; ENV_MUTEX held.
+        unsafe { std::env::remove_var("AHMA_SERVER_CHILD") };
+
+        let cfg = base_cfg();
+        assert!(
+            !is_test_or_server_child(&cfg),
+            "neither env nor config flag set → false"
+        );
+
+        // SAFETY: test-only; ENV_MUTEX held — restore prior state.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AHMA_SERVER_CHILD", v),
+                None => std::env::remove_var("AHMA_SERVER_CHILD"),
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // resolve_bridge_endpoints
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_bridge_endpoints_default_socket() {
+        let cfg = AppConfig {
+            unix_socket_path: String::new(),
+            http_host: "127.0.0.1".to_string(),
+            http_port: 3000,
+            ..base_cfg()
+        };
+        let (socket, url) = resolve_bridge_endpoints(&cfg);
+        assert_eq!(socket, "/tmp/ahma.sock");
+        assert_eq!(url, "http://127.0.0.1:3000");
+    }
+
+    #[test]
+    fn test_resolve_bridge_endpoints_custom_socket_and_host() {
+        let cfg = AppConfig {
+            unix_socket_path: "/run/custom/ahma.sock".to_string(),
+            http_host: "0.0.0.0".to_string(),
+            http_port: 8080,
+            ..base_cfg()
+        };
+        let (socket, url) = resolve_bridge_endpoints(&cfg);
+        assert_eq!(socket, "/run/custom/ahma.sock");
+        assert_eq!(url, "http://0.0.0.0:8080");
+    }
+
+    // ------------------------------------------------------------------
+    // open_capture_file
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_open_capture_file_writes_banner() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("capture.log");
+        let banner = "# banner line\n";
+
+        let file = open_capture_file(&path, banner);
+        assert!(file.is_some(), "valid path must yield Some(file)");
+        drop(file);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents, banner,
+            "the banner must be written as the file's first content"
+        );
+    }
+
+    #[test]
+    fn test_open_capture_file_appends_after_banner() {
+        use std::io::Write;
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("capture.log");
+        let banner = "HEADER\n";
+
+        let mut file = open_capture_file(&path, banner).expect("expected Some(file)");
+        // The returned handle is opened in append mode; writes land after the banner.
+        file.write_all(b"more\n").unwrap();
+        drop(file);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "HEADER\nmore\n");
+    }
+
+    #[test]
+    fn test_open_capture_file_missing_dir_returns_none() {
+        let tmp = tempdir().unwrap();
+        // Parent directory does not exist → std::fs::write fails → None.
+        let path = tmp.path().join("no_such_dir").join("capture.log");
+        assert!(
+            open_capture_file(&path, "banner").is_none(),
+            "path inside a non-existent directory must return None"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // bridge health / restart probes against absent or dead endpoints
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_bridge_version_none_endpoints() {
+        assert_eq!(get_bridge_version(None, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_check_bridge_running_none_endpoints() {
+        assert!(!check_bridge_running(None, None).await);
+    }
+
+    #[tokio::test]
+    async fn test_trigger_bridge_restart_none_endpoints() {
+        assert!(!trigger_bridge_restart(None, None).await);
+    }
+
+    #[tokio::test]
+    async fn test_query_tcp_health_dead_url() {
+        // Port 1 is reserved/unusable; connection fails fast (well under the 200ms cap).
+        assert_eq!(query_tcp_health("http://127.0.0.1:1").await, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_bridge_version_dead_url() {
+        assert_eq!(
+            get_bridge_version(None, Some("http://127.0.0.1:1")).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trigger_bridge_restart_dead_url() {
+        assert!(!trigger_bridge_restart(None, Some("http://127.0.0.1:1")).await);
+    }
+
+    #[tokio::test]
+    async fn test_get_bridge_version_missing_socket_and_dead_url() {
+        // A unix socket path that does not exist fails to connect immediately;
+        // combined with a dead URL the result is None.
+        let tmp = tempdir().unwrap();
+        let socket = tmp.path().join("missing.sock");
+        let socket_str = socket.to_string_lossy();
+        let result =
+            get_bridge_version(Some(socket_str.as_ref()), Some("http://127.0.0.1:1")).await;
+        assert_eq!(result, None);
+    }
+
+    // ------------------------------------------------------------------
+    // build_background_bridge_args — additional branch coverage
+    // ------------------------------------------------------------------
+
+    /// Returns the value following `flag`, if present.
+    fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.as_str())
+    }
+
+    #[test]
+    fn test_bridge_args_always_includes_serve_and_server_child() {
+        let args = build_background_bridge_args(&base_cfg());
+        assert_eq!(args[0], "serve");
+        assert!(args.contains(&"--server-child".to_string()));
+    }
+
+    #[test]
+    fn test_bridge_args_numeric_flags_omitted_when_zero() {
+        let cfg = AppConfig {
+            rate_limit_rps: 0,
+            rate_limit_burst: 0,
+            handshake_timeout_secs: 0,
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        assert!(!args.iter().any(|a| a == "--rate-limit-rps"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--rate-limit-burst"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--handshake-timeout"), "{args:?}");
+    }
+
+    #[test]
+    fn test_bridge_args_numeric_flags_present_when_positive() {
+        let cfg = AppConfig {
+            rate_limit_rps: 5,
+            rate_limit_burst: 7,
+            handshake_timeout_secs: 30,
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        assert_eq!(arg_value(&args, "--rate-limit-rps"), Some("5"));
+        assert_eq!(arg_value(&args, "--rate-limit-burst"), Some("7"));
+        assert_eq!(arg_value(&args, "--handshake-timeout"), Some("30"));
+    }
+
+    #[test]
+    fn test_bridge_args_boolean_flags_omitted_by_default() {
+        // base_cfg has no_sandbox=true, so check the others which default false.
+        let cfg = AppConfig {
+            no_sandbox: false,
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        for flag in [
+            "--no-sandbox",
+            "--skip-probes",
+            "--sync",
+            "--hot-reload",
+            "--defer-sandbox",
+            "--sandbox",
+            "--tmp",
+            "--disable-temp-files",
+        ] {
+            assert!(
+                !args.iter().any(|a| a == flag),
+                "{flag} must be absent by default: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bridge_args_all_boolean_flags_present_when_set() {
+        let cfg = AppConfig {
+            no_sandbox: true,
+            skip_availability_probes: true,
+            force_sync: true,
+            hot_reload_tools: true,
+            defer_sandbox: true,
+            use_sandbox_dir: true,
+            tmp_access: true,
+            no_temp_files: true,
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        for flag in [
+            "--no-sandbox",
+            "--skip-probes",
+            "--sync",
+            "--hot-reload",
+            "--defer-sandbox",
+            "--sandbox",
+            "--tmp",
+            "--disable-temp-files",
+        ] {
+            assert!(
+                args.iter().any(|a| a == flag),
+                "{flag} must be present when set: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bridge_args_idle_timeout_default_when_none() {
+        let cfg = AppConfig {
+            idle_timeout_secs: None,
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        let expected_idle = AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS.to_string();
+        assert_eq!(
+            arg_value(&args, "--idle-timeout"),
+            Some(expected_idle.as_str())
+        );
+    }
+
+    #[test]
+    fn test_bridge_args_idle_timeout_explicit_value() {
+        let cfg = AppConfig {
+            idle_timeout_secs: Some(123),
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        assert_eq!(arg_value(&args, "--idle-timeout"), Some("123"));
+    }
+
+    #[test]
+    fn test_bridge_args_idle_timeout_zero_omitted() {
+        let cfg = AppConfig {
+            idle_timeout_secs: Some(0),
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        assert!(
+            !args.iter().any(|a| a == "--idle-timeout"),
+            "zero idle-timeout must be omitted: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_bridge_args_unix_socket_path_forwarded() {
+        let cfg = AppConfig {
+            unix_socket_path: "/run/ahma/x.sock".to_string(),
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        assert_eq!(
+            arg_value(&args, "--unix-socket-path"),
+            Some("/run/ahma/x.sock")
+        );
+    }
+
+    #[test]
+    fn test_bridge_args_unix_socket_path_omitted_when_empty() {
+        let cfg = AppConfig {
+            unix_socket_path: String::new(),
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        assert!(
+            !args.iter().any(|a| a == "--unix-socket-path"),
+            "empty socket path must be omitted: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_bridge_args_require_token_and_path() {
+        let tmp = tempdir().unwrap();
+        let token_path = tmp.path().join("token.txt");
+        let cfg = AppConfig {
+            require_token: Some("s3cret".to_string()),
+            require_token_path: Some(token_path.clone()),
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        assert_eq!(arg_value(&args, "--require-token"), Some("s3cret"));
+        let expected_token_path = token_path.to_string_lossy().to_string();
+        assert_eq!(
+            arg_value(&args, "--require-token-path"),
+            Some(expected_token_path.as_str())
+        );
+    }
+
+    #[test]
+    fn test_bridge_args_require_token_omitted_when_none() {
+        let cfg = AppConfig {
+            require_token: None,
+            require_token_path: None,
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        assert!(!args.iter().any(|a| a == "--require-token"), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a == "--require-token-path"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn test_bridge_args_instance_label_forwarded() {
+        let cfg = AppConfig {
+            instance_label: "my-label".to_string(),
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        assert_eq!(arg_value(&args, "--instance-label"), Some("my-label"));
+    }
+
+    #[test]
+    fn test_bridge_args_instance_label_omitted_when_empty() {
+        let cfg = AppConfig {
+            instance_label: String::new(),
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        assert!(
+            !args.iter().any(|a| a == "--instance-label"),
+            "empty instance_label must be omitted: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_bridge_args_task_vault_forwarded() {
+        let tmp = tempdir().unwrap();
+        let vault = tmp.path().join("vault");
+        let cfg = AppConfig {
+            task_vault: Some(vault.clone()),
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        let expected_vault = vault.to_string_lossy().to_string();
+        assert_eq!(
+            arg_value(&args, "--task-vault"),
+            Some(expected_vault.as_str())
+        );
+    }
+
+    #[test]
+    fn test_bridge_args_task_vault_omitted_when_none() {
+        let args = build_background_bridge_args(&base_cfg());
+        assert!(!args.iter().any(|a| a == "--task-vault"), "{args:?}");
+    }
+
+    #[test]
+    fn test_bridge_args_tools_dir_only_when_explicit() {
+        let tmp = tempdir().unwrap();
+        let tools_dir = tmp.path().join("tools");
+
+        // Set but NOT explicit → omitted.
+        let cfg_implicit = AppConfig {
+            explicit_tools_dir: false,
+            tools_dir: Some(tools_dir.clone()),
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg_implicit);
+        assert!(
+            !args.iter().any(|a| a == "--tools-dir"),
+            "implicit tools_dir must not be forwarded: {args:?}"
+        );
+
+        // Explicit → forwarded.
+        let cfg_explicit = AppConfig {
+            explicit_tools_dir: true,
+            tools_dir: Some(tools_dir.clone()),
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg_explicit);
+        let expected_tools_dir = tools_dir.to_string_lossy().to_string();
+        assert_eq!(
+            arg_value(&args, "--tools-dir"),
+            Some(expected_tools_dir.as_str())
+        );
+    }
+
+    #[test]
+    fn test_bridge_args_tool_bundles_forwarded_per_bundle() {
+        let cfg = AppConfig {
+            tool_bundles: vec!["cargo".to_string(), "git".to_string()],
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        let tools: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--tools")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(tools, vec!["cargo", "git"]);
+    }
+
+    #[test]
+    fn test_bridge_args_working_dirs_forwarded_per_dir() {
+        let tmp = tempdir().unwrap();
+        let d1 = tmp.path().join("a");
+        let d2 = tmp.path().join("b");
+        let cfg = AppConfig {
+            working_dirs: vec![d1.clone(), d2.clone()],
+            ..base_cfg()
+        };
+        let args = build_background_bridge_args(&cfg);
+        let dirs: Vec<String> = args
+            .windows(2)
+            .filter(|w| w[0] == "--working-dir")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(
+            dirs,
+            vec![
+                d1.to_string_lossy().to_string(),
+                d2.to_string_lossy().to_string()
+            ]
         );
     }
 }

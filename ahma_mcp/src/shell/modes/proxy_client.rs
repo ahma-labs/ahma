@@ -469,6 +469,36 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    /// Serializes access to the process-wide `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS`
+    /// env var so the deadline-resolution tests do not race each other.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    const DEADLINE_ENV_KEY: &str = "AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS";
+
+    /// Run `frontend_handshake_deadline()` with the env var forced to `value`
+    /// (or unset when `None`), restoring the prior value afterward. Returns the
+    /// resolved deadline so assertions run *outside* the lock (avoids poisoning
+    /// the mutex on assertion failure).
+    fn deadline_with_env(value: Option<&str>) -> Option<Duration> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let saved = std::env::var_os(DEADLINE_ENV_KEY);
+        // SAFETY: test-only; ENV_MUTEX serializes env access in this module.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(DEADLINE_ENV_KEY, v),
+                None => std::env::remove_var(DEADLINE_ENV_KEY),
+            }
+        }
+        let resolved = frontend_handshake_deadline();
+        // SAFETY: test-only; ENV_MUTEX held for the duration of this function.
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var(DEADLINE_ENV_KEY, v),
+                None => std::env::remove_var(DEADLINE_ENV_KEY),
+            }
+        }
+        resolved
+    }
+
     fn client_request(id: i64) -> RxJsonRpcMessage<RoleServer> {
         serde_json::from_value(serde_json::json!({
             "jsonrpc": "2.0",
@@ -479,11 +509,38 @@ mod tests {
         .expect("valid client request")
     }
 
+    /// A bridge→client (server→client) response message the proxy should forward
+    /// back to stdio.
+    fn bridge_response(id: i64) -> RxJsonRpcMessage<RoleClient> {
+        serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {}
+        }))
+        .expect("valid bridge response")
+    }
+
     /// Stdio side: hands the proxy a fixed queue of client requests, then EOF
     /// (`None`), and records every server→client message the proxy sends back.
     struct MockStdio {
         inbound: VecDeque<RxJsonRpcMessage<RoleServer>>,
         sent: Arc<Mutex<Vec<serde_json::Value>>>,
+        /// Optional delay applied *before* yielding EOF once `inbound` is drained.
+        /// Used to deterministically order a ready bridge→client message ahead of
+        /// stdio EOF inside the proxy's `tokio::select!` loop.
+        eof_delay: Option<Duration>,
+    }
+    impl MockStdio {
+        fn new(
+            inbound: VecDeque<RxJsonRpcMessage<RoleServer>>,
+            sent: Arc<Mutex<Vec<serde_json::Value>>>,
+        ) -> Self {
+            Self {
+                inbound,
+                sent,
+                eof_delay: None,
+            }
+        }
     }
     impl Transport<RoleServer> for MockStdio {
         type Error = std::io::Error;
@@ -502,18 +559,39 @@ mod tests {
             }
         }
         async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
-            self.inbound.pop_front()
+            if let Some(msg) = self.inbound.pop_front() {
+                return Some(msg);
+            }
+            if let Some(delay) = self.eof_delay {
+                tokio::time::sleep(delay).await;
+            }
+            None
         }
         async fn close(&mut self) -> Result<(), Self::Error> {
             Ok(())
         }
     }
 
-    /// Bridge side: fails the first `fail_first_n` sends, then succeeds. Never
-    /// delivers a bridge→client message (so the stdio side drives the loop).
+    /// Bridge side: fails the first `fail_first_n` sends, then succeeds. Delivers
+    /// any queued `inbound` bridge→client messages once (then `receive` parks
+    /// forever via `pending`, so the stdio side drives the loop). Records how many
+    /// times `close()` is invoked so tests can assert teardown behaviour.
     struct MockClient {
         fail_first_n: usize,
         attempts: Arc<AtomicUsize>,
+        inbound: VecDeque<RxJsonRpcMessage<RoleClient>>,
+        closed: Arc<AtomicUsize>,
+    }
+    impl MockClient {
+        /// Default mock: no queued bridge messages, fresh close counter.
+        fn new(fail_first_n: usize, attempts: Arc<AtomicUsize>) -> Self {
+            Self {
+                fail_first_n,
+                attempts,
+                inbound: VecDeque::new(),
+                closed: Arc::new(AtomicUsize::new(0)),
+            }
+        }
     }
     impl Transport<RoleClient> for MockClient {
         type Error = std::io::Error;
@@ -533,9 +611,13 @@ mod tests {
             }
         }
         async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+            if let Some(msg) = self.inbound.pop_front() {
+                return Some(msg);
+            }
             std::future::pending().await
         }
         async fn close(&mut self) -> Result<(), Self::Error> {
+            self.closed.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -547,14 +629,11 @@ mod tests {
         // JSON-RPC error for that request id and keeps serving the next request.
         let sent = Arc::new(Mutex::new(Vec::new()));
         let attempts = Arc::new(AtomicUsize::new(0));
-        let stdio = MockStdio {
-            inbound: VecDeque::from(vec![client_request(1), client_request(2)]),
-            sent: sent.clone(),
-        };
-        let client = MockClient {
-            fail_first_n: 1,
-            attempts: attempts.clone(),
-        };
+        let stdio = MockStdio::new(
+            VecDeque::from(vec![client_request(1), client_request(2)]),
+            sent.clone(),
+        );
+        let client = MockClient::new(1, attempts.clone());
 
         let result = run_transport_proxy(stdio, client, "test", None).await;
         assert!(
@@ -575,19 +654,16 @@ mod tests {
         // of failures, not on the first one.
         let sent = Arc::new(Mutex::new(Vec::new()));
         let attempts = Arc::new(AtomicUsize::new(0));
-        let stdio = MockStdio {
-            inbound: VecDeque::from(vec![
+        let stdio = MockStdio::new(
+            VecDeque::from(vec![
                 client_request(1),
                 client_request(2),
                 client_request(3),
                 client_request(4),
             ]),
-            sent: sent.clone(),
-        };
-        let client = MockClient {
-            fail_first_n: usize::MAX,
-            attempts: attempts.clone(),
-        };
+            sent.clone(),
+        );
+        let client = MockClient::new(usize::MAX, attempts.clone());
 
         let result = run_transport_proxy(stdio, client, "test", None).await;
         assert!(result.is_ok());
@@ -600,5 +676,126 @@ mod tests {
             sent.lock().unwrap().len(),
             MAX_CONSECUTIVE_FORWARD_FAILURES as usize
         );
+    }
+
+    #[test]
+    fn handshake_deadline_unset_returns_default() {
+        let resolved = deadline_with_env(None);
+        assert_eq!(
+            resolved,
+            Some(Duration::from_secs(
+                ahma_common::timeouts::FRONTEND_HANDSHAKE_DEADLINE_SECS
+            )),
+            "unset env var must fall back to the default constant"
+        );
+    }
+
+    #[test]
+    fn handshake_deadline_zero_disables() {
+        let resolved = deadline_with_env(Some("0"));
+        assert_eq!(resolved, None, "value of 0 must disable the deadline");
+    }
+
+    #[test]
+    fn handshake_deadline_positive_value_is_used() {
+        let resolved = deadline_with_env(Some("5"));
+        assert_eq!(
+            resolved,
+            Some(Duration::from_secs(5)),
+            "positive value must be parsed and used verbatim"
+        );
+    }
+
+    #[test]
+    fn handshake_deadline_garbage_falls_back_to_default() {
+        let resolved = deadline_with_env(Some("abc"));
+        assert_eq!(
+            resolved,
+            Some(Duration::from_secs(
+                ahma_common::timeouts::FRONTEND_HANDSHAKE_DEADLINE_SECS
+            )),
+            "unparseable value must fall back to the default constant"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_proxy_client_without_target_errors() {
+        let result = run_proxy_client(None, None).await;
+        let err = result.expect_err("no socket or URL must be an error");
+        assert!(
+            err.to_string().contains("No socket or HTTP URL provided"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_response_forwarded_then_stdio_eof_returns_true() {
+        // Bridge delivers one message which the proxy must forward to stdio; the
+        // stdio side then EOFs. Because nothing was ever forwarded *to* the bridge
+        // (forwarded_any == false), the teardown `client.close()` must be skipped.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+
+        let mut stdio = MockStdio::new(VecDeque::new(), sent.clone());
+        // Delay EOF so the immediately-ready bridge message wins the first
+        // `select!` poll and is forwarded before the loop breaks on EOF.
+        stdio.eof_delay = Some(Duration::from_millis(50));
+
+        let client = MockClient {
+            fail_first_n: 0,
+            attempts: attempts.clone(),
+            inbound: VecDeque::from(vec![bridge_response(1)]),
+            closed: closed.clone(),
+        };
+
+        let result = run_transport_proxy(stdio, client, "test", None).await;
+        assert!(
+            matches!(result, Ok(true)),
+            "bridge responded → Ok(true), got {result:?}"
+        );
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "bridge message must be forwarded to stdio");
+        assert_eq!(sent[0]["id"], serde_json::json!(1));
+        assert_eq!(sent[0]["result"], serde_json::json!({}));
+
+        // Nothing forwarded to the bridge → no session → close() must be skipped.
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "no client.send should have occurred"
+        );
+        assert_eq!(
+            closed.load(Ordering::SeqCst),
+            0,
+            "close() must not run on the forwarded_any == false path"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_stdio_eof_with_no_traffic_returns_false() {
+        // Empty inbound on both sides: stdio EOFs immediately, the bridge never
+        // responds. The loop breaks at once and the proxy reports bridge_responded
+        // == false without attempting any teardown.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+
+        let stdio = MockStdio::new(VecDeque::new(), sent.clone());
+        let client = MockClient {
+            fail_first_n: 0,
+            attempts: attempts.clone(),
+            inbound: VecDeque::new(),
+            closed: closed.clone(),
+        };
+
+        let result = run_transport_proxy(stdio, client, "test", None).await;
+        assert!(
+            matches!(result, Ok(false)),
+            "no bridge response → Ok(false), got {result:?}"
+        );
+        assert_eq!(sent.lock().unwrap().len(), 0, "no messages should be sent");
+        assert_eq!(closed.load(Ordering::SeqCst), 0, "close() must be skipped");
     }
 }

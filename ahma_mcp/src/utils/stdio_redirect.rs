@@ -114,3 +114,47 @@ fn do_redirect() -> io::Result<File> {
         "Platform not supported",
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exercises the full stdout-redirect lifecycle in a single ordered test.
+    ///
+    /// This is deliberately ONE test rather than several: `redirect_stdout_to_stderr`
+    /// mutates a process-wide `OnceLock` and is irreversible for the process. Under
+    /// `cargo nextest` each test runs in its own process (so the redirect is isolated),
+    /// but under the `cargo test` fallback every test in the binary shares one process.
+    /// Keeping the whole sequence in one test means only a single test ever triggers
+    /// the irreversible redirect, and the "before redirect" observation remains valid
+    /// regardless of which runner is used.
+    ///
+    /// No output is printed: after the redirect, this process's stdout is wired to
+    /// stderr, so printing would produce confusing captured output. Assertions only.
+    #[test]
+    fn redirect_lifecycle_is_idempotent_and_saves_stdout() {
+        // (1) Before any redirect, nothing is saved.
+        assert!(
+            get_saved_stdout().is_none(),
+            "expected no saved stdout before redirect"
+        );
+
+        // (2) First redirect succeeds (exercises the real dup/dup2 happy path on unix).
+        redirect_stdout_to_stderr().expect("first redirect should succeed");
+
+        // (3) After redirect, the saved original stdout is available.
+        assert!(
+            get_saved_stdout().is_some(),
+            "expected saved stdout to be present after redirect"
+        );
+
+        // (4) Calling again is an idempotent no-op via the OnceLock and still returns Ok.
+        redirect_stdout_to_stderr().expect("second redirect should be a no-op and succeed");
+
+        // (5) The saved stdout is still present and cloneable after the repeat call.
+        assert!(
+            get_saved_stdout().is_some(),
+            "expected saved stdout to remain present after repeat redirect"
+        );
+    }
+}

@@ -226,4 +226,136 @@ mod tests {
         let resp = reqwest::get(&url).await.unwrap();
         assert_eq!(resp.status(), 401);
     }
+
+    #[tokio::test]
+    async fn base_url_matches_local_addr() {
+        let server = ArtifactServer::start("http://localhost:11434/v1")
+            .await
+            .unwrap();
+        assert_eq!(server.base_url(), format!("http://{}", server.local_addr));
+    }
+
+    /// POST `/chat` with a valid token but a guaranteed-dead upstream
+    /// (`127.0.0.1:1`) exercises the `Err(_)` arm of the upstream relay, which
+    /// must surface as `502 Bad Gateway`. The connect fails fast and
+    /// deterministically without depending on any running LLM.
+    #[tokio::test]
+    async fn chat_with_dead_upstream_returns_502() {
+        let server = ArtifactServer::start("http://127.0.0.1:1").await.unwrap();
+        let url = format!("{}/chat", server.base_url());
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", server.token))
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(2))
+            .body(r#"{"messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 502);
+    }
+
+    /// A GET to an unknown path with a valid token falls through to the final
+    /// `404 Not Found` writer.
+    #[tokio::test]
+    async fn unknown_path_with_token_returns_404() {
+        let server = ArtifactServer::start("http://localhost:11434/v1")
+            .await
+            .unwrap();
+        let url = format!("{}/nope", server.base_url());
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", server.token))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 404);
+    }
+
+    /// A POST `/chat` against a valid token routed to a tiny local mock upstream
+    /// exercises the `Ok(_)` relay arm: the server forwards the upstream status
+    /// and body back to the caller. The mock is a one-shot ephemeral
+    /// `TcpListener` that returns a canned `chat/completions` response, so the
+    /// path stays deterministic without any real LLM.
+    #[tokio::test]
+    async fn chat_relays_mock_upstream_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+
+        let mock = tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            // Drain the request (best-effort) so the client write completes.
+            let mut buf = vec![0u8; 8 * 1024];
+            let _ = sock.read(&mut buf).await;
+            let body = br#"{"id":"mock","choices":[]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(body).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let server = ArtifactServer::start(format!("http://{upstream_addr}"))
+            .await
+            .unwrap();
+        let url = format!("{}/chat", server.base_url());
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", server.token))
+            .header("Content-Type", "application/json")
+            .timeout(Duration::from_secs(2))
+            .body(r#"{"messages":[]}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("\"id\":\"mock\""), "unexpected body: {text}");
+
+        mock.await.unwrap();
+    }
+
+    /// A client that connects and immediately shuts the write half without
+    /// sending any bytes drives the `n == 0` early-return branch. The server
+    /// must handle it without panicking and keep serving subsequent requests.
+    #[tokio::test]
+    async fn empty_read_is_handled_gracefully() {
+        use tokio::io::AsyncWriteExt;
+
+        let server = ArtifactServer::start("http://localhost:11434/v1")
+            .await
+            .unwrap();
+
+        let mut stream = tokio::net::TcpStream::connect(server.local_addr)
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        drop(stream);
+
+        // The server is still alive and answers a normal request afterwards.
+        let url = format!("{}/health", server.base_url());
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", server.token))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
 }
