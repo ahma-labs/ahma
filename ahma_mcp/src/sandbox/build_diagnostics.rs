@@ -48,6 +48,14 @@ pub enum ContaminationKind {
     ProvenanceResidue,
     /// An `sccache`/`RUSTC_WRAPPER` was active and tripped the sandbox.
     SccacheWrapper,
+    /// A dependency's build script failed copying a file with `EPERM` (e.g.
+    /// `aws-lc-sys` "Failed to copy include file during build setup"). This is
+    /// the `com.apple.provenance` xattr being denied during a metadata-preserving
+    /// copy — most visible when a host sandbox (Cursor/VS Code) redirects
+    /// `CARGO_TARGET_DIR` to its own cache and denies the build script's write.
+    /// The error message carries no `target/` path, so it slips past the
+    /// [`ProvenanceResidue`](Self::ProvenanceResidue) heuristic.
+    BuildScriptCopy,
 }
 
 /// True for a token that looks like a Rust build artifact path (the things a
@@ -63,6 +71,17 @@ fn looks_like_build_artifact(line: &str) -> bool {
         || line.contains(".d`")
         || line.contains(".d'")
         || line.contains(".d:")
+}
+
+/// True for a line that looks like a dependency build script failing to copy a
+/// file (the `aws-lc-sys` / `ring` family of build-script copy failures). Paired
+/// with an `EPERM` line by the caller, this is the signature of a host sandbox
+/// denying the metadata-preserving copy of a provenance-stamped source file.
+fn looks_like_build_script_copy(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    line.contains("failed to copy")
+        || line.contains("copy include file")
+        || line.contains("during build setup")
 }
 
 /// Scan a failed build's `stderr` for a sandbox-contamination signature.
@@ -97,6 +116,13 @@ pub fn diagnose(stderr: &str) -> Option<ContaminationHint> {
                 remediation: PROVENANCE_REMEDIATION.to_string(),
             });
         }
+
+        if looks_like_build_script_copy(line) {
+            return Some(ContaminationHint {
+                kind: ContaminationKind::BuildScriptCopy,
+                remediation: BUILD_SCRIPT_COPY_REMEDIATION.to_string(),
+            });
+        }
     }
 
     // A bare sccache mention without an EPERM line is not, by itself, a failure
@@ -116,6 +142,15 @@ the sandbox — its cache lives outside the workspace, so its reads/writes are d
 contaminate the target dir. Fix: grant the sccache cache directory to the sandbox scope (e.g. \
 `ahma sandbox grant <cache-dir>`) so the build can read/write it, or clear the wrapper for this \
 build (`RUSTC_WRAPPER=\"\" cargo …`).";
+
+const BUILD_SCRIPT_COPY_REMEDIATION: &str = "Build failed with `Operation not permitted` while a \
+dependency's build script copied a file (e.g. `aws-lc-sys` copying its include headers). On macOS \
+this is a `com.apple.provenance` denial: a sandbox refuses the metadata-preserving copy of a \
+provenance-stamped source file. It is most common when a host sandbox (Cursor/VS Code) redirects \
+`CARGO_TARGET_DIR` to its own cache outside the workspace and denies the build script's write. \
+Fix: re-run the build with the host's full-permission/unsandboxed approval, set \
+`AHMA_PREFER_OWN_SANDBOX=1` so ahma applies its own sandbox (which keeps the build inside the \
+workspace), or clear the redirected build cache and rebuild.";
 
 #[cfg(test)]
 mod tests {
@@ -198,5 +233,46 @@ mod tests {
     #[test]
     fn empty_stderr_is_none() {
         assert!(diagnose("").is_none());
+    }
+
+    #[test]
+    fn aws_lc_sys_copy_failure_is_detected() {
+        // The exact signature captured under Cursor's host sandbox: a build
+        // script copy denied with EPERM, carrying NO `target/` path — so it
+        // slips past the provenance-artifact heuristic and needs its own arm.
+        let stderr = "\
+  --- stderr
+  thread 'main' (1693440) panicked at /Users/me/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-lc-sys-0.41.0/builder/main.rs:1116:18:
+  Failed to copy include file during build setup: Os { code: 1, kind: PermissionDenied, message: \"Operation not permitted\" }";
+        let hit = diagnose(stderr).expect("aws-lc-sys copy failure should be diagnosed");
+        assert_eq!(hit.kind, ContaminationKind::BuildScriptCopy);
+        assert!(hit.remediation.contains("AHMA_PREFER_OWN_SANDBOX"));
+        assert!(hit.remediation.contains("aws-lc-sys"));
+    }
+
+    #[test]
+    fn build_script_copy_requires_eperm() {
+        // A "Failed to copy" line WITHOUT an EPERM signature is an ordinary
+        // build error, not a sandbox denial — must not trip the detector.
+        let stderr = "error: Failed to copy include file: No such file or directory (os error 2)";
+        assert!(diagnose(stderr).is_none());
+    }
+
+    #[test]
+    fn build_script_copy_during_build_setup_phrase_matches() {
+        let stderr = "panicked: something during build setup: Operation not permitted (os error 1)";
+        let hit = diagnose(stderr).expect("'during build setup' + EPERM should match");
+        assert_eq!(hit.kind, ContaminationKind::BuildScriptCopy);
+    }
+
+    #[test]
+    fn provenance_artifact_still_wins_over_generic_copy() {
+        // A target/ artifact EPERM is classified as provenance residue (its
+        // remediation is the more specific `rm -rf target`), not the generic
+        // build-script-copy arm, because the artifact check runs first.
+        let stderr =
+            "error writing `/p/target/debug/deps/x.rlib`: Operation not permitted (os error 1)";
+        let hit = diagnose(stderr).unwrap();
+        assert_eq!(hit.kind, ContaminationKind::ProvenanceResidue);
     }
 }

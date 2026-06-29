@@ -14,10 +14,16 @@ use tempfile::NamedTempFile;
 mod consent;
 pub use consent::HookConsentStore;
 
+pub mod post_exec;
+
 const MANAGED_ID_DEFAULT_SHELL_V1: &str = "ahma-default-shell-v1";
 const WRAPPED_BY_MARKER: &str = "ahma-hooks-wrapper-v1";
 const HOOK_TIMEOUT_SECS: u64 = 30;
 const PATH_LOOKUP_BINARY: &str = "ahma";
+/// Cursor hook event for observing finished shell commands (post-execution).
+/// Used to surface a host-sandbox denial that the deferring pre-execution hook
+/// cannot see (SPEC R7 — defer to host, but still disclose failures).
+const CURSOR_OBSERVE_EVENT_KEY: &str = "afterShellExecution";
 
 /// The decision `compute_exec_decision` makes for each tool invocation.
 ///
@@ -107,6 +113,10 @@ pub enum HooksCommand {
     /// Internal hook entrypoint used by external tools.
     #[command(hide = true)]
     Exec(HooksExecArgs),
+    /// Internal post-execution observer used by managed hooks to surface a
+    /// host-sandbox denial that the pre-execution (defer-to-host) hook cannot see.
+    #[command(hide = true)]
+    Observe(HooksObserveArgs),
     /// Internal shell wrapper used by managed hooks.
     #[command(name = "run-shell", hide = true)]
     RunShell(HooksRunShellArgs),
@@ -166,6 +176,18 @@ pub struct HooksStatusArgs {
 
 #[derive(Args, Debug)]
 pub struct HooksExecArgs {
+    #[arg(long, value_enum)]
+    pub platform: HookPlatform,
+
+    #[arg(long, value_enum)]
+    pub scope: HookScope,
+
+    #[arg(long, hide = true, default_value = MANAGED_ID_DEFAULT_SHELL_V1)]
+    pub managed_id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct HooksObserveArgs {
     #[arg(long, value_enum)]
     pub platform: HookPlatform,
 
@@ -366,6 +388,7 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
         HooksCommand::Uninstall(args) => run_uninstall(args),
         HooksCommand::Status(args) => run_status(args),
         HooksCommand::Exec(args) => run_exec(args),
+        HooksCommand::Observe(args) => run_observe(args),
         HooksCommand::RunShell(args) => run_shell(args, cfg).await,
         HooksCommand::ApproveUnsandboxed => run_approve_unsandboxed(),
         HooksCommand::Revoke => run_revoke_consent(),
@@ -388,6 +411,15 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
 /// invocations, where the normal clap error/help should be shown.
 pub fn try_emit_exec_parse_error_fallback() -> bool {
     let args: Vec<String> = std::env::args().collect();
+    // The post-execution observer is purely informational: on a parse failure
+    // emit an empty object (no added context) rather than a usage dump.
+    let is_hook_observe = args
+        .windows(2)
+        .any(|w| w[0] == "hooks" && w[1] == "observe");
+    if is_hook_observe {
+        let _ = write_exec_output(&json!({}));
+        return true;
+    }
     let is_hook_exec = args.windows(2).any(|w| w[0] == "hooks" && w[1] == "exec");
     if !is_hook_exec {
         return false;
@@ -880,6 +912,115 @@ fn run_exec(args: HooksExecArgs) -> Result<()> {
 
     let decision = compute_exec_decision(&stdin, args.scope, &env);
     emit_decision(decision, args.platform)
+}
+
+/// `ahma hooks observe` — the post-execution observer (SPEC R7 disclosure).
+///
+/// Invoked by the managed `afterShellExecution` hook *after* a deferred-to-host
+/// command finishes. It scans the command's output for a host-sandbox denial and,
+/// on a hit, returns an actionable remediation the editor can surface. It is
+/// strictly observational: it NEVER blocks, denies, or errors — a post hook that
+/// failed the editor would be worse than the silent failure it is trying to fix.
+/// Any parse problem or absent signature emits an empty object (no-op).
+fn run_observe(_args: HooksObserveArgs) -> Result<()> {
+    let stdin = match read_stdin_json() {
+        Ok(s) => s,
+        Err(_) => return write_exec_output(&json!({})),
+    };
+
+    let output = extract_command_output(&stdin);
+    let failed = command_failed(&stdin);
+
+    match post_exec::surface_sandbox_denial(&output, failed) {
+        Some(remediation) => write_exec_output(&build_cursor_observe_output(&remediation)),
+        None => write_exec_output(&json!({})),
+    }
+}
+
+/// Collect the textual output of a finished command from the post-execution hook
+/// payload. Cursor's `afterShellExecution` payload shape is not contractually
+/// fixed, so this reads defensively from the keys that have carried command text
+/// (top-level and a nested `tool_output` object), concatenating any it finds.
+fn extract_command_output(input: &Value) -> String {
+    const KEYS: &[&str] = &[
+        "output",
+        "stdout",
+        "stderr",
+        "result",
+        "outputText",
+        "text",
+        "error",
+    ];
+
+    fn collect_from(object: &Map<String, Value>, into: &mut String) {
+        for key in KEYS {
+            if let Some(s) = object.get(*key).and_then(Value::as_str)
+                && !s.is_empty()
+            {
+                if !into.is_empty() {
+                    into.push('\n');
+                }
+                into.push_str(s);
+            }
+        }
+    }
+
+    let mut combined = String::new();
+    if let Some(object) = input.as_object() {
+        collect_from(object, &mut combined);
+        if let Some(nested) = object.get("tool_output").and_then(Value::as_object) {
+            collect_from(nested, &mut combined);
+        }
+    }
+    combined
+}
+
+/// Whether the finished command should be treated as failed. An explicit non-zero
+/// `exit_code`/`exitCode`, or an `aborted: true`, means failure; an unknown status
+/// is treated as failed so a clear denial signature is never suppressed (the
+/// signature only appears on failure anyway).
+fn command_failed(input: &Value) -> bool {
+    if let Some(code) = input
+        .get("exit_code")
+        .or_else(|| input.get("exitCode"))
+        .and_then(Value::as_i64)
+    {
+        return code != 0;
+    }
+    if let Some(aborted) = input.get("aborted").and_then(Value::as_bool) {
+        return aborted;
+    }
+    true
+}
+
+/// Build the Cursor post-hook output carrying the remediation. `additional_context`
+/// is the documented `postToolUse`/post-event field (injected into the agent's
+/// context); `agent_message`/`user_message` are emitted too as belt-and-suspenders
+/// (Cursor ignores fields an event does not support).
+fn build_cursor_observe_output(remediation: &str) -> Value {
+    json!({
+        "additional_context": remediation,
+        "agent_message": remediation,
+        "user_message": remediation,
+    })
+}
+
+/// Build the managed `afterShellExecution` observe command for Cursor.
+fn build_observe_command(scope: HookScope, env: &HookEnvironment) -> String {
+    BinaryReference::for_scope(env, scope).build_command(&observe_args(scope))
+}
+
+fn observe_args(scope: HookScope) -> Vec<String> {
+    vec![
+        "hooks".to_string(),
+        "observe".to_string(),
+        "--platform".to_string(),
+        HookPlatform::Cursor.cli_name().to_string(),
+        "--scope".to_string(),
+        scope.cli_name().to_string(),
+        "--managed-id".to_string(),
+        MANAGED_ID_DEFAULT_SHELL_V1.to_string(),
+    ]
 }
 
 /// Build the decision for a command ahma cannot sandbox (SPEC R5.5.3).
@@ -1514,16 +1655,37 @@ fn install_cursor_hook(
         "failClosed": false,
     }));
 
+    // Post-execution observer: when the pre-execution hook defers to the host
+    // sandbox (R7), the host can still deny a write its pre-hook never sees (the
+    // `aws-lc-sys` build-cache copy). This `afterShellExecution` hook scans the
+    // finished command's output and surfaces a remediation. Strictly
+    // observational and fail-open — it can only add context, never block.
+    let observe_entries = ensure_child_array(hooks, CURSOR_OBSERVE_EVENT_KEY)?;
+    observe_entries.retain(|entry| !is_managed_cursor_entry(entry));
+    observe_entries.push(json!({
+        "matcher": "Shell",
+        "command": build_observe_command(scope, env),
+        "timeout": HOOK_TIMEOUT_SECS,
+        "failClosed": false,
+    }));
+
     Ok(())
 }
 
 fn uninstall_cursor_hook(document: &mut Value) -> Result<bool> {
-    remove_managed_hook_entries(
+    let pre = remove_managed_hook_entries(
         document,
         "Cursor",
         HookPlatform::Cursor.event_key(),
         is_managed_cursor_entry,
-    )
+    )?;
+    let observe = remove_managed_hook_entries(
+        document,
+        "Cursor",
+        CURSOR_OBSERVE_EVENT_KEY,
+        is_managed_cursor_entry,
+    )?;
+    Ok(pre || observe)
 }
 
 fn cursor_hook_installed(document: &Value) -> bool {
@@ -2062,6 +2224,126 @@ mod tests {
             !entry["failClosed"].as_bool().unwrap_or(true),
             "Cursor hook must have failClosed:false so a binary crash/timeout fails OPEN (runs unsandboxed) rather than blocking the user's terminal"
         );
+    }
+
+    #[test]
+    fn test_cursor_install_writes_observe_hook() {
+        let env = test_env();
+        let mut document = Value::Object(Map::new());
+
+        install_cursor_hook(&mut document, HookScope::User, &env).unwrap();
+
+        let observe = &document["hooks"][CURSOR_OBSERVE_EVENT_KEY][0];
+        let command = observe["command"].as_str().unwrap();
+        // Tokens are shell-quoted individually, so assert on the distinctive
+        // `observe` subcommand token and the managed id rather than a contiguous
+        // `hooks observe` (which quoting splits into `'hooks' 'observe'`).
+        assert!(
+            command.contains("observe"),
+            "observe entry must invoke the `observe` subcommand: {command}"
+        );
+        assert!(command.contains(MANAGED_ID_DEFAULT_SHELL_V1));
+        assert_eq!(observe["matcher"].as_str().unwrap(), "Shell");
+        assert!(
+            !observe["failClosed"].as_bool().unwrap_or(true),
+            "observe hook must fail open — it is purely informational and must never block"
+        );
+    }
+
+    #[test]
+    fn test_cursor_install_is_idempotent_for_observe() {
+        let env = test_env();
+        let mut document = Value::Object(Map::new());
+
+        install_cursor_hook(&mut document, HookScope::User, &env).unwrap();
+        install_cursor_hook(&mut document, HookScope::User, &env).unwrap();
+
+        let pre = document["hooks"]["preToolUse"].as_array().unwrap();
+        let observe = document["hooks"][CURSOR_OBSERVE_EVENT_KEY]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            pre.len(),
+            1,
+            "re-install must not duplicate the preToolUse entry"
+        );
+        assert_eq!(
+            observe.len(),
+            1,
+            "re-install must not duplicate the observe entry"
+        );
+    }
+
+    #[test]
+    fn test_cursor_uninstall_removes_both_pre_and_observe() {
+        let env = test_env();
+        let mut document = Value::Object(Map::new());
+        install_cursor_hook(&mut document, HookScope::User, &env).unwrap();
+
+        let changed = uninstall_cursor_hook(&mut document).unwrap();
+        assert!(changed, "uninstall must report it removed managed entries");
+        assert!(
+            !cursor_hook_installed(&document),
+            "no managed preToolUse entry should remain"
+        );
+        // The whole hooks tree should be cleaned up since nothing else was there.
+        assert!(
+            document.get("hooks").is_none()
+                || document["hooks"].get(CURSOR_OBSERVE_EVENT_KEY).is_none(),
+            "observe entry must be removed on uninstall: {document}"
+        );
+    }
+
+    #[test]
+    fn test_extract_command_output_concatenates_known_keys() {
+        let input = json!({
+            "command": "cargo build",
+            "stdout": "Compiling foo",
+            "stderr": "Operation not permitted",
+        });
+        let out = extract_command_output(&input);
+        assert!(out.contains("Compiling foo"));
+        assert!(out.contains("Operation not permitted"));
+    }
+
+    #[test]
+    fn test_extract_command_output_reads_nested_tool_output() {
+        let input = json!({ "tool_output": { "output": "nested denial text" } });
+        assert_eq!(extract_command_output(&input), "nested denial text");
+    }
+
+    #[test]
+    fn test_extract_command_output_empty_when_no_known_keys() {
+        let input = json!({ "command": "ls", "unrelated": 5 });
+        assert!(extract_command_output(&input).is_empty());
+    }
+
+    #[test]
+    fn test_command_failed_reads_exit_code() {
+        assert!(command_failed(&json!({ "exit_code": 1 })));
+        assert!(!command_failed(&json!({ "exit_code": 0 })));
+        assert!(command_failed(&json!({ "exitCode": 137 })));
+        assert!(command_failed(&json!({ "aborted": true })));
+        assert!(!command_failed(&json!({ "aborted": false })));
+        // Unknown status → treated as failed so a denial signature is not suppressed.
+        assert!(command_failed(&json!({ "command": "x" })));
+    }
+
+    #[test]
+    fn test_build_cursor_observe_output_carries_remediation() {
+        let out = build_cursor_observe_output("do the fix");
+        assert_eq!(out["additional_context"].as_str().unwrap(), "do the fix");
+        assert_eq!(out["agent_message"].as_str().unwrap(), "do the fix");
+        assert_eq!(out["user_message"].as_str().unwrap(), "do the fix");
+    }
+
+    #[test]
+    fn test_observe_args_shape() {
+        let args = observe_args(HookScope::User);
+        assert_eq!(args[0], "hooks");
+        assert_eq!(args[1], "observe");
+        assert!(args.iter().any(|a| a == "--platform"));
+        assert!(args.iter().any(|a| a == MANAGED_ID_DEFAULT_SHELL_V1));
     }
 
     #[test]
