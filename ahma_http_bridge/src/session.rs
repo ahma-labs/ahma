@@ -659,7 +659,7 @@ async fn await_response(
         )),
         Err(_) => {
             clear_pending_request(pending, id_opt.as_deref());
-            Err(BridgeError::Communication("Request timed out".to_string()))
+            Err(BridgeError::Timeout)
         }
     }
 }
@@ -2145,6 +2145,12 @@ mod session_logic_tests {
         )
         .await
         .unwrap_err();
+        // Must be the dedicated, recoverable Timeout variant — not a generic
+        // Communication error — so `forward_request` can keep the session alive.
+        assert!(
+            matches!(err, BridgeError::Timeout),
+            "expected BridgeError::Timeout, got {err:?}"
+        );
         assert!(err.to_string().contains("timed out"));
         // The pending entry was cleared on timeout.
         assert!(!pending.contains_key(&id));

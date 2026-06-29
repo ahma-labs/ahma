@@ -14,6 +14,13 @@ use rmcp::transport::Transport;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// How many *consecutive* forward failures the proxy tolerates before treating
+/// the bridge transport as genuinely dead and exiting. A single failure (e.g. a
+/// per-request timeout or a sandbox-initializing 409) is relayed to the client
+/// and the session is preserved; only a sustained run of failures — meaning the
+/// transport itself is broken, not one request — tears the session down.
+const MAX_CONSECUTIVE_FORWARD_FAILURES: u32 = 3;
+
 /// Resolve the frontend handshake deadline: the internal
 /// `AHMA_FRONTEND_HANDSHAKE_DEADLINE_SECS` override if set (testing), otherwise
 /// [`FRONTEND_HANDSHAKE_DEADLINE_SECS`]. A value of `0` disables the deadline
@@ -100,6 +107,10 @@ where
     // This is the signal used by handle_version_checks to detect a stale bridge:
     // a healthy bridge always replies to `initialize`; a stale one closes silently.
     let mut bridge_responded = false;
+    // Count consecutive failures to forward a request to the bridge. Reset on any
+    // success. A single failure no longer tears the session down (see
+    // MAX_CONSECUTIVE_FORWARD_FAILURES).
+    let mut consecutive_forward_failures: u32 = 0;
 
     // Handshake deadline: if the client never sends its first message (the
     // `initialize` handshake) within this window, the connection was spawned
@@ -131,15 +142,52 @@ where
                     break;
                 };
                 let val = serde_json::to_value(msg).unwrap();
+                let request_id = val.get("id").filter(|id| !id.is_null()).cloned();
                 let tx_msg = serde_json::from_value(val).unwrap();
                 if let Err(e) = client.send(tx_msg).await {
-                    tracing::error!(
+                    // A single forward failure must NOT tear down the whole
+                    // multiplexed session. The bridge returns recoverable
+                    // conditions (per-request timeout, sandbox-initializing 409)
+                    // as ordinary responses now, but as defense-in-depth we also
+                    // refuse to die on one transport-level send error: relay an
+                    // error for THIS request id back to the client and keep
+                    // serving. Only a sustained run of failures (the transport is
+                    // genuinely dead) exits the proxy.
+                    consecutive_forward_failures += 1;
+                    tracing::warn!(
                         transport,
                         error = ?e,
-                        "Proxy exiting: failed to forward message to bridge"
+                        failures = consecutive_forward_failures,
+                        "Failed to forward request to bridge; relaying error to client, session preserved"
                     );
-                    break;
+                    if let Some(id) = request_id {
+                        let err_val = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32002,
+                                "message": "Bridge could not service this request; it may \
+                                            still be running. Retry, or await the completion \
+                                            notification."
+                            }
+                        });
+                        if let Ok(err_msg) =
+                            serde_json::from_value::<TxJsonRpcMessage<RoleServer>>(err_val)
+                        {
+                            let _ = stdio.send(err_msg).await;
+                        }
+                    }
+                    if consecutive_forward_failures >= MAX_CONSECUTIVE_FORWARD_FAILURES {
+                        tracing::error!(
+                            transport,
+                            failures = consecutive_forward_failures,
+                            "Proxy exiting: bridge transport failed repeatedly (genuinely dead)"
+                        );
+                        break;
+                    }
+                    continue;
                 }
+                consecutive_forward_failures = 0;
                 forwarded_any = true;
             }
             client_msg = client.receive() => {
@@ -409,4 +457,148 @@ async fn run_proxy_client_http(
         .await;
 
     Ok(bridge_responded)
+}
+
+// `run_transport_proxy` and the `RoleClient` import are Unix-only, so these
+// tests (which drive it directly with mock transports) are gated to match.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use rmcp::service::{RoleClient, RxJsonRpcMessage};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn client_request(id: i64) -> RxJsonRpcMessage<RoleServer> {
+        serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": "run_terminal_command", "arguments": {}}
+        }))
+        .expect("valid client request")
+    }
+
+    /// Stdio side: hands the proxy a fixed queue of client requests, then EOF
+    /// (`None`), and records every server→client message the proxy sends back.
+    struct MockStdio {
+        inbound: VecDeque<RxJsonRpcMessage<RoleServer>>,
+        sent: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+    impl Transport<RoleServer> for MockStdio {
+        type Error = std::io::Error;
+        // The trait requires `send` to return a `'static` future, so it cannot
+        // borrow `&mut self`; clone the shared recorder into an owned future.
+        fn send(
+            &mut self,
+            item: TxJsonRpcMessage<RoleServer>,
+        ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+            let sent = self.sent.clone();
+            async move {
+                sent.lock()
+                    .unwrap()
+                    .push(serde_json::to_value(item).unwrap());
+                Ok(())
+            }
+        }
+        async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
+            self.inbound.pop_front()
+        }
+        async fn close(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// Bridge side: fails the first `fail_first_n` sends, then succeeds. Never
+    /// delivers a bridge→client message (so the stdio side drives the loop).
+    struct MockClient {
+        fail_first_n: usize,
+        attempts: Arc<AtomicUsize>,
+    }
+    impl Transport<RoleClient> for MockClient {
+        type Error = std::io::Error;
+        fn send(
+            &mut self,
+            _item: TxJsonRpcMessage<RoleClient>,
+        ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+            let attempts = self.attempts.clone();
+            let fail_first_n = self.fail_first_n;
+            async move {
+                let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if n <= fail_first_n {
+                    Err(std::io::Error::other("simulated bridge forward failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+            std::future::pending().await
+        }
+        async fn close(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn single_forward_failure_relays_error_and_keeps_session_alive() {
+        // REGRESSION: one failed forward (e.g. a per-request timeout surfaced as a
+        // transport error) must NOT tear the proxy down. The proxy relays a
+        // JSON-RPC error for that request id and keeps serving the next request.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let stdio = MockStdio {
+            inbound: VecDeque::from(vec![client_request(1), client_request(2)]),
+            sent: sent.clone(),
+        };
+        let client = MockClient {
+            fail_first_n: 1,
+            attempts: attempts.clone(),
+        };
+
+        let result = run_transport_proxy(stdio, client, "test", None).await;
+        assert!(
+            result.is_ok(),
+            "proxy must survive a single forward failure"
+        );
+        // Both requests were attempted → the session survived the first failure.
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "expected one relayed error, got {sent:?}");
+        assert_eq!(sent[0]["id"], serde_json::json!(1));
+        assert_eq!(sent[0]["error"]["code"], serde_json::json!(-32002));
+    }
+
+    #[tokio::test]
+    async fn sustained_forward_failures_tear_down_the_session() {
+        // A genuinely dead transport still exits — but only after a sustained run
+        // of failures, not on the first one.
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let stdio = MockStdio {
+            inbound: VecDeque::from(vec![
+                client_request(1),
+                client_request(2),
+                client_request(3),
+                client_request(4),
+            ]),
+            sent: sent.clone(),
+        };
+        let client = MockClient {
+            fail_first_n: usize::MAX,
+            attempts: attempts.clone(),
+        };
+
+        let result = run_transport_proxy(stdio, client, "test", None).await;
+        assert!(result.is_ok());
+        // Gives up after MAX_CONSECUTIVE_FORWARD_FAILURES; request 4 is never tried.
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            MAX_CONSECUTIVE_FORWARD_FAILURES as usize
+        );
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            MAX_CONSECUTIVE_FORWARD_FAILURES as usize
+        );
+    }
 }

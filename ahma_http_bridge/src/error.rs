@@ -21,6 +21,13 @@ pub enum BridgeError {
     #[error("Communication error: {0}")]
     Communication(String),
 
+    /// A single request exceeded its wait window while the subprocess is still
+    /// alive and the operation is still running. This is *recoverable* — it must
+    /// NOT be surfaced as a transport-fatal error, or the whole proxy session
+    /// would be torn down (see `forward_request` / `proxy_client`).
+    #[error("Request timed out")]
+    Timeout,
+
     /// HTTP server binding or runtime error
     #[error("HTTP server error: {0}")]
     HttpServer(String),

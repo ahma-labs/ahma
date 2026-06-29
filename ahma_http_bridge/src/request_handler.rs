@@ -1,3 +1,4 @@
+use crate::error::BridgeError;
 use crate::session::{McpRoot, SessionManager, request_timeout_secs, tool_call_timeout_secs};
 use axum::{
     body::Body,
@@ -40,6 +41,31 @@ fn json_rpc_error_value(code: i32, message: &str) -> Value {
             "message": message
         }
     })
+}
+
+/// Build the recoverable "request timed out" response for a forwarded request.
+///
+/// Returned with **HTTP 200** (not 500) and the original request `id` so the
+/// rmcp client correlates it to the pending request and surfaces it as that
+/// request's error — WITHOUT treating the transport as dead. A 500 here would
+/// make the rmcp streamable-HTTP client raise `UnexpectedServerResponse`, which
+/// `proxy_client` treats as fatal and tears the whole MCP session down. The
+/// operation itself keeps running in the subprocess; the caller can await again
+/// or wait for the completion notification.
+fn request_timeout_response(payload: &Value) -> Response {
+    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32002,
+            "message": "Operation still running: the bridge wait window elapsed \
+                        before the tool returned. The operation continues in the \
+                        background — await again or wait for the completion \
+                        notification."
+        }
+    });
+    json_response_with_status(StatusCode::OK, body)
 }
 
 /// Attach MCP session header when available.
@@ -840,6 +866,19 @@ async fn forward_request(
                 .await;
             with_session_header(json_response(response), session_id)
         }
+        // A per-request timeout is recoverable: the subprocess is alive and the
+        // operation is still running, only our wait window elapsed. Return it as
+        // an HTTP 200 JSON-RPC error so the session survives (see
+        // `request_timeout_response`). A genuine transport/protocol failure still
+        // gets a fatal -32603 / HTTP 500 below.
+        Err(BridgeError::Timeout) => {
+            warn!(
+                session_id = %session_id,
+                "Forwarded request timed out; operation still running — returning \
+                 recoverable timeout (session preserved)"
+            );
+            with_session_header(request_timeout_response(payload), session_id)
+        }
         Err(e) => {
             error!(session_id = %session_id, "Failed to send request: {}", e);
             error_response(-32603, &format!("Failed to send request: {}", e))
@@ -847,7 +886,29 @@ async fn forward_request(
     }
 }
 
+/// Bridge wait budget for the `await` meta-tool.
+///
+/// `await` blocks in-process for up to its own ceiling — `DEFAULT_AWAIT_TIMEOUT`
+/// in `ahma_mcp::mcp_service::handlers::await_tool` (600s), capped by the same
+/// 600s ceiling that `calculate_tool_timeout` applies to operations — and then
+/// returns a graceful "still running" result. The bridge must grant it a
+/// strictly larger budget so the in-process path fires first; otherwise the
+/// bridge guillotines the call and (before the recoverable-timeout fix) tore the
+/// whole MCP session down. The +60s margin covers scheduling/IO slack.
+const AWAIT_TOOL_BRIDGE_TIMEOUT_SECS: u64 = 660;
+
 fn calculate_tool_timeout(payload: &Value) -> Duration {
+    let tool_name = payload
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str());
+
+    // `await` self-bounds in-process and returns gracefully; give it headroom
+    // over its own ceiling rather than the short default tool-call budget.
+    if tool_name == Some("await") {
+        return Duration::from_secs(AWAIT_TOOL_BRIDGE_TIMEOUT_SECS);
+    }
+
     let arg_timeout_secs = payload
         .get("params")
         .and_then(|p| p.get("arguments"))
@@ -1496,6 +1557,31 @@ mod tests {
         assert_eq!(
             calculate_tool_timeout(&no_params),
             Duration::from_secs(tool_call_timeout_secs())
+        );
+    }
+
+    #[test]
+    fn calculate_tool_timeout_await_gets_budget_above_inprocess_ceiling() {
+        // `await` blocks in-process up to 600s and then returns a graceful
+        // "still running" result. The bridge budget must STRICTLY EXCEED that
+        // ceiling so the in-process path fires first instead of the bridge
+        // guillotining the call.
+        let payload = json!({"params": {"name": "await", "arguments": {}}});
+        assert_eq!(
+            calculate_tool_timeout(&payload),
+            Duration::from_secs(AWAIT_TOOL_BRIDGE_TIMEOUT_SECS)
+        );
+        const {
+            assert!(
+                AWAIT_TOOL_BRIDGE_TIMEOUT_SECS > 600,
+                "await bridge budget must exceed the 600s in-process await ceiling"
+            )
+        };
+        // The extended budget applies regardless of any client-sent timeout arg.
+        let with_arg = json!({"params": {"name": "await", "arguments": {"timeout_seconds": 5}}});
+        assert_eq!(
+            calculate_tool_timeout(&with_arg),
+            Duration::from_secs(AWAIT_TOOL_BRIDGE_TIMEOUT_SECS)
         );
     }
 
@@ -2270,6 +2356,48 @@ mod tests {
         });
         let resp = forward_request(&mgr, &id, Some("tools/call"), &payload, false).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forward_request_timeout_is_recoverable_http_200_not_500() {
+        // REGRESSION: a request the subprocess never answers must yield a
+        // RECOVERABLE timeout — HTTP 200 with a JSON-RPC error carrying the
+        // request id — NOT a fatal HTTP 500. A 500 makes the rmcp client raise
+        // UnexpectedServerResponse, which the stdio proxy treats as fatal and
+        // tears the whole MCP session down (the "one timeout kills every Ahma
+        // tool" bug). The operation keeps running; only our wait window elapsed.
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        mark_session_initialized(&mgr, &id, true).await;
+        // id present (so it's a real request, not a notification) and
+        // timeout_seconds: 0 → the bridge wait window elapses immediately.
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {"name": "run_terminal_command", "arguments": {"timeout_seconds": 0}}
+        });
+        let resp = forward_request(&mgr, &id, Some("tools/call"), &payload, false).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a per-request timeout must not be a transport-fatal non-2xx"
+        );
+        assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["id"],
+            json!(42),
+            "must echo the request id for correlation"
+        );
+        assert_eq!(body["error"]["code"], json!(-32002));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("still running"),
+            "message should explain the op continues: {body}"
+        );
     }
 
     #[tokio::test]
