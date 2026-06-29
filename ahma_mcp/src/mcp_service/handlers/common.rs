@@ -104,6 +104,32 @@ pub fn execution_error(e: &anyhow::Error) -> McpError {
         return McpError::internal_error(message, Some(data));
     }
 
+    // A runtime kernel denial (the command ran but the kernel blocked an
+    // out-of-scope write/read it referenced in stderr). Same machine-readable
+    // shape as PathOutsideSandbox so the agent can drive the grant -> restart ->
+    // retry loop, but the remediation points at the `sandbox_grant`/`restart`
+    // MCP tools and the `details` already carry the original command output.
+    if let Some(SandboxError::RuntimeDenial {
+        path,
+        access,
+        scopes,
+        ..
+    }) = e.downcast_ref::<SandboxError>()
+    {
+        let data = serde_json::json!({
+            "kind": "sandbox_denial",
+            "path": path.to_string_lossy(),
+            "access": if access.is_write() { "write" } else { "read" },
+            "reason": "runtime_kernel_denial",
+            "current_scopes": scopes
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            "remediation": crate::sandbox::grant_channel::runtime_denial_remediation(path, *access),
+        });
+        return McpError::internal_error(message, Some(data));
+    }
+
     McpError::internal_error(message, None)
 }
 

@@ -362,6 +362,60 @@ pub async fn run(args: HooksArgs, cfg: AppConfig) -> Result<()> {
     }
 }
 
+/// Last-resort guard for the hook entrypoint when ahma's own CLI args fail to
+/// parse (for example a managed hook command written by one ahma version invoked
+/// against a different `ahma` resolved on `PATH`). The editor interprets the
+/// hook's stdout + exit code, so letting clap print its top-level usage/help
+/// would dump the entire CLI banner as the "Hook blocked with message" payload.
+/// Instead, detect a `hooks exec` invocation from the raw argv and emit a concise
+/// fail-open `allow` decision so the user's terminal is never wedged by ahma's
+/// own breakage (the same fail-open philosophy [`run_exec`] uses for malformed
+/// stdin payloads).
+///
+/// Returns `true` when it handled the invocation (the caller must then exit 0
+/// without letting clap print anything). Returns `false` for non-hook
+/// invocations, where the normal clap error/help should be shown.
+pub fn try_emit_exec_parse_error_fallback() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    let is_hook_exec = args.windows(2).any(|w| w[0] == "hooks" && w[1] == "exec");
+    if !is_hook_exec {
+        return false;
+    }
+    let platform = sniff_platform(&args).unwrap_or(HookPlatform::Cursor);
+    let output = build_exec_output(HooksDecision::AllowUnchanged, platform);
+    // Best-effort: even if the write fails, an empty stdout is far better than a
+    // usage dump — the editor treats "no decision" as allow.
+    let _ = write_exec_output(&output);
+    true
+}
+
+/// Parse `--platform <value>` (or `--platform=<value>`) out of raw argv for the
+/// parse-error fallback, where clap's own parsing is unavailable. Returns `None`
+/// for a missing/unknown value so the caller can apply its default.
+fn sniff_platform(args: &[String]) -> Option<HookPlatform> {
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        let val = if let Some(v) = a.strip_prefix("--platform=") {
+            Some(v.to_string())
+        } else if a == "--platform" {
+            iter.next().cloned()
+        } else {
+            None
+        };
+        if let Some(v) = val {
+            return match v.as_str() {
+                "cursor" => Some(HookPlatform::Cursor),
+                "claude" => Some(HookPlatform::Claude),
+                "codex" => Some(HookPlatform::Codex),
+                "copilot" => Some(HookPlatform::Copilot),
+                "antigravity" => Some(HookPlatform::Antigravity),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 /// `ahma hooks approve-unsandboxed` — grant session-scoped consent (R5.5.3).
 fn run_approve_unsandboxed() -> Result<()> {
     let store = HookConsentStore::current();
@@ -981,7 +1035,23 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // command the sandbox just blocked succeed on the unsandboxed retry — a
         // silent confinement bypass. The SPEC R5.5.3 unsandboxed fallback applies
         // only when the sandbox cannot be initialized at all.
-        Err(e) => Err(e),
+        //
+        // One refinement: when the failure was an out-of-scope *runtime* denial
+        // (`SandboxError::RuntimeDenial`), append an actionable `ahma sandbox
+        // grant ...` recovery line so the agent gets a next step instead of a raw
+        // `os error 1`. The native-terminal hook uses the CLI grant path (not the
+        // MCP grant/restart tools).
+        Err(e) => {
+            if let Some(crate::sandbox::SandboxError::RuntimeDenial { path, access, .. }) =
+                e.downcast_ref::<crate::sandbox::SandboxError>()
+            {
+                let remediation =
+                    crate::sandbox::grant_channel::runtime_denial_remediation_cli(path, *access);
+                eprintln!("{e}\n\n{remediation}");
+                return Err(anyhow!("{e}\n\n{remediation}"));
+            }
+            Err(e)
+        }
     }
 }
 

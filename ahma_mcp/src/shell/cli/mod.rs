@@ -2474,7 +2474,22 @@ pub async fn run() -> Result<()> {
     // We do a minimal Cli parse just to capture --no-settings / --settings-path; the
     // full parse happens below.  We also honour the legacy AHMA_LOG_TARGET env var with
     // a deprecation-friendly approach: settings file wins, env var is a fallback.
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            // Explicit `--help` / `--version` must still print normally.
+            let is_help_or_version =
+                matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion);
+            // For a malformed `hooks exec` invocation, never let clap dump its
+            // usage banner as the editor's "block message"; emit a concise
+            // fail-open decision instead and exit cleanly.
+            if !is_help_or_version && crate::hooks::try_emit_exec_parse_error_fallback() {
+                std::process::exit(0);
+            }
+            e.exit();
+        }
+    };
 
     // R-CFG1.2: AHMA_LOG_TARGET is RETIRED — warn and ignore.
     if std::env::var_os("AHMA_LOG_TARGET").is_some() {

@@ -46,6 +46,39 @@ fn execution_error_attaches_structured_sandbox_denial() {
 }
 
 #[test]
+fn execution_error_attaches_runtime_denial_payload() {
+    use crate::sandbox::SandboxError;
+    use ahma_common::config::ScopeAccess;
+    use std::path::PathBuf;
+
+    // A runtime kernel denial carries the original command output in `details`
+    // and the offending path/access so the agent can drive grant -> restart -> retry.
+    let err: anyhow::Error = SandboxError::RuntimeDenial {
+        path: PathBuf::from("/Users/me/.cargo/.crates.toml"),
+        access: ScopeAccess::Rw,
+        scopes: vec![PathBuf::from("/work/space")],
+        details: "Command failed with exit code 101: stderr: Operation not permitted (os error 1)"
+            .to_string(),
+    }
+    .into();
+
+    let mcp = execution_error(&err);
+    let data = mcp.data.expect("runtime denial must carry a data payload");
+    assert_eq!(data["kind"], "sandbox_denial");
+    assert_eq!(data["path"], "/Users/me/.cargo/.crates.toml");
+    assert_eq!(data["access"], "write");
+    assert_eq!(data["reason"], "runtime_kernel_denial");
+    assert_eq!(data["current_scopes"][0], "/work/space");
+    let remediation = data["remediation"].as_str().unwrap();
+    assert!(
+        remediation.contains("sandbox_grant") && remediation.contains("restart"),
+        "remediation should describe the grant -> restart -> retry loop: {remediation}"
+    );
+    // The original command output is preserved in the human-readable message.
+    assert!(mcp.message.contains("os error 1"));
+}
+
+#[test]
 fn execution_error_without_sandbox_cause_has_no_data() {
     let err = anyhow::anyhow!("compilation failed: missing semicolon");
     let mcp = execution_error(&err);

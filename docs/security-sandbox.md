@@ -140,6 +140,42 @@ AHMA_NO_PACKAGE_CACHE_WRITE=1 ahma serve stdio
 
 `$CARGO_HOME` is respected; defaults to `~/.cargo`.
 
+### `cargo install` / `cargo binstall` and other tool installs
+
+`cargo install`, `cargo binstall`, `rustup component add`, `npm i -g`, etc. write a
+binary into `~/.cargo/bin` (or the equivalent) **and** update an install manifest
+such as `~/.cargo/.crates.toml`. Those paths are intentionally **read-only** (see
+the table above), so the install fails with a low-level kernel error — on macOS:
+
+```
+error: failed to open: /Users/<you>/.cargo/.crates.toml
+
+Caused by:
+  Operation not permitted (os error 1)
+```
+
+This is expected and is **not** a bug: installing global binaries is denied by
+default. There is no special flag for it — the supported remedy is the standard
+**runtime-denial grant loop**:
+
+1. ahma detects the denied path from the command's stderr and returns a structured
+   `sandbox_denial` error (over MCP) or prints an `ahma sandbox grant …` hint (in a
+   hooked native terminal).
+2. **Grant the path** — via the `sandbox_grant` MCP tool (preview, then `confirm: true`),
+   or on the CLI: `ahma sandbox grant ~/.cargo/bin` (and `~/.cargo` for the
+   manifest). The grant is written to `~/.ahma/settings.toml`, which lives outside
+   every sandbox scope. Credential/config files are never auto-granted and the
+   path is risk-classified before it is offered.
+3. **Apply it** — run the `restart` MCP tool (or restart the server) so the new
+   scope takes effect; scopes are immutable for the lifetime of a running session.
+4. **Re-run** the original command.
+
+If a maintenance script bootstraps tools (e.g. `cargo install cargo-binstall`),
+expect the first run to surface a grant prompt; once granted and applied, the
+script proceeds. Prefer scripts that install into a workspace-local directory
+(`cargo install --root <workspace>/.tools`) when you want installs to land
+in-scope without any grant.
+
 ## Temp Directory Access (`--tmp`)
 
 By default, the system temp directory is accessible only via platform-implicit rules. Use `--tmp` (or `AHMA_TMP_ACCESS=1`) to add it as an explicit read/write scope — useful for compilers and build tools.

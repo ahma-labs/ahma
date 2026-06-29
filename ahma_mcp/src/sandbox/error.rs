@@ -1,3 +1,4 @@
+use ahma_common::config::ScopeAccess;
 use std::path::{Path, PathBuf};
 
 fn display_path(path: &Path) -> String {
@@ -13,6 +14,21 @@ pub enum SandboxError {
         path = display_path(.path)
     )]
     PathOutsideSandbox { path: PathBuf, scopes: Vec<PathBuf> },
+
+    /// A sandboxed command exited non-zero and its stderr matched a kernel-denial
+    /// signature ([`crate::sandbox::scan_denial`]) for a path that is **outside**
+    /// the current scope. Unlike [`Self::PathOutsideSandbox`] (a pre-execution
+    /// rejection where ahma knew the path up front), this is a *runtime* denial
+    /// the kernel raised mid-command — so the original command output is carried
+    /// in `details` and the offending `path`/`access` let the MCP boundary attach
+    /// a structured `sandbox_denial` payload (grant -> restart -> retry).
+    #[error("{details}")]
+    RuntimeDenial {
+        path: PathBuf,
+        access: ScopeAccess,
+        scopes: Vec<PathBuf>,
+        details: String,
+    },
 
     #[error(
         "Landlock is not available on this system (requires Linux kernel 5.13+ with Landlock LSM enabled). To run without sandboxing, add --disable-sandbox to your mcp.json tool definition. Example: \"args\": [\"--mode\", \"stdio\", \"--disable-sandbox\"]"

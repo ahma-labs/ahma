@@ -506,6 +506,8 @@ Check `--sandbox-scope` CLI flag or add `--sandbox` to include ~/sandbox as a pe
 
 > **Cargo dependency errors**: If `cargo add` or `cargo update` fail with permission errors, do **not** add `--sandbox-scope ~/.cargo` to your `mcp.json` — that grants write to the entire cargo home including binaries and credentials.  Instead, the built-in `package_cache_write` feature (on by default) handles this correctly, granting write only to `registry/`, `git/`, and the cargo lock files.  If you previously had `--sandbox-scope ~/.cargo` in your config, remove it — it is no longer needed.
 
+> **Tool installs (`cargo install` / `cargo binstall`, `npm i -g`, …)**: These write into `~/.cargo/bin` and update an install manifest (`~/.cargo/.crates.toml`), which are read-only by default, so they fail with `Operation not permitted (os error 1)`.  This is expected — there is no special flag.  ahma detects the denied path and returns a `sandbox_denial` error: call the `sandbox_grant` tool with the named path (preview, then `confirm: true`), run the `restart` tool to apply, then re-run the command.  In a hooked native terminal the recovery is the CLI equivalent: `ahma sandbox grant <path>`, then re-run.  To avoid grants entirely, install into the workspace: `cargo install --root <workspace>/.tools`.
+
 **Nested sandbox warning**: Ahma detected an outer sandbox (Cursor, VS Code, Docker).
 Internal sandbox auto-disabled. Use `--no-sandbox` flag to suppress the warning.
 

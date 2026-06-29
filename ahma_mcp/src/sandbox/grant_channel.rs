@@ -34,7 +34,7 @@ use ahma_common::scope_grant::{GrantCoordinator, GrantReason};
 /// as-is. This only ever walks up to the *immediate* parent and never suggests a
 /// filesystem root, and the result is still only a suggestion the human approves
 /// at the prompt — so it cannot widen scope on its own.
-fn grant_dir_for(path: &Path) -> PathBuf {
+pub(crate) fn grant_dir_for(path: &Path) -> PathBuf {
     let looks_like_file = if path.is_dir() {
         false
     } else if path.is_file() {
@@ -54,6 +54,54 @@ fn grant_dir_for(path: &Path) -> PathBuf {
         return parent.to_path_buf();
     }
     path.to_path_buf()
+}
+
+/// Agent-facing remediation for a *runtime* sandbox denial (a sandboxed command
+/// exited non-zero because the kernel blocked an out-of-scope access). Describes
+/// the supported grant -> restart -> retry loop using the MCP tools, so the sync
+/// error payload and the async operation alert phrase the recovery identically.
+///
+/// References [`grant_dir_for`] so the suggested grant path matches what the
+/// approval prompt offers (a file's parent directory, so one grant covers the
+/// whole cache rather than re-prompting per file).
+pub fn runtime_denial_remediation(path: &Path, access: ScopeAccess) -> String {
+    let target = grant_dir_for(path);
+    let access_str = if access.is_write() { "rw" } else { "ro" };
+    let verb = if access.is_write() { "write" } else { "read" };
+    format!(
+        "ahma's kernel sandbox blocked an out-of-scope {verb} to '{denied}'. This is expected: \
+         writing outside the workspace (for example installing a global binary under ~/.cargo) is \
+         denied by default. To allow it, call the `sandbox_grant` tool with path \"{target}\" and \
+         access \"{access_str}\" (it previews and asks the human to approve), then run the \
+         `restart` tool to apply the grant, then re-run the command. No flags are required.",
+        verb = verb,
+        denied = path.display(),
+        target = target.display(),
+        access_str = access_str,
+    )
+}
+
+/// CLI-oriented variant of [`runtime_denial_remediation`] for contexts where the
+/// MCP `sandbox_grant`/`restart` tools are not in play — notably the shell hook
+/// running in the editor's *native* terminal. Points at `ahma sandbox grant`.
+pub fn runtime_denial_remediation_cli(path: &Path, access: ScopeAccess) -> String {
+    let target = grant_dir_for(path);
+    let ro_flag = if access.is_write() {
+        ""
+    } else {
+        " --read-only"
+    };
+    let verb = if access.is_write() { "write" } else { "read" };
+    format!(
+        "ahma's kernel sandbox blocked an out-of-scope {verb} to '{denied}'. This is expected: \
+         writing outside the workspace (for example installing a global binary under ~/.cargo) is \
+         denied by default. To allow it, run `ahma sandbox grant {target}{ro_flag}` (it asks for \
+         confirmation), then re-run the command. No flags are required.",
+        verb = verb,
+        denied = path.display(),
+        target = target.display(),
+        ro_flag = ro_flag,
+    )
 }
 
 /// Shared actionable tail for the "blocked out-of-scope path" log lines: how to

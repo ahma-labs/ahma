@@ -38,14 +38,81 @@ pub struct DenialHit {
     pub pattern: &'static str,
 }
 
+/// How many lines a keyword-only denial line may look back to find the path it
+/// refers to. Cargo/anyhow print `error: failed to open: <path>` then, a couple
+/// of lines later under `Caused by:`, the bare `Operation not permitted (os error
+/// 1)`. A small window correlates the two without letting an unrelated earlier
+/// path bleed into a much later denial.
+const MULTILINE_LOOKBACK: usize = 5;
+
 /// Scan `stderr` for the first kernel-denial signature and extract its path.
-/// Returns `None` when nothing matches or no absolute path can be pulled from the
-/// matching line.
+/// Returns `None` when nothing matches or no absolute path can be associated with
+/// a denial.
+///
+/// Two shapes are recognised:
+///  1. **Single line** — the denial keyword and the path are on the same line
+///     (Seatbelt audit lines, `cat: /p: Permission denied`, …). See [`scan_line`].
+///  2. **Multi-line** — the path is on one line and the denial keyword on a later
+///     line within [`MULTILINE_LOOKBACK`] (the cargo/anyhow `Caused by:` form).
 pub fn scan_denial(stderr: &str) -> Option<DenialHit> {
+    // The most recent line that carried an absolute path but no denial keyword,
+    // plus how many lines ago it was seen, so a later keyword-only line can be
+    // attributed back to it (shape 2).
+    let mut recent_path: Option<(PathBuf, usize)> = None;
+
     for line in stderr.lines() {
+        // Shape 1: keyword and path on the same line (most specific).
         if let Some(hit) = scan_line(line) {
             return Some(hit);
         }
+
+        // Shape 2: a keyword-only denial line correlates with a path seen just
+        // above it. This is what makes `cargo install` / `cargo binstall`
+        // failures (and any other anyhow `Caused by:` denial) detectable.
+        if let Some(access) = denial_keyword_access(line)
+            && let Some((path, age)) = recent_path.take()
+            && age <= MULTILINE_LOOKBACK
+        {
+            return Some(DenialHit {
+                path,
+                access,
+                pattern: "multi-line denial",
+            });
+        }
+
+        // Track a path on this line as the candidate for a later keyword line,
+        // and age out a previously tracked path so it cannot match too far away.
+        if let Some(path) = extract_abs_path(line) {
+            recent_path = Some((path, 0));
+        } else if let Some((path, age)) = recent_path.take()
+            && age < MULTILINE_LOOKBACK
+        {
+            recent_path = Some((path, age + 1));
+        }
+    }
+    None
+}
+
+/// The access level a denial keyword implies, for a line that contains a denial
+/// signature but no inline path (the second line of a multi-line denial). Returns
+/// `None` when the line carries no recognised denial keyword.
+///
+/// A bare `os error 5` is deliberately **not** treated as a denial here: it is
+/// `EIO` on Unix and only `ACCESS_DENIED` on Windows, so without the explicit
+/// `Access is denied` text it is too ambiguous to correlate across lines.
+fn denial_keyword_access(line: &str) -> Option<ScopeAccess> {
+    let is_seatbelt = line.contains("deny(") || line.contains("Sandbox:");
+    if is_seatbelt && (line.contains("file-write") || line.contains("file-create")) {
+        return Some(ScopeAccess::Rw);
+    }
+    if is_seatbelt && line.contains("file-read") {
+        return Some(ScopeAccess::Ro);
+    }
+    if line.contains("Read-only file system") || line.contains("Operation not permitted") {
+        return Some(ScopeAccess::Rw);
+    }
+    if line.contains("Access is denied") || line.contains("Permission denied") {
+        return Some(ScopeAccess::Ro);
     }
     None
 }
@@ -314,5 +381,81 @@ warning: something
         // `os error 5` is EIO on Unix (an I/O error), not access-denied — a bare
         // `os error 5` on a Unix path must NOT raise a grant prompt.
         assert!(scan_denial("read /mnt/disk/file failed (os error 5)").is_none());
+    }
+
+    // ── Multi-line denial signatures (cargo / anyhow `Caused by:` form) ────────
+
+    #[test]
+    fn cargo_install_crates_toml_multiline_is_rw() {
+        // `cargo install` / `cargo binstall` print the path and the EPERM on
+        // separate lines. This is the exact failure that broke the grant loop.
+        let stderr = "\
+    Updating crates.io index
+error: failed to open: /Users/me/.cargo/.crates.toml
+
+Caused by:
+  Operation not permitted (os error 1)";
+        let hit = scan_denial(stderr).expect("multi-line cargo denial matches");
+        assert_eq!(hit.path, PathBuf::from("/Users/me/.cargo/.crates.toml"));
+        assert_eq!(hit.access, ScopeAccess::Rw);
+        assert_eq!(hit.pattern, "multi-line denial");
+    }
+
+    #[test]
+    fn cargo_install_bin_multiline_is_rw() {
+        let stderr = "\
+error: failed to write /Users/me/.cargo/bin/cargo-nextest
+
+Caused by:
+  Operation not permitted (os error 1)";
+        let hit = scan_denial(stderr).expect("multi-line cargo bin denial matches");
+        assert_eq!(
+            hit.path,
+            PathBuf::from("/Users/me/.cargo/bin/cargo-nextest")
+        );
+        assert_eq!(hit.access, ScopeAccess::Rw);
+    }
+
+    #[test]
+    fn generic_caused_by_permission_denied_multiline_is_ro() {
+        let stderr = "\
+error: failed to create /opt/ext/cache/obj
+
+Caused by:
+  Permission denied (os error 13)";
+        let hit = scan_denial(stderr).expect("multi-line permission-denied matches");
+        assert_eq!(hit.path, PathBuf::from("/opt/ext/cache/obj"));
+        assert_eq!(hit.access, ScopeAccess::Ro);
+    }
+
+    #[test]
+    fn multiline_keyword_beyond_window_does_not_match() {
+        // A path far above an unrelated denial line must NOT correlate: once the
+        // path has aged past the lookback window it is forgotten.
+        let stderr = "\
+opening /home/user/data.txt
+filler 1
+filler 2
+filler 3
+filler 4
+filler 5
+filler 6
+filler 7
+some op: Permission denied";
+        assert!(
+            scan_denial(stderr).is_none(),
+            "a denial more than the lookback window away from the path must not match"
+        );
+    }
+
+    #[test]
+    fn multiline_bare_os_error_5_does_not_correlate_on_unix_path() {
+        // A Unix path followed by a bare `os error 5` (EIO) must not be a denial.
+        let stderr = "\
+error: failed to read /mnt/disk/file
+
+Caused by:
+  (os error 5)";
+        assert!(scan_denial(stderr).is_none());
     }
 }

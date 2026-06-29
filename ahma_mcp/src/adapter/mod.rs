@@ -473,16 +473,34 @@ impl Adapter {
         // A non-zero exit may be a runtime sandbox denial the kernel did not name;
         // scan stderr and (best-effort, never blocking the result) offer to grant
         // an out-of-scope path it references.
-        if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let result = interpret_sync_command_output(output);
+        if result.is_err() {
             sandbox::grant_channel::notify_stderr_denial(
                 &self.sandbox,
                 self.scope_grant_notifier.as_ref(),
-                &String::from_utf8_lossy(&output.stderr),
+                &stderr,
                 command,
             )
             .await;
+            // When the failure was a kernel denial on an out-of-scope path, return
+            // it as a typed error so the MCP boundary attaches a structured
+            // `sandbox_denial` payload (path + grant->restart->retry remediation)
+            // instead of leaving the agent with a raw `os error 1`.
+            if let Some(hit) = sandbox::scan_denial(&stderr)
+                && !self.sandbox.is_path_in_scope(&hit.path)
+            {
+                let details = result.err().map(|e| e.to_string()).unwrap_or_default();
+                return Err(sandbox::SandboxError::RuntimeDenial {
+                    path: hit.path,
+                    access: hit.access,
+                    scopes: self.sandbox.scopes().to_vec(),
+                    details,
+                }
+                .into());
+            }
         }
-        interpret_sync_command_output(output)
+        result
     }
 
     /// Synchronously executes a command with optional retry logic for transient errors.
@@ -1454,6 +1472,24 @@ async fn finalize_streaming_operation(
             tool,
         )
         .await;
+
+        // An out-of-scope runtime denial cannot be returned as a typed McpError on
+        // the async path (the result is delivered later as text), so attach the
+        // grant -> restart -> retry remediation as an operation alert. Mirrors the
+        // typed `RuntimeDenial` the sync path returns.
+        if let Some(hit) = sandbox::scan_denial(&stderr_str)
+            && !sandbox.is_path_in_scope(&hit.path)
+        {
+            let remediation =
+                sandbox::grant_channel::runtime_denial_remediation(&hit.path, hit.access);
+            tracing::warn!(
+                "Operation {} hit an out-of-scope sandbox denial on {}: {}",
+                op_id,
+                hit.path.display(),
+                remediation
+            );
+            op_monitor.append_alert(op_id, remediation).await;
+        }
 
         // The grant flow above only fires for *out-of-scope* denials. The
         // sibling failure — an in-scope EPERM from macOS provenance/sccache
