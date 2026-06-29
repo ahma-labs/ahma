@@ -457,11 +457,12 @@ Examples:
 - Never trust user-provided paths without validation via `path_security` module
 - All file operations are restricted to the sandbox scope by the kernel
 
-### Nested Sandboxes
-When running inside another sandbox (Cursor, VS Code, Docker):
-- System auto-detects and disables internal sandbox
-- Outer sandbox still provides security
-- Use `--disable-sandbox` to suppress detection warnings
+### Nested Sandboxes (host sandbox present)
+When running inside a host sandbox (Cursor, VS Code, Docker), ahma picks one authoritative sandbox per execution path and always discloses which one is active (SPEC R7):
+- **Terminal hooks** defer to the host: the command runs unchanged in the host sandbox and ahma does NOT re-wrap it (avoids the redundant double-sandbox and the host's build-cache env friction). The hook discloses this loudly. Set `AHMA_PREFER_OWN_SANDBOX=1` to force ahma's own sandbox instead.
+- **MCP server (`run_terminal_command`)** stays authoritative: ahma applies its own sandbox (the host's terminal sandbox does not wrap ahma's own executions). If it cannot, it fails loudly — never silently unsandboxed.
+- `--disable-sandbox` defers to the host explicitly.
+- Honesty limit: detecting a host does not prove its sandbox is enabled; disclosure says so.
 
 ### Temp Directory Access (`--tmp`)
 

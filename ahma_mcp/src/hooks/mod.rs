@@ -47,6 +47,17 @@ enum HooksDecision {
         user_message: String,
         agent_message: String,
     },
+    /// A host sandbox (Cursor, VS Code, Docker, …) was detected, so ahma defers to
+    /// it: the original command is allowed UNCHANGED to run inside the host's
+    /// kernel sandbox, and ahma does NOT re-wrap it (avoids the redundant
+    /// double-sandbox and the host's build-cache env friction). A loud disclosure
+    /// states which sandbox is protecting the command. This is distinct from
+    /// `AllowWithWarning`: it is NOT an unsandboxed bypass and is not counted as
+    /// one — protection is provided by the host (R7).
+    DeferToHost {
+        user_message: String,
+        agent_message: String,
+    },
 }
 
 /// Manage terminal hooks for external AI tools.
@@ -910,12 +921,42 @@ fn unsandboxable_decision(reason: &str, consented: bool) -> HooksDecision {
     }
 }
 
+/// Whether the user has explicitly asked ahma to apply its OWN sandbox even when
+/// nested inside a host sandbox (re-introducing the redundant double-sandbox and
+/// the host build-cache friction, but giving ahma's tighter scope). Opt-in via
+/// `AHMA_PREFER_OWN_SANDBOX` (truthy).
+fn prefer_own_sandbox() -> bool {
+    match std::env::var("AHMA_PREFER_OWN_SANDBOX") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v.is_empty() || v == "0" || v == "false" || v == "no")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Build the decision to defer to a detected host sandbox (R7). The original
+/// command is allowed UNCHANGED (so it runs inside the host's kernel sandbox) and
+/// a loud, honest disclosure states which sandbox is protecting it.
+fn defer_to_host_decision(host: crate::sandbox::HostSandbox) -> HooksDecision {
+    let disclosure = crate::sandbox::ActiveSandbox::DeferredToHost(host).disclosure_line();
+    HooksDecision::DeferToHost {
+        user_message: disclosure.clone(),
+        agent_message: format!(
+            "{disclosure} ahma did not re-sandbox this command (deferred to host to avoid a \
+             redundant double-sandbox). To force ahma's own sandbox instead, set \
+             AHMA_PREFER_OWN_SANDBOX=1."
+        ),
+    }
+}
+
 /// Write the decision to stdout for the IDE, and mirror any fail-open warning to
 /// stderr so it is visible even when the IDE does not surface allow-time messages.
 fn emit_decision(decision: HooksDecision, platform: HookPlatform) -> Result<()> {
     match &decision {
         HooksDecision::AllowWithWarning { user_message, .. }
-        | HooksDecision::DenyPendingConsent { user_message, .. } => {
+        | HooksDecision::DenyPendingConsent { user_message, .. }
+        | HooksDecision::DeferToHost { user_message, .. } => {
             eprintln!("{user_message}");
         }
         _ => {}
@@ -1195,8 +1236,14 @@ fn extract_tool_args(input: &Value) -> Result<Option<ExtractedToolArgs>> {
 ///    command unsandboxed while it believes it is active.
 fn compute_exec_decision(input: &Value, scope: HookScope, env: &HookEnvironment) -> HooksDecision {
     let consented = HookConsentStore::current().is_consented();
+    // Detect a host sandbox to defer to (R7), unless the user prefers ahma's own.
+    let host = if prefer_own_sandbox() {
+        None
+    } else {
+        crate::sandbox::detect_host_sandbox()
+    };
     let decision =
-        compute_exec_decision_internal(input, scope, env, is_ahma_hooks_active(), consented);
+        compute_exec_decision_internal(input, scope, env, is_ahma_hooks_active(), consented, host);
     // When we are about to allow an UNSANDBOXED run under consent, count it so the
     // persistent banner reflects how many commands have bypassed the sandbox.
     if matches!(decision, HooksDecision::AllowWithWarning { .. }) {
@@ -1211,6 +1258,7 @@ fn compute_exec_decision_internal(
     env: &HookEnvironment,
     active: bool,
     consented: bool,
+    host: Option<crate::sandbox::HostSandbox>,
 ) -> HooksDecision {
     let args = match extract_tool_args(input) {
         Ok(Some(a)) => a,
@@ -1223,6 +1271,15 @@ fn compute_exec_decision_internal(
 
     if !active {
         return HooksDecision::AllowUnchanged;
+    }
+
+    // Capability-based deferral (R7): when a host already kernel-sandboxes this
+    // command (Cursor, VS Code, Docker), ahma re-wrapping it would only add the
+    // redundant double-sandbox and fight the host's build-cache env injection.
+    // Defer to the host and disclose loudly. `host` is resolved by the caller
+    // (None when the user set AHMA_PREFER_OWN_SANDBOX or no host was detected).
+    if let Some(host) = host {
+        return defer_to_host_decision(host);
     }
 
     // FAIL OPEN: if ahma cannot determine the working directory it cannot
@@ -1296,6 +1353,16 @@ fn build_cursor_hook_output(decision: HooksDecision) -> Value {
             "user_message": user_message,
             "agent_message": agent_message,
         }),
+        // Deferred to the host sandbox: allow the original command unchanged so it
+        // runs in the host's sandbox; attach the disclosure (R7).
+        HooksDecision::DeferToHost {
+            user_message,
+            agent_message,
+        } => json!({
+            "permission": "allow",
+            "user_message": user_message,
+            "agent_message": agent_message,
+        }),
         // Fail closed (R5.5.3): deny the command outright.
         HooksDecision::DenyPendingConsent {
             user_message,
@@ -1323,6 +1390,16 @@ fn build_structured_hook_output(decision: HooksDecision) -> Value {
         // Fail open: allow the original (unsandboxed) command, but surface the
         // warning to the agent (and a system message where the client shows it).
         HooksDecision::AllowWithWarning {
+            user_message,
+            agent_message,
+        } => json!({
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "agentMessage": agent_message,
+            "systemMessage": user_message,
+        }),
+        // Deferred to the host sandbox: allow unchanged, disclose loudly (R7).
+        HooksDecision::DeferToHost {
             user_message,
             agent_message,
         } => json!({
@@ -2043,7 +2120,7 @@ mod tests {
         });
 
         let decision =
-            compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
+            compute_exec_decision_internal(&input, HookScope::Project, &env, true, false, None);
         let output = build_exec_output(decision, HookPlatform::Claude);
         let updated = &output["hookSpecificOutput"]["updatedInput"];
         let command = updated["command"].as_str().unwrap();
@@ -2064,7 +2141,7 @@ mod tests {
         });
 
         let decision =
-            compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
+            compute_exec_decision_internal(&input, HookScope::Project, &env, true, false, None);
         let output = build_exec_output(decision, HookPlatform::Antigravity);
         let updated = &output["hookSpecificOutput"]["updatedInput"];
         let command = updated["CommandLine"].as_str().unwrap();
@@ -2095,7 +2172,7 @@ mod tests {
             });
             // active=true: even when ahma is on, non-shell tools must pass through
             let decision =
-                compute_exec_decision_internal(&input, HookScope::User, &env, true, false);
+                compute_exec_decision_internal(&input, HookScope::User, &env, true, false, None);
             let output = build_exec_output(decision, HookPlatform::Copilot);
             // Must return allow with no input modification
             assert_eq!(
@@ -2111,8 +2188,14 @@ mod tests {
 
         // Also check: completely missing tool_input field
         let input_no_args = json!({"tool_name": "unknown", "cwd": "/tmp"});
-        let decision =
-            compute_exec_decision_internal(&input_no_args, HookScope::User, &env, true, false);
+        let decision = compute_exec_decision_internal(
+            &input_no_args,
+            HookScope::User,
+            &env,
+            true,
+            false,
+            None,
+        );
         let output = build_exec_output(decision, HookPlatform::Copilot);
         assert_eq!(
             output["hookSpecificOutput"]["permissionDecision"].as_str(),
@@ -2271,7 +2354,8 @@ mod tests {
             "tool_input": { "command": "rm -rf /" }
         });
         // active=false → must return allow-unchanged regardless of command
-        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, false, false);
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::User, &env, false, false, None);
         let output = build_exec_output(decision, HookPlatform::Cursor);
         assert_eq!(output["permission"].as_str(), Some("allow"));
         assert!(
@@ -2290,7 +2374,8 @@ mod tests {
             "cwd": "/tmp/project",
             "tool_input": { "command": already_wrapped }
         });
-        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true, false);
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::User, &env, true, false, None);
         let output = build_exec_output(decision, HookPlatform::Cursor);
         assert_eq!(output["permission"].as_str(), Some("allow"));
         assert!(output.get("updated_input").is_none());
@@ -2303,7 +2388,8 @@ mod tests {
             "cwd": "/tmp/project",
             "tool_input": { "command": "cargo build" }
         });
-        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true, false);
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::User, &env, true, false, None);
         let output = build_exec_output(decision, HookPlatform::Cursor);
         assert_eq!(output["permission"].as_str(), Some("allow"));
         let updated = output["updated_input"]["command"].as_str().unwrap();
@@ -3402,8 +3488,72 @@ mod tests {
             "toolArgs": "{\"command\": \"cargo test\"}"
         });
         let decision =
-            compute_exec_decision_internal(&input, HookScope::Project, &env, true, false);
+            compute_exec_decision_internal(&input, HookScope::Project, &env, true, false, None);
         assert!(matches!(decision, HooksDecision::AllowRewrite(_)));
+    }
+
+    #[test]
+    fn test_compute_exec_decision_defers_to_host_when_detected() {
+        let env = test_env();
+        let input = json!({"tool_input": {"command": "cargo build"}});
+        // With a host sandbox injected, ahma must defer (not rewrite to run-shell).
+        let decision = compute_exec_decision_internal(
+            &input,
+            HookScope::User,
+            &env,
+            true,
+            false,
+            Some(crate::sandbox::HostSandbox::Cursor),
+        );
+        match decision {
+            HooksDecision::DeferToHost { user_message, .. } => {
+                assert!(
+                    user_message.contains("Cursor"),
+                    "names the host: {user_message}"
+                );
+                assert!(
+                    user_message.contains("DEFERRING") && user_message.contains("UNSANDBOXED"),
+                    "must disclose deferral + the host-off risk: {user_message}"
+                );
+            }
+            other => panic!("expected DeferToHost, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_compute_exec_decision_rewrites_when_no_host() {
+        let env = test_env();
+        let input = json!({"tool_input": {"command": "cargo build"}});
+        // No host → ahma stays authoritative and wraps the command in its sandbox.
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::User, &env, true, false, None);
+        assert!(matches!(decision, HooksDecision::AllowRewrite(_)));
+    }
+
+    #[test]
+    fn test_defer_to_host_runs_command_unchanged_cursor() {
+        let out = build_cursor_hook_output(HooksDecision::DeferToHost {
+            user_message: "msg".to_string(),
+            agent_message: "agent".to_string(),
+        });
+        assert_eq!(out["permission"].as_str(), Some("allow"));
+        assert!(
+            out.get("updated_input").is_none(),
+            "deferral must run the original command unchanged (no rewrite)"
+        );
+    }
+
+    #[test]
+    fn test_defer_to_host_structured_output_allows() {
+        let out = build_structured_hook_output(HooksDecision::DeferToHost {
+            user_message: "msg".to_string(),
+            agent_message: "agent".to_string(),
+        });
+        assert_eq!(
+            out["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("allow")
+        );
+        assert!(out["hookSpecificOutput"].get("updatedInput").is_none());
     }
 
     #[test]
@@ -3411,7 +3561,8 @@ mod tests {
         let env = test_env();
         // toolArgs string that is invalid JSON → extract_tool_args Err → allow.
         let input = json!({"toolArgs": "{bad"});
-        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true, false);
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::User, &env, true, false, None);
         assert!(matches!(decision, HooksDecision::AllowUnchanged));
     }
 
@@ -3420,7 +3571,8 @@ mod tests {
         let env = test_env();
         // No `working_directory`/`cwd` → falls back to current_dir (succeeds) → rewrite.
         let input = json!({"tool_input": {"command": "ls"}});
-        let decision = compute_exec_decision_internal(&input, HookScope::User, &env, true, false);
+        let decision =
+            compute_exec_decision_internal(&input, HookScope::User, &env, true, false, None);
         assert!(matches!(decision, HooksDecision::AllowRewrite(_)));
     }
 

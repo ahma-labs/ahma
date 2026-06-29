@@ -63,9 +63,26 @@ On macOS, Ahma uses Apple's built-in `sandbox-exec` with a generated Seatbelt pr
 
 On Windows, Ahma uses Job Object enforcement (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) at startup, with AppContainer profile DACL grants for per-scope access control. PowerShell (5.1+) is the shell. See [SPEC.md R6.3](../SPEC.md) for status.
 
-## Nested Sandbox Environments
+## Nested Sandbox Environments (Cursor, VS Code, Docker)
 
-When running inside Cursor, VS Code, or Docker, the outer environment may prevent Ahma from applying its own sandbox. Ahma detects this and exits with instructions.
+When ahma runs inside a host that already provides its own kernel sandbox (Cursor's agent sandbox, VS Code, Docker), ahma does **not** try to mimic or coexist with the host's internals (such as the build-cache environment variables Cursor injects). Instead it picks exactly **one authoritative sandbox per execution path** and **always tells you which one is active**.
+
+ahma detects a host from environment markers (`CURSOR_SANDBOX`/`CURSOR_AGENT`, `VSCODE_*`, `/.dockerenv`/`container`).
+
+**Terminal hooks → defer to the host.** When an ahma terminal hook fires inside a detected host sandbox, the command already runs under the host's kernel sandbox, so ahma defers: it lets the command run unchanged in the host sandbox and does **not** re-wrap it in a second sandbox. This removes the "double sandbox" friction (e.g. builds failing because the host redirected `CARGO_TARGET_DIR` outside the workspace) without ahma chasing each host's private cache variables. The hook discloses this loudly:
+
+> Sandbox: ahma is DEFERRING to Cursor's sandbox and is NOT applying its own. Protection now depends on Cursor. If you have disabled Cursor's sandbox, this command runs UNSANDBOXED.
+
+To force ahma's own (tighter) sandbox instead — accepting the redundant double-sandbox and the host's build-cache friction — set `AHMA_PREFER_OWN_SANDBOX=1`.
+
+**MCP server (`run_terminal_command`) → ahma stays authoritative.** Commands the agent runs through ahma's MCP tools execute in ahma's own process, which the host's terminal sandbox does **not** wrap, so ahma applies its own sandbox and remains the authority. If ahma cannot apply its own sandbox, it fails loudly (use `--disable-sandbox` to defer to the host explicitly) — it never silently runs unsandboxed.
+
+**Choosing your model:**
+- Default (hooks): let the host sandbox protect; ahma defers and tells you.
+- Want ahma to be the single sandbox? Disable the host's sandbox (e.g. Cursor `sandbox.json` `"type": "insecure_none"`, or the Legacy Terminal Tool) so only ahma sandboxes.
+- Want belt-and-suspenders (both)? `AHMA_PREFER_OWN_SANDBOX=1` for hooks (re-introduces the host cache friction).
+
+**Honesty limit:** detecting a host does not prove its sandbox is *enabled*. If you have turned the host sandbox off, deferral means the command is unsandboxed — which is why the disclosure says so explicitly.
 
 ## HTTP Transport Authentication
 
@@ -175,41 +192,6 @@ expect the first run to surface a grant prompt; once granted and applied, the
 script proceeds. Prefer scripts that install into a workspace-local directory
 (`cargo install --root <workspace>/.tools`) when you want installs to land
 in-scope without any grant.
-
-## Running inside Cursor (auto-adapt to its build-cache redirect)
-
-Cursor's agent terminal runs commands in its **own** sandbox and, separately,
-**injects ~25 build-cache environment variables** into every spawned process —
-`CARGO_TARGET_DIR`, `GOCACHE`, `GOMODCACHE`, `NPM_CONFIG_CACHE`, `PNPM_STORE_PATH`,
-`PIP_CACHE_DIR`, `UV_CACHE_DIR`, `POETRY_CACHE_DIR`, `GRADLE_USER_HOME`,
-`CCACHE_DIR`, `PLAYWRIGHT_BROWSERS_PATH`, … — all pointing **outside your
-workspace** into a `…/cursor-sandbox-cache/<hash>/…` tree. (These are re-injected
-per command and persist even with Cursor's `required_permissions: ["all"]`.)
-
-Because ahma confines writes to the workspace, a build that writes to
-`CARGO_TARGET_DIR` would otherwise be denied. To avoid that friction, **when ahma
-detects it is running nested inside Cursor** (the `CURSOR_SANDBOX` env var is set)
-it automatically grants read+write to those injected cache directories, so builds
-"just work" with no per-session grant prompt.
-
-Safety: only directories that (a) come from the known cache-env allowlist **and**
-(b) live under a `cursor-sandbox-cache` path segment are granted. A variable
-repointed at a sensitive location (e.g. `CARGO_TARGET_DIR=~/.ssh`) lacks the
-marker and is ignored. The auto-granted set is logged at startup (`info`).
-
-**Opt out** of the auto-grant:
-
-```bash
-AHMA_NO_EDITOR_CACHE_WRITE=1 ahma serve stdio
-```
-
-`--no-package-cache-write` also disables it (it is part of the same package-cache
-write feature). 
-
-**Alternatives** (configured on Cursor's side):
-- `sandbox.json` → `"enableSharedBuildCache": true` makes Cursor share one cache dir between sandboxed and unsandboxed runs.
-- `sandbox.json` → `"type": "insecure_none"` disables Cursor's own sandbox so ahma is the single authoritative sandbox.
-- Switch to the **Legacy Terminal Tool** (Cursor Settings → Agents) to avoid the cache-env injection entirely.
 
 ## Temp Directory Access (`--tmp`)
 

@@ -44,6 +44,7 @@ pub mod denial_scan;
 pub mod display;
 mod error;
 pub mod grant_channel;
+pub mod host_detect;
 #[cfg(target_os = "linux")]
 mod landlock;
 pub(crate) mod pkg_cache;
@@ -59,9 +60,10 @@ mod windows;
 pub use core::Sandbox;
 pub use core::{add_log_exception, is_target_allowed, load_exceptions};
 pub use denial_scan::{DenialHit, scan_denial};
-pub use display::{ScopeSource, ScopeView};
+pub use display::{ActiveSandbox, ScopeSource, ScopeView};
 pub use error::SandboxError;
 pub use grant_channel::{HubGrantNotifier, LoggingGrantNotifier, ScopeGrantNotifier};
+pub use host_detect::{HostSandbox, detect_host_sandbox};
 #[cfg(target_os = "linux")]
 pub use landlock::{
     apply_landlock_ruleset_in_child, enforce_landlock_sandbox, landlock_ruleset_fd,

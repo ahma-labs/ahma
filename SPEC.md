@@ -16,7 +16,7 @@
 | Latency Regression Guards | tests-pass | Ignored benchmarks guard end-to-end dispatch latency and per-line streaming cost (`latency_guard_test`) |
 | Linux Sandbox (Landlock) | tests-pass | Kernel-level FS sandboxing on Linux 5.13+ |
 | macOS Sandbox (Seatbelt) | tests-pass | Kernel-level FS sandboxing via `sandbox-exec` |
-| Nested Sandbox Detection | tests-pass | Detects Cursor/VS Code/Docker outer sandboxes |
+| Nested Sandbox Detection | tests-pass | Detects Cursor/VS Code/Docker outer sandboxes; hooks defer to host, MCP stays authoritative, active sandbox always disclosed (R7) |
 | Windows Runtime (PowerShell) | in-progress | Built-in PowerShell (5.1+) shell pool; cross-platform path security + file URI; parity tests green |
 | Windows Sandbox backend | in-progress | Job Object enforcement done; AppContainer spawn isolation pending Windows CI proof |
 | Windows Pre-built Releases | in-progress | `x86_64-pc-windows-msvc`; `.zip` CI artifacts; `install.ps1` |
@@ -452,11 +452,15 @@ The planned implementation uses two mechanisms in order of preference:
 - `normalize_path_lexically` never pops a `Prefix` or `RootDir` component (enforced by
   `scopes.rs`).
 
-### R7: Nested Sandbox Detection
+### R7: Nested Sandbox Detection and Deferral
 
-- **R7.1**: System **must** detect when running inside another sandbox (Cursor, VS Code, Docker).
-- **R7.2**: Upon detection, system **must** exit with instructions to use `--disable-sandbox` or `AHMA_DISABLE_SANDBOX=1`.
-- **R7.3**: When `--disable-sandbox` is used, outer sandbox provides security; Ahma's internal sandbox is disabled.
+A "host sandbox" is an outer kernel sandbox ahma is running inside (Cursor, VS Code, Docker). ahma detects it from environment markers (`CURSOR_SANDBOX`/`CURSOR_AGENT`, `VSCODE_*`, `/.dockerenv`/`container`) and, as an unnamed fallback, the platform nesting probe. ahma **must not** chase a host's private internals (e.g. its injected build-cache env vars) to coexist; instead it chooses **one authoritative sandbox per execution path** and **always discloses which one is active** (R5.4 "nothing silent").
+
+- **R7.1**: System **must** detect when running inside a host sandbox and, where possible, name it (Cursor/VS Code/Docker); otherwise report it as an unidentified outer sandbox.
+- **R7.2 (terminal hooks — defer to host)**: When an ahma terminal hook fires inside a detected host sandbox, the command already runs under the host's kernel sandbox, so ahma **must** defer: it allows the command **unchanged** (it runs in the host sandbox) and **must not** re-wrap it in ahma's own sandbox. This deferral **must** be disclosed loudly (hook `systemMessage`/`userMessage`), stating that protection comes from the host and that ahma is not re-enforcing — and that if the host's sandbox is disabled the command is unsandboxed. Deferral is **not** an "unsandboxed bypass" and is not counted as one. Users who want ahma's own (tighter) sandbox instead **may** set `AHMA_PREFER_OWN_SANDBOX=1`, accepting the redundant double-sandbox and the host's build-cache friction.
+- **R7.3 (MCP / standalone — stay authoritative)**: When ahma itself executes commands (the MCP `run_terminal_command` path, or standalone), the host sandbox does **not** wrap those executions, so ahma **remains authoritative** and applies its own sandbox. If ahma cannot apply its own sandbox, it **must** fail loudly with instructions (use `--disable-sandbox` to defer to the host explicitly) — it **must never** silently run unsandboxed.
+- **R7.4**: When `--disable-sandbox` is used, the outer sandbox provides security and ahma's internal sandbox is disabled; the active-sandbox disclosure **must** reflect this (deferred-to-host when a host is detected, otherwise disabled).
+- **R7.5 (honesty limit)**: Detecting a host does **not** prove the host's sandbox is *enabled* (it may be configured off). Disclosure copy **must** therefore state that protection now depends on the host, so a user who disabled the host sandbox is informed rather than surprised.
 
 ---
 

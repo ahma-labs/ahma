@@ -687,6 +687,19 @@ fn apply_platform_sandbox_enforcement(
 }
 
 fn log_sandbox_mode(no_sandbox: bool) {
+    // Always state, loudly, which sandbox is actually protecting the user (R5.4).
+    // In MCP/standalone mode ahma stays authoritative when enforcing; when its own
+    // enforcement is off, protection (if any) comes from a detected host sandbox.
+    let active = if no_sandbox {
+        match sandbox::detect_host_sandbox() {
+            Some(host) => sandbox::ActiveSandbox::DeferredToHost(host),
+            None => sandbox::ActiveSandbox::Disabled,
+        }
+    } else {
+        sandbox::ActiveSandbox::AhmaEnforcing
+    };
+    tracing::info!("{}", active.disclosure_line());
+
     if no_sandbox {
         tracing::info!("🔓 Sandbox mode: DISABLED (commands run without Ahma sandboxing)");
         return;

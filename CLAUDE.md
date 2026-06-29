@@ -380,7 +380,7 @@ Examples:
 - All file operations are restricted to the sandbox scope by the kernel
 
 ### Disabling the sandbox
-There is **no** automatic "nested sandbox" detection that silently disables enforcement — that would be a silent security downgrade and is prohibited (see SPEC R5 design principles). The kernel sandbox is disabled **only** by the explicit `--no-sandbox` / `--disable-sandbox` flag; the retired `AHMA_DISABLE_SANDBOX` environment variable is ignored. If you are running ahma inside another sandbox (Cursor, VS Code, Docker) and want to rely on the outer sandbox, pass `--disable-sandbox` explicitly.
+ahma never *silently* disables enforcement. When running inside a host sandbox (Cursor, VS Code, Docker), ahma picks one authoritative sandbox per execution path and discloses which one is active loudly (SPEC R7): **terminal hooks defer to the host** (the command runs unchanged in the host sandbox; ahma does not re-wrap it — disclosed loudly; override with `AHMA_PREFER_OWN_SANDBOX=1`), while the **MCP server stays authoritative** (ahma applies its own sandbox because the host does not wrap ahma's own executions; if it cannot, it fails loudly). The kernel sandbox is otherwise disabled **only** by the explicit `--no-sandbox` / `--disable-sandbox` flag; the retired `AHMA_DISABLE_SANDBOX` environment variable is ignored. Detecting a host does not prove its sandbox is enabled, so the disclosure states that protection then depends on the host.
 
 ### Temp Directory Access (`--tmp`)
 

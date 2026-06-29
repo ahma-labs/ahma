@@ -40,6 +40,52 @@ impl ScopeSource {
     }
 }
 
+/// Which sandbox is actually protecting the user right now (SPEC R5.4 "nothing
+/// silent"). ahma must always be able to state this so a user never discovers
+/// after the fact that they were not protected the way they assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveSandbox {
+    /// ahma's own kernel sandbox is enforcing.
+    AhmaEnforcing,
+    /// ahma detected a host sandbox and deferred to it; ahma is **not** applying
+    /// its own enforcement (used by terminal hooks to avoid the redundant
+    /// double-sandbox). Protection now depends on the host.
+    DeferredToHost(super::host_detect::HostSandbox),
+    /// Nothing is enforcing (e.g. `--disable-sandbox` with no detected host).
+    Disabled,
+}
+
+impl ActiveSandbox {
+    /// Stable machine-readable token for JSON payloads / logs.
+    pub fn token(self) -> &'static str {
+        match self {
+            ActiveSandbox::AhmaEnforcing => "ahma",
+            ActiveSandbox::DeferredToHost(_) => "deferred_to_host",
+            ActiveSandbox::Disabled => "disabled",
+        }
+    }
+
+    /// A single, loud, honest line stating which sandbox is in effect — suitable
+    /// for a hook `systemMessage`, the startup banner, or a tool-result note.
+    pub fn disclosure_line(self) -> String {
+        match self {
+            ActiveSandbox::AhmaEnforcing => {
+                "Sandbox: ahma kernel sandbox is ENFORCING (writes confined to the workspace scope)."
+                    .to_string()
+            }
+            ActiveSandbox::DeferredToHost(host) => format!(
+                "Sandbox: ahma is DEFERRING to {host}'s sandbox and is NOT applying its own. \
+                 Protection now depends on {host}. If you have disabled {host}'s sandbox, this \
+                 command runs UNSANDBOXED.",
+                host = host.label()
+            ),
+            ActiveSandbox::Disabled => {
+                "Sandbox: NO sandbox is enforcing — commands run UNSANDBOXED.".to_string()
+            }
+        }
+    }
+}
+
 /// A borrowed, render-ready view of the complete sandbox scope. Cheap to build
 /// from a live `Sandbox` or from raw config at startup.
 #[derive(Debug, Clone)]
@@ -215,6 +261,31 @@ mod tests {
         assert_eq!(json["source"], serde_json::json!("elicited"));
         assert_eq!(json["write"], serde_json::json!(["/a", "/b"]));
         assert_eq!(json["read"], serde_json::json!(["/r"]));
+    }
+
+    #[test]
+    fn active_sandbox_disclosure_is_loud_and_honest() {
+        use super::super::host_detect::HostSandbox;
+
+        let enforcing = ActiveSandbox::AhmaEnforcing.disclosure_line();
+        assert!(enforcing.contains("ENFORCING"), "{enforcing}");
+
+        let deferred = ActiveSandbox::DeferredToHost(HostSandbox::Cursor).disclosure_line();
+        assert!(deferred.contains("Cursor"), "names the host: {deferred}");
+        assert!(
+            deferred.contains("NOT applying its own") && deferred.contains("UNSANDBOXED"),
+            "must warn that ahma is not enforcing and the risk if host sandbox is off: {deferred}"
+        );
+
+        let disabled = ActiveSandbox::Disabled.disclosure_line();
+        assert!(disabled.contains("UNSANDBOXED"), "{disabled}");
+
+        assert_eq!(ActiveSandbox::AhmaEnforcing.token(), "ahma");
+        assert_eq!(
+            ActiveSandbox::DeferredToHost(HostSandbox::Docker).token(),
+            "deferred_to_host"
+        );
+        assert_eq!(ActiveSandbox::Disabled.token(), "disabled");
     }
 
     #[test]
