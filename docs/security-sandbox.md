@@ -176,6 +176,41 @@ script proceeds. Prefer scripts that install into a workspace-local directory
 (`cargo install --root <workspace>/.tools`) when you want installs to land
 in-scope without any grant.
 
+## Running inside Cursor (auto-adapt to its build-cache redirect)
+
+Cursor's agent terminal runs commands in its **own** sandbox and, separately,
+**injects ~25 build-cache environment variables** into every spawned process —
+`CARGO_TARGET_DIR`, `GOCACHE`, `GOMODCACHE`, `NPM_CONFIG_CACHE`, `PNPM_STORE_PATH`,
+`PIP_CACHE_DIR`, `UV_CACHE_DIR`, `POETRY_CACHE_DIR`, `GRADLE_USER_HOME`,
+`CCACHE_DIR`, `PLAYWRIGHT_BROWSERS_PATH`, … — all pointing **outside your
+workspace** into a `…/cursor-sandbox-cache/<hash>/…` tree. (These are re-injected
+per command and persist even with Cursor's `required_permissions: ["all"]`.)
+
+Because ahma confines writes to the workspace, a build that writes to
+`CARGO_TARGET_DIR` would otherwise be denied. To avoid that friction, **when ahma
+detects it is running nested inside Cursor** (the `CURSOR_SANDBOX` env var is set)
+it automatically grants read+write to those injected cache directories, so builds
+"just work" with no per-session grant prompt.
+
+Safety: only directories that (a) come from the known cache-env allowlist **and**
+(b) live under a `cursor-sandbox-cache` path segment are granted. A variable
+repointed at a sensitive location (e.g. `CARGO_TARGET_DIR=~/.ssh`) lacks the
+marker and is ignored. The auto-granted set is logged at startup (`info`).
+
+**Opt out** of the auto-grant:
+
+```bash
+AHMA_NO_EDITOR_CACHE_WRITE=1 ahma serve stdio
+```
+
+`--no-package-cache-write` also disables it (it is part of the same package-cache
+write feature). 
+
+**Alternatives** (configured on Cursor's side):
+- `sandbox.json` → `"enableSharedBuildCache": true` makes Cursor share one cache dir between sandboxed and unsandboxed runs.
+- `sandbox.json` → `"type": "insecure_none"` disables Cursor's own sandbox so ahma is the single authoritative sandbox.
+- Switch to the **Legacy Terminal Tool** (Cursor Settings → Agents) to avoid the cache-env injection entirely.
+
 ## Temp Directory Access (`--tmp`)
 
 By default, the system temp directory is accessible only via platform-implicit rules. Use `--tmp` (or `AHMA_TMP_ACCESS=1`) to add it as an explicit read/write scope — useful for compilers and build tools.
