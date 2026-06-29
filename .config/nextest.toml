@@ -107,10 +107,19 @@ slow-timeout = { period = "180s", terminate-after = 2 }
 # The per-test initialize_with_roots call is now wrapped in a 60s timeout so
 # the test skips gracefully.  This override reduces the nextest backstop from
 # 360s to 240s as a secondary safety net.
+#
+# retries: these tests assert a >=90% success rate across many concurrent
+# subprocess-backed requests. On a cold 2-CPU Windows runner, transient
+# scheduler/IPC starvation can drop a single run below the threshold (CI run
+# 28396600702 failed `test_high_volume_concurrent_requests_sse` this way). As
+# with the ahma_mcp:: integration override below, retries only rescue a flake —
+# a genuinely broken stress test still fails every attempt — so this never hides
+# a real regression.
 [[profile.ci.overrides]]
 filter = "binary_id(ahma_http_bridge::bridge_stress_tests)"
 threads-required = 2
 slow-timeout = { period = "120s", terminate-after = 2 }
+retries = 2
 
 # Many ahma_mcp integration test binaries spawn ahma subprocess.
 # Throttle all integration tests (binary_id "ahma_mcp::*") to 1 at a time.

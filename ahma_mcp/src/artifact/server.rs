@@ -235,13 +235,25 @@ mod tests {
         assert_eq!(server.base_url(), format!("http://{}", server.local_addr));
     }
 
-    /// POST `/chat` with a valid token but a guaranteed-dead upstream
-    /// (`127.0.0.1:1`) exercises the `Err(_)` arm of the upstream relay, which
-    /// must surface as `502 Bad Gateway`. The connect fails fast and
-    /// deterministically without depending on any running LLM.
+    /// POST `/chat` with a valid token but a guaranteed-dead upstream exercises
+    /// the `Err(_)` arm of the upstream relay, which must surface as `502 Bad
+    /// Gateway`.
+    ///
+    /// The dead upstream is an ephemeral port obtained by binding a listener and
+    /// immediately dropping it: connecting to it is then refused quickly and
+    /// deterministically on every platform. (The previous hardcoded
+    /// `127.0.0.1:1` is a privileged/reserved port that does NOT refuse fast on
+    /// Windows — the connect stalled past the client timeout and the test
+    /// flaked. See CI run 28396600702.)
     #[tokio::test]
     async fn chat_with_dead_upstream_returns_502() {
-        let server = ArtifactServer::start("http://127.0.0.1:1").await.unwrap();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = probe.local_addr().unwrap();
+        drop(probe); // nothing listens here now → connections are refused fast
+
+        let server = ArtifactServer::start(format!("http://{dead_addr}"))
+            .await
+            .unwrap();
         let url = format!("{}/chat", server.base_url());
 
         let client = reqwest::Client::new();
@@ -249,7 +261,7 @@ mod tests {
             .post(&url)
             .header("Authorization", format!("Bearer {}", server.token))
             .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(10))
             .body(r#"{"messages":[]}"#)
             .send()
             .await
