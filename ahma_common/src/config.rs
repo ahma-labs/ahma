@@ -607,7 +607,7 @@ pub fn default_mutex_groups() -> Vec<MutexGroupConfig> {
 /// ```
 ///
 /// The server listens on port 1234 by default.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LmStudioSettings {
     /// Base URL of the LM Studio local-server endpoint.
@@ -634,7 +634,7 @@ impl Default for LmStudioSettings {
 }
 
 /// Tool execution settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolSettings {
     /// Default tool execution timeout in seconds.
@@ -773,7 +773,7 @@ fn scope_paths_equiv(a: &Path, b: &Path) -> bool {
 }
 
 /// Sandbox and filesystem security settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SandboxSettings {
     /// Disable the kernel sandbox entirely.
@@ -940,7 +940,7 @@ pub fn ensure_sandbox_directory(path: &Path) -> Result<PathBuf> {
 }
 
 /// Logging and log-monitoring settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggingSettings {
     /// Log destination: `"file"` (rolling log under `./logs/`) or `"stderr"`.
@@ -970,7 +970,7 @@ impl Default for LoggingSettings {
 }
 
 /// HTTP server settings (applies to `ahma serve http`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HttpSettings {
     /// MCP handshake timeout in seconds.  The server closes a session that does
@@ -1002,7 +1002,7 @@ impl Default for HttpSettings {
 }
 
 /// HTTP authentication and rate limiting settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuthSettings {
     /// Path to a file containing the required bearer token for HTTP access.
@@ -1033,7 +1033,7 @@ impl Default for AuthSettings {
 }
 
 /// Instance identity settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InstanceSettings {
     /// Human-readable instance name shown in the TUI and daemon event stream.
@@ -1057,7 +1057,7 @@ impl Default for InstanceSettings {
 /// external infrastructure (cluster peers, etc.) start disabled.
 ///
 /// Toggle in `~/.ahma/settings.toml` or via `ahma tui` → `/settings`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FeatureSettings {
     /// Code complexity analysis (`ahma simplify`).
@@ -1118,7 +1118,7 @@ impl Default for FeatureSettings {
 /// ahma settings show       # print the effective resolved settings
 /// ahma --no-settings …     # ignore settings.toml for this invocation
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AhmaSettings {
     /// Runtime feature toggles (simplify, vault, cluster, etc.).
@@ -1191,10 +1191,13 @@ impl AhmaSettings {
         self.logging.target.trim().eq_ignore_ascii_case("stderr")
     }
 
-    /// Write the settings file template (all defaults commented out) to `path`.
+    /// Write a fresh settings file (the current defaults, all commented out) to
+    /// `path`.
     ///
-    /// Creates parent directories as needed.  Returns `Err` if the file already
-    /// exists and `overwrite` is `false`.
+    /// Uses the same [`render_documented`](Self::render_documented) renderer as
+    /// the startup sync, so `ahma settings init` and the auto-maintained file are
+    /// byte-identical for a default configuration. Creates parent directories as
+    /// needed. Returns `Err` if the file already exists and `overwrite` is `false`.
     pub fn write_defaults(path: &Path, overwrite: bool) -> Result<()> {
         if path.exists() && !overwrite {
             anyhow::bail!(
@@ -1207,7 +1210,7 @@ impl AhmaSettings {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
-        std::fs::write(path, SETTINGS_TEMPLATE)
+        std::fs::write(path, Self::default().render_documented())
             .with_context(|| format!("Failed to write {}", path.display()))
     }
 
@@ -1232,8 +1235,7 @@ impl AhmaSettings {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
-        let toml_text =
-            toml::to_string_pretty(self).context("Failed to serialize settings to TOML")?;
+        let toml_text = self.render_documented();
 
         // Atomic write: temp file → rename
         let tmp_path = path.with_extension("toml.tmp");
@@ -1249,36 +1251,41 @@ impl AhmaSettings {
         Ok(())
     }
 
-    /// Ensure the settings file at `path` exists and carries every field this
-    /// version of ahma knows about — the single mechanism that keeps the
-    /// on-disk file in sync with the compiled-in [`Default`] values across
-    /// upgrades.
+    /// Ensure the settings file at `path` is present and rendered in the current
+    /// version's **documented, minimized** form — the single mechanism that keeps
+    /// the on-disk file readable and in sync across upgrades.
     ///
-    /// - **Missing file** → write the full current defaults (so a fresh install
-    ///   reads real values, not a commented template).
-    /// - **Existing file** → insert any default keys it lacks (fields added by a
-    ///   newer version), while **preserving every value the user set**. Keys the
-    ///   file has that defaults no longer mention are left untouched, so the
-    ///   merge is forward-compatible and never destroys data.
+    /// Every run regenerates the file via [`render_documented`](Self::render_documented):
+    /// every option is documented with its compiled-in default, but only the
+    /// values the user actually changed from the default are written as active
+    /// (uncommented) assignments — defaults stay commented out. This both
+    /// **minimizes** the file (a value equal to the current default is dropped as
+    /// an assertion) and refreshes the comments and defaults to match this build.
     ///
-    /// Writes only when something actually changed, so it is cheap and safe to
-    /// call on every startup. Returns `Ok(true)` when the file was created or
-    /// updated. A settings file that fails to parse is left **untouched**
-    /// (`Ok(false)`) so a hand-edit in progress is never clobbered.
+    /// - **Missing file** → write the full documented template.
+    /// - **Existing file** → parse it (preserving every value the user set),
+    ///   then re-render. Because the parse honours serde defaults, fields a newer
+    ///   version introduced appear automatically, and assertions equal to the
+    ///   default collapse back into commented documentation.
+    ///
+    /// Writes only when the rendered text differs from what is on disk, so it is
+    /// cheap and idempotent to call on every startup. Returns `Ok(true)` when the
+    /// file was created or updated. A settings file that fails to parse is left
+    /// **untouched** (`Ok(false)`) so a hand-edit in progress is never clobbered.
+    ///
+    /// Note: regeneration normalizes formatting and replaces hand-written
+    /// comments with the generated documentation. User *values* are always
+    /// preserved; user *comments* are not.
     pub fn ensure_current(path: &Path) -> Result<bool> {
-        let defaults_value = toml::Value::try_from(Self::default())
-            .context("Failed to serialize default settings")?;
-
         match std::fs::read_to_string(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let text = toml::to_string_pretty(&defaults_value)
-                    .context("Failed to serialize default settings to TOML")?;
+                let text = Self::default().render_documented();
                 atomic_write_toml(path, &text)?;
                 Ok(true)
             }
             Err(e) => anyhow::bail!("Failed to read {}: {e}", path.display()),
             Ok(contents) => {
-                let mut existing: toml::Value = match toml::from_str(&contents) {
+                let parsed: Self = match toml::from_str(&contents) {
                     Ok(v) => v,
                     Err(e) => {
                         warn!(
@@ -1288,15 +1295,312 @@ impl AhmaSettings {
                         return Ok(false);
                     }
                 };
-                let changed = merge_missing_keys(&mut existing, &defaults_value);
-                if changed {
-                    let text = toml::to_string_pretty(&existing)
-                        .context("Failed to serialize merged settings to TOML")?;
+                let text = parsed.render_documented();
+                if text != contents {
                     atomic_write_toml(path, &text)?;
+                    Ok(true)
+                } else {
+                    Ok(false)
                 }
-                Ok(changed)
             }
         }
+    }
+
+    /// Render `self` as a fully-documented, minimized `settings.toml`.
+    ///
+    /// Every option carries a one-line doc comment that states its compiled-in
+    /// default. Values equal to the current default are emitted **commented out**
+    /// (documentation only); values the user changed are emitted as **active**
+    /// assignments. The result round-trips: parsing it back yields the same
+    /// [`AhmaSettings`], and re-rendering that is a fixed point (so
+    /// [`ensure_current`](Self::ensure_current) stops rewriting once converged).
+    ///
+    /// This is the single source of truth for the on-disk format — both the
+    /// startup sync and the TUI/CLI save paths go through it, so the file stays
+    /// documented and minimal no matter who writes it.
+    pub fn render_documented(&self) -> String {
+        let d = Self::default();
+        let mut w = SettingsDoc::new();
+
+        w.line("# ~/.ahma/settings.toml — Ahma user settings");
+        w.line("#");
+        w.line("# Auto-maintained: ahma regenerates this file on startup to match the running");
+        w.line("# version. Every option is documented with its default; only values you have");
+        w.line("# changed from the default are written as active (uncommented) lines — defaults");
+        w.line("# stay commented out. Uncomment a line and edit it to override; your changes are");
+        w.line("# preserved across upgrades (hand-written comments are not).");
+        w.line("#");
+        w.line(
+            "# Priority: CLI flags > this file > deprecated AHMA_* env vars > built-in defaults.",
+        );
+        w.line("# `ahma settings show` prints effective values; `ahma settings init` resets this file.");
+        w.blank();
+
+        // ── Features ─────────────────────────────────────────────────────────
+        w.section("Features", "features");
+        w.setting(
+            "Code complexity analysis (ahma simplify).",
+            "simplify",
+            self.features.simplify.to_string(),
+            d.features.simplify.to_string(),
+        );
+        w.setting(
+            "Task vault isolation (per-session working directories).",
+            "vault",
+            self.features.vault.to_string(),
+            d.features.vault.to_string(),
+        );
+        w.setting(
+            "Distributed cluster scheduling (requires peer setup).",
+            "cluster",
+            self.features.cluster.to_string(),
+            d.features.cluster.to_string(),
+        );
+        w.setting(
+            "Network egress proxy for sandboxed tasks.",
+            "egress",
+            self.features.egress.to_string(),
+            d.features.egress.to_string(),
+        );
+        w.setting(
+            "HTML artifact output channel.",
+            "artifact",
+            self.features.artifact.to_string(),
+            d.features.artifact.to_string(),
+        );
+        w.setting(
+            "LLM-powered task decomposition.",
+            "decompose",
+            self.features.decompose.to_string(),
+            d.features.decompose.to_string(),
+        );
+
+        // ── LM Studio ────────────────────────────────────────────────────────
+        w.section("LM Studio (local OpenAI-compatible server)", "lmstudio");
+        w.setting(
+            "Base URL of the LM Studio local-server endpoint.",
+            "base_url",
+            toml_str(&self.lmstudio.base_url),
+            toml_str(&d.lmstudio.base_url),
+        );
+        w.setting(
+            "Model identifier of the model loaded in LM Studio.",
+            "model",
+            toml_str(&self.lmstudio.model),
+            toml_str(&d.lmstudio.model),
+        );
+
+        // ── Tool execution ───────────────────────────────────────────────────
+        w.section("Tool execution", "tools");
+        w.setting(
+            "Default tool timeout in seconds (per-tool override via timeout_seconds).",
+            "timeout_secs",
+            self.tools.timeout_secs.to_string(),
+            d.tools.timeout_secs.to_string(),
+        );
+        w.setting(
+            "Run all tools synchronously instead of async-first.",
+            "force_sync",
+            self.tools.force_sync.to_string(),
+            d.tools.force_sync.to_string(),
+        );
+        w.setting(
+            "Reload tools from disk on change — INSECURE in production.",
+            "hot_reload",
+            self.tools.hot_reload.to_string(),
+            d.tools.hot_reload.to_string(),
+        );
+        w.setting(
+            "Skip tool-availability probes at startup.",
+            "skip_probes",
+            self.tools.skip_probes.to_string(),
+            d.tools.skip_probes.to_string(),
+        );
+        w.setting(
+            "Path to the tools directory of JSON tool definitions.",
+            "tools_dir",
+            toml_opt_path(&self.tools.tools_dir),
+            toml_opt_path(&d.tools.tools_dir),
+        );
+        w.setting(
+            "Tool bundles to enable, e.g. [\"rust\", \"git\"].",
+            "tool_bundles",
+            toml_str_list(&self.tools.tool_bundles),
+            toml_str_list(&d.tools.tool_bundles),
+        );
+        w.setting(
+            "Enable output compression and token minimization.",
+            "minimize_tokens",
+            self.tools.minimize_tokens.to_string(),
+            d.tools.minimize_tokens.to_string(),
+        );
+        w.setting(
+            "Enable small-model harness adaptations.",
+            "small_model_harness",
+            self.tools.small_model_harness.to_string(),
+            d.tools.small_model_harness.to_string(),
+        );
+        w.setting(
+            "Command serialisation groups (per-dir mutex; set [] to disable).",
+            "mutex_groups",
+            toml_mutex_groups(&self.tools.mutex_groups),
+            toml_mutex_groups(&d.tools.mutex_groups),
+        );
+
+        // ── Sandbox & filesystem security ────────────────────────────────────
+        w.section("Sandbox & filesystem security", "sandbox");
+        w.setting(
+            "UNSAFE: disable the kernel sandbox entirely.",
+            "disable",
+            self.sandbox.disable.to_string(),
+            d.sandbox.disable.to_string(),
+        );
+        w.setting(
+            "Add the system temp dir to the sandbox scope.",
+            "tmp_access",
+            self.sandbox.tmp_access.to_string(),
+            d.sandbox.tmp_access.to_string(),
+        );
+        w.setting(
+            "Block all access to the system temp dir (overrides tmp_access).",
+            "disable_temp",
+            self.sandbox.disable_temp.to_string(),
+            d.sandbox.disable_temp.to_string(),
+        );
+        w.setting(
+            "Defer sandbox lock until the client provides roots/list.",
+            "defer",
+            self.sandbox.defer.to_string(),
+            d.sandbox.defer.to_string(),
+        );
+        w.setting(
+            "Run this server session inside an existing task vault.",
+            "task_vault",
+            toml_opt_path(&self.sandbox.task_vault),
+            toml_opt_path(&d.sandbox.task_vault),
+        );
+        w.setting(
+            "Paths allowed for read/write access under the sandbox.",
+            "scopes",
+            toml_path_list(&self.sandbox.scopes),
+            toml_path_list(&d.sandbox.scopes),
+        );
+        w.setting(
+            "Directories containing allowed working directories.",
+            "working_dirs",
+            toml_path_list(&self.sandbox.working_dirs),
+            toml_path_list(&d.sandbox.working_dirs),
+        );
+        w.setting(
+            "Allow package-manager caches (cargo registry/git) to be written.",
+            "package_cache_write",
+            self.sandbox.package_cache_write.to_string(),
+            d.sandbox.package_cache_write.to_string(),
+        );
+        w.setting(
+            "Default scratch directory, auto-created when needed.",
+            "sandbox_directory",
+            toml_opt_path(&self.sandbox.sandbox_directory),
+            toml_opt_path(&d.sandbox.sandbox_directory),
+        );
+        w.setting(
+            "Add sandbox_directory as a persistent secondary scope (--sandbox).",
+            "use_sandbox_directory",
+            self.sandbox.use_sandbox_directory.to_string(),
+            d.sandbox.use_sandbox_directory.to_string(),
+        );
+        w.setting(
+            "External dirs surviving roots/list (manage via `ahma sandbox grant`).",
+            "persistent_scopes",
+            toml_persistent_scopes(&self.sandbox.persistent_scopes),
+            toml_persistent_scopes(&d.sandbox.persistent_scopes),
+        );
+
+        // ── Logging ──────────────────────────────────────────────────────────
+        w.section("Logging", "logging");
+        w.setting(
+            "Log destination: \"file\" (rolling) or \"stderr\".",
+            "target",
+            toml_str(&self.logging.target),
+            toml_str(&d.logging.target),
+        );
+        w.setting(
+            "Enable live log monitoring via an LLM.",
+            "log_monitor",
+            self.logging.log_monitor.to_string(),
+            d.logging.log_monitor.to_string(),
+        );
+        w.setting(
+            "Minimum seconds between log-monitor alerts.",
+            "monitor_rate_limit_secs",
+            self.logging.monitor_rate_limit_secs.to_string(),
+            d.logging.monitor_rate_limit_secs.to_string(),
+        );
+
+        // ── HTTP server ──────────────────────────────────────────────────────
+        w.section("HTTP server (ahma serve http only)", "http");
+        w.setting(
+            "MCP handshake timeout in seconds.",
+            "handshake_timeout_secs",
+            self.http.handshake_timeout_secs.to_string(),
+            d.http.handshake_timeout_secs.to_string(),
+        );
+        w.setting(
+            "Disable HTTP/3 QUIC; fall back to HTTP/2 TCP.",
+            "disable_quic",
+            self.http.disable_quic.to_string(),
+            d.http.disable_quic.to_string(),
+        );
+        w.setting(
+            "Reject HTTP/1.1 connections; require HTTP/2 or better.",
+            "disable_http1_1",
+            self.http.disable_http1_1.to_string(),
+            d.http.disable_http1_1.to_string(),
+        );
+        w.setting(
+            "Path to the Unix domain socket.",
+            "unix_socket_path",
+            toml_opt_str(&self.http.unix_socket_path),
+            toml_opt_str(&d.http.unix_socket_path),
+        );
+
+        // ── HTTP authentication & rate limiting ──────────────────────────────
+        w.section("HTTP authentication & rate limiting", "auth");
+        w.setting(
+            "Path to a file containing the required bearer token.",
+            "require_token_path",
+            toml_str(&self.auth.require_token_path),
+            toml_str(&d.auth.require_token_path),
+        );
+        w.setting(
+            "Required bearer token specified directly in config (prefer require_token_path).",
+            "require_token",
+            toml_opt_str(&self.auth.require_token),
+            toml_opt_str(&d.auth.require_token),
+        );
+        w.setting(
+            "Max requests per second (0 = no limit).",
+            "rate_limit_rps",
+            self.auth.rate_limit_rps.to_string(),
+            d.auth.rate_limit_rps.to_string(),
+        );
+        w.setting(
+            "Burst allowance for the rate limiter.",
+            "rate_limit_burst",
+            self.auth.rate_limit_burst.to_string(),
+            d.auth.rate_limit_burst.to_string(),
+        );
+
+        // ── Instance identity ────────────────────────────────────────────────
+        w.section("Instance identity", "instance");
+        w.setting(
+            "Instance name shown in the TUI and daemon event stream.",
+            "label",
+            toml_str(&self.instance.label),
+            toml_str(&d.instance.label),
+        );
+
+        w.into_string()
     }
 
     /// [`Self::ensure_current`] against the standard `~/.ahma/settings.toml`.
@@ -1309,32 +1613,142 @@ impl AhmaSettings {
     }
 }
 
-/// Recursively insert keys present in `defaults` but missing from `target`,
-/// without overwriting any value the user already set. Returns `true` if any key
-/// was added. Only tables are recursed; scalar/array values present in `target`
-/// always win.
-fn merge_missing_keys(target: &mut toml::Value, defaults: &toml::Value) -> bool {
-    let toml::Value::Table(default_tbl) = defaults else {
-        return false;
-    };
-    let toml::Value::Table(target_tbl) = target else {
-        return false;
-    };
-    let mut changed = false;
-    for (key, default_val) in default_tbl {
-        match target_tbl.get_mut(key) {
-            None => {
-                target_tbl.insert(key.clone(), default_val.clone());
-                changed = true;
-            }
-            Some(existing_val) => {
-                if existing_val.is_table() && default_val.is_table() {
-                    changed |= merge_missing_keys(existing_val, default_val);
-                }
-            }
-        }
+// ---------------------------------------------------------------------------
+// settings.toml rendering helpers (documented + minimized form)
+// ---------------------------------------------------------------------------
+
+/// Quote `s` as a TOML basic string (escaping `\` and `"`).
+fn toml_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Render an optional string; `None` is shown as an empty TOML string so an
+/// unset value reads as a clear placeholder rather than a missing line.
+fn toml_opt_str(o: &Option<String>) -> String {
+    match o {
+        Some(s) => toml_str(s),
+        None => "\"\"".to_string(),
     }
-    changed
+}
+
+/// Render a path as a TOML string (lossy UTF-8, matching how serde stores it).
+fn toml_path(p: &Path) -> String {
+    toml_str(&p.to_string_lossy())
+}
+
+/// Render an optional path; `None` is shown as an empty TOML string.
+fn toml_opt_path(o: &Option<PathBuf>) -> String {
+    match o {
+        Some(p) => toml_path(p),
+        None => "\"\"".to_string(),
+    }
+}
+
+/// Render a list of strings as an inline TOML array.
+fn toml_str_list(v: &[String]) -> String {
+    let items: Vec<String> = v.iter().map(|s| toml_str(s)).collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Render a list of paths as an inline TOML array.
+fn toml_path_list(v: &[PathBuf]) -> String {
+    let items: Vec<String> = v.iter().map(|p| toml_path(p)).collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Render mutex groups as an inline TOML array of inline tables.
+fn toml_mutex_groups(v: &[MutexGroupConfig]) -> String {
+    let items: Vec<String> = v
+        .iter()
+        .map(|g| {
+            format!(
+                "{{ name = {}, prefixes = {}, max_wait_secs = {} }}",
+                toml_str(&g.name),
+                toml_str_list(&g.prefixes),
+                g.max_wait_secs
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Render persistent scopes as an inline TOML array of inline tables, omitting
+/// the optional fields that are unset (matching serde's `skip_serializing_if`).
+fn toml_persistent_scopes(v: &[PersistentScope]) -> String {
+    let items: Vec<String> = v
+        .iter()
+        .map(|ps| {
+            let mut parts = vec![
+                format!("path = {}", toml_path(&ps.path)),
+                format!(
+                    "access = {}",
+                    toml_str(match ps.access {
+                        ScopeAccess::Ro => "ro",
+                        ScopeAccess::Rw => "rw",
+                    })
+                ),
+            ];
+            if let Some(g) = &ps.granted_by {
+                parts.push(format!("granted_by = {}", toml_str(g)));
+            }
+            if let Some(a) = &ps.granted_at {
+                parts.push(format!("granted_at = {}", toml_str(a)));
+            }
+            if let Some(n) = &ps.note {
+                parts.push(format!("note = {}", toml_str(n)));
+            }
+            format!("{{ {} }}", parts.join(", "))
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Builds the documented, minimized `settings.toml` text used by
+/// [`AhmaSettings::render_documented`].
+struct SettingsDoc {
+    out: String,
+}
+
+impl SettingsDoc {
+    fn new() -> Self {
+        Self { out: String::new() }
+    }
+
+    fn line(&mut self, s: &str) {
+        self.out.push_str(s);
+        self.out.push('\n');
+    }
+
+    fn blank(&mut self) {
+        self.out.push('\n');
+    }
+
+    /// Emit a section banner (`# ── Title ──…`) followed by its `[table]` header.
+    fn section(&mut self, title: &str, table: &str) {
+        let prefix = format!("# ── {title} ");
+        let pad = 80usize.saturating_sub(prefix.chars().count());
+        self.line(&format!("{prefix}{}", "─".repeat(pad)));
+        self.line(&format!("[{table}]"));
+    }
+
+    /// Emit one setting: a doc comment that always states the default, then the
+    /// assignment — commented out when `value` equals `default` (documentation
+    /// only), active when the user changed it. Equality is by rendered text, so
+    /// both sides must come from the same formatter. A trailing blank line keeps
+    /// adjacent settings visually separated.
+    fn setting(&mut self, doc: &str, key: &str, value: String, default: String) {
+        self.line(&format!("# {doc} (default: {default})"));
+        if value == default {
+            self.line(&format!("# {key} = {default}"));
+        } else {
+            self.line(&format!("{key} = {value}"));
+        }
+        self.blank();
+    }
+
+    fn into_string(self) -> String {
+        self.out
+    }
 }
 
 /// Atomic TOML write (temp sibling → rename), with a pid-scoped temp name so two
@@ -1355,103 +1769,6 @@ fn atomic_write_toml(path: &Path, text: &str) -> Result<()> {
         )
     })
 }
-
-/// The commented-out defaults template written by `ahma settings init`.
-pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user settings
-#
-# All options are commented out.  Uncomment and edit any value to override
-# the compiled-in default.  CLI flags always take highest priority, followed
-# by this file, followed by deprecated AHMA_* environment variables.
-#
-# Generate (or regenerate) this file with:   ahma settings init
-# Show effective settings with:              ahma settings show
-# Ignore this file for one invocation with:  ahma --no-settings <command>
-# Edit interactively with:                   ahma tui → /settings
-
-# ── Features ─────────────────────────────────────────────────────────────────
-# Toggle optional capabilities on/off.  Features that work without additional
-# setup are enabled by default; features requiring infrastructure are off.
-#
-# [features]
-# simplify  = true    # code complexity analysis (ahma simplify)
-# vault     = false   # task vault isolation (per-session working directories)
-# cluster   = false   # distributed cluster scheduling (requires peer setup)
-# egress    = true    # network egress proxy for sandboxed tasks
-# artifact  = true    # HTML artifact output channel
-# decompose = true    # LLM-powered task decomposition
-
-# ── Tool execution ───────────────────────────────────────────────────────────
-# [tools]
-# timeout_secs = 600      # default tool timeout (seconds); per-tool override via timeout_seconds
-# force_sync   = false    # run all tools synchronously instead of async-first
-# hot_reload   = false    # reload tools from disk on change — INSECURE in production
-# skip_probes  = false    # skip availability probes at startup
-# tools_dir    = ".ahma"  # path to tools directory containing JSON tool definitions
-# tool_bundles = []       # tool bundles to enable (e.g. ["rust", "git"])
-# minimize_tokens     = false # enable output compression and token minimization
-# small_model_harness = false # enable small-model harness adaptations
-#
-# Command serialisation: commands matching a group's prefix are serialised per
-# working directory so they don't contend on shared resources (e.g. cargo's target/).
-# The cargo group is enabled by default.  Set mutex_groups = [] to disable.
-# mutex_groups = [
-#   { name = "cargo", prefixes = ["cargo"], max_wait_secs = 600 }
-# ]
-# Add more groups for other slow exclusive tools, e.g.:
-#   { name = "gradle", prefixes = ["gradle", "./gradlew"], max_wait_secs = 600 }
-
-# ── LM Studio (local OpenAI-compatible server) ──────────────────────────────
-# Start the LM Studio Local Server (Developer tab), or headless: lms server start
-#
-# [lmstudio]
-# base_url = "http://localhost:1234/v1"  # default: 1234 (LM Studio local server)
-# model    = "openai/gpt-oss-20b"        # set to the model loaded in LM Studio
-
-# ── Sandbox & filesystem security ────────────────────────────────────────────
-# [sandbox]
-# disable              = false    # UNSAFE: disable kernel sandbox entirely
-# tmp_access           = false    # add system temp dir to sandbox scope
-# disable_temp         = false    # block all access to system temp dir (overrides tmp_access)
-# defer                = false    # defer sandbox lock until client provides roots/list
-# task_vault           = ""       # run this server session inside an existing task vault
-# scopes               = []       # paths allowed for read/write access under the sandbox
-# package_cache_write  = true     # allow package-manager caches (cargo registry/git) to be written
-# working_dirs         = []       # directories containing allowed working directories
-# sandbox_directory    = "~/sandbox"  # default scratch directory, auto-created when needed
-#
-# persistent_scopes: machine-local external directories that survive roots/list
-# replacement — e.g. a build cache outside the workspace (sccache, ccache).
-# Manage with `ahma sandbox grant|list|revoke`, or edit by hand.  Unlike `scopes`
-# (provisional, replaced when the client sends workspace roots), these are
-# re-added on every roots/list update so the grant lasts the whole session.
-# persistent_scopes = [
-#   { path = "~/Library/Caches/Mozilla.sccache", access = "rw", granted_by = "sccache", note = "compiler cache" },
-# ]
-
-# ── Logging ──────────────────────────────────────────────────────────────────
-# [logging]
-# target                 = "file"   # "file" (rolling) or "stderr"
-# log_monitor            = false    # enable live log monitoring via LLM
-# monitor_rate_limit_secs = 60      # min seconds between log-monitor alerts
-
-# ── HTTP server (ahma serve http only) ───────────────────────────────────────
-# [http]
-# handshake_timeout_secs = 45      # MCP handshake timeout
-# disable_quic           = false   # disable HTTP/3 QUIC; fall back to HTTP/2 TCP
-# disable_http1_1        = false   # reject HTTP/1.1; require HTTP/2+
-# unix_socket_path      = ""      # path to the unix domain socket
-
-# ── HTTP authentication & rate limiting ──────────────────────────────────────
-# [auth]
-# require_token      = ""   # required bearer token specified directly in config
-# require_token_path = ""   # path to file containing required bearer token
-# rate_limit_rps     = 0    # max requests/second (0 = no limit)
-# rate_limit_burst   = 10   # burst allowance
-
-# ── Instance identity ────────────────────────────────────────────────────────
-# [instance]
-# label = "ahma"   # instance name shown in TUI and daemon event stream
-"#;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1586,6 +1903,185 @@ mod tests {
             "a file that does not parse is never clobbered"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
+    }
+
+    /// A fully non-default settings value for round-trip / completeness testing.
+    /// Every field is set to something other than its compiled-in default so that
+    /// a missing field in [`AhmaSettings::render_documented`] would surface as a
+    /// lost value when this round-trips through TOML.
+    fn all_non_default_settings() -> AhmaSettings {
+        AhmaSettings {
+            features: FeatureSettings {
+                simplify: false,
+                vault: true,
+                cluster: true,
+                egress: false,
+                artifact: false,
+                decompose: false,
+            },
+            lmstudio: LmStudioSettings {
+                base_url: "http://example.test:9999/v1".into(),
+                model: "my/custom-model".into(),
+            },
+            tools: ToolSettings {
+                timeout_secs: 123,
+                force_sync: true,
+                hot_reload: true,
+                skip_probes: true,
+                tools_dir: Some(PathBuf::from("/opt/tools")),
+                tool_bundles: vec!["rust".into(), "git".into()],
+                minimize_tokens: true,
+                small_model_harness: true,
+                mutex_groups: vec![MutexGroupConfig {
+                    name: "gradle".into(),
+                    prefixes: vec!["gradle".into(), "./gradlew".into()],
+                    max_wait_secs: 42,
+                }],
+            },
+            sandbox: SandboxSettings {
+                disable: true,
+                tmp_access: true,
+                disable_temp: true,
+                defer: true,
+                task_vault: Some(PathBuf::from("/vaults/v1")),
+                scopes: vec![PathBuf::from("/a"), PathBuf::from("/b")],
+                working_dirs: vec![PathBuf::from("/work")],
+                package_cache_write: false,
+                sandbox_directory: Some(PathBuf::from("/scratch")),
+                use_sandbox_directory: true,
+                persistent_scopes: vec![PersistentScope {
+                    path: PathBuf::from("~/Library/Caches/x.sccache"),
+                    access: ScopeAccess::Ro,
+                    granted_by: Some("sccache".into()),
+                    granted_at: Some("2026-06-29".into()),
+                    note: Some("compiler cache".into()),
+                }],
+            },
+            logging: LoggingSettings {
+                target: "stderr".into(),
+                log_monitor: true,
+                monitor_rate_limit_secs: 7,
+            },
+            http: HttpSettings {
+                handshake_timeout_secs: 99,
+                disable_quic: true,
+                disable_http1_1: true,
+                unix_socket_path: Some("/run/ahma.sock".into()),
+            },
+            auth: AuthSettings {
+                require_token_path: "/etc/ahma/token".into(),
+                rate_limit_rps: 50,
+                rate_limit_burst: 5,
+                require_token: Some("secret".into()),
+            },
+            instance: InstanceSettings {
+                label: "custom-label".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn render_documented_round_trips_every_field() {
+        // Guards against drift: if a new field is added to AhmaSettings but not
+        // to render_documented, its non-default value is dropped here and the
+        // parsed value no longer equals the original.
+        let original = all_non_default_settings();
+        let text = original.render_documented();
+        let parsed: AhmaSettings = toml::from_str(&text)
+            .unwrap_or_else(|e| panic!("rendered settings must parse: {e}\n---\n{text}"));
+        assert_eq!(
+            parsed, original,
+            "every non-default field must survive render → parse"
+        );
+    }
+
+    #[test]
+    fn render_documented_is_a_fixed_point() {
+        // Rendering, parsing, and re-rendering must be byte-identical so that
+        // ensure_current stops rewriting once the file is in canonical form.
+        let original = all_non_default_settings();
+        let once = original.render_documented();
+        let reparsed: AhmaSettings = toml::from_str(&once).unwrap();
+        let twice = reparsed.render_documented();
+        assert_eq!(once, twice, "render must be a fixed point");
+    }
+
+    #[test]
+    fn render_documented_default_has_no_active_assignments() {
+        // A default configuration is fully minimized: every value line is either
+        // a comment, a section header, or blank — nothing is asserted.
+        let text = AhmaSettings::default().render_documented();
+        for line in text.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') || t.starts_with('[') {
+                continue;
+            }
+            panic!("default settings must not assert any value, found: {line:?}");
+        }
+        // It still documents every section.
+        for table in [
+            "[features]",
+            "[lmstudio]",
+            "[tools]",
+            "[sandbox]",
+            "[logging]",
+            "[http]",
+            "[auth]",
+            "[instance]",
+        ] {
+            assert!(text.contains(table), "missing section header {table}");
+        }
+        // Defaults are visible as commented documentation.
+        assert!(text.contains("# timeout_secs = 600"));
+        assert!(text.contains(&format!("# model = \"{DEFAULT_LMSTUDIO_MODEL}\"")));
+        // And every option states its default in the doc line.
+        assert!(text.contains("(default: 600)"));
+    }
+
+    #[test]
+    fn render_documented_only_overrides_are_active() {
+        // One field changed from default → exactly that line is active; its
+        // siblings stay commented.
+        let mut s = AhmaSettings::default();
+        s.sandbox.tmp_access = true;
+        let text = s.render_documented();
+        assert!(
+            text.contains("\ntmp_access = true\n"),
+            "override is written active; got:\n{text}"
+        );
+        assert!(
+            text.contains("# disable = false"),
+            "untouched default stays commented; got:\n{text}"
+        );
+        // Round-trips back to the same override.
+        let parsed: AhmaSettings = toml::from_str(&text).unwrap();
+        assert!(parsed.sandbox.tmp_access);
+        assert!(!parsed.sandbox.disable);
+    }
+
+    #[test]
+    fn ensure_current_minimizes_a_fully_asserted_file() {
+        // The pre-change format asserted every field, including defaults. After
+        // ensure_current, default-valued assertions collapse into comments while
+        // genuine overrides remain active.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        // A file that asserts a default (timeout_secs = 600) and an override.
+        std::fs::write(&path, "[tools]\ntimeout_secs = 600\nforce_sync = true\n").unwrap();
+
+        assert!(AhmaSettings::ensure_current(&path).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The default assertion is gone (now a comment), the override stays.
+        assert!(
+            text.contains("# timeout_secs = 600"),
+            "default value de-asserted into a comment; got:\n{text}"
+        );
+        assert!(
+            text.contains("\nforce_sync = true\n"),
+            "override preserved as active; got:\n{text}"
+        );
+        // Now idempotent.
+        assert!(!AhmaSettings::ensure_current(&path).unwrap());
     }
 
     #[test]
