@@ -168,6 +168,17 @@ fn build_server_spec(
     let mut args = vec![
         "--sync".to_string(),
         "--log-to-stderr".to_string(),
+        // Skip tool-availability probes. The integration tests load *synthetic*
+        // tool configs (e.g. a `pwd` tool) that are guaranteed present on every
+        // runner; they never assert on probe-driven hiding. With probes enabled,
+        // a probe subprocess timing out under CI load could transiently hide the
+        // tool, so a `tools/call` returns "Tool '<name>' not found" instead of
+        // exercising the path under test (e.g. the empty-roots sandbox gate in
+        // `sandbox_roots_handshake_test::test_empty_roots_rejection`). Skipping
+        // probes makes the loaded tool set deterministic. (It does NOT make a
+        // genuinely-absent tool name resolve — "invalid tool name" tests still
+        // get their not-found error.)
+        "--skip-probes".to_string(),
         "--tools-dir".to_string(),
         tools_dir.to_string_lossy().to_string(),
         "--sandbox-scope".to_string(),
