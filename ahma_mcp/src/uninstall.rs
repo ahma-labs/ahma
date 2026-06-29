@@ -371,9 +371,11 @@ fn remove_platform_mcp(
 
 /// Remove the `"Ahma"` key from `config[servers_key]` in a JSON MCP config file.
 ///
-/// Preserves all other content.  If the `servers_key` object becomes empty after
-/// removal, the key is pruned too.  Never deletes the file itself.  No-ops gracefully
-/// when the file or key is absent.
+/// Preserves all other content, including any other MCP servers.  If Ahma was the
+/// only server, the now-empty `servers_key` object is left in place (e.g.
+/// `{ "mcpServers": {} }`) — this is the canonical minimal MCP config format, so the
+/// file stays valid rather than becoming "empty".  Never deletes the file itself.
+/// No-ops gracefully when the file or key is absent.
 pub fn remove_mcp_entry(path: &Path, servers_key: &str, dry_run: bool) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -397,11 +399,9 @@ pub fn remove_mcp_entry(path: &Path, servers_key: &str, dry_run: bool) -> Result
         if servers_obj.remove("Ahma").is_none() {
             return Ok(()); // Ahma key already absent
         }
-        // Prune now-empty servers object.
-        let servers_empty = servers_obj.is_empty();
-        if servers_empty {
-            obj.remove(servers_key);
-        }
+        // Intentionally leave the (possibly now-empty) servers object in place.
+        // `{ "mcpServers": {} }` is the canonical minimal MCP config, so we keep it
+        // rather than pruning the key and risking an "empty" file.
     } else {
         return Ok(());
     }
@@ -946,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_mcp_entry_prunes_empty_servers_object() -> Result<()> {
+    fn remove_mcp_entry_keeps_empty_servers_object() -> Result<()> {
         let tmp = tempdir()?;
         let path = tmp.path().join("mcp.json");
         std::fs::write(
@@ -958,11 +958,38 @@ mod tests {
 
         let content = std::fs::read_to_string(&path)?;
         let parsed: Value = serde_json::from_str(&content)?;
+        let servers = parsed
+            .as_object()
+            .unwrap()
+            .get("mcpServers")
+            .expect("mcpServers key must be retained as the minimal config");
         assert!(
-            parsed.as_object().unwrap().get("mcpServers").is_none(),
-            "empty mcpServers should be pruned"
+            servers.as_object().unwrap().is_empty(),
+            "mcpServers should be kept as an empty object, not pruned"
         );
         assert_eq!(parsed["other"], "val", "other content preserved");
+        Ok(())
+    }
+
+    #[test]
+    fn remove_mcp_entry_only_ahma_leaves_minimal_config() -> Result<()> {
+        let tmp = tempdir()?;
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{"Ahma":{"type":"stdio"}}}"#)?;
+
+        remove_mcp_entry(&path, "mcpServers", false)?;
+
+        let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+        let obj = parsed.as_object().expect("top level object");
+        assert_eq!(obj.len(), 1, "only mcpServers should remain");
+        assert!(
+            obj.get("mcpServers")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .is_empty(),
+            "Cursor minimal format {{\"mcpServers\":{{}}}} must be preserved"
+        );
         Ok(())
     }
 
@@ -1505,7 +1532,12 @@ mod tests {
         assert_eq!(name, Some("Claude Code"));
         let parsed: Value =
             serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json"))?)?;
-        assert!(parsed.as_object().unwrap().get("mcpServers").is_none());
+        let servers = parsed
+            .as_object()
+            .unwrap()
+            .get("mcpServers")
+            .expect("mcpServers retained as minimal config");
+        assert!(servers.as_object().unwrap().is_empty());
         Ok(())
     }
 
