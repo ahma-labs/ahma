@@ -939,4 +939,418 @@ mod tests {
         );
         assert_eq!(parse_op_status(""), OpStatus::Failed, "empty → Failed");
     }
+
+    // ── coverage batch: apply_msg arms, DaemonState branches, embedded hub ─────
+    async fn next_ev(rx: &mut mpsc::Receiver<SourceEvent>) -> SourceEvent {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a SourceEvent should arrive within the timeout")
+            .expect("the source channel should remain open")
+    }
+
+    fn sample_scope_grant() -> ahma_common::scope_grant::ScopeGrantRequest {
+        ahma_common::scope_grant::ScopeGrantRequest {
+            decision_id: "d1".to_string(),
+            path: std::env::temp_dir().join("ahma_scope_grant_test"),
+            access: ahma_common::config::ScopeAccess::Ro,
+            reason: ahma_common::scope_grant::GrantReason::PreExecViolation,
+            tool: Some("run_terminal_command".to_string()),
+        }
+    }
+
+    #[test]
+    fn all_instances_returns_clones_of_registered() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "VS Code"));
+        s.add_instance(inst("i2", "Cursor"));
+        let mut got: Vec<String> = s.all_instances().into_iter().map(|i| i.id).collect();
+        got.sort();
+        assert_eq!(got, vec!["i1".to_string(), "i2".to_string()]);
+    }
+
+    #[test]
+    fn op_started_unknown_instance_uses_id_as_label_and_no_pid() {
+        let mut s = DaemonState::new();
+        s.on_op_started(
+            "ghost-instance",
+            "op-1".to_string(),
+            "tool".to_string(),
+            "desc".to_string(),
+            None,
+        );
+        let ops = s.all_ops();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].instance_label, Some("ghost-instance".to_string()));
+        assert_eq!(ops[0].instance_id, Some("ghost-instance".to_string()));
+        assert_eq!(ops[0].pid, None);
+        assert_eq!(ops[0].description, "desc");
+        assert_eq!(ops[0].scope, None);
+    }
+
+    #[test]
+    fn prune_terminal_keeps_recently_completed() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Test"));
+        s.on_op_started(
+            "i1",
+            "op-1".to_string(),
+            "tool".to_string(),
+            "".to_string(),
+            None,
+        );
+        s.on_op_finished("i1", "op-1", "Completed", None, 5);
+        s.prune_terminal();
+        let ops = s.all_ops();
+        assert_eq!(ops.len(), 1, "recently completed op is retained");
+        assert_eq!(ops[0].status, OpStatus::Succeeded);
+    }
+
+    #[test]
+    fn prune_terminal_keeps_terminal_without_completed_at() {
+        let mut s = DaemonState::new();
+        s.add_instance(inst("i1", "Test"));
+        let mut op = Operation::new("op-x", "tool", OpStatus::Failed);
+        op.instance_id = Some("i1".to_string());
+        op.completed_at = None;
+        s.ops
+            .entry("i1".to_string())
+            .or_default()
+            .insert("op-x".to_string(), op);
+        s.prune_terminal();
+        assert_eq!(
+            s.all_ops().len(),
+            1,
+            "terminal op without completed_at is kept"
+        );
+    }
+
+    #[test]
+    fn apply_msg_ping_is_noop() {
+        let mut s = DaemonState::new();
+        let a = apply_msg(&mut s, DaemonMsg::Ping { seq: 7 });
+        assert!(matches!(a, Applied::None));
+        assert!(!a.is_list_changed());
+    }
+
+    #[test]
+    fn apply_msg_chat_token_carries_token() {
+        let mut s = DaemonState::new();
+        match apply_msg(
+            &mut s,
+            DaemonMsg::ChatToken {
+                token: "hi".to_string(),
+            },
+        ) {
+            Applied::ChatToken(t) => assert_eq!(t, "hi"),
+            _ => panic!("ChatToken must map to Applied::ChatToken"),
+        }
+    }
+
+    #[test]
+    fn apply_msg_approval_requested_carries_fields() {
+        let mut s = DaemonState::new();
+        match apply_msg(
+            &mut s,
+            DaemonMsg::ApprovalRequested {
+                id: "a1".to_string(),
+                tool: "shell".to_string(),
+                args: "ls".to_string(),
+            },
+        ) {
+            Applied::ApprovalRequested { id, tool, args } => {
+                assert_eq!(id, "a1");
+                assert_eq!(tool, "shell");
+                assert_eq!(args, "ls");
+            }
+            _ => panic!("must map to Applied::ApprovalRequested"),
+        }
+    }
+
+    #[test]
+    fn apply_msg_agent_done() {
+        let mut s = DaemonState::new();
+        assert!(matches!(
+            apply_msg(&mut s, DaemonMsg::AgentDone),
+            Applied::AgentDone
+        ));
+    }
+
+    #[test]
+    fn apply_msg_agent_error_carries_message() {
+        let mut s = DaemonState::new();
+        match apply_msg(
+            &mut s,
+            DaemonMsg::AgentError {
+                error: "boom".to_string(),
+            },
+        ) {
+            Applied::AgentError(e) => assert_eq!(e, "boom"),
+            _ => panic!("must map to Applied::AgentError"),
+        }
+    }
+
+    #[test]
+    fn apply_msg_run_prompt_is_noop() {
+        let mut s = DaemonState::new();
+        let a = apply_msg(
+            &mut s,
+            DaemonMsg::RunPrompt {
+                messages: vec![],
+                system_prompt: None,
+                provider: None,
+                model: None,
+            },
+        );
+        assert!(matches!(a, Applied::None));
+    }
+
+    #[test]
+    fn apply_msg_submit_approval_is_noop() {
+        let mut s = DaemonState::new();
+        let a = apply_msg(&mut s, DaemonMsg::SubmitApproval { approved: true });
+        assert!(matches!(a, Applied::None));
+    }
+
+    #[test]
+    fn apply_msg_scope_grant_requested_carries_request() {
+        let mut s = DaemonState::new();
+        match apply_msg(
+            &mut s,
+            DaemonMsg::ScopeGrantRequested {
+                request: sample_scope_grant(),
+            },
+        ) {
+            Applied::ScopeGrantRequested { request } => {
+                assert_eq!(request.decision_id, "d1");
+                assert_eq!(request.access, ahma_common::config::ScopeAccess::Ro);
+            }
+            _ => panic!("must map to Applied::ScopeGrantRequested"),
+        }
+    }
+
+    #[test]
+    fn apply_msg_scope_grant_dismiss_carries_decision_id() {
+        let mut s = DaemonState::new();
+        match apply_msg(
+            &mut s,
+            DaemonMsg::ScopeGrantDismiss {
+                decision_id: "d9".to_string(),
+            },
+        ) {
+            Applied::ScopeGrantDismiss { decision_id } => assert_eq!(decision_id, "d9"),
+            _ => panic!("must map to Applied::ScopeGrantDismiss"),
+        }
+    }
+
+    #[test]
+    fn apply_msg_submit_scope_grant_is_noop() {
+        let mut s = DaemonState::new();
+        let a = apply_msg(
+            &mut s,
+            DaemonMsg::SubmitScopeGrant {
+                decision_id: "d1".to_string(),
+                decision: ahma_common::scope_grant::GrantDecision::Deny,
+            },
+        );
+        assert!(matches!(a, Applied::None));
+    }
+
+    #[tokio::test]
+    async fn embedded_hub_source_maps_every_event() {
+        let (tx_b, rx_b) = broadcast::channel::<DaemonMsg>(64);
+        let (tx_s, mut rx_s) = mpsc::channel::<SourceEvent>(64);
+        spawn_embedded_hub_source(rx_b, tx_s);
+
+        match next_ev(&mut rx_s).await {
+            SourceEvent::DaemonHealthChanged { healthy } => assert!(healthy),
+            other => panic!("expected DaemonHealthChanged, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::InstanceList {
+            instances: vec![inst("i1", "IDE")],
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::InstancesUpdated { instances } => assert_eq!(instances.len(), 1),
+            other => panic!("expected InstancesUpdated, got {other:?}"),
+        }
+        match next_ev(&mut rx_s).await {
+            SourceEvent::OperationsUpdated { ops } => assert!(ops.is_empty()),
+            other => panic!("expected OperationsUpdated, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::Event {
+            instance_id: "i1".to_string(),
+            payload: DaemonEvent::OpStarted {
+                id: "op1".to_string(),
+                tool_name: "t".to_string(),
+                description: "d".to_string(),
+                scope: "/s".to_string(),
+            },
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::OperationsUpdated { ops } => {
+                assert_eq!(ops.len(), 1);
+                assert_eq!(ops[0].id, "op1");
+                assert_eq!(ops[0].status, OpStatus::Running);
+            }
+            other => panic!("expected OperationsUpdated, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::Event {
+            instance_id: "i1".to_string(),
+            payload: DaemonEvent::OpOutput {
+                id: "op1".to_string(),
+                line: "hello".to_string(),
+                is_stderr: true,
+            },
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::OperationOutput {
+                instance_id,
+                op_id,
+                line,
+                is_stderr,
+            } => {
+                assert_eq!(instance_id, Some("i1".to_string()));
+                assert_eq!(op_id, "op1");
+                assert_eq!(line, "hello");
+                assert!(is_stderr);
+            }
+            other => panic!("expected OperationOutput, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::ChatToken {
+            token: "tok".to_string(),
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::ChatToken { token } => assert_eq!(token, "tok"),
+            other => panic!("expected ChatToken, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::Ping { seq: 3 }).unwrap();
+        tx_b.send(DaemonMsg::ApprovalRequested {
+            id: "a1".to_string(),
+            tool: "tool".to_string(),
+            args: "args".to_string(),
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::ApprovalRequested { id, tool, args } => {
+                assert_eq!(id, "a1");
+                assert_eq!(tool, "tool");
+                assert_eq!(args, "args");
+            }
+            other => panic!("Ping must be a no-op; got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::ScopeGrantRequested {
+            request: sample_scope_grant(),
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::ScopeGrantRequested { request } => {
+                assert_eq!(request.decision_id, "d1");
+            }
+            other => panic!("expected ScopeGrantRequested, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::ScopeGrantDismiss {
+            decision_id: "d1".to_string(),
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::ScopeGrantDismiss { decision_id } => assert_eq!(decision_id, "d1"),
+            other => panic!("expected ScopeGrantDismiss, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::AgentDone).unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::AgentDone => {}
+            other => panic!("expected AgentDone, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::AgentError {
+            error: "boom".to_string(),
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::AgentError { error } => assert_eq!(error, "boom"),
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::InstanceUnregistered {
+            id: "i1".to_string(),
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::InstancesUpdated { instances } => assert!(instances.is_empty()),
+            other => panic!("expected InstancesUpdated, got {other:?}"),
+        }
+        match next_ev(&mut rx_s).await {
+            SourceEvent::OperationsUpdated { ops } => assert!(ops.is_empty()),
+            other => panic!("expected OperationsUpdated, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_hub_source_recovers_after_lag() {
+        let (tx_b, rx_b) = broadcast::channel::<DaemonMsg>(2);
+        let (tx_s, mut rx_s) = mpsc::channel::<SourceEvent>(256);
+        spawn_embedded_hub_source(rx_b, tx_s);
+
+        for i in 0..8 {
+            tx_b.send(DaemonMsg::ChatToken {
+                token: format!("t{i}"),
+            })
+            .unwrap();
+        }
+        tx_b.send(DaemonMsg::ChatToken {
+            token: "final".to_string(),
+        })
+        .unwrap();
+
+        let mut saw_final = false;
+        for _ in 0..32 {
+            match tokio::time::timeout(Duration::from_secs(2), rx_s.recv()).await {
+                Ok(Some(SourceEvent::ChatToken { token })) if token == "final" => {
+                    saw_final = true;
+                    break;
+                }
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(
+            saw_final,
+            "embedded hub source must continue past a Lagged error and deliver later tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_hub_source_exits_when_tui_channel_closed() {
+        let (tx_b, rx_b) = broadcast::channel::<DaemonMsg>(16);
+        let (tx_s, rx_s) = mpsc::channel::<SourceEvent>(8);
+        spawn_embedded_hub_source(rx_b, tx_s);
+
+        drop(rx_s);
+        tx_b.send(DaemonMsg::InstanceList { instances: vec![] })
+            .unwrap();
+
+        let mut exited = false;
+        for _ in 0..100 {
+            if tx_b.receiver_count() == 0 {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            exited,
+            "task must exit (drop its receiver) once the TUI channel is closed"
+        );
+    }
 }

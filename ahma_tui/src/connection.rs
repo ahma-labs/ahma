@@ -857,4 +857,418 @@ mod tests {
         };
         assert_eq!(conn.transport_label(), "HTTP");
     }
+
+    // ── coverage batch: probes, health, restart, http3 upgrade, version ────────
+    async fn start_test_http_server(
+        health_code: u16,
+        version: Option<&'static str>,
+        restart_code: u16,
+        alt_svc: Option<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::http::{HeaderMap, HeaderValue, StatusCode, header::HeaderName};
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+
+        let health = get(move || async move {
+            let status = StatusCode::from_u16(health_code).unwrap_or(StatusCode::OK);
+            let mut headers = HeaderMap::new();
+            if let Some(av) = alt_svc {
+                headers.insert(
+                    HeaderName::from_static("alt-svc"),
+                    HeaderValue::from_static(av),
+                );
+            }
+            if let Some(ver) = version {
+                let body = serde_json::json!({ "version": ver });
+                (status, headers, axum::Json(body)).into_response()
+            } else {
+                (status, headers).into_response()
+            }
+        });
+
+        let restart = post(move || async move {
+            StatusCode::from_u16(restart_code)
+                .unwrap_or(StatusCode::OK)
+                .into_response()
+        });
+
+        let app = axum::Router::new()
+            .route("/health", health)
+            .route("/restart", restart);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn unreachable_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    #[cfg(unix)]
+    fn spawn_uds_once(socket_path: String, response: &'static [u8]) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+            if let Ok((mut conn, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = tokio::time::timeout(Duration::from_millis(200), conn.read(&mut buf)).await;
+                let _ = conn.write_all(response).await;
+                let _ = conn.shutdown().await;
+            }
+        })
+    }
+
+    #[test]
+    fn parse_version_valid_partial_invalid() {
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("10.20.30"), Some((10, 20, 30)));
+        assert_eq!(parse_version("1.2.3.4"), Some((1, 2, 3)));
+        assert_eq!(parse_version("1.2"), None);
+        assert_eq!(parse_version("x.y.z"), None);
+        assert_eq!(parse_version(""), None);
+    }
+
+    #[test]
+    fn candidate_to_resolved_is_identity() {
+        let c = ResolvedConnection {
+            display_url: "http://example".to_string(),
+            transport: ResolvedTransport::Http("http://example".to_string()),
+        };
+        let r = candidate_to_resolved(c);
+        assert_eq!(r.display_url, "http://example");
+        assert!(matches!(r.transport, ResolvedTransport::Http(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transport_label_unix_socket() {
+        let c = ResolvedConnection {
+            display_url: "unix:///tmp/x.sock".to_string(),
+            transport: ResolvedTransport::UnixSocket("/tmp/x.sock".to_string()),
+        };
+        assert_eq!(c.transport_label(), "Unix socket");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_server_candidate_unix_is_socket() {
+        let c = default_server_candidate();
+        assert!(matches!(c.transport, ResolvedTransport::UnixSocket(_)));
+        assert!(c.display_url.starts_with("unix://"));
+    }
+
+    #[tokio::test]
+    async fn probe_http_success_non2xx_and_unreachable() {
+        let (url, h) = start_test_http_server(200, None, 200, None).await;
+        assert!(probe_http(&url).await, "200 /health must probe healthy");
+        h.abort();
+
+        let (url5, h5) = start_test_http_server(500, None, 200, None).await;
+        assert!(!probe_http(&url5).await, "500 /health must probe unhealthy");
+        h5.abort();
+
+        let dead = unreachable_url().await;
+        assert!(
+            !probe_http(&dead).await,
+            "unreachable server must probe false"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_tcp_health_variants() {
+        let (url, h) = start_test_http_server(200, Some("4.5.6"), 200, None).await;
+        assert_eq!(query_tcp_health(&url).await.as_deref(), Some("4.5.6"));
+        h.abort();
+
+        let (url_nv, h2) = start_test_http_server(200, None, 200, None).await;
+        assert!(query_tcp_health(&url_nv).await.is_none());
+        h2.abort();
+
+        let (url5, h3) = start_test_http_server(503, Some("1.0.0"), 200, None).await;
+        assert!(query_tcp_health(&url5).await.is_none());
+        h3.abort();
+
+        let dead = unreachable_url().await;
+        assert!(query_tcp_health(&dead).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_candidate_version_http_and_http3() {
+        let (url, h) = start_test_http_server(200, Some("7.8.9"), 200, None).await;
+
+        let c_http = ResolvedConnection {
+            display_url: url.clone(),
+            transport: ResolvedTransport::Http(url.clone()),
+        };
+        assert_eq!(
+            get_candidate_version(&c_http).await.as_deref(),
+            Some("7.8.9")
+        );
+
+        let c_h3 = ResolvedConnection {
+            display_url: url.clone(),
+            transport: ResolvedTransport::Http3(url.clone()),
+        };
+        assert_eq!(get_candidate_version(&c_h3).await.as_deref(), Some("7.8.9"));
+
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn trigger_tcp_restart_variants() {
+        let (url, h) = start_test_http_server(200, None, 200, None).await;
+        assert!(trigger_tcp_restart(&url).await, "200 /restart → true");
+        h.abort();
+
+        let (url5, h2) = start_test_http_server(200, None, 500, None).await;
+        assert!(!trigger_tcp_restart(&url5).await, "500 /restart → false");
+        h2.abort();
+
+        let dead = unreachable_url().await;
+        assert!(
+            !trigger_tcp_restart(&dead).await,
+            "unreachable /restart → false"
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_candidate_restart_http() {
+        let (url, h) = start_test_http_server(200, None, 200, None).await;
+        let c = ResolvedConnection {
+            display_url: url.clone(),
+            transport: ResolvedTransport::Http(url.clone()),
+        };
+        assert!(trigger_candidate_restart(&c).await);
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn probe_candidate_http3_variant() {
+        let (url, h) = start_test_http_server(200, None, 200, None).await;
+        let c = ResolvedConnection {
+            display_url: url.clone(),
+            transport: ResolvedTransport::Http3(url.clone()),
+        };
+        assert!(
+            probe_candidate(&c).await,
+            "Http3 probe delegates to probe_http"
+        );
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn try_upgrade_http3_returns_none_for_non_http_transport() {
+        let c = ResolvedConnection {
+            display_url: "http://x".to_string(),
+            transport: ResolvedTransport::Http3("http://x".to_string()),
+        };
+        assert!(try_upgrade_to_http3(&c).await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn try_upgrade_http3_none_for_unix_transport() {
+        let c = ResolvedConnection {
+            display_url: "unix:///x.sock".to_string(),
+            transport: ResolvedTransport::UnixSocket("/x.sock".to_string()),
+        };
+        assert!(try_upgrade_to_http3(&c).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn try_upgrade_http3_unreachable_http_returns_none() {
+        let dead = unreachable_url().await;
+        let c = ResolvedConnection {
+            display_url: dead.clone(),
+            transport: ResolvedTransport::Http(dead.clone()),
+        };
+        assert!(try_upgrade_to_http3(&c).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn try_upgrade_http3_with_local_cert_present() {
+        let tls_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(tls_dir.path().join("cert.der"), b"dummy_cert").unwrap();
+        std::fs::write(tls_dir.path().join("key.der"), b"dummy_key").unwrap();
+        ahma_common::local_tls::LocalTlsConfig::set_dir_override(tls_dir.path().to_path_buf());
+
+        if !ahma_common::local_tls::LocalTlsConfig::from_env().exists() {
+            eprintln!(
+                "[skip] try_upgrade_http3_with_local_cert_present: TLS dir override not active"
+            );
+            return;
+        }
+
+        let (url, h) = start_test_http_server(200, None, 200, Some("h3=\":443\"")).await;
+        let c = ResolvedConnection {
+            display_url: url.clone(),
+            transport: ResolvedTransport::Http(url.clone()),
+        };
+        let upgraded = try_upgrade_to_http3(&c).await;
+        assert!(
+            upgraded.is_some(),
+            "must upgrade when h3 advertised and cert present"
+        );
+        let upgraded = upgraded.unwrap();
+        assert!(matches!(upgraded.transport, ResolvedTransport::Http3(_)));
+        assert_eq!(upgraded.display_url, url);
+        h.abort();
+
+        let (url2, h2) = start_test_http_server(200, None, 200, None).await;
+        let c2 = ResolvedConnection {
+            display_url: url2.clone(),
+            transport: ResolvedTransport::Http(url2.clone()),
+        };
+        assert!(
+            try_upgrade_to_http3(&c2).await.is_none(),
+            "no upgrade without an h3 Alt-Svc token"
+        );
+        h2.abort();
+
+        let (url3, h3) = start_test_http_server(500, None, 200, Some("h3=\":443\"")).await;
+        let c3 = ResolvedConnection {
+            display_url: url3.clone(),
+            transport: ResolvedTransport::Http(url3.clone()),
+        };
+        assert!(
+            try_upgrade_to_http3(&c3).await.is_none(),
+            "no upgrade when /health is non-2xx"
+        );
+        h3.abort();
+    }
+
+    #[tokio::test]
+    async fn handle_existing_candidate_same_version_returns_some() {
+        let c = ResolvedConnection {
+            display_url: "http://x".to_string(),
+            transport: ResolvedTransport::Http("http://x".to_string()),
+        };
+        let r = handle_existing_candidate(&c, "1.2.3", "1.2.3".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            Some(()),
+            "matching versions must short-circuit to Some(())"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_existing_candidate_client_newer_unreachable_returns_none() {
+        let dead = unreachable_url().await;
+        let c = ResolvedConnection {
+            display_url: dead.clone(),
+            transport: ResolvedTransport::Http(dead.clone()),
+        };
+        let r = handle_existing_candidate(&c, "999.0.0", "0.0.1".to_string())
+            .await
+            .unwrap();
+        assert_eq!(r, None, "client-newer path returns Ok(None)");
+    }
+
+    #[tokio::test]
+    async fn handle_existing_candidate_client_older_with_restart_flag_errors() {
+        unsafe {
+            std::env::set_var("AHMA_RESTARTED", "1");
+        }
+        let c = ResolvedConnection {
+            display_url: "http://x".to_string(),
+            transport: ResolvedTransport::Http("http://x".to_string()),
+        };
+        let r = handle_existing_candidate(&c, "0.0.1", "999.0.0".to_string()).await;
+        unsafe {
+            std::env::remove_var("AHMA_RESTARTED");
+        }
+        assert!(
+            r.is_err(),
+            "older client with AHMA_RESTARTED set must error"
+        );
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("Version mismatch"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn spawn_server_process_nonexistent_exe_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fake = dir.path().join("does_not_exist_ahma_bin");
+        let r = spawn_server_process(&fake, &["serve"]);
+        assert!(r.is_err(), "spawning a nonexistent binary must return Err");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn query_uds_health_live_and_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock = tmp
+            .path()
+            .join("health.sock")
+            .to_string_lossy()
+            .into_owned();
+        let resp = b"HTTP/1.0 200 OK\r\nContent-Length: 19\r\n\r\n{\"version\":\"2.0.0\"}";
+        let server = spawn_uds_once(sock.clone(), resp);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let v = query_uds_health(&sock).await;
+        server.abort();
+        assert_eq!(v.as_deref(), Some("2.0.0"));
+
+        let missing = tmp.path().join("nope.sock").to_string_lossy().into_owned();
+        assert!(query_uds_health(&missing).await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trigger_uds_restart_live_and_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock = tmp
+            .path()
+            .join("restart.sock")
+            .to_string_lossy()
+            .into_owned();
+        let resp = b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let server = spawn_uds_once(sock.clone(), resp);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let ok = trigger_uds_restart(&sock).await;
+        server.abort();
+        assert!(ok, "live UDS returning 200 must report restart success");
+
+        let missing = tmp.path().join("nope.sock").to_string_lossy().into_owned();
+        assert!(
+            !trigger_uds_restart(&missing).await,
+            "missing socket → false"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_candidate_version_and_restart_unix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock = tmp.path().join("uds.sock").to_string_lossy().into_owned();
+        let resp = b"HTTP/1.0 200 OK\r\nContent-Length: 19\r\n\r\n{\"version\":\"3.1.4\"}";
+        let server = spawn_uds_once(sock.clone(), resp);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let c = ResolvedConnection {
+            display_url: format!("unix://{sock}"),
+            transport: ResolvedTransport::UnixSocket(sock.clone()),
+        };
+        let v = get_candidate_version(&c).await;
+        server.abort();
+        assert_eq!(v.as_deref(), Some("3.1.4"), "UDS version dispatch");
+
+        let missing = format!("{}/none.sock", tmp.path().to_string_lossy());
+        let c_missing = ResolvedConnection {
+            display_url: format!("unix://{missing}"),
+            transport: ResolvedTransport::UnixSocket(missing.clone()),
+        };
+        assert!(!trigger_candidate_restart(&c_missing).await);
+    }
 }

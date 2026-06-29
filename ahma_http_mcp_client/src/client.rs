@@ -625,4 +625,295 @@ mod tests {
         // If it is disabled, this will fail to compile.
         let _ = reqwest::Client::builder().http3_prior_knowledge();
     }
+
+    // ── coverage batch: listen_for_callback_async + transport round-trips ──────
+    fn isolated_transport(token_path: &std::path::Path) -> HttpMcpTransport {
+        unsafe {
+            env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap());
+        }
+        let url = Url::parse("http://localhost:8080/mcp").unwrap();
+        HttpMcpTransport::new(url, None, None).unwrap()
+    }
+
+    async fn drive_callback_client(request_line: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = {
+            let mut attempt = 0;
+            loop {
+                match tokio::net::TcpStream::connect("127.0.0.1:8080").await {
+                    Ok(s) => break s,
+                    Err(_) if attempt < 200 => {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(e) => panic!("failed to connect to loopback listener: {e}"),
+                }
+            }
+        };
+        stream.write_all(request_line.as_bytes()).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf).await;
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    // The OAuth callback listener binds the fixed production port 127.0.0.1:8080,
+    // so these three scenarios cannot run concurrently (nextest schedules each
+    // #[test] in its own process, and an in-process mutex can't serialize across
+    // processes). They are folded into one sequential test: each call drops its
+    // listener before the next binds, and tokio sets SO_REUSEADDR so rebinding
+    // 8080 in turn succeeds.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn listen_for_callback_async_scenarios() {
+        let _guard = token_env_guard().lock().unwrap();
+        let tmp = tempdir().unwrap();
+
+        // 1. Happy path: both code and state present.
+        {
+            let transport = isolated_transport(&tmp.path().join("listen_ok.json"));
+            let server_fut = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                transport.listen_for_callback_async(),
+            );
+            let client_fut = drive_callback_client(
+                "GET /?code=the_code&state=the_state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            );
+            let (server_res, response) = tokio::join!(server_fut, client_fut);
+            let (code, state) = server_res
+                .expect("listener should not time out")
+                .expect("listener should return Ok with code/state");
+            assert_eq!(code, "the_code");
+            assert_eq!(state.secret(), "the_state");
+            assert!(response.contains("200 OK"), "response was: {response:?}");
+            assert!(
+                response.contains("Authentication successful"),
+                "response was: {response:?}"
+            );
+        }
+
+        // 2. Missing code → error.
+        {
+            let transport = isolated_transport(&tmp.path().join("listen_no_code.json"));
+            let server_fut = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                transport.listen_for_callback_async(),
+            );
+            let client_fut =
+                drive_callback_client("GET /?state=only_state HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let (server_res, _response) = tokio::join!(server_fut, client_fut);
+            let err = server_res
+                .expect("listener should not time out")
+                .expect_err("listener should error when code is missing");
+            assert!(
+                err.to_string().contains("Missing auth code"),
+                "unexpected error: {err}"
+            );
+        }
+
+        // 3. Missing state → error.
+        {
+            let transport = isolated_transport(&tmp.path().join("listen_no_state.json"));
+            let server_fut = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                transport.listen_for_callback_async(),
+            );
+            let client_fut =
+                drive_callback_client("GET /?code=only_code HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let (server_res, _response) = tokio::join!(server_fut, client_fut);
+            let err = server_res
+                .expect("listener should not time out")
+                .expect_err("listener should error when state is missing");
+            assert!(
+                err.to_string().contains("Missing state"),
+                "unexpected error: {err}"
+            );
+        }
+
+        unsafe {
+            env::remove_var(TOKEN_PATH_ENV);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ensure_authenticated_short_circuits_with_stored_token() {
+        let _guard = token_env_guard().lock().unwrap();
+        let tmp = tempdir().unwrap();
+        let token_path = tmp.path().join("stored.json");
+        unsafe {
+            env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap());
+        }
+
+        let token = StoredToken {
+            access_token: "stored_access".to_string(),
+            refresh_token: Some("r".to_string()),
+            expires_in: Some(3600),
+            scopes: Some(vec!["read:me".to_string()]),
+        };
+        save_token(&token).unwrap();
+
+        let url = Url::parse("http://localhost:8080/mcp").unwrap();
+        let transport = HttpMcpTransport::new(url, None, None).unwrap();
+
+        let result = transport.ensure_authenticated().await;
+        assert!(
+            result.is_ok(),
+            "ensure_authenticated should short-circuit with a stored token: {result:?}"
+        );
+
+        assert!(transport.ensure_authenticated().await.is_ok());
+
+        unsafe {
+            env::remove_var(TOKEN_PATH_ENV);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn send_receive_round_trip_with_stored_token() {
+        use rmcp::service::TxJsonRpcMessage;
+        use rmcp::transport::Transport;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = token_env_guard().lock().unwrap();
+        let tmp = tempdir().unwrap();
+        let token_path = tmp.path().join("send_token.json");
+        unsafe {
+            env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap());
+        }
+        let token = StoredToken {
+            access_token: "round_trip_token".to_string(),
+            refresh_token: None,
+            expires_in: Some(3600),
+            scopes: None,
+        };
+        save_token(&token).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "marker": "pong_42" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
+        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
+
+        let request: TxJsonRpcMessage<RoleClient> = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping",
+            "params": {}
+        }))
+        .unwrap();
+
+        transport.send(request).await.expect("send should succeed");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), transport.receive())
+            .await
+            .expect("receive should not time out")
+            .expect("a response should be queued");
+        let received_str = serde_json::to_string(&received).unwrap();
+        assert!(
+            received_str.contains("pong_42"),
+            "received message did not match: {received_str}"
+        );
+
+        unsafe {
+            env::remove_var(TOKEN_PATH_ENV);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn send_without_token_yields_missing_access_token() {
+        use rmcp::service::TxJsonRpcMessage;
+        use rmcp::transport::Transport;
+
+        let _guard = token_env_guard().lock().unwrap();
+        let tmp = tempdir().unwrap();
+        let mut transport = isolated_transport(&tmp.path().join("absent.json"));
+
+        let request: TxJsonRpcMessage<RoleClient> = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .unwrap();
+
+        let err = transport
+            .send(request)
+            .await
+            .expect_err("send must fail without an access token");
+        assert!(
+            err.to_string().contains("Missing access token"),
+            "unexpected error: {err}"
+        );
+
+        unsafe {
+            env::remove_var(TOKEN_PATH_ENV);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn send_propagates_http_error_status() {
+        use rmcp::service::TxJsonRpcMessage;
+        use rmcp::transport::Transport;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _guard = token_env_guard().lock().unwrap();
+        let tmp = tempdir().unwrap();
+        let token_path = tmp.path().join("err_token.json");
+        unsafe {
+            env::set_var(TOKEN_PATH_ENV, token_path.to_str().unwrap());
+        }
+        let token = StoredToken {
+            access_token: "any".to_string(),
+            refresh_token: None,
+            expires_in: None,
+            scopes: None,
+        };
+        save_token(&token).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = Url::parse(&format!("{}/mcp", server.uri())).unwrap();
+        let mut transport = HttpMcpTransport::new(url, None, None).unwrap();
+
+        let request: TxJsonRpcMessage<RoleClient> = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping",
+            "params": {}
+        }))
+        .unwrap();
+
+        let err = transport
+            .send(request)
+            .await
+            .expect_err("send must surface a non-2xx HTTP status");
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP Error"), "unexpected error: {msg}");
+        assert!(msg.contains("500"), "error should include status: {msg}");
+
+        unsafe {
+            env::remove_var(TOKEN_PATH_ENV);
+        }
+    }
 }

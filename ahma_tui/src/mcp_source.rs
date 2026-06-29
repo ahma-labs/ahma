@@ -1174,4 +1174,767 @@ mod tests {
         assert!(msg.contains("409"));
         assert!(msg.contains("sandbox"));
     }
+
+    // ── coverage batch: SSE/parse helpers + axum-mocked HTTP calls ─────────────
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use tokio::sync::oneshot;
+
+    async fn spawn_test_server(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let port = listener.local_addr().expect("local_addr").port();
+        let base = format!("http://127.0.0.1:{port}");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        (base, handle)
+    }
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client build")
+    }
+
+    #[derive(Clone)]
+    struct RecState {
+        tx: tokio::sync::mpsc::UnboundedSender<Value>,
+    }
+
+    async fn record_handler(State(st): State<RecState>, Json(body): Json<Value>) -> StatusCode {
+        let _ = st.tx.send(body);
+        StatusCode::OK
+    }
+
+    #[test]
+    fn mcp_boundary_lf_only() {
+        assert_eq!(first_sse_event_boundary("a\n\nb"), Some((1, 2)));
+    }
+
+    #[test]
+    fn mcp_boundary_crlf_only() {
+        assert_eq!(first_sse_event_boundary("a\r\n\r\nb"), Some((1, 4)));
+    }
+
+    #[test]
+    fn mcp_boundary_lf_before_crlf() {
+        assert_eq!(first_sse_event_boundary("a\n\nb\r\n\r\n"), Some((1, 2)));
+    }
+
+    #[test]
+    fn mcp_boundary_crlf_before_lf() {
+        assert_eq!(first_sse_event_boundary("ab\r\n\r\nc\n\nd"), Some((2, 4)));
+    }
+
+    #[test]
+    fn mcp_boundary_none() {
+        assert_eq!(first_sse_event_boundary("abc"), None);
+    }
+
+    #[test]
+    fn mcp_event_data_multiline_join() {
+        // Two `data:` lines are concatenated with '\n' before JSON parsing.
+        let raw = "data: {\"x\":\ndata: 5}";
+        let v = event_data_to_json(raw).expect("multiline data joins into valid json");
+        assert_eq!(v["x"].as_i64(), Some(5));
+    }
+
+    #[test]
+    fn mcp_event_data_empty_returns_none() {
+        assert!(event_data_to_json("").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_encode_file_uri_relative() {
+        let uri = encode_file_uri(std::path::Path::new("foo/bar"));
+        assert_eq!(uri, "file://foo/bar");
+    }
+
+    #[test]
+    fn mcp_session_id_and_req_id_sequence() {
+        let s = McpSession::new("sess-xyz");
+        assert_eq!(s.id(), "sess-xyz");
+        assert_eq!(s.next_req_id(), 10);
+        assert_eq!(s.next_req_id(), 11);
+        assert_eq!(s.next_req_id(), 12);
+    }
+
+    #[test]
+    fn mcp_status_call_error_403_401_404_other() {
+        let m403 = format!(
+            "{:#}",
+            status_call_error("u", reqwest::StatusCode::FORBIDDEN)
+        );
+        assert!(m403.contains("forbidden"), "{m403}");
+        let m401 = format!(
+            "{:#}",
+            status_call_error("u", reqwest::StatusCode::UNAUTHORIZED)
+        );
+        assert!(m401.contains("unauthorized"), "{m401}");
+        let m404 = format!(
+            "{:#}",
+            status_call_error("u", reqwest::StatusCode::NOT_FOUND)
+        );
+        assert!(m404.contains("session not found"), "{m404}");
+        let m500 = format!(
+            "{:#}",
+            status_call_error("u", reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert!(m500.contains("unexpected"), "{m500}");
+    }
+
+    #[test]
+    fn mcp_extract_http_base_url_http_and_http3() {
+        let http = ResolvedConnection {
+            display_url: "d".to_string(),
+            transport: ResolvedTransport::Http("http://h:1234".to_string()),
+        };
+        assert_eq!(extract_http_base_url(&http), "http://h:1234");
+
+        let http3 = ResolvedConnection {
+            display_url: "d".to_string(),
+            transport: ResolvedTransport::Http3("http://h:5678".to_string()),
+        };
+        assert_eq!(extract_http_base_url(&http3), "http://h:5678");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mcp_extract_http_base_url_unix_socket_default() {
+        if std::env::var("AHMA_HTTP_URL").is_ok() {
+            return;
+        }
+        let conn = ResolvedConnection {
+            display_url: "d".to_string(),
+            transport: ResolvedTransport::UnixSocket("/run/ahma.sock".to_string()),
+        };
+        assert_eq!(extract_http_base_url(&conn), "unix:///run/ahma.sock");
+    }
+
+    #[test]
+    fn mcp_parse_op_status_all_variants() {
+        let cases = [
+            ("running", OpStatus::Running),
+            ("inprogress", OpStatus::Running),
+            ("in_progress", OpStatus::Running),
+            ("pending", OpStatus::Pending),
+            ("succeeded", OpStatus::Succeeded),
+            ("success", OpStatus::Succeeded),
+            ("completed", OpStatus::Succeeded),
+            ("done", OpStatus::Succeeded),
+            ("failed", OpStatus::Failed),
+            ("error", OpStatus::Failed),
+            ("cancelled", OpStatus::Cancelled),
+            ("canceled", OpStatus::Cancelled),
+            ("waiting", OpStatus::Waiting),
+            ("waiting_dependency", OpStatus::Waiting),
+            ("SUCCEEDED", OpStatus::Succeeded),
+            ("weird-unknown", OpStatus::Running),
+        ];
+        for (s, expected) in cases {
+            let v = json!({ "status": s });
+            assert_eq!(parse_op_status(&v), expected, "status={s}");
+        }
+    }
+
+    #[test]
+    fn mcp_parse_op_status_state_fallback_and_missing() {
+        assert_eq!(
+            parse_op_status(&json!({ "state": "failed" })),
+            OpStatus::Failed
+        );
+        assert_eq!(parse_op_status(&json!({})), OpStatus::Running);
+    }
+
+    #[test]
+    fn mcp_parse_op_times_start_and_end() {
+        let start = chrono::Local::now() - chrono::Duration::seconds(10);
+        let end = start + chrono::Duration::milliseconds(5000);
+        let v = json!({
+            "start_time": start.to_rfc3339(),
+            "end_time": end.to_rfc3339(),
+        });
+        let mut op = Operation::new("id", "tool", OpStatus::Succeeded);
+        parse_op_times(&v, &mut op);
+        assert_eq!(op.duration_ms, Some(5000));
+        assert!(op.started_at.is_some());
+        assert!(op.completed_at.is_some());
+    }
+
+    #[test]
+    fn mcp_parse_op_times_start_only() {
+        let start = chrono::Local::now() - chrono::Duration::seconds(3);
+        let v = json!({ "start_time": start.to_rfc3339() });
+        let mut op = Operation::new("id", "tool", OpStatus::Running);
+        parse_op_times(&v, &mut op);
+        assert!(op.started_at.is_some());
+        assert!(op.duration_ms.is_none());
+    }
+
+    #[test]
+    fn mcp_parse_op_times_none() {
+        let mut op = Operation::new("id", "tool", OpStatus::Running);
+        parse_op_times(&json!({}), &mut op);
+        assert!(op.duration_ms.is_none());
+    }
+
+    #[test]
+    fn mcp_parse_op_times_end_before_start_no_duration() {
+        let start = chrono::Local::now() - chrono::Duration::seconds(3);
+        let end = start - chrono::Duration::seconds(2);
+        let v = json!({
+            "start_time": start.to_rfc3339(),
+            "end_time": end.to_rfc3339(),
+        });
+        let mut op = Operation::new("id", "tool", OpStatus::Running);
+        parse_op_times(&v, &mut op);
+        assert!(op.duration_ms.is_none());
+    }
+
+    #[test]
+    fn mcp_parse_operations_empty_and_non_array() {
+        assert!(parse_operations(&json!({})).is_empty());
+        assert!(parse_operations(&json!({ "result": { "content": "nope" } })).is_empty());
+    }
+
+    #[test]
+    fn mcp_parse_operations_full_op() {
+        let op_text = json!({
+            "id": "op-1",
+            "tool": "cargo_build",
+            "status": "running",
+            "cwd": "/work/x",
+            "description": "build it",
+            "stdout_tail": ["line1", "line2"],
+            "alerts": ["alert-a"],
+        })
+        .to_string();
+        let val = json!({
+            "result": { "content": [ { "type": "text", "text": op_text } ] }
+        });
+        let ops = parse_operations(&val);
+        assert_eq!(ops.len(), 1);
+        let op = &ops[0];
+        assert_eq!(op.id, "op-1");
+        assert_eq!(op.tool_name, "cargo_build");
+        assert_eq!(op.status, OpStatus::Running);
+        assert_eq!(op.cwd.as_deref(), Some("/work/x"));
+        assert_eq!(op.description, "build it");
+        assert!(op.stdout_tail.iter().any(|s| s == "line1"));
+        assert!(op.alerts.iter().any(|s| s == "alert-a"));
+    }
+
+    #[test]
+    fn mcp_parse_operations_tool_name_fallback_and_default() {
+        let aliased =
+            json!({ "id": "a", "tool_name": "npm_install", "status": "pending" }).to_string();
+        let unknown = json!({ "id": "b", "status": "done" }).to_string();
+        let val = json!({
+            "result": { "content": [
+                { "text": aliased },
+                { "text": unknown },
+            ] }
+        });
+        let ops = parse_operations(&val);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].tool_name, "npm_install");
+        assert_eq!(ops[0].status, OpStatus::Pending);
+        assert_eq!(ops[1].tool_name, "unknown");
+        assert_eq!(ops[1].status, OpStatus::Succeeded);
+    }
+
+    #[test]
+    fn mcp_parse_operations_skips_malformed_items() {
+        let valid = json!({ "id": "ok", "tool": "t", "status": "running" }).to_string();
+        let val = json!({
+            "result": { "content": [
+                { "text": "not-json-at-all" },
+                { "text": "[1,2,3]" },
+                { "text": "{\"tool\":\"x\"}" },
+                { "text": valid },
+            ] }
+        });
+        let ops = parse_operations(&val);
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].id, "ok");
+    }
+
+    #[tokio::test]
+    async fn mcp_check_health_ok() {
+        let router = Router::new().route("/health", get(|| async { StatusCode::OK }));
+        let (base, handle) = spawn_test_server(router).await;
+        let client = test_client();
+        assert!(check_health(&client, &base).await);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_check_health_non_2xx_is_false() {
+        let router = Router::new().route(
+            "/health",
+            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let (base, handle) = spawn_test_server(router).await;
+        let client = test_client();
+        assert!(!check_health(&client, &base).await);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_check_health_unreachable_is_false() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let base = format!("http://127.0.0.1:{port}");
+        let client = test_client();
+        assert!(!check_health(&client, &base).await);
+    }
+
+    #[tokio::test]
+    async fn mcp_call_tools_list_parses_and_filters() {
+        async fn handler(Json(_b): Json<Value>) -> Response {
+            Json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": { "tools": [
+                    { "name": "alpha", "description": "d", "inputSchema": {"type":"object"} },
+                    { "name": "beta" },
+                    { "description": "no name here" }
+                ] }
+            }))
+            .into_response()
+        }
+        let router = Router::new().route("/mcp", post(handler));
+        let (base, handle) = spawn_test_server(router).await;
+        let session = McpSession::new("s");
+        let tools = call_tools_list(&test_client(), &base, &session)
+            .await
+            .expect("tools list ok");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "alpha");
+        assert_eq!(tools[0].description.as_deref(), Some("d"));
+        assert_eq!(tools[1].name, "beta");
+        assert!(tools[1].description.is_none());
+        assert_eq!(tools[1].input_schema["type"], "object");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_call_tools_list_missing_result_is_empty() {
+        async fn handler(Json(_b): Json<Value>) -> Response {
+            Json(json!({ "jsonrpc": "2.0", "id": 1, "result": null })).into_response()
+        }
+        let router = Router::new().route("/mcp", post(handler));
+        let (base, handle) = spawn_test_server(router).await;
+        let session = McpSession::new("s");
+        let tools = call_tools_list(&test_client(), &base, &session)
+            .await
+            .expect("ok");
+        assert!(tools.is_empty());
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_call_status_ready() {
+        async fn handler(Json(_b): Json<Value>) -> Response {
+            let op = json!({ "id": "op9", "tool": "t", "status": "running" }).to_string();
+            Json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": { "content": [ { "type": "text", "text": op } ] }
+            }))
+            .into_response()
+        }
+        let router = Router::new().route("/mcp", post(handler));
+        let (base, handle) = spawn_test_server(router).await;
+        let session = McpSession::new("s");
+        let poll = call_status(&test_client(), &base, &session)
+            .await
+            .expect("status ok");
+        match poll {
+            StatusPoll::Ready(ops) => {
+                assert_eq!(ops.len(), 1);
+                assert_eq!(ops[0].id, "op9");
+            }
+            StatusPoll::Initializing => panic!("expected Ready"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_call_status_conflict_is_initializing() {
+        let router = Router::new().route("/mcp", post(|| async { StatusCode::CONFLICT }));
+        let (base, handle) = spawn_test_server(router).await;
+        let session = McpSession::new("s");
+        let poll = call_status(&test_client(), &base, &session)
+            .await
+            .expect("conflict maps to Initializing");
+        assert!(matches!(poll, StatusPoll::Initializing));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_call_status_forbidden_is_error() {
+        let router = Router::new().route("/mcp", post(|| async { StatusCode::FORBIDDEN }));
+        let (base, handle) = spawn_test_server(router).await;
+        let session = McpSession::new("s");
+        let err = match call_status(&test_client(), &base, &session).await {
+            Ok(_) => panic!("403 must error"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("forbidden"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_call_logs_list_success() {
+        async fn handler(Json(_b): Json<Value>) -> Response {
+            let files = json!([{
+                "name": "a.log", "path": "/x/a.log", "size_bytes": 10,
+                "modified": null, "is_symlink": false,
+                "symlink_target": null, "is_approved": true
+            }])
+            .to_string();
+            Json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": { "content": [ { "type": "text", "text": files } ] }
+            }))
+            .into_response()
+        }
+        let router = Router::new().route("/mcp", post(handler));
+        let (base, handle) = spawn_test_server(router).await;
+        let session = McpSession::new("s");
+        let files = call_logs_list(&test_client(), &base, &session)
+            .await
+            .expect("logs_list ok");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "a.log");
+        assert!(files[0].is_approved);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_call_logs_list_error_field() {
+        async fn handler(Json(_b): Json<Value>) -> Response {
+            Json(json!({ "jsonrpc": "2.0", "id": 1, "error": { "message": "boom" } }))
+                .into_response()
+        }
+        let router = Router::new().route("/mcp", post(handler));
+        let (base, handle) = spawn_test_server(router).await;
+        let session = McpSession::new("s");
+        let err = call_logs_list(&test_client(), &base, &session)
+            .await
+            .expect_err("error field must surface");
+        assert!(format!("{err:#}").contains("boom"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_call_logs_list_missing_content() {
+        async fn handler(Json(_b): Json<Value>) -> Response {
+            Json(json!({ "jsonrpc": "2.0", "id": 1, "result": {} })).into_response()
+        }
+        let router = Router::new().route("/mcp", post(handler));
+        let (base, handle) = spawn_test_server(router).await;
+        let session = McpSession::new("s");
+        let err = call_logs_list(&test_client(), &base, &session)
+            .await
+            .expect_err("missing content must error");
+        assert!(format!("{err:#}").contains("Invalid response format"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_call_logs_read_success() {
+        async fn handler(Json(_b): Json<Value>) -> Response {
+            Json(json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": { "content": [ { "type": "text", "text": "line1\nline2" } ] }
+            }))
+            .into_response()
+        }
+        let router = Router::new().route("/mcp", post(handler));
+        let (base, handle) = spawn_test_server(router).await;
+        let session = McpSession::new("s");
+        let text = call_logs_read(&test_client(), &base, &session, "a.log", 0, 100)
+            .await
+            .expect("logs_read ok");
+        assert_eq!(text, "line1\nline2");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_call_logs_read_error_field() {
+        async fn handler(Json(_b): Json<Value>) -> Response {
+            Json(json!({ "jsonrpc": "2.0", "id": 1, "error": { "message": "nope" } }))
+                .into_response()
+        }
+        let router = Router::new().route("/mcp", post(handler));
+        let (base, handle) = spawn_test_server(router).await;
+        let session = McpSession::new("s");
+        let err = call_logs_read(&test_client(), &base, &session, "a.log", 0, 100)
+            .await
+            .expect_err("error field must surface");
+        assert!(format!("{err:#}").contains("nope"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_call_logs_read_missing_content() {
+        async fn handler(Json(_b): Json<Value>) -> Response {
+            Json(json!({ "jsonrpc": "2.0", "id": 1, "result": {} })).into_response()
+        }
+        let router = Router::new().route("/mcp", post(handler));
+        let (base, handle) = spawn_test_server(router).await;
+        let session = McpSession::new("s");
+        let err = call_logs_read(&test_client(), &base, &session, "a.log", 0, 100)
+            .await
+            .expect_err("missing content must error");
+        assert!(format!("{err:#}").contains("Invalid response format"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_handle_sse_event_sandbox_failed() {
+        let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
+        let client = test_client();
+        let value = json!({
+            "method": "notifications/sandbox/failed",
+            "params": { "error": "scope locked" }
+        });
+        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
+            .await
+            .expect("ok");
+        match rx.try_recv().expect("event emitted") {
+            SourceEvent::SandboxStatus { status } => assert_eq!(status, "FAILED"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_handle_sse_event_sandbox_configured() {
+        let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
+        let client = test_client();
+        let value = json!({ "method": "notifications/sandbox/configured" });
+        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
+            .await
+            .expect("ok");
+        match rx.try_recv().expect("event emitted") {
+            SourceEvent::SandboxStatus { status } => assert_eq!(status, "LOCKED"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_handle_sse_event_other_method_noop() {
+        let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
+        let client = test_client();
+        let value = json!({ "method": "notifications/progress" });
+        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
+            .await
+            .expect("ok");
+        assert!(rx.try_recv().is_err(), "no event should be emitted");
+    }
+
+    #[tokio::test]
+    async fn mcp_handle_sse_event_roots_list_missing_id_errors() {
+        let (tx, _rx) = mpsc::channel::<SourceEvent>(8);
+        let client = test_client();
+        let value = json!({ "method": "roots/list" });
+        let err = handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
+            .await
+            .expect_err("missing id must error");
+        assert!(format!("{err:#}").contains("must include id"));
+    }
+
+    #[tokio::test]
+    async fn mcp_handle_sse_event_roots_list_posts_reply() {
+        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let state = RecState { tx: rec_tx };
+        let router = Router::new()
+            .route("/mcp", post(record_handler))
+            .with_state(state);
+        let (base, handle) = spawn_test_server(router).await;
+        let mcp_url = format!("{base}/mcp");
+
+        let (tx, _rx) = mpsc::channel::<SourceEvent>(8);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let value = json!({ "jsonrpc": "2.0", "id": 7, "method": "roots/list", "params": {} });
+
+        handle_sse_event(
+            &test_client(),
+            &mcp_url,
+            &value,
+            "sid-1",
+            Some(tmp.path()),
+            &tx,
+        )
+        .await
+        .expect("roots/list handled");
+
+        let recorded = rec_rx.try_recv().expect("roots reply posted");
+        assert_eq!(recorded["id"], json!(7));
+        assert!(recorded["result"]["roots"].is_array());
+        let uri = recorded["result"]["roots"][0]["uri"].as_str().unwrap();
+        assert!(uri.starts_with("file://"), "uri={uri}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_run_sse_listener_processes_event_and_signals_ready() {
+        async fn sse_roots_body() -> Response {
+            let body =
+                "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"roots/list\",\"params\":{}}\n\n";
+            (
+                StatusCode::OK,
+                [("content-type", "text/event-stream")],
+                body,
+            )
+                .into_response()
+        }
+        let (rec_tx, mut rec_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let state = RecState { tx: rec_tx };
+        let router = Router::new()
+            .route("/mcp", get(sse_roots_body).post(record_handler))
+            .with_state(state);
+        let (base, handle) = spawn_test_server(router).await;
+        let sse_url = format!("{base}/mcp");
+
+        let (tx, _rx) = mpsc::channel::<SourceEvent>(8);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        run_sse_listener(
+            test_client(),
+            test_client(),
+            sse_url,
+            "sid-2".to_string(),
+            Some(tmp.path().to_path_buf()),
+            tx,
+            Some(ready_tx),
+        )
+        .await
+        .expect("listener completes ok");
+
+        assert!(ready_rx.await.is_ok(), "ready signal fired");
+        let recorded = rec_rx.try_recv().expect("roots reply posted by listener");
+        assert_eq!(recorded["id"], json!(7));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_run_sse_listener_non_2xx_errors() {
+        let router =
+            Router::new().route("/mcp", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
+        let (base, handle) = spawn_test_server(router).await;
+        let sse_url = format!("{base}/mcp");
+        let (tx, _rx) = mpsc::channel::<SourceEvent>(8);
+
+        let err = run_sse_listener(
+            test_client(),
+            test_client(),
+            sse_url,
+            "sid-3".to_string(),
+            None,
+            tx,
+            None,
+        )
+        .await
+        .expect_err("non-2xx SSE must error");
+        assert!(format!("{err:#}").contains("SSE stream failed"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_init_session_success() {
+        async fn post_handler(Json(body): Json<Value>) -> Response {
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            if method == "initialize" {
+                let mut headers = HeaderMap::new();
+                headers.insert("mcp-session-id", "session-ok".parse().unwrap());
+                (
+                    StatusCode::OK,
+                    headers,
+                    Json(json!({ "jsonrpc": "2.0", "id": 1, "result": {} })),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(json!({ "jsonrpc": "2.0", "result": null })),
+                )
+                    .into_response()
+            }
+        }
+        async fn sse_handler() -> Response {
+            (StatusCode::OK, [("content-type", "text/event-stream")], "").into_response()
+        }
+        let router = Router::new().route("/mcp", post(post_handler).get(sse_handler));
+        let (base, handle) = spawn_test_server(router).await;
+        let (tx, mut rx) = mpsc::channel::<SourceEvent>(16);
+
+        let session = init_mcp_session(&test_client(), &reqwest::Client::new(), &base, None, tx)
+            .await
+            .expect("handshake succeeds");
+        assert_eq!(session.id(), "session-ok");
+        match rx.try_recv().expect("status event") {
+            SourceEvent::SandboxStatus { status } => assert_eq!(status, "INITIALIZING"),
+            other => panic!("unexpected first event: {other:?}"),
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_init_session_missing_session_id_errors() {
+        async fn post_handler(Json(_b): Json<Value>) -> Response {
+            Json(json!({ "jsonrpc": "2.0", "id": 1, "result": {} })).into_response()
+        }
+        let router = Router::new().route("/mcp", post(post_handler));
+        let (base, handle) = spawn_test_server(router).await;
+        let (tx, _rx) = mpsc::channel::<SourceEvent>(16);
+
+        let err = match init_mcp_session(&test_client(), &reqwest::Client::new(), &base, None, tx)
+            .await
+        {
+            Ok(_) => panic!("missing session id must error"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("no mcp-session-id"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_init_session_sse_failure_aborts_handshake() {
+        async fn post_handler(Json(body): Json<Value>) -> Response {
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            if method == "initialize" {
+                let mut headers = HeaderMap::new();
+                headers.insert("mcp-session-id", "session-x".parse().unwrap());
+                (StatusCode::OK, headers, Json(json!({ "result": {} }))).into_response()
+            } else {
+                (StatusCode::OK, Json(json!({ "result": null }))).into_response()
+            }
+        }
+        let router = Router::new().route(
+            "/mcp",
+            post(post_handler).get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+        );
+        let (base, handle) = spawn_test_server(router).await;
+        let (tx, _rx) = mpsc::channel::<SourceEvent>(16);
+
+        let err = match init_mcp_session(&test_client(), &reqwest::Client::new(), &base, None, tx)
+            .await
+        {
+            Ok(_) => panic!("SSE failure must abort handshake"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("SSE stream failed to open"));
+        handle.abort();
+    }
 }
