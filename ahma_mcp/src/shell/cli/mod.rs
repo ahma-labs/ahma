@@ -1887,6 +1887,10 @@ pub struct LlmAddArgs {
     /// Optional API key. Use \${ENV_VAR} notation to reference an environment variable.
     #[arg(long)]
     pub api_key: Option<String>,
+    /// Optional context-window size in tokens (Ollama only; sent as
+    /// `options.num_ctx`). Ignored by hosted clouds that pin context to the model.
+    #[arg(long)]
+    pub num_ctx: Option<u32>,
 }
 
 /// Arguments for `ahma llm test`.

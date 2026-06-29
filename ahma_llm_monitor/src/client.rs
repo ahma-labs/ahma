@@ -177,6 +177,9 @@ pub struct LlmClient {
     flavor: ApiFlavor,
     /// Anthropic only: send `thinking: {type: "adaptive"}` on chat/tool turns.
     thinking: bool,
+    /// Optional context-window override (tokens). Sent to Ollama as
+    /// `options.num_ctx`; ignored for non-Ollama OpenAI endpoints and Anthropic.
+    num_ctx: Option<u32>,
 }
 
 impl LlmClient {
@@ -216,6 +219,38 @@ impl LlmClient {
             flavor,
             // Adaptive thinking is on by default for Anthropic chat/tool turns.
             thinking: flavor == ApiFlavor::Anthropic,
+            num_ctx: None,
+        }
+    }
+
+    /// Set the context-window override (tokens). Only sent to Ollama endpoints;
+    /// see [`ahma_common::config::endpoint_supports_num_ctx`].
+    pub fn with_num_ctx(mut self, num_ctx: Option<u32>) -> Self {
+        self.num_ctx = num_ctx;
+        self
+    }
+
+    /// Whether this client will actually send a `num_ctx` override on requests
+    /// (i.e. one is configured *and* the endpoint is Ollama).
+    pub fn sends_num_ctx(&self) -> bool {
+        self.num_ctx.is_some()
+            && ahma_common::config::endpoint_supports_num_ctx(
+                &self.base_url,
+                match self.flavor {
+                    ApiFlavor::OpenAi => ahma_common::config::ProviderKind::OpenAi,
+                    ApiFlavor::Anthropic => ahma_common::config::ProviderKind::Anthropic,
+                },
+            )
+    }
+
+    /// Inject `options.num_ctx` into an OpenAI-compatible request body when a
+    /// context override is configured and the endpoint is Ollama. No-op
+    /// otherwise, so hosted clouds never see an unknown field.
+    fn apply_num_ctx(&self, body: &mut Value) {
+        if let Some(n) = self.num_ctx
+            && self.sends_num_ctx()
+        {
+            body["options"] = json!({ "num_ctx": n });
         }
     }
 
@@ -255,6 +290,7 @@ impl LlmClient {
             provider.api_key.clone(),
         )
         .with_flavor(flavor)
+        .with_num_ctx(provider.num_ctx)
     }
 
     /// The wire-format flavor this client speaks.
@@ -389,10 +425,11 @@ impl LlmClient {
         use futures::stream;
 
         let (url, body) = match self.flavor {
-            ApiFlavor::OpenAi => (
-                format!("{}/chat/completions", self.base_url),
-                build_chat_stream_body(&self.model, &messages, system_prompt),
-            ),
+            ApiFlavor::OpenAi => {
+                let mut body = build_chat_stream_body(&self.model, &messages, system_prompt);
+                self.apply_num_ctx(&mut body);
+                (format!("{}/chat/completions", self.base_url), body)
+            }
             ApiFlavor::Anthropic => {
                 let mut openai_msgs: Vec<Value> = Vec::with_capacity(messages.len() + 1);
                 if let Some(sys) = system_prompt {
@@ -480,6 +517,7 @@ impl LlmClient {
                     body["tools"] = Value::Array(tools.to_vec());
                     body["tool_choice"] = json!("auto");
                 }
+                self.apply_num_ctx(&mut body);
                 (format!("{}/chat/completions", self.base_url), body)
             }
             ApiFlavor::Anthropic => {
@@ -500,6 +538,16 @@ impl LlmClient {
             }
         };
 
+        let started = std::time::Instant::now();
+        info!(
+            model = %self.model,
+            messages = messages.len(),
+            tools = tools.len(),
+            stream = false,
+            timeout_secs = 120,
+            "llm: requesting chat completion with tools (non-streaming)"
+        );
+
         let request = self.apply_auth(
             self.http
                 .post(url)
@@ -507,10 +555,31 @@ impl LlmClient {
                 .timeout(Duration::from_secs(120)),
         );
 
-        let response = request.send().await.map_err(LlmMonitorError::Http)?;
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let elapsed_ms = started.elapsed().as_millis();
+                if e.is_timeout() {
+                    warn!(
+                        model = %self.model,
+                        elapsed_ms,
+                        "llm: chat completion timed out (120s) — model too slow, or prompt exceeds its context window and it is still generating"
+                    );
+                } else {
+                    warn!(model = %self.model, elapsed_ms, error = %e, "llm: chat completion request failed");
+                }
+                return Err(LlmMonitorError::Http(e));
+            }
+        };
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
+            warn!(
+                model = %self.model,
+                status = %status,
+                body = %body_text,
+                "llm: HTTP error from chat completion endpoint"
+            );
             return Err(LlmMonitorError::Parse(format!(
                 "HTTP {status}: {body_text}"
             )));
@@ -520,10 +589,169 @@ impl LlmClient {
             .json::<Value>()
             .await
             .map_err(LlmMonitorError::Http)?;
-        match self.flavor {
+        let parsed = match self.flavor {
             ApiFlavor::OpenAi => parse_chat_completion_response(json),
             ApiFlavor::Anthropic => anthropic::parse_messages_response(json),
+        };
+        if let Ok(ref resp) = parsed {
+            let (prompt_tokens, completion_tokens) = resp
+                .usage
+                .as_ref()
+                .map(|u| (u.prompt_tokens, u.completion_tokens))
+                .unwrap_or((0, 0));
+            info!(
+                model = %self.model,
+                elapsed_ms = started.elapsed().as_millis(),
+                content_chars = resp.content.len(),
+                tool_calls = resp.tool_calls.len(),
+                prompt_tokens,
+                completion_tokens,
+                "llm: chat completion received"
+            );
         }
+        parsed
+    }
+
+    /// Streaming variant of [`Self::chat_completion_with_tools`].
+    ///
+    /// Sends `stream: true` and forwards visible/reasoning fragments through
+    /// `deltas` as they arrive, while accumulating the full assistant turn
+    /// (visible content + any tool calls) and returning it once the stream
+    /// completes. This gives the TUI a live "is it actually working" signal and
+    /// lets it surface reasoning tokens, instead of blocking on one opaque
+    /// 120-second request.
+    ///
+    /// Only the OpenAI flavor streams here; Anthropic falls back to the
+    /// non-streaming path (its tool-call streaming format differs) and emits its
+    /// visible content as a single delta so callers still see output.
+    pub async fn chat_completion_with_tools_streaming(
+        &self,
+        messages: Vec<Value>,
+        tools: &[Value],
+        deltas: tokio::sync::mpsc::Sender<StreamDelta>,
+    ) -> Result<ChatCompletionResponse, LlmMonitorError> {
+        use futures::StreamExt as _;
+
+        if self.flavor != ApiFlavor::OpenAi {
+            // Anthropic: keep the proven non-streaming path, but still feed the
+            // visible content to the UI as one delta so it isn't silent.
+            let resp = self.chat_completion_with_tools(messages, tools).await?;
+            if !resp.content.is_empty() {
+                let _ = deltas
+                    .send(StreamDelta::Content(resp.content.clone()))
+                    .await;
+            }
+            return Ok(resp);
+        }
+
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.2,
+            "stream": true,
+            "stream_options": { "include_usage": true },
+        });
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools.to_vec());
+            body["tool_choice"] = json!("auto");
+        }
+        self.apply_num_ctx(&mut body);
+
+        let started = std::time::Instant::now();
+        info!(
+            model = %self.model,
+            messages_len = body["messages"].as_array().map(|a| a.len()).unwrap_or(0),
+            tools = tools.len(),
+            stream = true,
+            num_ctx = ?self.num_ctx.filter(|_| self.sends_num_ctx()),
+            "llm: requesting chat completion with tools (streaming)"
+        );
+
+        let request = self.apply_auth(
+            self.http
+                .post(format!("{}/chat/completions", self.base_url))
+                .json(&body)
+                .header("Accept", "text/event-stream"),
+        );
+
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(model = %self.model, elapsed_ms = started.elapsed().as_millis(), error = %e, "llm: streaming chat request failed");
+                return Err(LlmMonitorError::Http(e));
+            }
+        };
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            warn!(model = %self.model, status = %status, body = %body_text, "llm: HTTP error from streaming endpoint");
+            return Err(LlmMonitorError::Parse(format!(
+                "HTTP {status}: {body_text}"
+            )));
+        }
+
+        let mut byte_stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut acc = StreamingToolAccumulator::default();
+        let mut usage: Option<Value> = None;
+        let mut first_token_logged = false;
+
+        'outer: loop {
+            while let Some(line) = take_sse_line(&mut buffer) {
+                let Some(data) = line.strip_prefix("data: ") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    break 'outer;
+                }
+                let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
+                    usage = Some(u.clone());
+                }
+                let (content_delta, thinking_delta) = acc.push_chunk(&chunk);
+                if let Some(c) = content_delta {
+                    if !first_token_logged {
+                        first_token_logged = true;
+                        info!(model = %self.model, elapsed_ms = started.elapsed().as_millis(), "llm: first streamed token");
+                    }
+                    let _ = deltas.send(StreamDelta::Content(c)).await;
+                }
+                if let Some(t) = thinking_delta {
+                    let _ = deltas.send(StreamDelta::Thinking(t)).await;
+                }
+            }
+            match byte_stream.next().await {
+                None => break,
+                Some(Err(e)) => {
+                    warn!(model = %self.model, error = %e, "llm: streaming byte error");
+                    return Err(LlmMonitorError::Http(e));
+                }
+                Some(Ok(bytes)) => buffer.push_str(&String::from_utf8_lossy(&bytes)),
+            }
+        }
+
+        let response_json = acc.into_response_json(usage);
+        let parsed = parse_chat_completion_response(response_json);
+        if let Ok(ref resp) = parsed {
+            let (prompt_tokens, completion_tokens) = resp
+                .usage
+                .as_ref()
+                .map(|u| (u.prompt_tokens, u.completion_tokens))
+                .unwrap_or((0, 0));
+            info!(
+                model = %self.model,
+                elapsed_ms = started.elapsed().as_millis(),
+                content_chars = resp.content.len(),
+                tool_calls = resp.tool_calls.len(),
+                prompt_tokens,
+                completion_tokens,
+                "llm: streaming chat completion assembled"
+            );
+        }
+        parsed
     }
 
     // ─── Model discovery ──────────────────────────────────────────────────────
@@ -559,6 +787,121 @@ impl LlmClient {
             .unwrap_or_default();
         ids.sort();
         ids
+    }
+}
+
+/// A live fragment emitted while a streaming tool-calling turn is in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamDelta {
+    /// Visible assistant text (shown normally).
+    Content(String),
+    /// Reasoning / "thinking" text (shown in lower contrast).
+    Thinking(String),
+}
+
+/// Accumulates OpenAI streaming deltas into a single assistant turn.
+///
+/// Streaming responses split content, reasoning, and each tool call's
+/// `arguments` JSON across many `choices[0].delta` chunks; tool-call fragments
+/// are keyed by their `index`. This reassembles them into the same
+/// `{choices:[{message}]}` shape a non-streaming response has, so the existing
+/// [`parse_chat_completion_response`] can finish the job.
+#[derive(Default)]
+struct StreamingToolAccumulator {
+    content: String,
+    thinking: String,
+    /// Per-index `(id, name, arguments)` accumulators.
+    tools: Vec<(String, String, String)>,
+}
+
+impl StreamingToolAccumulator {
+    /// Fold one streamed chunk into the accumulator, returning any
+    /// `(content, thinking)` fragments to forward live.
+    fn push_chunk(&mut self, chunk: &Value) -> (Option<String>, Option<String>) {
+        let delta = chunk.pointer("/choices/0/delta");
+        let Some(delta) = delta else {
+            return (None, None);
+        };
+
+        let content = delta
+            .get("content")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                self.content.push_str(s);
+                s.to_string()
+            });
+
+        // Reasoning fragments are non-standard: Ollama/DeepSeek use
+        // `reasoning_content`, some gateways use `reasoning`.
+        let thinking = delta
+            .get("reasoning_content")
+            .or_else(|| delta.get("reasoning"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                self.thinking.push_str(s);
+                s.to_string()
+            });
+
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                while self.tools.len() <= index {
+                    self.tools
+                        .push((String::new(), String::new(), String::new()));
+                }
+                let slot = &mut self.tools[index];
+                if let Some(id) = call.get("id").and_then(Value::as_str)
+                    && !id.is_empty()
+                {
+                    slot.0 = id.to_string();
+                }
+                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
+                    && !name.is_empty()
+                {
+                    slot.1 = name.to_string();
+                }
+                if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                    slot.2.push_str(args);
+                }
+            }
+        }
+
+        (content, thinking)
+    }
+
+    /// Reassemble into a `{choices:[{message}]}` JSON value (with optional
+    /// `usage`) for [`parse_chat_completion_response`].
+    fn into_response_json(self, usage: Option<Value>) -> Value {
+        let tool_calls: Vec<Value> = self
+            .tools
+            .into_iter()
+            .filter(|(_, name, _)| !name.is_empty())
+            .enumerate()
+            .map(|(i, (id, name, args))| {
+                let id = if id.is_empty() {
+                    format!("call_{i}")
+                } else {
+                    id
+                };
+                json!({
+                    "id": id,
+                    "type": "function",
+                    "function": { "name": name, "arguments": args },
+                })
+            })
+            .collect();
+
+        let mut message = json!({ "role": "assistant", "content": self.content });
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = Value::Array(tool_calls);
+        }
+        let mut out = json!({ "choices": [{ "message": message }] });
+        if let Some(u) = usage {
+            out["usage"] = u;
+        }
+        out
     }
 }
 
@@ -780,6 +1123,75 @@ fn parse_chat_completion_response(json: Value) -> Result<ChatCompletionResponse,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_accumulator_reassembles_split_tool_call_and_reasoning() {
+        let mut acc = StreamingToolAccumulator::default();
+        let mut content = String::new();
+        let mut thinking = String::new();
+
+        // Reasoning arrives first (DeepSeek/Ollama style), then a tool call
+        // whose name+arguments are split across several chunks.
+        let chunks = [
+            json!({"choices":[{"delta":{"reasoning_content":"Let me "}}]}),
+            json!({"choices":[{"delta":{"reasoning_content":"check."}}]}),
+            json!({"choices":[{"delta":{"content":"On it. "}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]}}]}),
+        ];
+        for c in &chunks {
+            let (cd, td) = acc.push_chunk(c);
+            if let Some(s) = cd {
+                content.push_str(&s);
+            }
+            if let Some(s) = td {
+                thinking.push_str(&s);
+            }
+        }
+        assert_eq!(content, "On it. ");
+        assert_eq!(thinking, "Let me check.");
+
+        let resp = parse_chat_completion_response(acc.into_response_json(None)).unwrap();
+        assert_eq!(resp.content, "On it. ");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "call_a");
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        assert_eq!(resp.tool_calls[0].arguments, json!({"path": "a.rs"}));
+    }
+
+    #[test]
+    fn streaming_accumulator_plain_answer_has_no_tool_calls() {
+        let mut acc = StreamingToolAccumulator::default();
+        acc.push_chunk(&json!({"choices":[{"delta":{"content":"Hello"}}]}));
+        acc.push_chunk(&json!({"choices":[{"delta":{"content":" world"}}]}));
+        let resp = parse_chat_completion_response(acc.into_response_json(None)).unwrap();
+        assert_eq!(resp.content, "Hello world");
+        assert!(resp.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn num_ctx_injected_only_for_ollama_endpoints() {
+        // Ollama endpoint + configured num_ctx → options.num_ctx is sent.
+        let ollama = LlmClient::new("http://localhost:11434/v1", "ornith:35b", None)
+            .with_num_ctx(Some(16384));
+        assert!(ollama.sends_num_ctx());
+        let mut body = json!({"model": "ornith:35b", "messages": []});
+        ollama.apply_num_ctx(&mut body);
+        assert_eq!(body["options"]["num_ctx"], json!(16384));
+
+        // Hosted OpenAI cloud → never sends num_ctx (would 400 on unknown field).
+        let cloud = LlmClient::new("https://api.openai.com/v1", "gpt-4o-mini", None)
+            .with_num_ctx(Some(16384));
+        assert!(!cloud.sends_num_ctx());
+        let mut body = json!({"model": "gpt-4o-mini", "messages": []});
+        cloud.apply_num_ctx(&mut body);
+        assert!(body.get("options").is_none());
+
+        // Ollama endpoint but no override configured → nothing sent.
+        let bare = LlmClient::new("http://localhost:11434/v1", "ornith:35b", None);
+        assert!(!bare.sends_num_ctx());
+    }
 
     #[test]
     fn parse_chat_completion_response_extracts_tool_calls() {

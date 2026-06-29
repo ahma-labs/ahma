@@ -188,6 +188,30 @@ pub struct ProviderEntry {
     /// Optional bearer token. Supports `${ENV_VAR}` interpolation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Optional context-window size (in tokens) to request from the provider.
+    ///
+    /// Only meaningful for providers that accept a per-request context override —
+    /// in practice Ollama, via the `options.num_ctx` field on its
+    /// OpenAI-compatible endpoint. For hosted OpenAI-protocol clouds the context
+    /// window is fixed by the model and this value is ignored (and not offered in
+    /// the TUI). See [`endpoint_supports_num_ctx`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u32>,
+}
+
+/// Whether an endpoint accepts a per-request context-window override
+/// (`options.num_ctx`).
+///
+/// Today this is true only for Ollama's OpenAI-compatible endpoint, detected by
+/// its default port (`11434`) or an `ollama` host. Hosted clouds (OpenAI,
+/// Together, Groq, …) pin the context to the model and reject unknown fields, so
+/// the TUI greys out the `num_ctx` control for them.
+pub fn endpoint_supports_num_ctx(base_url: &str, kind: ProviderKind) -> bool {
+    if kind != ProviderKind::OpenAi {
+        return false;
+    }
+    let lower = base_url.to_ascii_lowercase();
+    lower.contains(":11434") || lower.contains("ollama")
 }
 
 impl ProviderEntry {
@@ -206,7 +230,13 @@ impl ProviderEntry {
             base_url: self.base_url.clone(),
             default_model: self.default_model.clone(),
             api_key,
+            num_ctx: self.num_ctx,
         })
+    }
+
+    /// Whether this provider accepts a per-request `num_ctx` override.
+    pub fn supports_num_ctx(&self) -> bool {
+        endpoint_supports_num_ctx(&self.base_url, self.kind)
     }
 }
 
@@ -218,6 +248,15 @@ pub struct ResolvedProvider {
     pub base_url: String,
     pub default_model: String,
     pub api_key: Option<String>,
+    /// Per-request context-window override (tokens), if configured and supported.
+    pub num_ctx: Option<u32>,
+}
+
+impl ResolvedProvider {
+    /// Whether this provider accepts a per-request `num_ctx` override.
+    pub fn supports_num_ctx(&self) -> bool {
+        endpoint_supports_num_ctx(&self.base_url, self.kind)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -389,10 +428,75 @@ impl AhmaConfig {
                 base_url: settings.lmstudio.base_url.clone(),
                 default_model: settings.lmstudio.model.clone(),
                 api_key: None,
+                num_ctx: None,
             });
         }
 
         cfg
+    }
+
+    /// Append a provider to `~/.ahma/config.toml` and persist it.
+    ///
+    /// Operates on the **raw** file (not [`Self::load`], which injects a
+    /// synthetic `lmstudio` entry) so auto-registered providers never leak into
+    /// the saved file. Errors if a provider with the same name already exists.
+    pub fn add_provider(entry: ProviderEntry) -> Result<()> {
+        let path = ahma_config_path()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine ~/.ahma/config.toml path"))?;
+        Self::add_provider_to(&path, entry)
+    }
+
+    /// [`Self::add_provider`] against an explicit path (for tests).
+    pub fn add_provider_to(path: &Path, entry: ProviderEntry) -> Result<()> {
+        let mut cfg: AhmaConfig = match std::fs::read_to_string(path) {
+            Ok(contents) => toml::from_str(&contents)
+                .map_err(|e| anyhow::anyhow!("Failed to parse {}: {e}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => AhmaConfig::default(),
+            Err(e) => anyhow::bail!("Failed to read {}: {e}", path.display()),
+        };
+        if cfg.providers.iter().any(|p| p.name == entry.name) {
+            anyhow::bail!(
+                "A provider named '{}' already exists in {}",
+                entry.name,
+                path.display()
+            );
+        }
+        cfg.providers.push(entry);
+        let text = toml::to_string_pretty(&cfg).context("Failed to serialize config to TOML")?;
+        atomic_write_toml(path, &text)
+    }
+
+    /// Set (or clear, with `None`) the `num_ctx` of an existing provider in
+    /// `~/.ahma/config.toml` and persist it. Errors if the provider isn't in the
+    /// file, or if it doesn't support a context override (hosted clouds).
+    pub fn set_provider_num_ctx(name: &str, num_ctx: Option<u32>) -> Result<()> {
+        let path = ahma_config_path()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine ~/.ahma/config.toml path"))?;
+        Self::set_provider_num_ctx_to(&path, name, num_ctx)
+    }
+
+    /// [`Self::set_provider_num_ctx`] against an explicit path (for tests).
+    pub fn set_provider_num_ctx_to(path: &Path, name: &str, num_ctx: Option<u32>) -> Result<()> {
+        let mut cfg: AhmaConfig = match std::fs::read_to_string(path) {
+            Ok(contents) => toml::from_str(&contents)
+                .map_err(|e| anyhow::anyhow!("Failed to parse {}: {e}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => AhmaConfig::default(),
+            Err(e) => anyhow::bail!("Failed to read {}: {e}", path.display()),
+        };
+        let entry = cfg
+            .providers
+            .iter_mut()
+            .find(|p| p.name == name)
+            .ok_or_else(|| anyhow::anyhow!("No provider named '{name}' in {}", path.display()))?;
+        if num_ctx.is_some() && !endpoint_supports_num_ctx(&entry.base_url, entry.kind) {
+            anyhow::bail!(
+                "Provider '{name}' ({}) does not support a num_ctx override",
+                entry.base_url
+            );
+        }
+        entry.num_ctx = num_ctx;
+        let text = toml::to_string_pretty(&cfg).context("Failed to serialize config to TOML")?;
+        atomic_write_toml(path, &text)
     }
 
     /// Look up a provider by name and resolve its secrets.
@@ -513,11 +617,18 @@ pub struct LmStudioSettings {
     pub model: String,
 }
 
+/// Built-in default LM Studio endpoint, seeded into a fresh settings file.
+pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234/v1";
+/// Built-in default model for the auto-registered LM Studio provider. This is the
+/// single source of truth for the shipped model default — do not hardcode model
+/// names elsewhere; read them from settings (which is seeded from this const).
+pub const DEFAULT_LMSTUDIO_MODEL: &str = "openai/gpt-oss-20b";
+
 impl Default for LmStudioSettings {
     fn default() -> Self {
         Self {
-            base_url: "http://localhost:1234/v1".to_string(),
-            model: "openai/gpt-oss-20b".to_string(),
+            base_url: DEFAULT_LMSTUDIO_BASE_URL.to_string(),
+            model: DEFAULT_LMSTUDIO_MODEL.to_string(),
         }
     }
 }
@@ -1137,6 +1248,112 @@ impl AhmaSettings {
         })?;
         Ok(())
     }
+
+    /// Ensure the settings file at `path` exists and carries every field this
+    /// version of ahma knows about — the single mechanism that keeps the
+    /// on-disk file in sync with the compiled-in [`Default`] values across
+    /// upgrades.
+    ///
+    /// - **Missing file** → write the full current defaults (so a fresh install
+    ///   reads real values, not a commented template).
+    /// - **Existing file** → insert any default keys it lacks (fields added by a
+    ///   newer version), while **preserving every value the user set**. Keys the
+    ///   file has that defaults no longer mention are left untouched, so the
+    ///   merge is forward-compatible and never destroys data.
+    ///
+    /// Writes only when something actually changed, so it is cheap and safe to
+    /// call on every startup. Returns `Ok(true)` when the file was created or
+    /// updated. A settings file that fails to parse is left **untouched**
+    /// (`Ok(false)`) so a hand-edit in progress is never clobbered.
+    pub fn ensure_current(path: &Path) -> Result<bool> {
+        let defaults_value = toml::Value::try_from(Self::default())
+            .context("Failed to serialize default settings")?;
+
+        match std::fs::read_to_string(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let text = toml::to_string_pretty(&defaults_value)
+                    .context("Failed to serialize default settings to TOML")?;
+                atomic_write_toml(path, &text)?;
+                Ok(true)
+            }
+            Err(e) => anyhow::bail!("Failed to read {}: {e}", path.display()),
+            Ok(contents) => {
+                let mut existing: toml::Value = match toml::from_str(&contents) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            "settings file {} does not parse ({e}); leaving it untouched",
+                            path.display()
+                        );
+                        return Ok(false);
+                    }
+                };
+                let changed = merge_missing_keys(&mut existing, &defaults_value);
+                if changed {
+                    let text = toml::to_string_pretty(&existing)
+                        .context("Failed to serialize merged settings to TOML")?;
+                    atomic_write_toml(path, &text)?;
+                }
+                Ok(changed)
+            }
+        }
+    }
+
+    /// [`Self::ensure_current`] against the standard `~/.ahma/settings.toml`.
+    /// Returns `Ok(false)` (no-op) when the home directory can't be determined.
+    pub fn ensure_current_default_path() -> Result<bool> {
+        match settings_path() {
+            Some(p) => Self::ensure_current(&p),
+            None => Ok(false),
+        }
+    }
+}
+
+/// Recursively insert keys present in `defaults` but missing from `target`,
+/// without overwriting any value the user already set. Returns `true` if any key
+/// was added. Only tables are recursed; scalar/array values present in `target`
+/// always win.
+fn merge_missing_keys(target: &mut toml::Value, defaults: &toml::Value) -> bool {
+    let toml::Value::Table(default_tbl) = defaults else {
+        return false;
+    };
+    let toml::Value::Table(target_tbl) = target else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, default_val) in default_tbl {
+        match target_tbl.get_mut(key) {
+            None => {
+                target_tbl.insert(key.clone(), default_val.clone());
+                changed = true;
+            }
+            Some(existing_val) => {
+                if existing_val.is_table() && default_val.is_table() {
+                    changed |= merge_missing_keys(existing_val, default_val);
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Atomic TOML write (temp sibling → rename), with a pid-scoped temp name so two
+/// processes seeding the file at once don't clobber each other's temp file.
+fn atomic_write_toml(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    }
+    let tmp_path = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    std::fs::write(&tmp_path, text)
+        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to rename {} → {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })
 }
 
 /// The commented-out defaults template written by `ahma settings init`.
@@ -1243,6 +1460,179 @@ pub const SETTINGS_TEMPLATE: &str = r#"# ~/.ahma/settings.toml — Ahma user set
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_provider_persists_and_rejects_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let entry = ProviderEntry {
+            name: "togetherai".into(),
+            kind: ProviderKind::OpenAi,
+            base_url: "https://api.together.xyz/v1".into(),
+            default_model: "moonshotai/Kimi-K2".into(),
+            api_key: Some("${TOGETHER_API_KEY}".into()),
+            num_ctx: None,
+        };
+        AhmaConfig::add_provider_to(&path, entry.clone()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("togetherai"));
+        // No synthetic lmstudio entry leaks into the saved file.
+        assert!(
+            !text.contains("lmstudio"),
+            "raw save must not persist auto-registered providers"
+        );
+        // Duplicate name is rejected.
+        assert!(AhmaConfig::add_provider_to(&path, entry).is_err());
+    }
+
+    #[test]
+    fn set_provider_num_ctx_only_for_supported_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        AhmaConfig::add_provider_to(
+            &path,
+            ProviderEntry {
+                name: "ollama".into(),
+                kind: ProviderKind::OpenAi,
+                base_url: "http://localhost:11434/v1".into(),
+                default_model: "ornith:35b".into(),
+                api_key: None,
+                num_ctx: None,
+            },
+        )
+        .unwrap();
+        AhmaConfig::add_provider_to(
+            &path,
+            ProviderEntry {
+                name: "openai".into(),
+                kind: ProviderKind::OpenAi,
+                base_url: "https://api.openai.com/v1".into(),
+                default_model: "gpt-4o-mini".into(),
+                api_key: None,
+                num_ctx: None,
+            },
+        )
+        .unwrap();
+
+        // Ollama supports it → stored.
+        AhmaConfig::set_provider_num_ctx_to(&path, "ollama", Some(16384)).unwrap();
+        let cfg = AhmaConfig::load_from(&path);
+        assert_eq!(
+            cfg.providers
+                .iter()
+                .find(|p| p.name == "ollama")
+                .unwrap()
+                .num_ctx,
+            Some(16384)
+        );
+        // Hosted cloud rejects it.
+        assert!(AhmaConfig::set_provider_num_ctx_to(&path, "openai", Some(8192)).is_err());
+        // Unknown provider errors.
+        assert!(AhmaConfig::set_provider_num_ctx_to(&path, "nope", Some(8192)).is_err());
+    }
+
+    #[test]
+    fn ensure_current_creates_then_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+
+        // Missing file → created from defaults, with real values present.
+        assert!(AhmaSettings::ensure_current(&path).unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[lmstudio]"));
+        assert!(
+            text.contains(DEFAULT_LMSTUDIO_MODEL),
+            "fresh file seeds the const model default; got:\n{text}"
+        );
+
+        // Second call changes nothing.
+        assert!(
+            !AhmaSettings::ensure_current(&path).unwrap(),
+            "ensure_current is idempotent once the file is current"
+        );
+    }
+
+    #[test]
+    fn ensure_current_adds_missing_fields_and_preserves_user_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        // A user file from an older version: only a custom lmstudio model, nothing else.
+        std::fs::write(&path, "[lmstudio]\nmodel = \"my-local-model\"\n").unwrap();
+
+        assert!(
+            AhmaSettings::ensure_current(&path).unwrap(),
+            "missing default fields are merged in"
+        );
+        let loaded = AhmaSettings::load_from(&path);
+        // User's value is preserved …
+        assert_eq!(loaded.lmstudio.model, "my-local-model");
+        // … and previously-absent defaults are now present.
+        assert_eq!(loaded.lmstudio.base_url, DEFAULT_LMSTUDIO_BASE_URL);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[tools]"), "a whole missing table is added");
+
+        // Now idempotent.
+        assert!(!AhmaSettings::ensure_current(&path).unwrap());
+    }
+
+    #[test]
+    fn ensure_current_leaves_unparseable_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let garbage = "this = is = not = valid = toml";
+        std::fs::write(&path, garbage).unwrap();
+        assert!(
+            !AhmaSettings::ensure_current(&path).unwrap(),
+            "a file that does not parse is never clobbered"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
+    }
+
+    #[test]
+    fn num_ctx_support_is_ollama_only() {
+        // Ollama (by port or host) on the OpenAI flavor supports num_ctx.
+        assert!(endpoint_supports_num_ctx(
+            "http://localhost:11434/v1",
+            ProviderKind::OpenAi
+        ));
+        assert!(endpoint_supports_num_ctx(
+            "https://my-ollama.example.com/v1",
+            ProviderKind::OpenAi
+        ));
+        // Hosted clouds pin context to the model — unsupported.
+        assert!(!endpoint_supports_num_ctx(
+            "https://api.openai.com/v1",
+            ProviderKind::OpenAi
+        ));
+        assert!(!endpoint_supports_num_ctx(
+            "https://api.together.xyz/v1",
+            ProviderKind::OpenAi
+        ));
+        // Anthropic flavor never supports the Ollama option, even at :11434.
+        assert!(!endpoint_supports_num_ctx(
+            "http://localhost:11434/v1",
+            ProviderKind::Anthropic
+        ));
+    }
+
+    #[test]
+    fn num_ctx_round_trips_through_toml() {
+        let toml = r#"
+            [[providers]]
+            name = "ollama-local"
+            kind = "openai"
+            base_url = "http://localhost:11434/v1"
+            default_model = "ornith:35b"
+            num_ctx = 16384
+        "#;
+        let cfg: AhmaConfig = toml::from_str(toml).expect("parse");
+        let p = &cfg.providers[0];
+        assert_eq!(p.num_ctx, Some(16384));
+        assert!(p.resolve().unwrap().supports_num_ctx());
+        // Re-serialize and confirm the field survives.
+        let out = toml::to_string(&cfg).expect("serialize");
+        assert!(out.contains("num_ctx = 16384"), "got: {out}");
+    }
 
     #[test]
     fn interpolate_no_placeholders() {
@@ -1447,6 +1837,7 @@ api_key = "${AHMA_TEST_PROVIDER_KEY}"
             base_url: "http://localhost:11434/v1".into(),
             default_model: "llama3.2".into(),
             api_key: None,
+            num_ctx: None,
         });
 
         let toml_text = toml::to_string_pretty(&cfg).unwrap();
@@ -1478,6 +1869,7 @@ api_key = "${AHMA_TEST_PROVIDER_KEY}"
             base_url: "http://localhost:11434/v1".into(),
             default_model: "gemma3n".into(),
             api_key: None,
+            num_ctx: None,
         });
         cfg.providers.push(ProviderEntry {
             name: "remove-me".into(),
@@ -1485,6 +1877,7 @@ api_key = "${AHMA_TEST_PROVIDER_KEY}"
             base_url: "https://api.anthropic.com/v1".into(),
             default_model: "claude-opus-4-8".into(),
             api_key: Some("${ANTHROPIC_API_KEY}".into()),
+            num_ctx: None,
         });
 
         let toml_text = toml::to_string_pretty(&cfg).unwrap();

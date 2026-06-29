@@ -13,6 +13,9 @@ use tracing::{info, warn};
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Token(String),
+    /// Reasoning / "thinking" text streamed from the model, shown in lower
+    /// contrast so the user can see it is thinking without it dominating.
+    Thinking(String),
     Done,
     Error(String),
     ToolCallStarted {
@@ -467,6 +470,9 @@ async fn dispatch_tool_execution(
     }
 }
 
+/// Fetch one assistant turn. Returns `(response, content_streamed)` where
+/// `content_streamed` is `true` when the visible content was already emitted to
+/// `tx` as `AgentEvent::Token`s during the call (so callers must not re-send it).
 async fn fetch_completion(
     client: &LlmClient,
     msg_json: &[serde_json::Value],
@@ -475,7 +481,7 @@ async fn fetch_completion(
     tx: &Sender<AgentEvent>,
     messages: &[ChatMessage],
     system_prompt: &Option<String>,
-) -> Option<ahma_llm_monitor::client::ChatCompletionResponse> {
+) -> Option<(ahma_llm_monitor::client::ChatCompletionResponse, bool)> {
     if client.base_url().starts_with("mcp://") {
         let Some(mcp_cfg) = mcp else {
             let _ = tx
@@ -494,24 +500,44 @@ async fn fetch_completion(
         )
         .await
         {
-            Ok(c) => Some(c),
+            // Sampling is not streamed; caller still needs to emit the content.
+            Ok(c) => Some((c, false)),
             Err(e) => {
                 let _ = tx.send(AgentEvent::Error(e)).await;
                 None
             }
         }
     } else {
-        match client
-            .chat_completion_with_tools(msg_json.to_vec(), tool_defs)
-            .await
-        {
-            Ok(c) => Some(c),
+        // Stream the turn so the UI shows live tokens + reasoning instead of
+        // blocking on one opaque request. Forward each delta onto the agent
+        // event channel; dropping `dtx` (when the call returns) ends the loop.
+        let (dtx, mut drx) =
+            tokio::sync::mpsc::channel::<ahma_llm_monitor::client::StreamDelta>(64);
+        let tx_fwd = tx.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(d) = drx.recv().await {
+                let evt = match d {
+                    ahma_llm_monitor::client::StreamDelta::Content(s) => AgentEvent::Token(s),
+                    ahma_llm_monitor::client::StreamDelta::Thinking(s) => AgentEvent::Thinking(s),
+                };
+                if tx_fwd.send(evt).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let result = client
+            .chat_completion_with_tools_streaming(msg_json.to_vec(), tool_defs, dtx)
+            .await;
+        let _ = forwarder.await;
+        match result {
+            Ok(c) => Some((c, true)),
             Err(e) => {
                 let err_msg = e.to_string().to_lowercase();
                 if err_msg.contains("400")
                     || err_msg.contains("tool")
                     || err_msg.contains("not supported")
                 {
+                    info!(error = %e, "agent: model rejected tools — falling back to plain chat (no tool use this turn)");
                     let _ = tx
                         .send(AgentEvent::Error(
                             "Model does not support tools. Falling back to standard chat."
@@ -526,6 +552,7 @@ async fn fetch_completion(
                         tx.clone(),
                     );
                 } else {
+                    warn!(error = %e, "agent: chat completion failed (non-recoverable) — ending turn");
                     let _ = tx.send(AgentEvent::Error(e.to_string())).await;
                 }
                 None
@@ -626,7 +653,7 @@ pub async fn execute_agent_turn(
         trim_conversation(msg_json, conversation_char_budget(cfg));
     }
 
-    let Some(completion) = fetch_completion(
+    let Some((completion, content_streamed)) = fetch_completion(
         client,
         msg_json,
         tool_defs,
@@ -637,8 +664,18 @@ pub async fn execute_agent_turn(
     )
     .await
     else {
+        // The concrete error was already logged in fetch_completion and pushed to
+        // the TUI as AgentEvent::Error; this records why the turn stopped.
+        warn!("agent: turn aborted — no completion returned by the model");
         return false;
     };
+
+    info!(
+        conversation_messages = msg_json.len(),
+        content_chars = completion.content.len(),
+        tool_calls = completion.tool_calls.len(),
+        "agent: model turn completed"
+    );
 
     if let Some(usage) = &completion.usage {
         let _ = tx.send(AgentEvent::Usage(usage.clone())).await;
@@ -651,7 +688,10 @@ pub async fn execute_agent_turn(
     }));
 
     if completion.tool_calls.is_empty() {
-        if !completion.content.is_empty() {
+        info!("agent: final answer received (no tool calls) — ending agentic loop");
+        // When streamed, the content was already emitted token-by-token; only
+        // emit it here for non-streamed paths (e.g. MCP sampling).
+        if !content_streamed && !completion.content.is_empty() {
             let _ = tx.send(AgentEvent::Token(completion.content)).await;
         }
         let _ = tx.send(AgentEvent::Done).await;
@@ -666,6 +706,17 @@ pub async fn execute_agent_turn(
             .await;
         return false;
     };
+
+    let tool_names: Vec<&str> = completion
+        .tool_calls
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    info!(
+        count = tool_names.len(),
+        tools = ?tool_names,
+        "agent: model requested tool call(s)"
+    );
 
     let call_futures = completion
         .tool_calls
@@ -734,7 +785,15 @@ pub fn spawn_agent_task(
         let mut read_file_hinted = false;
         let mut error_hinted = false;
 
-        for _ in 0..max_turns {
+        info!(
+            max_turns,
+            initial_messages = msg_json.len(),
+            tool_defs = tool_defs.len(),
+            "agent: starting agentic loop"
+        );
+
+        for turn in 0..max_turns {
+            info!(turn = turn + 1, max_turns, "agent: turn start");
             if !execute_agent_turn(
                 &client,
                 &mut msg_json,
@@ -755,6 +814,10 @@ pub fn spawn_agent_task(
         }
 
         if !completed {
+            warn!(
+                max_turns,
+                "agent: loop reached max turns without a final answer — the model kept requesting tools (or looping) until the turn budget ran out"
+            );
             let _ = tx
                 .send(AgentEvent::Error(
                     "Agent loop reached max turns without completion".to_string(),
@@ -1264,17 +1327,22 @@ fn provider_is_url(provider: &str) -> bool {
 fn resolve_llm_connection(
     provider: Option<String>,
     model: Option<String>,
-) -> Result<(String, String, Option<String>), String> {
+) -> Result<(String, String, Option<String>, Option<u32>), String> {
     if let Some(p_name) = provider {
         if provider_is_url(&p_name) {
-            return Ok((p_name, model.unwrap_or_default(), None));
+            return Ok((p_name, model.unwrap_or_default(), None, None));
         }
         let config = ahma_common::config::AhmaConfig::load();
         let resolved = config
             .resolve_provider(&p_name)
             .map_err(|e| format!("Failed to resolve provider '{}': {e}", p_name))?;
         let resolved_model = model.unwrap_or(resolved.default_model);
-        return Ok((resolved.base_url, resolved_model, resolved.api_key));
+        return Ok((
+            resolved.base_url,
+            resolved_model,
+            resolved.api_key,
+            resolved.num_ctx,
+        ));
     }
 
     let config = ahma_common::config::AhmaConfig::load();
@@ -1288,7 +1356,12 @@ fn resolve_llm_connection(
         )
     })?;
     let resolved_model = model.unwrap_or(resolved.default_model);
-    Ok((resolved.base_url, resolved_model, resolved.api_key))
+    Ok((
+        resolved.base_url,
+        resolved_model,
+        resolved.api_key,
+        resolved.num_ctx,
+    ))
 }
 
 /// A PromptRunner implementation that executes the agent loop inside ahma_core.
@@ -1310,9 +1383,9 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
             .ok_or_else(|| "No active AhmaMcpService found in this process".to_string())?;
 
         // 2. Resolve LLM client connection parameters using provider and model.
-        let (base_url, model_name, api_key) = resolve_llm_connection(provider, model)?;
+        let (base_url, model_name, api_key, num_ctx) = resolve_llm_connection(provider, model)?;
 
-        let client = LlmClient::new(base_url.clone(), model_name, api_key);
+        let client = LlmClient::new(base_url.clone(), model_name, api_key).with_num_ctx(num_ctx);
 
         // 3. Get all available tools dynamically from active service
         let available_tools = service.get_all_available_tools().await;
@@ -1385,6 +1458,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         while let Some(evt) = rx.recv().await {
             let client_msg = match evt {
                 AgentEvent::Token(t) => ClientMsg::ChatToken { token: t },
+                AgentEvent::Thinking(t) => ClientMsg::ChatThinking { token: t },
                 AgentEvent::Done => ClientMsg::AgentDone,
                 AgentEvent::Error(e) => ClientMsg::AgentError { error: e },
                 // Tool-call lifecycle events are NOT approval requests. The actual
@@ -1554,34 +1628,26 @@ mod tests {
             axum::routing::post(move || {
                 let counter = llm_counter.clone();
                 async move {
+                    // The tool-calling path streams; reply with SSE. Turn 1 emits a
+                    // tool call, turn 2 emits the final answer as one content delta.
                     let count = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if count == 0 {
-                        axum::Json(serde_json::json!({
-                            "choices": [{
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "",
-                                    "tool_calls": [{
-                                        "id": "call_123",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "test_tool",
-                                            "arguments": "{\"arg\":\"value\"}"
-                                        }
-                                    }]
-                                }
-                            }]
-                        }))
+                    let body = if count == 0 {
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_123\",\"function\":{\"name\":\"test_tool\",\"arguments\":\"{\\\"arg\\\":\\\"value\\\"}\"}}]}}]}\n",
+                            "data: [DONE]\n",
+                        )
+                        .to_string()
                     } else {
-                        axum::Json(serde_json::json!({
-                            "choices": [{
-                                "message": {
-                                    "role": "assistant",
-                                    "content": "Tool call was successful.",
-                                }
-                            }]
-                        }))
-                    }
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"Tool call was successful.\"}}]}\n",
+                            "data: [DONE]\n",
+                        )
+                        .to_string()
+                    };
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(body)
+                        .unwrap()
                 }
             }),
         );
@@ -2419,7 +2485,7 @@ mod tests {
 
     #[test]
     fn resolve_llm_connection_url_provider_bypasses_config() {
-        let (base, model, key) = resolve_llm_connection(
+        let (base, model, key, num_ctx) = resolve_llm_connection(
             Some("http://localhost:1234/v1".to_string()),
             Some("my-model".to_string()),
         )
@@ -2427,16 +2493,18 @@ mod tests {
         assert_eq!(base, "http://localhost:1234/v1");
         assert_eq!(model, "my-model");
         assert!(key.is_none());
+        assert!(num_ctx.is_none());
     }
 
     #[test]
     fn resolve_llm_connection_url_provider_uses_empty_default_model() {
-        let (base, model, key) =
+        let (base, model, key, num_ctx) =
             resolve_llm_connection(Some("unix:///run/ahma.sock".to_string()), None)
                 .expect("unix URL provider resolves");
         assert_eq!(base, "unix:///run/ahma.sock");
         assert_eq!(model, "", "missing model defaults to empty string");
         assert!(key.is_none());
+        assert!(num_ctx.is_none());
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2934,22 +3002,20 @@ mod tests {
 
     #[tokio::test]
     async fn execute_agent_turn_tools_without_mcp_errors() {
+        // The tool-calling path streams now, so serve an SSE body that carries a
+        // tool call (split id/name vs arguments across chunks, like real servers).
         let router = axum::Router::new().route(
             "/chat/completions",
             axum::routing::post(|| async {
-                axum::Json(serde_json::json!({
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [{
-                                "id": "c1",
-                                "type": "function",
-                                "function": {"name": "t", "arguments": "{}"}
-                            }]
-                        }
-                    }]
-                }))
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"t\"}}]}}]}\n",
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n",
+                    "data: [DONE]\n",
+                );
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(body.to_string())
+                    .unwrap()
             }),
         );
         let base = serve_router(router).await;
@@ -3014,8 +3080,12 @@ mod tests {
             &Some("sys".to_string()),
         )
         .await;
-        let resp = res.expect("mcp routing returns a completion");
+        let (resp, content_streamed) = res.expect("mcp routing returns a completion");
         assert_eq!(resp.content, "ROUTED");
+        assert!(
+            !content_streamed,
+            "MCP sampling is not streamed; caller must emit the content"
+        );
     }
 
     #[tokio::test]

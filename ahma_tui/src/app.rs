@@ -253,6 +253,12 @@ async fn run_ratatui(
                             w.visible = false;
                         }
                     }
+                    // While a turn is in flight but quiet, pulse the liveness
+                    // spinner slowly so the user can tell it is still alive (and
+                    // not silently timed out) — token arrivals drive it fast.
+                    if chat_in_progress(&state) {
+                        state.tick_waiting_spinner();
+                    }
                     update_scroll_animations(&mut state);
                 }
             }
@@ -501,7 +507,13 @@ fn submit_provider_picker(picker: crate::state::PickerState, state: &mut crate::
 
     let (name_part, base_url_part) = item.split_once("  ").unwrap_or((item, ""));
     let name = name_part.trim().to_string();
-    let base_url = base_url_part.trim().to_string();
+    // The row is `name  base_url[  · num_ctx …]`; the base_url is the first
+    // whitespace-delimited token of the remainder (URLs never contain spaces).
+    let base_url = base_url_part
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
     let old_model = state.selected_model();
     state.current_provider_url = Some(base_url.clone());
     state.available_models.clear();
@@ -1808,6 +1820,7 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
         || handle_settings_nav_command(cmd, state)
         || handle_tools_nav_command(cmd, state)
         || handle_approval_nav_command(cmd, state)
+        || handle_provider_admin_command(cmd, state)
         || handle_picker_nav_command(cmd, state)
         || handle_run_nav_command(cmd, state)
         || handle_monitor_nav_command(cmd, state)
@@ -2187,6 +2200,15 @@ fn handle_export_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
                 md.push_str(text);
                 md.push_str("\n\n");
             }
+            crate::state::ChatEntry::Thinking { content, .. } => {
+                md.push_str("## Thinking\n\n");
+                for line in content.lines() {
+                    md.push_str("> ");
+                    md.push_str(line);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
             crate::state::ChatEntry::Assistant { content, .. } => {
                 md.push_str("## Assistant\n\n");
                 md.push_str(content);
@@ -2249,33 +2271,199 @@ fn handle_picker_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
     true
 }
 
+/// Provider administration commands that persist to `~/.ahma/config.toml`:
+///
+/// - `/provider add <name> <base_url> <model> [num_ctx] [api_key]`
+/// - `/provider numctx <tokens|off>` — set the context window for the *current*
+///   provider (Ollama only; refused for providers that pin context).
+#[cfg(feature = "tui")]
+fn handle_provider_admin_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    if let Some(rest) = cmd.strip_prefix("/provider add") {
+        provider_add_command(rest.trim(), state);
+        return true;
+    }
+    if let Some(rest) = cmd.strip_prefix("/provider numctx") {
+        provider_numctx_command(rest.trim(), state);
+        return true;
+    }
+    false
+}
+
+#[cfg(feature = "tui")]
+fn provider_add_command(args: &str, state: &mut crate::state::AppState) {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    if parts.len() < 3 {
+        push_assistant_message(
+            state,
+            "Usage: /provider add <name> <base_url> <model> [num_ctx] [api_key]\n\
+             Example: /provider add together https://api.together.xyz/v1 moonshotai/Kimi-K2 - ${TOGETHER_API_KEY}\n\
+             (num_ctx is honored only for Ollama endpoints; use `-` to skip it.)",
+        );
+        return;
+    }
+    let (name, base_url, model) = (parts[0], parts[1], parts[2]);
+    // 4th token: num_ctx (or `-`/`off` to skip). 5th: api_key.
+    let supports_ctx = ahma_common::config::endpoint_supports_num_ctx(
+        base_url,
+        ahma_common::config::ProviderKind::OpenAi,
+    );
+    let mut num_ctx = None;
+    if let Some(tok) = parts.get(3)
+        && !matches!(*tok, "-" | "off" | "_")
+    {
+        match tok.parse::<u32>() {
+            Ok(n) if supports_ctx => num_ctx = Some(n),
+            Ok(_) => push_assistant_message(
+                state,
+                format!(
+                    "Note: '{base_url}' does not support num_ctx (not an Ollama endpoint); ignoring it."
+                ),
+            ),
+            Err(_) => {
+                push_assistant_message(
+                    state,
+                    format!("Invalid num_ctx '{tok}' (expected a number)."),
+                );
+                return;
+            }
+        }
+    }
+    let api_key = parts.get(4).map(|s| s.to_string());
+
+    let entry = ahma_common::config::ProviderEntry {
+        name: name.to_string(),
+        kind: ahma_common::config::ProviderKind::OpenAi,
+        base_url: base_url.to_string(),
+        default_model: model.to_string(),
+        api_key,
+        num_ctx,
+    };
+    match ahma_common::config::AhmaConfig::add_provider(entry) {
+        Ok(()) => {
+            rebuild_available_providers(state);
+            let ctx_note = match (supports_ctx, num_ctx) {
+                (_, Some(n)) => format!(" (num_ctx={n})"),
+                (true, None) => " (supports num_ctx; set with /provider numctx <n>)".to_string(),
+                (false, None) => String::new(),
+            };
+            push_assistant_message(
+                state,
+                format!(
+                    "Added provider '{name}' → {base_url}{ctx_note}. Select it with /provider."
+                ),
+            );
+        }
+        Err(e) => push_assistant_message(state, format!("Could not add provider: {e}")),
+    }
+}
+
+#[cfg(feature = "tui")]
+fn provider_numctx_command(arg: &str, state: &mut crate::state::AppState) {
+    let Some(name) = current_provider_name(state) else {
+        push_assistant_message(
+            state,
+            "No current provider selected. Pick one with /provider first.",
+        );
+        return;
+    };
+    if arg.is_empty() {
+        push_assistant_message(state, "Usage: /provider numctx <tokens|off>");
+        return;
+    }
+    let num_ctx = if matches!(arg, "off" | "0" | "-") {
+        None
+    } else {
+        match arg.parse::<u32>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                push_assistant_message(
+                    state,
+                    format!("Invalid num_ctx '{arg}' (expected a number or 'off')."),
+                );
+                return;
+            }
+        }
+    };
+    match ahma_common::config::AhmaConfig::set_provider_num_ctx(&name, num_ctx) {
+        Ok(()) => {
+            rebuild_available_providers(state);
+            let msg = match num_ctx {
+                Some(n) => format!(
+                    "Set num_ctx={n} for provider '{name}'. It takes effect on the next prompt."
+                ),
+                None => format!("Cleared num_ctx for provider '{name}'."),
+            };
+            push_assistant_message(state, msg);
+        }
+        Err(e) => push_assistant_message(
+            state,
+            format!(
+                "Could not set num_ctx: {e}. (Tip: add it to config first with /provider add, and note hosted clouds don't support it.)"
+            ),
+        ),
+    }
+}
+
+/// The name of the currently-selected provider, derived from the `llm_label`
+/// (`"Provider / Model"`); `None` if nothing is selected yet.
+#[cfg(feature = "tui")]
+fn current_provider_name(state: &crate::state::AppState) -> Option<String> {
+    let label = provider_label(&state.llm_label);
+    if label.is_empty() || label == "no LLM" {
+        None
+    } else {
+        Some(label)
+    }
+}
+
 #[cfg(feature = "tui")]
 fn open_provider_picker(state: &mut crate::state::AppState) {
     use crate::state::PickerState;
 
+    // Annotate each row with its num_ctx capability so the control reads as
+    // "16384" / "settable" for Ollama, and a dim "num_ctx: n/a" for hosted
+    // clouds that pin context to the model (greyed/not-supported).
+    let cfg = ahma_common::config::AhmaConfig::load();
     let items: Vec<String> = state
         .available_providers
         .iter()
-        .map(|p| format!("{}  {}", p.name, p.base_url))
+        .map(|p| {
+            let supports = ahma_common::config::endpoint_supports_num_ctx(
+                &p.base_url,
+                ahma_common::config::ProviderKind::OpenAi,
+            );
+            let configured = cfg
+                .providers
+                .iter()
+                .find(|c| c.name == p.name || c.base_url == p.base_url)
+                .and_then(|c| c.num_ctx);
+            let ctx = match (supports, configured) {
+                (_, Some(n)) => format!("  · num_ctx {n}"),
+                (true, None) => "  · num_ctx settable".to_string(),
+                (false, None) => "  · num_ctx n/a".to_string(),
+            };
+            format!("{}  {}{}", p.name, p.base_url, ctx)
+        })
         .collect();
 
     if items.is_empty() {
         push_assistant_message(
             state,
-            "No providers discovered yet. Install Ollama or use `ahma llm add`.",
+            "No providers discovered yet. Install Ollama, add one with `/provider add`, or use `ahma llm add`.",
         );
         return;
     }
 
     let mut picker = PickerState::new("Select provider", items);
-    if let Some(current_url) = &state.current_provider_url {
-        let selected = state
+    if let Some(current_url) = &state.current_provider_url
+        && let Some(p) = state
             .available_providers
             .iter()
             .find(|p| p.base_url == *current_url)
-            .map(|p| format!("{}  {}", p.name, p.base_url))
-            .unwrap_or_default();
-        picker.select_exact(&selected);
+    {
+        // Rows carry a trailing ` · num_ctx …` annotation, so match by the
+        // stable `name  base_url` prefix.
+        picker.select_prefix(&format!("{}  {}", p.name, p.base_url));
     }
     state.modal = crate::state::ModalState::ProviderPicker(picker);
 }
@@ -2586,6 +2774,23 @@ fn rebuild_available_providers(state: &mut crate::state::AppState) {
             combined.push(virtual_provider);
         }
     }
+    // Merge user-configured providers from ~/.ahma/config.toml so manually-added
+    // endpoints (e.g. an OpenAI-protocol cloud added via `/provider add`) are
+    // selectable, not just auto-discovered local servers.
+    let cfg = ahma_common::config::AhmaConfig::load();
+    for p in &cfg.providers {
+        if combined
+            .iter()
+            .any(|c| c.base_url == p.base_url || c.name == p.name)
+        {
+            continue;
+        }
+        combined.push(ahma_llm_monitor::LocalProvider {
+            name: p.name.clone(),
+            base_url: p.base_url.clone(),
+            models: vec![p.default_model.clone()],
+        });
+    }
     state.available_providers = combined;
 }
 
@@ -2786,16 +2991,21 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
     if matches!(
         event,
         BridgeEvent::Token(_)
+            | BridgeEvent::Thinking(_)
             | BridgeEvent::Usage(_)
             | BridgeEvent::ToolCallStarted { .. }
             | BridgeEvent::ToolCallFinished { .. }
     ) {
-        state.bump_liveness();
+        state.mark_stream_activity();
     }
 
     match event {
         BridgeEvent::Token(token) => {
             state.chat.append_token(&token);
+            state.chat_scroll = 0;
+        }
+        BridgeEvent::Thinking(token) => {
+            state.chat.append_thinking(&token);
             state.chat_scroll = 0;
         }
         BridgeEvent::Usage(usage) => {
@@ -3248,6 +3458,13 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         }
         SourceEvent::ChatToken { token } => {
             state.chat.append_token(&token);
+            state.mark_stream_activity();
+            state.chat_scroll = 0;
+        }
+        SourceEvent::ChatThinking { token } => {
+            state.chat.append_thinking(&token);
+            state.mark_stream_activity();
+            state.chat_scroll = 0;
         }
         SourceEvent::ApprovalRequested { id, tool, args } => {
             let diff = if tool.contains("replace") || tool == "write_file" {
@@ -3282,10 +3499,12 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             }
         }
         SourceEvent::AgentDone => {
+            state.reset_liveness();
             state.chat.finish_stream();
             state.chat.finish_user_timing();
         }
         SourceEvent::AgentError { error } => {
+            state.reset_liveness();
             state.chat.finish_stream();
             state.chat.push(crate::state::ChatEntry::Assistant {
                 content: format!("Error: {error}"),

@@ -114,6 +114,11 @@ pub fn spawn_embedded_hub_source(
                                 return;
                             }
                         }
+                        Applied::ChatThinking(token) => {
+                            if tx.send(SourceEvent::ChatThinking { token }).await.is_err() {
+                                return;
+                            }
+                        }
                         Applied::ApprovalRequested { id, tool, args } => {
                             if tx
                                 .send(SourceEvent::ApprovalRequested { id, tool, args })
@@ -395,6 +400,11 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
                                 return;
                             }
                         }
+                        Applied::ChatThinking(token) => {
+                            if tx.send(SourceEvent::ChatThinking { token }).await.is_err() {
+                                return;
+                            }
+                        }
                         Applied::ApprovalRequested { id, tool, args } => {
                             if tx
                                 .send(SourceEvent::ApprovalRequested { id, tool, args })
@@ -464,6 +474,7 @@ enum Applied {
         is_stderr: bool,
     },
     ChatToken(String),
+    ChatThinking(String),
     ApprovalRequested {
         id: String,
         tool: String,
@@ -545,6 +556,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
         },
         DaemonMsg::Ping { .. } => Applied::None, // hub-to-instance ping; no state change for subscribers
         DaemonMsg::ChatToken { token } => Applied::ChatToken(token),
+        DaemonMsg::ChatThinking { token } => Applied::ChatThinking(token),
         DaemonMsg::ApprovalRequested { id, tool, args } => {
             Applied::ApprovalRequested { id, tool, args }
         }

@@ -42,6 +42,13 @@ pub enum ChatEntry {
         started_at: Option<std::time::Instant>,
         duration_ms: Option<u64>,
     },
+    /// Reasoning / "thinking" output from the model, shown in lower contrast so
+    /// the user can see it is thinking without it dominating the answer.
+    Thinking {
+        content: String,
+        /// True while reasoning tokens are still arriving.
+        streaming: bool,
+    },
     /// A response from the LLM, potentially still streaming.
     Assistant {
         content: String,
@@ -113,10 +120,33 @@ impl ChatHistory {
         }
     }
 
-    /// Mark the last assistant entry as no longer streaming.
+    /// Append a reasoning/"thinking" token to the last streaming `Thinking`
+    /// entry, creating one if the latest entry isn't an in-flight thinking block.
+    pub fn append_thinking(&mut self, token: &str) {
+        if let Some(ChatEntry::Thinking {
+            content,
+            streaming: true,
+        }) = self.entries.back_mut()
+        {
+            content.push_str(token);
+        } else {
+            self.push(ChatEntry::Thinking {
+                content: token.to_string(),
+                streaming: true,
+            });
+        }
+    }
+
+    /// Mark the last assistant entry (and any still-streaming thinking block) as
+    /// no longer streaming, so their live cursors/glyphs collapse.
     pub fn finish_stream(&mut self) {
         if let Some(ChatEntry::Assistant { streaming, .. }) = self.entries.back_mut() {
             *streaming = false;
+        }
+        for entry in self.entries.iter_mut() {
+            if let ChatEntry::Thinking { streaming, .. } = entry {
+                *streaming = false;
+            }
         }
     }
 
@@ -473,6 +503,19 @@ impl PickerState {
             .filtered_items()
             .iter()
             .position(|candidate| *candidate == item)
+        {
+            self.selected = index;
+        }
+    }
+
+    /// Select the first item that starts with `prefix`. Useful when display rows
+    /// carry trailing annotations (e.g. ` · num_ctx …`) the caller can't
+    /// reproduce verbatim.
+    pub fn select_prefix(&mut self, prefix: &str) {
+        if let Some(index) = self
+            .filtered_items()
+            .iter()
+            .position(|candidate| candidate.starts_with(prefix))
         {
             self.selected = index;
         }
@@ -1203,14 +1246,21 @@ pub struct AppState {
     pub settings_editor: crate::settings_editor::SettingsEditor,
 
     // ── Liveness indicator ──
-    /// Braille "liveness" glyph shown in front of the streaming `ahma` response
-    /// line (e.g. `⢷ ahma`). It is re-randomised by [`AppState::bump_liveness`]
-    /// only when the server sends a fresh signal (tokens/thinking, tool events,
-    /// usage) so it visibly proves the connection is alive and more is coming.
-    /// Reset to a space when the turn completes.
-    pub liveness_glyph: char,
+    /// Two-cell Braille "liveness" glyph shown in front of the streaming `ahma`
+    /// response line (e.g. `⢷⡪ ahma`). Re-randomised *fast* by
+    /// [`AppState::mark_stream_activity`] on every token/thinking/tool/usage
+    /// signal (proving results are actively coming back), and *slowly* by
+    /// [`AppState::tick_waiting_spinner`] while the request is in flight but
+    /// quiet (proving it is still alive — vs frozen/timed-out). Two spaces when
+    /// the turn is complete.
+    pub liveness_glyph: String,
     /// xorshift64 state driving the random liveness glyph. Never zero.
     pub liveness_seed: u64,
+    /// When the last visible stream signal (token/thinking/tool/usage) arrived.
+    /// Drives the fast-vs-slow spinner cadence. `None` until the first signal.
+    pub last_stream_activity: Option<std::time::Instant>,
+    /// When the slow "still waiting" spinner last advanced.
+    pub last_wait_tick: Option<std::time::Instant>,
 
     // ── Config ──
     pub unicode: bool,
@@ -1269,24 +1319,66 @@ impl AppState {
         self.modal.is_open()
     }
 
-    /// Re-randomise the liveness glyph. Call this whenever the server sends an
-    /// indication that the turn is alive and more is coming (a token/thinking
-    /// chunk, a tool-call edge, a usage update). The glyph only ever changes
-    /// here, so its movement is a faithful pulse of real server activity.
+    /// Re-randomise the two-cell liveness glyph from the xorshift generator.
+    /// Low-level; prefer [`Self::mark_stream_activity`] (fast pulse on real
+    /// output) or [`Self::tick_waiting_spinner`] (slow pulse while waiting).
     pub fn bump_liveness(&mut self) {
-        // xorshift64 — cheap, dependency-free, and seeded away from zero.
+        // xorshift64 — cheap, dependency-free, and seeded away from zero. Draw
+        // two cells so the indicator is wider and its motion is easier to see.
         let mut x = self.liveness_seed;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
+        let mut glyph = String::with_capacity(8);
+        for _ in 0..2 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            glyph.push(liveness_char(x, self.unicode));
+        }
         self.liveness_seed = x;
-        self.liveness_glyph = liveness_char(x, self.unicode);
+        self.liveness_glyph = glyph;
     }
 
-    /// Clear the liveness glyph back to a space once the turn is complete and no
+    /// Record real server output (token/thinking/tool/usage) and pulse the
+    /// spinner *fast*. The rapid, per-token change is the reliable "results are
+    /// actively coming back" signal.
+    pub fn mark_stream_activity(&mut self) {
+        self.bump_liveness();
+        self.last_stream_activity = Some(std::time::Instant::now());
+    }
+
+    /// Advance the spinner on a slow cadence while a request is in flight but
+    /// quiet (no recent output) — the "still alive, just waiting" signal that is
+    /// visibly distinct from the fast streaming pulse. Call once per animation
+    /// tick *only while a turn is in progress*. Returns `true` if the glyph
+    /// changed (so the caller can redraw).
+    pub fn tick_waiting_spinner(&mut self) -> bool {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        // If output arrived very recently, token events are driving the fast
+        // pulse — don't also tick here.
+        let streaming_recently = self
+            .last_stream_activity
+            .is_some_and(|t| now.duration_since(t) < Duration::from_millis(350));
+        if streaming_recently {
+            return false;
+        }
+        let due = self
+            .last_wait_tick
+            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(700));
+        if due {
+            self.bump_liveness();
+            self.last_wait_tick = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear the liveness glyph back to blank once the turn is complete and no
     /// further server updates are expected for the current response line.
     pub fn reset_liveness(&mut self) {
-        self.liveness_glyph = ' ';
+        self.liveness_glyph = "  ".to_string();
+        self.last_stream_activity = None;
+        self.last_wait_tick = None;
     }
 
     /// True when a text-entry overlay (navigator, palette, or an inline picker)
@@ -1556,8 +1648,10 @@ impl AppState {
             cleared_at: None,
             window_rects: std::cell::RefCell::new(vec![]),
 
-            liveness_glyph: ' ',
+            liveness_glyph: "  ".to_string(),
             liveness_seed: liveness_initial_seed(),
+            last_stream_activity: None,
+            last_wait_tick: None,
             unicode,
             should_quit: false,
             bridge_tx: None,
@@ -2052,11 +2146,16 @@ mod tests {
     #[test]
     fn bump_liveness_changes_glyph_and_reset_clears_it() {
         let mut s = AppState::new("http://localhost:3000", "HTTP", true);
-        assert_eq!(s.liveness_glyph, ' ', "starts idle");
+        assert_eq!(s.liveness_glyph, "  ", "starts idle (two blanks)");
 
         s.bump_liveness();
-        let first = s.liveness_glyph;
-        assert_ne!(first, ' ', "a bump produces a visible glyph");
+        let first = s.liveness_glyph.clone();
+        assert_eq!(
+            first.chars().count(),
+            2,
+            "the glyph is a two-cell wide indicator"
+        );
+        assert_ne!(first, "  ", "a bump produces a visible glyph");
 
         // The seed advances, so successive bumps move the glyph (deterministically
         // via xorshift). Collect a few and confirm they are not all identical.
@@ -2064,14 +2163,32 @@ mod tests {
         seen.insert(first);
         for _ in 0..8 {
             s.bump_liveness();
-            seen.insert(s.liveness_glyph);
+            seen.insert(s.liveness_glyph.clone());
         }
         assert!(seen.len() > 1, "liveness glyph should change across bumps");
 
         s.reset_liveness();
         assert_eq!(
-            s.liveness_glyph, ' ',
-            "reset collapses the glyph to a space"
+            s.liveness_glyph, "  ",
+            "reset collapses the glyph to two blanks"
+        );
+    }
+
+    #[test]
+    fn waiting_spinner_ticks_slowly_and_not_during_active_streaming() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        // Fresh in-flight turn, no output yet → first wait-tick fires immediately.
+        assert!(s.tick_waiting_spinner(), "first waiting tick advances");
+        // Immediately calling again is throttled by the slow cadence.
+        assert!(
+            !s.tick_waiting_spinner(),
+            "slow cadence throttles back-to-back ticks"
+        );
+        // Real output just arrived → waiting ticks are suppressed (tokens drive it).
+        s.mark_stream_activity();
+        assert!(
+            !s.tick_waiting_spinner(),
+            "no waiting tick while output is actively streaming"
         );
     }
 

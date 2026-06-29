@@ -6,6 +6,8 @@ use tokio::sync::mpsc::Sender;
 
 pub enum BridgeEvent {
     Token(String),
+    /// Reasoning / "thinking" fragment, rendered in lower contrast.
+    Thinking(String),
     Done,
     Error(String),
     ToolCallStarted {
@@ -95,6 +97,7 @@ pub fn spawn_agent_task(
         while let Some(evt) = core_rx.recv().await {
             let bridge_evt = match evt {
                 ahma_core::agent::AgentEvent::Token(t) => BridgeEvent::Token(t),
+                ahma_core::agent::AgentEvent::Thinking(t) => BridgeEvent::Thinking(t),
                 ahma_core::agent::AgentEvent::Done => BridgeEvent::Done,
                 ahma_core::agent::AgentEvent::Error(e) => BridgeEvent::Error(e),
                 ahma_core::agent::AgentEvent::ToolCallStarted { id, name, args } => {
@@ -123,6 +126,7 @@ pub fn spawn_chat_task(
         while let Some(evt) = core_rx.recv().await {
             let bridge_evt = match evt {
                 ahma_core::agent::AgentEvent::Token(t) => BridgeEvent::Token(t),
+                ahma_core::agent::AgentEvent::Thinking(t) => BridgeEvent::Thinking(t),
                 ahma_core::agent::AgentEvent::Done => BridgeEvent::Done,
                 ahma_core::agent::AgentEvent::Error(e) => BridgeEvent::Error(e),
                 ahma_core::agent::AgentEvent::ToolCallStarted { id, name, args } => {

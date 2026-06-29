@@ -179,6 +179,8 @@ pub enum ClientMsg {
     },
     /// Stream a chat token from the instance to the hub.
     ChatToken { token: String },
+    /// Stream a reasoning/"thinking" token (rendered in lower contrast by the TUI).
+    ChatThinking { token: String },
     /// Request approval from the TUI.
     ApprovalRequested {
         id: String,
@@ -228,6 +230,8 @@ pub enum DaemonMsg {
     Ping { seq: u32 },
     /// Live chat token streamed back to the TUI from the daemon's agent loop.
     ChatToken { token: String },
+    /// Live reasoning/"thinking" token streamed back to the TUI (lower contrast).
+    ChatThinking { token: String },
     /// Prompt the TUI to request user approval for tool execution or elevation.
     ApprovalRequested {
         id: String,
@@ -1088,6 +1092,9 @@ async fn serve_instance<R, W>(
                     }
                     Ok(ClientMsg::ChatToken { token }) => {
                         let _ = hub.broadcast.send(DaemonMsg::ChatToken { token });
+                    }
+                    Ok(ClientMsg::ChatThinking { token }) => {
+                        let _ = hub.broadcast.send(DaemonMsg::ChatThinking { token });
                     }
                     Ok(ClientMsg::ApprovalRequested { id: call_id, tool, args }) => {
                         let _ = hub.broadcast.send(DaemonMsg::ApprovalRequested { id: call_id, tool, args });

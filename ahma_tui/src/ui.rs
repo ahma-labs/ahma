@@ -758,6 +758,9 @@ fn push_chat_entry_lines(
         } => {
             push_user_chat_lines(lines, text, *started_at, *duration_ms, theme, width);
         }
+        ChatEntry::Thinking { content, streaming } => {
+            push_thinking_chat_lines(lines, content, *streaming, state, theme);
+        }
         ChatEntry::Assistant { content, streaming } => {
             push_assistant_chat_lines(lines, content, *streaming, state, theme);
         }
@@ -889,7 +892,7 @@ fn push_assistant_chat_lines(
     // continuation indent matches the 7-column prefix width so wrapped text stays
     // aligned under the response.
     let prefix = assistant_line_prefix(streaming, state);
-    const CONT_INDENT: &str = "       "; // 7 spaces == width of "X ahma "
+    const CONT_INDENT: &str = "        "; // 8 spaces == width of "GG ahma "
 
     for (index, line_str) in display.lines().enumerate() {
         if index == 0 {
@@ -913,12 +916,50 @@ fn push_assistant_chat_lines(
     }
 }
 
+/// Render a reasoning/"thinking" block entirely in lower-contrast (dim) style so
+/// the user can see the model is thinking — and read it if they care — without it
+/// competing with the actual answer. Prefixed `X think ` (8 cols) where `X` is the
+/// live Braille pulse while streaming.
+fn push_thinking_chat_lines(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    streaming: bool,
+    state: &AppState,
+    theme: &Theme,
+) {
+    let cursor = assistant_stream_cursor(streaming, state.unicode);
+    let display = format!("{content}{cursor}");
+    let glyph: &str = if streaming {
+        &state.liveness_glyph
+    } else {
+        "  "
+    };
+    let prefix = format!("{glyph} think ");
+    const CONT_INDENT: &str = "         "; // 9 spaces == width of "GG think "
+
+    for (index, line_str) in display.lines().enumerate() {
+        let pfx = if index == 0 {
+            prefix.clone()
+        } else {
+            CONT_INDENT.to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(pfx, theme.dim()),
+            Span::styled(line_str.to_string(), theme.dim()),
+        ]));
+    }
+}
+
 /// Build the `ahma` response prefix. While the turn is live the leading glyph is
 /// the random Braille liveness pulse (`state.liveness_glyph`); when complete it
 /// collapses to a space so the column reads ` ahma`.
 #[cfg(feature = "tui")]
 fn assistant_line_prefix(streaming: bool, state: &AppState) -> String {
-    let glyph = if streaming { state.liveness_glyph } else { ' ' };
+    let glyph: &str = if streaming {
+        &state.liveness_glyph
+    } else {
+        "  "
+    };
     format!("{glyph} ahma ")
 }
 

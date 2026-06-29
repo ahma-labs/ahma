@@ -55,6 +55,19 @@ async fn main() -> Result<()> {
         ahma_core::agent::CorePromptRunner,
     ));
 
+    // Keep ~/.ahma/settings.toml in sync with this version's compiled-in
+    // defaults: create it on first run, and on upgrade add any fields a newer
+    // ahma introduced — preserving every value the user set. Skipped with
+    // --no-settings and for `settings` subcommands (which manage the file
+    // explicitly). Best-effort: a failure here is logged, never fatal.
+    if !cli.no_settings && !matches!(subcommand, Subcommands::Settings(_)) {
+        match ahma_common::config::AhmaSettings::ensure_current_default_path() {
+            Ok(true) => tracing::info!("settings.toml synced with current defaults"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("could not sync settings.toml defaults: {e}"),
+        }
+    }
+
     #[cfg(target_os = "windows")]
     check_powershell_available();
 
@@ -319,6 +332,7 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
                 base_url: add_args.base_url.clone(),
                 default_model: add_args.model.clone(),
                 api_key: add_args.api_key.clone(),
+                num_ctx: add_args.num_ctx,
             });
 
             // Ensure the directory exists before writing

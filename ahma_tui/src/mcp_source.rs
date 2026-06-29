@@ -61,6 +61,9 @@ pub enum SourceEvent {
     ChatToken {
         token: String,
     },
+    ChatThinking {
+        token: String,
+    },
     ApprovalRequested {
         id: String,
         tool: String,
