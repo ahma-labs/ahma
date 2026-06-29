@@ -1610,8 +1610,28 @@ fn grouped_hook_installed(document: &Value, platform: HookPlatform) -> bool {
         .unwrap_or(false)
 }
 
-fn codex_group_entry(scope: HookScope, env: &HookEnvironment) -> Value {
-    let args = exec_args(HookPlatform::Codex, scope);
+/// Build a grouped `type: command` hook entry whose **command is fully
+/// self-contained**: the binary path and every `hooks exec` argument are joined
+/// into the single `command` string (with a `commandWindows` variant where
+/// relevant), and there is no separate `args` array.
+///
+/// The command MUST be self-contained. Some consumers execute only the
+/// `command` field and ignore a sibling `args` array — notably Cursor, which
+/// also imports Claude Code's `~/.claude/settings.json` PreToolUse hooks and
+/// runs just their `command`. A split `command` + `args` entry then runs bare
+/// `ahma` with no subcommand, which dumps the CLI usage banner and exits
+/// non-zero; the editor surfaces that as a hard "Hook blocked with message:
+/// <banner>" on every shell command. Codex, Claude and Antigravity share this
+/// grouped format, so they all build the command the same self-contained way
+/// (differing only in the tool-name `matcher` and the status message).
+fn single_command_group_entry(
+    platform: HookPlatform,
+    scope: HookScope,
+    env: &HookEnvironment,
+    matcher: &str,
+    status_message: &str,
+) -> Value {
+    let args = exec_args(platform, scope);
     let binary_ref = BinaryReference::for_scope(env, scope);
     let command = binary_ref.build_command(&args);
     let mut handler = Map::new();
@@ -1633,35 +1653,36 @@ fn codex_group_entry(scope: HookScope, env: &HookEnvironment) -> Value {
     );
     handler.insert(
         "statusMessage".to_string(),
-        Value::String("Routing Bash through ahma".to_string()),
+        Value::String(status_message.to_string()),
     );
     json!({
-        "matcher": "^Bash$",
+        "matcher": matcher,
         "hooks": [Value::Object(handler)],
     })
 }
 
+fn codex_group_entry(scope: HookScope, env: &HookEnvironment) -> Value {
+    single_command_group_entry(
+        HookPlatform::Codex,
+        scope,
+        env,
+        "^Bash$",
+        "Routing Bash through ahma",
+    )
+}
+
 fn managed_group_entry(platform: HookPlatform, scope: HookScope, env: &HookEnvironment) -> Value {
     match platform {
-        HookPlatform::Claude | HookPlatform::Antigravity => {
-            let (command, args) = exec_command_and_args(platform, scope, env);
-            let matcher = match platform {
-                HookPlatform::Claude => "Bash",
-                HookPlatform::Antigravity => "run_command",
-                _ => unreachable!(),
-            };
-            json!({
-                "matcher": matcher,
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": command,
-                        "args": args,
-                        "timeout": HOOK_TIMEOUT_SECS,
-                    }
-                ]
-            })
+        HookPlatform::Claude => {
+            single_command_group_entry(platform, scope, env, "Bash", "Routing Bash through ahma")
         }
+        HookPlatform::Antigravity => single_command_group_entry(
+            platform,
+            scope,
+            env,
+            "run_command",
+            "Routing run_command through ahma",
+        ),
         HookPlatform::Codex => codex_group_entry(scope, env),
         HookPlatform::Cursor | HookPlatform::Copilot => {
             unreachable!("Cursor/Copilot do not use grouped hooks")
@@ -1767,18 +1788,6 @@ fn exec_args(platform: HookPlatform, scope: HookScope) -> Vec<String> {
         "--managed-id".to_string(),
         MANAGED_ID_DEFAULT_SHELL_V1.to_string(),
     ]
-}
-
-fn exec_command_and_args(
-    platform: HookPlatform,
-    scope: HookScope,
-    env: &HookEnvironment,
-) -> (String, Vec<String>) {
-    let binary = match BinaryReference::for_scope(env, scope) {
-        BinaryReference::Absolute(path) => path.to_string_lossy().into_owned(),
-        BinaryReference::PathLookup => PATH_LOOKUP_BINARY.to_string(),
-    };
-    (binary, exec_args(platform, scope))
 }
 
 fn ensure_root_object(document: &mut Value) -> Result<&mut Map<String, Value>> {
@@ -2332,17 +2341,19 @@ mod tests {
             .unwrap();
         assert_eq!(matcher, "run_command");
 
-        let command = installed["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
+        let handler = &installed["hooks"]["PreToolUse"][0]["hooks"][0];
+        let command = handler["command"].as_str().unwrap();
         assert!(command.contains("bin space"));
-
-        let args = installed["hooks"]["PreToolUse"][0]["hooks"][0]["args"]
-            .as_array()
-            .unwrap();
+        // The command must be fully self-contained (binary + `hooks exec` args
+        // in one string) so a consumer that runs only `command` — e.g. Cursor
+        // importing Claude/Antigravity hooks — still gets a complete invocation
+        // rather than bare `ahma` (which dumps the usage banner and exits 2).
+        assert!(command.contains("hooks"));
+        assert!(command.contains("exec"));
+        assert!(command.contains(MANAGED_ID_DEFAULT_SHELL_V1));
         assert!(
-            args.iter()
-                .any(|arg| arg.as_str() == Some(MANAGED_ID_DEFAULT_SHELL_V1))
+            handler.get("args").is_none(),
+            "grouped hook must NOT use a separate `args` array: {handler:?}",
         );
     }
 
@@ -3370,7 +3381,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // exec_args / exec_command_and_args / build_exec_command
+    // exec_args / build_exec_command / self-contained grouped command
     // ----------------------------------------------------------------------
     #[test]
     fn test_exec_args_shape() {
@@ -3383,19 +3394,36 @@ mod tests {
         assert!(args.contains(&MANAGED_ID_DEFAULT_SHELL_V1.to_string()));
     }
 
+    /// The Claude grouped hook's `command` must be self-contained: a consumer
+    /// that runs only `command` (e.g. Cursor importing Claude hooks) must still
+    /// invoke `ahma hooks exec …`, never bare `ahma`. Regression for the
+    /// "Hook blocked with message: <usage banner>" failure.
     #[test]
-    fn test_exec_command_and_args_user_is_absolute_path() {
+    fn test_claude_group_command_is_self_contained_user_absolute() {
         let env = test_env();
-        let (binary, args) = exec_command_and_args(HookPlatform::Claude, HookScope::User, &env);
-        assert!(binary.contains("bin space"));
-        assert_eq!(args[0], "hooks");
+        let entry = managed_group_entry(HookPlatform::Claude, HookScope::User, &env);
+        let handler = &entry["hooks"][0];
+        let command = handler["command"].as_str().unwrap();
+        assert!(command.contains("bin space"), "absolute path: {command}");
+        assert!(command.contains("hooks"));
+        assert!(command.contains("exec"));
+        assert!(command.contains(MANAGED_ID_DEFAULT_SHELL_V1));
+        assert!(
+            handler.get("args").is_none(),
+            "must not split into a separate `args` array: {handler:?}",
+        );
     }
 
     #[test]
-    fn test_exec_command_and_args_project_uses_path_lookup() {
+    fn test_claude_group_command_is_self_contained_project_path_lookup() {
         let env = test_env();
-        let (binary, _) = exec_command_and_args(HookPlatform::Claude, HookScope::Project, &env);
-        assert_eq!(binary, "ahma");
+        let entry = managed_group_entry(HookPlatform::Claude, HookScope::Project, &env);
+        let command = entry["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            command.starts_with("ahma hooks exec"),
+            "project scope uses PATH lookup + self-contained command: {command}",
+        );
+        assert!(command.contains(MANAGED_ID_DEFAULT_SHELL_V1));
     }
 
     #[test]

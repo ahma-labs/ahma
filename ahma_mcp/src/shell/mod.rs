@@ -32,7 +32,7 @@ pub use cli::{
     SettingsArgs, SettingsCommand, Subcommands, TlsArgs, TlsCommand, TuiArgs, VaultArgs,
     VaultCommand, VaultCreateArgs,
 };
-pub use cli::{build_app_config, dispatch_subcommand, load_settings, run};
+pub use cli::{build_app_config, dispatch_subcommand, load_settings};
 
 pub use resolution::{
     find_matching_tool, find_tool_config, normalize_tools_dir, resolve_cli_subcommand,

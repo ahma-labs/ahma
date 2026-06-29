@@ -18,7 +18,26 @@ use ahma_mcp::utils::logging::{
 };
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Parse via `try_parse` (not `Cli::parse`) so a malformed `ahma hooks exec …`
+    // invocation never lets clap dump its top-level usage banner. An editor that
+    // runs the hook treats the hook's stdout + exit code as the decision, so a
+    // usage dump would surface as a hard "Hook blocked with message: <banner>".
+    // Instead, emit a concise fail-open `allow` decision and exit cleanly. This
+    // covers the version/flag skew where a hooks.json command written by one ahma
+    // version is invoked against a different `ahma` resolved on PATH.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            // Explicit `--help` / `--version` must still print normally.
+            let is_help_or_version =
+                matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion);
+            if !is_help_or_version && ahma_mcp::hooks::try_emit_exec_parse_error_fallback() {
+                std::process::exit(0);
+            }
+            e.exit();
+        }
+    };
 
     // --markdown-help: emit the full CLI reference as Markdown and exit.
     // Regenerate docs/cli-reference.md with:  ahma --markdown-help > docs/cli-reference.md

@@ -695,3 +695,90 @@ mod ahma_list_tools_mode_tests {
         assert!(list2_stdout.contains("No peers configured."));
     }
 }
+
+// ============================================================================
+// Hooks exec fail-open guard (regression)
+// ============================================================================
+
+mod hooks_exec_fail_open_tests {
+    use super::*;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    /// Regression for the Cursor "Hook blocked with message: <ahma usage banner>"
+    /// failure. A `preToolUse` hook command (`ahma hooks exec …`) recorded by one
+    /// ahma version can be invoked against a different `ahma` resolved on PATH that
+    /// does not recognize one of its flags. The editor treats the hook's stdout +
+    /// exit code as the decision, so if `ahma` lets clap print its usage banner and
+    /// exit 2, the editor surfaces that banner as a hard tool block.
+    ///
+    /// The real binary's `main` must therefore FAIL OPEN on a malformed `hooks
+    /// exec` invocation: emit `{"permission":"allow"}` and exit 0, never the clap
+    /// banner. This pins the guard end-to-end through `ahma_bin::main`, which used
+    /// `Cli::parse()` (parse-or-exit) and bypassed the fallback entirely.
+    #[test]
+    fn hooks_exec_unknown_flag_fails_open_without_usage_banner() {
+        let binary = build_binary_cached("ahma_bin", "ahma");
+        let temp = TempDir::new().expect("create temp dir");
+        let cwd = temp.path().display().to_string();
+
+        let mut child = Command::new(&binary)
+            .args([
+                "hooks",
+                "exec",
+                "--platform",
+                "cursor",
+                "--scope",
+                "user",
+                "--managed-id",
+                "ahma-default-shell-v1",
+                "--totally-bogus-flag-that-no-ahma-version-knows",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn `ahma hooks exec`");
+
+        // Best-effort: the fail-open guard writes its decision and exits without
+        // reading stdin, so this write may hit a closed pipe — that is fine.
+        if let Some(mut stdin) = child.stdin.take() {
+            let payload = format!(r#"{{"tool_input":{{"command":"git status"}},"cwd":"{cwd}"}}"#);
+            let _ = stdin.write_all(payload.as_bytes());
+        }
+
+        let output = child
+            .wait_with_output()
+            .expect("wait for `ahma hooks exec`");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Fail open with a clean exit, not clap's exit 2.
+        assert!(
+            output.status.success(),
+            "malformed `hooks exec` must exit 0 (fail open), got {:?}.\nstdout: {stdout}\nstderr: {stderr}",
+            output.status.code(),
+        );
+
+        // stdout must be a decision the editor can parse, and it must allow.
+        let decision: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("stdout must be a JSON decision, got {stdout:?}: {e}"));
+        assert_eq!(
+            decision.get("permission").and_then(|v| v.as_str()),
+            Some("allow"),
+            "decision must be `allow`, got {stdout:?}",
+        );
+
+        // The clap usage/about banner must never leak into the hook output —
+        // that is exactly what the editor would render as the block reason.
+        let combined = format!("{stdout}{stderr}");
+        assert!(
+            !combined.contains("Usage: ahma"),
+            "clap usage banner leaked into hook output:\n{combined}",
+        );
+        assert!(
+            !combined.contains("secure, config-driven adapter"),
+            "clap top-level about banner leaked into hook output:\n{combined}",
+        );
+    }
+}

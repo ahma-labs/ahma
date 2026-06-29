@@ -25,10 +25,7 @@ mod commands;
 
 use super::{list_tools, modes, resolution};
 
-use crate::{
-    sandbox,
-    utils::logging::{detect_log_role_from_startup, init_logging_with_observability, set_log_role},
-};
+use crate::sandbox;
 use ahma_common::config::MutexGroupConfig;
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
@@ -721,28 +718,6 @@ fn log_sandbox_mode(no_sandbox: bool) {
     tracing::info!(
         "SECURE Sandbox mode: UNSUPPORTED ON THIS OS (startup fails closed in strict mode)"
     );
-}
-
-#[cfg(target_os = "windows")]
-fn check_powershell_available() {
-    let ps_check = std::process::Command::new("powershell")
-        .arg("-NoProfile")
-        .arg("-Command")
-        .arg("$PSVersionTable.PSVersion.ToString()")
-        .output();
-    match ps_check {
-        Ok(out) if out.status.success() => {
-            let ver = String::from_utf8_lossy(&out.stdout);
-            tracing::info!("PowerShell detected: {}", ver.trim());
-        }
-        _ => {
-            eprintln!(
-                "\nFAIL Error: PowerShell was not found.\n\n\
-                 ahma_mcp requires PowerShell (built into Windows 10/11) as its runtime shell.\n"
-            );
-            std::process::exit(1);
-        }
-    }
 }
 
 async fn dispatch_serve(serve_args: ServeArgs, cfg: AppConfig) -> Result<()> {
@@ -2481,53 +2456,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
-
-pub async fn run() -> Result<()> {
-    // Load settings early so we can determine log target before initialising logging.
-    // We do a minimal Cli parse just to capture --no-settings / --settings-path; the
-    // full parse happens below.  We also honour the legacy AHMA_LOG_TARGET env var with
-    // a deprecation-friendly approach: settings file wins, env var is a fallback.
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(e) => {
-            use clap::error::ErrorKind;
-            // Explicit `--help` / `--version` must still print normally.
-            let is_help_or_version =
-                matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion);
-            // For a malformed `hooks exec` invocation, never let clap dump its
-            // usage banner as the editor's "block message"; emit a concise
-            // fail-open decision instead and exit cleanly.
-            if !is_help_or_version && crate::hooks::try_emit_exec_parse_error_fallback() {
-                std::process::exit(0);
-            }
-            e.exit();
-        }
-    };
-
-    // R-CFG1.2: AHMA_LOG_TARGET is RETIRED — warn and ignore.
-    if std::env::var_os("AHMA_LOG_TARGET").is_some() {
-        tracing::warn!(
-            "AHMA env var AHMA_LOG_TARGET is set but IGNORED (retired per R-CFG1.2). \
-             Use `logging.target = \"stderr\"` in ~/.ahma/settings.toml instead."
-        );
-    }
-    let settings_for_log = load_settings(&cli);
-    let log_to_stderr = settings_for_log.log_to_stderr() || cli.log_to_stderr;
-
-    set_log_role(detect_log_role_from_startup());
-
-    let cfg = build_app_config(&cli);
-    let subcommand = cli.command;
-
-    // Keep the guard alive for the duration of the process.
-    let _telemetry_guard =
-        init_logging_with_observability("info", !log_to_stderr, Some(cfg.observability.clone()))?;
-
-    #[cfg(target_os = "windows")]
-    check_powershell_available();
-
-    dispatch_subcommand(subcommand, cfg).await
-}
 
 pub(crate) fn initialize_sandbox(cfg: &AppConfig) -> Result<Option<Arc<sandbox::Sandbox>>> {
     let policy = resolve_sandbox_policy(cfg);
