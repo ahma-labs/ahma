@@ -1530,6 +1530,8 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let workspace_short = shorten_path(&state.workspace, max_path_len);
     let external_part = format_external_part(state);
     let tokens_part = format_tokens_part(state);
+    // Only surface minimization when it is on — the default-off case stays quiet.
+    let minimize_part = if state.minimize_tokens { " · min" } else { "" };
 
     let daemon_char = match (state.daemon_healthy, state.unicode) {
         (true, true) => " · ● DMON",
@@ -1562,6 +1564,7 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         Span::styled(sandbox_status_part, sandbox_style),
         Span::styled(external_part, theme.dim()),
         Span::styled(tokens_part, theme.pending()),
+        Span::styled(minimize_part, theme.dim()),
         Span::styled(format!(" · {}", state.transport_label), theme.dim()),
         health_span,
         daemon_span,

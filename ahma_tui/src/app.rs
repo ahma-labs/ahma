@@ -78,6 +78,9 @@ async fn run_ratatui(
     }
     state.mcp_http_base_url = http_base_url(connection);
     state.token_prefs = token_prefs;
+    // Cache the effective minimize state (flag > env > settings) for the status
+    // bar and the `/minimize` switch, so neither has to re-read settings.
+    state.minimize_tokens = resolve_token_prefs(&state).0;
 
     if let Some(profile_name) = profile_override
         && let Ok(cwd) = std::env::current_dir()
@@ -1819,6 +1822,7 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
         || handle_basic_nav_command(cmd, state)
         || handle_mode_nav_command(cmd, state)
         || handle_mcp_nav_command(cmd, state)
+        || handle_minimize_nav_command(cmd, state)
         || handle_agent_nav_command(cmd, state)
         || handle_export_nav_command(cmd, state)
         || handle_settings_nav_command(cmd, state)
@@ -1837,6 +1841,65 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
         state,
         format!("Unknown command `{cmd}`. Use /help to see the available commands."),
     );
+}
+
+/// `/minimize [on|off]` — toggle token minimization (concise prompting + output
+/// compression for small models). With no argument it reports the current state.
+/// The choice is applied live and persisted to `settings.tools.minimize_tokens`
+/// so the daemon agent loop (which reads settings) and the next session both
+/// honour it. Default is off.
+#[cfg(feature = "tui")]
+fn handle_minimize_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    let Some(rest) = cmd.strip_prefix("/minimize") else {
+        return false;
+    };
+    let arg = rest.trim();
+
+    let desired = match arg {
+        "" => {
+            let status = if state.minimize_tokens { "on" } else { "off" };
+            push_assistant_message(
+                state,
+                format!(
+                    "Token minimization is **{status}**. Use `/minimize on` or `/minimize off` to change it."
+                ),
+            );
+            return true;
+        }
+        "on" | "true" | "1" => true,
+        "off" | "false" | "0" => false,
+        other => {
+            push_assistant_message(state, format!("Usage: /minimize [on|off] (got `{other}`)"));
+            return true;
+        }
+    };
+
+    set_minimize_tokens(state, desired);
+    true
+}
+
+/// Apply and persist the token-minimization preference. Updates the live session
+/// (`token_prefs` + the cached display flag) and writes `settings.toml`.
+#[cfg(feature = "tui")]
+fn set_minimize_tokens(state: &mut crate::state::AppState, desired: bool) {
+    state.minimize_tokens = desired;
+    state.token_prefs.minimize_tokens = Some(desired);
+
+    let mut settings = ahma_common::config::AhmaSettings::load();
+    settings.tools.minimize_tokens = desired;
+    let status = if desired { "on" } else { "off" };
+    match settings.save() {
+        Ok(()) => push_assistant_message(
+            state,
+            format!("Token minimization turned **{status}** (saved to settings)."),
+        ),
+        Err(e) => push_assistant_message(
+            state,
+            format!(
+                "Token minimization turned **{status}** for this session, but saving to settings failed: {e}"
+            ),
+        ),
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -4193,6 +4256,58 @@ mod tests {
     fn parse_run_command_rejects_non_object_json() {
         let error = parse_run_command("status []").unwrap_err();
         assert!(error.contains("expects a JSON object"));
+    }
+
+    #[test]
+    fn minimize_command_toggles_persists_and_reports() {
+        use crate::state::AppState;
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        unsafe {
+            std::env::set_var("AHMA_TEST_HOME", dir.path());
+        }
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        assert!(!state.minimize_tokens, "default off");
+
+        // An unrecognised argument is still claimed (returns true) but changes nothing.
+        assert!(super::handle_minimize_nav_command(
+            "/minimize bogus",
+            &mut state
+        ));
+        assert!(!state.minimize_tokens);
+
+        // Turn on: live display flag, session override, and persisted setting.
+        assert!(super::handle_minimize_nav_command(
+            "/minimize on",
+            &mut state
+        ));
+        assert!(state.minimize_tokens);
+        assert_eq!(state.token_prefs.minimize_tokens, Some(true));
+        assert!(
+            ahma_common::config::AhmaSettings::load()
+                .tools
+                .minimize_tokens
+        );
+
+        // Turn off again, persisted.
+        assert!(super::handle_minimize_nav_command(
+            "/minimize off",
+            &mut state
+        ));
+        assert!(!state.minimize_tokens);
+        assert!(
+            !ahma_common::config::AhmaSettings::load()
+                .tools
+                .minimize_tokens
+        );
+
+        // A non-minimize command is not claimed by this handler.
+        assert!(!super::handle_minimize_nav_command("/help", &mut state));
+
+        unsafe {
+            std::env::remove_var("AHMA_TEST_HOME");
+        }
     }
 
     #[test]

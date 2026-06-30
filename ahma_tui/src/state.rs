@@ -269,6 +269,14 @@ pub fn builtin_commands() -> Vec<NavCommand> {
             description: "select model for current provider",
         },
         NavCommand {
+            command: "/minimize on".into(),
+            description: "enable token minimization (concise prompts, compressed output)",
+        },
+        NavCommand {
+            command: "/minimize off".into(),
+            description: "disable token minimization (default)",
+        },
+        NavCommand {
             command: "/mcp on".into(),
             description: "enable ahma as MCP tool server",
         },
@@ -1129,6 +1137,10 @@ pub struct AppState {
     /// `--small-model-harness`, `--context-length`).  Flag values override
     /// settings.toml and the deprecated env vars.
     pub token_prefs: crate::TokenPrefs,
+    /// Effective token-minimization state for display and the `/minimize` switch.
+    /// Resolved once at startup (flag > env > settings) and kept in sync by the
+    /// `/minimize on|off` command, which also persists `settings.tools`.
+    pub minimize_tokens: bool,
 
     // ── Panel data ──
     pub ai_activity: VecDeque<AiActivityEntry>,
@@ -1563,6 +1575,7 @@ impl AppState {
             sandbox_status: "UNKNOWN".to_string(),
             workspace,
             token_prefs: crate::TokenPrefs::default(),
+            minimize_tokens: false,
             ai_activity: VecDeque::with_capacity(ACTIVITY_RING_CAP),
             operations: vec![],
             pending_output: HashMap::new(),
