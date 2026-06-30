@@ -241,3 +241,52 @@ async fn test_discover_local_providers() {
     let result = ahma_llm_monitor::discovery::discover_local_providers().await;
     assert!(result.is_ok());
 }
+
+/// A transient 5xx is retried with backoff and the call ultimately succeeds.
+#[tokio::test]
+async fn chat_completion_retries_transient_5xx_then_succeeds() {
+    let server = MockServer::start().await;
+    // First two attempts get 503 (higher priority, capped at 2 uses)…
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // …then a normal 200 completion.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(make_response("recovered")))
+        .mount(&server)
+        .await;
+
+    let client = LlmClient::new(server.uri(), "test-model", None);
+    let resp = client
+        .chat_completion_with_tools(vec![], &[])
+        .await
+        .expect("retry should recover from transient 503s");
+    assert_eq!(resp.content, "recovered");
+}
+
+/// A non-retryable 4xx fails immediately (no wasted retries on a caller error).
+#[tokio::test]
+async fn chat_completion_does_not_retry_4xx() {
+    let server = MockServer::start().await;
+    // Mounted with a single-use cap: if the client retried, the 2nd call would
+    // 404 (no matching mock) — but expect(1) also asserts exactly one call.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = LlmClient::new(server.uri(), "test-model", None);
+    let err = client
+        .chat_completion_with_tools(vec![], &[])
+        .await
+        .expect_err("4xx must surface as an error, not be retried");
+    assert!(err.to_string().contains("400"), "got: {err}");
+    // `expect(1)` is verified on server drop: exactly one request was made.
+}

@@ -46,6 +46,67 @@ fn build_http_client() -> Client {
         })
 }
 
+/// Maximum number of *retries* (extra attempts) on a transient LLM failure.
+const LLM_MAX_RETRIES: u32 = 3;
+/// Backoff before the first retry; doubles each attempt up to [`LLM_RETRY_MAX_DELAY`].
+const LLM_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+const LLM_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
+
+/// HTTP statuses worth retrying — transient overload/server conditions. Other
+/// 4xx (400/401/403/404) are caller errors and must never be retried.
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
+/// Transport errors worth retrying: a timed-out or momentarily unreachable
+/// endpoint — not a malformed request or a decoding error.
+fn is_retryable_transport_err(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
+}
+
+/// Exponential backoff for retry `attempt` (0-based), capped.
+fn backoff_delay(attempt: u32) -> Duration {
+    LLM_RETRY_BASE_DELAY
+        .saturating_mul(1u32 << attempt.min(5))
+        .min(LLM_RETRY_MAX_DELAY)
+}
+
+/// Send an HTTP request with bounded exponential backoff on transient failures
+/// (timeouts/connect errors and 429/5xx). `build` constructs a fresh request per
+/// attempt. A non-retryable response (success or a non-429 4xx) is returned as
+/// `Ok` so the caller's own status handling runs; a non-retryable transport
+/// error, or exhaustion of all retries, returns the last error/response.
+async fn send_with_backoff<F>(build: F) -> Result<reqwest::Response, LlmMonitorError>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempt = 0u32;
+    loop {
+        match build().send().await {
+            Ok(resp) => {
+                if is_retryable_status(resp.status()) && attempt < LLM_MAX_RETRIES {
+                    let delay = backoff_delay(attempt);
+                    warn!(status = %resp.status(), attempt = attempt + 1, ?delay, "llm: retryable HTTP status — backing off and retrying");
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Ok(resp);
+            }
+            Err(e) => {
+                if is_retryable_transport_err(&e) && attempt < LLM_MAX_RETRIES {
+                    let delay = backoff_delay(attempt);
+                    warn!(error = %e, attempt = attempt + 1, ?delay, "llm: retryable transport error — backing off and retrying");
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue;
+                }
+                return Err(LlmMonitorError::Http(e));
+            }
+        }
+    }
+}
+
 // ─── Chat types ───────────────────────────────────────────────────────────────
 
 /// Role in a chat conversation.
@@ -548,29 +609,23 @@ impl LlmClient {
             "llm: requesting chat completion with tools (non-streaming)"
         );
 
-        let request = self.apply_auth(
-            self.http
-                .post(url)
-                .json(&body)
-                .timeout(Duration::from_secs(120)),
-        );
-
-        let response = match request.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                let elapsed_ms = started.elapsed().as_millis();
-                if e.is_timeout() {
-                    warn!(
-                        model = %self.model,
-                        elapsed_ms,
-                        "llm: chat completion timed out (120s) — model too slow, or prompt exceeds its context window and it is still generating"
-                    );
-                } else {
-                    warn!(model = %self.model, elapsed_ms, error = %e, "llm: chat completion request failed");
-                }
-                return Err(LlmMonitorError::Http(e));
+        let response = send_with_backoff(|| {
+            self.apply_auth(
+                self.http
+                    .post(&url)
+                    .json(&body)
+                    .timeout(Duration::from_secs(120)),
+            )
+        })
+        .await
+        .inspect_err(|e| {
+            let elapsed_ms = started.elapsed().as_millis();
+            if e.to_string().contains("timed out") {
+                warn!(model = %self.model, elapsed_ms, "llm: chat completion timed out after retries — model too slow, or prompt exceeds its context window");
+            } else {
+                warn!(model = %self.model, elapsed_ms, error = %e, "llm: chat completion request failed after retries");
             }
-        };
+        })?;
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
@@ -667,20 +722,19 @@ impl LlmClient {
             "llm: requesting chat completion with tools (streaming)"
         );
 
-        let request = self.apply_auth(
-            self.http
-                .post(format!("{}/chat/completions", self.base_url))
-                .json(&body)
-                .header("Accept", "text/event-stream"),
-        );
-
-        let response = match request.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(model = %self.model, elapsed_ms = started.elapsed().as_millis(), error = %e, "llm: streaming chat request failed");
-                return Err(LlmMonitorError::Http(e));
-            }
-        };
+        let url = format!("{}/chat/completions", self.base_url);
+        let response = send_with_backoff(|| {
+            self.apply_auth(
+                self.http
+                    .post(&url)
+                    .json(&body)
+                    .header("Accept", "text/event-stream"),
+            )
+        })
+        .await
+        .inspect_err(|e| {
+            warn!(model = %self.model, elapsed_ms = started.elapsed().as_millis(), error = %e, "llm: streaming chat request failed after retries");
+        })?;
         if !response.status().is_success() {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
@@ -1123,6 +1177,29 @@ fn parse_chat_completion_response(json: Value) -> Result<ChatCompletionResponse,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retryable_status_classification() {
+        use reqwest::StatusCode;
+        for s in [429u16, 500, 502, 503, 504] {
+            assert!(is_retryable_status(StatusCode::from_u16(s).unwrap()), "{s}");
+        }
+        for s in [200u16, 400, 401, 403, 404] {
+            assert!(
+                !is_retryable_status(StatusCode::from_u16(s).unwrap()),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        assert_eq!(backoff_delay(0), LLM_RETRY_BASE_DELAY);
+        assert!(backoff_delay(1) > backoff_delay(0));
+        assert!(backoff_delay(2) > backoff_delay(1));
+        // Never exceeds the cap, even for large attempt counts.
+        assert!(backoff_delay(20) <= LLM_RETRY_MAX_DELAY);
+    }
 
     #[test]
     fn streaming_accumulator_reassembles_split_tool_call_and_reasoning() {
