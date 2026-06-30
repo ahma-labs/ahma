@@ -567,8 +567,10 @@ impl AhmaMcpService {
             output_optimizer: Arc::new(tokio::sync::Mutex::new(
                 crate::output_optimizer::OutputOptimizer::new(false, None),
             )),
+            // Self-correction (tool-name/argument healing + failure-loop
+            // detection) is on by default — see `set_app_config` for why.
             harness_guard: Arc::new(tokio::sync::Mutex::new(
-                crate::harness_guard::HarnessGuard::new(false),
+                crate::harness_guard::HarnessGuard::new(true),
             )),
             progress_push,
             vault_audited_ops: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -649,8 +651,13 @@ impl AhmaMcpService {
         if let Ok(mut opt) = self.output_optimizer.try_lock() {
             opt.enabled = config.minimize_tokens;
         }
+        // Self-correction (tool-name/argument healing + failure-loop detection)
+        // is universally safe and is exactly what stops a model from burning its
+        // turn budget re-issuing the same broken call, so it stays on regardless
+        // of `small_model_harness`. That flag now governs only the verbose
+        // coaching hints injected in the agent loop, not self-correction.
         if let Ok(mut guard) = self.harness_guard.try_lock() {
-            guard.enabled = config.small_model_harness;
+            guard.enabled = true;
         }
         *self.app_config.write().unwrap() = Some(config);
     }
@@ -3759,6 +3766,26 @@ mod tests {
         assert_eq!(*service.current_tools_dir.read().unwrap(), Some(tools_dir));
         assert!(service.output_optimizer.lock().await.enabled);
         assert!(service.harness_guard.lock().await.enabled);
+    }
+
+    /// Self-correction (tool-name/argument healing + failure-loop detection) is
+    /// on by default and stays on even when `small_model_harness` is off — it is
+    /// what stops a model from burning its turn budget re-issuing a broken call.
+    #[tokio::test]
+    async fn self_correction_enabled_by_default_independent_of_small_model_harness() {
+        let service = make_service().await;
+        // Enabled before any AppConfig is applied.
+        assert!(service.harness_guard.lock().await.enabled);
+
+        let cfg = crate::shell::cli::AppConfig {
+            small_model_harness: false,
+            ..Default::default()
+        };
+        service.set_app_config(Arc::new(cfg));
+        assert!(
+            service.harness_guard.lock().await.enabled,
+            "self-correction must stay on with small_model_harness disabled"
+        );
     }
 
     // ==================== cancel most-recent background op ====================
