@@ -815,6 +815,7 @@ impl AhmaMcpService {
         "fetch_webpage",
         "write_file",
         "replace_in_file",
+        "agent",
     ];
 
     /// Returns true if a configured tool should be exposed to the client
@@ -1346,6 +1347,12 @@ impl ServerHandler for AhmaMcpService {
                 )
                 .with_title("replace_in_file"),
                 Tool::new(
+                    "agent",
+                    "Delegate a self-contained task to ahma's own agent loop as a sub-agent. ahma runs its full tool-using loop (read/edit files, run commands in the sandbox, search) with the model the user last selected in `ahma tui`, and returns the final answer. Use this to offload a focused sub-task — investigating code, producing a file or report, or answering a question grounded in the workspace — without doing the steps yourself.",
+                    handlers::agent_tool::agent_schema(),
+                )
+                .with_title("agent"),
+                Tool::new(
                     "log_monitor",
                     "Start a real-time log monitoring session on a file inside the sandbox. Reads new lines as they are written, runs them through the AI for issue detection, and sends alerts.",
                     schema::object_input_schema(
@@ -1495,6 +1502,10 @@ impl ServerHandler for AhmaMcpService {
                 }
                 "replace_in_file" => {
                     self.handle_replace_in_file(run_params.arguments.unwrap_or_default())
+                        .await
+                }
+                "agent" => {
+                    self.handle_agent(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "log_monitor" => {
@@ -3832,6 +3843,69 @@ mod tests {
             .find(|o| o.id == "bg1")
             .expect("cancelled op moved to completion history");
         assert_eq!(op.state, OperationStatus::Cancelled);
+    }
+
+    // ==================== agent sub-agent tool ====================
+
+    #[tokio::test]
+    async fn handle_agent_requires_a_prompt() {
+        let service = make_service().await;
+        // Missing prompt → invalid-params protocol error, before any runner call.
+        assert!(service.handle_agent(serde_json::Map::new()).await.is_err());
+        // Blank prompt is also rejected.
+        let mut blank = serde_json::Map::new();
+        blank.insert("prompt".into(), json!("   "));
+        assert!(service.handle_agent(blank).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_agent_delegates_to_the_registered_runner() {
+        use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
+
+        struct MockRunner;
+        #[async_trait::async_trait]
+        impl PromptRunner for MockRunner {
+            async fn run_prompt(
+                &self,
+                _messages: Vec<DaemonChatMessage>,
+                _system_prompt: Option<String>,
+                _provider: Option<String>,
+                _model: Option<String>,
+                _hub_tx: tokio::sync::mpsc::Sender<ClientMsg>,
+                _session: Arc<tokio::sync::Mutex<ActiveAgentSession>>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            async fn run_prompt_to_completion(
+                &self,
+                messages: Vec<DaemonChatMessage>,
+                _system_prompt: Option<String>,
+                _provider: Option<String>,
+                _model: Option<String>,
+                max_turns: Option<u32>,
+            ) -> Result<String, String> {
+                Ok(format!(
+                    "handled '{}' (max_turns={:?})",
+                    messages[0].content, max_turns
+                ))
+            }
+        }
+
+        // nextest runs each test in its own process, so this global set is local.
+        register_global_prompt_runner(Arc::new(MockRunner));
+
+        let service = make_service().await;
+        let mut args = serde_json::Map::new();
+        args.insert("prompt".into(), json!("summarise the build"));
+        args.insert("max_turns".into(), json!(3));
+
+        let result = service.handle_agent(args).await.expect("tool call ok");
+        assert_ne!(result.is_error, Some(true), "delegation should succeed");
+        let text = first_text(&result);
+        assert!(
+            text.contains("handled 'summarise the build'") && text.contains("max_turns=Some(3)"),
+            "unexpected sub-agent result: {text}"
+        );
     }
 
     // ==================== harness guard preprocessing ====================

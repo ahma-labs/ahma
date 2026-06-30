@@ -1441,66 +1441,13 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         hub_tx: tokio::sync::mpsc::Sender<ClientMsg>,
         session: Arc<tokio::sync::Mutex<ActiveAgentSession>>,
     ) -> Result<(), String> {
-        // 1. Get the active MCP service instance
-        let service = ahma_mcp::get_active_service()
-            .ok_or_else(|| "No active AhmaMcpService found in this process".to_string())?;
+        // Build the client/tools/config (tool_approval on → prompts the TUI),
+        // and convert the inbound messages.
+        let (client, mcp_config, available_tools) =
+            build_agent_run_context(provider, model, None).await?;
+        let chat_messages = daemon_messages_to_chat(messages);
 
-        // 2. Resolve LLM client connection parameters using provider and model.
-        let (base_url, model_name, api_key, num_ctx) = resolve_llm_connection(provider, model)?;
-
-        let client = LlmClient::new(base_url.clone(), model_name, api_key).with_num_ctx(num_ctx);
-
-        // 3. Get all available tools dynamically from active service
-        let available_tools = service.get_all_available_tools().await;
-
-        // 4. Construct McpChatConfig
-        let workspace_root = service
-            .adapter
-            .sandbox()
-            .scopes()
-            .first()
-            .cloned()
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-        let settings = ahma_common::config::AhmaSettings::load();
-        let mcp_connections = service.mcp_connections.read().await.clone();
-
-        let local_mcp_base_url = {
-            let app_config_guard = service.app_config.read().unwrap();
-            let app_config_ref = app_config_guard.as_ref().map(|arc| arc.as_ref());
-            get_mcp_base_url(app_config_ref)
-        };
-
-        let mcp_config = McpChatConfig {
-            base_url: local_mcp_base_url,
-            workspace_root,
-            session_id: None,
-            external_http_servers: BTreeMap::new(),
-            max_turns: settings.tools.max_turns,
-            tool_approval: true, // Always enable tool approval for hub tasks to prompt TUI
-            mcp_connections,
-            minimize_tokens: settings.tools.minimize_tokens,
-            small_model_harness: settings.tools.small_model_harness,
-            context_length: None,
-        };
-
-        // 5. Convert DaemonChatMessage to ChatMessage
-        let mut chat_messages = Vec::new();
-        for msg in messages {
-            let role = match msg.role.to_lowercase().as_str() {
-                "system" => ahma_llm_monitor::ChatRole::System,
-                "assistant" => ahma_llm_monitor::ChatRole::Assistant,
-                "tool" => ahma_llm_monitor::ChatRole::Tool,
-                _ => ahma_llm_monitor::ChatRole::User,
-            };
-            chat_messages.push(ChatMessage {
-                role,
-                content: msg.content,
-                tool_call_id: None,
-            });
-        }
-
-        // 6. Spawn the agent task with a custom AgentApprovalGate and event channel
+        // Spawn the agent task with the hub approval gate and an event channel.
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let gate = Arc::new(HubApprovalGate {
             hub_tx: hub_tx.clone(),
@@ -1517,7 +1464,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
             gate,
         );
 
-        // 7. Receive events from the agent loop and forward them to the hub daemon
+        // Receive events from the agent loop and forward them to the hub daemon
         while let Some(evt) = rx.recv().await {
             let client_msg = match evt {
                 AgentEvent::Token(t) => ClientMsg::ChatToken { token: t },
@@ -1547,6 +1494,147 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         }
 
         Ok(())
+    }
+
+    async fn run_prompt_to_completion(
+        &self,
+        messages: Vec<DaemonChatMessage>,
+        system_prompt: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        max_turns: Option<u32>,
+    ) -> Result<String, String> {
+        // Default the provider/model to the model the user last selected in
+        // `ahma tui` (persisted in settings.agent). Prefer the resolved base URL
+        // so we don't depend on the TUI's provider label matching a config name.
+        let settings = ahma_common::config::AhmaSettings::load();
+        let provider = provider.or_else(|| {
+            settings
+                .agent
+                .provider_url
+                .clone()
+                .or_else(|| settings.agent.provider.clone())
+        });
+        let model = model.or_else(|| settings.agent.model.clone());
+
+        let (client, mut mcp_config, available_tools) =
+            build_agent_run_context(provider, model, max_turns).await?;
+        // A delegated sub-agent has no interactive surface, so do not gate tool
+        // calls on human approval — auto-approve them.
+        mcp_config.tool_approval = false;
+
+        let chat_messages = daemon_messages_to_chat(messages);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        spawn_agent_task(
+            client,
+            chat_messages,
+            system_prompt,
+            Some(mcp_config),
+            available_tools,
+            tx,
+            Arc::new(AutoApproveAgentGate),
+        );
+
+        // Collect the assistant text; surface the loop's error verbatim.
+        let mut out = String::new();
+        while let Some(evt) = rx.recv().await {
+            match evt {
+                AgentEvent::Token(t) => out.push_str(&t),
+                AgentEvent::Error(e) => return Err(e),
+                AgentEvent::Done => break,
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Build the per-run agent context shared by [`CorePromptRunner::run_prompt`]
+/// and [`CorePromptRunner::run_prompt_to_completion`]: resolve the LLM client,
+/// gather the active service's tools, and assemble the [`McpChatConfig`].
+/// `max_turns_override` replaces the configured default when `Some`.
+async fn build_agent_run_context(
+    provider: Option<String>,
+    model: Option<String>,
+    max_turns_override: Option<u32>,
+) -> Result<
+    (
+        LlmClient,
+        McpChatConfig,
+        Vec<ahma_mcp::mcp_client::ToolInfo>,
+    ),
+    String,
+> {
+    let service = ahma_mcp::get_active_service()
+        .ok_or_else(|| "No active AhmaMcpService found in this process".to_string())?;
+
+    let (base_url, model_name, api_key, num_ctx) = resolve_llm_connection(provider, model)?;
+    let client = LlmClient::new(base_url, model_name, api_key).with_num_ctx(num_ctx);
+
+    let available_tools = service.get_all_available_tools().await;
+
+    let workspace_root = service
+        .adapter
+        .sandbox()
+        .scopes()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let settings = ahma_common::config::AhmaSettings::load();
+    let mcp_connections = service.mcp_connections.read().await.clone();
+
+    let local_mcp_base_url = {
+        let app_config_guard = service.app_config.read().unwrap();
+        let app_config_ref = app_config_guard.as_ref().map(|arc| arc.as_ref());
+        get_mcp_base_url(app_config_ref)
+    };
+
+    let mcp_config = McpChatConfig {
+        base_url: local_mcp_base_url,
+        workspace_root,
+        session_id: None,
+        external_http_servers: BTreeMap::new(),
+        max_turns: max_turns_override.unwrap_or(settings.tools.max_turns),
+        tool_approval: true,
+        mcp_connections,
+        minimize_tokens: settings.tools.minimize_tokens,
+        small_model_harness: settings.tools.small_model_harness,
+        context_length: None,
+    };
+
+    Ok((client, mcp_config, available_tools))
+}
+
+/// Convert hub `DaemonChatMessage`s into agent `ChatMessage`s.
+fn daemon_messages_to_chat(messages: Vec<DaemonChatMessage>) -> Vec<ChatMessage> {
+    messages
+        .into_iter()
+        .map(|msg| {
+            let role = match msg.role.to_lowercase().as_str() {
+                "system" => ahma_llm_monitor::ChatRole::System,
+                "assistant" => ahma_llm_monitor::ChatRole::Assistant,
+                "tool" => ahma_llm_monitor::ChatRole::Tool,
+                _ => ahma_llm_monitor::ChatRole::User,
+            };
+            ChatMessage {
+                role,
+                content: msg.content,
+                tool_call_id: None,
+            }
+        })
+        .collect()
+}
+
+/// Approval gate that approves every tool call — used by the headless MCP
+/// `agent` sub-agent, which has no interactive surface to ask a human.
+struct AutoApproveAgentGate;
+
+#[async_trait]
+impl AgentApprovalGate for AutoApproveAgentGate {
+    async fn request_approval(&self, _id: &str, _tool: &str, _args: &str) -> bool {
+        true
     }
 }
 

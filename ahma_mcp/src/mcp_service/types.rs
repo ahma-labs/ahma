@@ -28,6 +28,21 @@ pub trait PromptRunner: Send + Sync {
         hub_tx: tokio::sync::mpsc::Sender<ClientMsg>,
         session: Arc<tokio::sync::Mutex<ActiveAgentSession>>,
     ) -> Result<(), String>;
+
+    /// Run the agent loop to completion for a **delegated sub-task** (the MCP
+    /// `agent` tool) and return the final assistant text. Unlike [`PromptRunner::run_prompt`]
+    /// this does not stream to a hub and auto-approves tool calls — a sub-agent
+    /// has no interactive surface to ask. `provider`/`model` default to the
+    /// model last selected in `ahma tui` (`settings.agent`); `max_turns`
+    /// overrides the configured default when set.
+    async fn run_prompt_to_completion(
+        &self,
+        messages: Vec<DaemonChatMessage>,
+        system_prompt: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        max_turns: Option<u32>,
+    ) -> Result<String, String>;
 }
 
 static GLOBAL_PROMPT_RUNNER: std::sync::OnceLock<Arc<dyn PromptRunner>> =
