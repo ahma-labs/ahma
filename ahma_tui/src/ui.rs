@@ -1453,34 +1453,95 @@ fn header_health_span(state: &AppState, theme: &Theme) -> Span<'static> {
     }
 }
 
+/// Approximate characters per token, matching the agent's budget math.
 #[cfg(feature = "tui")]
+const STATUS_CHARS_PER_TOKEN: usize = 4;
+
 #[cfg(feature = "tui")]
 fn format_tokens_part(state: &AppState) -> String {
-    if state.token_usage.total_tokens > 0 {
-        let (p, c, t) = (
-            state.token_usage.prompt_tokens,
-            state.token_usage.completion_tokens,
-            state.token_usage.total_tokens,
-        );
-        let p_fmt = if p > 1000 {
-            format!("{:.1}k", p as f64 / 1000.0)
-        } else {
-            p.to_string()
-        };
-        let c_fmt = if c > 1000 {
-            format!("{:.1}k", c as f64 / 1000.0)
-        } else {
-            c.to_string()
-        };
-        let t_fmt = if t > 1000 {
-            format!("{:.1}k", t as f64 / 1000.0)
-        } else {
-            t.to_string()
-        };
-        format!(" · tkns {p_fmt} in / {c_fmt} out ({t_fmt} ttl)")
+    token_status_segment(
+        state.token_usage.total_tokens,
+        state.token_usage.prompt_tokens,
+        state.token_usage.completion_tokens,
+        state.last_prompt_tokens,
+        conversation_chars(state),
+        state.token_prefs.context_length,
+    )
+}
+
+/// Total characters of the visible conversation — the basis for a token estimate
+/// when the provider does not report usage, and for the context-fill fallback.
+#[cfg(feature = "tui")]
+fn conversation_chars(state: &AppState) -> usize {
+    use crate::state::ChatEntry;
+    state
+        .chat
+        .entries()
+        .iter()
+        .map(|e| match e {
+            ChatEntry::User { text, .. } => text.len(),
+            ChatEntry::Thinking { content, .. } | ChatEntry::Assistant { content, .. } => {
+                content.len()
+            }
+            ChatEntry::ToolCall { args, result, .. } => {
+                args.len() + result.as_ref().map_or(0, |r| r.len())
+            }
+        })
+        .sum()
+}
+
+/// Abbreviate a token count (e.g. `1.2k`).
+#[cfg(feature = "tui")]
+fn fmt_token_count(n: u32) -> String {
+    if n > 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
     } else {
-        String::new()
+        n.to_string()
     }
+}
+
+/// Build the status-bar token segment. Pure, for testability.
+///
+/// - Exact cumulative usage when the provider reports it (`total_tokens > 0`);
+///   otherwise a `~est` derived from the conversation size, so providers that
+///   return no `usage` still show a counter.
+/// - A best-effort context-window fill `%` when the window is known: exact from
+///   the last turn's prompt tokens when available, else estimated.
+#[cfg(feature = "tui")]
+fn token_status_segment(
+    total_tokens: u32,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    last_prompt_tokens: u32,
+    conversation_chars: usize,
+    ctx_window: Option<u32>,
+) -> String {
+    let est_conv = (conversation_chars / STATUS_CHARS_PER_TOKEN) as u32;
+    if total_tokens == 0 && est_conv == 0 {
+        return String::new();
+    }
+
+    let mut out = if total_tokens > 0 {
+        format!(
+            " · tkns {} in / {} out ({} ttl)",
+            fmt_token_count(prompt_tokens),
+            fmt_token_count(completion_tokens),
+            fmt_token_count(total_tokens),
+        )
+    } else {
+        format!(" · ~{} tkns est", fmt_token_count(est_conv))
+    };
+
+    if let Some(window) = ctx_window.filter(|&w| w > 0) {
+        let used = if last_prompt_tokens > 0 {
+            last_prompt_tokens
+        } else {
+            est_conv
+        };
+        let pct = ((used as f64 / window as f64) * 100.0).round() as u32;
+        out.push_str(&format!(" · {}% ctx", pct.min(999)));
+    }
+    out
 }
 
 #[cfg(feature = "tui")]
@@ -3102,6 +3163,40 @@ mod tests {
 
     fn make_line(text: &str) -> Line<'static> {
         Line::from(Span::raw(text.to_string()))
+    }
+
+    #[test]
+    fn token_status_segment_empty_when_no_data() {
+        assert_eq!(token_status_segment(0, 0, 0, 0, 0, None), "");
+    }
+
+    #[test]
+    fn token_status_segment_shows_exact_usage() {
+        // Provider reported usage → exact cumulative counts, no context window.
+        let s = token_status_segment(1700, 1200, 500, 1200, 0, None);
+        assert_eq!(s, " · tkns 1.2k in / 500 out (1.7k ttl)");
+    }
+
+    #[test]
+    fn token_status_segment_estimates_when_no_usage() {
+        // No API usage, but a 6000-char conversation → ~1500 token estimate.
+        let s = token_status_segment(0, 0, 0, 0, 6000, None);
+        assert_eq!(s, " · ~1.5k tkns est");
+    }
+
+    #[test]
+    fn token_status_segment_context_pct_exact_from_last_prompt() {
+        // 4096-token window, last turn's prompt was 2048 → 50% (exact).
+        let s = token_status_segment(3000, 2048, 200, 2048, 9999, Some(4096));
+        assert!(s.ends_with(" · 50% ctx"), "got {s:?}");
+    }
+
+    #[test]
+    fn token_status_segment_context_pct_estimated_without_usage() {
+        // No usage at all: % falls back to the conversation estimate.
+        // 8000 chars → 2000 tokens; window 8000 → 25%.
+        let s = token_status_segment(0, 0, 0, 0, 8000, Some(8000));
+        assert_eq!(s, " · ~2.0k tkns est · 25% ctx");
     }
 
     #[test]

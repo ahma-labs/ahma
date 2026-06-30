@@ -3079,6 +3079,9 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             state.token_usage.prompt_tokens += usage.prompt_tokens;
             state.token_usage.completion_tokens += usage.completion_tokens;
             state.token_usage.total_tokens += usage.total_tokens;
+            if usage.prompt_tokens > 0 {
+                state.last_prompt_tokens = usage.prompt_tokens;
+            }
         }
         BridgeEvent::Done => {
             state.reset_liveness();
@@ -3588,6 +3591,9 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             state.token_usage.prompt_tokens += prompt_tokens;
             state.token_usage.completion_tokens += completion_tokens;
             state.token_usage.total_tokens += total_tokens;
+            if prompt_tokens > 0 {
+                state.last_prompt_tokens = prompt_tokens;
+            }
         }
         SourceEvent::ToolCallStarted { id, name, args } => {
             state.chat.start_tool_call(id, name, args);

@@ -1141,6 +1141,10 @@ pub struct AppState {
     /// Resolved once at startup (flag > env > settings) and kept in sync by the
     /// `/minimize on|off` command, which also persists `settings.tools`.
     pub minimize_tokens: bool,
+    /// Prompt (input) token count of the **most recent** model turn. Unlike the
+    /// cumulative `token_usage`, this is the exact current context fill, used for
+    /// the status-bar context-window %. Zero until a turn reports usage.
+    pub last_prompt_tokens: u32,
 
     // ── Panel data ──
     pub ai_activity: VecDeque<AiActivityEntry>,
@@ -1576,6 +1580,7 @@ impl AppState {
             workspace,
             token_prefs: crate::TokenPrefs::default(),
             minimize_tokens: false,
+            last_prompt_tokens: 0,
             ai_activity: VecDeque::with_capacity(ACTIVITY_RING_CAP),
             operations: vec![],
             pending_output: HashMap::new(),
