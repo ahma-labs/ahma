@@ -1271,49 +1271,100 @@ fn format_recent_failures(operations: &[crate::state::Operation]) -> String {
 ///
 /// The context block is intentionally short (<500 tokens) so it does not eat
 /// into the user's context window.
+/// The pieces of a system prompt, assembled by a [`PromptComposer`]. Keeping
+/// them separate lets a composer decide which to include for token economy.
+#[cfg(feature = "tui")]
+struct PromptParts {
+    /// Optional per-profile prompt override.
+    profile_prompt: String,
+    /// The agentic base (user-editable agent prompt, or the concise fallback).
+    base: String,
+    /// `"Workspace: …\n"` or empty.
+    workspace_line: String,
+    /// `"Sandbox: …\n"` or empty.
+    sandbox_line: String,
+    /// Recent operations block (token-heavy).
+    recent_ops: String,
+    /// Recent failures block incl. stdout tails (token-heavy).
+    recent_failures: String,
+}
+
+/// Strategy for assembling the agent system prompt. Swap implementations to
+/// trade prompt richness for token economy — the seam behind `/minimize`.
+#[cfg(feature = "tui")]
+trait PromptComposer {
+    fn compose(&self, parts: &PromptParts) -> String;
+}
+
+/// Join `profile` + `base` + the live-context `ctx` in the canonical layout.
+#[cfg(feature = "tui")]
+fn assemble_prompt(profile: &str, base: &str, ctx: &str) -> String {
+    match (profile.is_empty(), ctx.is_empty()) {
+        (true, true) => base.to_string(),
+        (true, false) => format!("{base}\n\n--- Live context ---\n{ctx}"),
+        (false, true) => format!("{profile}\n\n{base}"),
+        (false, false) => format!("{profile}\n\n{base}\n\n--- Live context ---\n{ctx}"),
+    }
+}
+
+/// The default composer: agentic base + profile + the full live-context block.
+#[cfg(feature = "tui")]
+struct FullComposer;
+
+#[cfg(feature = "tui")]
+impl PromptComposer for FullComposer {
+    fn compose(&self, p: &PromptParts) -> String {
+        let ctx = format!(
+            "{}{}{}{}",
+            p.workspace_line, p.sandbox_line, p.recent_ops, p.recent_failures
+        );
+        assemble_prompt(&p.profile_prompt, &p.base, &ctx)
+    }
+}
+
+/// The lean composer used under `/minimize`: drops the token-heavy recent-ops
+/// and recent-failures blocks, keeping the base, profile, workspace and sandbox.
+#[cfg(feature = "tui")]
+struct MinimalComposer;
+
+#[cfg(feature = "tui")]
+impl PromptComposer for MinimalComposer {
+    fn compose(&self, p: &PromptParts) -> String {
+        let ctx = format!("{}{}", p.workspace_line, p.sandbox_line);
+        assemble_prompt(&p.profile_prompt, &p.base, &ctx)
+    }
+}
+
 #[cfg(feature = "tui")]
 fn build_system_prompt(state: &crate::state::AppState) -> String {
-    // 1. Profile system prompt (may override defaults).
-    let profile_prompt = profile_field(state, |p| p.system_prompt, String::new());
-
-    // 2. Live context block.
-    let mut ctx = String::new();
-
-    // Workspace / scope.
-    if !state.workspace.is_empty() {
-        ctx.push_str(&format!("Workspace: {}\n", state.workspace));
-    }
-
-    // Sandbox / server status.
-    if !state.sandbox_status.is_empty() && state.sandbox_status != "unknown" {
-        ctx.push_str(&format!("Sandbox: {}\n", state.sandbox_status));
-    }
-
-    // Recent operations (last 5, most recent first).
-    ctx.push_str(&format_recent_ops(&state.operations));
-
-    // Recent failures — include a brief stdout tail to help with "why did it fail?" queries.
-    ctx.push_str(&format_recent_failures(&state.operations));
-
-    // 3. Assemble final prompt. The tool-using base is the user-editable agent
-    // system prompt from prompts.toml (or the compiled-in default) — this is the
-    // agentic scaffolding that lets the model complete multi-step tasks rather
-    // than stopping after one tool call.
-    let base: String = if state.mcp_enabled {
-        ahma_common::prompts::AhmaPrompts::load().agent_system_prompt()
-    } else {
-        "Provide concise, accurate answers.".to_string()
+    let parts = PromptParts {
+        profile_prompt: profile_field(state, |p| p.system_prompt, String::new()),
+        base: if state.mcp_enabled {
+            ahma_common::prompts::AhmaPrompts::load().agent_system_prompt()
+        } else {
+            "Provide concise, accurate answers.".to_string()
+        },
+        workspace_line: if state.workspace.is_empty() {
+            String::new()
+        } else {
+            format!("Workspace: {}\n", state.workspace)
+        },
+        sandbox_line: if !state.sandbox_status.is_empty() && state.sandbox_status != "unknown" {
+            format!("Sandbox: {}\n", state.sandbox_status)
+        } else {
+            String::new()
+        },
+        recent_ops: format_recent_ops(&state.operations),
+        recent_failures: format_recent_failures(&state.operations),
     };
 
-    if profile_prompt.is_empty() && ctx.is_empty() {
-        base.to_string()
-    } else if profile_prompt.is_empty() {
-        format!("{base}\n\n--- Live context ---\n{ctx}")
-    } else if ctx.is_empty() {
-        format!("{profile_prompt}\n\n{base}")
+    // Under token minimization, drop the token-heavy live-context blocks.
+    let composer: &dyn PromptComposer = if state.minimize_tokens {
+        &MinimalComposer
     } else {
-        format!("{profile_prompt}\n\n{base}\n\n--- Live context ---\n{ctx}")
-    }
+        &FullComposer
+    };
+    composer.compose(&parts)
 }
 
 #[cfg(feature = "tui")]
@@ -4376,6 +4427,31 @@ mod tests {
         unsafe {
             std::env::remove_var("AHMA_TEST_HOME");
         }
+    }
+
+    #[test]
+    fn minimal_composer_drops_heavy_live_context() {
+        use super::{FullComposer, MinimalComposer, PromptComposer, PromptParts};
+        let parts = PromptParts {
+            profile_prompt: String::new(),
+            base: "BASE".to_string(),
+            workspace_line: "Workspace: /w\n".to_string(),
+            sandbox_line: "Sandbox: on\n".to_string(),
+            recent_ops: "OPS-HEAVY\n".to_string(),
+            recent_failures: "FAILS-HEAVY\n".to_string(),
+        };
+
+        // The default composer includes the full live context.
+        let full = FullComposer.compose(&parts);
+        assert!(full.contains("OPS-HEAVY") && full.contains("FAILS-HEAVY"));
+        assert!(full.contains("Workspace: /w") && full.contains("BASE"));
+
+        // The minimal composer drops the token-heavy ops/failures, but keeps the
+        // cheap workspace/sandbox lines and the agentic base.
+        let minimal = MinimalComposer.compose(&parts);
+        assert!(!minimal.contains("OPS-HEAVY") && !minimal.contains("FAILS-HEAVY"));
+        assert!(minimal.contains("Workspace: /w") && minimal.contains("Sandbox: on"));
+        assert!(minimal.contains("BASE"));
     }
 
     #[test]

@@ -1457,6 +1457,25 @@ fn header_health_span(state: &AppState, theme: &Theme) -> Span<'static> {
 #[cfg(feature = "tui")]
 const STATUS_CHARS_PER_TOKEN: usize = 4;
 
+/// Estimates a token count from a character count. The default is a ~4
+/// chars/token heuristic; the trait is the seam for a future real-tokenizer
+/// estimator (mirrors `ahma_core`'s `ContextStrategy`).
+#[cfg(feature = "tui")]
+trait TokenEstimator {
+    fn estimate_tokens(&self, chars: usize) -> u32;
+}
+
+/// Default estimator: characters divided by [`STATUS_CHARS_PER_TOKEN`].
+#[cfg(feature = "tui")]
+struct CharHeuristicEstimator;
+
+#[cfg(feature = "tui")]
+impl TokenEstimator for CharHeuristicEstimator {
+    fn estimate_tokens(&self, chars: usize) -> u32 {
+        (chars / STATUS_CHARS_PER_TOKEN) as u32
+    }
+}
+
 #[cfg(feature = "tui")]
 fn format_tokens_part(state: &AppState) -> String {
     token_status_segment(
@@ -1466,6 +1485,7 @@ fn format_tokens_part(state: &AppState) -> String {
         state.last_prompt_tokens,
         conversation_chars(state),
         state.token_prefs.context_length,
+        &CharHeuristicEstimator,
     )
 }
 
@@ -1515,8 +1535,9 @@ fn token_status_segment(
     last_prompt_tokens: u32,
     conversation_chars: usize,
     ctx_window: Option<u32>,
+    estimator: &dyn TokenEstimator,
 ) -> String {
-    let est_conv = (conversation_chars / STATUS_CHARS_PER_TOKEN) as u32;
+    let est_conv = estimator.estimate_tokens(conversation_chars);
     if total_tokens == 0 && est_conv == 0 {
         return String::new();
     }
@@ -3166,28 +3187,45 @@ mod tests {
     }
 
     #[test]
+    fn char_heuristic_estimator_divides_by_four() {
+        assert_eq!(CharHeuristicEstimator.estimate_tokens(4000), 1000);
+        assert_eq!(CharHeuristicEstimator.estimate_tokens(3), 0);
+    }
+
+    #[test]
     fn token_status_segment_empty_when_no_data() {
-        assert_eq!(token_status_segment(0, 0, 0, 0, 0, None), "");
+        assert_eq!(
+            token_status_segment(0, 0, 0, 0, 0, None, &CharHeuristicEstimator),
+            ""
+        );
     }
 
     #[test]
     fn token_status_segment_shows_exact_usage() {
         // Provider reported usage → exact cumulative counts, no context window.
-        let s = token_status_segment(1700, 1200, 500, 1200, 0, None);
+        let s = token_status_segment(1700, 1200, 500, 1200, 0, None, &CharHeuristicEstimator);
         assert_eq!(s, " · tkns 1.2k in / 500 out (1.7k ttl)");
     }
 
     #[test]
     fn token_status_segment_estimates_when_no_usage() {
         // No API usage, but a 6000-char conversation → ~1500 token estimate.
-        let s = token_status_segment(0, 0, 0, 0, 6000, None);
+        let s = token_status_segment(0, 0, 0, 0, 6000, None, &CharHeuristicEstimator);
         assert_eq!(s, " · ~1.5k tkns est");
     }
 
     #[test]
     fn token_status_segment_context_pct_exact_from_last_prompt() {
         // 4096-token window, last turn's prompt was 2048 → 50% (exact).
-        let s = token_status_segment(3000, 2048, 200, 2048, 9999, Some(4096));
+        let s = token_status_segment(
+            3000,
+            2048,
+            200,
+            2048,
+            9999,
+            Some(4096),
+            &CharHeuristicEstimator,
+        );
         assert!(s.ends_with(" · 50% ctx"), "got {s:?}");
     }
 
@@ -3195,7 +3233,7 @@ mod tests {
     fn token_status_segment_context_pct_estimated_without_usage() {
         // No usage at all: % falls back to the conversation estimate.
         // 8000 chars → 2000 tokens; window 8000 → 25%.
-        let s = token_status_segment(0, 0, 0, 0, 8000, Some(8000));
+        let s = token_status_segment(0, 0, 0, 0, 8000, Some(8000), &CharHeuristicEstimator);
         assert_eq!(s, " · ~2.0k tkns est · 25% ctx");
     }
 
