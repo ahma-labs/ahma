@@ -1292,12 +1292,14 @@ fn build_system_prompt(state: &crate::state::AppState) -> String {
     // Recent failures — include a brief stdout tail to help with "why did it fail?" queries.
     ctx.push_str(&format_recent_failures(&state.operations));
 
-    // 3. Assemble final prompt.
-    let base = if state.mcp_enabled {
-        "Use ahma tools when they would materially improve the answer. \
-         Prefer direct answers when no tool is needed."
+    // 3. Assemble final prompt. The tool-using base is the user-editable agent
+    // system prompt from prompts.toml (or the compiled-in default) — this is the
+    // agentic scaffolding that lets the model complete multi-step tasks rather
+    // than stopping after one tool call.
+    let base: String = if state.mcp_enabled {
+        ahma_common::prompts::AhmaPrompts::load().agent_system_prompt()
     } else {
-        "Provide concise, accurate answers."
+        "Provide concise, accurate answers.".to_string()
     };
 
     if profile_prompt.is_empty() && ctx.is_empty() {
@@ -3833,9 +3835,7 @@ fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
         })
         .collect();
 
-    let system_prompt = state.mcp_enabled.then(|| {
-        "Use ahma tools when they would materially improve the answer. Prefer direct answers when no tool is needed.".to_string()
-    });
+    let system_prompt = state.mcp_enabled.then(|| build_system_prompt(state));
 
     send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitPrompt {
         messages,

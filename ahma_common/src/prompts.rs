@@ -116,6 +116,28 @@ pub const DEFAULT_SPLIT_PROMPT: &str = r#"Break the following question into at m
 
 Question: {question}"#;
 
+/// Default system prompt for the interactive `ahma tui` chat agent (and the
+/// shared agent loop used by the MCP sub-agent). This is the scaffolding that
+/// turns a bare "helpful assistant" into a task-completing agent: it tells the
+/// model to keep working across turns, the file-editing tool contract, and the
+/// single rule that actually ends the agent loop — finish by replying with no
+/// tool call. Users override it via the `[agent] system` key in prompts.toml.
+pub const DEFAULT_AGENT_SYSTEM_PROMPT: &str = r#"You are Ahma, an autonomous coding and knowledge-work assistant operating inside a sandboxed workspace. You complete tasks end-to-end by calling tools, not by describing what you would do.
+
+Operating rules:
+- Work autonomously across multiple turns. After each tool result, decide the next action and keep going until the task is fully done. Do NOT stop after a single tool call.
+- Inspect before you act: use read_file, list_dir, grep_search, and file_search to understand the workspace before you change it.
+- Editing files: use write_file ONLY to create a new file; use replace_in_file (with exact old/new text) to modify a file that already exists. Never blind-overwrite an existing file.
+- Running commands: use run_terminal_command for builds, tests, scripts, and data processing. It is sandboxed to the workspace.
+- Verify your work: after making changes, re-read the file or run the relevant build/test/command to confirm the result before you declare success.
+- Producing artifacts: when asked for a table, chart, report, or data file, write it to a file (Markdown, CSV, or SVG) with write_file and tell the user the path.
+
+Finishing:
+- The task is complete only when the user's request is fully satisfied. When it is, reply with a short plain-text summary of what you did and the outcome, and make NO tool call — replying with no tool call is what ends your turn.
+- If you are genuinely blocked (missing information, permission, or an unrecoverable error), stop and clearly explain what is blocking you and what you need to proceed.
+
+Be concise and direct. Prefer doing over explaining."#;
+
 /// Path to the global prompts config file.
 ///
 /// Uses [`crate::config::ahma_home_dir`] for home resolution so that tests can
@@ -143,6 +165,16 @@ pub struct DecomposePrompts {
     pub split: Option<String>,
 }
 
+/// Structure representing prompts for the interactive chat agent (`ahma tui`
+/// and the shared MCP sub-agent loop).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AgentPrompts {
+    /// System prompt prepended to every agent conversation. Overrides
+    /// [`DEFAULT_AGENT_SYSTEM_PROMPT`] when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+}
+
 /// Main prompt configuration loaded from prompts.toml.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct AhmaPrompts {
@@ -150,6 +182,8 @@ pub struct AhmaPrompts {
     pub task_tree: Option<TaskTreePrompts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decompose: Option<DecomposePrompts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentPrompts>,
 }
 
 impl AhmaPrompts {
@@ -227,6 +261,13 @@ impl AhmaPrompts {
                 self_dec.split = Some(s);
             }
         }
+
+        if let Some(other_agent) = other.agent {
+            let self_agent = self.agent.get_or_insert_with(AgentPrompts::default);
+            if let Some(s) = other_agent.system {
+                self_agent.system = Some(s);
+            }
+        }
     }
 
     /// Get planning prompt (global or project override, or compiled-in default).
@@ -261,6 +302,15 @@ impl AhmaPrompts {
             .unwrap_or_else(|| DEFAULT_SPLIT_PROMPT.to_string())
     }
 
+    /// Get the interactive agent system prompt (global or project override, or
+    /// the compiled-in [`DEFAULT_AGENT_SYSTEM_PROMPT`]).
+    pub fn agent_system_prompt(&self) -> String {
+        self.agent
+            .as_ref()
+            .and_then(|a| a.system.clone())
+            .unwrap_or_else(|| DEFAULT_AGENT_SYSTEM_PROMPT.to_string())
+    }
+
     /// Generate the fully commented-out defaults template to be written to prompts.toml.
     pub fn generate_template() -> String {
         format!(
@@ -274,6 +324,12 @@ impl AhmaPrompts {
 #   summarisation: {{stdout}}, {{stderr}}
 #   recovery: {{goal}}, {{task_desc}}, {{branch_context}}, {{failed_step_desc}}, {{failed_step_error}}, {{remaining_str}}, {{max_subtasks}}
 #   split: {{max}}, {{question}}
+#   agent: (no placeholders — free-form system prompt for the `ahma tui` chat agent)
+
+# [agent]
+# system = """
+# {}
+# """
 
 # [task_tree]
 # planning = """
@@ -293,6 +349,7 @@ impl AhmaPrompts {
 # {}
 # """
 "#,
+            DEFAULT_AGENT_SYSTEM_PROMPT.replace('\n', "\n# "),
             DEFAULT_PLANNING_PROMPT.replace('\n', "\n# "),
             DEFAULT_SUMMARISATION_PROMPT.replace('\n', "\n# "),
             DEFAULT_RECOVERY_PROMPT.replace('\n', "\n# "),
@@ -416,6 +473,51 @@ mod tests {
         let warnings = prompts.validate();
         assert!(!warnings.is_empty());
         assert!(warnings.iter().any(|w| w.contains("goal")));
+    }
+
+    #[test]
+    fn test_agent_system_prompt_default() {
+        let prompts = AhmaPrompts::default();
+        assert_eq!(prompts.agent_system_prompt(), DEFAULT_AGENT_SYSTEM_PROMPT);
+        // The default must carry the loop-ending contract, or the agent never
+        // stops requesting tools and hits the turn limit.
+        assert!(prompts.agent_system_prompt().contains("no tool call"));
+    }
+
+    #[test]
+    fn test_agent_system_prompt_override() {
+        let mut base = AhmaPrompts::default();
+        base.merge(AhmaPrompts {
+            agent: Some(AgentPrompts {
+                system: Some("Custom agent prompt".to_string()),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(base.agent_system_prompt(), "Custom agent prompt");
+        // Overriding the agent prompt must not disturb the other sections.
+        assert_eq!(base.planning_prompt(), DEFAULT_PLANNING_PROMPT);
+    }
+
+    #[test]
+    fn test_load_agent_prompt_from_dir() {
+        let dir = tempdir().unwrap();
+        let local_ahma = dir.path().join(".ahma");
+        std::fs::create_dir_all(&local_ahma).unwrap();
+        std::fs::write(
+            local_ahma.join("prompts.toml"),
+            "[agent]\nsystem = \"Project agent prompt\"\n",
+        )
+        .unwrap();
+
+        let loaded = AhmaPrompts::load_from_dir(dir.path());
+        assert_eq!(loaded.agent_system_prompt(), "Project agent prompt");
+    }
+
+    #[test]
+    fn test_generate_template_includes_agent_section() {
+        let template = AhmaPrompts::generate_template();
+        assert!(template.contains("[agent]"));
+        assert!(template.contains("# system = "));
     }
 
     #[test]
