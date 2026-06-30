@@ -127,6 +127,10 @@ pub struct AhmaMcpService {
     pub output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     /// Safety harness guard context.
     pub harness_guard: Arc<tokio::sync::Mutex<crate::harness_guard::HarnessGuard>>,
+    /// The agent's current task plan (the `todo_write` checklist). One list per
+    /// service instance — adequate for the single-user TUI; per-session
+    /// isolation is a future refinement.
+    pub todo_list: Arc<tokio::sync::Mutex<Vec<handlers::todo_tool::TodoItem>>>,
     /// Routes unified operation events to the MCP client as progress
     /// notifications (per-operation peer + progress token registration).
     pub progress_push: Arc<progress_push::ProgressPushRouter>,
@@ -216,6 +220,11 @@ impl AhmaMcpService {
                 name: "replace_in_file".to_string(),
                 description: Some("Replace exact string occurrences in a scoped UTF-8 file.".to_string()),
                 input_schema: serde_json::Value::Object(handlers::harness_tools::replace_in_file_schema().as_ref().clone()),
+            },
+            crate::mcp_client::ToolInfo {
+                name: "todo_write".to_string(),
+                description: Some("Record or update your task plan as a checklist (pass the full list each time; it replaces the current plan). Use for any multi-step task: list the steps, mark one in_progress, mark finished steps completed.".to_string()),
+                input_schema: serde_json::Value::Object(handlers::todo_tool::todo_write_schema().as_ref().clone()),
             },
             crate::mcp_client::ToolInfo {
                 name: "log_monitor".to_string(),
@@ -572,6 +581,7 @@ impl AhmaMcpService {
             harness_guard: Arc::new(tokio::sync::Mutex::new(
                 crate::harness_guard::HarnessGuard::new(true),
             )),
+            todo_list: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             progress_push,
             vault_audited_ops: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             mcp_connections: Arc::new(tokio::sync::RwLock::new(
@@ -816,6 +826,7 @@ impl AhmaMcpService {
         "write_file",
         "replace_in_file",
         "agent",
+        "todo_write",
     ];
 
     /// Returns true if a configured tool should be exposed to the client
@@ -1353,6 +1364,12 @@ impl ServerHandler for AhmaMcpService {
                 )
                 .with_title("agent"),
                 Tool::new(
+                    "todo_write",
+                    "Record or update your task plan as a checklist. Pass the FULL list of steps each time — it replaces the current plan. Use this at the start of any multi-step task, then call it again to mark a step in_progress before you work on it and completed when it's done. Keeps you (and the user) oriented across turns.",
+                    handlers::todo_tool::todo_write_schema(),
+                )
+                .with_title("todo_write"),
+                Tool::new(
                     "log_monitor",
                     "Start a real-time log monitoring session on a file inside the sandbox. Reads new lines as they are written, runs them through the AI for issue detection, and sends alerts.",
                     schema::object_input_schema(
@@ -1506,6 +1523,10 @@ impl ServerHandler for AhmaMcpService {
                 }
                 "agent" => {
                     self.handle_agent(run_params.arguments.unwrap_or_default())
+                        .await
+                }
+                "todo_write" => {
+                    self.handle_todo_write(run_params.arguments.unwrap_or_default())
                         .await
                 }
                 "log_monitor" => {
@@ -3906,6 +3927,51 @@ mod tests {
             text.contains("handled 'summarise the build'") && text.contains("max_turns=Some(3)"),
             "unexpected sub-agent result: {text}"
         );
+    }
+
+    // ==================== todo_write plan tool ====================
+
+    #[tokio::test]
+    async fn handle_todo_write_stores_and_renders_plan() {
+        let service = make_service().await;
+        let args: serde_json::Map<String, Value> = serde_json::from_value(json!({
+            "todos": [
+                {"content": "read SPEC", "status": "completed"},
+                {"content": "add field", "status": "in_progress"},
+                {"content": "wire + test"}
+            ]
+        }))
+        .unwrap();
+
+        let result = service.handle_todo_write(args).await.expect("tool ok");
+        let text = first_text(&result);
+        assert!(text.contains("Plan (1/3 done):"), "got: {text}");
+        assert!(text.contains("[x] read SPEC"));
+        assert!(text.contains("[~] add field"));
+        assert!(text.contains("[ ] wire + test"));
+
+        // The plan is persisted on the service for the TUI/next turn.
+        assert_eq!(service.todo_list.lock().await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn handle_todo_write_rejects_bad_input() {
+        let service = make_service().await;
+        // Missing `todos`.
+        assert!(
+            service
+                .handle_todo_write(serde_json::Map::new())
+                .await
+                .is_err()
+        );
+        // Blank content.
+        let blank: serde_json::Map<String, Value> =
+            serde_json::from_value(json!({"todos": [{"content": "  "}]})).unwrap();
+        assert!(service.handle_todo_write(blank).await.is_err());
+        // Unknown status.
+        let bad_status: serde_json::Map<String, Value> =
+            serde_json::from_value(json!({"todos": [{"content": "x", "status": "nope"}]})).unwrap();
+        assert!(service.handle_todo_write(bad_status).await.is_err());
     }
 
     // ==================== harness guard preprocessing ====================

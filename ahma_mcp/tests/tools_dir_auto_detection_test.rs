@@ -181,14 +181,18 @@ async fn test_no_ahma_fallback_to_builtin_tools() -> anyhow::Result<()> {
     // Verify only built-in tools are present
     assert_eq!(
         tools.len(),
-        19,
-        "Should have exactly 19 built-in tools when no .ahma exists. Got: {:?}",
+        20,
+        "Should have exactly 20 built-in tools when no .ahma exists. Got: {:?}",
         tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 
     assert!(
         tools.iter().any(|t| t.name == "agent"),
         "Built-in 'agent' sub-agent tool should be present"
+    );
+    assert!(
+        tools.iter().any(|t| t.name == "todo_write"),
+        "Built-in 'todo_write' plan tool should be present"
     );
     assert!(
         tools.iter().any(|t| t.name == "sandbox_grant"),
