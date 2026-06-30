@@ -1582,72 +1582,62 @@ impl AhmaMcpService {
         tool_name: &mut std::borrow::Cow<'static, str>,
         tool_args: &mut Option<serde_json::Map<String, Value>>,
     ) -> Option<CallToolResult> {
-        // 1. Tool name format healing
+        use crate::harness_guard::{GuardContext, GuardOutcome};
+
+        // Assemble the known-tool set (hard-coded + configured) for name healing.
         let known = Self::HARDCODED_TOOLS.to_vec();
         let configs_lock = self.configs.read().unwrap();
         let config_names: Vec<String> = configs_lock.keys().cloned().collect();
         drop(configs_lock);
-        let mut known_str: Vec<&str> = known.clone();
+        let mut known_str: Vec<&str> = known;
         for name in &config_names {
             known_str.push(name);
         }
 
-        if let Some(healed_name) =
-            crate::harness_guard::heal_tool_name(tool_name.as_ref(), &known_str)
-            && healed_name.as_str() != &**tool_name
-        {
-            tracing::warn!("Healed tool name from '{}' to '{}'", tool_name, healed_name);
-            *tool_name = std::borrow::Cow::Owned(healed_name);
+        // Run the guard pipeline over a mutable copy, then write any healing back.
+        let had_args = tool_args.is_some();
+        let mut name = tool_name.to_string();
+        let mut args = tool_args.take().unwrap_or_default();
+        let ctx = GuardContext {
+            known_tools: &known_str,
+        };
+        let outcome = match self.harness_guard.try_lock() {
+            Ok(guard) => guard.inspect(&ctx, &mut name, &mut args),
+            Err(_) => GuardOutcome::Proceed,
+        };
+        if name.as_str() != &**tool_name {
+            *tool_name = std::borrow::Cow::Owned(name);
+        }
+        // Preserve a `None` payload: handlers distinguish "no arguments" from an
+        // empty object (e.g. task_tree's "Missing arguments payload"). Only
+        // restore args if they existed originally or the pipeline added some.
+        if had_args || !args.is_empty() {
+            *tool_args = Some(args);
         }
 
-        // 2. Tool arguments format healing
-        if let Some(map) = tool_args.as_mut() {
-            crate::harness_guard::heal_tool_arguments(tool_name.as_ref(), map);
+        match outcome {
+            GuardOutcome::Block(msg) => {
+                Some(CallToolResult::error(vec![rmcp::model::Content::text(msg)]))
+            }
+            GuardOutcome::Proceed => None,
         }
-
-        // 3. Loop detection — block the call if the same invocation has failed 3 times
-        let args_str = tool_args
-            .as_ref()
-            .map(|v| serde_json::Value::Object(v.clone()).to_string())
-            .unwrap_or_default();
-        let is_loop = self
-            .harness_guard
-            .try_lock()
-            .map(|g| g.loop_detector.is_loop(tool_name.as_ref(), &args_str))
-            .unwrap_or(false);
-
-        if is_loop {
-            return Some(CallToolResult::error(vec![rmcp::model::Content::text(
-                "LOOP_DETECTED: This exact call has failed 3 times. The approach is not working.\n\
-                 Hint: Re-read the error messages above. Try a fundamentally different approach or read relevant documentation first.",
-            )]));
-        }
-
-        None
     }
 
-    /// Records the success or failure of a completed tool call into the loop
-    /// detector so that repeated identical failures can be detected on future calls.
+    /// Notify the guard pipeline of a completed tool call so stateful guards
+    /// (loop detection) can track repeated identical failures.
     fn record_result_in_loop_detector(
         &self,
         tool_name: &str,
         tool_args: &Option<serde_json::Map<String, Value>>,
         result: &Result<CallToolResult, McpError>,
     ) {
-        let args_str = tool_args
-            .as_ref()
-            .map(|v| serde_json::Value::Object(v.clone()).to_string())
-            .unwrap_or_default();
-        let is_error = match result {
+        let failed = match result {
             Ok(res) => res.is_error.unwrap_or(false),
             Err(_) => true,
         };
-        if let Ok(mut guard) = self.harness_guard.try_lock() {
-            if is_error {
-                guard.loop_detector.record_failure(tool_name, &args_str);
-            } else {
-                guard.loop_detector.record_success();
-            }
+        let args = tool_args.clone().unwrap_or_default();
+        if let Ok(guard) = self.harness_guard.try_lock() {
+            guard.observe(tool_name, &args, failed);
         }
     }
 
@@ -3987,6 +3977,9 @@ mod tests {
                 .is_none()
         );
         assert_eq!(&*name, "status");
+        // Regression: a None payload must stay None so handlers can still detect
+        // "missing arguments" (the pipeline must not materialise an empty {}).
+        assert!(args.is_none(), "None args must be preserved");
     }
 
     #[tokio::test]
@@ -4011,10 +4004,11 @@ mod tests {
     async fn harness_guard_preprocess_detects_loop() {
         let service = make_service().await;
         {
-            let mut g = service.harness_guard.lock().await;
-            g.loop_detector.record_failure("status", "");
-            g.loop_detector.record_failure("status", "");
-            g.loop_detector.record_failure("status", "");
+            let g = service.harness_guard.lock().await;
+            let empty = serde_json::Map::new();
+            for _ in 0..3 {
+                g.observe("status", &empty, true);
+            }
         }
         let mut name: Cow<'static, str> = Cow::Owned("status".to_string());
         let mut args: Option<serde_json::Map<String, Value>> = None;
@@ -4029,7 +4023,6 @@ mod tests {
     async fn record_result_in_loop_detector_tracks_failures() {
         let service = make_service().await;
         let args = Some(obj(json!({"x": 1})));
-        let args_str = serde_json::Value::Object(args.clone().unwrap()).to_string();
 
         let err_result: Result<CallToolResult, McpError> =
             Ok(CallToolResult::error(vec![rmcp::model::Content::text(
@@ -4038,18 +4031,27 @@ mod tests {
         for _ in 0..3 {
             service.record_result_in_loop_detector("mytool", &args, &err_result);
         }
-        {
-            let g = service.harness_guard.lock().await;
-            assert!(g.loop_detector.is_loop("mytool", &args_str));
-        }
+        // After three identical failures the same call is blocked by the pipeline.
+        let mut name: Cow<'static, str> = Cow::Owned("mytool".to_string());
+        let mut a = args.clone();
+        assert!(
+            service
+                .harness_guard_preprocess(&mut name, &mut a)
+                .is_some(),
+            "loop should be detected after 3 failures"
+        );
 
-        // A success clears the detector.
+        // A success clears the detector, so the call proceeds again.
         let ok_result: Result<CallToolResult, McpError> = Ok(handlers::common::text_result("done"));
         service.record_result_in_loop_detector("mytool", &args, &ok_result);
-        {
-            let g = service.harness_guard.lock().await;
-            assert!(!g.loop_detector.is_loop("mytool", &args_str));
-        }
+        let mut name2: Cow<'static, str> = Cow::Owned("mytool".to_string());
+        let mut a2 = args.clone();
+        assert!(
+            service
+                .harness_guard_preprocess(&mut name2, &mut a2)
+                .is_none(),
+            "success should clear the loop"
+        );
     }
 
     // ==================== KeepAlive trait impl ====================
