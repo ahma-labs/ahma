@@ -118,9 +118,10 @@ pub fn truncate_middle(s: &str, cap: usize) -> String {
 }
 
 /// Trim the oldest non-system messages until the conversation fits `budget`
-/// characters.  The system prompt (first message) and the two most recent
-/// messages are always preserved so the model keeps its instructions and the
-/// immediate task state.
+/// characters.  Three things are always preserved: the system prompt (first
+/// message), the **first user message** — the original task/goal, so a long run
+/// can never trim away its own objective and start wandering — and the two most
+/// recent messages (the immediate task state).
 pub fn trim_conversation(msg_json: &mut Vec<serde_json::Value>, budget: usize) {
     let total = |msgs: &[serde_json::Value]| -> usize {
         msgs.iter()
@@ -137,12 +138,18 @@ pub fn trim_conversation(msg_json: &mut Vec<serde_json::Value>, budget: usize) {
         return;
     }
 
-    let has_system = msg_json
-        .first()
-        .and_then(|m| m.get("role"))
-        .and_then(|r| r.as_str())
-        == Some("system");
-    let protected_head = if has_system { 1 } else { 0 };
+    let role_at = |i: usize| -> Option<&str> {
+        msg_json
+            .get(i)
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+    };
+
+    let base_head = usize::from(role_at(0) == Some("system"));
+    // Pin the first user message (the original goal) right after any system
+    // prompt, so the model never loses sight of what it was asked to do.
+    let pin_goal = role_at(base_head) == Some("user");
+    let protected_head = base_head + usize::from(pin_goal);
 
     let mut dropped = 0usize;
     while total(msg_json) > budget && msg_json.len() > protected_head + 2 {
@@ -1649,12 +1656,20 @@ mod tests {
         trim_conversation(&mut msgs, 2_000);
 
         assert_eq!(msgs[0]["role"], "system");
+        // The first user message (the goal) is pinned right after the system
+        // prompt, so the model never loses the original objective.
         assert!(
+            msgs[1]["content"].as_str().unwrap().starts_with("msg-0"),
+            "first user message (goal) preserved, got {:?}",
             msgs[1]["content"]
+        );
+        // The elision notice follows the pinned goal.
+        assert!(
+            msgs[2]["content"]
                 .as_str()
                 .unwrap()
                 .contains("removed to fit"),
-            "elision notice present"
+            "elision notice present after the goal"
         );
         let last = msgs.last().unwrap()["content"].as_str().unwrap();
         assert!(last.starts_with("msg-19"), "latest message preserved");
@@ -1663,6 +1678,27 @@ mod tests {
             .map(|m| m["content"].as_str().map(|s| s.len()).unwrap_or(0))
             .sum();
         assert!(total < 3_000, "trimmed total = {total}");
+    }
+
+    #[test]
+    fn trim_conversation_pins_goal_without_system_prompt() {
+        // No system message: the first message is the goal and must survive.
+        let mut msgs = vec![serde_json::json!({
+            "role": "user",
+            "content": format!("THE GOAL {}", "g".repeat(300))
+        })];
+        for i in 0..20 {
+            msgs.push(serde_json::json!({"role": "user", "content": format!("msg-{i}-{}", "x".repeat(500))}));
+        }
+        trim_conversation(&mut msgs, 2_000);
+
+        assert!(
+            msgs[0]["content"].as_str().unwrap().starts_with("THE GOAL"),
+            "goal preserved as the first message, got {:?}",
+            msgs[0]["content"]
+        );
+        let last = msgs.last().unwrap()["content"].as_str().unwrap();
+        assert!(last.starts_with("msg-19"), "latest message preserved");
     }
 
     #[test]
@@ -2248,14 +2284,19 @@ mod tests {
             );
         }
         trim_conversation(&mut msgs, 1_500);
-        // protected_head == 0: oldest messages dropped, elision notice prepended.
-        assert_eq!(msgs[0]["role"], "user");
+        // No system prompt, so protected_head == 1: the first user message (the
+        // goal, m0) is pinned, then the elision notice, then recent messages.
         assert!(
+            msgs[0]["content"].as_str().unwrap().starts_with("m0"),
+            "goal (first user message) pinned, got {:?}",
             msgs[0]["content"]
+        );
+        assert!(
+            msgs[1]["content"]
                 .as_str()
                 .unwrap()
                 .contains("removed to fit"),
-            "elision notice present"
+            "elision notice present after the goal"
         );
         assert!(
             msgs.last().unwrap()["content"]
