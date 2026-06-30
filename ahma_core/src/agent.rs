@@ -75,24 +75,84 @@ const DEFAULT_CONVERSATION_CHAR_BUDGET: usize = 240_000;
 /// Tighter conversation budget under `--small-model-harness`.
 const SMALL_MODEL_CONVERSATION_CHAR_BUDGET: usize = 24_000;
 
-/// Character cap for a single tool result injected into the conversation.
-pub fn tool_result_char_cap(cfg: &McpChatConfig) -> usize {
-    match cfg.context_length {
-        // A single tool result may use at most a quarter of the window.
-        Some(tokens) => ((tokens as usize) * CHARS_PER_TOKEN / 4).max(1_000),
-        None if cfg.small_model_harness => SMALL_MODEL_TOOL_RESULT_CHAR_CAP,
-        None => DEFAULT_TOOL_RESULT_CHAR_CAP,
+/// System-prompt suffix that asks for terse output when minimizing tokens.
+const MINIMIZE_CONCISENESS_RULE: &str = "\n\nRespond concisely. No preamble, no conversational filler. Output only the tool call, code, or bare answer.";
+
+/// Policy controlling how much context is sent to the model: the per-result and
+/// per-conversation character budgets, plus any system-prompt augmentation for
+/// token minimization. This is the single seam for context handling — swap in a
+/// smarter (e.g. real-tokenizer) strategy in future without touching the agent
+/// loop. [`BudgetStrategy`] is the default character-heuristic implementation.
+pub trait ContextStrategy: Send + Sync {
+    /// Max characters for a single tool result injected into the conversation.
+    fn tool_result_char_cap(&self) -> usize;
+    /// Total character budget for the whole conversation sent to the model.
+    fn conversation_char_budget(&self) -> usize;
+    /// Optional suffix appended to the system prompt (e.g. a conciseness rule
+    /// when minimizing tokens). `None` leaves the prompt unchanged.
+    fn system_prompt_suffix(&self) -> Option<&'static str> {
+        None
     }
 }
 
-/// Total character budget for the conversation sent to the model.
-pub fn conversation_char_budget(cfg: &McpChatConfig) -> usize {
-    match cfg.context_length {
-        // Keep a quarter of the window free for the model's response.
-        Some(tokens) => ((tokens as usize) * CHARS_PER_TOKEN * 3 / 4).max(4_000),
-        None if cfg.small_model_harness => SMALL_MODEL_CONVERSATION_CHAR_BUDGET,
-        None => DEFAULT_CONVERSATION_CHAR_BUDGET,
+/// The default context strategy: character budgets derived from the model's
+/// context window (or generous/tight defaults) using a ~4 chars/token heuristic.
+pub struct BudgetStrategy {
+    /// Model context window in tokens, when known.
+    pub context_length: Option<u32>,
+    /// Tighten budgets for small local models.
+    pub small_model_harness: bool,
+    /// Append the conciseness rule to the system prompt.
+    pub minimize_tokens: bool,
+}
+
+impl ContextStrategy for BudgetStrategy {
+    fn tool_result_char_cap(&self) -> usize {
+        match self.context_length {
+            // A single tool result may use at most a quarter of the window.
+            Some(tokens) => ((tokens as usize) * CHARS_PER_TOKEN / 4).max(1_000),
+            None if self.small_model_harness => SMALL_MODEL_TOOL_RESULT_CHAR_CAP,
+            None => DEFAULT_TOOL_RESULT_CHAR_CAP,
+        }
     }
+
+    fn conversation_char_budget(&self) -> usize {
+        match self.context_length {
+            // Keep a quarter of the window free for the model's response.
+            Some(tokens) => ((tokens as usize) * CHARS_PER_TOKEN * 3 / 4).max(4_000),
+            None if self.small_model_harness => SMALL_MODEL_CONVERSATION_CHAR_BUDGET,
+            None => DEFAULT_CONVERSATION_CHAR_BUDGET,
+        }
+    }
+
+    fn system_prompt_suffix(&self) -> Option<&'static str> {
+        self.minimize_tokens.then_some(MINIMIZE_CONCISENESS_RULE)
+    }
+}
+
+impl McpChatConfig {
+    /// The context strategy for this run. Currently always a [`BudgetStrategy`];
+    /// returning it through the [`ContextStrategy`] trait keeps the agent loop
+    /// decoupled from the concrete choice.
+    pub fn context_strategy(&self) -> BudgetStrategy {
+        BudgetStrategy {
+            context_length: self.context_length,
+            small_model_harness: self.small_model_harness,
+            minimize_tokens: self.minimize_tokens,
+        }
+    }
+}
+
+/// Character cap for a single tool result injected into the conversation.
+/// Thin wrapper over the run's [`ContextStrategy`].
+pub fn tool_result_char_cap(cfg: &McpChatConfig) -> usize {
+    cfg.context_strategy().tool_result_char_cap()
+}
+
+/// Total character budget for the conversation sent to the model.
+/// Thin wrapper over the run's [`ContextStrategy`].
+pub fn conversation_char_budget(cfg: &McpChatConfig) -> usize {
+    cfg.context_strategy().conversation_char_budget()
 }
 
 /// Truncate the middle of `s` to at most `cap` characters, keeping the head
@@ -768,12 +828,11 @@ pub fn spawn_agent_task(
     tokio::spawn(async move {
         let mut sys_prompt = system_prompt.clone();
         if let Some(ref cfg) = mcp
-            && cfg.minimize_tokens
+            && let Some(suffix) = cfg.context_strategy().system_prompt_suffix()
         {
-            let conciseness_rule = "\n\nRespond concisely. No preamble, no conversational filler. Output only the tool call, code, or bare answer.";
             match sys_prompt {
-                Some(ref mut s) => s.push_str(conciseness_rule),
-                None => sys_prompt = Some(conciseness_rule.trim().to_string()),
+                Some(ref mut s) => s.push_str(suffix),
+                None => sys_prompt = Some(suffix.trim().to_string()),
             }
         }
 
@@ -1803,6 +1862,81 @@ mod tests {
         let before = msgs.clone();
         trim_conversation(&mut msgs, 10_000);
         assert_eq!(msgs, before);
+    }
+
+    #[test]
+    fn budget_strategy_budgets_and_suffix() {
+        let default = BudgetStrategy {
+            context_length: None,
+            small_model_harness: false,
+            minimize_tokens: false,
+        };
+        assert_eq!(default.tool_result_char_cap(), DEFAULT_TOOL_RESULT_CHAR_CAP);
+        assert_eq!(
+            default.conversation_char_budget(),
+            DEFAULT_CONVERSATION_CHAR_BUDGET
+        );
+        assert_eq!(default.system_prompt_suffix(), None);
+
+        let small = BudgetStrategy {
+            context_length: None,
+            small_model_harness: true,
+            minimize_tokens: true,
+        };
+        assert_eq!(
+            small.tool_result_char_cap(),
+            SMALL_MODEL_TOOL_RESULT_CHAR_CAP
+        );
+        assert_eq!(
+            small.conversation_char_budget(),
+            SMALL_MODEL_CONVERSATION_CHAR_BUDGET
+        );
+        assert!(
+            small
+                .system_prompt_suffix()
+                .is_some_and(|s| s.contains("concisely"))
+        );
+
+        // A known context window drives both budgets and overrides the flag.
+        let windowed = BudgetStrategy {
+            context_length: Some(8_192),
+            small_model_harness: true,
+            minimize_tokens: false,
+        };
+        assert_eq!(windowed.tool_result_char_cap(), 8_192 * CHARS_PER_TOKEN / 4);
+        assert_eq!(
+            windowed.conversation_char_budget(),
+            8_192 * CHARS_PER_TOKEN * 3 / 4
+        );
+    }
+
+    #[test]
+    fn context_strategy_maps_config_and_wrappers_delegate() {
+        let cfg = McpChatConfig {
+            base_url: "http://x".into(),
+            workspace_root: PathBuf::from("/tmp"),
+            session_id: None,
+            external_http_servers: BTreeMap::new(),
+            max_turns: 8,
+            tool_approval: false,
+            mcp_connections: ahma_mcp::mcp_client::McpConnectionManager::default(),
+            minimize_tokens: true,
+            small_model_harness: true,
+            context_length: None,
+        };
+        let strat = cfg.context_strategy();
+        assert!(strat.small_model_harness && strat.minimize_tokens);
+        // The free-function wrappers must agree with the strategy.
+        assert_eq!(
+            tool_result_char_cap(&cfg),
+            strat.tool_result_char_cap(),
+            "wrapper must delegate"
+        );
+        assert_eq!(
+            conversation_char_budget(&cfg),
+            strat.conversation_char_budget()
+        );
+        assert!(strat.system_prompt_suffix().is_some());
     }
 
     #[tokio::test]
