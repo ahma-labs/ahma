@@ -208,6 +208,25 @@ pub enum ClientMsg {
     AgentDone,
     /// Notify that the agent turn encountered an error.
     AgentError { error: String },
+    /// Stream a tool-call start so the TUI can show which tool is running.
+    ToolCallStarted {
+        id: String,
+        name: String,
+        args: String,
+    },
+    /// Stream a tool-call result back to the TUI.
+    ToolCallFinished {
+        id: String,
+        result: String,
+        failed: bool,
+    },
+    /// Report token usage for the latest model turn so the TUI counter updates.
+    /// Carried as plain fields to keep this crate free of an LLM-client dep.
+    Usage {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+    },
 }
 
 /// Message from the daemon to a subscriber (TUI).
@@ -266,6 +285,24 @@ pub enum DaemonMsg {
     AgentDone,
     /// Notify TUI that the agent turn encountered an error.
     AgentError { error: String },
+    /// Forward a tool-call start to the TUI (which tool the agent is running).
+    ToolCallStarted {
+        id: String,
+        name: String,
+        args: String,
+    },
+    /// Forward a tool-call result to the TUI.
+    ToolCallFinished {
+        id: String,
+        result: String,
+        failed: bool,
+    },
+    /// Forward token usage for the latest model turn so the TUI counter updates.
+    Usage {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1104,6 +1141,15 @@ async fn serve_instance<R, W>(
                     }
                     Ok(ClientMsg::ScopeGrantResolved { decision_id }) => {
                         let _ = hub.broadcast.send(DaemonMsg::ScopeGrantDismiss { decision_id });
+                    }
+                    Ok(ClientMsg::ToolCallStarted { id: call_id, name, args }) => {
+                        let _ = hub.broadcast.send(DaemonMsg::ToolCallStarted { id: call_id, name, args });
+                    }
+                    Ok(ClientMsg::ToolCallFinished { id: call_id, result, failed }) => {
+                        let _ = hub.broadcast.send(DaemonMsg::ToolCallFinished { id: call_id, result, failed });
+                    }
+                    Ok(ClientMsg::Usage { prompt_tokens, completion_tokens, total_tokens }) => {
+                        let _ = hub.broadcast.send(DaemonMsg::Usage { prompt_tokens, completion_tokens, total_tokens });
                     }
                     Ok(ClientMsg::AgentDone) => {
                         let _ = hub.broadcast.send(DaemonMsg::AgentDone);
@@ -2191,6 +2237,67 @@ mod tests {
         match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
             DaemonMsg::ScopeGrantDismiss { decision_id } => assert_eq!(decision_id, "d9"),
             other => panic!("expected ScopeGrantDismiss, got {other:?}"),
+        }
+
+        // ToolCallStarted → ToolCallStarted.
+        send_msg(
+            &mut iw,
+            &ClientMsg::ToolCallStarted {
+                id: "t1".into(),
+                name: "read_file".into(),
+                args: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::ToolCallStarted { id, name, .. } => {
+                assert_eq!(id, "t1");
+                assert_eq!(name, "read_file");
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+
+        // ToolCallFinished → ToolCallFinished.
+        send_msg(
+            &mut iw,
+            &ClientMsg::ToolCallFinished {
+                id: "t1".into(),
+                result: "ok".into(),
+                failed: false,
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::ToolCallFinished { id, failed, .. } => {
+                assert_eq!(id, "t1");
+                assert!(!failed);
+            }
+            other => panic!("expected ToolCallFinished, got {other:?}"),
+        }
+
+        // Usage → Usage.
+        send_msg(
+            &mut iw,
+            &ClientMsg::Usage {
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                total_tokens: 120,
+            },
+        )
+        .await
+        .unwrap();
+        match recv_msg::<_, DaemonMsg>(&mut srdr).await.unwrap() {
+            DaemonMsg::Usage {
+                prompt_tokens,
+                total_tokens,
+                ..
+            } => {
+                assert_eq!(prompt_tokens, 100);
+                assert_eq!(total_tokens, 120);
+            }
+            other => panic!("expected Usage, got {other:?}"),
         }
 
         // Pong produces NO broadcast; the next AgentDone proves it was swallowed.

@@ -82,6 +82,26 @@ pub enum SourceEvent {
     AgentError {
         error: String,
     },
+    /// Token usage for the latest model turn, forwarded over the daemon hub so
+    /// the status-bar counter updates on the hub path (not just in-process).
+    Usage {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+    },
+    /// A tool call the agent started — drives the live "which tool is running"
+    /// display when the agent runs through the daemon hub.
+    ToolCallStarted {
+        id: String,
+        name: String,
+        args: String,
+    },
+    /// A tool call result, forwarded over the daemon hub.
+    ToolCallFinished {
+        id: String,
+        result: String,
+        failed: bool,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -156,6 +156,41 @@ pub fn spawn_embedded_hub_source(
                                 return;
                             }
                         }
+                        Applied::Usage {
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens,
+                        } => {
+                            if tx
+                                .send(SourceEvent::Usage {
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    total_tokens,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Applied::ToolCallStarted { id, name, args } => {
+                            if tx
+                                .send(SourceEvent::ToolCallStarted { id, name, args })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Applied::ToolCallFinished { id, result, failed } => {
+                            if tx
+                                .send(SourceEvent::ToolCallFinished { id, result, failed })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
                         Applied::None => {}
                     }
                 }
@@ -442,6 +477,41 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
                                 return;
                             }
                         }
+                        Applied::Usage {
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens,
+                        } => {
+                            if tx
+                                .send(SourceEvent::Usage {
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    total_tokens,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Applied::ToolCallStarted { id, name, args } => {
+                            if tx
+                                .send(SourceEvent::ToolCallStarted { id, name, args })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Applied::ToolCallFinished { id, result, failed } => {
+                            if tx
+                                .send(SourceEvent::ToolCallFinished { id, result, failed })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
                         Applied::None => {}
                     }
                 }
@@ -488,6 +558,21 @@ enum Applied {
     },
     AgentDone,
     AgentError(String),
+    Usage {
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+    },
+    ToolCallStarted {
+        id: String,
+        name: String,
+        args: String,
+    },
+    ToolCallFinished {
+        id: String,
+        result: String,
+        failed: bool,
+    },
 }
 
 impl Applied {
@@ -562,6 +647,21 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
         }
         DaemonMsg::AgentDone => Applied::AgentDone,
         DaemonMsg::AgentError { error } => Applied::AgentError(error),
+        DaemonMsg::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        } => Applied::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        },
+        DaemonMsg::ToolCallStarted { id, name, args } => {
+            Applied::ToolCallStarted { id, name, args }
+        }
+        DaemonMsg::ToolCallFinished { id, result, failed } => {
+            Applied::ToolCallFinished { id, result, failed }
+        }
         DaemonMsg::RunPrompt { .. } => Applied::None,
         DaemonMsg::SubmitApproval { .. } => Applied::None,
         DaemonMsg::ScopeGrantRequested { request } => Applied::ScopeGrantRequested { request },
@@ -1055,6 +1155,64 @@ mod tests {
         ) {
             Applied::ChatToken(t) => assert_eq!(t, "hi"),
             _ => panic!("ChatToken must map to Applied::ChatToken"),
+        }
+    }
+
+    #[test]
+    fn apply_msg_usage_carries_token_counts() {
+        let mut s = DaemonState::new();
+        match apply_msg(
+            &mut s,
+            DaemonMsg::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 3,
+                total_tokens: 13,
+            },
+        ) {
+            Applied::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            } => {
+                assert_eq!(
+                    (prompt_tokens, completion_tokens, total_tokens),
+                    (10, 3, 13)
+                );
+            }
+            _ => panic!("Usage must map to Applied::Usage"),
+        }
+    }
+
+    #[test]
+    fn apply_msg_tool_call_lifecycle_carries_fields() {
+        let mut s = DaemonState::new();
+        match apply_msg(
+            &mut s,
+            DaemonMsg::ToolCallStarted {
+                id: "t1".to_string(),
+                name: "read_file".to_string(),
+                args: "{}".to_string(),
+            },
+        ) {
+            Applied::ToolCallStarted { id, name, .. } => {
+                assert_eq!(id, "t1");
+                assert_eq!(name, "read_file");
+            }
+            _ => panic!("ToolCallStarted must map to Applied::ToolCallStarted"),
+        }
+        match apply_msg(
+            &mut s,
+            DaemonMsg::ToolCallFinished {
+                id: "t1".to_string(),
+                result: "ok".to_string(),
+                failed: false,
+            },
+        ) {
+            Applied::ToolCallFinished { id, failed, .. } => {
+                assert_eq!(id, "t1");
+                assert!(!failed);
+            }
+            _ => panic!("ToolCallFinished must map to Applied::ToolCallFinished"),
         }
     }
 

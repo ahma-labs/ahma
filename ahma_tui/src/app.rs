@@ -3515,6 +3515,25 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
                 streaming: false,
             });
         }
+        SourceEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        } => {
+            // Mirror the in-process BridgeEvent::Usage accumulation so the
+            // status-bar token counter populates on the daemon-hub path too.
+            state.token_usage.prompt_tokens += prompt_tokens;
+            state.token_usage.completion_tokens += completion_tokens;
+            state.token_usage.total_tokens += total_tokens;
+        }
+        SourceEvent::ToolCallStarted { id, name, args } => {
+            state.chat.start_tool_call(id, name, args);
+            state.chat_scroll = 0;
+        }
+        SourceEvent::ToolCallFinished { id, result, failed } => {
+            state.chat.finish_tool_call(&id, result, failed);
+            state.chat_scroll = 0;
+        }
     }
 }
 

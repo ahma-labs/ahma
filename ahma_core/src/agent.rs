@@ -1524,16 +1524,21 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
                 AgentEvent::Thinking(t) => ClientMsg::ChatThinking { token: t },
                 AgentEvent::Done => ClientMsg::AgentDone,
                 AgentEvent::Error(e) => ClientMsg::AgentError { error: e },
-                // Tool-call lifecycle events are NOT approval requests. The actual
-                // approval prompt is raised explicitly by the HubApprovalGate when
-                // a tool needs consent; ToolCallStarted fires *after* approval (or
-                // for auto-approved tools), so forwarding it as ApprovalRequested
-                // popped a spurious second dialog on the TUI for every tool call.
-                // The hub protocol has no tool-progress display message yet, so we
-                // drop these rather than misrepresent them.
-                AgentEvent::ToolCallStarted { .. } => continue,
-                AgentEvent::ToolCallFinished { .. } => continue,
-                AgentEvent::Usage(_) => continue,
+                // Tool-call lifecycle events are NOT approval requests — the
+                // approval prompt is raised separately by the HubApprovalGate.
+                // These drive the TUI's live "which tool is running" display and
+                // the token counter, so forward them over their own hub messages.
+                AgentEvent::ToolCallStarted { id, name, args } => {
+                    ClientMsg::ToolCallStarted { id, name, args }
+                }
+                AgentEvent::ToolCallFinished { id, result, failed } => {
+                    ClientMsg::ToolCallFinished { id, result, failed }
+                }
+                AgentEvent::Usage(usage) => ClientMsg::Usage {
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    total_tokens: usage.total_tokens,
+                },
             };
 
             if hub_tx.send(client_msg).await.is_err() {
