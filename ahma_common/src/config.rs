@@ -669,6 +669,13 @@ pub struct ToolSettings {
     /// Enable small-model harness adaptations.
     /// Default: `false`
     pub small_model_harness: bool,
+    /// Maximum number of agent tool-call turns before the interactive chat agent
+    /// stops and summarises. Each turn is one model call that may request tools;
+    /// multi-step tasks (read → edit → build → fix) need several. Too low and the
+    /// agent gives up mid-task; too high risks runaway loops on a stuck model.
+    /// Default: `25`
+    #[serde(default = "default_max_turns")]
+    pub max_turns: u32,
     /// Command serialisation groups.  Commands matching a group's prefix are
     /// serialised per working directory (at most one runs at a time within
     /// that directory).  Defaults to a single `cargo` group so that
@@ -690,9 +697,15 @@ impl Default for ToolSettings {
             tool_bundles: Vec::new(),
             minimize_tokens: false,
             small_model_harness: false,
+            max_turns: default_max_turns(),
             mutex_groups: default_mutex_groups(),
         }
     }
+}
+
+/// Default maximum agent tool-call turns (see [`ToolSettings::max_turns`]).
+pub fn default_max_turns() -> u32 {
+    25
 }
 
 /// Access level granted to a [`PersistentScope`].
@@ -1441,6 +1454,12 @@ impl AhmaSettings {
             d.tools.small_model_harness.to_string(),
         );
         w.setting(
+            "Max agent tool-call turns before the chat agent stops and summarises.",
+            "max_turns",
+            self.tools.max_turns.to_string(),
+            d.tools.max_turns.to_string(),
+        );
+        w.setting(
             "Command serialisation groups (per-dir mutex; set [] to disable).",
             "mutex_groups",
             toml_mutex_groups(&self.tools.mutex_groups),
@@ -1932,6 +1951,7 @@ mod tests {
                 tool_bundles: vec!["rust".into(), "git".into()],
                 minimize_tokens: true,
                 small_model_harness: true,
+                max_turns: 7,
                 mutex_groups: vec![MutexGroupConfig {
                     name: "gradle".into(),
                     prefixes: vec!["gradle".into(), "./gradlew".into()],

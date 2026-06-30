@@ -814,17 +814,73 @@ pub fn spawn_agent_task(
         }
 
         if !completed {
-            warn!(
+            finish_with_limit_summary(
+                &client,
+                &mut msg_json,
+                &mcp,
+                &tx,
+                &messages,
+                &sys_prompt,
                 max_turns,
-                "agent: loop reached max turns without a final answer — the model kept requesting tools (or looping) until the turn budget ran out"
-            );
-            let _ = tx
-                .send(AgentEvent::Error(
-                    "Agent loop reached max turns without completion".to_string(),
-                ))
-                .await;
+            )
+            .await;
         }
     });
+}
+
+/// Close out an agent run that exhausted its turn budget. Instead of dead-ending
+/// on an opaque error, give the model one final turn with **no tools** so it
+/// summarises what it accomplished, what is left, and the next step. The empty
+/// tool list guarantees this turn ends the loop (the model cannot request
+/// another tool), and the user gets a useful closing message instead of a raw
+/// "reached max turns" error.
+#[allow(clippy::too_many_arguments)]
+async fn finish_with_limit_summary(
+    client: &LlmClient,
+    msg_json: &mut Vec<serde_json::Value>,
+    mcp: &Option<McpChatConfig>,
+    tx: &Sender<AgentEvent>,
+    messages: &[ChatMessage],
+    system_prompt: &Option<String>,
+    max_turns: u32,
+) {
+    warn!(
+        max_turns,
+        "agent: loop reached max turns — requesting a tool-free summary of progress"
+    );
+    msg_json.push(serde_json::json!({
+        "role": "user",
+        "content": format!(
+            "You have reached the maximum of {max_turns} tool-call turns for this task. \
+             Do not call any more tools. In a few sentences, summarise what you accomplished, \
+             what remains unfinished, and the single recommended next step."
+        )
+    }));
+    if let Some(cfg) = mcp {
+        trim_conversation(msg_json, conversation_char_budget(cfg));
+    }
+
+    match fetch_completion(client, msg_json, &[], mcp, tx, messages, system_prompt).await {
+        Some((completion, content_streamed)) => {
+            if let Some(usage) = &completion.usage {
+                let _ = tx.send(AgentEvent::Usage(usage.clone())).await;
+            }
+            // Streamed paths already emitted the content token-by-token.
+            if !content_streamed && !completion.content.is_empty() {
+                let _ = tx.send(AgentEvent::Token(completion.content)).await;
+            }
+            let _ = tx.send(AgentEvent::Done).await;
+        }
+        None => {
+            // fetch_completion already surfaced the concrete error to the UI.
+            let _ = tx
+                .send(AgentEvent::Error(format!(
+                    "Agent stopped after {max_turns} tool-call turns without completing the task, \
+                     and the closing summary could not be generated."
+                )))
+                .await;
+        }
+    }
 }
 
 async fn spawn_local_tool_call(
@@ -1413,7 +1469,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
             workspace_root,
             session_id: None,
             external_http_servers: BTreeMap::new(),
-            max_turns: 8,
+            max_turns: settings.tools.max_turns,
             tool_approval: true, // Always enable tool approval for hub tasks to prompt TUI
             mcp_connections,
             minimize_tokens: settings.tools.minimize_tokens,
@@ -1784,6 +1840,147 @@ mod tests {
         assert!(got_finish, "Missing ToolCallFinished");
         assert!(got_token, "Missing Token");
         assert!(got_done, "Missing Done");
+    }
+
+    /// When the model never stops requesting tools and the turn budget is
+    /// exhausted, the loop must not dead-end on an opaque error: it runs one
+    /// final **tool-free** turn so the model summarises progress, and the user
+    /// sees that summary plus `Done` — never `Error`. The LLM mock returns a
+    /// tool call whenever `tools` is present and a plain summary when the request
+    /// carries no tools (the closing turn).
+    #[tokio::test]
+    async fn test_agent_task_summarises_when_turn_budget_exhausted() {
+        let llm_router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(
+                |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    let tools_empty = body
+                        .get("tools")
+                        .and_then(|t| t.as_array())
+                        .map(|a| a.is_empty())
+                        .unwrap_or(true);
+                    let sse = if tools_empty {
+                        // Closing summary turn: no tools offered → plain content.
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"Reached the turn limit. I inspected the file; the build still fails; next run cargo build.\"}}]}\n",
+                            "data: [DONE]\n",
+                        )
+                    } else {
+                        // Every tool-enabled turn keeps requesting a tool, so the
+                        // loop never completes on its own.
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"test_tool\",\"arguments\":\"{}\"}}]}}]}\n",
+                            "data: [DONE]\n",
+                        )
+                    };
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(sse.to_string())
+                        .unwrap()
+                },
+            ),
+        );
+
+        let llm_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llm_addr = llm_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(llm_listener, llm_router).await.unwrap();
+        });
+
+        let mcp_router = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(
+                |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    use axum::response::IntoResponse;
+                    let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    match method {
+                        "initialize" => {
+                            let mut headers = axum::http::HeaderMap::new();
+                            headers.insert(
+                                "mcp-session-id",
+                                axum::http::HeaderValue::from_static("sess-limit"),
+                            );
+                            (headers, axum::Json(serde_json::json!({}))).into_response()
+                        }
+                        "tools/call" => axum::Json(serde_json::json!({
+                            "result": { "content": [{"type": "text", "text": "Tool executed"}] }
+                        }))
+                        .into_response(),
+                        _ => axum::http::StatusCode::OK.into_response(),
+                    }
+                },
+            )
+            .get(|| async {
+                use axum::response::IntoResponse;
+                use futures::StreamExt;
+                let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/sandbox/configured\"}\n\n";
+                let head = futures::stream::once(async move {
+                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(body))
+                });
+                let tail =
+                    futures::stream::pending::<Result<axum::body::Bytes, std::convert::Infallible>>();
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    axum::body::Body::from_stream(head.chain(tail)),
+                )
+                    .into_response()
+            }),
+        );
+
+        let mcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcp_addr = mcp_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(mcp_listener, mcp_router).await.unwrap();
+        });
+
+        let client = LlmClient::new(format!("http://{}", llm_addr), "test-model", None);
+        let mcp = McpChatConfig {
+            base_url: format!("http://{}", mcp_addr),
+            workspace_root: PathBuf::from("/tmp"),
+            session_id: None,
+            external_http_servers: BTreeMap::new(),
+            max_turns: 1,
+            tool_approval: false,
+            mcp_connections: ahma_mcp::mcp_client::McpConnectionManager::default(),
+            minimize_tokens: false,
+            small_model_harness: false,
+            context_length: None,
+        };
+
+        let (tx, mut rx) = mpsc::channel(100);
+        spawn_agent_task(
+            client,
+            vec![ChatMessage::user("Fix the build")],
+            None,
+            Some(mcp),
+            vec![ahma_mcp::mcp_client::ToolInfo {
+                name: "test_tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object", "additionalProperties": true}),
+            }],
+            tx,
+            Arc::new(AutoApproveGate),
+        );
+
+        let mut summary = String::new();
+        let mut got_done = false;
+        while let Some(evt) = rx.recv().await {
+            match evt {
+                AgentEvent::Token(t) => summary.push_str(&t),
+                AgentEvent::Done => {
+                    got_done = true;
+                    break;
+                }
+                AgentEvent::Error(e) => panic!("Budget exhaustion must summarise, not error: {e}"),
+                _ => {}
+            }
+        }
+
+        assert!(got_done, "summary turn must end with Done");
+        assert!(
+            summary.contains("turn limit"),
+            "expected a closing progress summary, got: {summary:?}"
+        );
     }
 
     /// Regression: a freshly created MCP session must complete the full

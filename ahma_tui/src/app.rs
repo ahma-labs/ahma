@@ -364,7 +364,7 @@ fn approve_symlink(state: &mut crate::state::AppState) {
             workspace_root: std::path::PathBuf::from(&state.workspace),
             session_id: state.session_id.clone(),
             external_http_servers: std::collections::BTreeMap::new(),
-            max_turns: 8,
+            max_turns: ahma_common::config::AhmaSettings::load().tools.max_turns,
             tool_approval: false,
             mcp_connections: state.mcp_connections.clone(),
             minimize_tokens,
@@ -1397,7 +1397,9 @@ fn mcp_chat_config(state: &crate::state::AppState) -> crate::llm_bridge::McpChat
         })
         .collect();
 
-    let max_turns = profile_field(state, |p| p.max_turns, 8);
+    // Fall back to the configured global default when no profile pins a value.
+    let settings_max_turns = ahma_common::config::AhmaSettings::load().tools.max_turns;
+    let max_turns = profile_field(state, |p| p.max_turns, settings_max_turns);
     let tool_approval = profile_field(state, |p| p.tool_approval, false);
 
     let (minimize_tokens, small_model_harness, context_length) = resolve_token_prefs(state);
