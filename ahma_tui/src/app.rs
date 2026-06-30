@@ -2762,8 +2762,8 @@ fn save_session(state: &crate::state::AppState) {
     };
 
     let cfg = TuiSessionConfig {
-        provider,
-        model,
+        provider: provider.clone(),
+        model: model.clone(),
         provider_url: state.current_provider_url.clone(),
         mcp_enabled: state.mcp_enabled,
         active_profile: state.active_profile.clone(),
@@ -2773,6 +2773,35 @@ fn save_session(state: &crate::state::AppState) {
         && let Err(e) = cfg.save(&cwd)
     {
         debug!("Failed to save session config: {e}");
+    }
+
+    // Also record the selection globally so the MCP sub-agent (and the next
+    // session, in any directory) can reuse the model the user last chose.
+    persist_selected_model_to_settings(&provider, &model, &state.current_provider_url);
+}
+
+/// Persist the most-recently-selected provider/model to `~/.ahma/settings.toml`
+/// (the `[agent]` section). Empty values clear the field. Best-effort: a save
+/// failure is logged, never surfaced — the per-project session save is primary.
+#[cfg(feature = "tui")]
+fn persist_selected_model_to_settings(provider: &str, model: &str, provider_url: &Option<String>) {
+    let mut settings = ahma_common::config::AhmaSettings::load();
+    let to_opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
+    let next_provider = to_opt(provider);
+    let next_model = to_opt(model);
+
+    // Avoid a needless disk write when nothing changed.
+    if settings.agent.provider == next_provider
+        && settings.agent.model == next_model
+        && &settings.agent.provider_url == provider_url
+    {
+        return;
+    }
+    settings.agent.provider = next_provider;
+    settings.agent.model = next_model;
+    settings.agent.provider_url = provider_url.clone();
+    if let Err(e) = settings.save() {
+        debug!("Failed to persist selected model to settings: {e}");
     }
 }
 
@@ -4310,6 +4339,39 @@ mod tests {
 
         // A non-minimize command is not claimed by this handler.
         assert!(!super::handle_minimize_nav_command("/help", &mut state));
+
+        unsafe {
+            std::env::remove_var("AHMA_TEST_HOME");
+        }
+    }
+
+    #[test]
+    fn persist_selected_model_writes_and_clears_agent_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        unsafe {
+            std::env::set_var("AHMA_TEST_HOME", dir.path());
+        }
+
+        super::persist_selected_model_to_settings(
+            "Ollama",
+            "gemma3:27b",
+            &Some("http://localhost:11434".to_string()),
+        );
+        let s = ahma_common::config::AhmaSettings::load();
+        assert_eq!(s.agent.provider.as_deref(), Some("Ollama"));
+        assert_eq!(s.agent.model.as_deref(), Some("gemma3:27b"));
+        assert_eq!(
+            s.agent.provider_url.as_deref(),
+            Some("http://localhost:11434")
+        );
+
+        // Empty values clear the fields.
+        super::persist_selected_model_to_settings("", "", &None);
+        let s2 = ahma_common::config::AhmaSettings::load();
+        assert_eq!(s2.agent.provider, None);
+        assert_eq!(s2.agent.model, None);
+        assert_eq!(s2.agent.provider_url, None);
 
         unsafe {
             std::env::remove_var("AHMA_TEST_HOME");

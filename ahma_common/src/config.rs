@@ -633,6 +633,22 @@ impl Default for LmStudioSettings {
     }
 }
 
+/// The LLM provider/model most recently selected in `ahma tui`, persisted
+/// globally so the MCP sub-agent (and the next session, in any directory) can
+/// reuse "the model the user last chose" rather than re-deriving it. The TUI
+/// writes this on every `/model` / `/provider` change; it is advisory, never a
+/// security input. All fields are optional — unset means "no selection yet".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AgentSettings {
+    /// Provider name or label (e.g. `Ollama`), or a base URL.
+    pub provider: Option<String>,
+    /// Model identifier (e.g. `gemma3:27b`).
+    pub model: Option<String>,
+    /// Resolved provider base URL, when the TUI knows it.
+    pub provider_url: Option<String>,
+}
+
 /// Tool execution settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1151,6 +1167,9 @@ pub struct AhmaSettings {
     pub auth: AuthSettings,
     /// Instance identity settings.
     pub instance: InstanceSettings,
+    /// LLM provider/model most recently selected in `ahma tui`, persisted so the
+    /// MCP sub-agent and the next session can reuse it.
+    pub agent: AgentSettings,
 }
 
 impl AhmaSettings {
@@ -1619,6 +1638,26 @@ impl AhmaSettings {
             toml_str(&d.instance.label),
         );
 
+        w.section("Agent (last-selected LLM, written by ahma tui)", "agent");
+        w.setting(
+            "Provider name/label of the most recently selected LLM.",
+            "provider",
+            toml_opt_str(&self.agent.provider),
+            toml_opt_str(&d.agent.provider),
+        );
+        w.setting(
+            "Model id of the most recently selected LLM.",
+            "model",
+            toml_opt_str(&self.agent.model),
+            toml_opt_str(&d.agent.model),
+        );
+        w.setting(
+            "Resolved base URL of the most recently selected provider.",
+            "provider_url",
+            toml_opt_str(&self.agent.provider_url),
+            toml_opt_str(&d.agent.provider_url),
+        );
+
         w.into_string()
     }
 
@@ -1997,6 +2036,11 @@ mod tests {
             instance: InstanceSettings {
                 label: "custom-label".into(),
             },
+            agent: AgentSettings {
+                provider: Some("Ollama".into()),
+                model: Some("gemma3:27b".into()),
+                provider_url: Some("http://localhost:11434".into()),
+            },
         }
     }
 
@@ -2048,6 +2092,7 @@ mod tests {
             "[http]",
             "[auth]",
             "[instance]",
+            "[agent]",
         ] {
             assert!(text.contains(table), "missing section header {table}");
         }
