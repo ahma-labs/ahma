@@ -29,6 +29,7 @@ impl Sandbox {
         let scope_rules = self.get_macos_scope_rules();
         let read_scopes_rules = self.get_macos_read_scopes_rules();
         let system_rules = self.get_macos_system_rules();
+        let credential_deny_rules = self.get_macos_credential_deny_rules();
         let user_tool_rules = self.get_macos_user_tool_rules();
         let temp_rules = self.get_macos_temp_rules();
         let pkg_cache_rules = self.get_macos_package_cache_write_rules();
@@ -39,7 +40,7 @@ impl Sandbox {
 (allow process*)
 (allow signal)
 (allow sysctl-read)
-{system_rules}{user_tool_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
+{system_rules}{credential_deny_rules}{user_tool_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
 (allow file-write* (subpath "{working_dir}"))
 {pkg_cache_rules}{temp_rules}(allow file-read* (literal "/dev/null"))
 (allow file-write* (literal "/dev/null"))
@@ -53,6 +54,7 @@ impl Sandbox {
 "#,
             working_dir = wd_str,
             system_rules = system_rules,
+            credential_deny_rules = credential_deny_rules,
             user_tool_rules = user_tool_rules,
             scope_rules = scope_rules,
             read_scopes_rules = read_scopes_rules,
@@ -82,6 +84,21 @@ impl Sandbox {
             rules.push_str(&format!(
                 "(allow file-read* (subpath \"{}\"))\n",
                 scope.display()
+            ));
+        }
+        rules
+    }
+
+    /// `(deny file-read* …)` rules for the operator's credential-read deny set.
+    /// Emitted right after the global `(allow file-read*)` so they override it,
+    /// but before the workspace-scope allows so an explicit scope grant still
+    /// wins (SBPL is last-match-wins).
+    fn get_macos_credential_deny_rules(&self) -> String {
+        let mut rules = String::new();
+        for deny in super::credential_reads::credential_read_denies() {
+            rules.push_str(&format!(
+                "(deny file-read* (subpath \"{}\"))\n",
+                deny.display()
             ));
         }
         rules

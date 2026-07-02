@@ -40,6 +40,7 @@
 pub mod build_diagnostics;
 mod command;
 pub(crate) mod core;
+pub mod credential_reads;
 pub mod denial_scan;
 pub mod display;
 mod error;
@@ -60,6 +61,9 @@ mod windows;
 pub use command::{is_secret_env_name, scrub_secret_env, secret_env_keys, set_secret_env_allow};
 pub use core::Sandbox;
 pub use core::{add_log_exception, is_target_allowed, load_exceptions};
+pub use credential_reads::{
+    default_credential_read_denies, effective_credential_read_denies, set_credential_read_denies,
+};
 pub use denial_scan::{DenialHit, scan_denial};
 pub use display::{ActiveSandbox, ScopeSource, ScopeView};
 pub use error::SandboxError;

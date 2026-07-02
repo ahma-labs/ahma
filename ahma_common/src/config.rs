@@ -886,6 +886,26 @@ pub struct SandboxSettings {
     /// Default: empty list
     #[serde(default)]
     pub env_allow: Vec<String>,
+    /// macOS only. Additional credential directories whose **reads** are denied
+    /// to sandboxed tools, on top of the built-in default set (`~/.ahma`,
+    /// `~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.kube`, `~/.docker`,
+    /// `~/.netrc`, `~/Library/Keychains`).
+    ///
+    /// macOS Seatbelt grants global file-read to sandboxed commands (an APFS
+    /// firmlink workaround), so credential files would otherwise be readable and
+    /// exfiltratable. `~/.ssh` and `~/.config/gh` are **not** denied by default
+    /// so git-over-ssh and `gh` keep working — add them here to harden further.
+    /// `~` is expanded. Ignored on Linux/Windows (reads are already scoped).
+    /// Default: empty list
+    #[serde(default)]
+    pub deny_credential_reads: Vec<PathBuf>,
+    /// macOS only. Credential directories to **remove** from the built-in
+    /// default deny set (the escape hatch for a tool that legitimately needs
+    /// e.g. `~/.aws`). `~` is expanded. Applied after `deny_credential_reads`,
+    /// so a path listed in both ends up allowed.
+    /// Default: empty list
+    #[serde(default)]
+    pub allow_credential_reads: Vec<PathBuf>,
 }
 
 impl SandboxSettings {
@@ -942,6 +962,8 @@ impl Default for SandboxSettings {
             use_sandbox_directory: false,
             persistent_scopes: Vec::new(),
             env_allow: Vec::new(),
+            deny_credential_reads: Vec::new(),
+            allow_credential_reads: Vec::new(),
         }
     }
 }
@@ -1578,6 +1600,18 @@ impl AhmaSettings {
             toml_str_list(&self.sandbox.env_allow),
             toml_str_list(&d.sandbox.env_allow),
         );
+        w.setting(
+            "macOS: extra credential dirs to deny reads (on top of the built-in default set; e.g. ~/.ssh to harden further).",
+            "deny_credential_reads",
+            toml_path_list(&self.sandbox.deny_credential_reads),
+            toml_path_list(&d.sandbox.deny_credential_reads),
+        );
+        w.setting(
+            "macOS: credential dirs to remove from the built-in deny set (escape hatch for a tool that needs e.g. ~/.aws).",
+            "allow_credential_reads",
+            toml_path_list(&self.sandbox.allow_credential_reads),
+            toml_path_list(&d.sandbox.allow_credential_reads),
+        );
 
         // ── Logging ──────────────────────────────────────────────────────────
         w.section("Logging", "logging");
@@ -2041,6 +2075,8 @@ mod tests {
                     note: Some("compiler cache".into()),
                 }],
                 env_allow: vec!["GITHUB_TOKEN".into()],
+                deny_credential_reads: vec![PathBuf::from("~/.ssh")],
+                allow_credential_reads: vec![PathBuf::from("~/.aws")],
             },
             logging: LoggingSettings {
                 target: "stderr".into(),

@@ -240,4 +240,71 @@ mod seatbelt_profile_tests {
             "Profile must NOT allow write for git when disabled.\nProfile:\n{profile}"
         );
     }
+
+    /// The installed credential-read deny set appears as a `(deny file-read* …)`
+    /// rule, and it is placed after the global `(allow file-read*)` but before
+    /// the working-directory allow so it overrides the global read yet an
+    /// explicit scope grant still wins (SBPL last-match-wins).
+    #[test]
+    fn test_seatbelt_profile_emits_credential_read_denies_in_order() {
+        let scope = TempDir::new().unwrap();
+        let secret = TempDir::new().unwrap();
+        let secret_path = secret.path().to_string_lossy().into_owned();
+
+        // nextest runs each test in its own process, so this global is isolated.
+        ahma_mcp::sandbox::set_credential_read_denies(vec![secret.path().to_path_buf()]);
+
+        let sandbox = Sandbox::new(
+            vec![scope.path().to_path_buf()],
+            SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let profile = profile_for(&sandbox, &scope);
+        ahma_mcp::sandbox::set_credential_read_denies(Vec::new());
+
+        let deny_rule = format!("(deny file-read* (subpath \"{secret_path}\"))");
+        assert!(
+            profile.contains(&deny_rule),
+            "Profile must deny reads of the credential dir.\nProfile:\n{profile}"
+        );
+
+        let global_allow = profile
+            .find("(allow file-read*)")
+            .expect("global read allow present");
+        let deny_at = profile.find(&deny_rule).expect("deny present");
+        let wd_allow = profile
+            .find(&format!(
+                "(allow file-read* (subpath \"{}\"))",
+                scope.path().to_string_lossy()
+            ))
+            .expect("working-dir/scope read allow present");
+        assert!(
+            global_allow < deny_at && deny_at < wd_allow,
+            "deny must sit between the global allow and the scope allow.\nProfile:\n{profile}"
+        );
+    }
+
+    /// With nothing installed (the default when startup wiring hasn't run), no
+    /// credential deny rules are emitted — behaviour is unchanged for embedders.
+    #[test]
+    fn test_seatbelt_profile_has_no_credential_denies_by_default() {
+        ahma_mcp::sandbox::set_credential_read_denies(Vec::new());
+        let scope = TempDir::new().unwrap();
+        let sandbox = Sandbox::new(
+            vec![scope.path().to_path_buf()],
+            SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let profile = profile_for(&sandbox, &scope);
+        assert!(
+            !profile.contains("(deny file-read*"),
+            "no credential deny rules expected when none installed.\nProfile:\n{profile}"
+        );
+    }
 }

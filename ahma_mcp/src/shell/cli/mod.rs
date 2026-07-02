@@ -2354,6 +2354,28 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     // secret is scrubbed from tool environments (see `sandbox::base_command`).
     sandbox::set_secret_env_allow(s.sandbox.env_allow.clone());
 
+    // Install the macOS credential-read deny set (built-in defaults ±
+    // `[sandbox] deny_credential_reads`/`allow_credential_reads`). On macOS the
+    // Seatbelt profile grants global file-read, so these dirs are denied to
+    // sandboxed tools to prevent credential exfiltration. No-op on Linux/Windows
+    // where reads are already scoped.
+    if let Some(home) = dirs::home_dir() {
+        let denies = sandbox::effective_credential_read_denies(
+            &home,
+            &s.sandbox.deny_credential_reads,
+            &s.sandbox.allow_credential_reads,
+        );
+        if cfg!(target_os = "macos") && !denies.is_empty() {
+            tracing::info!(
+                "macOS credential-read protection: denying tool reads of {} dir(s): {:?} \
+                 (adjust via [sandbox] deny_credential_reads / allow_credential_reads)",
+                denies.len(),
+                denies
+            );
+        }
+        sandbox::set_credential_read_denies(denies);
+    }
+
     // ── Tool loading ────────────────────────────────────────────────────────
     // R-CFG1.2: AHMA_TOOLS_DIR is RETIRED — warn and ignore.
     warn_retired_env!("AHMA_TOOLS_DIR");
