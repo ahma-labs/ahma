@@ -65,8 +65,16 @@ fn redaction_rules() -> &'static Vec<(Regex, &'static str)> {
                 "Bearer [REDACTED]",
             ),
             (
-                Regex::new(r"(?i)\b(password|passwd|token|secret|api[_-]?key)\b\s*[:=]\s*(\S+)")
-                    .expect("key-value secret redaction regex must compile"),
+                // Match `key = value` / `key: value` where the key *ends in* a
+                // sensitive word. The optional `[a-z0-9_]*` prefix is what lets
+                // env-var-style names like `ANTHROPIC_API_KEY=` or `MY_SECRET=`
+                // match — a bare `\b(api_key)` never fires there because `_` is a
+                // word character, so there is no boundary before `API` in
+                // `ANTHROPIC_API_KEY`.
+                Regex::new(
+                    r"(?i)\b([a-z0-9_]*(?:password|passwd|secret|token|api[_-]?key|apikey|access[_-]?key))\b\s*[:=]\s*(\S+)",
+                )
+                .expect("key-value secret redaction regex must compile"),
                 "$1=[REDACTED]",
             ),
             (
@@ -79,7 +87,11 @@ fn redaction_rules() -> &'static Vec<(Regex, &'static str)> {
                 REDACTION_PLACEHOLDER,
             ),
             (
-                Regex::new(r"\bsk-[A-Za-z0-9]{16,}\b")
+                // `sk-` provider keys. The inner class must include `-` and `_`
+                // so modern segmented keys (`sk-ant-api03-…`, `sk-proj-…`) are
+                // caught — the old `[A-Za-z0-9]` class stopped at the first `-`
+                // and only ever redacted the 3-char `ant`/`proj` fragment.
+                Regex::new(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{15,}")
                     .expect("api token redaction regex must compile"),
                 REDACTION_PLACEHOLDER,
             ),
@@ -1122,6 +1134,59 @@ mod tests {
         assert!(!redacted.contains("sk-1234567890ABCDEF"));
         assert!(redacted.contains("Authorization: [REDACTED]"));
         assert!(redacted.contains("token=[REDACTED]"));
+    }
+
+    #[test]
+    fn test_redact_env_var_style_secret_keys() {
+        // Regression: env-var-style names end in a sensitive word but are
+        // preceded by a word character (`_`), so the old `\b(api_key)` rule
+        // never fired. These are the formats this tool most needs to redact.
+        for (line, secret) in [
+            (
+                "ANTHROPIC_API_KEY=sk-ant-api03-abcdefABCDEF0123456789",
+                "sk-ant-api03",
+            ),
+            ("OPENAI_API_KEY=sk-proj-abcdefABCDEF0123456789", "sk-proj"),
+            ("MY_SECRET=supersecretvalue123", "supersecretvalue123"),
+            (
+                "AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI0K7MDENGbPxRfiCY",
+                "wJalrXUtnFEMI0K7MDENGbPxRfiCY",
+            ),
+        ] {
+            let redacted = redact_sensitive_line(line);
+            assert!(
+                !redacted.contains(secret),
+                "expected `{secret}` redacted from `{line}`, got `{redacted}`"
+            );
+            assert!(
+                redacted.contains("[REDACTED]"),
+                "no redaction marker in `{redacted}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_redact_segmented_sk_keys() {
+        // Regression: modern `sk-ant-…`/`sk-proj-…` keys contain hyphens; the
+        // old `[A-Za-z0-9]` class stopped at the first `-`.
+        for key in [
+            "sk-ant-api03-abcdefABCDEF0123456789ghijkl",
+            "sk-proj-abcdefABCDEF0123456789ghijkl",
+        ] {
+            let redacted = redact_sensitive_line(&format!("using key {key} now"));
+            assert!(
+                !redacted.contains(key),
+                "expected `{key}` redacted, got `{redacted}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_redaction_does_not_overmatch_benign_identifiers() {
+        // `tokenizer` contains `token` but is not a secret assignment.
+        let line = "tokenizer=gpt2 model=large";
+        let redacted = redact_sensitive_line(line);
+        assert_eq!(redacted, line, "benign identifier must not be redacted");
     }
 
     #[test]
