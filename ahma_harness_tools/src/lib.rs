@@ -26,6 +26,8 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+pub mod egress_guard;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DirEntryInfo {
     pub name: String,
@@ -290,20 +292,14 @@ pub fn grep_search(
     Ok(matches)
 }
 
-pub async fn fetch_webpage(url: &str, query: Option<&str>) -> Result<WebFetchResult> {
-    let resp = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("Failed to fetch URL: {url}"))?;
-    let body = resp.text().await.context("Failed to read response body")?;
-
+/// Render a fetched HTML body into a [`WebFetchResult`]: HTML → plain text,
+/// optional case-insensitive line filter, and `<title>` extraction. Pure, so
+/// the parsing/filtering behaviour is unit-testable without any network.
+fn render_webpage(url: &str, body: &str, query: Option<&str>) -> WebFetchResult {
     let rendered = html2text::from_read(body.as_bytes(), 120);
 
-    let filtered = if let Some(q) = query {
-        if q.trim().is_empty() {
-            rendered
-        } else {
+    let filtered = match query {
+        Some(q) if !q.trim().is_empty() => {
             let ql = q.to_lowercase();
             rendered
                 .lines()
@@ -312,8 +308,7 @@ pub async fn fetch_webpage(url: &str, query: Option<&str>) -> Result<WebFetchRes
                 .collect::<Vec<_>>()
                 .join("\n")
         }
-    } else {
-        rendered
+        _ => rendered,
     };
 
     let title = body
@@ -322,11 +317,41 @@ pub async fn fetch_webpage(url: &str, query: Option<&str>) -> Result<WebFetchRes
         .and_then(|s| s.split("</title>").next())
         .map(|s| s.trim().to_string());
 
-    Ok(WebFetchResult {
+    WebFetchResult {
         url: url.to_string(),
         title,
         text: filtered,
-    })
+    }
+}
+
+/// Fetch a URL and render its HTML as plain text.
+///
+/// Outbound access is guarded against SSRF: the target must be `http`/`https`,
+/// requests to private/loopback/link-local/cloud-metadata addresses are blocked
+/// at connection time (including across redirects and DNS-rebinding), and the
+/// redirect chain is bounded. See [`egress_guard`].
+pub async fn fetch_webpage(url: &str, query: Option<&str>) -> Result<WebFetchResult> {
+    fetch_webpage_guarded(url, query, true).await
+}
+
+/// Implementation of [`fetch_webpage`] with the SSRF private-range block as a
+/// parameter. `block_private` is always `true` in production; tests set it
+/// `false` to reach a loopback mock server (the R-WEB.3.3 dev opt-out).
+async fn fetch_webpage_guarded(
+    url: &str,
+    query: Option<&str>,
+    block_private: bool,
+) -> Result<WebFetchResult> {
+    egress_guard::check_url(url, block_private)?;
+    let client = egress_guard::guarded_client(block_private)
+        .context("Failed to build guarded HTTP client")?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch URL: {url}"))?;
+    let body = resp.text().await.context("Failed to read response body")?;
+    Ok(render_webpage(url, &body, query))
 }
 
 #[cfg(test)]
@@ -490,8 +515,12 @@ mod tests {
             }
         });
 
+        // Permissive mode (block_private=false) so the loopback mock is reachable;
+        // this exercises the real guarded client + render path end to end.
         let url = format!("http://{}", addr);
-        let res = fetch_webpage(&url, Some("Paragraph")).await.unwrap();
+        let res = fetch_webpage_guarded(&url, Some("Paragraph"), false)
+            .await
+            .unwrap();
         assert_eq!(res.title, Some("Test Title".to_string()));
         assert!(res.text.contains("Paragraph text here"));
 
@@ -507,8 +536,41 @@ mod tests {
         });
 
         let url = format!("http://{}", addr);
-        let res = fetch_webpage(&url, None).await.unwrap();
+        let res = fetch_webpage_guarded(&url, None, false).await.unwrap();
         assert_eq!(res.title, Some("Test Title 2".to_string()));
         assert!(res.text.contains("Hello 2"));
+    }
+
+    #[tokio::test]
+    async fn fetch_webpage_blocks_ssrf_targets() {
+        // Cloud-metadata, loopback admin, and RFC-1918 hosts must be refused by
+        // the strict (production) path before any connection is attempted.
+        for u in [
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "http://127.0.0.1:8080/admin",
+            "http://192.168.0.1/",
+            "http://[::1]:9000/",
+        ] {
+            let res = fetch_webpage(u, None).await;
+            assert!(res.is_err(), "{u} must be blocked, got {res:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_webpage_rejects_non_http_scheme() {
+        assert!(fetch_webpage("file:///etc/passwd", None).await.is_err());
+    }
+
+    #[test]
+    fn render_webpage_extracts_title_and_filters() {
+        let body =
+            "<html><head><title>  Hi  </title></head><body><p>alpha</p><p>beta</p></body></html>";
+        let full = render_webpage("http://x/", body, None);
+        assert_eq!(full.title, Some("Hi".to_string()));
+        assert!(full.text.contains("alpha") && full.text.contains("beta"));
+
+        let filtered = render_webpage("http://x/", body, Some("beta"));
+        assert!(filtered.text.contains("beta"));
+        assert!(!filtered.text.contains("alpha"));
     }
 }
