@@ -385,3 +385,325 @@ fn grant_approved_accepts_only_explicit_approvals() {
         assert!(!grant_approved(no), "'{no}' must NOT approve");
     }
 }
+
+// ── sandbox_grant_schema ─────────────────────────────────────────────────────
+
+#[test]
+fn schema_declares_path_access_confirm_and_note() {
+    let schema = sandbox_grant_schema();
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("schema must have a properties object");
+    for key in ["path", "access", "confirm", "note"] {
+        assert!(properties.contains_key(key), "missing property {key}");
+    }
+
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .expect("schema must declare required fields");
+    assert_eq!(required, &vec![Value::String("path".to_string())]);
+
+    // `access` defaults to "ro" and is constrained to the two valid values.
+    let access_prop = properties.get("access").expect("access property");
+    assert_eq!(
+        access_prop.get("default").and_then(Value::as_str),
+        Some("ro")
+    );
+    let access_enum = access_prop
+        .get("enum")
+        .and_then(Value::as_array)
+        .expect("access enum");
+    assert_eq!(
+        access_enum,
+        &vec![
+            Value::String("ro".to_string()),
+            Value::String("rw".to_string())
+        ]
+    );
+
+    // `path` carries the `format: path` hint used by security validation.
+    assert_eq!(
+        properties
+            .get("path")
+            .and_then(|p| p.get("format"))
+            .and_then(Value::as_str),
+        Some("path")
+    );
+}
+
+// ── resolve_grant_path: canonicalize failure fallback ───────────────────────
+
+#[test]
+fn resolve_grant_path_falls_back_to_lexical_clean_for_missing_path() {
+    let base = tempdir().unwrap();
+    let missing = base.path().join("nope").join("..").join("also-missing");
+    // The path does not exist, so `dunce::canonicalize` fails and the code must
+    // fall back to the lexical `..`-collapsing `clean_path`.
+    let resolved = resolve_grant_path(&missing.to_string_lossy(), None, None);
+    assert!(
+        resolved.ends_with("also-missing"),
+        "expected the collapsed lexical path, got {resolved:?}"
+    );
+    assert!(
+        !resolved.to_string_lossy().contains(".."),
+        "`..` should have been collapsed: {resolved:?}"
+    );
+}
+
+// ── agent_requested_text (pure, both `raised` branches) ─────────────────────
+
+#[test]
+fn agent_requested_text_when_surface_raised() {
+    let text = agent_requested_text(
+        Path::new("/cache/x"),
+        ScopeAccess::Ro,
+        Path::new("/home/u/.ahma/settings.toml"),
+        true,
+    );
+    assert!(
+        text.contains("A human approval prompt has been raised"),
+        "{text}"
+    );
+    assert!(text.contains("cannot widen its own sandbox"), "{text}");
+    // Read-only access appends the `--read-only` CLI hint.
+    assert!(
+        text.contains("ahma sandbox grant /cache/x --read-only"),
+        "{text}"
+    );
+}
+
+#[test]
+fn agent_requested_text_when_no_surface_attached() {
+    let text = agent_requested_text(
+        Path::new("/cache/x"),
+        ScopeAccess::Rw,
+        Path::new("/home/u/.ahma/settings.toml"),
+        false,
+    );
+    assert!(
+        text.contains("No interactive approval surface is attached"),
+        "{text}"
+    );
+    // Read+write access must NOT append the `--read-only` flag.
+    assert!(!text.contains("--read-only"), "{text}");
+    assert!(text.contains("ahma sandbox grant /cache/x\n"), "{text}");
+}
+
+// ── declined_text (pure; unreachable via the handler without a mocked Peer) ─
+
+#[test]
+fn declined_text_reports_nothing_written() {
+    let text = declined_text(
+        Path::new("/cache/x"),
+        ScopeAccess::Ro,
+        Path::new("/home/u/.ahma/settings.toml"),
+    );
+    assert!(text.contains("Not granted"), "{text}");
+    assert!(text.contains("the human declined the prompt"), "{text}");
+    assert!(text.contains("/home/u/.ahma/settings.toml"), "{text}");
+    assert!(text.contains("confirm: true"), "{text}");
+}
+
+// ── grant_prompt_message (pure; unreachable via the handler without a mocked Peer) ─
+
+#[test]
+fn grant_prompt_message_states_path_access_and_answers() {
+    let msg = grant_prompt_message(
+        Path::new("/cache/x"),
+        ScopeAccess::Rw,
+        Path::new("/home/u/.ahma/settings.toml"),
+        "{ path = \"/cache/x\" }",
+        &GrantRisk::Normal,
+    );
+    assert!(
+        msg.contains("Grant read+write sandbox access to '/cache/x'?"),
+        "{msg}"
+    );
+    assert!(msg.contains("'approve'"), "{msg}");
+    assert!(msg.contains("'deny'"), "{msg}");
+    assert!(msg.contains("/home/u/.ahma/settings.toml"), "{msg}");
+}
+
+#[test]
+fn grant_prompt_message_surfaces_high_risk_banner() {
+    let msg = grant_prompt_message(
+        Path::new("/data"),
+        ScopeAccess::Ro,
+        Path::new("/home/u/.ahma/settings.toml"),
+        "line",
+        &GrantRisk::High(vec!["sits directly under the filesystem root".to_string()]),
+    );
+    assert!(msg.contains("Risk: HIGH"), "{msg}");
+    assert!(msg.contains("filesystem root"), "{msg}");
+}
+
+// ── handler: argument validation errors ──────────────────────────────────────
+
+#[tokio::test]
+async fn handler_errors_when_path_missing() {
+    let (service, _scope) = crate::test_utils::in_process::build_test_service()
+        .await
+        .unwrap();
+    let err = service
+        .handle_sandbox_grant(args(&[]), crate::client_type::McpClientType::Cursor)
+        .await
+        .expect_err("a missing `path` argument must error");
+    assert!(err.message.contains("requires a `path`"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn handler_errors_on_invalid_access_argument() {
+    let (service, _scope) = crate::test_utils::in_process::build_test_service()
+        .await
+        .unwrap();
+    let target = tempdir().unwrap();
+    let err = service
+        .handle_sandbox_grant(
+            args(&[
+                ("path", json!(target.path().to_string_lossy())),
+                ("access", json!("yolo")),
+            ]),
+            crate::client_type::McpClientType::Cursor,
+        )
+        .await
+        .expect_err("an invalid `access` value must error before anything is written");
+    assert!(err.message.contains("invalid access"), "{}", err.message);
+}
+
+// ── handler: High-risk path surfaced through the real classify+preview pipeline ─
+
+#[tokio::test]
+async fn handler_preview_surfaces_high_risk_for_nonexistent_path() {
+    let (service, _scope) = crate::test_utils::in_process::build_test_service()
+        .await
+        .unwrap();
+    let base = tempdir().unwrap();
+    let missing = base.path().join("does-not-exist-yet");
+    let result = service
+        .handle_sandbox_grant(
+            args(&[("path", json!(missing.to_string_lossy()))]),
+            crate::client_type::McpClientType::Cursor,
+        )
+        .await
+        .expect("preview must succeed even for a High-risk path");
+    let text = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<String>();
+    assert!(text.contains("PREVIEW ONLY"), "{text}");
+    assert!(text.contains("Risk: HIGH"), "{text}");
+    assert!(text.contains("does not exist"), "{text}");
+}
+
+// ── handler: external client, no peer attached — the "pre-existing trust     ─
+// ── model" direct-persist path (Gate: `None => true` at the elicit site).    ─
+
+#[tokio::test]
+async fn handler_persists_grant_for_external_client_with_no_peer_and_reports_update() {
+    // SAFETY: nextest runs each test in its own process, so mutating this
+    // process-global env var is isolated from other tests (see the identical
+    // pattern in `harness_tools_tests.rs`).
+    let home_dir = tempdir().unwrap();
+    let target = tempdir().unwrap();
+
+    let (service, _scope) = crate::test_utils::in_process::build_test_service()
+        .await
+        .unwrap();
+
+    unsafe { std::env::set_var("AHMA_TEST_HOME", home_dir.path()) };
+
+    let first = service
+        .handle_sandbox_grant(
+            args(&[
+                ("path", json!(target.path().to_string_lossy())),
+                ("access", json!("ro")),
+                ("confirm", json!(true)),
+                ("note", json!("test provenance")),
+            ]),
+            crate::client_type::McpClientType::Cursor,
+        )
+        .await;
+
+    // Granting the same path again with a different access level must update
+    // the existing entry rather than duplicate it (`GrantOutcome::Updated`).
+    let second = service
+        .handle_sandbox_grant(
+            args(&[
+                ("path", json!(target.path().to_string_lossy())),
+                ("access", json!("rw")),
+                ("confirm", json!(true)),
+            ]),
+            crate::client_type::McpClientType::Cursor,
+        )
+        .await;
+
+    let settings_contents =
+        std::fs::read_to_string(home_dir.path().join(".ahma").join("settings.toml"));
+
+    unsafe { std::env::remove_var("AHMA_TEST_HOME") };
+
+    let first_text = first
+        .expect("no peer attached -> pre-existing trust model persists directly")
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<String>();
+    assert!(first_text.contains("✓ Granted"), "{first_text}");
+    assert!(first_text.contains("next server start"), "{first_text}");
+
+    let second_text = second
+        .expect("re-granting the same path should update, not fail")
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<String>();
+    assert!(second_text.contains("Updated grant"), "{second_text}");
+    assert!(second_text.contains("read-only"), "{second_text}");
+    assert!(second_text.contains("read+write"), "{second_text}");
+
+    let settings_contents = settings_contents.expect("settings.toml must have been written");
+    assert!(
+        settings_contents.contains("test provenance") || settings_contents.contains("rw"),
+        "settings file should reflect the persisted grant: {settings_contents}"
+    );
+}
+
+// ── handler: persist_grant failure is reported through the handler's map_err ─
+
+#[tokio::test]
+async fn handler_reports_persist_failure_when_settings_file_unwritable() {
+    let home_dir = tempdir().unwrap();
+    let target = tempdir().unwrap();
+    // Make `~/.ahma/settings.toml` a directory instead of a file so reading it
+    // as a settings file fails, exercising `persist_grant`'s error path and the
+    // handler's `.map_err("failed to persist grant to ...")`.
+    std::fs::create_dir_all(home_dir.path().join(".ahma").join("settings.toml")).unwrap();
+
+    let (service, _scope) = crate::test_utils::in_process::build_test_service()
+        .await
+        .unwrap();
+
+    unsafe { std::env::set_var("AHMA_TEST_HOME", home_dir.path()) };
+    let result = service
+        .handle_sandbox_grant(
+            args(&[
+                ("path", json!(target.path().to_string_lossy())),
+                ("confirm", json!(true)),
+            ]),
+            crate::client_type::McpClientType::Cursor,
+        )
+        .await;
+    unsafe { std::env::remove_var("AHMA_TEST_HOME") };
+
+    let err = result.expect_err(
+        "writing to a directory in place of the settings file must surface a persist failure",
+    );
+    assert!(
+        err.message.contains("failed to persist grant to"),
+        "{}",
+        err.message
+    );
+}

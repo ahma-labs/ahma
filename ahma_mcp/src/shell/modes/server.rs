@@ -1861,4 +1861,166 @@ mod tests {
             ]
         );
     }
+
+    // ------------------------------------------------------------------
+    // network_enforcement_note
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_network_enforcement_note_matches_current_platform() {
+        let note = network_enforcement_note();
+        #[cfg(target_os = "macos")]
+        assert!(
+            note.contains("Kernel-enforced (Seatbelt)"),
+            "macOS note must mention Seatbelt enforcement: {note}"
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            note.contains("Kernel-enforced where supported (Landlock"),
+            "Linux note must mention Landlock enforcement: {note}"
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert!(
+            note.contains("Advisory"),
+            "other platforms must be disclosed as advisory-only: {note}"
+        );
+        // Regardless of platform, the note is a non-empty, static disclosure string.
+        assert!(!note.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // maybe_start_egress_proxy
+    // ------------------------------------------------------------------
+
+    fn test_net_approval() -> crate::egress::NetApprovalContext {
+        crate::egress::NetApprovalContext {
+            coordinator: Arc::new(ahma_common::net_approval::NetApprovalCoordinator::new()),
+            peer: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_maybe_start_egress_proxy_off_returns_none() {
+        let tmp = tempdir().unwrap();
+        let sb = make_test_sandbox(tmp.path());
+        let cfg = AppConfig {
+            restrict_network: false,
+            // Even with allow entries present, restrict_network=false must short-circuit
+            // before any proxy is started.
+            network_allow: vec!["example.com".to_string()],
+            ..base_cfg()
+        };
+
+        let proxy = maybe_start_egress_proxy(&cfg, &sb, test_net_approval()).await;
+        assert!(
+            proxy.is_none(),
+            "restrict_network=false must never start the egress proxy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_maybe_start_egress_proxy_on_empty_allow_starts_proxy() {
+        let tmp = tempdir().unwrap();
+        let sb = make_test_sandbox(tmp.path());
+        let cfg = AppConfig {
+            restrict_network: true,
+            network_allow: vec![],
+            ..base_cfg()
+        };
+
+        let proxy = maybe_start_egress_proxy(&cfg, &sb, test_net_approval()).await;
+        let proxy = proxy.expect("restrict_network=true must start the egress proxy");
+        assert!(
+            proxy.local_addr.port() != 0,
+            "proxy must bind to a real ephemeral port: {:?}",
+            proxy.local_addr
+        );
+        assert!(proxy.local_addr.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn test_maybe_start_egress_proxy_on_with_allowlist_starts_proxy() {
+        let tmp = tempdir().unwrap();
+        let sb = make_test_sandbox(tmp.path());
+        let cfg = AppConfig {
+            restrict_network: true,
+            network_allow: vec!["example.com".to_string(), "*.example.org".to_string()],
+            ..base_cfg()
+        };
+
+        let proxy = maybe_start_egress_proxy(&cfg, &sb, test_net_approval()).await;
+        let proxy =
+            proxy.expect("restrict_network=true with a non-empty allowlist must start the proxy");
+        assert!(proxy.local_addr.port() != 0);
+    }
+
+    // ------------------------------------------------------------------
+    // try_setup_mcp_client
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_setup_mcp_client_missing_file_is_ok() {
+        let tmp = tempdir().unwrap();
+        let cfg = AppConfig {
+            mcp_config: tmp.path().join("does_not_exist.json"),
+            ..base_cfg()
+        };
+        let result = try_setup_mcp_client(&cfg).await;
+        assert!(
+            result.is_ok(),
+            "a missing mcp.json must be silently ignored: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_setup_mcp_client_invalid_json_is_ok() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+        let cfg = AppConfig {
+            mcp_config: path,
+            ..base_cfg()
+        };
+        let result = try_setup_mcp_client(&cfg).await;
+        assert!(
+            result.is_ok(),
+            "a non-ahma / malformed mcp.json (e.g. Cursor/VSCode config) must not error: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_setup_mcp_client_valid_empty_servers_is_ok() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(&path, r#"{"servers": {}}"#).unwrap();
+        let cfg = AppConfig {
+            mcp_config: path,
+            ..base_cfg()
+        };
+        let result = try_setup_mcp_client(&cfg).await;
+        assert!(
+            result.is_ok(),
+            "a valid ahma mcp.json with no servers must be a no-op: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_setup_mcp_client_non_http_server_is_ok() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"servers": {"local": {"type": "child_process", "command": "echo", "args": []}}}"#,
+        )
+        .unwrap();
+        let cfg = AppConfig {
+            mcp_config: path,
+            ..base_cfg()
+        };
+        let result = try_setup_mcp_client(&cfg).await;
+        assert!(
+            result.is_ok(),
+            "a child_process server entry must be skipped (only Http is wired), not error: {result:?}"
+        );
+    }
 }

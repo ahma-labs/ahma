@@ -727,4 +727,263 @@ mod tests {
         assert_eq!(peers[0].id, "static-peer-1");
         assert_eq!(peers[0].addr, "http://10.0.0.10:9000");
     }
+
+    // ── Additional coverage: default_reachable / load_score / static-peers edge cases ──
+
+    #[test]
+    fn peer_info_missing_reachable_field_defaults_to_true() {
+        // Exercises `default_reachable()` (line 67-69) via serde's `#[serde(default = ...)]`.
+        let json = r#"{
+            "id": "no-reachable-field",
+            "addr": "http://127.0.0.1:4000",
+            "models": ["gemma"]
+        }"#;
+        let peer: PeerInfo = serde_json::from_str(json).unwrap();
+        assert!(
+            peer.reachable,
+            "peer.reachable must default to true when the field is absent from JSON"
+        );
+        assert_eq!(peer.active_ops, 0, "active_ops must default to 0");
+        assert!(peer.capabilities.is_none());
+    }
+
+    #[test]
+    fn peer_info_explicit_reachable_false_is_respected() {
+        let json = r#"{
+            "id": "unreachable-peer",
+            "addr": "http://127.0.0.1:4001",
+            "models": [],
+            "reachable": false
+        }"#;
+        let peer: PeerInfo = serde_json::from_str(json).unwrap();
+        assert!(!peer.reachable);
+    }
+
+    #[test]
+    fn generic_load_score_accounts_for_active_ops_and_vram() {
+        // Exercises `PeerInfo::load_score()` (lines 107-114), which has no direct
+        // caller elsewhere in this crate's test suite (only `load_score_for` is used above).
+        let mut peer = make_peer("x", "model");
+        assert_eq!(peer.load_score(), 0, "fresh peer with no caps scores 0");
+
+        let caps = PeerCapabilities {
+            model_available: vec!["model".into()],
+            model_loaded: vec![],
+            active_ops: 2,
+            max_concurrent: 4,
+            vram_free_mb: Some(512), // < 1024 MiB triggers the 50-point penalty
+        };
+        peer.apply_capabilities(caps);
+        // 2 active_ops * 10 + 50 vram penalty = 70. Model-loaded state is irrelevant here
+        // since `load_score` (unlike `load_score_for`) has no model-loaded term.
+        assert_eq!(peer.load_score(), 70);
+    }
+
+    #[test]
+    fn generic_load_score_no_vram_penalty_when_plenty_free() {
+        let mut peer = make_peer("x", "model");
+        let caps = PeerCapabilities {
+            active_ops: 1,
+            vram_free_mb: Some(8192),
+            ..PeerCapabilities::default()
+        };
+        peer.apply_capabilities(caps);
+        assert_eq!(peer.load_score(), 10, "only active_ops penalty applies");
+    }
+
+    #[test]
+    fn load_static_peers_missing_file_returns_zero() {
+        // Exercises the `!path.exists()` early return (line 249) when the directory
+        // structure exists but peers.json itself has never been written.
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".ahma").join("cluster")).unwrap();
+
+        let reg = WorkerRegistry::new(60);
+        let count = reg.load_static_peers_from(temp.path()).unwrap();
+        assert_eq!(count, 0);
+        assert!(reg.all_live().is_empty());
+    }
+
+    #[test]
+    fn load_static_peers_missing_ahma_dir_returns_zero() {
+        // No `.ahma` directory at all under the base path.
+        let temp = tempfile::tempdir().unwrap();
+        let reg = WorkerRegistry::new(60);
+        let count = reg.load_static_peers_from(temp.path()).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn load_static_peers_from_default_home_does_not_error() {
+        // Exercises `load_static_peers()` (lines 238-243), which resolves the real
+        // home directory via `dirs::home_dir()` rather than a test-controlled path.
+        // We only assert it doesn't error — the actual peer count depends on whether
+        // this machine happens to have `~/.ahma/cluster/peers.json`.
+        let reg = WorkerRegistry::new(60);
+        let result = reg.load_static_peers();
+        assert!(
+            result.is_ok(),
+            "load_static_peers() against the real home dir must not error: {result:?}"
+        );
+    }
+
+    #[test]
+    fn load_static_peers_malformed_json_is_an_error() {
+        // Exercises the `serde_json::from_str` failure branch (line 252).
+        let temp = tempfile::tempdir().unwrap();
+        let ahma_dir = temp.path().join(".ahma").join("cluster");
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+        std::fs::write(ahma_dir.join("peers.json"), "{ this is not valid json").unwrap();
+
+        let reg = WorkerRegistry::new(60);
+        let err = reg
+            .load_static_peers_from(temp.path())
+            .expect_err("malformed JSON must fail to parse");
+        // serde_json errors mention "expected" or a similar parse diagnostic.
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn load_static_peers_missing_required_field_is_an_error() {
+        // `models` has no `#[serde(default)]`, so a peer entry lacking it must fail
+        // deserialization rather than silently defaulting to an empty list.
+        let temp = tempfile::tempdir().unwrap();
+        let ahma_dir = temp.path().join(".ahma").join("cluster");
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+        let peers_json = r#"[
+            {
+                "id": "incomplete-peer",
+                "addr": "http://10.0.0.11:9000"
+            }
+        ]"#;
+        std::fs::write(ahma_dir.join("peers.json"), peers_json).unwrap();
+
+        let reg = WorkerRegistry::new(60);
+        let err = reg
+            .load_static_peers_from(temp.path())
+            .expect_err("peer missing required `models` field must fail to parse");
+        assert!(
+            err.to_string().contains("models"),
+            "error should mention the missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn load_static_peers_empty_array_returns_zero() {
+        let temp = tempfile::tempdir().unwrap();
+        let ahma_dir = temp.path().join(".ahma").join("cluster");
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+        std::fs::write(ahma_dir.join("peers.json"), "[]").unwrap();
+
+        let reg = WorkerRegistry::new(60);
+        let count = reg.load_static_peers_from(temp.path()).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn load_static_peers_duplicate_ids_last_write_wins() {
+        // Two entries share the same `id`; the registry is keyed by id so only the
+        // last one survives the upsert loop, even though `count` reports the raw
+        // list length parsed from JSON.
+        let temp = tempfile::tempdir().unwrap();
+        let ahma_dir = temp.path().join(".ahma").join("cluster");
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+        let peers_json = r#"[
+            {
+                "id": "dup-peer",
+                "addr": "http://10.0.0.20:9000",
+                "models": ["gemma"],
+                "active_ops": 0,
+                "reachable": true
+            },
+            {
+                "id": "dup-peer",
+                "addr": "http://10.0.0.21:9000",
+                "models": ["llama3.2"],
+                "active_ops": 5,
+                "reachable": true
+            }
+        ]"#;
+        std::fs::write(ahma_dir.join("peers.json"), peers_json).unwrap();
+
+        let reg = WorkerRegistry::new(60);
+        let count = reg.load_static_peers_from(temp.path()).unwrap();
+        assert_eq!(count, 2, "count reflects the raw JSON list length");
+
+        let live = reg.all_live();
+        assert_eq!(
+            live.len(),
+            1,
+            "duplicate peer ids collapse to a single registry entry"
+        );
+        assert_eq!(live[0].addr, "http://10.0.0.21:9000", "last entry wins");
+        assert_eq!(live[0].active_ops, 5);
+    }
+
+    #[test]
+    fn mdns_info_to_peer_empty_id_returns_none() {
+        // Exercises the `id.is_empty()` early-return (line 396) by forcing the TXT
+        // `id` property to an explicit empty string, which takes priority over the
+        // (non-empty) instance-name fallback.
+        let mut properties = HashMap::new();
+        properties.insert("id".to_owned(), String::new());
+
+        let info = ServiceInfo::new(
+            MDNS_SERVICE_TYPE,
+            "some-instance",
+            "mymac.local.",
+            "192.168.1.60",
+            8001,
+            Some(properties),
+        )
+        .expect("failed to create ServiceInfo");
+
+        assert!(
+            mdns_info_to_peer(&info).is_none(),
+            "an explicit empty `id` TXT property must yield no peer"
+        );
+    }
+
+    #[test]
+    fn mdns_info_to_peer_falls_back_to_hostname_when_no_addresses() {
+        // Exercises the address-fallback branch (line 378): when the ServiceInfo has
+        // no resolved IP addresses at all, `mdns_info_to_peer` falls back to the
+        // advertised hostname instead of an address.
+        let info = ServiceInfo::new(
+            MDNS_SERVICE_TYPE,
+            "no-addr-instance",
+            "hostfallback.local.",
+            "", // empty IP list — mdns_sd's `AsIpAddrs` for `&str` treats "" as no addresses
+            8002,
+            None::<HashMap<String, String>>,
+        )
+        .expect("failed to create ServiceInfo");
+        assert!(
+            info.get_addresses().is_empty(),
+            "precondition: ServiceInfo must have no resolved addresses"
+        );
+
+        let peer = mdns_info_to_peer(&info).expect("conversion should still succeed");
+        assert_eq!(peer.addr, "http://hostfallback.local:8002");
+        assert_eq!(peer.id, "no-addr-instance");
+    }
+
+    #[test]
+    fn mdns_info_to_peer_no_models_property_is_empty_vec() {
+        let info = ServiceInfo::new(
+            MDNS_SERVICE_TYPE,
+            "bare-instance",
+            "mymac.local.",
+            "192.168.1.70",
+            8003,
+            None::<HashMap<String, String>>,
+        )
+        .expect("failed to create ServiceInfo");
+
+        let peer = mdns_info_to_peer(&info).expect("conversion failed");
+        assert!(
+            peer.models.is_empty(),
+            "no `models` TXT property must yield an empty model list"
+        );
+    }
 }

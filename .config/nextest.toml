@@ -73,6 +73,23 @@ filter = "binary_id(ahma_http_bridge::bridge_stress_tests)"
 threads-required = 4
 slow-timeout = { period = "240s", terminate-after = 2 }
 
+# config_watcher's fs-watching tests each register a real OS-level file-system
+# watcher (notify::recommended_watcher — FSEvents on macOS, inotify on Linux).
+# Unlike most lib unit tests these hold a genuine, contended OS resource: when
+# more than one runs at a time (or many concurrent test PROCESSES generally,
+# since nextest runs each test in its own process) registration itself can
+# stall well past the test's own internal timeout — nextest then hard-kills
+# the test at slow-timeout, not the test's own assertion failing. Observed
+# hanging up to 120s+ under a large multi-crate `nextest run` even though every
+# one of these tests passes in well under 1s in isolation, and a threads-required
+# of 4 (allowing 2 concurrent on a 10-core machine) was not enough — two still
+# hung together. threads-required is intentionally set far above any real
+# core count so nextest can never schedule more than one of these at once,
+# fully serializing them relative to each other regardless of machine size.
+[[profile.default.overrides]]
+filter = "test(~config_watcher::tests::start_config_watcher)"
+threads-required = 1000
+
 # Many ahma_mcp integration test binaries spawn ahma subprocess.
 # Throttle all integration tests (binary_id "ahma_mcp::*") to prevent
 # scheduler starvation when running concurrently with bridge tests.
@@ -137,6 +154,16 @@ filter = "binary_id(~ahma_mcp::)"
 threads-required = 2
 retries = 2
 
+# Same FSEvents/inotify contention as the default profile (see there), fully
+# serialized on the 2-CPU CI runner (threads-required = 2 with test-threads =
+# 2 => 1 at a time). retries: a genuine OS-level registration stall is a
+# transient scheduler condition, not a logic bug — see the other CI retries
+# above for the same rationale.
+[[profile.ci.overrides]]
+filter = "test(~config_watcher::tests::start_config_watcher)"
+threads-required = 2
+retries = 2
+
 # ---------------------------------------------------------------------------
 # Coverage profile (cargo llvm-cov) — instrumentation slows tests significantly
 # ---------------------------------------------------------------------------
@@ -168,6 +195,12 @@ slow-timeout = { period = "600s", terminate-after = 2 }
 # Same throttle as CI — prevents concurrent subprocess starvation.
 [[profile.coverage.overrides]]
 filter = "binary_id(~ahma_mcp::)"
+threads-required = 2
+
+# Same FSEvents/inotify contention as the default/ci profiles — llvm-cov's
+# instrumentation overhead makes registration stalls worse, not better.
+[[profile.coverage.overrides]]
+filter = "test(~config_watcher::tests::start_config_watcher)"
 threads-required = 2
 
 # ---------------------------------------------------------------------------

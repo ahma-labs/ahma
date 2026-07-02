@@ -321,6 +321,7 @@ pub fn enforce_landlock_sandbox(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
     use tempfile::tempdir;
 
     /// The ruleset must build cleanly when a proxy port is supplied — the TCP
@@ -336,5 +337,154 @@ mod tests {
         // None: the unrestricted path must keep working too.
         landlock_ruleset_fd(&scopes, &[], true, false, None)
             .expect("unrestricted ruleset must build");
+    }
+
+    /// The `scopes` loop in `build_landlock_ruleset` must handle both the
+    /// empty case (nothing granted beyond system/home rules) and multiple
+    /// scopes (each gets its own `PathBeneath` rule) without erroring.
+    #[test]
+    fn ruleset_fd_builds_with_multiple_and_empty_scopes() {
+        // Empty scopes: the `for scope in scopes` loop body never runs, but
+        // construction must still succeed (system/home rules are unaffected).
+        landlock_ruleset_fd(&[], &[], true, false, None)
+            .expect("empty scopes must still build a valid ruleset");
+
+        // Multiple scopes: exercise more than one loop iteration.
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let scopes = vec![dir_a.path().to_path_buf(), dir_b.path().to_path_buf()];
+        landlock_ruleset_fd(&scopes, &[], true, false, None)
+            .expect("multiple scopes must build a valid ruleset");
+    }
+
+    /// Explicit `read_scopes` (used by `--livelog`) must get a read-only
+    /// `PathBeneath` rule when the path exists, and must be silently skipped
+    /// (not error the whole build) when `PathFd::new` fails for a missing path.
+    #[test]
+    fn ruleset_fd_grants_explicit_read_scope_and_skips_missing_ones() {
+        let dir = tempdir().unwrap();
+        let scopes = vec![dir.path().to_path_buf()];
+
+        let readable_dir = tempdir().unwrap();
+        let missing_path = readable_dir.path().join("does-not-exist-xyz");
+
+        // One real read-only target plus one path that doesn't exist:
+        // `PathFd::new` fails for the missing one and it must be skipped
+        // rather than erroring the whole ruleset build.
+        let read_scopes = vec![readable_dir.path().to_path_buf(), missing_path];
+
+        landlock_ruleset_fd(&scopes, &read_scopes, true, false, None)
+            .expect("ruleset with a valid + missing read scope must still build");
+    }
+
+    /// When `no_temp_files` is false, `add_landlock_temp_rules` must run and
+    /// grant `/tmp` access (it always exists on Linux) without erroring. The
+    /// existing test above only ever passes `no_temp_files: true`, so this
+    /// exercises the opposite branch of `build_landlock_ruleset`'s
+    /// `if !no_temp_files { ... }` guard.
+    #[test]
+    fn ruleset_fd_grants_temp_access_when_not_disabled() {
+        let dir = tempdir().unwrap();
+        let scopes = vec![dir.path().to_path_buf()];
+
+        landlock_ruleset_fd(&scopes, &[], false, false, None)
+            .expect("ruleset with temp files enabled must build");
+    }
+
+    /// Serialize tests in this module that mutate process-wide `HOME` /
+    /// `CARGO_HOME` env vars, mirroring the pattern in
+    /// `sandbox::pkg_cache::tests` (see that module for rationale).
+    static LANDLOCK_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Sets an env var for the duration of a test and restores the previous
+    /// value (or removes it) on drop, regardless of pass/fail/panic.
+    struct EnvVarRestore {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarRestore {
+        /// SAFETY: caller must hold `LANDLOCK_ENV_MUTEX` for the lifetime of
+        /// the returned guard.
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: test-only; serialized by `LANDLOCK_ENV_MUTEX`.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            // SAFETY: test-only; serialized by `LANDLOCK_ENV_MUTEX`.
+            unsafe {
+                match &self.original {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// `add_landlock_package_cache_write_rules` must pre-create the cargo
+    /// cache dirs/files (so `PathFd::new` can succeed) and grant write rules
+    /// for each, when `package_cache_write` is enabled and `CARGO_HOME`
+    /// points at an existing directory.
+    #[test]
+    fn ruleset_fd_grants_package_cache_write_rules_when_cache_exists() {
+        let _guard = LANDLOCK_ENV_MUTEX.lock().unwrap();
+        let cargo_home_dir = tempdir().unwrap();
+        let _restore = EnvVarRestore::set("CARGO_HOME", cargo_home_dir.path());
+
+        let dir = tempdir().unwrap();
+        let scopes = vec![dir.path().to_path_buf()];
+
+        landlock_ruleset_fd(&scopes, &[], true, true, None)
+            .expect("ruleset with package_cache_write=true must build");
+
+        // `pre_create_package_cache_paths` must have created the writable
+        // dirs/files so the Landlock `PathFd::new()` calls could succeed.
+        assert!(cargo_home_dir.path().join("registry").is_dir());
+        assert!(cargo_home_dir.path().join("git").is_dir());
+        assert!(cargo_home_dir.path().join(".package-cache").is_file());
+        assert!(
+            cargo_home_dir
+                .path()
+                .join(".package-cache-mutate")
+                .is_file()
+        );
+    }
+
+    /// `add_landlock_home_tool_rules` must grant read+execute access to
+    /// toolchain dirs (e.g. `~/.cargo`) that actually exist under `HOME`.
+    #[test]
+    fn ruleset_fd_grants_home_tool_rules_when_home_has_toolchain_dirs() {
+        let _guard = LANDLOCK_ENV_MUTEX.lock().unwrap();
+        let home_dir = tempdir().unwrap();
+        std::fs::create_dir_all(home_dir.path().join(".cargo")).unwrap();
+        std::fs::create_dir_all(home_dir.path().join(".rustup")).unwrap();
+        let _restore = EnvVarRestore::set("HOME", home_dir.path());
+
+        let dir = tempdir().unwrap();
+        let scopes = vec![dir.path().to_path_buf()];
+
+        landlock_ruleset_fd(&scopes, &[], true, false, None)
+            .expect("ruleset must build when HOME has toolchain dirs present");
+    }
+
+    /// Passing an invalid ruleset fd must fail, not silently succeed.
+    /// `prctl(PR_SET_NO_NEW_PRIVS)` succeeds unconditionally (it only blocks
+    /// future privilege escalation, it does not restrict filesystem access),
+    /// but the `landlock_restrict_self` syscall must reject a bogus fd, so no
+    /// enforcement is actually applied to this test's thread — this exercises
+    /// the error path without depending on Landlock being available/working
+    /// on the machine running the test.
+    #[test]
+    fn apply_landlock_ruleset_in_child_fails_with_invalid_fd() {
+        let result = apply_landlock_ruleset_in_child(-1);
+        assert!(
+            result.is_err(),
+            "applying an invalid ruleset fd must return an error, not succeed silently"
+        );
     }
 }

@@ -167,35 +167,52 @@ impl AhmaMcpService {
         tokio::spawn(async move {
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-            let mut watcher =
-                match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-                    if let Ok(event) = res {
-                        // Only react to relevant events on JSON files or directory changes
-                        let relevant = event
-                            .paths
-                            .iter()
-                            .any(|p| p.extension().is_some_and(|ext| ext == "json") || p.is_dir());
+            // `notify::recommended_watcher` and `Watcher::watch` are
+            // synchronous, OS-level calls — FSEvents registration on macOS
+            // can block for a noticeable while under system load (observed
+            // in CI: enough to starve a current-thread tokio runtime's own
+            // task scheduling for minutes). Run them on the blocking-thread
+            // pool so a slow registration never stalls this tokio worker,
+            // which the debounce loop below (and callers polling this
+            // service's state) depend on making progress.
+            let watch_dir = tools_dir.clone();
+            let watcher_result = tokio::task::spawn_blocking(move || {
+                let mut watcher =
+                    notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+                        if let Ok(event) = res {
+                            // Only react to relevant events on JSON files or directory changes
+                            let relevant = event.paths.iter().any(|p| {
+                                p.extension().is_some_and(|ext| ext == "json") || p.is_dir()
+                            });
 
-                        if relevant
-                            && (event.kind.is_modify()
-                                || event.kind.is_create()
-                                || event.kind.is_remove())
-                        {
-                            let _ = tx.blocking_send(());
+                            if relevant
+                                && (event.kind.is_modify()
+                                    || event.kind.is_create()
+                                    || event.kind.is_remove())
+                            {
+                                let _ = tx.blocking_send(());
+                            }
                         }
-                    }
-                }) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::error!("Failed to create config watcher: {}", e);
-                        return;
-                    }
-                };
+                    })?;
+                watcher.watch(&watch_dir, RecursiveMode::Recursive)?;
+                Ok::<_, notify::Error>(watcher)
+            })
+            .await;
 
-            if let Err(e) = watcher.watch(&tools_dir, RecursiveMode::Recursive) {
-                tracing::error!("Failed to watch tools directory: {}", e);
-                return;
-            }
+            // Never read again — held only so the OS-level watch stays
+            // registered for the lifetime of this task (dropping it stops
+            // watching).
+            let _watcher = match watcher_result {
+                Ok(Ok(w)) => w,
+                Ok(Err(e)) => {
+                    tracing::error!("Failed to create/watch config watcher: {}", e);
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!("Config watcher setup task panicked: {}", e);
+                    return;
+                }
+            };
 
             tracing::info!("Started watching tools directory: {:?}", tools_dir);
 

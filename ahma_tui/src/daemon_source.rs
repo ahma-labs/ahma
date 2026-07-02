@@ -1116,6 +1116,40 @@ mod tests {
         }
     }
 
+    fn sample_web_approval() -> ahma_common::web_approval::WebApprovalRequest {
+        ahma_common::web_approval::WebApprovalRequest {
+            decision_id: "w1".to_string(),
+            domain: "api.github.com".to_string(),
+            url: "https://api.github.com/repos".to_string(),
+            tool: Some("fetch_webpage".to_string()),
+        }
+    }
+
+    /// Point `AHMA_DAEMON_SOCK` (Unix) / `AHMA_DAEMON_PORT` (Windows) at a
+    /// throwaway location so this test's embedded hub cannot collide with a
+    /// real daemon or with another test's hub. Mirrors the isolation done by
+    /// `ahma_common::daemon_hub::init_test_daemon_isolation` (a `#[cfg(test)]`
+    /// item private to that crate and thus unavailable here).
+    ///
+    /// The returned `TempDir` must be kept alive for the duration of the test.
+    fn isolate_daemon_socket_for_test() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir for isolated daemon socket");
+        let sock_path = dir.path().join("daemon_test.sock");
+        // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+        unsafe {
+            std::env::set_var("AHMA_DAEMON_SOCK", &sock_path);
+        }
+        if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0")
+            && let Ok(addr) = listener.local_addr()
+        {
+            // SAFETY: debug-only test seam; nextest isolates each test in its own process.
+            unsafe {
+                std::env::set_var("AHMA_DAEMON_PORT", addr.port().to_string());
+            }
+        }
+        dir
+    }
+
     #[test]
     fn all_instances_returns_clones_of_registered() {
         let mut s = DaemonState::new();
@@ -1568,5 +1602,498 @@ mod tests {
             exited,
             "task must exit (drop its receiver) once the TUI channel is closed"
         );
+    }
+
+    // ── apply_msg: remaining variants (ChatThinking, WebApproval*) ─────────────
+
+    #[test]
+    fn apply_msg_chat_thinking_carries_token() {
+        let mut s = DaemonState::new();
+        match apply_msg(
+            &mut s,
+            DaemonMsg::ChatThinking {
+                token: "pondering".to_string(),
+            },
+        ) {
+            Applied::ChatThinking(t) => assert_eq!(t, "pondering"),
+            _ => panic!("ChatThinking must map to Applied::ChatThinking"),
+        }
+    }
+
+    #[test]
+    fn apply_msg_web_approval_requested_carries_request() {
+        let mut s = DaemonState::new();
+        match apply_msg(
+            &mut s,
+            DaemonMsg::WebApprovalRequested {
+                request: sample_web_approval(),
+            },
+        ) {
+            Applied::WebApprovalRequested { request } => {
+                assert_eq!(request.decision_id, "w1");
+                assert_eq!(request.domain, "api.github.com");
+                assert_eq!(request.tool, Some("fetch_webpage".to_string()));
+            }
+            _ => panic!("must map to Applied::WebApprovalRequested"),
+        }
+    }
+
+    #[test]
+    fn apply_msg_web_approval_dismiss_carries_decision_id() {
+        let mut s = DaemonState::new();
+        match apply_msg(
+            &mut s,
+            DaemonMsg::WebApprovalDismiss {
+                decision_id: "w9".to_string(),
+            },
+        ) {
+            Applied::WebApprovalDismiss { decision_id } => assert_eq!(decision_id, "w9"),
+            _ => panic!("must map to Applied::WebApprovalDismiss"),
+        }
+    }
+
+    #[test]
+    fn apply_msg_submit_web_approval_is_noop() {
+        let mut s = DaemonState::new();
+        let a = apply_msg(
+            &mut s,
+            DaemonMsg::SubmitWebApproval {
+                decision_id: "w1".to_string(),
+                decision: ahma_common::web_approval::WebApprovalDecision::Deny,
+            },
+        );
+        assert!(matches!(a, Applied::None));
+    }
+
+    // ── embedded hub: variants not covered by `embedded_hub_source_maps_every_event` ──
+
+    #[tokio::test]
+    async fn embedded_hub_source_maps_remaining_events() {
+        let (tx_b, rx_b) = broadcast::channel::<DaemonMsg>(64);
+        let (tx_s, mut rx_s) = mpsc::channel::<SourceEvent>(64);
+        spawn_embedded_hub_source(rx_b, tx_s);
+
+        match next_ev(&mut rx_s).await {
+            SourceEvent::DaemonHealthChanged { healthy } => assert!(healthy),
+            other => panic!("expected DaemonHealthChanged, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::ChatThinking {
+            token: "pondering".to_string(),
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::ChatThinking { token } => assert_eq!(token, "pondering"),
+            other => panic!("expected ChatThinking, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::WebApprovalRequested {
+            request: sample_web_approval(),
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::WebApprovalRequested { request } => {
+                assert_eq!(request.decision_id, "w1");
+            }
+            other => panic!("expected WebApprovalRequested, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::WebApprovalDismiss {
+            decision_id: "w1".to_string(),
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::WebApprovalDismiss { decision_id } => assert_eq!(decision_id, "w1"),
+            other => panic!("expected WebApprovalDismiss, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::ToolCallStarted {
+            id: "t1".to_string(),
+            name: "read_file".to_string(),
+            args: "{}".to_string(),
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::ToolCallStarted { id, name, .. } => {
+                assert_eq!(id, "t1");
+                assert_eq!(name, "read_file");
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::ToolCallFinished {
+            id: "t1".to_string(),
+            result: "ok".to_string(),
+            failed: true,
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::ToolCallFinished { id, failed, .. } => {
+                assert_eq!(id, "t1");
+                assert!(failed);
+            }
+            other => panic!("expected ToolCallFinished, got {other:?}"),
+        }
+
+        tx_b.send(DaemonMsg::Usage {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+        })
+        .unwrap();
+        match next_ev(&mut rx_s).await {
+            SourceEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            } => {
+                assert_eq!((prompt_tokens, completion_tokens, total_tokens), (1, 2, 3));
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    // ── daemon_source_task: full round trip over a real (isolated) socket ──────
+    //
+    // Exercises the actual connect → Subscribe → recv loop in
+    // `daemon_source_task`, not just `apply_msg`/`Applied` in isolation. This
+    // covers the socket-framed match arms (lines that forward each `Applied`
+    // variant into a `SourceEvent` send) that the pure in-process
+    // `embedded_hub_source_*` tests above cannot reach, because that source
+    // takes a different code path (`spawn_embedded_hub_source`, no socket).
+    //
+    // A second raw connection plays the role of a registered ahma instance,
+    // driving the hub exactly the way a real `ahma` process would.
+    #[tokio::test]
+    async fn daemon_source_task_full_round_trip_over_socket() {
+        let _isolation_guard = isolate_daemon_socket_for_test();
+
+        let hub = ahma_common::daemon_hub::try_start_hub_server_at(
+            ahma_common::daemon_hub::default_socket_path(),
+        )
+        .await
+        .expect("binding the isolated test socket should not error")
+        .expect("this test owns a freshly isolated socket, so bind must succeed");
+
+        let (tx, mut rx) = mpsc::channel::<SourceEvent>(64);
+        let task = tokio::spawn(daemon_source_task(tx));
+
+        // Connect succeeds → health true, then the initial (empty) snapshot.
+        match next_ev(&mut rx).await {
+            SourceEvent::DaemonHealthChanged { healthy } => assert!(healthy),
+            other => panic!("expected DaemonHealthChanged, got {other:?}"),
+        }
+        match next_ev(&mut rx).await {
+            SourceEvent::InstancesUpdated { instances } => assert!(instances.is_empty()),
+            other => panic!("expected InstancesUpdated, got {other:?}"),
+        }
+        match next_ev(&mut rx).await {
+            SourceEvent::OperationsUpdated { ops } => assert!(ops.is_empty()),
+            other => panic!("expected OperationsUpdated, got {other:?}"),
+        }
+
+        // Give the server a beat to finish `hub.broadcast.subscribe()` (it runs
+        // immediately after writing the InstanceList snapshot, with no other
+        // await point in between) before a second connection starts broadcasting
+        // — otherwise events raised in the gap would be silently dropped.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A second raw connection plays the role of a registered ahma instance.
+        let inst_stream = ahma_common::daemon_hub::connect_to_daemon()
+            .await
+            .expect("instance connect");
+        let (_inst_r, mut inst_w) = tokio::io::split(inst_stream);
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::Register {
+                pid: 42,
+                mode: "stdio".to_string(),
+                scope: "/test".to_string(),
+                label: "IntegrationInstance".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        match next_ev(&mut rx).await {
+            SourceEvent::InstancesUpdated { instances } => assert_eq!(instances.len(), 1),
+            other => panic!("expected InstancesUpdated, got {other:?}"),
+        }
+        match next_ev(&mut rx).await {
+            SourceEvent::OperationsUpdated { ops } => assert!(ops.is_empty()),
+            other => panic!("expected OperationsUpdated, got {other:?}"),
+        }
+
+        // OpStarted → ListChanged → OperationsUpdated with one running op.
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::Event {
+                payload: DaemonEvent::OpStarted {
+                    id: "op-1".to_string(),
+                    tool_name: "cargo_build".to_string(),
+                    description: "Build".to_string(),
+                    scope: "/test/scope".to_string(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::OperationsUpdated { ops } => {
+                assert_eq!(ops.len(), 1);
+                assert_eq!(ops[0].status, OpStatus::Running);
+                assert_eq!(ops[0].id, "op-1");
+            }
+            other => panic!("expected OperationsUpdated, got {other:?}"),
+        }
+
+        // OpOutput → forwarded incrementally as OperationOutput.
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::Event {
+                payload: DaemonEvent::OpOutput {
+                    id: "op-1".to_string(),
+                    line: "compiling".to_string(),
+                    is_stderr: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::OperationOutput {
+                op_id,
+                line,
+                is_stderr,
+                ..
+            } => {
+                assert_eq!(op_id, "op-1");
+                assert_eq!(line, "compiling");
+                assert!(!is_stderr);
+            }
+            other => panic!("expected OperationOutput, got {other:?}"),
+        }
+
+        // OpFinished → ListChanged → OperationsUpdated with the terminal status.
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::Event {
+                payload: DaemonEvent::OpFinished {
+                    id: "op-1".to_string(),
+                    status: "Completed".to_string(),
+                    result_summary: Some("ok".to_string()),
+                    duration_ms: 42,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::OperationsUpdated { ops } => {
+                assert_eq!(ops[0].status, OpStatus::Succeeded);
+                assert_eq!(ops[0].result_summary, Some("ok".to_string()));
+            }
+            other => panic!("expected OperationsUpdated, got {other:?}"),
+        }
+
+        // A LogLine event is a documented no-op (not yet surfaced in the TUI) —
+        // sending one here proves it does NOT produce a spurious SourceEvent by
+        // checking the *next* observable event still lines up with what follows.
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::Event {
+                payload: DaemonEvent::LogLine {
+                    level: "info".to_string(),
+                    message: "hello".to_string(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::ChatToken {
+                token: "hi".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::ChatToken { token } => assert_eq!(token, "hi"),
+            other => panic!("LogLine must be a no-op; expected ChatToken, got {other:?}"),
+        }
+
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::ChatThinking {
+                token: "pondering".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::ChatThinking { token } => assert_eq!(token, "pondering"),
+            other => panic!("expected ChatThinking, got {other:?}"),
+        }
+
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::ApprovalRequested {
+                id: "a1".to_string(),
+                tool: "shell".to_string(),
+                args: "ls".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::ApprovalRequested { id, tool, args } => {
+                assert_eq!(id, "a1");
+                assert_eq!(tool, "shell");
+                assert_eq!(args, "ls");
+            }
+            other => panic!("expected ApprovalRequested, got {other:?}"),
+        }
+
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::ScopeGrantRequested {
+                request: sample_scope_grant(),
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::ScopeGrantRequested { request } => {
+                assert_eq!(request.decision_id, "d1");
+            }
+            other => panic!("expected ScopeGrantRequested, got {other:?}"),
+        }
+
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::ScopeGrantResolved {
+                decision_id: "d1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::ScopeGrantDismiss { decision_id } => assert_eq!(decision_id, "d1"),
+            other => panic!("expected ScopeGrantDismiss, got {other:?}"),
+        }
+
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::WebApprovalRequested {
+                request: sample_web_approval(),
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::WebApprovalRequested { request } => {
+                assert_eq!(request.decision_id, "w1");
+            }
+            other => panic!("expected WebApprovalRequested, got {other:?}"),
+        }
+
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::WebApprovalResolved {
+                decision_id: "w1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::WebApprovalDismiss { decision_id } => assert_eq!(decision_id, "w1"),
+            other => panic!("expected WebApprovalDismiss, got {other:?}"),
+        }
+
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::ToolCallStarted {
+                id: "t1".to_string(),
+                name: "read_file".to_string(),
+                args: "{}".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::ToolCallStarted { id, name, .. } => {
+                assert_eq!(id, "t1");
+                assert_eq!(name, "read_file");
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::ToolCallFinished {
+                id: "t1".to_string(),
+                result: "ok".to_string(),
+                failed: false,
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::ToolCallFinished { id, failed, .. } => {
+                assert_eq!(id, "t1");
+                assert!(!failed);
+            }
+            other => panic!("expected ToolCallFinished, got {other:?}"),
+        }
+
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            } => {
+                assert_eq!(
+                    (prompt_tokens, completion_tokens, total_tokens),
+                    (10, 5, 15)
+                );
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+
+        send_msg(&mut inst_w, &ClientMsg::AgentDone).await.unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::AgentDone => {}
+            other => panic!("expected AgentDone, got {other:?}"),
+        }
+
+        send_msg(
+            &mut inst_w,
+            &ClientMsg::AgentError {
+                error: "boom".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        match next_ev(&mut rx).await {
+            SourceEvent::AgentError { error } => assert_eq!(error, "boom"),
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+
+        // Clean up: stop the subscriber task, then tear down the hub (removes
+        // the socket file via `EmbeddedHub::drop`).
+        task.abort();
+        drop(hub);
     }
 }

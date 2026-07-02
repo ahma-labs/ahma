@@ -80,6 +80,7 @@ libc.workspace = true
 ahma_test_support = { path = "../ahma_test_support" }
 futures.workspace = true
 tempfile.workspace = true
+tokio = { version = "1.52", features = ["test-util"] }
 wiremock = "0.6"
 
 [features]
