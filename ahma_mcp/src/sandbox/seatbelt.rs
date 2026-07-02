@@ -117,12 +117,27 @@ impl Sandbox {
     /// Emitted right after the global `(allow file-read*)` so they override it,
     /// but before the workspace-scope allows so an explicit scope grant still
     /// wins (SBPL is last-match-wins).
+    ///
+    /// Each path is canonicalized before being written into the profile —
+    /// unlike `self.scopes` (canonicalized once in `Sandbox::new` via
+    /// `scopes::canonicalize_scopes`), this deny set is a free-standing global
+    /// installed independently of sandbox construction, so nothing else
+    /// resolves symlinks in it first. On macOS `/tmp` and `/var` are symlinks
+    /// to `/private/tmp` and `/private/var`; Seatbelt's kernel-side subpath
+    /// matcher resolves against the canonical vnode, so a `(deny … (subpath
+    /// "/var/folders/…"))` rule silently fails to match a read of
+    /// `/private/var/folders/…` — the deny is emitted but never fires. This
+    /// bit `test_credential_read_deny_is_kernel_enforced`, whose test fixture
+    /// lived under the symlinked temp dir. Falls back to the raw path if
+    /// canonicalization fails (e.g. the directory doesn't exist yet) rather
+    /// than dropping the rule.
     fn get_macos_credential_deny_rules(&self) -> String {
         let mut rules = String::new();
         for deny in super::credential_reads::credential_read_denies() {
+            let canonical = dunce::canonicalize(&deny).unwrap_or(deny);
             rules.push_str(&format!(
                 "(deny file-read* (subpath \"{}\"))\n",
-                deny.display()
+                canonical.display()
             ));
         }
         rules
@@ -251,5 +266,75 @@ mod tests {
         let p = sb.generate_seatbelt_profile_test(dir.path());
         assert!(p.contains("(allow network*)"));
         assert!(!p.contains("(deny network-outbound"));
+    }
+
+    /// Regression test for the bug behind `test_credential_read_deny_is_kernel_enforced`
+    /// flaking on CI: `/tmp` is a symlink to `/private/tmp` on macOS, and Seatbelt's
+    /// kernel-side subpath matcher resolves against the canonical vnode — a
+    /// `(deny … (subpath "/tmp/…"))` rule silently never matches a read of
+    /// `/private/tmp/…`, so the deny is emitted but never fires. The emitted rule
+    /// must use the canonicalized path.
+    #[test]
+    fn credential_deny_rule_uses_canonical_path_not_symlink() {
+        use super::super::credential_reads::set_credential_read_denies;
+
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let symlinked_deny = std::path::PathBuf::from("/tmp");
+        set_credential_read_denies(vec![symlinked_deny.clone()]);
+        let profile = sb.generate_seatbelt_profile_test(dir.path());
+        set_credential_read_denies(Vec::new());
+
+        let canonical = dunce::canonicalize(&symlinked_deny).expect("/tmp must resolve on macOS");
+        assert!(
+            profile.contains(&format!(
+                "(deny file-read* (subpath \"{}\"))",
+                canonical.display()
+            )),
+            "deny rule must use the canonicalized path, got:\n{profile}"
+        );
+        assert!(
+            !profile.contains("(deny file-read* (subpath \"/tmp\"))"),
+            "deny rule must not use the raw symlinked path, got:\n{profile}"
+        );
+    }
+
+    /// A deny path that doesn't exist (so it can't be canonicalized) must still be
+    /// emitted, falling back to the raw path rather than being silently dropped —
+    /// dropping it would be a fail-open regression of the credential deny list.
+    #[test]
+    fn credential_deny_rule_falls_back_to_raw_path_when_uncanonicalizable() {
+        use super::super::credential_reads::set_credential_read_denies;
+
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let missing = std::path::PathBuf::from("/no/such/path/ever-XYZ123");
+        set_credential_read_denies(vec![missing.clone()]);
+        let profile = sb.generate_seatbelt_profile_test(dir.path());
+        set_credential_read_denies(Vec::new());
+
+        assert!(
+            profile.contains(&format!(
+                "(deny file-read* (subpath \"{}\"))",
+                missing.display()
+            )),
+            "an uncanonicalizable deny path must still be emitted (raw), got:\n{profile}"
+        );
     }
 }
