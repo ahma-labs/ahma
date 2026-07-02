@@ -2349,6 +2349,11 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     // Load user settings (priority layer 2: below CLI flags, above env vars)
     let s = load_settings(cli);
 
+    // Install the tool-subprocess secret-env passthrough allowlist from
+    // `[sandbox] env_allow`. Everything not on this list that looks like a
+    // secret is scrubbed from tool environments (see `sandbox::base_command`).
+    sandbox::set_secret_env_allow(s.sandbox.env_allow.clone());
+
     // ── Tool loading ────────────────────────────────────────────────────────
     // R-CFG1.2: AHMA_TOOLS_DIR is RETIRED — warn and ignore.
     warn_retired_env!("AHMA_TOOLS_DIR");

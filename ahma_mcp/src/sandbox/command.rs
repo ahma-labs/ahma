@@ -1,8 +1,92 @@
 use anyhow::Result;
 use std::path::Path;
+use std::sync::RwLock;
 
 use super::core::Sandbox;
 use super::types::SandboxMode;
+
+/// Operator-configured passthrough allowlist (`[sandbox] env_allow`): variable
+/// names preserved in tool subprocess environments despite matching a secret
+/// pattern. Set once at startup from the loaded settings; empty by default so
+/// the safe posture (scrub everything secret-looking) holds even when nothing
+/// is configured. Process-global because it is a single operator policy, not
+/// per-session state.
+static SECRET_ENV_ALLOW: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Install the passthrough allowlist from `[sandbox] env_allow`. Called once at
+/// startup. Names are stored as-is; matching is case-insensitive.
+pub fn set_secret_env_allow(allow: Vec<String>) {
+    if let Ok(mut guard) = SECRET_ENV_ALLOW.write() {
+        *guard = allow;
+    }
+}
+
+/// Return `true` if `name` looks like it holds a secret and should be scrubbed
+/// from tool subprocess environments.
+///
+/// Uses unambiguous substring markers plus a `_`-delimited `TOKEN` segment
+/// check, so genuine credentials (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`,
+/// `GITHUB_TOKEN`) match while non-secret look-alikes (`TOKENIZERS_PARALLELISM`)
+/// do not.
+pub fn is_secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    const MARKERS: [&str; 8] = [
+        "API_KEY",
+        "APIKEY",
+        "ACCESS_KEY",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PASSPHRASE",
+        "CREDENTIAL",
+    ];
+    if MARKERS.iter().any(|m| upper.contains(m)) {
+        return true;
+    }
+    if upper.contains("PRIVATE") && upper.contains("KEY") {
+        return true;
+    }
+    // `TOKEN` only as a whole `_`-delimited segment, so `TOKENIZERS_PARALLELISM`
+    // (a non-secret ML flag) is not swept up but `GITHUB_TOKEN` is.
+    upper.split('_').any(|seg| seg == "TOKEN")
+}
+
+/// Given an iterator of environment variable names and an allowlist, return the
+/// names that must be scrubbed: secret-looking and not allow-listed
+/// (case-insensitive exact match). Pure — the unit of behaviour under test.
+pub fn secret_env_keys<I>(names: I, allow: &[String]) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let allow_upper: Vec<String> = allow.iter().map(|a| a.to_ascii_uppercase()).collect();
+    names
+        .into_iter()
+        .filter(|n| is_secret_env_name(n) && !allow_upper.contains(&n.to_ascii_uppercase()))
+        .collect()
+}
+
+/// Remove secret-bearing environment variables from `cmd`, honoring the operator
+/// `[sandbox] env_allow` passthrough list. Every place that spawns a tool
+/// subprocess must call this: the kernel sandbox restricts the filesystem, not
+/// environment inheritance, so a child would otherwise inherit the server's
+/// `ANTHROPIC_API_KEY`, `AWS_*`, etc. and could dump them via `env`.
+pub fn scrub_secret_env(cmd: &mut tokio::process::Command, context: &str) {
+    let allow = SECRET_ENV_ALLOW
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let scrubbed = secret_env_keys(std::env::vars().map(|(k, _)| k), &allow);
+    if !scrubbed.is_empty() {
+        tracing::debug!(
+            "Scrubbed {} secret-bearing env var(s) from {context}: {:?}",
+            scrubbed.len(),
+            scrubbed
+        );
+        for key in &scrubbed {
+            cmd.env_remove(key);
+        }
+    }
+}
 
 impl Sandbox {
     /// Create a sandboxed tokio process Command.
@@ -42,6 +126,15 @@ impl Sandbox {
         cmd.env_remove("AHMA_SERVER_CHILD")
             .env_remove(ahma_common::process_guard::SPAWN_DEPTH_ENV)
             .env_remove("AHMA_RESTARTED");
+
+        // Scrub secret-bearing environment variables so a sandboxed (or
+        // prompt-injected) tool cannot read the server's credentials out of its
+        // own process environment and exfiltrate them. The kernel sandbox
+        // restricts the filesystem, not environment inheritance — `env`,
+        // `printenv`, and `/proc/self/environ` all read process memory the
+        // sandbox cannot gate. Names on the operator's `[sandbox] env_allow`
+        // list are preserved for tools that legitimately need a token.
+        scrub_secret_env(&mut cmd, program);
 
         // Run each command as its own process-group leader so the whole tree can
         // be killed as a unit on timeout/cancellation. On macOS the direct child
@@ -185,6 +278,114 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn secret_env_names_match_real_credentials() {
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SESSION_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "MY_SECRET",
+            "DB_PASSWORD",
+            "SIGNING_PASSPHRASE",
+            "GCP_CREDENTIALS",
+            "SSH_PRIVATE_KEY",
+            "apikey",
+        ] {
+            assert!(
+                is_secret_env_name(name),
+                "{name} should be treated as secret"
+            );
+        }
+    }
+
+    #[test]
+    fn benign_env_names_are_not_secret() {
+        for name in [
+            "PATH",
+            "HOME",
+            "LANG",
+            "CARGO_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "TOKENIZERS_PARALLELISM", // contains "TOKEN" but not as a segment
+            "KEYBOARD_LAYOUT",
+            "ACCESSIBILITY",
+        ] {
+            assert!(
+                !is_secret_env_name(name),
+                "{name} should not be treated as secret"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_env_keys_respects_allowlist_case_insensitively() {
+        let names = vec![
+            "ANTHROPIC_API_KEY".to_string(),
+            "GITHUB_TOKEN".to_string(),
+            "PATH".to_string(),
+        ];
+        // Allow GITHUB_TOKEN through (lowercase in config to prove case-insensitivity).
+        let allow = vec!["github_token".to_string()];
+        let scrubbed = secret_env_keys(names, &allow);
+        assert!(scrubbed.contains(&"ANTHROPIC_API_KEY".to_string()));
+        assert!(
+            !scrubbed.contains(&"GITHUB_TOKEN".to_string()),
+            "allow-listed var must survive"
+        );
+        assert!(
+            !scrubbed.contains(&"PATH".to_string()),
+            "non-secret var must survive"
+        );
+    }
+
+    /// A tool subprocess must not inherit a secret-looking env var.
+    #[test]
+    fn base_command_scrubs_secret_env_from_child() {
+        // SAFETY: single-threaded test; sets/removes a uniquely-named var.
+        unsafe {
+            std::env::set_var("AHMA_TEST_FAKE_API_KEY", "sk-should-be-scrubbed");
+            std::env::set_var("AHMA_TEST_PLAIN_VAR", "keepme");
+        }
+        let td = tempdir().unwrap();
+        let sandbox = make_test_sandbox(td.path());
+        let cmd = sandbox.base_command("env", &[], td.path());
+        let child_env: std::collections::HashMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                // Only keys with an explicit override appear here; a scrubbed key
+                // shows up as (key, None).
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        // The scrubbed key must be explicitly removed (present as a removal).
+        let removed: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            removed.contains(&"AHMA_TEST_FAKE_API_KEY".to_string()),
+            "secret var must be scrubbed (removed) from child env; removed={removed:?}"
+        );
+        assert!(
+            !child_env.contains_key("AHMA_TEST_PLAIN_VAR"),
+            "non-secret var is inherited normally (not explicitly overridden)"
+        );
+        unsafe {
+            std::env::remove_var("AHMA_TEST_FAKE_API_KEY");
+            std::env::remove_var("AHMA_TEST_PLAIN_VAR");
+        }
     }
 
     /// create_command in Test mode delegates directly to base_command.

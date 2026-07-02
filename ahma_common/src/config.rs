@@ -868,6 +868,24 @@ pub struct SandboxSettings {
     /// Default: empty list
     #[serde(default)]
     pub persistent_scopes: Vec<PersistentScope>,
+    /// Environment-variable names to **preserve** in tool subprocess
+    /// environments even though they match a built-in secret pattern
+    /// (`*_API_KEY`, `*_SECRET`, `*_TOKEN`, `*PASSWORD*`, …).
+    ///
+    /// By default ahma scrubs secret-looking variables from every tool
+    /// subprocess so a sandboxed (or prompt-injected) command cannot read the
+    /// server's credentials out of its own environment and exfiltrate them —
+    /// the kernel sandbox restricts the filesystem, not environment
+    /// inheritance. This is the explicit, human-authored exception list for the
+    /// rare tool that legitimately needs a token (e.g. `GITHUB_TOKEN` for a CI
+    /// workflow). Matching is case-insensitive on the exact variable name.
+    ///
+    /// Like every security-tier setting it lives in `~/.ahma/settings.toml`,
+    /// outside every workspace scope and kernel-unwritable from inside the
+    /// sandbox — the agent cannot grant itself a passthrough.
+    /// Default: empty list
+    #[serde(default)]
+    pub env_allow: Vec<String>,
 }
 
 impl SandboxSettings {
@@ -923,6 +941,7 @@ impl Default for SandboxSettings {
             sandbox_directory: default_sandbox_directory(),
             use_sandbox_directory: false,
             persistent_scopes: Vec::new(),
+            env_allow: Vec::new(),
         }
     }
 }
@@ -1553,6 +1572,12 @@ impl AhmaSettings {
             toml_persistent_scopes(&self.sandbox.persistent_scopes),
             toml_persistent_scopes(&d.sandbox.persistent_scopes),
         );
+        w.setting(
+            "Env var names preserved in tool subprocesses despite matching a secret pattern (e.g. GITHUB_TOKEN). Everything else secret-looking is scrubbed.",
+            "env_allow",
+            toml_str_list(&self.sandbox.env_allow),
+            toml_str_list(&d.sandbox.env_allow),
+        );
 
         // ── Logging ──────────────────────────────────────────────────────────
         w.section("Logging", "logging");
@@ -2015,6 +2040,7 @@ mod tests {
                     granted_at: Some("2026-06-29".into()),
                     note: Some("compiler cache".into()),
                 }],
+                env_allow: vec!["GITHUB_TOKEN".into()],
             },
             logging: LoggingSettings {
                 target: "stderr".into(),

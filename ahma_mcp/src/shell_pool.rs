@@ -412,14 +412,19 @@ impl PrewarmedShell {
             // Spawn a pre-warmed protocol shell.
             // On Windows: `powershell -NoProfile -NonInteractive -Command -`
             // On Unix:    `bash`
-            let mut process = Command::new(platform_shell_program())
+            let mut builder = Command::new(platform_shell_program());
+            builder
                 .args(shell_args())
                 .kill_on_drop(true)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()) // capture stderr for diagnostics
-                .current_dir(&working_dir)
-                .spawn()?;
+                .current_dir(&working_dir);
+            // The pooled shell inherits the server env; scrub secrets so tools
+            // run in it cannot read the server's credentials (see
+            // `sandbox::scrub_secret_env`).
+            crate::sandbox::scrub_secret_env(&mut builder, "pooled shell");
+            let mut process = builder.spawn()?;
 
             let stdin = process.stdin.take().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Failed to get stdin")
@@ -533,14 +538,16 @@ impl PrewarmedShell {
         let program = &command.command[0];
         let args: Vec<&str> = command.command.iter().skip(1).map(|s| s.as_str()).collect();
 
-        let child_spawn = Command::new(program)
+        let mut builder = Command::new(program);
+        builder
             .args(&args)
             .current_dir(&command.working_dir)
             .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+            .stderr(Stdio::piped());
+        crate::sandbox::scrub_secret_env(&mut builder, program);
+        let child_spawn = builder.spawn();
 
         let child = match child_spawn {
             Ok(c) => c,
