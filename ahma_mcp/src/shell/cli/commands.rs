@@ -7,7 +7,7 @@
 use super::{
     AppConfig, BundleArgs, BundleAuditArgs, BundleCommand, BundleSignArgs, BundleVerifyArgs,
     InfoArgs, PromptsArgs, PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs,
-    SettingsCommand,
+    SettingsCommand, WebArgs, WebCommand,
 };
 use crate::shell::{list_tools, resolution};
 use anyhow::{Context, Result};
@@ -433,6 +433,179 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
                     Ok(())
                 }
             }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Web-egress policy (SPEC R-WEB.10)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub(crate) fn run_web_command(args: WebArgs) -> Result<()> {
+    use ahma_common::config::settings_path;
+    let file = settings_path()
+        .context("Cannot determine ~/.ahma/settings.toml (home directory not found)")?;
+    web_command_at(&file, args.command)
+}
+
+/// Which list a pattern lives in.
+enum WebList {
+    Allow,
+    Deny,
+}
+
+/// Core of `ahma web`, operating on an explicit settings file so it is unit
+/// testable without touching the real home directory.
+fn web_command_at(file: &std::path::Path, command: WebCommand) -> Result<()> {
+    use ahma_common::config::AhmaSettings;
+    use ahma_common::web_policy::{WebPolicy, url_coordinates};
+
+    // Strict load on write paths: never clobber an unparseable settings file.
+    let load = || -> Result<AhmaSettings> {
+        AhmaSettings::load_from_result(file).map_err(|e| anyhow::anyhow!(e))
+    };
+
+    match command {
+        WebCommand::Allow { pattern } => web_add(file, &load()?, pattern, WebList::Allow),
+        WebCommand::Deny { pattern } => web_add(file, &load()?, pattern, WebList::Deny),
+        WebCommand::Revoke { pattern } => {
+            let mut settings = load()?;
+            let before = settings.web.always_allow.len() + settings.web.never_allow.len();
+            settings.web.always_allow.retain(|p| p != &pattern);
+            settings.web.never_allow.retain(|p| p != &pattern);
+            let removed =
+                before - (settings.web.always_allow.len() + settings.web.never_allow.len());
+            if removed == 0 {
+                println!("No `{pattern}` entry found in always_allow or never_allow.");
+                println!("Run `ahma web list` to see current entries.");
+                return Ok(());
+            }
+            settings
+                .save_to(file)
+                .with_context(|| format!("Failed to write {}", file.display()))?;
+            println!("✓ Removed `{pattern}` from the web policy");
+            println!();
+            println!("Updated: {}", file.display());
+            Ok(())
+        }
+        WebCommand::List => {
+            let settings = load()?;
+            let (_, errors) = WebPolicy::from_settings(&settings.web);
+            println!("# Web-egress policy");
+            println!("# File: {}", file.display());
+            println!();
+            println!("default_policy       = {:?}", settings.web.default_policy);
+            println!(
+                "block_private_ranges = {}",
+                settings.web.block_private_ranges
+            );
+            println!(
+                "on_redirect          = {:?}",
+                settings.web.on_redirect_to_new_domain
+            );
+            println!();
+            print_web_list("always_allow (permitted)", &settings.web.always_allow);
+            print_web_list("never_allow (blocked)", &settings.web.never_allow);
+            for e in &errors {
+                println!("⚠ invalid pattern ignored: {e}");
+            }
+            println!();
+            println!("Manage with: ahma web allow|deny|revoke <PATTERN>, or ahma web check <URL>.");
+            Ok(())
+        }
+        WebCommand::Check { url } => {
+            let settings = load()?;
+            let (policy, _) = WebPolicy::from_settings(&settings.web);
+            let domain =
+                url_coordinates(&url).map_or_else(|| "(unparseable)".to_string(), |(_, h, _)| h);
+            let decision = policy.decide(&url, &[], &[]);
+            println!("URL:      {url}");
+            println!("Domain:   {domain}");
+            println!("Decision: {}", format_decision(&decision));
+            println!();
+            println!(
+                "Note: the SSRF/private-range guard also applies at connect time \
+                 (block_private_ranges = {}).",
+                settings.web.block_private_ranges
+            );
+            Ok(())
+        }
+    }
+}
+
+fn web_add(
+    file: &std::path::Path,
+    loaded: &ahma_common::config::AhmaSettings,
+    pattern: String,
+    list: WebList,
+) -> Result<()> {
+    use ahma_common::web_policy::WebPattern;
+    // R-WEB.10.1: reject invalid patterns (bare `*`, TLD wildcard, IP/localhost).
+    let parsed = WebPattern::parse(&pattern)
+        .map_err(|e| anyhow::anyhow!("invalid pattern '{pattern}': {e}"))?;
+    if parsed.is_cleartext() {
+        eprintln!("⚠ '{pattern}' uses cleartext http:// — traffic is unencrypted.");
+    }
+
+    let mut settings = loaded.clone();
+    let (target, other, label, other_label) = match list {
+        WebList::Allow => (
+            &mut settings.web.always_allow,
+            &settings.web.never_allow,
+            "always_allow",
+            "never_allow",
+        ),
+        WebList::Deny => (
+            &mut settings.web.never_allow,
+            &settings.web.always_allow,
+            "never_allow",
+            "always_allow",
+        ),
+    };
+
+    if target.iter().any(|p| p == &pattern) {
+        println!("`{pattern}` is already in {label}; nothing to do.");
+        return Ok(());
+    }
+    let conflicts = other.contains(&pattern);
+    target.push(pattern.clone());
+    settings
+        .save_to(file)
+        .with_context(|| format!("Failed to write {}", file.display()))?;
+
+    println!("✓ Added `{pattern}` to [web].{label}");
+    if conflicts {
+        println!(
+            "⚠ `{pattern}` is also in {other_label}; note never_allow always wins over always_allow."
+        );
+    }
+    println!();
+    println!("Recorded in: {}", file.display());
+    println!("  This file lives outside every sandbox scope, so a sandboxed tool cannot");
+    println!("  edit it. Takes effect immediately for new fetches (the policy is reloaded");
+    println!("  per request).");
+    Ok(())
+}
+
+fn print_web_list(title: &str, entries: &[String]) {
+    println!("{title}:");
+    if entries.is_empty() {
+        println!("  (none)");
+    } else {
+        for e in entries {
+            println!("  • {e}");
+        }
+    }
+    println!();
+}
+
+fn format_decision(decision: &ahma_common::web_policy::WebDecision) -> String {
+    use ahma_common::web_policy::WebDecision;
+    match decision {
+        WebDecision::Allow { matched } => format!("ALLOW (matched: {matched})"),
+        WebDecision::Deny { reason } => format!("DENY ({reason})"),
+        WebDecision::Prompt { domain } => {
+            format!("PROMPT — '{domain}' would require approval (default_policy = deny)")
         }
     }
 }
@@ -1191,6 +1364,93 @@ mod tests {
             },
         })
         .unwrap();
+    }
+
+    #[test]
+    fn web_cli_lifecycle() {
+        use ahma_common::config::AhmaSettings;
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("settings.toml");
+        let load = || AhmaSettings::load_from(&file);
+
+        // allow → always_allow; deny → never_allow.
+        web_command_at(
+            &file,
+            WebCommand::Allow {
+                pattern: "api.github.com".into(),
+            },
+        )
+        .unwrap();
+        web_command_at(
+            &file,
+            WebCommand::Deny {
+                pattern: "bad.example".into(),
+            },
+        )
+        .unwrap();
+        let s = load();
+        assert!(s.web.always_allow.contains(&"api.github.com".to_string()));
+        assert!(s.web.never_allow.contains(&"bad.example".to_string()));
+
+        // Invalid patterns are rejected and write nothing.
+        assert!(
+            web_command_at(
+                &file,
+                WebCommand::Allow {
+                    pattern: "*.com".into()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            web_command_at(
+                &file,
+                WebCommand::Deny {
+                    pattern: "127.0.0.1".into()
+                }
+            )
+            .is_err()
+        );
+
+        // Duplicate allow is a no-op (no error, no duplicate entry).
+        web_command_at(
+            &file,
+            WebCommand::Allow {
+                pattern: "api.github.com".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load()
+                .web
+                .always_allow
+                .iter()
+                .filter(|p| *p == "api.github.com")
+                .count(),
+            1
+        );
+
+        // list + check must not error.
+        web_command_at(&file, WebCommand::List).unwrap();
+        web_command_at(
+            &file,
+            WebCommand::Check {
+                url: "https://api.github.com/x".into(),
+            },
+        )
+        .unwrap();
+
+        // revoke removes only the named entry.
+        web_command_at(
+            &file,
+            WebCommand::Revoke {
+                pattern: "api.github.com".into(),
+            },
+        )
+        .unwrap();
+        let s = load();
+        assert!(!s.web.always_allow.contains(&"api.github.com".to_string()));
+        assert!(s.web.never_allow.contains(&"bad.example".to_string()));
     }
 
     // ── bundle: sign / verify ────────────────────────────────────────────────

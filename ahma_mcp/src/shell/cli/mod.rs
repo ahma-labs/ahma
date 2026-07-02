@@ -867,6 +867,10 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in sandbox-scope management mode");
             commands::run_sandbox_command(args)
         }
+        Subcommands::Web(args) => {
+            tracing::info!("Running in web-egress policy management mode");
+            commands::run_web_command(args)
+        }
     }
 }
 
@@ -1192,6 +1196,11 @@ pub enum Subcommands {
     /// cache. Grants are recorded in `~/.ahma/settings.toml` and survive every
     /// `roots/list` update, so they stay in effect for the whole session.
     Sandbox(SandboxArgs),
+    /// Manage the web-egress allow/deny policy for ahma's own HTTP tools
+    /// (`fetch_webpage`). Domains are recorded in `[web]` in
+    /// `~/.ahma/settings.toml`, outside every sandbox scope, so a sandboxed tool
+    /// cannot edit them. See `ahma web --help`.
+    Web(WebArgs),
 }
 
 /// Arguments for `ahma setup`.
@@ -1367,6 +1376,53 @@ pub enum SandboxCommand {
         /// Directory to revoke (matched after `~` expansion).
         #[arg(value_name = "PATH")]
         path: PathBuf,
+    },
+}
+
+// ── web egress policy ────────────────────────────────────────────────────────
+
+/// Arguments for `ahma web`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct WebArgs {
+    #[command(subcommand)]
+    pub command: WebCommand,
+}
+
+/// Subcommands for `ahma web` — manage the web-egress policy (SPEC R-WEB.10).
+///
+/// Governs outbound HTTP made by ahma's own tools (`fetch_webpage`). Domains are
+/// stored in `[web].always_allow` / `[web].never_allow` in `~/.ahma/settings.toml`,
+/// a file outside every sandbox scope, so a sandboxed tool call cannot edit them.
+/// Pattern syntax: exact (`api.github.com`), single-level wildcard
+/// (`*.github.com`), scheme/port qualifiers (`https://api.github.com`,
+/// `api.github.com:8080`). Note: `github.com` matches `github.com` only.
+#[derive(Subcommand, Debug, Clone)]
+pub enum WebCommand {
+    /// Always permit a domain pattern (add to `always_allow`).
+    Allow {
+        /// Domain pattern to permit.
+        #[arg(value_name = "PATTERN")]
+        pattern: String,
+    },
+    /// Always block a domain pattern (add to `never_allow`, overrides everything).
+    Deny {
+        /// Domain pattern to block.
+        #[arg(value_name = "PATTERN")]
+        pattern: String,
+    },
+    /// Show the policy (`default_policy`, `block_private_ranges`, and both lists).
+    List,
+    /// Remove a pattern from `always_allow` or `never_allow`.
+    Revoke {
+        /// Domain pattern to remove.
+        #[arg(value_name = "PATTERN")]
+        pattern: String,
+    },
+    /// Dry-run: report what decision the policy would make for a URL.
+    Check {
+        /// URL to evaluate (e.g. `https://api.github.com/x`).
+        #[arg(value_name = "URL")]
+        url: String,
     },
 }
 
