@@ -395,3 +395,71 @@ fn test_sandbox_exec_is_available() {
         "sandbox-exec should be available on macOS"
     );
 }
+
+/// Kernel-enforcement test for the macOS credential-read deny list (P1/#393):
+/// a directory on the deny set must be unreadable by a sandboxed command, while
+/// a file inside the sandbox scope stays readable. This exercises the REAL
+/// Seatbelt profile generator (`generate_seatbelt_profile_test`) plus the
+/// `set_credential_read_denies` global, so it catches a reversion of either the
+/// rule emission or its ordering (the deny must override the global read-allow
+/// but yield to an explicit scope allow).
+#[cfg(target_os = "macos")]
+#[test]
+fn test_credential_read_deny_is_kernel_enforced() {
+    skip_if_nested_sandbox!();
+    use ahma_mcp::sandbox::{Sandbox, SandboxMode, set_credential_read_denies};
+
+    let scope = TempDir::new().expect("scope dir");
+    let secret_dir = TempDir::new().expect("secret dir");
+    let secret_file = secret_dir.path().join("credentials");
+    std::fs::write(&secret_file, "AKIA-super-secret-value").expect("write secret");
+
+    // Install the deny for the secret dir. nextest isolates the process global;
+    // it is cleared immediately after the (synchronous) profile generation.
+    set_credential_read_denies(vec![secret_dir.path().to_path_buf()]);
+    // `no_temp_files = true` so the profile does not emit a blanket
+    // /private/var/folders read-allow that would override the deny (TempDir lives
+    // under /var/folders on macOS).
+    let sandbox = Sandbox::new(
+        vec![scope.path().to_path_buf()],
+        SandboxMode::Strict,
+        true,  // no_temp_files
+        false, // livelog
+        false, // tmp_access
+    )
+    .expect("build sandbox");
+    let profile = sandbox.generate_seatbelt_profile_test(scope.path());
+    set_credential_read_denies(Vec::new());
+
+    // Reading the denied credential file must be OS-blocked.
+    let denied = Command::new("sandbox-exec")
+        .args(["-p", &profile, "/bin/cat", &secret_file.to_string_lossy()])
+        .current_dir(scope.path())
+        .output()
+        .expect("run sandbox-exec (deny case)");
+    let denied_stdout = String::from_utf8_lossy(&denied.stdout);
+    assert!(
+        !denied.status.success() && !denied_stdout.contains("super-secret"),
+        "credential-dir read must be blocked by the sandbox. exit={:?} stdout={} stderr={}",
+        denied.status.code(),
+        denied_stdout,
+        String::from_utf8_lossy(&denied.stderr),
+    );
+
+    // A file inside the sandbox scope must still be readable (control: proves the
+    // deny is targeted, not a blanket read block).
+    let in_scope = scope.path().join("ok.txt");
+    std::fs::write(&in_scope, "in-scope-content").expect("write in-scope file");
+    let allowed = Command::new("sandbox-exec")
+        .args(["-p", &profile, "/bin/cat", &in_scope.to_string_lossy()])
+        .current_dir(scope.path())
+        .output()
+        .expect("run sandbox-exec (allow case)");
+    assert!(
+        allowed.status.success()
+            && String::from_utf8_lossy(&allowed.stdout).contains("in-scope-content"),
+        "in-scope read must succeed. exit={:?} stderr={}",
+        allowed.status.code(),
+        String::from_utf8_lossy(&allowed.stderr),
+    );
+}

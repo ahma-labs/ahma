@@ -17,7 +17,6 @@ use ahma_mcp::test_utils::in_process::create_in_process_mcp_with_scope;
 use ahma_mcp::utils::logging::init_test_logging;
 use common::fs::get_workspace_tools_dir;
 use rmcp::model::CallToolRequestParams;
-#[cfg(target_os = "linux")]
 use rmcp::model::CallToolResult;
 use serde_json::json;
 use std::fs;
@@ -25,7 +24,6 @@ use std::fs;
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
-#[cfg(target_os = "linux")]
 fn result_text(result: &CallToolResult) -> String {
     result
         .content
@@ -379,15 +377,83 @@ async fn red_team_shell_metacharacters_in_path() {
     let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
         serde_json::from_value(json!({
             "command": "echo test",
-            "working_directory": "; cat /etc/passwd #"
+            "working_directory": "; cat /etc/passwd #",
+            "execution_mode": "Synchronous"
         }))
         .unwrap(),
     );
     let result = mcp.client.call_tool(params).await;
-    // The command may start async but should fail during execution
-    // because the working directory doesn't exist.
-    // We're documenting that the system handles this case safely.
-    let _ = result;
+    // The metacharacters must be treated as a literal (nonexistent) directory
+    // name, never shell-interpreted. Whether the call errors (invalid working
+    // dir) or runs with the path taken literally, /etc/passwd must NOT be read.
+    let leaked = match &result {
+        Ok(r) => {
+            let text = result_text(r);
+            text.contains("root:") || text.contains("/bin/bash\n") || text.contains(":0:0:")
+        }
+        Err(_) => false,
+    };
+    assert!(
+        !leaked,
+        "shell metacharacters in working_directory must not execute a command injection: {result:?}"
+    );
+}
+
+/// End-to-end: a tool subprocess must NOT inherit secret-bearing environment
+/// variables from the server, so a prompt-injected `env`/`printenv` cannot leak
+/// the server's credentials. Complements the `base_command` unit test by
+/// asserting a *real spawned process* does not see the secret, while a
+/// non-secret var is still inherited (the scrub is selective).
+#[cfg(unix)]
+#[tokio::test]
+async fn red_team_secret_env_scrubbed_from_subprocess() {
+    init_test_logging();
+    // Set the secret BEFORE spawning the server so the server inherits it (and
+    // must then scrub it from the tool child). SAFETY: nextest runs each test in
+    // its own process; these names are unique.
+    unsafe {
+        std::env::set_var("AHMA_TEST_FAKE_API_KEY", "supersecretvalue123");
+        std::env::set_var("AHMA_TEST_KEEPME", "keepvalue456");
+    }
+
+    let temp_dir = TempDir::new().unwrap();
+    let tools_dir = get_workspace_tools_dir();
+    // ClientBuilder spawns a real server subprocess; env scrubbing happens in
+    // `base_command` regardless of whether the OS sandbox engages, so this runs
+    // in a nested-sandbox environment too (the harness auto-disables the OS
+    // sandbox there). `env` dumps the child's environment.
+    let client = ClientBuilder::new()
+        .tools_dir(&tools_dir)
+        .working_dir(temp_dir.path())
+        .no_sandbox(false)
+        .build()
+        .await
+        .unwrap();
+
+    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
+        serde_json::from_value(json!({
+            "command": "env",
+            "execution_mode": "Synchronous"
+        }))
+        .unwrap(),
+    );
+    let result = client.call_tool(params).await;
+    let text = result.as_ref().map(result_text).unwrap_or_default();
+    client.cancel().await.unwrap();
+
+    unsafe {
+        std::env::remove_var("AHMA_TEST_FAKE_API_KEY");
+        std::env::remove_var("AHMA_TEST_KEEPME");
+    }
+
+    assert!(
+        text.contains("keepvalue456"),
+        "sanity: `env` ran and inherited the non-secret var; got: {text}"
+    );
+    assert!(
+        !text.contains("supersecretvalue123"),
+        "SECURITY: a secret-named env var must be scrubbed from the tool subprocess; got: {text}"
+    );
 }
 
 // =============================================================================
@@ -759,46 +825,11 @@ async fn red_team_command_write_escape_blocked() {
 // RED TEAM TEST 6: Command Argument Escape (Read - Linux Only)
 // =============================================================================
 
-/// Test that reading a file outside the sandbox via command arguments is blocked on Linux
-#[tokio::test]
-#[cfg(target_os = "linux")]
-async fn red_team_command_read_escape_blocked_linux() {
-    init_test_logging();
-    let temp_dir = TempDir::new().unwrap();
-    let tools_dir = get_workspace_tools_dir();
-    let client = ClientBuilder::new()
-        .tools_dir(&tools_dir)
-        .working_dir(temp_dir.path())
-        .no_sandbox(false)
-        .arg("--disable-temp-files")
-        .build()
-        .await
-        .unwrap();
-
-    // Attempt to read /etc/shadow (or similar restricted file)
-    let params = CallToolRequestParams::new("run_terminal_command").with_arguments(
-        serde_json::from_value(json!({
-            "command": "cat /etc/shadow", // Typically root only, but Landlock should block open() regardless
-            "execution_mode": "Synchronous"
-        }))
-        .unwrap(),
-    );
-
-    let result = client.call_tool(params).await;
-
-    // Command should fail or return error exit code
-    if let Ok(response) = result {
-        let _content = response.content.first().unwrap().as_text().unwrap();
-        // Check if output contains "Permission denied" or similar
-        // Note: response content is JSON string of the result, we need to check stderr/exit code
-        // But client.call_tool returns the ToolResult. Use debug print if needed.
-        // Simplified check: Use a file we know exists but shouldn't be readable due to sandbox
-
-        // Actually, let's use a custom file outside sandbox to be sure
-    }
-
-    client.cancel().await.unwrap();
-}
+// NOTE: a former `red_team_command_read_escape_blocked_linux` that targeted
+// `/etc/shadow` was removed: `/etc/shadow` is unreadable to non-root regardless
+// of the sandbox (confounding the assertion), and it asserted nothing. The
+// definitive read-escape coverage is `_custom` below, which uses a
+// world-readable file placed outside the sandbox scope.
 
 /// Refined Linux read test with verified outside file
 #[tokio::test]
