@@ -41,9 +41,13 @@
 //! [`resolve`]: WebApprovalCoordinator::resolve
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Mutex;
 
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::config::AhmaSettings;
 
 /// A request to approve outbound web access to `domain`, fanned to every capable
 /// surface under one `decision_id`.
@@ -263,6 +267,38 @@ impl WebApprovalCoordinator {
     }
 }
 
+/// Persist an approved domain to `[web].always_allow` in the settings file — the
+/// durable form of an [`WebApprovalDecision::AllowAlways`] answer. The chokepoint
+/// that mirrors [`crate::scope_grant::persist_grant`]: a strict load (so a corrupt
+/// settings file is never silently clobbered), a case-insensitive dedup, then save.
+/// The settings file lives outside every sandbox scope, so a sandboxed tool cannot
+/// reach it. Returns `true` if the domain was newly added, `false` if it was
+/// already present.
+pub fn persist_web_allow(settings_file: &Path, domain: &str) -> Result<bool> {
+    let domain = norm(domain);
+    let mut settings = AhmaSettings::load_from_result(settings_file)
+        .map_err(|e| anyhow::anyhow!(e))
+        .with_context(|| {
+            format!(
+                "refusing to overwrite unparseable {}",
+                settings_file.display()
+            )
+        })?;
+    if settings
+        .web
+        .always_allow
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(&domain))
+    {
+        return Ok(false);
+    }
+    settings.web.always_allow.push(domain);
+    settings
+        .save_to(settings_file)
+        .with_context(|| format!("failed to write {}", settings_file.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +429,48 @@ mod tests {
         assert_eq!(
             c.resolve("never-issued", WebApprovalDecision::AllowSession),
             WebResolveOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn persist_web_allow_adds_then_dedups_case_insensitively() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join(".ahma").join("settings.toml");
+
+        // First persist adds the domain.
+        assert!(persist_web_allow(&file, "API.GitHub.com").unwrap());
+        let reloaded = AhmaSettings::load_from_result(&file).unwrap();
+        assert_eq!(
+            reloaded.web.always_allow,
+            vec!["api.github.com".to_string()]
+        );
+
+        // A second persist of the same host (any case) is a no-op, not a duplicate.
+        assert!(!persist_web_allow(&file, "api.github.com").unwrap());
+        let reloaded = AhmaSettings::load_from_result(&file).unwrap();
+        assert_eq!(
+            reloaded.web.always_allow.len(),
+            1,
+            "domain must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn persist_web_allow_refuses_to_clobber_corrupt_settings() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".ahma");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.toml");
+        std::fs::write(&file, "this is : not valid toml [[[").unwrap();
+        assert!(
+            persist_web_allow(&file, "api.github.com").is_err(),
+            "a corrupt settings file must not be silently overwritten"
+        );
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("not valid toml"),
+            "the bad contents are left intact for the human to fix"
         );
     }
 

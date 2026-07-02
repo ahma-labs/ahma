@@ -41,6 +41,7 @@
 pub mod allowlist;
 pub mod proxy;
 pub mod web_audit;
+pub mod web_prompt;
 
 pub use allowlist::EgressAllowlist;
 pub use proxy::{EgressProxy, EgressProxyConfig};

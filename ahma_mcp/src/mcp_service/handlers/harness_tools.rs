@@ -121,6 +121,113 @@ impl AhmaMcpService {
         Ok(text_result(body))
     }
 
+    /// Raise an interactive web-egress approval for an unknown `domain` (strict
+    /// `deny` mode) and turn the human's answer into a fetch action.
+    ///
+    /// Deduplicated through the session [`WebApprovalCoordinator`](ahma_common::web_approval::WebApprovalCoordinator):
+    /// a domain already in flight is not double-prompted, and an approval takes
+    /// effect for the rest of the session (or is persisted for `always`). When no
+    /// client can be prompted — a headless/CLI peer, a client without the
+    /// elicitation capability, a timeout, or a user cancel — the domain is left
+    /// askable and the request falls back to the actionable `ahma web allow` deny,
+    /// so egress is never widened without an explicit human "yes".
+    async fn approve_web_egress(
+        &self,
+        domain: &str,
+        url: &str,
+    ) -> crate::egress::web_audit::FetchAction {
+        use crate::egress::web_audit::{FetchAction, action_for};
+        use crate::egress::web_prompt::{WebApprovalForm, parse_answer, prompt_message};
+        use ahma_common::web_approval::{WebApprovalDecision, WebResolveOutcome};
+        use ahma_common::web_policy::WebDecision;
+
+        // The actionable deny used whenever we cannot obtain an explicit approval.
+        let deny = || {
+            action_for(&WebDecision::Prompt {
+                domain: domain.to_string(),
+            })
+        };
+
+        // Dedup: if a decision for this domain is already in flight (a concurrent
+        // request), don't raise a second prompt — deny this one with the hint.
+        let Some(req) = self
+            .web_approval
+            .begin(domain, url, Some("fetch_webpage".to_string()))
+        else {
+            return deny();
+        };
+
+        // Reach the connected client, if any. No peer ⇒ CLI/headless: cannot prompt.
+        let peer = self.peer.read().unwrap().clone();
+        let Some(peer) = peer else {
+            self.web_approval.cancel(&req.decision_id);
+            return deny();
+        };
+
+        // Ask the human. A ~2-minute window keeps a fetch from hanging forever.
+        let decision = match peer
+            .elicit_with_timeout::<WebApprovalForm>(
+                prompt_message(domain, url),
+                Some(std::time::Duration::from_secs(120)),
+            )
+            .await
+        {
+            Ok(Some(form)) => parse_answer(&form.decision),
+            // Accepted with no content, or an explicit decline: remember the deny.
+            Ok(None) | Err(rmcp::service::ElicitationError::UserDeclined) => {
+                WebApprovalDecision::Deny
+            }
+            // Cancelled, timed out, or the client can't elicit: do NOT poison the
+            // session with a deny — a capable surface may ask later. Fall back.
+            Err(e) => {
+                tracing::debug!("web approval prompt unavailable for '{domain}': {e}");
+                self.web_approval.cancel(&req.decision_id);
+                return deny();
+            }
+        };
+
+        match self.web_approval.resolve(&req.decision_id, decision) {
+            WebResolveOutcome::AllowOnce { domain } => {
+                tracing::info!(domain = %domain, "web egress approved for this request");
+                FetchAction::Proceed
+            }
+            WebResolveOutcome::AllowSession { domain } => {
+                tracing::info!(domain = %domain, "web egress approved for this session");
+                FetchAction::Proceed
+            }
+            WebResolveOutcome::Persist { domain } => {
+                match ahma_common::config::settings_path() {
+                    Some(file) => {
+                        match ahma_common::web_approval::persist_web_allow(&file, &domain) {
+                            Ok(true) => tracing::info!(
+                                domain = %domain,
+                                "web egress approved and saved to [web].always_allow"
+                            ),
+                            Ok(false) => tracing::info!(
+                                domain = %domain,
+                                "web egress approved (already in [web].always_allow)"
+                            ),
+                            Err(e) => tracing::warn!(
+                                domain = %domain,
+                                "web egress approved for the session but persisting failed: {e}"
+                            ),
+                        }
+                    }
+                    None => tracing::warn!(
+                        "web egress approved but ~/.ahma/settings.toml is not locatable to persist"
+                    ),
+                }
+                FetchAction::Proceed
+            }
+            WebResolveOutcome::Denied { domain } => {
+                tracing::info!(domain = %domain, "web egress denied by user");
+                deny()
+            }
+            // A twin surface resolved first, or the decision vanished: fail safe.
+            WebResolveOutcome::AlreadyResolved | WebResolveOutcome::Unknown => deny(),
+        }
+    }
+
     pub async fn handle_fetch_webpage(
         &self,
         args: Map<String, Value>,
@@ -136,9 +243,9 @@ impl AhmaMcpService {
         // never_allow blocks, always_allow permits; the session-approval
         // coordinator's grants/denies (R-WEB.5) are threaded in so an approval made
         // earlier this session takes effect without a restart. In strict `deny` mode
-        // an unknown, un-approved domain still yields Prompt — until an interactive
-        // approval surface is wired (a later PR) that resolves as a deny with an
-        // actionable hint. Every request is audited (R-WEB.9).
+        // an unknown domain yields Prompt, which `approve_web_egress` raises as an
+        // interactive MCP `elicitation/create` when a capable client is attached.
+        // Every request is audited (R-WEB.9).
         {
             use crate::egress::web_audit::{self, FetchAction};
             use ahma_common::web_policy::{WebDecision, WebPolicy, url_coordinates};
@@ -160,15 +267,13 @@ impl AhmaMcpService {
                 &decision,
                 ts,
             ));
-            // Register an unknown domain with the coordinator so, once an approval
-            // surface exists, the prompt is raised at most once per domain. Today
-            // there is no surface, so `begin` only debounces the deny hint.
-            if let WebDecision::Prompt { domain } = &decision {
-                let _ = self
-                    .web_approval
-                    .begin(domain, url, Some("fetch_webpage".to_string()));
-            }
-            if let FetchAction::Deny(reason) = web_audit::action_for(&decision) {
+            // An unknown domain (strict `deny` mode) is offered to the human via an
+            // interactive prompt; every other decision maps straight to an action.
+            let action = match &decision {
+                WebDecision::Prompt { domain } => self.approve_web_egress(domain, url).await,
+                other => web_audit::action_for(other),
+            };
+            if let FetchAction::Deny(reason) = action {
                 return Err(mcp_invalid_params(reason));
             }
         }
