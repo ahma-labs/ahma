@@ -462,6 +462,44 @@ async fn fetch_webpage_success() {
 }
 
 #[tokio::test]
+async fn fetch_webpage_never_allow_blocks() {
+    // Isolate settings to a temp home so the [web] policy is deterministic.
+    // SAFETY: nextest runs each test in its own process.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".ahma")).unwrap();
+    std::fs::write(
+        home.path().join(".ahma").join("settings.toml"),
+        "[web]\nnever_allow = [\"blocked.example\"]\n",
+    )
+    .unwrap();
+    unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+
+    let svc = make_service_with(
+        Arc::new(MockFileOpsProvider::default()),
+        Arc::new(MockWebPageFetcher::default()),
+    )
+    .await;
+
+    let blocked = svc
+        .handle_fetch_webpage(make_args(&[("url", json!("https://blocked.example/x"))]))
+        .await;
+    let allowed = svc
+        .handle_fetch_webpage(make_args(&[("url", json!("https://allowed.example/x"))]))
+        .await;
+
+    unsafe { std::env::remove_var("AHMA_TEST_HOME") };
+
+    let err = blocked.expect_err("never_allow domain must be blocked");
+    assert!(
+        err.message.contains("web egress blocked"),
+        "expected an egress-blocked message, got: {}",
+        err.message
+    );
+    // A domain not on never_allow still passes (default policy is allow).
+    assert!(allowed.is_ok(), "unlisted domain must pass in allow mode");
+}
+
+#[tokio::test]
 async fn fetch_webpage_with_optional_query() {
     let svc = make_service_with(
         Arc::new(MockFileOpsProvider::default()),

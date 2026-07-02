@@ -15,6 +15,7 @@ coverage = []
 anyhow.workspace = true
 dirs.workspace = true
 dunce.workspace = true
+url.workspace = true
 rcgen = "0.13.2"
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }

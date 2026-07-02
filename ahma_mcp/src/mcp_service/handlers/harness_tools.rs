@@ -131,6 +131,35 @@ impl AhmaMcpService {
             .ok_or_else(|| mcp_invalid_params("'url' is required"))?;
         let query = args.get("query").and_then(Value::as_str);
 
+        // Consult the [web] egress policy (R-WEB). Loaded fresh so a runtime
+        // `always_allow` addition takes effect without a restart (R-WEB.5.5).
+        // never_allow blocks, always_allow permits, and in strict `deny` mode an
+        // unknown domain is refused with an actionable hint (interactive approval
+        // arrives in a later PR). Every request is audited (R-WEB.9).
+        {
+            use crate::egress::web_audit::{self, FetchAction};
+            use ahma_common::web_policy::{WebPolicy, url_coordinates};
+
+            let settings = ahma_common::config::AhmaSettings::load();
+            let (policy, errors) = WebPolicy::from_settings(&settings.web);
+            for e in errors {
+                tracing::warn!("ignoring invalid [web] pattern: {e}");
+            }
+            let decision = policy.decide(url, &[], &[]);
+            let domain = url_coordinates(url).map_or_else(|| url.to_string(), |(_, host, _)| host);
+            let ts = chrono::Local::now().to_rfc3339();
+            web_audit::append(&web_audit::record(
+                "fetch_webpage",
+                url,
+                &domain,
+                &decision,
+                ts,
+            ));
+            if let FetchAction::Deny(reason) = web_audit::action_for(&decision) {
+                return Err(mcp_invalid_params(reason));
+            }
+        }
+
         let result = self
             .web_page_fetcher
             .fetch(url, query)

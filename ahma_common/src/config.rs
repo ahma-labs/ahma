@@ -1119,6 +1119,75 @@ impl Default for InstanceSettings {
     }
 }
 
+/// Default policy for outbound HTTP made by ahma's own tools (`fetch_webpage`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WebDefaultPolicy {
+    /// Domains not in `never_allow`/`always_allow` are permitted without a
+    /// prompt (backward-compatible default).
+    #[default]
+    Allow,
+    /// Strict mode: a domain not in `always_allow` or a session grant is held
+    /// and an approval prompt is raised. Recommended for sensitive workspaces.
+    Deny,
+}
+
+/// What to do when an approved request is redirected to a **different** domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RedirectPolicy {
+    /// Fail the request (default). A cross-domain redirect does not inherit the
+    /// source domain's approval.
+    #[default]
+    Block,
+    /// Raise a fresh approval prompt for the redirect target domain.
+    Prompt,
+}
+
+/// Web-egress policy for outbound HTTP made by ahma's own tools (SPEC §4.6
+/// R-WEB). Governs `fetch_webpage` and any future tool using the egress client;
+/// it does **not** govern subprocess HTTP or the ahma process's LLM connections.
+///
+/// Lives in `~/.ahma/settings.toml`, outside every workspace scope and
+/// kernel-unwritable from inside the sandbox — the agent cannot grant itself web
+/// access. Private-range blocking (`block_private_ranges`) is enforced at
+/// connection time by the egress guard regardless of `default_policy`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebSettings {
+    /// `allow` (default, backward-compatible) or `deny` (strict: prompt for
+    /// unknown domains).
+    pub default_policy: WebDefaultPolicy,
+    /// Block loopback, RFC-1918, link-local, and cloud-metadata IP ranges at DNS
+    /// resolution time (resists DNS rebinding). STRONGLY recommended `true`;
+    /// `false` enables SSRF against local services and must warn loudly.
+    pub block_private_ranges: bool,
+    /// `block` (default): cross-domain redirects fail. `prompt`: raise a new
+    /// approval for the redirect target.
+    pub on_redirect_to_new_domain: RedirectPolicy,
+    /// Domains always permitted without a prompt. Syntax: exact
+    /// (`api.github.com`), single-level wildcard (`*.github.com`),
+    /// scheme-qualified (`https://api.github.com`), port-qualified
+    /// (`api.github.com:8080`). Note: `github.com` matches `github.com` only, not
+    /// `api.github.com`.
+    pub always_allow: Vec<String>,
+    /// Domains always blocked, regardless of `default_policy`, `always_allow`, or
+    /// session grants.
+    pub never_allow: Vec<String>,
+}
+
+impl Default for WebSettings {
+    fn default() -> Self {
+        Self {
+            default_policy: WebDefaultPolicy::Allow,
+            block_private_ranges: true,
+            on_redirect_to_new_domain: RedirectPolicy::Block,
+            always_allow: Vec::new(),
+            never_allow: Vec::new(),
+        }
+    }
+}
+
 /// Runtime feature toggles.
 ///
 /// Controls which optional capabilities are active at runtime.  Features
@@ -1211,6 +1280,8 @@ pub struct AhmaSettings {
     /// LLM provider/model most recently selected in `ahma tui`, persisted so the
     /// MCP sub-agent and the next session can reuse it.
     pub agent: AgentSettings,
+    /// Web-egress policy for ahma's own HTTP tools (SPEC §4.6 R-WEB).
+    pub web: WebSettings,
 }
 
 impl AhmaSettings {
@@ -1717,6 +1788,39 @@ impl AhmaSettings {
             toml_opt_str(&d.agent.provider_url),
         );
 
+        // ── Web egress ───────────────────────────────────────────────────────
+        w.section("Web egress (ahma's own HTTP tools; SPEC R-WEB)", "web");
+        w.setting(
+            "\"allow\" (default) or \"deny\" (strict: prompt for unknown domains).",
+            "default_policy",
+            toml_str(web_default_policy_str(self.web.default_policy)),
+            toml_str(web_default_policy_str(d.web.default_policy)),
+        );
+        w.setting(
+            "Block loopback/RFC-1918/link-local/cloud-metadata IPs at DNS resolution time. Keep true.",
+            "block_private_ranges",
+            self.web.block_private_ranges.to_string(),
+            d.web.block_private_ranges.to_string(),
+        );
+        w.setting(
+            "Cross-domain redirects: \"block\" (default) fails; \"prompt\" asks for the new domain.",
+            "on_redirect_to_new_domain",
+            toml_str(redirect_policy_str(self.web.on_redirect_to_new_domain)),
+            toml_str(redirect_policy_str(d.web.on_redirect_to_new_domain)),
+        );
+        w.setting(
+            "Domains always permitted (exact, *.wildcard, scheme/port-qualified). github.com != api.github.com.",
+            "always_allow",
+            toml_str_list(&self.web.always_allow),
+            toml_str_list(&d.web.always_allow),
+        );
+        w.setting(
+            "Domains always blocked, overriding default_policy/always_allow/session grants.",
+            "never_allow",
+            toml_str_list(&self.web.never_allow),
+            toml_str_list(&d.web.never_allow),
+        );
+
         w.into_string()
     }
 
@@ -1737,6 +1841,22 @@ impl AhmaSettings {
 /// Quote `s` as a TOML basic string (escaping `\` and `"`).
 fn toml_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// TOML token for a [`WebDefaultPolicy`] (matches its serde representation).
+fn web_default_policy_str(p: WebDefaultPolicy) -> &'static str {
+    match p {
+        WebDefaultPolicy::Allow => "allow",
+        WebDefaultPolicy::Deny => "deny",
+    }
+}
+
+/// TOML token for a [`RedirectPolicy`] (matches its serde representation).
+fn redirect_policy_str(p: RedirectPolicy) -> &'static str {
+    match p {
+        RedirectPolicy::Block => "block",
+        RedirectPolicy::Prompt => "prompt",
+    }
 }
 
 /// Render an optional string; `None` is shown as an empty TOML string so an
@@ -2102,6 +2222,13 @@ mod tests {
                 provider: Some("Ollama".into()),
                 model: Some("gemma3:27b".into()),
                 provider_url: Some("http://localhost:11434".into()),
+            },
+            web: WebSettings {
+                default_policy: WebDefaultPolicy::Deny,
+                block_private_ranges: false,
+                on_redirect_to_new_domain: RedirectPolicy::Prompt,
+                always_allow: vec!["api.github.com".into(), "*.crates.io".into()],
+                never_allow: vec!["evil.example".into()],
             },
         }
     }
