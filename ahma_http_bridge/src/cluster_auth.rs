@@ -23,7 +23,7 @@
 //!
 //! ## Security
 //!
-//! - Signature: HMAC-SHA256 over `task_id|tool_name|issued_at|nonce`
+//! - Signature: HMAC-SHA256 over `task_id|tool_name|issued_at|nonce|scope`
 //! - Freshness: manifests older than [`MANIFEST_MAX_AGE_SECS`] are rejected
 //! - Replay protection: each nonce is recorded in a [`ManifestNonceCache`]
 //!
@@ -70,7 +70,7 @@ pub struct ClusterManifest {
     pub nonce: String,
     /// Unix timestamp (seconds) when this manifest was created.
     pub issued_at: u64,
-    /// HMAC-SHA256 hex over `task_id|tool_name|issued_at|nonce`.
+    /// HMAC-SHA256 hex over `task_id|tool_name|issued_at|nonce|scope`.
     pub signature: String,
 }
 
@@ -148,9 +148,17 @@ impl ClusterManifest {
     }
 
     fn canonical_payload(&self) -> String {
+        // `scope` MUST be included: it selects the session's sandbox scope, so
+        // leaving it out of the signature would let a tamperer widen or redirect
+        // the scope of an otherwise-valid manifest. `None` and `Some("")` are
+        // distinguished by a marker so they cannot be forged into each other.
+        let scope = match &self.scope {
+            Some(s) => format!("s:{s}"),
+            None => "n".to_string(),
+        };
         format!(
-            "{}|{}|{}|{}",
-            self.task_id, self.tool_name, self.issued_at, self.nonce
+            "{}|{}|{}|{}|{}",
+            self.task_id, self.tool_name, self.issued_at, self.nonce, scope
         )
     }
 }
@@ -254,6 +262,44 @@ mod tests {
         let key = b"test-secret-key";
         let manifest = test_manifest("cargo_build").sign(key);
         assert!(manifest.verify(key).is_ok());
+    }
+
+    #[test]
+    fn tampering_with_scope_fails_verification() {
+        // The scope selects the session's sandbox scope, so a valid manifest
+        // whose scope is altered in transit must fail verification.
+        let key = b"cluster-key";
+        let mut manifest = test_manifest("run_terminal_command").sign(key);
+        assert!(manifest.verify(key).is_ok(), "baseline must verify");
+        manifest.scope = Some("/etc".into()); // tamper: widen the scope
+        assert!(
+            matches!(
+                manifest.verify(key),
+                Err(ClusterAuthError::InvalidSignature)
+            ),
+            "a tampered scope must invalidate the signature"
+        );
+    }
+
+    #[test]
+    fn scope_is_bound_into_signature() {
+        // Two manifests identical except for scope must not share a signature,
+        // and each must reject the other's scope.
+        let key = b"cluster-key";
+        let mut a = test_manifest("t");
+        a.scope = Some("/a".into());
+        let a = a.sign(key);
+        let mut b = ClusterManifest {
+            scope: Some("/b".into()),
+            ..a.clone()
+        };
+        // Recompute b's signature would differ; but even reusing a's signature
+        // with b's scope must fail.
+        b.signature = a.signature.clone();
+        assert!(
+            b.verify(key).is_err(),
+            "a's signature must not cover b's scope"
+        );
     }
 
     #[test]

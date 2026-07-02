@@ -27,8 +27,10 @@
 //! The QUIC transport connects over TLS.  If a CA PEM string is supplied via
 //! [`ClusterTransport::new`], it is added as a trusted root so the peer's
 //! self-signed leaf certificate is accepted.  If no CA PEM is supplied,
-//! certificate verification is **disabled** (appropriate for cluster peers on
-//! a trusted LAN that haven't yet distributed their CA cert).
+//! certificate verification stays **on** by default (self-signed peers fail and
+//! the transport falls back to HTTP/2); verification is disabled only when the
+//! caller explicitly passes `allow_insecure = true`, which is MITM-able and
+//! meant only for a trusted LAN before CA distribution.
 //!
 //! # `PeerDispatch` implementation
 //!
@@ -73,9 +75,12 @@ impl ClusterTransport {
     /// * `preference` — ordered list of transport modes to try.  Use
     ///   [`default_preference`] for the recommended default.
     /// * `ca_pem` — PEM-encoded CA certificate used to verify QUIC peers.
-    ///   Pass `None` to skip certificate verification (suitable for LAN
-    ///   clusters with self-signed certs before CA distribution).
-    pub fn new(preference: Vec<TransportMode>, ca_pem: Option<&str>) -> Self {
+    /// * `allow_insecure` — when `true` **and** no `ca_pem` is supplied, QUIC
+    ///   accepts *any* peer certificate. This is MITM-able on the network and is
+    ///   never the default: without it, a QUIC client with no CA keeps normal
+    ///   verification (self-signed peers fail and the transport falls back to
+    ///   HTTP/2). Only enable it for a trusted LAN before CA distribution.
+    pub fn new(preference: Vec<TransportMode>, ca_pem: Option<&str>, allow_insecure: bool) -> Self {
         let timeout = Duration::from_secs(DEFAULT_PEER_TIMEOUT_SECS);
 
         // HTTP/1.1 — plain, no frills.
@@ -104,12 +109,28 @@ impl ClusterTransport {
             match ca_pem {
                 Some(pem) => match reqwest::tls::Certificate::from_pem(pem.as_bytes()) {
                     Ok(cert) => b = b.add_root_certificate(cert),
+                    // Fail closed: a bad CA PEM keeps normal verification on
+                    // (self-signed peers will fail) rather than trusting anyone.
                     Err(e) => warn!(
-                        "cluster-quic: could not parse CA PEM ({e}); \
-                         disabling cert verification for QUIC peers"
+                        "cluster-quic: could not parse CA PEM ({e}); keeping cert \
+                         verification ON — QUIC peers with untrusted certs will fail"
                     ),
                 },
-                None => b = b.danger_accept_invalid_certs(true),
+                None if allow_insecure => {
+                    warn!(
+                        "cluster-quic: INSECURE mode — accepting ANY QUIC peer certificate \
+                         (no CA configured). Network traffic to peers can be MITM'd. Provide a \
+                         CA PEM to secure it."
+                    );
+                    b = b.danger_accept_invalid_certs(true);
+                }
+                None => {
+                    warn!(
+                        "cluster-quic: no CA PEM configured; QUIC peers with self-signed certs \
+                         will fail verification and the transport will fall back to HTTP/2. \
+                         Provide a CA PEM, or explicitly enable insecure mode for a trusted LAN."
+                    );
+                }
             }
             b.build().unwrap_or_else(|e| {
                 warn!("cluster-quic: failed to build QUIC client ({e}); QUIC disabled");
@@ -117,9 +138,9 @@ impl ClusterTransport {
             })
         };
 
-        // Suppress unused-variable warning for ca_pem when cluster-quic is off.
+        // Suppress unused-variable warnings when cluster-quic is off.
         #[cfg(not(feature = "cluster-quic"))]
-        let _ = ca_pem;
+        let _ = (ca_pem, allow_insecure);
 
         Self {
             preference,
@@ -304,8 +325,9 @@ impl PeerDispatch for ClusterTransport {
 pub fn new_cluster_dispatch(
     preference: Vec<TransportMode>,
     ca_pem: Option<&str>,
+    allow_insecure: bool,
 ) -> Arc<dyn PeerDispatch> {
-    Arc::new(ClusterTransport::new(preference, ca_pem))
+    Arc::new(ClusterTransport::new(preference, ca_pem, allow_insecure))
 }
 
 /// Returns the default cluster transport preference order: QUIC → HTTP/2 → HTTP/1.
@@ -361,20 +383,20 @@ mod tests {
     #[test]
     fn transport_new_with_no_ca() {
         // Should not panic even with no CA and full preference list.
-        let t = ClusterTransport::new(ClusterTransport::default_preference(), None);
+        let t = ClusterTransport::new(ClusterTransport::default_preference(), None, false);
         assert_eq!(t.preference.len(), 3);
     }
 
     #[test]
     fn transport_new_with_empty_preference() {
-        let t = ClusterTransport::new(vec![], None);
+        let t = ClusterTransport::new(vec![], None, false);
         assert!(t.preference.is_empty());
     }
 
     #[test]
     fn https_url_derivation() {
         // Verify client_and_url_for produces the right URL for each mode.
-        let t = ClusterTransport::new(ClusterTransport::default_preference(), None);
+        let t = ClusterTransport::new(ClusterTransport::default_preference(), None, false);
         let http = "http://10.0.0.5:7000/tasks";
         let https = "https://10.0.0.5:7000/tasks";
 
@@ -421,7 +443,7 @@ mod tests {
             }
         });
 
-        let transport = ClusterTransport::new(vec![TransportMode::Http1], None);
+        let transport = ClusterTransport::new(vec![TransportMode::Http1], None, false);
         let resp = transport
             .post(&format!("http://127.0.0.1:{port}"), "/tasks", &"payload")
             .await

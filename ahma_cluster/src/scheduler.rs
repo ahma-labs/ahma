@@ -182,7 +182,7 @@ impl ClusterScheduler {
         Self {
             registry,
             shared_key: key_bytes,
-            transport: new_cluster_dispatch(default_transport_preference(), None),
+            transport: new_cluster_dispatch(default_transport_preference(), None, false),
             nonce_cache: NonceCache::default(),
         }
     }
@@ -198,12 +198,17 @@ impl ClusterScheduler {
     ///
     /// # async fn example() {
     /// let sched = ClusterScheduler::new(todo!(), b"key")
-    ///     .with_transport(vec![TransportMode::Http2, TransportMode::Http1], None);
+    ///     .with_transport(vec![TransportMode::Http2, TransportMode::Http1], None, false);
     /// # }
     /// ```
     #[must_use]
-    pub fn with_transport(mut self, preference: Vec<TransportMode>, ca_pem: Option<&str>) -> Self {
-        self.transport = new_cluster_dispatch(preference, ca_pem);
+    pub fn with_transport(
+        mut self,
+        preference: Vec<TransportMode>,
+        ca_pem: Option<&str>,
+        allow_insecure: bool,
+    ) -> Self {
+        self.transport = new_cluster_dispatch(preference, ca_pem, allow_insecure);
         self
     }
 
@@ -557,8 +562,11 @@ mod tests {
         reg.upsert(peer);
 
         let shared_key = b"cluster-key".to_vec();
-        let scheduler =
-            ClusterScheduler::new(reg, shared_key).with_transport(vec![TransportMode::Http1], None);
+        let scheduler = ClusterScheduler::new(reg, shared_key).with_transport(
+            vec![TransportMode::Http1],
+            None,
+            false,
+        );
 
         let manifest = base_manifest();
         let result = scheduler
