@@ -270,10 +270,8 @@ fn package_version_in_lock(lock_contents: &str, package: &str) -> Option<String>
             in_target = false;
         } else if trimmed == target {
             in_target = true;
-        } else if in_target {
-            if let Some(rest) = trimmed.strip_prefix("version = \"") {
-                return rest.strip_suffix('"').map(str::to_string);
-            }
+        } else if in_target && let Some(rest) = trimmed.strip_prefix("version = \"") {
+            return rest.strip_suffix('"').map(str::to_string);
         }
     }
     None
