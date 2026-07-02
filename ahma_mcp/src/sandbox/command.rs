@@ -272,11 +272,21 @@ impl Sandbox {
             return Ok(None);
         }
         let scopes = self.scopes().to_vec();
+        // R-NET: when the guarded egress proxy is active, confine the child's
+        // outbound TCP to the proxy port (Landlock ≥ 6.7). `None` leaves network
+        // unrestricted (restriction off / advisory tier).
+        let connect_tcp_port = self
+            .egress_proxy_addr
+            .read()
+            .ok()
+            .and_then(|g| *g)
+            .map(|addr| addr.port());
         let fd = super::landlock::landlock_ruleset_fd(
             &scopes,
             &self.read_scopes(),
             self.is_no_temp_files(),
             self.package_cache_write(),
+            connect_tcp_port,
         )?;
         if fd.is_none() {
             tracing::warn!(

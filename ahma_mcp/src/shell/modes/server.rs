@@ -131,6 +131,9 @@ async fn maybe_start_egress_proxy(
 fn network_enforcement_note() -> &'static str {
     if cfg!(target_os = "macos") {
         "Kernel-enforced (Seatbelt): direct egress that bypasses the proxy is blocked."
+    } else if cfg!(target_os = "linux") {
+        "Kernel-enforced where supported (Landlock, kernel 6.7+): outbound TCP is restricted to \
+         the proxy port. Advisory on older kernels and for UDP (see the README network limits)."
     } else {
         "Advisory: a tool that ignores HTTP_PROXY or opens a raw socket is not contained \
          (see the README network limits)."

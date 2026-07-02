@@ -11,10 +11,12 @@ fn build_landlock_ruleset(
     read_scopes: &[PathBuf],
     no_temp_files: bool,
     package_cache_write: bool,
+    connect_tcp_port: Option<u16>,
 ) -> Result<landlock::RulesetCreated> {
     use anyhow::Context;
     use landlock::{
-        ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        ABI, Access, AccessFs, AccessNet, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
+        RulesetCreatedAttr,
     };
 
     // Use V1 for maximum kernel compatibility — it includes all the core FS access
@@ -26,9 +28,19 @@ fn build_landlock_ruleset(
     let access_all = AccessFs::from_all(abi);
     let access_read = AccessFs::from_read(abi);
 
-    let mut ruleset = Ruleset::default()
+    let mut builder = Ruleset::default()
         .handle_access(access_all)
-        .context("Failed to create Landlock ruleset")?
+        .context("Failed to create Landlock ruleset")?;
+    // R-NET (child only): additionally handle TCP `connect()` so the child can be
+    // confined to the egress proxy port. Best-effort by default: on kernels < 6.7
+    // (Landlock ABI < V4) this access is silently dropped and only the filesystem
+    // rules enforce, so older kernels degrade to the advisory tier without error.
+    if connect_tcp_port.is_some() {
+        builder = builder
+            .handle_access(AccessNet::ConnectTcp)
+            .context("Failed to handle Landlock TCP-connect access")?;
+    }
+    let mut ruleset = builder
         .create()
         .context("Failed to create Landlock ruleset instance")?;
 
@@ -58,6 +70,18 @@ fn build_landlock_ruleset(
         add_landlock_temp_rules(&mut ruleset, access_all)?;
     }
 
+    // R-NET: allow outbound TCP *only* to the egress-proxy port. With this rule the
+    // only `connect()` the child may make is to the local guarded proxy; every
+    // other TCP connect is denied by the kernel, so a tool that ignores
+    // `HTTP_PROXY` cannot reach the internet directly. Port-only (Landlock cannot
+    // filter by address) and TCP-only — see the README network limits. A no-op on
+    // kernels where the access was dropped above.
+    if let Some(port) = connect_tcp_port {
+        ruleset = ruleset
+            .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
+            .context("Failed to add Landlock TCP-connect rule for the egress proxy")?;
+    }
+
     Ok(ruleset)
 }
 
@@ -81,7 +105,16 @@ pub fn enforce_landlock_sandbox(
 
     tracing::info!("Enforcing Landlock sandbox (process level)");
 
-    let ruleset = build_landlock_ruleset(scopes, read_scopes, no_temp_files, package_cache_write)?;
+    // The server process itself keeps full network: it *runs* the egress proxy,
+    // which must connect out to real destinations. The TCP-connect restriction is
+    // applied only to spawned children (see `landlock_ruleset_fd`).
+    let ruleset = build_landlock_ruleset(
+        scopes,
+        read_scopes,
+        no_temp_files,
+        package_cache_write,
+        None,
+    )?;
 
     let status = ruleset
         .restrict_self()
@@ -136,8 +169,15 @@ pub fn landlock_ruleset_fd(
     read_scopes: &[PathBuf],
     no_temp_files: bool,
     package_cache_write: bool,
+    connect_tcp_port: Option<u16>,
 ) -> Result<Option<std::os::fd::OwnedFd>> {
-    let ruleset = build_landlock_ruleset(scopes, read_scopes, no_temp_files, package_cache_write)?;
+    let ruleset = build_landlock_ruleset(
+        scopes,
+        read_scopes,
+        no_temp_files,
+        package_cache_write,
+        connect_tcp_port,
+    )?;
     Ok(ruleset.into())
 }
 
@@ -276,4 +316,25 @@ pub fn enforce_landlock_sandbox(
     _package_cache_write: bool,
 ) -> Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// The ruleset must build cleanly when a proxy port is supplied — the TCP
+    /// `connect()` access is added best-effort, so on any kernel (net-capable or
+    /// not) construction succeeds; it never turns into an error.
+    #[test]
+    fn ruleset_fd_builds_with_connect_tcp_port() {
+        let dir = tempdir().unwrap();
+        let scopes = vec![dir.path().to_path_buf()];
+        // Some(port): the R-NET child restriction path.
+        landlock_ruleset_fd(&scopes, &[], true, false, Some(34567))
+            .expect("ruleset with a connect-tcp restriction must build");
+        // None: the unrestricted path must keep working too.
+        landlock_ruleset_fd(&scopes, &[], true, false, None)
+            .expect("unrestricted ruleset must build");
+    }
 }
