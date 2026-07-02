@@ -138,7 +138,7 @@ See [docs/installation.md](docs/installation.md) for supported binary platforms 
 
 Ahma enforces **kernel-level filesystem sandboxing** by default — Landlock on Linux, Seatbelt on macOS, Job Objects on Windows. The sandbox scope is set once at startup and cannot be changed. The AI has full access within the workspace, zero access outside it, unconditionally.
 
-**Network egress** is unrestricted by default. Pass `--restrict-network` (or set `[network] restrict = true`) to route every sandboxed subprocess through a guarded local proxy that forwards only the domains in `[network] allow` (deny-all when empty) and refuses private/loopback/cloud-metadata addresses. Ahma's own web tool (`fetch_webpage`) is governed separately by the `[web]` policy.
+**Network egress** is unrestricted by default. Pass `--restrict-network` (or set `[network] restrict = true`) to route every sandboxed subprocess through a guarded local proxy that forwards only the domains in `[network] allow` (deny-all when empty) and refuses private/loopback/cloud-metadata addresses. When a subprocess reaches a domain not on the list and an MCP client capable of `elicitation/create` is attached (e.g. an IDE), the proxy raises an interactive approval prompt instead of denying outright — the human can allow it once, for the session, or persist it to `[network] allow`; declining, a timeout, or no capable client all fail safe to a deny. Ahma's own web tool (`fetch_webpage`) is governed separately by the `[web]` policy.
 
 See [docs/security-sandbox.md](docs/security-sandbox.md) for platform details, nested sandbox detection, temp directory access, and example `mcp.json` configs.
 

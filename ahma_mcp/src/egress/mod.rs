@@ -45,9 +45,10 @@
 //! ```
 
 pub mod allowlist;
+pub mod net_prompt;
 pub mod proxy;
 pub mod web_audit;
 pub mod web_prompt;
 
 pub use allowlist::EgressAllowlist;
-pub use proxy::{EgressProxy, EgressProxyConfig};
+pub use proxy::{EgressProxy, EgressProxyConfig, NetApprovalContext};

@@ -791,6 +791,7 @@ The subprocess egress sandbox is a complementary mechanism that covers HTTP traf
 - **R-WEB.16.5**: The private-range block (R-WEB.3.1) is applied by the proxy regardless of `egress.allowlist` entries.
 - **R-WEB.16.6**: QUIC (HTTP/3) connections are not intercepted by an HTTP proxy. For strict subprocess egress, HTTP/3 **should** be disabled in the subprocess environment (`AHMA_NO_HTTP3=1` or equivalent).
 - **R-WEB.16.7**: `EgressAllowlist` (Rust API in `ahma_core`) is the canonical type for managing the allowlist file. `EgressClient` (in `ahma_common`) is the canonical HTTP client for enforced requests from the ahma process itself.
+- **R-WEB.16.8** (interactive approval, R-NET): When `--restrict-network` (or `[network] restrict`) is on and a subprocess reaches a domain not in `[network] allow`, the proxy **must** raise an MCP `elicitation/create` prompt at the attached peer before denying, offering the same three-tier answer as R-WEB.5 (`once` / `session` / `always`, persisted to `[network].allow`) plus `deny`. Concurrent connections to the same in-flight domain are **not** double-prompted (R-WEB.5's dedup applies identically). When no peer is attached, the client lacks the elicitation capability, the prompt times out, or the human declines, the connection **must** fail exactly as R-WEB.16.2 specifies — indistinguishable from a real network failure. A denied or unanswerable prompt is cancelled rather than left in flight, so a later connection (e.g. once a capable client attaches) may re-ask.
 
 ---
 

@@ -19,15 +19,19 @@
 //! session.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
+use ahma_common::net_approval::{NetApprovalCoordinator, NetApprovalDecision, NetResolveOutcome};
 use ahma_harness_tools::egress_guard::is_blocked_ip;
 use anyhow::{Context, Result};
+use rmcp::service::{Peer, RoleServer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
 use super::allowlist::EgressAllowlist;
+use super::net_prompt::{NetApprovalForm, parse_answer, prompt_message};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EgressProxyConfig
@@ -46,6 +50,13 @@ pub struct EgressProxyConfig {
     /// [`ahma_harness_tools::egress_guard`]. Tests that must reach a loopback mock
     /// upstream set this `false`.
     pub block_private: bool,
+    /// Interactive network-approval context (SPEC R-NET): when a subprocess
+    /// reaches a domain not on `allowlist`, this raises an MCP
+    /// `elicitation/create` prompt at the attached peer instead of denying
+    /// outright, mirroring the `fetch_webpage` web-approval flow (R-WEB.5).
+    /// Defaults to a fresh coordinator with no peer attached, which denies
+    /// unlisted domains exactly as before this feature existed.
+    pub net_approval: NetApprovalContext,
 }
 
 impl Default for EgressProxyConfig {
@@ -53,6 +64,31 @@ impl Default for EgressProxyConfig {
         Self {
             allowlist: EgressAllowlist::default(),
             block_private: true,
+            net_approval: NetApprovalContext::default(),
+        }
+    }
+}
+
+/// Bundles the state needed to raise an interactive network-approval prompt
+/// for a domain not on the static allowlist: the session coordinator (dedup,
+/// session grants/denies) and a handle to the MCP peer to elicit against.
+/// Cheap to clone — both fields are `Arc`.
+#[derive(Debug, Clone)]
+pub struct NetApprovalContext {
+    /// Session grant/deny state and in-flight decision dedup.
+    pub coordinator: Arc<NetApprovalCoordinator>,
+    /// The connected MCP peer to prompt via `elicitation/create`. `None`
+    /// means no interactive surface is attached (yet, or ever, for
+    /// non-MCP callers like the task-tree orchestrator), so an unlisted
+    /// domain is denied outright.
+    pub peer: Arc<RwLock<Option<Peer<RoleServer>>>>,
+}
+
+impl Default for NetApprovalContext {
+    fn default() -> Self {
+        Self {
+            coordinator: Arc::new(NetApprovalCoordinator::new()),
+            peer: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -82,8 +118,9 @@ impl EgressProxy {
 
         let allowlist = Arc::new(cfg.allowlist);
         let block_private = cfg.block_private;
+        let net_approval = cfg.net_approval;
         let task = tokio::spawn(async move {
-            accept_loop(listener, allowlist, block_private).await;
+            accept_loop(listener, allowlist, block_private, net_approval).await;
         });
 
         Ok(Self {
@@ -117,13 +154,20 @@ impl EgressProxy {
 // accept loop
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn accept_loop(listener: TcpListener, allowlist: Arc<EgressAllowlist>, block_private: bool) {
+async fn accept_loop(
+    listener: TcpListener,
+    allowlist: Arc<EgressAllowlist>,
+    block_private: bool,
+    net_approval: NetApprovalContext,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let al = Arc::clone(&allowlist);
+                let net_approval = net_approval.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, al, block_private).await {
+                    if let Err(e) = handle_connection(stream, al, block_private, net_approval).await
+                    {
                         debug!("Egress proxy connection from {peer} error: {e}");
                     }
                 });
@@ -173,6 +217,7 @@ async fn handle_connection(
     mut client: TcpStream,
     allowlist: Arc<EgressAllowlist>,
     block_private: bool,
+    net_approval: NetApprovalContext,
 ) -> Result<()> {
     // Read the first line of the HTTP request to determine the method and target.
     let mut buf = vec![0u8; 4096];
@@ -188,9 +233,135 @@ async fn handle_connection(
     let first_line = request_head.lines().next().unwrap_or("").to_string();
 
     if first_line.starts_with("CONNECT ") {
-        handle_connect(client, &first_line, &buf[..n], allowlist, block_private).await
+        handle_connect(
+            client,
+            &first_line,
+            &buf[..n],
+            allowlist,
+            block_private,
+            net_approval,
+        )
+        .await
     } else {
-        handle_plain_http(client, &first_line, &buf[..n], allowlist, block_private).await
+        handle_plain_http(
+            client,
+            &first_line,
+            &buf[..n],
+            allowlist,
+            block_private,
+            net_approval,
+        )
+        .await
+    }
+}
+
+/// Decide whether an unlisted domain may proceed, raising an interactive MCP
+/// `elicitation/create` prompt at the connected peer when one is attached
+/// (SPEC R-NET; mirrors the `fetch_webpage` web-approval flow, R-WEB.5).
+/// Returns `true` when the connection should proceed — statically
+/// allowlisted, session-granted, or freshly approved — and `false` for every
+/// other outcome: no peer attached, the client cannot elicit, the prompt
+/// times out or errors, or the human declines. Fails safe throughout: any
+/// ambiguous outcome denies rather than allows.
+async fn resolve_egress_approval(
+    host: &str,
+    target: &str,
+    allowlist: &EgressAllowlist,
+    net_approval: &NetApprovalContext,
+) -> bool {
+    if allowlist.allows(host) {
+        return true;
+    }
+    if net_approval.coordinator.is_session_granted(host) {
+        return true;
+    }
+    if net_approval.coordinator.is_session_denied(host) {
+        return false;
+    }
+
+    // Dedup: a decision for this domain already in flight (a concurrent
+    // connection) is not double-prompted — deny this one; the in-flight
+    // answer will let a retry through once resolved.
+    let Some(req) = net_approval.coordinator.begin(host, target) else {
+        return false;
+    };
+
+    let peer_opt = net_approval.peer.read().unwrap().clone();
+    let elicited: Option<NetApprovalDecision> = match peer_opt {
+        None => None,
+        Some(peer) => match peer
+            .elicit_with_timeout::<NetApprovalForm>(
+                prompt_message(host, target),
+                Some(Duration::from_secs(120)),
+            )
+            .await
+        {
+            Ok(Some(form)) => Some(parse_answer(&form.decision)),
+            // Accepted with no content, or an explicit decline: remember deny.
+            Ok(None) | Err(rmcp::service::ElicitationError::UserDeclined) => {
+                Some(NetApprovalDecision::Deny)
+            }
+            // The client cannot elicit: no other surface to fall back to for
+            // subprocess egress (unlike `fetch_webpage`, this is not a
+            // TUI-routed request), so fail safe.
+            Err(rmcp::service::ElicitationError::CapabilityNotSupported) => None,
+            // Cancelled, timed out, or transport error: don't leave it
+            // pending; deny without remembering so a later connection may
+            // re-ask.
+            Err(e) => {
+                debug!("network approval prompt unavailable for '{host}': {e}");
+                net_approval.coordinator.cancel(&req.decision_id);
+                return false;
+            }
+        },
+    };
+
+    let Some(decision) = elicited else {
+        net_approval.coordinator.cancel(&req.decision_id);
+        warn!(
+            "Egress proxy: no interactive surface available to approve '{host}'; denying \
+             (add it to [network] allow in ~/.ahma/settings.toml to permit)"
+        );
+        return false;
+    };
+
+    match net_approval.coordinator.resolve(&req.decision_id, decision) {
+        NetResolveOutcome::AllowOnce { domain } => {
+            info!(domain = %domain, "network egress approved for this connection");
+            true
+        }
+        NetResolveOutcome::AllowSession { domain } => {
+            info!(domain = %domain, "network egress approved for this session");
+            true
+        }
+        NetResolveOutcome::Persist { domain } => {
+            match ahma_common::config::settings_path() {
+                Some(file) => match ahma_common::net_approval::persist_net_allow(&file, &domain) {
+                    Ok(true) => info!(
+                        domain = %domain,
+                        "network egress approved and saved to [network].allow"
+                    ),
+                    Ok(false) => info!(
+                        domain = %domain,
+                        "network egress approved (already in [network].allow)"
+                    ),
+                    Err(e) => warn!(
+                        domain = %domain,
+                        "network egress approved for the session but persisting failed: {e}"
+                    ),
+                },
+                None => warn!(
+                    "network egress approved but ~/.ahma/settings.toml is not locatable to persist"
+                ),
+            }
+            true
+        }
+        NetResolveOutcome::Denied { domain } => {
+            info!(domain = %domain, "network egress denied by user");
+            false
+        }
+        // A twin surface resolved first, or the decision vanished: fail safe.
+        NetResolveOutcome::AlreadyResolved | NetResolveOutcome::Unknown => false,
     }
 }
 
@@ -201,6 +372,7 @@ async fn handle_connect(
     _raw: &[u8],
     allowlist: Arc<EgressAllowlist>,
     block_private: bool,
+    net_approval: NetApprovalContext,
 ) -> Result<()> {
     // CONNECT api.openai.com:443 HTTP/1.1
     let target = first_line
@@ -214,7 +386,7 @@ async fn handle_connect(
         None => (target, 443),
     };
 
-    if !allowlist.allows(host) {
+    if !resolve_egress_approval(host, target, &allowlist, &net_approval).await {
         warn!("Egress proxy blocked CONNECT to {host}");
         client
             .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")
@@ -259,6 +431,7 @@ async fn handle_plain_http(
     raw: &[u8],
     allowlist: Arc<EgressAllowlist>,
     block_private: bool,
+    net_approval: NetApprovalContext,
 ) -> Result<()> {
     // Extract Host header.
     let raw_str = String::from_utf8_lossy(raw);
@@ -285,7 +458,8 @@ async fn handle_plain_http(
         None => (host_header.to_string(), 80),
     };
 
-    if !allowlist.allows(&host) {
+    let target = format!("{host}:{port}");
+    if !resolve_egress_approval(&host, &target, &allowlist, &net_approval).await {
         warn!("Egress proxy blocked HTTP {first_line} (host={host})");
         client
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
@@ -367,6 +541,7 @@ mod tests {
         let proxy = EgressProxy::start(EgressProxyConfig {
             allowlist,
             block_private: false,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -427,6 +602,7 @@ mod tests {
         EgressProxy::start(EgressProxyConfig {
             allowlist,
             block_private: false,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -611,6 +787,7 @@ mod tests {
         EgressProxy::start(EgressProxyConfig {
             allowlist,
             block_private: true,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -691,5 +868,132 @@ mod tests {
             "empty request must be handled without a response, got: {:?}",
             String::from_utf8_lossy(&resp)
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Interactive network-approval (SPEC R-NET) — proxy-level wiring.
+    //
+    // The `elicitation/create` round-trip itself requires a live MCP peer and
+    // is exercised by `net_prompt::tests` (pure mapping) and
+    // `ahma_common::net_approval::tests` (coordinator semantics); these tests
+    // cover what the proxy does around that round-trip: a domain granted for
+    // the session bypasses the static allowlist entirely, a domain denied for
+    // the session is refused without re-prompting, and — critically — a
+    // connection with no peer attached fails safe *immediately* (no 120s
+    // elicit timeout stall) and frees the dedup gate so a later connection
+    // (e.g. once a capable client attaches) may re-ask.
+    // ─────────────────────────────────────────────────────────────────────
+
+    async fn start_proxy_with_net_approval(
+        allowlist: EgressAllowlist,
+        net_approval: NetApprovalContext,
+    ) -> EgressProxy {
+        EgressProxy::start(EgressProxyConfig {
+            allowlist,
+            block_private: false,
+            net_approval,
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_session_granted_domain_bypasses_static_denylist() {
+        // The host is NOT on the static allowlist, but was already approved
+        // for the session (as if a prior connection's elicit answered
+        // `session`) — the connection must proceed without prompting again.
+        // The CONNECT target is the loopback IP itself (no DNS in a test
+        // sandbox), so that's what gets the session grant.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut buf = vec![0u8; 64];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+
+        let net_approval = NetApprovalContext::default();
+        let req = net_approval
+            .coordinator
+            .begin("127.0.0.1", "127.0.0.1:0")
+            .unwrap();
+        net_approval
+            .coordinator
+            .resolve(&req.decision_id, NetApprovalDecision::AllowSession);
+
+        let proxy = start_proxy_with_net_approval(EgressAllowlist::deny_all(), net_approval).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        let req = format!(
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n",
+            upstream_addr.port()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        let established = read_chunk(&mut client).await;
+        let established_str = String::from_utf8_lossy(&established);
+        assert!(
+            established_str.contains("200 Connection Established"),
+            "a session-granted domain must tunnel without re-prompting, got: {established_str:?}"
+        );
+
+        client.write_all(b"ping").await.unwrap();
+        let echoed = read_chunk(&mut client).await;
+        assert_eq!(&echoed[..], b"pong");
+
+        upstream_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_session_denied_domain_returns_407_without_reprompting() {
+        let net_approval = NetApprovalContext::default();
+        let req = net_approval
+            .coordinator
+            .begin("denied.example", "denied.example:443")
+            .unwrap();
+        net_approval
+            .coordinator
+            .resolve(&req.decision_id, NetApprovalDecision::Deny);
+
+        let proxy =
+            start_proxy_with_net_approval(EgressAllowlist::from_str("*"), net_approval).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        client
+            .write_all(b"CONNECT denied.example:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("407 Proxy Authentication Required"),
+            "a session-denied domain must be refused even under a `*` allowlist, got: {resp_str:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_unknown_domain_with_no_peer_denies_immediately_and_frees_dedup_gate() {
+        // No peer attached (the default `NetApprovalContext`): an unlisted
+        // domain must be denied without waiting out the 120s elicit timeout,
+        // and the in-flight decision must be freed so a second attempt is
+        // independently deniable rather than hanging on stale dedup state.
+        let proxy = start_proxy(EgressAllowlist::deny_all()).await;
+
+        for _ in 0..2 {
+            let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+            client
+                .write_all(b"CONNECT nopeer.example:443 HTTP/1.1\r\n\r\n")
+                .await
+                .unwrap();
+            let resp = tokio::time::timeout(Duration::from_secs(5), read_chunk(&mut client))
+                .await
+                .expect("must deny immediately, not stall on the elicit timeout");
+            let resp_str = String::from_utf8_lossy(&resp);
+            assert!(
+                resp_str.contains("407 Proxy Authentication Required"),
+                "got: {resp_str:?}"
+            );
+        }
     }
 }

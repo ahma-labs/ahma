@@ -50,6 +50,7 @@ pub mod file_uri;
 pub mod hook_consent;
 pub mod keepalive;
 pub mod local_tls;
+pub mod net_approval;
 pub mod observability;
 /// Transport-agnostic MCP peer factory abstraction (P6).
 pub mod peer_factory;

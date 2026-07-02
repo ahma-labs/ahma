@@ -74,9 +74,16 @@ async fn try_setup_mcp_client(config: &AppConfig) -> Result<()> {
 /// see that egress is gated, which domains are reachable, and that the containment
 /// is advisory (a tool that ignores `HTTP_PROXY` is not held by this alone —
 /// kernel-level enforcement is a separate, platform-specific step).
+///
+/// `net_approval` carries the peer handle a subprocess connection to an
+/// unlisted domain can raise an `elicitation/create` prompt against (SPEC
+/// R-NET interactive approval): the caller passes the same peer handle the
+/// MCP service populates on connect, so a prompt can reach whichever client
+/// is attached by the time a subprocess actually tries to connect.
 async fn maybe_start_egress_proxy(
     config: &AppConfig,
     sandbox: &sandbox::Sandbox,
+    net_approval: crate::egress::NetApprovalContext,
 ) -> Option<crate::egress::EgressProxy> {
     if !config.restrict_network {
         return None;
@@ -84,6 +91,7 @@ async fn maybe_start_egress_proxy(
     let allowlist = crate::egress::EgressAllowlist::from_str(&config.network_allow.join("\n"));
     let proxy = match crate::egress::EgressProxy::start(crate::egress::EgressProxyConfig {
         allowlist,
+        net_approval,
         ..Default::default()
     })
     .await
@@ -934,11 +942,6 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     // Try to wire up an HTTP MCP client proxy if mcp.json specifies one.
     try_setup_mcp_client(&config).await?;
 
-    // Route sandboxed subprocesses through the guarded egress proxy when
-    // `--restrict-network` is on (R-NET). Held for the server's lifetime — the
-    // proxy's background task is aborted when this drops at function return.
-    let _egress_proxy = maybe_start_egress_proxy(&config, &sandbox).await;
-
     // Scope-grant auto-detection: one shared coordinator drives both the adapter's
     // notifier (which emits requests) and the reporter (which resolves answers and
     // persists). The notifier delivers requests to the hub so a connected TUI can
@@ -964,6 +967,21 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         .await?;
     let service_handler = service;
     crate::register_active_service(Arc::new(service_handler.clone()));
+
+    // Route sandboxed subprocesses through the guarded egress proxy when
+    // `--restrict-network` is on (R-NET). Held for the server's lifetime — the
+    // proxy's background task is aborted when this drops at function return.
+    // Built after `service_handler` so an unlisted domain can raise an
+    // interactive `elicitation/create` prompt at whichever MCP client attaches
+    // (R-NET interactive approval): the proxy shares the service's own `peer`
+    // handle, which the handshake populates once a client connects — the
+    // sandbox does not lock (and no subprocess can spawn) until then, so
+    // starting the proxy here does not weaken the existing enforcement timing.
+    let net_approval = crate::egress::NetApprovalContext {
+        coordinator: Arc::new(ahma_common::net_approval::NetApprovalCoordinator::new()),
+        peer: service_handler.peer.clone(),
+    };
+    let _egress_proxy = maybe_start_egress_proxy(&config, &sandbox, net_approval).await;
 
     // Web-approval TUI surface (R-WEB.6): the service's own `WebApprovalCoordinator`
     // drives both the prompt delivery (via this sender) and the answer resolution
