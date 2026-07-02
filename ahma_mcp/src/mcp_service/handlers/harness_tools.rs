@@ -133,19 +133,24 @@ impl AhmaMcpService {
 
         // Consult the [web] egress policy (R-WEB). Loaded fresh so a runtime
         // `always_allow` addition takes effect without a restart (R-WEB.5.5).
-        // never_allow blocks, always_allow permits, and in strict `deny` mode an
-        // unknown domain is refused with an actionable hint (interactive approval
-        // arrives in a later PR). Every request is audited (R-WEB.9).
+        // never_allow blocks, always_allow permits; the session-approval
+        // coordinator's grants/denies (R-WEB.5) are threaded in so an approval made
+        // earlier this session takes effect without a restart. In strict `deny` mode
+        // an unknown, un-approved domain still yields Prompt — until an interactive
+        // approval surface is wired (a later PR) that resolves as a deny with an
+        // actionable hint. Every request is audited (R-WEB.9).
         {
             use crate::egress::web_audit::{self, FetchAction};
-            use ahma_common::web_policy::{WebPolicy, url_coordinates};
+            use ahma_common::web_policy::{WebDecision, WebPolicy, url_coordinates};
 
             let settings = ahma_common::config::AhmaSettings::load();
             let (policy, errors) = WebPolicy::from_settings(&settings.web);
             for e in errors {
                 tracing::warn!("ignoring invalid [web] pattern: {e}");
             }
-            let decision = policy.decide(url, &[], &[]);
+            let session_grants = self.web_approval.session_grants();
+            let session_denies = self.web_approval.session_denies();
+            let decision = policy.decide(url, &session_grants, &session_denies);
             let domain = url_coordinates(url).map_or_else(|| url.to_string(), |(_, host, _)| host);
             let ts = chrono::Local::now().to_rfc3339();
             web_audit::append(&web_audit::record(
@@ -155,6 +160,14 @@ impl AhmaMcpService {
                 &decision,
                 ts,
             ));
+            // Register an unknown domain with the coordinator so, once an approval
+            // surface exists, the prompt is raised at most once per domain. Today
+            // there is no surface, so `begin` only debounces the deny hint.
+            if let WebDecision::Prompt { domain } = &decision {
+                let _ = self
+                    .web_approval
+                    .begin(domain, url, Some("fetch_webpage".to_string()));
+            }
             if let FetchAction::Deny(reason) = web_audit::action_for(&decision) {
                 return Err(mcp_invalid_params(reason));
             }

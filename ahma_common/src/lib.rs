@@ -61,5 +61,6 @@ pub mod scope_decision;
 pub mod scope_grant;
 pub mod state_machine;
 pub mod timeouts;
+pub mod web_approval;
 pub mod web_policy;
 pub mod workspace_scope;

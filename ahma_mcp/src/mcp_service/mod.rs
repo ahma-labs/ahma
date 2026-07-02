@@ -140,6 +140,11 @@ pub struct AhmaMcpService {
     pub vault_audited_ops: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// All external MCP servers (HTTP and stdio) for agent tool routing.
     pub mcp_connections: Arc<tokio::sync::RwLock<crate::mcp_client::McpConnectionManager>>,
+    /// Session-scoped web-egress approvals (R-WEB.5). Holds the domains granted or
+    /// denied for this session and coordinates in-flight approval prompts. Its
+    /// grant/deny snapshots are threaded into the `[web]` policy decision on every
+    /// `fetch_webpage`, so a session approval takes effect without a restart.
+    pub web_approval: Arc<ahma_common::web_approval::WebApprovalCoordinator>,
 }
 
 impl AhmaMcpService {
@@ -587,6 +592,7 @@ impl AhmaMcpService {
             mcp_connections: Arc::new(tokio::sync::RwLock::new(
                 crate::mcp_client::McpConnectionManager::default(),
             )),
+            web_approval: Arc::new(ahma_common::web_approval::WebApprovalCoordinator::new()),
         };
         service.spawn_vault_audit_subscriber();
         Ok(service)
