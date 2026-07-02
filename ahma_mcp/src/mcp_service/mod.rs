@@ -145,6 +145,19 @@ pub struct AhmaMcpService {
     /// grant/deny snapshots are threaded into the `[web]` policy decision on every
     /// `fetch_webpage`, so a session approval takes effect without a restart.
     pub web_approval: Arc<ahma_common::web_approval::WebApprovalCoordinator>,
+    /// Optional sink for delivering a web-approval prompt to a connected TUI over
+    /// the daemon hub (R-WEB.6), set in daemon/server mode. When a `fetch_webpage`
+    /// hits an unknown domain and the MCP client cannot do interactive
+    /// `elicitation/create`, the request is sent here; the daemon reporter forwards
+    /// it as [`ahma_common::daemon_hub::ClientMsg::WebApprovalRequested`] and routes
+    /// the TUI's answer back into `web_approval`. `None` ⇒ no TUI surface wired.
+    pub web_approval_tx: Arc<
+        std::sync::Mutex<
+            Option<
+                tokio::sync::mpsc::UnboundedSender<ahma_common::web_approval::WebApprovalRequest>,
+            >,
+        >,
+    >,
 }
 
 impl AhmaMcpService {
@@ -593,6 +606,7 @@ impl AhmaMcpService {
                 crate::mcp_client::McpConnectionManager::default(),
             )),
             web_approval: Arc::new(ahma_common::web_approval::WebApprovalCoordinator::new()),
+            web_approval_tx: Arc::new(std::sync::Mutex::new(None)),
         };
         service.spawn_vault_audit_subscriber();
         Ok(service)
@@ -650,6 +664,17 @@ impl AhmaMcpService {
     pub fn with_web_page_fetcher(mut self, fetcher: Arc<dyn WebPageFetcher>) -> Self {
         self.web_page_fetcher = fetcher;
         self
+    }
+
+    /// Wire the daemon-hub sink that delivers web-approval prompts to a connected
+    /// TUI (R-WEB.6). Takes `&self` so it can be called after construction on the
+    /// already-shared service; the sink is stored behind the service's shared
+    /// `Arc`, so every clone sees it.
+    pub fn set_web_approval_sender(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<ahma_common::web_approval::WebApprovalRequest>,
+    ) {
+        *self.web_approval_tx.lock().unwrap() = Some(tx);
     }
 
     /// Sets a custom LLM completion service.

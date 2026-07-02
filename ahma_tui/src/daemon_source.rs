@@ -146,6 +146,24 @@ pub fn spawn_embedded_hub_source(
                                 return;
                             }
                         }
+                        Applied::WebApprovalRequested { request } => {
+                            if tx
+                                .send(SourceEvent::WebApprovalRequested { request })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Applied::WebApprovalDismiss { decision_id } => {
+                            if tx
+                                .send(SourceEvent::WebApprovalDismiss { decision_id })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
                         Applied::AgentDone => {
                             if tx.send(SourceEvent::AgentDone).await.is_err() {
                                 return;
@@ -467,6 +485,24 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
                                 return;
                             }
                         }
+                        Applied::WebApprovalRequested { request } => {
+                            if tx
+                                .send(SourceEvent::WebApprovalRequested { request })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Applied::WebApprovalDismiss { decision_id } => {
+                            if tx
+                                .send(SourceEvent::WebApprovalDismiss { decision_id })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
                         Applied::AgentDone => {
                             if tx.send(SourceEvent::AgentDone).await.is_err() {
                                 return;
@@ -554,6 +590,12 @@ enum Applied {
         request: ahma_common::scope_grant::ScopeGrantRequest,
     },
     ScopeGrantDismiss {
+        decision_id: String,
+    },
+    WebApprovalRequested {
+        request: ahma_common::web_approval::WebApprovalRequest,
+    },
+    WebApprovalDismiss {
         decision_id: String,
     },
     AgentDone,
@@ -666,8 +708,12 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
         DaemonMsg::SubmitApproval { .. } => Applied::None,
         DaemonMsg::ScopeGrantRequested { request } => Applied::ScopeGrantRequested { request },
         DaemonMsg::ScopeGrantDismiss { decision_id } => Applied::ScopeGrantDismiss { decision_id },
+        DaemonMsg::WebApprovalRequested { request } => Applied::WebApprovalRequested { request },
+        DaemonMsg::WebApprovalDismiss { decision_id } => {
+            Applied::WebApprovalDismiss { decision_id }
+        }
         // Instance-bound; a subscriber never receives it.
-        DaemonMsg::SubmitScopeGrant { .. } => Applied::None,
+        DaemonMsg::SubmitScopeGrant { .. } | DaemonMsg::SubmitWebApproval { .. } => Applied::None,
     }
 }
 

@@ -78,6 +78,15 @@ pub enum SourceEvent {
     ScopeGrantDismiss {
         decision_id: String,
     },
+    /// An unknown domain under a `deny` web policy: raise the "allow egress?" modal.
+    WebApprovalRequested {
+        request: ahma_common::web_approval::WebApprovalRequest,
+    },
+    /// Dismiss the web-approval modal for `decision_id` (a twin answered, or the
+    /// instance withdrew it).
+    WebApprovalDismiss {
+        decision_id: String,
+    },
     AgentDone,
     AgentError {
         error: String,

@@ -157,75 +157,104 @@ impl AhmaMcpService {
             return deny();
         };
 
-        // Reach the connected client, if any. No peer ⇒ CLI/headless: cannot prompt.
+        // First choice: interactive MCP `elicitation/create` (IDE clients). This
+        // yields `Some(decision)` to resolve synchronously; `None` means no MCP
+        // surface can prompt (no peer, or the client lacks the elicitation
+        // capability) and we fall through to the TUI hub path below.
         let peer = self.peer.read().unwrap().clone();
-        let Some(peer) = peer else {
-            self.web_approval.cancel(&req.decision_id);
-            return deny();
-        };
-
-        // Ask the human. A ~2-minute window keeps a fetch from hanging forever.
-        let decision = match peer
-            .elicit_with_timeout::<WebApprovalForm>(
-                prompt_message(domain, url),
-                Some(std::time::Duration::from_secs(120)),
-            )
-            .await
-        {
-            Ok(Some(form)) => parse_answer(&form.decision),
-            // Accepted with no content, or an explicit decline: remember the deny.
-            Ok(None) | Err(rmcp::service::ElicitationError::UserDeclined) => {
-                WebApprovalDecision::Deny
-            }
-            // Cancelled, timed out, or the client can't elicit: do NOT poison the
-            // session with a deny — a capable surface may ask later. Fall back.
-            Err(e) => {
-                tracing::debug!("web approval prompt unavailable for '{domain}': {e}");
-                self.web_approval.cancel(&req.decision_id);
-                return deny();
-            }
-        };
-
-        match self.web_approval.resolve(&req.decision_id, decision) {
-            WebResolveOutcome::AllowOnce { domain } => {
-                tracing::info!(domain = %domain, "web egress approved for this request");
-                FetchAction::Proceed
-            }
-            WebResolveOutcome::AllowSession { domain } => {
-                tracing::info!(domain = %domain, "web egress approved for this session");
-                FetchAction::Proceed
-            }
-            WebResolveOutcome::Persist { domain } => {
-                match ahma_common::config::settings_path() {
-                    Some(file) => {
-                        match ahma_common::web_approval::persist_web_allow(&file, &domain) {
-                            Ok(true) => tracing::info!(
-                                domain = %domain,
-                                "web egress approved and saved to [web].always_allow"
-                            ),
-                            Ok(false) => tracing::info!(
-                                domain = %domain,
-                                "web egress approved (already in [web].always_allow)"
-                            ),
-                            Err(e) => tracing::warn!(
-                                domain = %domain,
-                                "web egress approved for the session but persisting failed: {e}"
-                            ),
-                        }
-                    }
-                    None => tracing::warn!(
-                        "web egress approved but ~/.ahma/settings.toml is not locatable to persist"
-                    ),
+        let elicited: Option<WebApprovalDecision> = match peer {
+            None => None,
+            Some(peer) => match peer
+                .elicit_with_timeout::<WebApprovalForm>(
+                    prompt_message(domain, url),
+                    Some(std::time::Duration::from_secs(120)),
+                )
+                .await
+            {
+                Ok(Some(form)) => Some(parse_answer(&form.decision)),
+                // Accepted with no content, or an explicit decline: remember deny.
+                Ok(None) | Err(rmcp::service::ElicitationError::UserDeclined) => {
+                    Some(WebApprovalDecision::Deny)
                 }
-                FetchAction::Proceed
-            }
-            WebResolveOutcome::Denied { domain } => {
-                tracing::info!(domain = %domain, "web egress denied by user");
-                deny()
-            }
-            // A twin surface resolved first, or the decision vanished: fail safe.
-            WebResolveOutcome::AlreadyResolved | WebResolveOutcome::Unknown => deny(),
+                // The client cannot elicit → try the TUI surface instead.
+                Err(rmcp::service::ElicitationError::CapabilityNotSupported) => None,
+                // Cancelled, timed out, or transport error: the user dismissed it or
+                // it failed. Don't leave it pending; deny this fetch without
+                // remembering so a later request may re-ask.
+                Err(e) => {
+                    tracing::debug!("web approval prompt unavailable for '{domain}': {e}");
+                    self.web_approval.cancel(&req.decision_id);
+                    return deny();
+                }
+            },
+        };
+
+        if let Some(decision) = elicited {
+            return match self.web_approval.resolve(&req.decision_id, decision) {
+                WebResolveOutcome::AllowOnce { domain } => {
+                    tracing::info!(domain = %domain, "web egress approved for this request");
+                    FetchAction::Proceed
+                }
+                WebResolveOutcome::AllowSession { domain } => {
+                    tracing::info!(domain = %domain, "web egress approved for this session");
+                    FetchAction::Proceed
+                }
+                WebResolveOutcome::Persist { domain } => {
+                    match ahma_common::config::settings_path() {
+                        Some(file) => {
+                            match ahma_common::web_approval::persist_web_allow(&file, &domain) {
+                                Ok(true) => tracing::info!(
+                                    domain = %domain,
+                                    "web egress approved and saved to [web].always_allow"
+                                ),
+                                Ok(false) => tracing::info!(
+                                    domain = %domain,
+                                    "web egress approved (already in [web].always_allow)"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    domain = %domain,
+                                    "web egress approved for the session but persisting failed: {e}"
+                                ),
+                            }
+                        }
+                        None => tracing::warn!(
+                            "web egress approved but ~/.ahma/settings.toml is not locatable to persist"
+                        ),
+                    }
+                    FetchAction::Proceed
+                }
+                WebResolveOutcome::Denied { domain } => {
+                    tracing::info!(domain = %domain, "web egress denied by user");
+                    deny()
+                }
+                // A twin surface resolved first, or the decision vanished: fail safe.
+                WebResolveOutcome::AlreadyResolved | WebResolveOutcome::Unknown => deny(),
+            };
         }
+
+        // Second choice: deliver the prompt to a connected TUI over the daemon hub
+        // (R-WEB.6). The answer arrives asynchronously (the daemon reporter routes
+        // it back into `web_approval`), so — like a scope grant — it cannot unblock
+        // *this* fetch. Deny it with a "prompt raised, approve and retry" hint and
+        // leave the decision in flight so the TUI answer resolves it; the
+        // coordinator's dedup means the retry re-checks the session grant rather
+        // than raising a second modal.
+        let tx = self.web_approval_tx.lock().unwrap().clone();
+        if let Some(tx) = tx
+            && tx.send(req.clone()).is_ok()
+        {
+            tracing::info!(domain = %req.domain, "raised web-approval prompt in the ahma TUI");
+            return FetchAction::Deny(format!(
+                "web egress to '{d}' needs approval — a prompt was raised in the ahma TUI. \
+                 Approve it there (or run `ahma web allow {d}`), then retry.",
+                d = req.domain
+            ));
+        }
+
+        // Nothing can prompt (no MCP elicitation, no TUI): don't leak an in-flight
+        // entry — cancel so a future request may re-ask — and deny with the hint.
+        self.web_approval.cancel(&req.decision_id);
+        deny()
     }
 
     pub async fn handle_fetch_webpage(

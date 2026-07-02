@@ -52,6 +52,10 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     if state.scope_grant.is_some() {
         draw_scope_grant_modal(frame, state, theme, full);
     }
+    // The web-approval prompt is likewise a security decision; draw it on top too.
+    if state.web_approval.is_some() {
+        draw_web_approval_modal(frame, state, theme, full);
+    }
 }
 
 // ─── Chat layout ──────────────────────────────────────────────────────────────
@@ -2499,6 +2503,54 @@ fn draw_scope_grant_modal(frame: &mut Frame, state: &AppState, theme: &Theme, ar
             Span::styled("Grant read-only    ", theme.normal()),
             Span::styled("[y] ", theme.success().bold()),
             Span::styled("Grant read+write", theme.normal()),
+        ]),
+        Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
+    ];
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
+}
+
+fn draw_web_approval_modal(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    let Some(gate) = &state.web_approval else {
+        return;
+    };
+    let popup = centered_rect(76, 14, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled(" Web · allow egress? ", theme.title().bold()))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let tool = gate.tool.as_deref().unwrap_or("A tool");
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(tool.to_string(), theme.normal().bold()),
+            Span::styled(" wants to reach the domain:", theme.normal()),
+        ]),
+        Line::from(Span::styled(gate.domain.clone(), theme.success().bold())),
+        Line::from(Span::styled(format!("  {}", gate.url), theme.dim())),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Approving applies to this session; 'always' also saves it to",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(
+            "~/.ahma/settings.toml. The request that triggered this is denied — retry it.",
+            theme.dim(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [n] ", theme.failed().bold()),
+            Span::styled("Deny (default)    ", theme.normal().bold()),
+            Span::styled("[s] ", theme.pending().bold()),
+            Span::styled("Allow session    ", theme.normal()),
+            Span::styled("[a] ", theme.success().bold()),
+            Span::styled("Allow always", theme.normal()),
         ]),
         Line::from(Span::styled("  Enter / Esc = Deny", theme.dim())),
     ];

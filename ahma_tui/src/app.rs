@@ -182,6 +182,7 @@ async fn run_ratatui(
                                 || handle_help_key(key, &mut state)
                                 || handle_picker_key(key, &mut state)
                                 || handle_scope_grant_key(key, &mut state)
+                                || handle_web_approval_key(key, &mut state)
                                 || handle_approval_key(key, &mut state)
                                 || handle_chat_input_key(key, &mut state)
                             {
@@ -1743,6 +1744,87 @@ fn resolve_scope_grant(
                 "Granted read+write access to {} — restart the bridge to apply now, else \
                  it takes effect on the next server start",
                 gate.path
+            ),
+        ),
+    };
+    state.push_log(LogEntry {
+        timestamp: chrono::Local::now(),
+        level,
+        message,
+    });
+}
+
+#[cfg(feature = "tui")]
+fn handle_web_approval_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut crate::state::AppState,
+) -> bool {
+    use ahma_common::web_approval::WebApprovalDecision;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if state.web_approval.is_none() || state.text_entry_modal_open() || state.log_filter_active {
+        return false;
+    }
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('a'), KeyModifiers::NONE) => {
+            resolve_web_approval(state, WebApprovalDecision::AllowAlways);
+            true
+        }
+        (KeyCode::Char('s'), KeyModifiers::NONE) => {
+            resolve_web_approval(state, WebApprovalDecision::AllowSession);
+            true
+        }
+        (KeyCode::Char('n'), KeyModifiers::NONE) | (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
+            resolve_web_approval(state, WebApprovalDecision::Deny);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Resolve the pending web-approval prompt: send the decision to the daemon (which
+/// applies it to the live session and, for `always`, persists it) and log it. The
+/// request that raised the prompt was already denied, so the user retries it.
+#[cfg(feature = "tui")]
+fn resolve_web_approval(
+    state: &mut crate::state::AppState,
+    decision: ahma_common::web_approval::WebApprovalDecision,
+) {
+    use crate::state::{LogEntry, LogLevel};
+    use ahma_common::web_approval::WebApprovalDecision;
+
+    let Some(gate) = state.web_approval.take() else {
+        return;
+    };
+
+    send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitWebApproval {
+        decision_id: gate.decision_id,
+        decision,
+        target_instance_id: None,
+    });
+
+    let (level, message) = match decision {
+        WebApprovalDecision::Deny => (
+            LogLevel::Warn,
+            format!("Denied web access to {}", gate.domain),
+        ),
+        WebApprovalDecision::AllowOnce => (
+            LogLevel::Info,
+            format!("Allowed web access to {} for this request", gate.domain),
+        ),
+        WebApprovalDecision::AllowSession => (
+            LogLevel::Info,
+            format!(
+                "Allowed web access to {} for this session — retry the request",
+                gate.domain
+            ),
+        ),
+        WebApprovalDecision::AllowAlways => (
+            LogLevel::Info,
+            format!(
+                "Allowed web access to {} and saved it to ~/.ahma/settings.toml — retry the request",
+                gate.domain
             ),
         ),
     };
@@ -3648,6 +3730,20 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
                 state.scope_grant = None;
             }
         }
+        SourceEvent::WebApprovalRequested { request } => {
+            // Dedup happens upstream in the WebApprovalCoordinator, so duplicates
+            // never reach here; the newest request becomes the pending prompt.
+            state.web_approval = Some(crate::state::WebApprovalGate::from_request(request));
+        }
+        SourceEvent::WebApprovalDismiss { decision_id } => {
+            if state
+                .web_approval
+                .as_ref()
+                .is_some_and(|g| g.decision_id == decision_id)
+            {
+                state.web_approval = None;
+            }
+        }
         SourceEvent::AgentDone => {
             state.reset_liveness();
             state.chat.finish_stream();
@@ -4677,6 +4773,76 @@ mod tests {
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
         let handled = super::handle_scope_grant_key(
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(!handled, "no gate → not handled, key falls through");
+    }
+
+    /// Build a pending web-approval gate for the key-handler tests.
+    #[cfg(test)]
+    fn test_web_approval_gate() -> crate::state::WebApprovalGate {
+        use ahma_common::web_approval::WebApprovalRequest;
+        crate::state::WebApprovalGate::from_request(WebApprovalRequest {
+            decision_id: "web_test".to_string(),
+            domain: "api.github.com".to_string(),
+            url: "https://api.github.com/repos".to_string(),
+            tool: Some("fetch_webpage".to_string()),
+        })
+    }
+
+    /// `a`/`s` resolve to allow-always / allow-session, clear the gate, and are
+    /// consumed even with chat focus so they never land in the input box.
+    #[test]
+    fn test_web_approval_key_allow_variants() {
+        use crate::state::{AppState, Focus};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for code in [KeyCode::Char('a'), KeyCode::Char('s')] {
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            state.focus = Focus::Chat;
+            state.web_approval = Some(test_web_approval_gate());
+
+            let handled =
+                super::handle_web_approval_key(KeyEvent::new(code, KeyModifiers::NONE), &mut state);
+            assert!(
+                handled,
+                "{code:?} must be consumed by the web-approval modal"
+            );
+            assert!(state.web_approval.is_none(), "{code:?} must clear the gate");
+            assert!(
+                state.chat_input_is_empty(),
+                "{code:?} must not land in the input box"
+            );
+        }
+    }
+
+    /// Enter / Esc / `n` all resolve to the safe default Deny — Enter must never
+    /// widen egress (SPEC R-WEB.6, mirrors R5.3.1).
+    #[test]
+    fn test_web_approval_key_enter_esc_n_deny() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('n')] {
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            state.web_approval = Some(test_web_approval_gate());
+
+            let handled =
+                super::handle_web_approval_key(KeyEvent::new(code, KeyModifiers::NONE), &mut state);
+            assert!(handled, "{code:?} must be consumed (deny)");
+            assert!(state.web_approval.is_none(), "{code:?} must clear the gate");
+        }
+    }
+
+    /// With no pending gate the handler is inert so other handlers see the key.
+    #[test]
+    fn test_web_approval_key_noop_when_no_gate() {
+        use crate::state::AppState;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        let handled = super::handle_web_approval_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
             &mut state,
         );
         assert!(!handled, "no gate → not handled, key falls through");

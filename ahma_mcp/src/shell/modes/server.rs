@@ -885,6 +885,14 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     let service_handler = service;
     crate::register_active_service(Arc::new(service_handler.clone()));
 
+    // Web-approval TUI surface (R-WEB.6): the service's own `WebApprovalCoordinator`
+    // drives both the prompt delivery (via this sender) and the answer resolution
+    // (the reporter shares the same coordinator), so a TUI approval takes effect for
+    // the live session. Wired only in this daemon/server path.
+    let (web_req_tx, web_req_rx) = tokio::sync::mpsc::unbounded_channel();
+    service_handler.set_web_approval_sender(web_req_tx);
+    let web_coordinator = service_handler.web_approval.clone();
+
     // Register this stdio instance with the hub daemon so TUI can see it.
     {
         let scope_str = config
@@ -901,6 +909,10 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
             Some(crate::daemon_reporter::GrantReporting {
                 coordinator: grant_coordinator,
                 req_rx: grant_req_rx,
+            }),
+            Some(crate::daemon_reporter::WebApprovalReporting {
+                coordinator: web_coordinator,
+                req_rx: web_req_rx,
             }),
         );
     }

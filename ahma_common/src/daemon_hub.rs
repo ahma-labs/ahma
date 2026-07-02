@@ -204,6 +204,23 @@ pub enum ClientMsg {
     /// An instance announcing a scope-grant decision is resolved, so the hub can
     /// dismiss the prompt on any other TUI showing the same `decision_id`.
     ScopeGrantResolved { decision_id: String },
+    /// An instance asking every TUI to raise an "allow web access to X?" prompt for
+    /// an unknown domain under a `deny` web policy (SPEC R-WEB.6). The parallel of
+    /// [`Self::ScopeGrantRequested`] for network egress; the decision takes effect
+    /// for the session (or is persisted) rather than for a filesystem scope.
+    WebApprovalRequested {
+        request: crate::web_approval::WebApprovalRequest,
+    },
+    /// A TUI's answer to a web-approval prompt, routed back to the instance that
+    /// raised it.
+    SubmitWebApproval {
+        decision_id: String,
+        decision: crate::web_approval::WebApprovalDecision,
+        target_instance_id: Option<String>,
+    },
+    /// An instance announcing a web-approval decision is resolved, so the hub can
+    /// dismiss the prompt on any other TUI showing the same `decision_id`.
+    WebApprovalResolved { decision_id: String },
     /// Notify that the agent turn is done.
     AgentDone,
     /// Notify that the agent turn encountered an error.
@@ -281,6 +298,22 @@ pub enum DaemonMsg {
     /// Tell every TUI to dismiss the scope-grant modal for `decision_id` (a twin
     /// surface answered, or the instance withdrew it).
     ScopeGrantDismiss { decision_id: String },
+    /// Prompt every TUI to raise an "allow web access to X?" modal for an unknown
+    /// domain under a `deny` web policy (SPEC R-WEB.6). The default/Enter choice
+    /// must be the safe Deny; an approval takes effect for the session (or is
+    /// persisted), never retroactively for the request that raised it.
+    WebApprovalRequested {
+        request: crate::web_approval::WebApprovalRequest,
+    },
+    /// Forward a TUI's web-approval decision to the registered instance that raised
+    /// it, where it is resolved and (if approved) applied/persisted.
+    SubmitWebApproval {
+        decision_id: String,
+        decision: crate::web_approval::WebApprovalDecision,
+    },
+    /// Tell every TUI to dismiss the web-approval modal for `decision_id` (a twin
+    /// surface answered, or the instance withdrew it).
+    WebApprovalDismiss { decision_id: String },
     /// Notify TUI that the agent turn is done.
     AgentDone,
     /// Notify TUI that the agent turn encountered an error.
@@ -1083,6 +1116,23 @@ where
             }
         }
 
+        ClientMsg::SubmitWebApproval {
+            decision_id,
+            decision,
+            target_instance_id,
+        } => {
+            if let Some(tid) = resolve_target(&hub, target_instance_id.as_deref()).await
+                && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
+            {
+                let _ = tx
+                    .send(DaemonMsg::SubmitWebApproval {
+                        decision_id,
+                        decision,
+                    })
+                    .await;
+            }
+        }
+
         _ => {
             debug!("daemon: unexpected message, closing connection");
         }
@@ -1169,6 +1219,12 @@ async fn serve_instance<R, W>(
                     }
                     Ok(ClientMsg::ScopeGrantResolved { decision_id }) => {
                         let _ = hub.broadcast.send(DaemonMsg::ScopeGrantDismiss { decision_id });
+                    }
+                    Ok(ClientMsg::WebApprovalRequested { request }) => {
+                        let _ = hub.broadcast.send(DaemonMsg::WebApprovalRequested { request });
+                    }
+                    Ok(ClientMsg::WebApprovalResolved { decision_id }) => {
+                        let _ = hub.broadcast.send(DaemonMsg::WebApprovalDismiss { decision_id });
                     }
                     Ok(ClientMsg::ToolCallStarted { id: call_id, name, args }) => {
                         let _ = hub.broadcast.send(DaemonMsg::ToolCallStarted { id: call_id, name, args });
@@ -1572,6 +1628,53 @@ mod tests {
             },
             DaemonMsg::ScopeGrantDismiss {
                 decision_id: "dec-42".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            let back: DaemonMsg = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{msg:?}"), format!("{back:?}"));
+        }
+    }
+
+    #[test]
+    fn web_approval_messages_round_trip() {
+        use crate::web_approval::{WebApprovalDecision, WebApprovalRequest};
+
+        let request = WebApprovalRequest {
+            decision_id: "web-7".into(),
+            domain: "api.github.com".into(),
+            url: "https://api.github.com/repos".into(),
+            tool: Some("fetch_webpage".into()),
+        };
+
+        // ClientMsg side (instance → hub, and TUI → hub).
+        for msg in [
+            ClientMsg::WebApprovalRequested {
+                request: request.clone(),
+            },
+            ClientMsg::SubmitWebApproval {
+                decision_id: "web-7".into(),
+                decision: WebApprovalDecision::AllowSession,
+                target_instance_id: Some("inst-1".into()),
+            },
+            ClientMsg::WebApprovalResolved {
+                decision_id: "web-7".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            let back: ClientMsg = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{msg:?}"), format!("{back:?}"));
+        }
+
+        // DaemonMsg side (hub → TUI, and hub → instance).
+        for msg in [
+            DaemonMsg::WebApprovalRequested { request },
+            DaemonMsg::SubmitWebApproval {
+                decision_id: "web-7".into(),
+                decision: WebApprovalDecision::Deny,
+            },
+            DaemonMsg::WebApprovalDismiss {
+                decision_id: "web-7".into(),
             },
         ] {
             let json = serde_json::to_string(&msg).unwrap();

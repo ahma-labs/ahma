@@ -937,6 +937,32 @@ impl ScopeGrantGate {
     }
 }
 
+/// A pending web-egress approval prompt (SPEC R-WEB.6), the network-egress parallel
+/// of [`ScopeGrantGate`]. Rendered as a top overlay; the default/Enter choice is the
+/// safe Deny.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebApprovalGate {
+    pub decision_id: String,
+    /// The host the prompt is about (e.g. `api.github.com`).
+    pub domain: String,
+    /// The full URL that triggered the prompt, shown for context.
+    pub url: String,
+    /// The tool that requested egress, if known.
+    pub tool: Option<String>,
+}
+
+impl WebApprovalGate {
+    /// Build a gate from a hub [`ahma_common::web_approval::WebApprovalRequest`].
+    pub fn from_request(request: ahma_common::web_approval::WebApprovalRequest) -> Self {
+        Self {
+            decision_id: request.decision_id,
+            domain: request.domain,
+            url: request.url,
+            tool: request.tool,
+        }
+    }
+}
+
 // ─── Click target ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1161,6 +1187,8 @@ pub struct AppState {
     pub approval: Option<ApprovalGate>,
     /// Pending scope-grant prompt, if any (parallel to `approval`).
     pub scope_grant: Option<ScopeGrantGate>,
+    /// Pending web-egress approval prompt, if any (parallel to `scope_grant`).
+    pub web_approval: Option<WebApprovalGate>,
     pub tools_list: Vec<crate::mcp_connections::ToolInfo>,
     pub mcp_connections: McpConnectionManager,
 
@@ -1587,6 +1615,7 @@ impl AppState {
             log: VecDeque::with_capacity(LOG_RING_CAP),
             approval: None,
             scope_grant: None,
+            web_approval: None,
             tools_list: vec![],
             mcp_connections,
 

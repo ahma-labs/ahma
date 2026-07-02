@@ -19,6 +19,9 @@ use ahma_common::daemon_hub::{
 use ahma_common::scope_grant::{
     GrantCoordinator, GrantResolveOutcome, ScopeGrantRequest, persist_grant,
 };
+use ahma_common::web_approval::{
+    WebApprovalCoordinator, WebApprovalRequest, WebResolveOutcome, persist_web_allow,
+};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{debug, info, warn};
@@ -33,6 +36,19 @@ pub struct GrantReporting {
     pub coordinator: Arc<GrantCoordinator>,
     /// Stream of fresh requests to forward to the hub.
     pub req_rx: UnboundedReceiver<ScopeGrantRequest>,
+}
+
+/// The shared web-approval plumbing handed to the reporter (SPEC R-WEB.6). Parallel
+/// to [`GrantReporting`]: `coordinator` is the same
+/// [`WebApprovalCoordinator`](ahma_common::web_approval::WebApprovalCoordinator) the
+/// MCP service consults on every `fetch_webpage`, so a TUI answer routed back here
+/// takes effect for the live session. `req_rx` receives fresh requests to forward
+/// to the hub as [`ClientMsg::WebApprovalRequested`].
+pub struct WebApprovalReporting {
+    /// Resolves answers, applies session grants/denies, and persists `always`.
+    pub coordinator: Arc<WebApprovalCoordinator>,
+    /// Stream of fresh requests to forward to the hub.
+    pub req_rx: UnboundedReceiver<WebApprovalRequest>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,13 +73,14 @@ pub fn spawn_reporter(
     scope: impl Into<String> + Send + 'static,
     label: impl Into<String> + Send + 'static,
     grant: Option<GrantReporting>,
+    web: Option<WebApprovalReporting>,
 ) {
     let mode = mode.into();
     let scope = scope.into();
     let label = label.into();
 
     tokio::spawn(async move {
-        run_reporter_loop(monitor, mode, scope, label, grant).await;
+        run_reporter_loop(monitor, mode, scope, label, grant, web).await;
     });
 }
 
@@ -75,6 +92,30 @@ async fn recv_optional_grant(
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Await the next web-approval request, or pend forever when there is no receiver.
+async fn recv_optional_web(
+    rx: Option<&mut UnboundedReceiver<WebApprovalRequest>>,
+) -> Option<WebApprovalRequest> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Persist an approved `always` domain to `~/.ahma/settings.toml`. The session
+/// grant was already applied in-memory by [`WebApprovalCoordinator::resolve`]; this
+/// makes it survive restarts. Best-effort: a write failure is logged, not fatal.
+fn persist_resolved_web_allow(domain: &str) {
+    match settings_path() {
+        Some(file) => match persist_web_allow(&file, domain) {
+            Ok(true) => info!(domain, "web approval persisted to [web].always_allow"),
+            Ok(false) => info!(domain, "web approval already in [web].always_allow"),
+            Err(e) => warn!("daemon_reporter: failed to persist web allow for {domain}: {e:#}"),
+        },
+        None => warn!("daemon_reporter: cannot persist web allow (home directory unknown)"),
     }
 }
 
@@ -118,6 +159,7 @@ async fn run_reporter_loop(
     scope: String,
     label: String,
     grant: Option<GrantReporting>,
+    web: Option<WebApprovalReporting>,
 ) {
     let pid = std::process::id();
     let mut backoff_secs: u64 = 1;
@@ -128,6 +170,9 @@ async fn run_reporter_loop(
     // of one struct across two select branches.
     let grant_coordinator = grant.as_ref().map(|g| g.coordinator.clone());
     let mut grant_req_rx = grant.map(|g| g.req_rx);
+    // Same split for the web-approval plumbing.
+    let web_coordinator = web.as_ref().map(|w| w.coordinator.clone());
+    let mut web_req_rx = web.map(|w| w.req_rx);
 
     loop {
         // ── Ensure daemon is running ─────────────────────────────────────────
@@ -290,6 +335,19 @@ async fn run_reporter_loop(
                     }
                 }
 
+                // 2c. Fresh web-approval requests to forward to the hub.
+                maybe_web = recv_optional_web(web_req_rx.as_mut()) => {
+                    match maybe_web {
+                        Some(request) => {
+                            if send_msg(&mut writer, &ClientMsg::WebApprovalRequested { request }).await.is_err() {
+                                debug!("daemon_reporter: send WebApprovalRequested failed, reconnecting");
+                                closed = true;
+                            }
+                        }
+                        None => web_req_rx = None,
+                    }
+                }
+
                 // 3. Incoming messages from daemon hub
                 daemon_msg = recv_msg::<_, DaemonMsg>(&mut reader) => {
                     match daemon_msg {
@@ -347,6 +405,26 @@ async fn run_reporter_loop(
                                         let _ = send_msg(&mut writer, &ClientMsg::ScopeGrantResolved { decision_id }).await;
                                     }
                                     GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => {}
+                                }
+                            }
+                        }
+                        Ok(DaemonMsg::SubmitWebApproval { decision_id, decision }) => {
+                            debug!("daemon_reporter: received SubmitWebApproval id={decision_id} decision={decision:?}");
+                            if let Some(coord) = &web_coordinator {
+                                // resolve() applies the session grant/deny in-memory;
+                                // Persist additionally writes always_allow. Every
+                                // terminal outcome dismisses twin modals on other TUIs.
+                                match coord.resolve(&decision_id, decision) {
+                                    WebResolveOutcome::Persist { domain } => {
+                                        persist_resolved_web_allow(&domain);
+                                        let _ = send_msg(&mut writer, &ClientMsg::WebApprovalResolved { decision_id }).await;
+                                    }
+                                    WebResolveOutcome::AllowOnce { .. }
+                                    | WebResolveOutcome::AllowSession { .. }
+                                    | WebResolveOutcome::Denied { .. } => {
+                                        let _ = send_msg(&mut writer, &ClientMsg::WebApprovalResolved { decision_id }).await;
+                                    }
+                                    WebResolveOutcome::AlreadyResolved | WebResolveOutcome::Unknown => {}
                                 }
                             }
                         }
@@ -1213,6 +1291,7 @@ mod tests {
             "ws-scope".to_string(),
             "VSCode".to_string(),
             Some(grant),
+            None,
         ));
 
         // ── Register + replay ────────────────────────────────────────────────────
