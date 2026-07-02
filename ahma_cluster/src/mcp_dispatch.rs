@@ -120,17 +120,46 @@ impl PeerDispatch for McpPeerDispatch {
 
             let task_id = uuid::Uuid::new_v4().to_string();
 
-            let manifest = ClusterManifest {
+            // The handshake steps (initialize / notifications/initialized /
+            // session close) carry no attacker-influenced payload, so a
+            // session-scoped manifest without a body_hash authenticates them.
+            let session_manifest = ClusterManifest {
                 task_id: task_id.clone(),
                 tool_name: tool_name.clone(),
                 scope: None,
                 nonce: String::new(),
                 issued_at: 0,
+                body_hash: None,
                 signature: String::new(),
             }
             .sign(&shared_key);
 
-            let manifest_header_value = manifest
+            let session_manifest_header_value = session_manifest
+                .to_header_value()
+                .context("Failed to encode cluster manifest as header")?;
+
+            // The `tools/call` step carries the actual tool name *and*
+            // arguments the bridge will execute, so its manifest must be
+            // bound to the exact request body — a signature over `tool_name`
+            // alone would let a tampered body ride under a validly-signed
+            // manifest. Serialize once and reuse the same bytes for both the
+            // hash and the request body, so the bridge hashes exactly what
+            // was signed (no re-serialization that could produce different
+            // bytes).
+            let call_body_bytes =
+                serde_json::to_vec(&payload).context("Failed to serialize tools/call payload")?;
+            let call_manifest = ClusterManifest {
+                task_id: task_id.clone(),
+                tool_name: tool_name.clone(),
+                scope: None,
+                nonce: String::new(),
+                issued_at: 0,
+                body_hash: Some(ClusterManifest::hash_body(&call_body_bytes)),
+                signature: String::new(),
+            }
+            .sign(&shared_key);
+
+            let call_manifest_header_value = call_manifest
                 .to_header_value()
                 .context("Failed to encode cluster manifest as header")?;
 
@@ -161,7 +190,7 @@ impl PeerDispatch for McpPeerDispatch {
                 &mcp_url,
                 &init_body,
                 &manifest_header,
-                &manifest_header_value,
+                &session_manifest_header_value,
             )
             .await
             .context("McpPeerDispatch: initialize failed")?;
@@ -185,10 +214,10 @@ impl PeerDispatch for McpPeerDispatch {
                 "params": {}
             });
 
-            let mut notif_req = client
-                .post(&mcp_url)
-                .json(&notif_body)
-                .header(manifest_header.clone(), manifest_header_value.clone());
+            let mut notif_req = client.post(&mcp_url).json(&notif_body).header(
+                manifest_header.clone(),
+                session_manifest_header_value.clone(),
+            );
             if let Some(ref sid) = session_id {
                 notif_req = notif_req.header("mcp-session-id", sid.as_str());
             }
@@ -199,8 +228,9 @@ impl PeerDispatch for McpPeerDispatch {
             debug!(peer = %peer_addr, tool = %tool_name, "McpPeerDispatch: calling tool");
             let mut call_req = client
                 .post(&mcp_url)
-                .json(&payload)
-                .header(manifest_header.clone(), manifest_header_value.clone());
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(call_body_bytes)
+                .header(manifest_header.clone(), call_manifest_header_value.clone());
             if let Some(ref sid) = session_id {
                 call_req = call_req.header("mcp-session-id", sid.as_str());
             }
@@ -219,7 +249,10 @@ impl PeerDispatch for McpPeerDispatch {
                 let _ = client
                     .delete(&mcp_url)
                     .header("mcp-session-id", sid.as_str())
-                    .header(manifest_header.clone(), manifest_header_value.clone())
+                    .header(
+                        manifest_header.clone(),
+                        session_manifest_header_value.clone(),
+                    )
                     .send()
                     .await;
             }

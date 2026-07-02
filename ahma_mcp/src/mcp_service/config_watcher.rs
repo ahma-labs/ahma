@@ -617,7 +617,17 @@ impl AhmaMcpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::assertions::assert_eventually;
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    /// Poll interval / timeout for [`assert_eventually`] in this module's
+    /// config-watcher tests. Generous enough to absorb scheduler contention on
+    /// a busy dev machine or CI runner (the watcher's own debounce is 200ms,
+    /// plus a 2s polling-fallback cycle) without slowing the common case,
+    /// since `assert_eventually` returns as soon as the condition is true.
+    const WATCHER_TIMEOUT: Duration = Duration::from_secs(10);
+    const WATCHER_POLL: Duration = Duration::from_millis(25);
 
     // ── parse_root_uri_to_scope ──────────────────────────────────────────────
 
@@ -1098,13 +1108,15 @@ mod tests {
         let app_config = crate::shell::cli::AppConfig::default();
         service.start_config_watcher(tmp.path().to_path_buf(), app_config);
 
-        // Wait for the startup sync to complete.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        assert!(
-            service.configs.read().unwrap().contains_key("pre_existing"),
-            "pre_existing tool must be loaded by the startup sync"
-        );
+        // Wait for the startup sync to complete (polled, not a fixed sleep —
+        // a fixed delay flakes under scheduler contention).
+        assert_eventually(
+            WATCHER_TIMEOUT,
+            WATCHER_POLL,
+            "pre_existing tool loaded by the startup sync",
+            || async { service.configs.read().unwrap().contains_key("pre_existing") },
+        )
+        .await;
     }
 
     /// A new JSON file added after the watcher starts is detected and reloaded.
@@ -1115,10 +1127,10 @@ mod tests {
         let app_config = crate::shell::cli::AppConfig::default();
         service.start_config_watcher(tmp.path().to_path_buf(), app_config);
 
-        // Let the startup sync complete first.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        // Add a new tool file.
+        // No need to wait for the startup sync first: `watcher.watch(..)` is
+        // established before the startup sync runs, so a change made here
+        // queues on the (capacity-1) event channel and is processed once the
+        // watcher's debounce loop starts draining it — nothing is lost.
         tokio::fs::write(
             tmp.path().join("dynamic_tool.json"),
             r#"{"name":"dynamic_tool","description":"added dynamically","command":"echo","enabled":true}"#,
@@ -1126,13 +1138,15 @@ mod tests {
         .await
         .unwrap();
 
-        // Wait for debounce (200 ms in watcher) + reload time + margin.
-        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-
-        assert!(
-            service.configs.read().unwrap().contains_key("dynamic_tool"),
-            "dynamic_tool must be detected and loaded by the fs watcher"
-        );
+        // Wait for the watcher's debounce + reload to pick it up (polled, not
+        // a fixed sleep — a fixed delay flakes under scheduler contention).
+        assert_eventually(
+            WATCHER_TIMEOUT,
+            WATCHER_POLL,
+            "dynamic_tool detected and loaded by the fs watcher",
+            || async { service.configs.read().unwrap().contains_key("dynamic_tool") },
+        )
+        .await;
     }
 
     /// Deleting a JSON file after the watcher starts removes that tool from configs.
@@ -1151,23 +1165,29 @@ mod tests {
         let app_config = crate::shell::cli::AppConfig::default();
         service.start_config_watcher(tmp.path().to_path_buf(), app_config);
 
-        // Wait for startup sync to pick up the existing tool.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert!(
-            service.configs.read().unwrap().contains_key("remove_me"),
-            "remove_me should be loaded by startup sync"
-        );
+        // Wait for startup sync to pick up the existing tool (polled, not a
+        // fixed sleep — a fixed delay flakes under scheduler contention: the
+        // spawned watcher task may not have reached the startup-sync step
+        // yet on a busy machine).
+        assert_eventually(
+            WATCHER_TIMEOUT,
+            WATCHER_POLL,
+            "remove_me loaded by startup sync",
+            || async { service.configs.read().unwrap().contains_key("remove_me") },
+        )
+        .await;
 
         // Delete the file.
         tokio::fs::remove_file(&tool_path).await.unwrap();
 
-        // Wait for watcher to fire and reload.
-        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-
-        assert!(
-            !service.configs.read().unwrap().contains_key("remove_me"),
-            "remove_me must disappear after the file is deleted"
-        );
+        // Wait for the watcher to fire and reload.
+        assert_eventually(
+            WATCHER_TIMEOUT,
+            WATCHER_POLL,
+            "remove_me removed after the file is deleted",
+            || async { !service.configs.read().unwrap().contains_key("remove_me") },
+        )
+        .await;
     }
 
     /// Modifying a JSON file is detected and the description is updated.
@@ -1186,8 +1206,23 @@ mod tests {
         let app_config = crate::shell::cli::AppConfig::default();
         service.start_config_watcher(tmp.path().to_path_buf(), app_config);
 
-        // Wait for startup sync.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Wait for startup sync to load the original description first, so
+        // the overwrite below genuinely exercises the fs-watcher reload path
+        // rather than racing to be included in the startup sync itself.
+        assert_eventually(
+            WATCHER_TIMEOUT,
+            WATCHER_POLL,
+            "editable loaded with its original description by startup sync",
+            || async {
+                service
+                    .configs
+                    .read()
+                    .unwrap()
+                    .get("editable")
+                    .is_some_and(|c| c.description == "original")
+            },
+        )
+        .await;
 
         // Overwrite with updated description.
         tokio::fs::write(
@@ -1197,18 +1232,21 @@ mod tests {
         .await
         .unwrap();
 
-        // Wait for watcher to detect and reload.
-        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-
-        let configs = service.configs.read().unwrap();
-        let desc = configs
-            .get("editable")
-            .map(|c| c.description.as_str())
-            .unwrap_or("");
-        assert_eq!(
-            desc, "modified",
-            "description should reflect the updated file content after reload"
-        );
+        // Wait for the watcher to detect and reload.
+        assert_eventually(
+            WATCHER_TIMEOUT,
+            WATCHER_POLL,
+            "editable description updated to 'modified' after reload",
+            || async {
+                service
+                    .configs
+                    .read()
+                    .unwrap()
+                    .get("editable")
+                    .is_some_and(|c| c.description == "modified")
+            },
+        )
+        .await;
     }
 
     /// Non-JSON files (readme, txt, hidden) in the watched directory do not

@@ -23,16 +23,23 @@
 //!
 //! ## Security
 //!
-//! - Signature: HMAC-SHA256 over `task_id|tool_name|issued_at|nonce|scope`
+//! - Signature: HMAC-SHA256 over `task_id|tool_name|issued_at|nonce|scope|body_hash`
 //! - Freshness: manifests older than [`MANIFEST_MAX_AGE_SECS`] are rejected
 //! - Replay protection: each nonce is recorded in a [`ManifestNonceCache`]
+//! - Body binding: for `tools/call` requests, `body_hash` binds the manifest
+//!   to the *exact* request body (tool name **and** arguments) that was
+//!   authorized when the manifest was signed (see [`ClusterManifest::verify_body`]).
+//!   Without this, the manifest only proves "some call to `tool_name` was
+//!   authorized" — a tamperer who can rewrite the request body in transit
+//!   (or a bug that reuses a manifest across calls) could smuggle arbitrary
+//!   arguments under a validly-signed manifest.
 //!
 //! [`ClusterManifest`]: ClusterManifest
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::Mutex,
@@ -70,7 +77,13 @@ pub struct ClusterManifest {
     pub nonce: String,
     /// Unix timestamp (seconds) when this manifest was created.
     pub issued_at: u64,
-    /// HMAC-SHA256 hex over `task_id|tool_name|issued_at|nonce|scope`.
+    /// SHA-256 hex digest of the exact `tools/call` request body this manifest
+    /// authorizes, binding the signature to the tool name **and** arguments —
+    /// not just the tool name carried in [`Self::tool_name`]. `None` for the
+    /// `initialize` / `notifications/initialized` / session-close requests
+    /// that carry no attacker-influenced payload; see [`Self::verify_body`].
+    pub body_hash: Option<String>,
+    /// HMAC-SHA256 hex over `task_id|tool_name|issued_at|nonce|scope|body_hash`.
     pub signature: String,
 }
 
@@ -97,6 +110,37 @@ impl ClusterManifest {
             Ok(())
         } else {
             Err(ClusterAuthError::InvalidSignature)
+        }
+    }
+
+    /// Compute the SHA-256 hex digest of a request body, for binding a
+    /// manifest to (or checking it against) the exact bytes of a `tools/call`
+    /// request.
+    pub fn hash_body(body: &[u8]) -> String {
+        let digest = Sha256::digest(body);
+        digest.iter().fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    }
+
+    /// Verify that `body` is the exact request this manifest authorizes.
+    ///
+    /// Callers **must** invoke this for every `tools/call` request — the
+    /// signature alone only proves *some* call to `tool_name` was signed, not
+    /// which arguments. Constant-time compared, like [`Self::verify`]. Fails
+    /// if the manifest carries no `body_hash` at all: a `tools/call` manifest
+    /// must always be body-bound.
+    pub fn verify_body(&self, body: &[u8]) -> Result<(), ClusterAuthError> {
+        let Some(ref expected) = self.body_hash else {
+            return Err(ClusterAuthError::MissingBodyHash);
+        };
+        let actual = Self::hash_body(body);
+        if expected.as_bytes().ct_eq(actual.as_bytes()).into() {
+            Ok(())
+        } else {
+            Err(ClusterAuthError::BodyHashMismatch)
         }
     }
 
@@ -156,9 +200,17 @@ impl ClusterManifest {
             Some(s) => format!("s:{s}"),
             None => "n".to_string(),
         };
+        // `body_hash` MUST be included for the same reason: omitting it would
+        // let a tamperer attach an unrelated (or absent) body_hash to an
+        // otherwise-valid signature and defeat the body-binding check in
+        // `verify_body`. `None` and `Some("")` are distinguished, as with `scope`.
+        let body_hash = match &self.body_hash {
+            Some(h) => format!("b:{h}"),
+            None => "n".to_string(),
+        };
         format!(
-            "{}|{}|{}|{}|{}",
-            self.task_id, self.tool_name, self.issued_at, self.nonce, scope
+            "{}|{}|{}|{}|{}|{}",
+            self.task_id, self.tool_name, self.issued_at, self.nonce, scope, body_hash
         )
     }
 }
@@ -182,6 +234,14 @@ pub enum ClusterAuthError {
 
     #[error("Cluster manifest header missing")]
     Missing,
+
+    #[error(
+        "Cluster manifest has no body_hash — a tools/call manifest must be bound to its request body"
+    )]
+    MissingBodyHash,
+
+    #[error("Cluster manifest body_hash does not match the request body")]
+    BodyHashMismatch,
 }
 
 // ─── ManifestNonceCache ──────────────────────────────────────────────────────
@@ -253,6 +313,7 @@ mod tests {
             scope: None,
             nonce: String::new(),
             issued_at: 0,
+            body_hash: None,
             signature: String::new(),
         }
     }
@@ -299,6 +360,82 @@ mod tests {
         assert!(
             b.verify(key).is_err(),
             "a's signature must not cover b's scope"
+        );
+    }
+
+    #[test]
+    fn hash_body_is_deterministic_and_content_sensitive() {
+        let a = ClusterManifest::hash_body(b"{\"command\":\"ls\"}");
+        let b = ClusterManifest::hash_body(b"{\"command\":\"ls\"}");
+        let c = ClusterManifest::hash_body(b"{\"command\":\"rm -rf /\"}");
+        assert_eq!(a, b, "hashing the same bytes must be deterministic");
+        assert_ne!(a, c, "different bodies must hash differently");
+    }
+
+    #[test]
+    fn verify_body_accepts_matching_and_rejects_tampered_body() {
+        let key = b"cluster-key";
+        let body = br#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"run_terminal_command","arguments":{"command":"ls"}}}"#;
+        let mut manifest = test_manifest("run_terminal_command");
+        manifest.body_hash = Some(ClusterManifest::hash_body(body));
+        let manifest = manifest.sign(key);
+
+        assert!(manifest.verify(key).is_ok());
+        assert!(manifest.verify_body(body).is_ok());
+
+        let tampered = br#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"run_terminal_command","arguments":{"command":"rm -rf /"}}}"#;
+        assert!(matches!(
+            manifest.verify_body(tampered),
+            Err(ClusterAuthError::BodyHashMismatch)
+        ));
+    }
+
+    #[test]
+    fn verify_body_fails_when_manifest_has_no_body_hash() {
+        let key = b"cluster-key";
+        let manifest = test_manifest("run_terminal_command").sign(key);
+        assert!(manifest.verify(key).is_ok(), "baseline manifest is valid");
+        assert!(
+            matches!(
+                manifest.verify_body(b"anything"),
+                Err(ClusterAuthError::MissingBodyHash)
+            ),
+            "a tools/call manifest without a body_hash must never verify a body"
+        );
+    }
+
+    #[test]
+    fn body_hash_is_bound_into_signature() {
+        // A signature computed with one body_hash must not verify once the
+        // body_hash field is swapped for another — even though `verify()`
+        // alone doesn't look at the request body, the signature must still
+        // cover which body_hash it authorized.
+        let key = b"cluster-key";
+        let mut manifest = test_manifest("run_terminal_command");
+        manifest.body_hash = Some(ClusterManifest::hash_body(b"original"));
+        let manifest = manifest.sign(key);
+        assert!(manifest.verify(key).is_ok(), "baseline must verify");
+
+        let mut swapped = manifest.clone();
+        swapped.body_hash = Some(ClusterManifest::hash_body(b"attacker-controlled"));
+        assert!(
+            matches!(swapped.verify(key), Err(ClusterAuthError::InvalidSignature)),
+            "a swapped body_hash must invalidate the signature"
+        );
+    }
+
+    #[test]
+    fn missing_and_present_body_hash_are_not_interchangeable() {
+        // A manifest signed with `body_hash: None` must not verify if a
+        // body_hash is later attached (and vice versa) — the `None`/`Some`
+        // marker in the canonical payload must prevent this confusion.
+        let key = b"cluster-key";
+        let unbound = test_manifest("t").sign(key);
+        let mut forged = unbound.clone();
+        forged.body_hash = Some(ClusterManifest::hash_body(b"anything"));
+        assert!(
+            matches!(forged.verify(key), Err(ClusterAuthError::InvalidSignature)),
+            "attaching a body_hash to an unbound manifest's signature must fail"
         );
     }
 
