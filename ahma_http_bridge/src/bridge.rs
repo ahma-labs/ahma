@@ -1056,6 +1056,10 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .map_err(|e| BridgeError::HttpServer(format!("Failed to bind Unix socket: {}", e)))?;
 
+    // Restrict to owner-only (0600) so other local users cannot connect and drive
+    // the bridge. No-op for abstract sockets (leading NUL).
+    ahma_common::daemon_hub::restrict_unix_socket_permissions(std::path::Path::new(&socket_path));
+
     info!("HTTP bridge listening on Unix socket: {}", raw_socket_path);
     info!(
         "MCP endpoint (POST): http+unix://{}{}",

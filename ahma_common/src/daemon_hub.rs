@@ -794,12 +794,37 @@ pub async fn try_start_hub_server_at(socket_path: PathBuf) -> Result<Option<Embe
 
 // ── Unix bind/accept ──────────────────────────────────────────────────────────
 
+/// Restrict a filesystem-backed Unix socket to owner-only (mode `0600`) so that
+/// no other local user can `connect()` and drive the server (which executes
+/// shell/build commands). Left to the process umask otherwise, a lax umask
+/// (0, common in some containers/CI) yields a world-connectable socket.
+///
+/// No-op for Linux abstract-namespace sockets (path begins with NUL), which have
+/// no filesystem entry to chmod. Best-effort: a failure is logged, not fatal.
+#[cfg(unix)]
+pub fn restrict_unix_socket_permissions(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    if path.as_os_str().as_bytes().first() == Some(&0) {
+        return; // abstract socket — no filesystem permissions apply
+    }
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        warn!(
+            "failed to chmod 0600 unix socket {}: {e} (other local users may be able to connect)",
+            path.display()
+        );
+    }
+}
+
 #[cfg(unix)]
 async fn bind_unix(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
     use tokio::net::UnixListener;
     loop {
         match UnixListener::bind(path) {
-            Ok(l) => return Ok(l),
+            Ok(l) => {
+                restrict_unix_socket_permissions(path);
+                return Ok(l);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 // Check if there is actually a live daemon.
                 match tokio::net::UnixStream::connect(path).await {
@@ -829,7 +854,10 @@ async fn try_bind_unix(path: &std::path::Path) -> Result<Option<tokio::net::Unix
     use tokio::net::UnixListener;
     loop {
         match UnixListener::bind(path) {
-            Ok(l) => return Ok(Some(l)),
+            Ok(l) => {
+                restrict_unix_socket_permissions(path);
+                return Ok(Some(l));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 match tokio::net::UnixStream::connect(path).await {
                     Ok(_) => {
@@ -1258,6 +1286,30 @@ fn uuid_v4() -> String {
 mod tests {
     use super::*;
     use tokio::io::BufReader;
+
+    /// A filesystem-backed Unix socket must end up mode 0600, regardless of the
+    /// process umask, so no other local user can connect and drive the server.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restrict_unix_socket_permissions_sets_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("t.sock");
+        let _listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        restrict_unix_socket_permissions(&sock);
+        let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "socket must be owner-only, got {mode:o}");
+    }
+
+    /// An abstract-namespace path (leading NUL) has no filesystem entry, so the
+    /// helper must be a no-op and never error.
+    #[cfg(unix)]
+    #[test]
+    fn restrict_unix_socket_permissions_ignores_abstract() {
+        use std::os::unix::ffi::OsStrExt;
+        let p = std::path::Path::new(std::ffi::OsStr::from_bytes(b"\0abstract-name"));
+        restrict_unix_socket_permissions(p); // must not panic / error
+    }
 
     // ── SubmitPrompt routing ──────────────────────────────────────────────────
 
