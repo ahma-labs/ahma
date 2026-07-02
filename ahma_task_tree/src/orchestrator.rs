@@ -629,7 +629,12 @@ impl TaskTreeOrchestrator {
         let proxy = if let Some(ref domains) = parent_domains {
             info!("Starting egress proxy restricted to domains: {:?}", domains);
             let allowlist = EgressAllowlist::from_str(&domains.join("\n"));
-            let proxy_config = EgressProxyConfig { allowlist };
+            // block_private defaults to true: an allowlisted domain that resolves
+            // to a private/loopback address is refused at connect time (SSRF).
+            let proxy_config = EgressProxyConfig {
+                allowlist,
+                ..Default::default()
+            };
             let p = EgressProxy::start(proxy_config).await?;
             Some(p)
         } else {

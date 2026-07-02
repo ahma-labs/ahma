@@ -21,6 +21,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ahma_harness_tools::egress_guard::is_blocked_ip;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -33,10 +34,27 @@ use super::allowlist::EgressAllowlist;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Configuration for an egress proxy instance.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EgressProxyConfig {
     /// Allowlist controlling which domains may be forwarded.
     pub allowlist: EgressAllowlist,
+    /// When `true` (the default), a forwarded request whose target host resolves
+    /// to a private/loopback/link-local/cloud-metadata address is refused *at
+    /// connect time on the resolved IP* — closing the DNS-rebinding hole where an
+    /// allowlisted domain flips its DNS to `127.0.0.1` or `169.254.169.254` after
+    /// the hostname passes the allowlist (SSRF). Mirrors `block_private` in
+    /// [`ahma_harness_tools::egress_guard`]. Tests that must reach a loopback mock
+    /// upstream set this `false`.
+    pub block_private: bool,
+}
+
+impl Default for EgressProxyConfig {
+    fn default() -> Self {
+        Self {
+            allowlist: EgressAllowlist::default(),
+            block_private: true,
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,8 +81,9 @@ impl EgressProxy {
         info!("Egress proxy listening on {local_addr}");
 
         let allowlist = Arc::new(cfg.allowlist);
+        let block_private = cfg.block_private;
         let task = tokio::spawn(async move {
-            accept_loop(listener, allowlist).await;
+            accept_loop(listener, allowlist, block_private).await;
         });
 
         Ok(Self {
@@ -98,13 +117,13 @@ impl EgressProxy {
 // accept loop
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn accept_loop(listener: TcpListener, allowlist: Arc<EgressAllowlist>) {
+async fn accept_loop(listener: TcpListener, allowlist: Arc<EgressAllowlist>, block_private: bool) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let al = Arc::clone(&allowlist);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, al).await {
+                    if let Err(e) = handle_connection(stream, al, block_private).await {
                         debug!("Egress proxy connection from {peer} error: {e}");
                     }
                 });
@@ -118,7 +137,43 @@ async fn accept_loop(listener: TcpListener, allowlist: Arc<EgressAllowlist>) {
     }
 }
 
-async fn handle_connection(mut client: TcpStream, allowlist: Arc<EgressAllowlist>) -> Result<()> {
+/// Resolve `host:port` and, when `block_private`, drop any address in a
+/// private/loopback/link-local/cloud-metadata range. Returns the vetted socket
+/// addresses to connect to (so the connection targets an IP that was actually
+/// checked — no second resolution that could rebind), or an error string when the
+/// name does not resolve or resolves *only* to blocked addresses.
+async fn vetted_addrs(
+    host: &str,
+    port: u16,
+    block_private: bool,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DNS resolution of '{host}' failed: {e}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("'{host}' resolved to no addresses"));
+    }
+    if !block_private {
+        return Ok(addrs);
+    }
+    let allowed: Vec<SocketAddr> = addrs
+        .into_iter()
+        .filter(|a| !is_blocked_ip(&a.ip()))
+        .collect();
+    if allowed.is_empty() {
+        return Err(format!(
+            "'{host}' resolves only to private/loopback/link-local addresses (SSRF protection)"
+        ));
+    }
+    Ok(allowed)
+}
+
+async fn handle_connection(
+    mut client: TcpStream,
+    allowlist: Arc<EgressAllowlist>,
+    block_private: bool,
+) -> Result<()> {
     // Read the first line of the HTTP request to determine the method and target.
     let mut buf = vec![0u8; 4096];
     let n = client
@@ -133,9 +188,9 @@ async fn handle_connection(mut client: TcpStream, allowlist: Arc<EgressAllowlist
     let first_line = request_head.lines().next().unwrap_or("").to_string();
 
     if first_line.starts_with("CONNECT ") {
-        handle_connect(client, &first_line, &buf[..n], allowlist).await
+        handle_connect(client, &first_line, &buf[..n], allowlist, block_private).await
     } else {
-        handle_plain_http(client, &first_line, &buf[..n], allowlist).await
+        handle_plain_http(client, &first_line, &buf[..n], allowlist, block_private).await
     }
 }
 
@@ -145,6 +200,7 @@ async fn handle_connect(
     first_line: &str,
     _raw: &[u8],
     allowlist: Arc<EgressAllowlist>,
+    block_private: bool,
 ) -> Result<()> {
     // CONNECT api.openai.com:443 HTTP/1.1
     let target = first_line
@@ -152,7 +208,11 @@ async fn handle_connect(
         .nth(1)
         .context("CONNECT missing target")?;
 
-    let host = target.split(':').next().unwrap_or(target);
+    // Target is `host:port`; the port is required for CONNECT but default to 443.
+    let (host, port) = match target.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().unwrap_or(443)),
+        None => (target, 443),
+    };
 
     if !allowlist.allows(host) {
         warn!("Egress proxy blocked CONNECT to {host}");
@@ -162,9 +222,25 @@ async fn handle_connect(
         return Ok(());
     }
 
+    // The hostname is allowlisted, but resolve it and vet the IP before
+    // connecting — an allowlisted domain must not tunnel to a private/loopback
+    // address via DNS rebinding (SSRF).
+    let addrs = match vetted_addrs(host, port, block_private).await {
+        Ok(a) => a,
+        Err(reason) => {
+            warn!("Egress proxy blocked CONNECT to {host}: {reason}");
+            client
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+
     debug!("Egress proxy: CONNECT {target} allowed");
 
-    let mut upstream = TcpStream::connect(target)
+    let mut upstream = TcpStream::connect(addrs.as_slice())
         .await
         .with_context(|| format!("Failed to connect to upstream {target}"))?;
 
@@ -182,6 +258,7 @@ async fn handle_plain_http(
     first_line: &str,
     raw: &[u8],
     allowlist: Arc<EgressAllowlist>,
+    block_private: bool,
 ) -> Result<()> {
     // Extract Host header.
     let raw_str = String::from_utf8_lossy(raw);
@@ -216,13 +293,25 @@ async fn handle_plain_http(
         return Ok(());
     }
 
+    // Vet the resolved IP before connecting (see `handle_connect`): an allowlisted
+    // host must not reach a private/loopback address via DNS rebinding (SSRF).
+    let addrs = match vetted_addrs(&host, port, block_private).await {
+        Ok(a) => a,
+        Err(reason) => {
+            warn!("Egress proxy blocked HTTP {first_line} (host={host}): {reason}");
+            client
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await?;
+            return Ok(());
+        }
+    };
+
     debug!("Egress proxy: HTTP {first_line} allowed (host={host}, port={port})");
 
-    // Connect to the host on the specified port.
-    let upstream_addr = format!("{host}:{port}");
-    let mut upstream = TcpStream::connect(&upstream_addr)
+    // Connect to a vetted resolved address on the specified port.
+    let mut upstream = TcpStream::connect(addrs.as_slice())
         .await
-        .with_context(|| format!("Failed to connect to upstream {upstream_addr}"))?;
+        .with_context(|| format!("Failed to connect to upstream {host}:{port}"))?;
 
     // Forward the buffered request then splice the connection.
     upstream.write_all(raw).await?;
@@ -274,9 +363,13 @@ mod tests {
         let upstream_port = upstream_addr.port();
 
         let allowlist = EgressAllowlist::from_str("127.0.0.1");
-        let proxy = EgressProxy::start(EgressProxyConfig { allowlist })
-            .await
-            .unwrap();
+        // Loopback upstream: opt out of the private-range block for this test.
+        let proxy = EgressProxy::start(EgressProxyConfig {
+            allowlist,
+            block_private: false,
+        })
+        .await
+        .unwrap();
 
         let upstream_task = tokio::spawn(async move {
             let (mut stream, _) = upstream.accept().await.unwrap();
@@ -328,10 +421,15 @@ mod tests {
         resp
     }
 
+    /// Start a proxy with the private-range block **off** so tests can use
+    /// loopback upstreams. Rebind-block tests below opt back in explicitly.
     async fn start_proxy(allowlist: EgressAllowlist) -> EgressProxy {
-        EgressProxy::start(EgressProxyConfig { allowlist })
-            .await
-            .unwrap()
+        EgressProxy::start(EgressProxyConfig {
+            allowlist,
+            block_private: false,
+        })
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -505,6 +603,77 @@ mod tests {
         assert!(
             resp_str.contains("403 Forbidden"),
             "bad port should fall back and host be blocked, got: {resp_str:?}"
+        );
+    }
+
+    /// Start a proxy with the private-range block **on** (production default).
+    async fn start_guarded_proxy(allowlist: EgressAllowlist) -> EgressProxy {
+        EgressProxy::start(EgressProxyConfig {
+            allowlist,
+            block_private: true,
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_rebind_to_loopback_blocked() {
+        // The hostname is on the allowlist, but it resolves to a loopback address.
+        // With the private-range guard on (default), the CONNECT must be refused at
+        // the resolved IP — this is the DNS-rebinding / SSRF case (R-WEB.3).
+        let proxy = start_guarded_proxy(EgressAllowlist::from_str("localhost")).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        client
+            .write_all(b"CONNECT localhost:8080 HTTP/1.1\r\nHost: localhost:8080\r\n\r\n")
+            .await
+            .unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("407 Proxy Authentication Required"),
+            "an allowlisted host resolving to loopback must be refused, got: {resp_str:?}"
+        );
+        assert!(
+            !resp_str.contains("200 Connection Established"),
+            "must not tunnel to a loopback address"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_rebind_to_loopback_blocked() {
+        // Same as above for the plain-HTTP path: allowlisted host, loopback IP → 403.
+        let proxy = start_guarded_proxy(EgressAllowlist::from_str("localhost")).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        client
+            .write_all(b"GET http://localhost/ HTTP/1.1\r\nHost: localhost:8080\r\n\r\n")
+            .await
+            .unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("403 Forbidden"),
+            "an allowlisted host resolving to loopback must be refused, got: {resp_str:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_ip_literal_to_metadata_blocked() {
+        // A subprocess that CONNECTs straight to the cloud-metadata IP (allowlisted
+        // via `*`) is still refused by the resolved-IP guard.
+        let proxy = start_guarded_proxy(EgressAllowlist::from_str("*")).await;
+        let mut client = TcpStream::connect(proxy.local_addr).await.unwrap();
+        client
+            .write_all(b"CONNECT 169.254.169.254:80 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        let resp = read_chunk(&mut client).await;
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.contains("407 Proxy Authentication Required"),
+            "the cloud-metadata IP must be refused even under a `*` allowlist, got: {resp_str:?}"
         );
     }
 

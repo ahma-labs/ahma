@@ -12,9 +12,15 @@
 //!
 //! ## Security properties
 //!
-//! - The kernel FS sandbox prevents the subprocess from modifying its own
-//!   `/etc/hosts` or `/etc/resolv.conf`, so DNS rebinding cannot be used to
-//!   route traffic around the proxy.
+//! - The allowlist check is on the hostname, but the proxy then **resolves the
+//!   host and refuses any connection to a private/loopback/link-local/cloud-
+//!   metadata IP** (`block_private`, on by default). It connects to the exact
+//!   address it vetted, so an allowlisted domain cannot DNS-rebind to
+//!   `127.0.0.1` or `169.254.169.254` between the check and the connect. This
+//!   reuses [`ahma_harness_tools::egress_guard::is_blocked_ip`], the same guard
+//!   `fetch_webpage` uses.
+//! - The kernel FS sandbox additionally prevents the subprocess from modifying
+//!   its own `/etc/hosts` or `/etc/resolv.conf`.
 //! - The proxy is bound to `127.0.0.1` only; no external network access.
 //! - Each task gets a distinct port allocated by the OS (`0`), preventing
 //!   cross-task traffic snooping.
