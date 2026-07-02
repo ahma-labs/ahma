@@ -372,3 +372,16 @@ async fn handler_autonomous_agent_does_not_self_persist_on_confirm() {
     // tests in `ahma_common::scope_grant`; it is not exercised here because the
     // in-process test service does not isolate HOME and would write real settings.
 }
+
+#[test]
+fn grant_approved_accepts_only_explicit_approvals() {
+    use super::grant_approved;
+    for yes in ["approve", "Approve", "  ALLOW ", "yes", "grant", "ok"] {
+        assert!(grant_approved(yes), "'{yes}' should approve");
+    }
+    // Fail-safe: anything else — including empty, garbage, or a deny — is not an
+    // approval, so a misbehaving client can never widen the sandbox.
+    for no in ["", "deny", "no", "later", "approved?", "rm -rf", "🤷"] {
+        assert!(!grant_approved(no), "'{no}' must NOT approve");
+    }
+}

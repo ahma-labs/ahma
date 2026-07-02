@@ -17,16 +17,19 @@
 //!    credential directories (`~/.ssh`, `~/.aws`, …), `~/.ahma` itself, and OS
 //!    system directories are refused **even with `confirm: true`**. The model
 //!    cannot override this; only a human editing the file by hand can.
-//! 2. **A human decision, not the model's word.** `confirm: true` self-persists
-//!    only for external clients (Cursor, VS Code, …) that gate every tool call
-//!    behind a human — there, approving the call *is* the human decision. For the
-//!    autonomous in-process agent ([`McpClientType::Ahma`](crate::client_type::McpClientType)),
-//!    which auto-approves its own calls, `confirm: true` does **not** persist:
-//!    the request is routed to the human approval surface (the TUI grant modal,
-//!    or an actionable log/CLI hint) and only a human key-press writes it. The
-//!    model cannot forge its client type (it is set by the connecting client at
-//!    MCP init), so this gate is real. This closes the autonomous self-grant
-//!    hole where the agent could set `confirm: true` itself.
+//! 2. **A human decision, not the model's word.** For the autonomous in-process
+//!    agent ([`McpClientType::Ahma`](crate::client_type::McpClientType)), which
+//!    auto-approves its own calls, `confirm: true` does **not** persist: the
+//!    request is routed to the human approval surface (the TUI grant modal, or an
+//!    actionable log/CLI hint) and only a human key-press writes it. For an
+//!    external client (Cursor, VS Code, …), `confirm: true` raises an MCP
+//!    `elicitation/create` prompt when the client supports it, and persists only
+//!    on an explicit human approval — closing the hole where a *headless* external
+//!    client that does not gate its own calls could self-grant. Only when the
+//!    client cannot elicit does it fall back to a direct persist (a gating client
+//!    approved the call itself); a decline or timeout never persists. The model
+//!    cannot forge its client type (it is set by the connecting client at MCP
+//!    init), so these gates are real.
 //! 3. **A two-phase confirm**. Without `confirm: true` the tool only *previews*
 //!    (writes nothing) and shows the exact file and line. The default is Deny.
 //!
@@ -169,6 +172,46 @@ impl AhmaMcpService {
                 access,
                 &settings_file,
                 raised,
+            )));
+        }
+
+        // External client + `confirm: true`. The pre-existing model trusts that the
+        // client gated this tool call behind a human. That assumption breaks for a
+        // *headless* external client that auto-approves its own calls. So when the
+        // client supports MCP elicitation, raise a real human yes/no prompt and
+        // persist only on approval — closing the headless self-grant hole. When the
+        // client cannot elicit we fall back to the pre-existing direct persist (a
+        // gating client like Cursor approved the call itself); a decline, timeout,
+        // or transport error never persists.
+        let human_approved = {
+            let peer = self.peer.read().unwrap().clone();
+            match peer {
+                None => true, // no peer to ask; pre-existing trust model
+                Some(peer) => match peer
+                    .elicit_with_timeout::<ScopeGrantForm>(
+                        grant_prompt_message(&path, access, &settings_file, &line, &risk),
+                        Some(std::time::Duration::from_secs(120)),
+                    )
+                    .await
+                {
+                    Ok(Some(form)) => grant_approved(&form.decision),
+                    // Accepted with no content, or an explicit decline: do not grant.
+                    Ok(None) | Err(rmcp::service::ElicitationError::UserDeclined) => false,
+                    // Client cannot elicit → fall back to the pre-existing behavior.
+                    Err(rmcp::service::ElicitationError::CapabilityNotSupported) => true,
+                    // Cancelled, timed out, or transport error: never persist on doubt.
+                    Err(e) => {
+                        tracing::debug!("sandbox_grant elicitation unavailable: {e}");
+                        false
+                    }
+                },
+            }
+        };
+        if !human_approved {
+            return Ok(common::text_result(declined_text(
+                &path,
+                access,
+                &settings_file,
             )));
         }
 
@@ -540,6 +583,71 @@ fn success_text(
         high_note = high_note,
         file = settings_file.display(),
         line = line,
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Interactive human approval via MCP elicitation (external clients)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The form an elicitation-capable external client renders to approve or deny a
+/// `sandbox_grant`. A single choice field; rmcp auto-generates the JSON schema.
+/// The value is mapped by [`grant_approved`], which **fails safe** — anything that
+/// is not an explicit approval is a deny, so a misbehaving client can never widen
+/// the sandbox by returning garbage.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct ScopeGrantForm {
+    /// `approve` to persist the grant, or `deny` to refuse. The default is deny.
+    pub decision: String,
+}
+
+rmcp::elicit_safe!(ScopeGrantForm);
+
+/// Whether the client's raw choice is an explicit approval. Lenient on spelling
+/// (case-insensitive, trims whitespace, accepts a few synonyms) but fails safe:
+/// anything unrecognized — including an empty string — is **not** an approval.
+pub fn grant_approved(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "approve" | "allow" | "yes" | "grant" | "ok"
+    )
+}
+
+/// The human-facing prompt shown at the elicitation surface. States the exact
+/// path, access, risk banner, and the line that would be written, so the operator
+/// can judge the grant before approving.
+fn grant_prompt_message(
+    path: &Path,
+    access: ScopeAccess,
+    settings_file: &Path,
+    line: &str,
+    risk: &GrantRisk,
+) -> String {
+    format!(
+        "Grant {access} sandbox access to '{path}'?\n\n\
+         {banner}\n\n\
+         This appends to {file} (outside every sandbox scope) and takes effect on the \
+         next server start:\n  {line}\n\n\
+         Answer 'approve' to persist, or 'deny' to refuse (the default).",
+        access = access.label(),
+        path = path.display(),
+        banner = risk_banner(risk),
+        file = settings_file.display(),
+        line = line,
+    )
+}
+
+/// Message returned to an external client when the human declined the elicitation
+/// prompt (or it could not be answered): nothing was written.
+fn declined_text(path: &Path, access: ScopeAccess, settings_file: &Path) -> String {
+    format!(
+        "Not granted — the human declined the prompt, so nothing was written.\n\n\
+         Requested {access} access to\n  {path}\n\n\
+         Nothing was appended to {file}. Re-run `sandbox_grant` with `confirm: true` to \
+         prompt again, or the human can run `ahma sandbox grant {path}` directly.",
+        access = access.label(),
+        path = path.display(),
+        file = settings_file.display(),
     )
 }
 
