@@ -249,7 +249,13 @@ mod seatbelt_profile_tests {
     fn test_seatbelt_profile_emits_credential_read_denies_in_order() {
         let scope = TempDir::new().unwrap();
         let secret = TempDir::new().unwrap();
-        let secret_path = secret.path().to_string_lossy().into_owned();
+        // The emitted rule is canonicalized (e.g. macOS `/var` -> `/private/var`)
+        // so Seatbelt's kernel-side subpath matcher actually matches it; assert
+        // against the same canonical form rather than the raw TempDir path.
+        let secret_path = dunce::canonicalize(secret.path())
+            .unwrap_or_else(|_| secret.path().to_path_buf())
+            .to_string_lossy()
+            .into_owned();
 
         // nextest runs each test in its own process, so this global is isolated.
         ahma_mcp::sandbox::set_credential_read_denies(vec![secret.path().to_path_buf()]);
