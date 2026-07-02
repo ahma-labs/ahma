@@ -22,6 +22,7 @@
 //! always uses the strict (`true`) default.
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -29,6 +30,51 @@ use reqwest::redirect;
 
 /// Maximum redirects followed before failing the request.
 const MAX_REDIRECTS: usize = 10;
+
+/// Decides whether a **cross-domain** redirect hop may be followed (SPEC R-WEB.8).
+///
+/// The SSRF resolver already blocks any hop that resolves to a private address,
+/// but it says nothing about a hop to a *different public domain*: an approved
+/// `api.github.com` that returns `302 Location: https://evil.example/` would
+/// otherwise be followed, laundering an unapproved domain through an approved
+/// one. This guard closes that hole. The `origin_host` (the host of the URL the
+/// tool actually requested) is always permitted; every other host is consulted
+/// through `allow`, which the caller wires to the live `[web]` policy so a
+/// redirect target is followed only if the policy would independently approve it.
+#[derive(Clone)]
+pub struct RedirectDomainGuard {
+    origin_host: String,
+    allow: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+impl RedirectDomainGuard {
+    /// Build a guard for a request whose original host is `origin_host`. `allow`
+    /// returns `true` for any other host the caller's policy independently
+    /// approves as a redirect target.
+    pub fn new(
+        origin_host: impl Into<String>,
+        allow: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    ) -> Self {
+        Self {
+            origin_host: origin_host.into(),
+            allow,
+        }
+    }
+
+    /// Whether a redirect to `host` may be followed: the origin host itself
+    /// (case-insensitive) always may; any other host must be approved by `allow`.
+    fn permits(&self, host: &str) -> bool {
+        host.eq_ignore_ascii_case(&self.origin_host) || (self.allow)(host)
+    }
+}
+
+impl std::fmt::Debug for RedirectDomainGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedirectDomainGuard")
+            .field("origin_host", &self.origin_host)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Return `true` if `ip` is in a range that outbound tool requests must never
 /// reach: loopback, RFC-1918 private, link-local / cloud-metadata
@@ -100,9 +146,14 @@ impl Resolve for GuardedResolver {
     }
 }
 
-/// Redirect policy: cap the chain and reject any redirect whose target host is a
-/// blocked IP *literal* (hostname targets are re-checked by the resolver).
-fn redirect_policy(block_private: bool) -> redirect::Policy {
+/// Redirect policy: cap the chain, reject any redirect whose target host is a
+/// blocked IP *literal* (hostname targets are re-checked by the resolver), and —
+/// when a [`RedirectDomainGuard`] is supplied — reject a cross-domain hop to a
+/// host the `[web]` policy would not approve (R-WEB.8).
+fn redirect_policy(
+    block_private: bool,
+    domain_guard: Option<RedirectDomainGuard>,
+) -> redirect::Policy {
     redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= MAX_REDIRECTS {
             return attempt.error(anyhow!("too many redirects (>{MAX_REDIRECTS})"));
@@ -117,6 +168,21 @@ fn redirect_policy(block_private: bool) -> redirect::Policy {
         if let Some(ip) = blocked {
             return attempt.error(anyhow!(
                 "egress blocked: redirect to private/loopback address {ip} (SSRF protection)"
+            ));
+        }
+        // R-WEB.8: a redirect to a *new* domain does not inherit the source
+        // domain's approval. We cannot raise an interactive prompt inside this
+        // synchronous callback, so an unapproved cross-domain hop is refused with
+        // an actionable message rather than followed.
+        if let Some(guard) = &domain_guard
+            && let Some(host) = attempt.url().host_str()
+            && !guard.permits(host)
+        {
+            let host = host.to_string();
+            return attempt.error(anyhow!(
+                "egress blocked: redirect to '{host}' is a different domain than the approved \
+                 request and the [web] policy does not approve it (R-WEB.8). To allow it, run \
+                 `ahma web allow {host}` and retry."
             ));
         }
         attempt.follow()
@@ -149,11 +215,16 @@ pub fn check_url(url: &str, block_private: bool) -> Result<()> {
 }
 
 /// Build a [`reqwest::Client`] whose DNS resolution and redirect handling are
-/// guarded against SSRF. `block_private` should be `true` for all tool code.
-pub fn guarded_client(block_private: bool) -> reqwest::Result<reqwest::Client> {
+/// guarded against SSRF, and — when `domain_guard` is set — against cross-domain
+/// redirect laundering (R-WEB.8). `block_private` should be `true` for all tool
+/// code.
+pub fn guarded_client(
+    block_private: bool,
+    domain_guard: Option<RedirectDomainGuard>,
+) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .redirect(redirect_policy(block_private))
-        .dns_resolver(std::sync::Arc::new(GuardedResolver { block_private }))
+        .redirect(redirect_policy(block_private, domain_guard))
+        .dns_resolver(Arc::new(GuardedResolver { block_private }))
         .build()
 }
 
@@ -231,7 +302,26 @@ mod tests {
 
     #[test]
     fn guarded_client_builds() {
-        assert!(guarded_client(true).is_ok());
-        assert!(guarded_client(false).is_ok());
+        assert!(guarded_client(true, None).is_ok());
+        assert!(guarded_client(false, None).is_ok());
+        let guard = RedirectDomainGuard::new("api.github.com", Arc::new(|_| false));
+        assert!(guarded_client(true, Some(guard)).is_ok());
+    }
+
+    #[test]
+    fn redirect_domain_guard_permits_origin_and_allowed_hosts_only() {
+        // `allow` approves exactly one extra host; everything else is refused.
+        let guard = RedirectDomainGuard::new(
+            "api.github.com",
+            Arc::new(|h: &str| h == "codeload.github.com"),
+        );
+        // Origin host is always permitted, case-insensitively.
+        assert!(guard.permits("api.github.com"));
+        assert!(guard.permits("API.GitHub.com"));
+        // A host the policy approves is permitted.
+        assert!(guard.permits("codeload.github.com"));
+        // An unapproved cross-domain target is refused.
+        assert!(!guard.permits("evil.example"));
+        assert!(!guard.permits("github.com"));
     }
 }

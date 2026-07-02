@@ -102,6 +102,21 @@ impl FileOpsProvider for DefaultFileOpsProvider {
 #[async_trait::async_trait]
 pub trait WebPageFetcher: Send + Sync {
     async fn fetch(&self, url: &str, query: Option<&str>) -> Result<WebFetchResult>;
+
+    /// Fetch with a cross-domain redirect guard applied (SPEC R-WEB.8): a redirect
+    /// to a host the `[web]` policy would not approve is refused rather than
+    /// followed. The default ignores the guard and delegates to [`Self::fetch`] —
+    /// adequate for mock/test fetchers that never follow real redirects; the
+    /// production [`DefaultWebPageFetcher`] overrides it to enforce the guard.
+    async fn fetch_with_redirect_guard(
+        &self,
+        url: &str,
+        query: Option<&str>,
+        guard: ahma_harness_tools::egress_guard::RedirectDomainGuard,
+    ) -> Result<WebFetchResult> {
+        let _ = guard;
+        self.fetch(url, query).await
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,6 +126,15 @@ pub struct DefaultWebPageFetcher;
 impl WebPageFetcher for DefaultWebPageFetcher {
     async fn fetch(&self, url: &str, query: Option<&str>) -> Result<WebFetchResult> {
         ahma_harness_tools::fetch_webpage(url, query).await
+    }
+
+    async fn fetch_with_redirect_guard(
+        &self,
+        url: &str,
+        query: Option<&str>,
+        guard: ahma_harness_tools::egress_guard::RedirectDomainGuard,
+    ) -> Result<WebFetchResult> {
+        ahma_harness_tools::fetch_webpage_with_redirect_guard(url, query, guard).await
     }
 }
 

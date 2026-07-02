@@ -331,19 +331,34 @@ fn render_webpage(url: &str, body: &str, query: Option<&str>) -> WebFetchResult 
 /// at connection time (including across redirects and DNS-rebinding), and the
 /// redirect chain is bounded. See [`egress_guard`].
 pub async fn fetch_webpage(url: &str, query: Option<&str>) -> Result<WebFetchResult> {
-    fetch_webpage_guarded(url, query, true).await
+    fetch_webpage_guarded(url, query, true, None).await
+}
+
+/// Like [`fetch_webpage`], but additionally refuses a cross-domain redirect to a
+/// host the caller's `[web]` policy does not approve (SPEC R-WEB.8). Used by the
+/// MCP harness so an approved domain cannot 30x-launder egress to an unapproved
+/// one. See [`egress_guard::RedirectDomainGuard`].
+pub async fn fetch_webpage_with_redirect_guard(
+    url: &str,
+    query: Option<&str>,
+    domain_guard: egress_guard::RedirectDomainGuard,
+) -> Result<WebFetchResult> {
+    fetch_webpage_guarded(url, query, true, Some(domain_guard)).await
 }
 
 /// Implementation of [`fetch_webpage`] with the SSRF private-range block as a
 /// parameter. `block_private` is always `true` in production; tests set it
 /// `false` to reach a loopback mock server (the R-WEB.3.3 dev opt-out).
+/// `domain_guard`, when set, additionally enforces the cross-domain redirect
+/// policy (R-WEB.8).
 async fn fetch_webpage_guarded(
     url: &str,
     query: Option<&str>,
     block_private: bool,
+    domain_guard: Option<egress_guard::RedirectDomainGuard>,
 ) -> Result<WebFetchResult> {
     egress_guard::check_url(url, block_private)?;
-    let client = egress_guard::guarded_client(block_private)
+    let client = egress_guard::guarded_client(block_private, domain_guard)
         .context("Failed to build guarded HTTP client")?;
     let resp = client
         .get(url)
@@ -518,7 +533,7 @@ mod tests {
         // Permissive mode (block_private=false) so the loopback mock is reachable;
         // this exercises the real guarded client + render path end to end.
         let url = format!("http://{}", addr);
-        let res = fetch_webpage_guarded(&url, Some("Paragraph"), false)
+        let res = fetch_webpage_guarded(&url, Some("Paragraph"), false, None)
             .await
             .unwrap();
         assert_eq!(res.title, Some("Test Title".to_string()));
@@ -536,9 +551,85 @@ mod tests {
         });
 
         let url = format!("http://{}", addr);
-        let res = fetch_webpage_guarded(&url, None, false).await.unwrap();
+        let res = fetch_webpage_guarded(&url, None, false, None)
+            .await
+            .unwrap();
         assert_eq!(res.title, Some("Test Title 2".to_string()));
         assert!(res.text.contains("Hello 2"));
+    }
+
+    #[tokio::test]
+    async fn fetch_webpage_blocks_unapproved_cross_domain_redirect() {
+        use egress_guard::RedirectDomainGuard;
+        use std::sync::Arc;
+
+        // A mock origin that 302-redirects to a *different* host. The origin is
+        // reached via `localhost`; the redirect points at `127.0.0.1` — a
+        // different host string, i.e. a cross-domain hop under R-WEB.8.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                let response = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\n\r\n";
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+            }
+        });
+
+        // A guard whose origin is `localhost` and which approves no other host.
+        let guard = RedirectDomainGuard::new("localhost", Arc::new(|_h: &str| false));
+        let url = format!("http://localhost:{}/", addr.port());
+        // block_private=false so the loopback mock is reachable; the redirect must
+        // still be refused by the *domain* guard, not the SSRF resolver.
+        let res = fetch_webpage_guarded(&url, None, false, Some(guard)).await;
+        assert!(res.is_err(), "cross-domain redirect must be blocked");
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            msg.contains("different domain") || msg.contains("R-WEB.8"),
+            "error should explain the cross-domain block, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_webpage_follows_same_host_redirect_under_guard() {
+        use egress_guard::RedirectDomainGuard;
+        use std::sync::Arc;
+
+        // Two loopback listeners on the same host (127.0.0.1); the first redirects
+        // to the second by absolute URL. Same host string ⇒ not cross-domain ⇒ the
+        // guard must let it through even though `allow` approves nothing.
+        let dest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dest_addr = dest.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = dest.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><head><title>Dest</title></head><body>ok</body></html>";
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+            }
+        });
+
+        let src = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let src_addr = src.local_addr().unwrap();
+        let dest_port = dest_addr.port();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = src.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{dest_port}/\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+            }
+        });
+
+        let guard = RedirectDomainGuard::new("127.0.0.1", Arc::new(|_h: &str| false));
+        let url = format!("http://127.0.0.1:{}/", src_addr.port());
+        let res = fetch_webpage_guarded(&url, None, false, Some(guard))
+            .await
+            .expect("same-host redirect must be followed");
+        assert_eq!(res.title, Some("Dest".to_string()));
     }
 
     #[tokio::test]

@@ -246,7 +246,7 @@ impl AhmaMcpService {
         // an unknown domain yields Prompt, which `approve_web_egress` raises as an
         // interactive MCP `elicitation/create` when a capable client is attached.
         // Every request is audited (R-WEB.9).
-        {
+        let redirect_guard = {
             use crate::egress::web_audit::{self, FetchAction};
             use ahma_common::web_policy::{WebDecision, WebPolicy, url_coordinates};
 
@@ -276,11 +276,29 @@ impl AhmaMcpService {
             if let FetchAction::Deny(reason) = action {
                 return Err(mcp_invalid_params(reason));
             }
-        }
+
+            // R-WEB.8: the initial URL passed the policy, but a 30x redirect could
+            // still bounce to a *different* domain the policy would not approve.
+            // Build a guard from the same policy so the fetcher refuses such a hop
+            // instead of laundering egress through the approved origin. In
+            // default-`allow` mode the policy approves every host, so this is a
+            // no-op; it only bites in `deny` mode.
+            let allow = std::sync::Arc::new(move |host: &str| {
+                matches!(
+                    policy.decide(
+                        &format!("https://{host}/"),
+                        &session_grants,
+                        &session_denies
+                    ),
+                    WebDecision::Allow { .. }
+                )
+            });
+            ahma_harness_tools::egress_guard::RedirectDomainGuard::new(domain, allow)
+        };
 
         let result = self
             .web_page_fetcher
-            .fetch(url, query)
+            .fetch_with_redirect_guard(url, query, redirect_guard)
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
 
