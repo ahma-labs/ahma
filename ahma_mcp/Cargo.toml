@@ -39,7 +39,7 @@ opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true }
 opener = { version = "0.8", optional = true }
 pulldown-cmark = { version = "0.13", optional = true }
-quick-xml = { version = "0.37.5", optional = true }
+quick-xml = { version = "0.41", optional = true }
 rand = "0.10.1"
 regex.workspace = true
 reqwest = { workspace = true, features = ["json", "rustls", "http2", "http3"] }
