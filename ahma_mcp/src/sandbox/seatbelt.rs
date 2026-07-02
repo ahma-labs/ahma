@@ -33,6 +33,7 @@ impl Sandbox {
         let user_tool_rules = self.get_macos_user_tool_rules();
         let temp_rules = self.get_macos_temp_rules();
         let pkg_cache_rules = self.get_macos_package_cache_write_rules();
+        let network_rules = self.get_macos_network_rules();
 
         let profile = format!(
             r#"(version 1)
@@ -48,8 +49,7 @@ impl Sandbox {
 (allow file-write* (literal "/dev/tty"))
 (allow file-read* (literal "/dev/zero"))
 (allow file-write* (literal "/dev/zero"))
-(allow network*)
-(allow mach-lookup)
+{network_rules}(allow mach-lookup)
 (allow ipc-posix-shm*)
 "#,
             working_dir = wd_str,
@@ -60,6 +60,7 @@ impl Sandbox {
             read_scopes_rules = read_scopes_rules,
             pkg_cache_rules = pkg_cache_rules,
             temp_rules = temp_rules,
+            network_rules = network_rules,
         );
 
         tracing::debug!("Generated macOS Sandbox (Seatbelt) profile:\n{}", profile);
@@ -76,6 +77,29 @@ impl Sandbox {
             ));
         }
         rules
+    }
+
+    /// Network rules (R-NET enforcement). With no egress proxy configured, the
+    /// blanket `(allow network*)` is emitted (advisory tier / restriction off).
+    /// With a proxy address set (`--restrict-network`), all outbound IP egress is
+    /// denied *except* the proxy — so a sandboxed subprocess can only reach the
+    /// network through the allow-listed, SSRF-guarded proxy. Uses last-match-wins
+    /// SBPL semantics: start from `(allow network*)` (keeps unix sockets, mach,
+    /// local binds, DNS-via-mDNSResponder working), deny all outbound IP, then
+    /// re-allow the single proxy address. `network-inbound`/`bind` and unix-socket
+    /// egress are intentionally left permitted (local IPC cannot exfiltrate off the
+    /// host on its own).
+    fn get_macos_network_rules(&self) -> String {
+        match *self.egress_proxy_addr.read().unwrap() {
+            None => "(allow network*)\n".to_string(),
+            Some(addr) => format!(
+                "(allow network*)\n\
+                 (deny network-outbound (remote ip \"*:*\"))\n\
+                 (allow network-outbound (remote ip \"{}:{}\"))\n",
+                addr.ip(),
+                addr.port()
+            ),
+        }
     }
 
     fn get_macos_read_scopes_rules(&self) -> String {
@@ -177,5 +201,55 @@ impl Sandbox {
              (allow file-write* (subpath \"/private/var/folders\"))\n"
                 .to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::core::Sandbox;
+    use super::super::types::SandboxMode;
+    use tempfile::tempdir;
+
+    /// The generated Seatbelt profile keeps the blanket network allow when no
+    /// egress proxy is configured (restriction off / advisory tier), and switches
+    /// to deny-all-outbound-IP-except-the-proxy when `--restrict-network` set the
+    /// proxy address (R-NET enforcement).
+    #[test]
+    fn network_rules_reflect_egress_proxy_addr() {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // No proxy → blanket allow, no deny rule.
+        let p = sb.generate_seatbelt_profile_test(dir.path());
+        assert!(p.contains("(allow network*)"), "default keeps network open");
+        assert!(
+            !p.contains("(deny network-outbound"),
+            "no deny rule without restrict-network"
+        );
+
+        // Proxy set → deny all outbound IP, re-allow only the proxy address.
+        sb.set_egress_proxy_addr(Some("127.0.0.1:34567".parse().unwrap()));
+        let p = sb.generate_seatbelt_profile_test(dir.path());
+        assert!(
+            p.contains("(deny network-outbound (remote ip \"*:*\"))"),
+            "enforcement must deny all outbound IP egress, got:\n{p}"
+        );
+        assert!(
+            p.contains("(allow network-outbound (remote ip \"127.0.0.1:34567\"))"),
+            "enforcement must re-allow exactly the proxy address, got:\n{p}"
+        );
+
+        // Clearing the address returns to the open policy.
+        sb.set_egress_proxy_addr(None);
+        let p = sb.generate_seatbelt_profile_test(dir.path());
+        assert!(p.contains("(allow network*)"));
+        assert!(!p.contains("(deny network-outbound"));
     }
 }

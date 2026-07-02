@@ -242,6 +242,13 @@ pub struct Sandbox {
     /// Allow package-manager caches (cargo registry/git) to be written.
     /// Default `true`; disable with `--no-package-cache-write`.
     pub(super) package_cache_write: bool,
+    /// When `--restrict-network` is on, the address of the local guarded egress
+    /// proxy. On macOS the Seatbelt profile then denies all outbound IP egress
+    /// *except* this address, so the subprocess can only reach the network through
+    /// the allow-listed, SSRF-guarded proxy (R-NET enforcement). `None` leaves the
+    /// blanket `(allow network*)` rule (advisory tier / restriction off). Set after
+    /// the proxy binds its port; behind a lock because it is installed post-construction.
+    pub(super) egress_proxy_addr: std::sync::RwLock<Option<std::net::SocketAddr>>,
     /// The scope commit latch and roots-received flag, modeled as an explicit
     /// state machine (SPEC R23). Owns the one-shot lock semantics and the memory
     /// ordering that the commit decision must not be reordered past the scopes
@@ -263,6 +270,7 @@ impl Clone for Sandbox {
             explicit_scopes: self.explicit_scopes,
             livelog: self.livelog,
             package_cache_write: self.package_cache_write,
+            egress_proxy_addr: std::sync::RwLock::new(*self.egress_proxy_addr.read().unwrap()),
             scope_lock: self.scope_lock.clone(),
         }
     }
@@ -321,8 +329,18 @@ impl Sandbox {
             explicit_scopes: false,
             livelog,
             package_cache_write: true,
+            egress_proxy_addr: std::sync::RwLock::new(None),
             scope_lock: super::scope_lock::ScopeLock::new(true),
         })
+    }
+
+    /// Install the guarded egress-proxy address for R-NET enforcement (macOS
+    /// Seatbelt). Called once at server startup after the proxy binds. `None`
+    /// disables the network-deny rule (restriction off).
+    pub fn set_egress_proxy_addr(&self, addr: Option<std::net::SocketAddr>) {
+        if let Ok(mut guard) = self.egress_proxy_addr.write() {
+            *guard = addr;
+        }
     }
 
     /// Override the package-cache-write flag.

@@ -74,7 +74,10 @@ async fn try_setup_mcp_client(config: &AppConfig) -> Result<()> {
 /// see that egress is gated, which domains are reachable, and that the containment
 /// is advisory (a tool that ignores `HTTP_PROXY` is not held by this alone —
 /// kernel-level enforcement is a separate, platform-specific step).
-async fn maybe_start_egress_proxy(config: &AppConfig) -> Option<crate::egress::EgressProxy> {
+async fn maybe_start_egress_proxy(
+    config: &AppConfig,
+    sandbox: &sandbox::Sandbox,
+) -> Option<crate::egress::EgressProxy> {
     if !config.restrict_network {
         return None;
     }
@@ -97,23 +100,41 @@ async fn maybe_start_egress_proxy(config: &AppConfig) -> Option<crate::egress::E
         }
     };
     sandbox::set_egress_proxy_env(proxy.env_vars());
+    // macOS enforcement (R-NET): the Seatbelt profile denies all outbound IP
+    // egress except this proxy address, so a subprocess that ignores HTTP_PROXY
+    // still cannot reach the network directly. No-op on other platforms.
+    sandbox.set_egress_proxy_addr(Some(proxy.local_addr));
     if config.network_allow.is_empty() {
         tracing::warn!(
             "NETWORK EGRESS RESTRICTED (--restrict-network): [network] allow is EMPTY, so ALL \
              subprocess network egress is denied. Add domains to [network] allow in \
-             ~/.ahma/settings.toml. Advisory: a tool that ignores HTTP_PROXY is not contained."
+             ~/.ahma/settings.toml. {enforcement}",
+            enforcement = network_enforcement_note(),
         );
     } else {
         tracing::warn!(
             "NETWORK EGRESS RESTRICTED (--restrict-network): sandboxed subprocesses are routed \
              through a guarded proxy at {addr}; reachable domains: {allow:?}. Private/loopback/\
-             cloud-metadata targets are refused. Advisory: a tool that ignores HTTP_PROXY is not \
-             contained (see the README network limits).",
+             cloud-metadata targets are refused. {enforcement}",
             addr = proxy.local_addr,
             allow = config.network_allow,
+            enforcement = network_enforcement_note(),
         );
     }
     Some(proxy)
+}
+
+/// Disclose how strongly the network restriction is enforced on this platform.
+/// On macOS the Seatbelt profile denies direct egress (only the proxy is
+/// reachable), so it is kernel-enforced; elsewhere it is advisory (a tool that
+/// ignores `HTTP_PROXY` or opens a raw socket is not contained — see the README).
+fn network_enforcement_note() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Kernel-enforced (Seatbelt): direct egress that bypasses the proxy is blocked."
+    } else {
+        "Advisory: a tool that ignores HTTP_PROXY or opens a raw socket is not contained \
+         (see the README network limits)."
+    }
 }
 
 fn emit_sandbox_terminated(reason: &str) {
@@ -913,7 +934,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     // Route sandboxed subprocesses through the guarded egress proxy when
     // `--restrict-network` is on (R-NET). Held for the server's lifetime — the
     // proxy's background task is aborted when this drops at function return.
-    let _egress_proxy = maybe_start_egress_proxy(&config).await;
+    let _egress_proxy = maybe_start_egress_proxy(&config, &sandbox).await;
 
     // Scope-grant auto-detection: one shared coordinator drives both the adapter's
     // notifier (which emits requests) and the reporter (which resolves answers and
