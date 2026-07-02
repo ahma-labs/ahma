@@ -424,6 +424,9 @@ impl PrewarmedShell {
             // run in it cannot read the server's credentials (see
             // `sandbox::scrub_secret_env`).
             crate::sandbox::scrub_secret_env(&mut builder, "pooled shell");
+            // Route the shell (and everything it runs) through the guarded egress
+            // proxy when `--restrict-network` is on (a no-op otherwise).
+            crate::sandbox::apply_egress_proxy_env(&mut builder);
             let mut process = builder.spawn()?;
 
             let stdin = process.stdin.take().ok_or_else(|| {
@@ -547,6 +550,7 @@ impl PrewarmedShell {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         crate::sandbox::scrub_secret_env(&mut builder, program);
+        crate::sandbox::apply_egress_proxy_env(&mut builder);
         let child_spawn = builder.spawn();
 
         let child = match child_spawn {

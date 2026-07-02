@@ -107,6 +107,12 @@ pub struct AppConfig {
     // ── Sandbox ─────────────────────────────────────────────────────────────
     /// Disable the kernel sandbox entirely (AHMA_DISABLE_SANDBOX=1).
     pub no_sandbox: bool,
+    /// Route sandboxed subprocesses through the guarded egress proxy (R-NET),
+    /// from `--restrict-network` or `[network] restrict`.
+    pub restrict_network: bool,
+    /// Domains subprocesses may reach when `restrict_network` is on (`[network]
+    /// allow`). Empty means deny-all egress.
+    pub network_allow: Vec<String>,
     /// Explicit sandbox scope directories (from --sandbox-scope).
     pub sandbox_scopes: Vec<PathBuf>,
     /// Defer sandbox lock until client provides roots/list (AHMA_SANDBOX_DEFER=1).
@@ -212,6 +218,8 @@ impl Default for AppConfig {
             mutex_groups: ahma_common::config::default_mutex_groups(),
 
             no_sandbox: false,
+            restrict_network: false,
+            network_allow: vec![],
             sandbox_scopes: vec![],
             defer_sandbox: false,
             working_dirs: vec![],
@@ -970,6 +978,14 @@ pub struct Cli {
     /// Use only in environments that provide their own containment (Docker, CI containers).
     #[arg(long = "no-sandbox", global = true)]
     pub no_sandbox: bool,
+
+    /// Route every sandboxed subprocess through a guarded egress proxy, so tools
+    /// reach only the domains in `[network] allow` (deny-all when empty) and never
+    /// private/loopback/cloud-metadata addresses. Advisory (a tool that ignores
+    /// HTTP_PROXY is not contained); see the README network-restriction limits.
+    /// Equivalent to `[network] restrict = true`.
+    #[arg(long = "restrict-network", global = true)]
+    pub restrict_network: bool,
 
     /// Enable output compression and token minimization.
     #[arg(long = "minimize-tokens", global = true)]
@@ -2490,6 +2506,8 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         mutex_groups,
 
         no_sandbox,
+        restrict_network: cli.restrict_network || s.network.restrict,
+        network_allow: s.network.allow.clone(),
         sandbox_scopes,
         defer_sandbox,
         working_dirs,
@@ -2683,6 +2701,8 @@ mod tests {
             mutex_groups: ahma_common::config::default_mutex_groups(),
 
             no_sandbox: false,
+            restrict_network: false,
+            network_allow: vec![],
             sandbox_scopes: vec![],
             defer_sandbox: false,
             working_dirs: vec![],

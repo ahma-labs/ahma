@@ -138,7 +138,20 @@ See [docs/installation.md](docs/installation.md) for supported binary platforms 
 
 Ahma enforces **kernel-level filesystem sandboxing** by default — Landlock on Linux, Seatbelt on macOS, Job Objects on Windows. The sandbox scope is set once at startup and cannot be changed. The AI has full access within the workspace, zero access outside it, unconditionally.
 
+**Network egress** is unrestricted by default. Pass `--restrict-network` (or set `[network] restrict = true`) to route every sandboxed subprocess through a guarded local proxy that forwards only the domains in `[network] allow` (deny-all when empty) and refuses private/loopback/cloud-metadata addresses. Ahma's own web tool (`fetch_webpage`) is governed separately by the `[web]` policy.
+
 See [docs/security-sandbox.md](docs/security-sandbox.md) for platform details, nested sandbox detection, temp directory access, and example `mcp.json` configs.
+
+### What the sandbox does *not* cover
+
+Ahma sandboxes the **real host process in place** — there is no image, no rootfs, no VM. That is its strength (near-instant startup; per-session scope and egress that can be tailored per run) and the source of its limits. It is **not** a full container/VM isolation boundary:
+
+- **Network restriction is advisory.** `--restrict-network` routes HTTP(S) via proxy env vars; a tool that ignores `HTTP_PROXY`, or opens a raw TCP/UDP/QUIC socket, is not held by that alone. Kernel-enforced confinement (deny all egress except the proxy) is being added on macOS via Seatbelt; **on Linux there is no clean equivalent** (Landlock's network rules are limited to a few TCP operations), so on Linux network restriction is advisory-only for now.
+- **No resource limits.** Unlike a container's cgroups, ahma does not cap CPU, memory, PIDs, or I/O — a runaway build can exhaust host resources. (A container *memory limit* is a cgroup ceiling with OOM-kill on breach, not a reservation; both a container and ahma allocate host memory dynamically and share the host kernel, so "fixed vs dynamic memory" is **not** a real difference — the difference is that a container *can* cap it and ahma does not.)
+- **No process/namespace isolation.** A sandboxed tool shares the host PID, network, and user namespaces: it can see and signal other host processes and bind local ports. There is no seccomp syscall filtering and no UID remapping.
+- **Broad reads on macOS.** To work around APFS firmlinks, the Seatbelt profile grants global file-*read* (writes stay scoped); credential directories (`~/.ssh`, `~/.aws`, …) are then explicitly denied, but this is wider than a container's mount namespace.
+
+For hard multi-tenant isolation or resource governance, run ahma **inside** a container/VM — the two compose. Ahma's job is a fast, in-place, scope- and egress-tailored guard for an agent working on your own machine, not a substitute for full virtualization.
 
 ## Terminal Hooks
 

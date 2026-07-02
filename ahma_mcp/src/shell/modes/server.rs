@@ -65,6 +65,57 @@ async fn try_setup_mcp_client(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// Start the guarded egress proxy and route every sandboxed subprocess through it
+/// when `--restrict-network` (or `[network] restrict`) is on (SPEC R-NET). Returns
+/// the proxy handle, which the caller must keep alive for the server's lifetime
+/// (dropping it aborts the proxy). `None` when restriction is off.
+///
+/// Discloses the active restriction loudly (SPEC R7): the operator must be able to
+/// see that egress is gated, which domains are reachable, and that the containment
+/// is advisory (a tool that ignores `HTTP_PROXY` is not held by this alone —
+/// kernel-level enforcement is a separate, platform-specific step).
+async fn maybe_start_egress_proxy(config: &AppConfig) -> Option<crate::egress::EgressProxy> {
+    if !config.restrict_network {
+        return None;
+    }
+    let allowlist = crate::egress::EgressAllowlist::from_str(&config.network_allow.join("\n"));
+    let proxy = match crate::egress::EgressProxy::start(crate::egress::EgressProxyConfig {
+        allowlist,
+        ..Default::default()
+    })
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            // Fail loud but non-fatal: the server still runs, just without the
+            // network restriction. (We do not silently pretend it is enforced.)
+            tracing::error!(
+                "--restrict-network: failed to start the egress proxy ({e}); subprocess network \
+                 egress is NOT restricted this session"
+            );
+            return None;
+        }
+    };
+    sandbox::set_egress_proxy_env(proxy.env_vars());
+    if config.network_allow.is_empty() {
+        tracing::warn!(
+            "NETWORK EGRESS RESTRICTED (--restrict-network): [network] allow is EMPTY, so ALL \
+             subprocess network egress is denied. Add domains to [network] allow in \
+             ~/.ahma/settings.toml. Advisory: a tool that ignores HTTP_PROXY is not contained."
+        );
+    } else {
+        tracing::warn!(
+            "NETWORK EGRESS RESTRICTED (--restrict-network): sandboxed subprocesses are routed \
+             through a guarded proxy at {addr}; reachable domains: {allow:?}. Private/loopback/\
+             cloud-metadata targets are refused. Advisory: a tool that ignores HTTP_PROXY is not \
+             contained (see the README network limits).",
+            addr = proxy.local_addr,
+            allow = config.network_allow,
+        );
+    }
+    Some(proxy)
+}
+
 fn emit_sandbox_terminated(reason: &str) {
     if let Ok(notification) = serde_json::to_string(&serde_json::json!({
         "jsonrpc": "2.0",
@@ -859,6 +910,11 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     // Try to wire up an HTTP MCP client proxy if mcp.json specifies one.
     try_setup_mcp_client(&config).await?;
 
+    // Route sandboxed subprocesses through the guarded egress proxy when
+    // `--restrict-network` is on (R-NET). Held for the server's lifetime — the
+    // proxy's background task is aborted when this drops at function return.
+    let _egress_proxy = maybe_start_egress_proxy(&config).await;
+
     // Scope-grant auto-detection: one shared coordinator drives both the adapter's
     // notifier (which emits requests) and the reporter (which resolves answers and
     // persists). The notifier delivers requests to the hub so a connected TUI can
@@ -1003,6 +1059,8 @@ mod tests {
     fn base_cfg() -> AppConfig {
         AppConfig {
             no_sandbox: true,
+            restrict_network: false,
+            network_allow: vec![],
             sandbox_scopes: vec![],
             use_sandbox_dir: false,
             sandbox_directory: Some(std::path::PathBuf::from("~/sandbox")),

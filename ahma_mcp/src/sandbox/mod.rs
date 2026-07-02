@@ -58,7 +58,10 @@ mod types;
 #[cfg(target_os = "windows")]
 mod windows;
 
-pub use command::{is_secret_env_name, scrub_secret_env, secret_env_keys, set_secret_env_allow};
+pub use command::{
+    apply_egress_proxy_env, is_secret_env_name, scrub_secret_env, secret_env_keys,
+    set_egress_proxy_env, set_secret_env_allow,
+};
 pub use core::Sandbox;
 pub use core::{add_log_exception, is_target_allowed, load_exceptions};
 pub use credential_reads::{

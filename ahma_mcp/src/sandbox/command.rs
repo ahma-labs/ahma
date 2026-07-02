@@ -88,6 +88,45 @@ pub fn scrub_secret_env(cmd: &mut tokio::process::Command, context: &str) {
     }
 }
 
+/// The `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` variables that route every sandboxed
+/// subprocess through the local guarded egress proxy (`--restrict-network`,
+/// R-NET). Empty unless the operator turned restriction on; set once at startup
+/// after the proxy binds its port. Process-global for the same reason as
+/// [`SECRET_ENV_ALLOW`]: it is a single operator policy, and it must reach every
+/// spawn site — `base_command` *and* the shell pool — none of which share a
+/// `Sandbox` handle.
+static EGRESS_PROXY_ENV: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+
+/// Install the egress-proxy environment (from a started [`super::super::egress::EgressProxy`]).
+/// Called once at server startup when `--restrict-network` is on. Passing an empty
+/// vec (the default) leaves subprocess egress unrestricted.
+pub fn set_egress_proxy_env(vars: Vec<(String, String)>) {
+    if let Ok(mut guard) = EGRESS_PROXY_ENV.write() {
+        *guard = vars;
+    }
+}
+
+/// Inject the egress-proxy variables into `cmd`. A no-op when restriction is off.
+/// Applied *after* [`scrub_secret_env`] at every subprocess spawn site so a tool
+/// that honours `HTTP_PROXY` reaches the network only through the allow-listed,
+/// SSRF-guarded proxy. (A tool that ignores the proxy variables is not contained
+/// by this alone — see the network-restriction limitations in the README.)
+pub fn apply_egress_proxy_env(cmd: &mut tokio::process::Command) {
+    let vars = EGRESS_PROXY_ENV
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    apply_proxy_vars(cmd, &vars);
+}
+
+/// Pure core of [`apply_egress_proxy_env`]: set `vars` on `cmd` (a no-op when
+/// empty). Split out so the injection is unit-testable without the process-global.
+fn apply_proxy_vars(cmd: &mut tokio::process::Command, vars: &[(String, String)]) {
+    if !vars.is_empty() {
+        cmd.envs(vars.iter().cloned());
+    }
+}
+
 impl Sandbox {
     /// Create a sandboxed tokio process Command.
     pub fn create_command(
@@ -135,6 +174,11 @@ impl Sandbox {
         // sandbox cannot gate. Names on the operator's `[sandbox] env_allow`
         // list are preserved for tools that legitimately need a token.
         scrub_secret_env(&mut cmd, program);
+
+        // Route the subprocess through the guarded egress proxy when
+        // `--restrict-network` is on (a no-op otherwise). After the scrub so the
+        // proxy vars are never mistaken for secrets.
+        apply_egress_proxy_env(&mut cmd);
 
         // Run each command as its own process-group leader so the whole tree can
         // be killed as a unit on timeout/cancellation. On macOS the direct child
@@ -268,6 +312,47 @@ impl Sandbox {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn apply_proxy_vars_injects_and_empty_is_noop() {
+        // Empty vars → no env is set on the command.
+        let mut cmd = tokio::process::Command::new("true");
+        apply_proxy_vars(&mut cmd, &[]);
+        assert_eq!(
+            cmd.as_std().get_envs().count(),
+            0,
+            "empty proxy vars must not touch the command environment"
+        );
+
+        // Non-empty vars → each is set explicitly on the command.
+        let vars = vec![
+            ("HTTP_PROXY".to_string(), "http://127.0.0.1:9".to_string()),
+            (
+                "NO_PROXY".to_string(),
+                "127.0.0.1,::1,localhost".to_string(),
+            ),
+        ];
+        let mut cmd = tokio::process::Command::new("true");
+        apply_proxy_vars(&mut cmd, &vars);
+        let set: std::collections::HashMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            set.get("HTTP_PROXY").and_then(|v| v.as_deref()),
+            Some("http://127.0.0.1:9")
+        );
+        assert_eq!(
+            set.get("NO_PROXY").and_then(|v| v.as_deref()),
+            Some("127.0.0.1,::1,localhost")
+        );
+    }
 
     fn make_test_sandbox(scope: &std::path::Path) -> Sandbox {
         Sandbox::new(

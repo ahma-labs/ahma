@@ -1188,6 +1188,32 @@ impl Default for WebSettings {
     }
 }
 
+/// Subprocess network-egress restriction (SPEC R-NET). When `restrict` is on,
+/// every sandboxed subprocess is routed through a local guarded proxy
+/// (`HTTP_PROXY`/`HTTPS_PROXY`) that forwards only domains in `allow` and refuses
+/// private/loopback/cloud-metadata targets. This is the network analog of the
+/// filesystem write-sandbox; it is **advisory** on its own (a tool that ignores
+/// the proxy variables is not contained) — see the network-restriction
+/// limitations in the README.
+///
+/// Distinct from [`WebSettings`], which governs ahma's *own* HTTP tools
+/// (`fetch_webpage`); this governs the *subprocesses ahma spawns*. Lives in
+/// `~/.ahma/settings.toml`, outside every sandbox scope, so the agent cannot
+/// grant itself egress.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NetworkSettings {
+    /// Route sandboxed subprocesses through the guarded egress proxy. Off by
+    /// default (backward-compatible: `(allow network*)`). Also enabled by the
+    /// `--restrict-network` flag. With `restrict = true` and an empty `allow`,
+    /// **all** subprocess egress is denied.
+    pub restrict: bool,
+    /// Domains subprocesses may reach when `restrict` is on. Syntax matches the
+    /// egress allowlist: exact (`crates.io`), single-level wildcard
+    /// (`*.crates.io`), or `*` for any. Empty means deny-all.
+    pub allow: Vec<String>,
+}
+
 /// Runtime feature toggles.
 ///
 /// Controls which optional capabilities are active at runtime.  Features
@@ -1282,6 +1308,8 @@ pub struct AhmaSettings {
     pub agent: AgentSettings,
     /// Web-egress policy for ahma's own HTTP tools (SPEC §4.6 R-WEB).
     pub web: WebSettings,
+    /// Subprocess network-egress restriction (SPEC R-NET).
+    pub network: NetworkSettings,
 }
 
 impl AhmaSettings {
@@ -1821,6 +1849,24 @@ impl AhmaSettings {
             toml_str_list(&d.web.never_allow),
         );
 
+        // ── Subprocess network egress ────────────────────────────────────────
+        w.section(
+            "Subprocess network egress (route tools through a guarded proxy; SPEC R-NET)",
+            "network",
+        );
+        w.setting(
+            "Route sandboxed subprocesses through the egress proxy (also: --restrict-network). Advisory; see README limits.",
+            "restrict",
+            self.network.restrict.to_string(),
+            d.network.restrict.to_string(),
+        );
+        w.setting(
+            "Domains subprocesses may reach when restrict=true (exact, *.wildcard, or *). Empty = deny all egress.",
+            "allow",
+            toml_str_list(&self.network.allow),
+            toml_str_list(&d.network.allow),
+        );
+
         w.into_string()
     }
 
@@ -2229,6 +2275,10 @@ mod tests {
                 on_redirect_to_new_domain: RedirectPolicy::Prompt,
                 always_allow: vec!["api.github.com".into(), "*.crates.io".into()],
                 never_allow: vec!["evil.example".into()],
+            },
+            network: NetworkSettings {
+                restrict: true,
+                allow: vec!["crates.io".into(), "*.crates.io".into()],
             },
         }
     }
