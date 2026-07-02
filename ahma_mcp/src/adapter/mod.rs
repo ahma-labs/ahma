@@ -373,6 +373,34 @@ impl Adapter {
         self.sandbox.clone()
     }
 
+    /// Raise a scope-grant request to the human approval surface (the TUI grant
+    /// modal, or an actionable log line when no interactive surface is attached),
+    /// deduplicated through the shared `GrantCoordinator`. Used by the
+    /// `sandbox_grant` tool so the autonomous agent can *request* a grant but
+    /// never persist one itself. Returns `true` if a notifier surface received
+    /// the request, `false` if none is wired.
+    pub async fn request_scope_grant(
+        &self,
+        path: &std::path::Path,
+        access: ahma_common::config::ScopeAccess,
+        tool: Option<String>,
+    ) -> bool {
+        match &self.scope_grant_notifier {
+            Some(notifier) => {
+                notifier
+                    .notify_violation(
+                        path,
+                        access,
+                        ahma_common::scope_grant::GrantReason::PreExecViolation,
+                        tool,
+                    )
+                    .await;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Synchronously executes a command and returns the result directly.
     ///
     /// This method bypasses the async operation queue and runs the command directly, waiting for it to complete.

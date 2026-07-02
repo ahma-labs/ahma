@@ -1470,7 +1470,8 @@ impl ServerHandler for AhmaMcpService {
                         .await
                 }
                 "sandbox_grant" => {
-                    self.handle_sandbox_grant(run_params.arguments.unwrap_or_default())
+                    let client_type = McpClientType::from_peer(&context.peer);
+                    self.handle_sandbox_grant(run_params.arguments.unwrap_or_default(), client_type)
                         .await
                 }
                 "logs_list" => {

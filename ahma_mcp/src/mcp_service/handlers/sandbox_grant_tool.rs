@@ -9,7 +9,7 @@
 //!
 //! ## Security model
 //!
-//! Two independent gates stand between a confused/adversarial model and a
+//! Three independent gates stand between a confused/adversarial model and a
 //! widened sandbox:
 //!
 //! 1. **A hard denylist** ([`classify_grant_risk`] → [`GrantRisk::Refused`]). The
@@ -17,9 +17,18 @@
 //!    credential directories (`~/.ssh`, `~/.aws`, …), `~/.ahma` itself, and OS
 //!    system directories are refused **even with `confirm: true`**. The model
 //!    cannot override this; only a human editing the file by hand can.
-//! 2. **A two-phase confirm**. Without `confirm: true` the tool only *previews*
-//!    (writes nothing) and tells the AI to show the human the full path and line
-//!    first. The default is always Deny.
+//! 2. **A human decision, not the model's word.** `confirm: true` self-persists
+//!    only for external clients (Cursor, VS Code, …) that gate every tool call
+//!    behind a human — there, approving the call *is* the human decision. For the
+//!    autonomous in-process agent ([`McpClientType::Ahma`](crate::client_type::McpClientType)),
+//!    which auto-approves its own calls, `confirm: true` does **not** persist:
+//!    the request is routed to the human approval surface (the TUI grant modal,
+//!    or an actionable log/CLI hint) and only a human key-press writes it. The
+//!    model cannot forge its client type (it is set by the connecting client at
+//!    MCP init), so this gate is real. This closes the autonomous self-grant
+//!    hole where the agent could set `confirm: true` itself.
+//! 3. **A two-phase confirm**. Without `confirm: true` the tool only *previews*
+//!    (writes nothing) and shows the exact file and line. The default is Deny.
 //!
 //! The grant is written to `~/.ahma/settings.toml`, which lives outside every
 //! sandbox scope and only takes effect on the next server start — never the live
@@ -85,9 +94,19 @@ pub fn sandbox_grant_schema() -> Arc<Map<String, Value>> {
 
 impl AhmaMcpService {
     /// Handle a `sandbox_grant` call. See the module docs for the security model.
+    ///
+    /// `client_type` distinguishes the autonomous in-process agent
+    /// ([`McpClientType::Ahma`], which auto-approves its own tool calls) from
+    /// external clients (Cursor, VS Code, …) that gate each tool call behind a
+    /// human. For the autonomous agent, `confirm: true` must **not** self-persist
+    /// — the request is routed to the human approval surface instead — so the
+    /// model cannot widen its own sandbox. The LLM cannot forge `client_type`
+    /// (it is set by the connecting client at MCP init), so this is a real gate,
+    /// not an honor-system one.
     pub async fn handle_sandbox_grant(
         &self,
         args: Map<String, Value>,
+        client_type: crate::client_type::McpClientType,
     ) -> Result<CallToolResult, McpError> {
         let raw = common::require_str(&args, "path", "sandbox_grant requires a `path` argument")?;
         let access = parse_access(&args)?;
@@ -130,6 +149,26 @@ impl AhmaMcpService {
                 &settings_file,
                 &line,
                 &risk,
+            )));
+        }
+
+        // Confirmed and not denylisted. For the autonomous in-process agent there
+        // is no per-call human approval, so `confirm: true` must not self-persist:
+        // route the request to the human approval surface (TUI grant modal / log)
+        // and return without writing. Only a human key-press at that surface
+        // persists the grant (via the same GrantCoordinator the denial detector
+        // uses). External clients gated the tool call behind a human already, so
+        // they persist directly.
+        if matches!(client_type, crate::client_type::McpClientType::Ahma) {
+            let raised = self
+                .adapter
+                .request_scope_grant(&path, access, Some("sandbox_grant".to_string()))
+                .await;
+            return Ok(common::text_result(agent_requested_text(
+                &path,
+                access,
+                &settings_file,
+                raised,
             )));
         }
 
@@ -432,6 +471,42 @@ fn preview_text(
         banner = risk_banner(risk),
         file = settings_file.display(),
         line = line,
+    )
+}
+
+/// Message for the autonomous agent when `confirm: true` was routed to the human
+/// approval surface instead of persisted. It must make clear the agent did NOT
+/// widen the sandbox and that a human decision is required.
+fn agent_requested_text(
+    path: &Path,
+    access: ScopeAccess,
+    settings_file: &Path,
+    raised: bool,
+) -> String {
+    let ro_flag = if access == ScopeAccess::Ro {
+        " --read-only"
+    } else {
+        ""
+    };
+    let surface = if raised {
+        "A human approval prompt has been raised. It is NOT granted until a person approves it \
+         (Enter/Esc deny)."
+    } else {
+        "No interactive approval surface is attached, so nothing was requested."
+    };
+    format!(
+        "Requested {access} access to\n  {path}\n\n\
+         The autonomous agent cannot widen its own sandbox: `confirm: true` does not self-grant \
+         here. {surface}\n\n\
+         A human must approve — either at the prompt, or by running:\n  \
+         ahma sandbox grant {path}{ro_flag}\n\n\
+         Grants are written to {file} (outside every sandbox scope) and take effect on the next \
+         server start, not the live session.",
+        access = access.label(),
+        path = path.display(),
+        surface = surface,
+        ro_flag = ro_flag,
+        file = settings_file.display(),
     )
 }
 

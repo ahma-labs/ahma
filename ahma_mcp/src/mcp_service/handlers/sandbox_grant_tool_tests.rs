@@ -292,11 +292,14 @@ async fn handler_refuses_catastrophic_path_even_with_confirm() {
         .await
         .unwrap();
     let result = service
-        .handle_sandbox_grant(args(&[
-            ("path", json!("/")),
-            ("access", json!("rw")),
-            ("confirm", json!(true)),
-        ]))
+        .handle_sandbox_grant(
+            args(&[
+                ("path", json!("/")),
+                ("access", json!("rw")),
+                ("confirm", json!(true)),
+            ]),
+            crate::client_type::McpClientType::Cursor,
+        )
         .await;
     let err = result.expect_err("granting the filesystem root must be refused");
     assert!(
@@ -313,7 +316,10 @@ async fn handler_previews_without_writing_when_unconfirmed() {
         .unwrap();
     let target = tempdir().unwrap();
     let result = service
-        .handle_sandbox_grant(args(&[("path", json!(target.path().to_string_lossy()))]))
+        .handle_sandbox_grant(
+            args(&[("path", json!(target.path().to_string_lossy()))]),
+            crate::client_type::McpClientType::Cursor,
+        )
         .await
         .expect("preview should succeed");
     let text = result
@@ -323,4 +329,46 @@ async fn handler_previews_without_writing_when_unconfirmed() {
         .collect::<String>();
     assert!(text.contains("PREVIEW ONLY"), "{text}");
     assert!(text.contains("confirm: true"), "{text}");
+}
+
+#[tokio::test]
+async fn handler_autonomous_agent_does_not_self_persist_on_confirm() {
+    // The in-process autonomous agent (McpClientType::Ahma) auto-approves its own
+    // tool calls, so `confirm: true` must NOT write settings.toml — it must route
+    // to the human approval surface instead.
+    let (service, _scope) = crate::test_utils::in_process::build_test_service()
+        .await
+        .unwrap();
+    let target = tempdir().unwrap();
+    let result = service
+        .handle_sandbox_grant(
+            args(&[
+                ("path", json!(target.path().to_string_lossy())),
+                ("access", json!("rw")),
+                ("confirm", json!(true)),
+            ]),
+            crate::client_type::McpClientType::Ahma,
+        )
+        .await
+        .expect("request should succeed (as a request, not a grant)");
+    let text = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<String>();
+    assert!(
+        text.contains("cannot widen its own sandbox"),
+        "autonomous agent must be told it cannot self-grant: {text}"
+    );
+    assert!(
+        !text.contains("✓ Granted"),
+        "autonomous agent confirm must not persist a grant: {text}"
+    );
+    assert!(
+        text.contains("A human must approve"),
+        "message must direct to human approval: {text}"
+    );
+    // The external-client persist path is covered by the `persist_grant` unit
+    // tests in `ahma_common::scope_grant`; it is not exercised here because the
+    // in-process test service does not isolate HOME and would write real settings.
 }
