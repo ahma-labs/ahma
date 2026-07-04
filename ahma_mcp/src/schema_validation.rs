@@ -414,7 +414,7 @@ impl MtdfValidator {
 
         // Add general help
         report.push_str("Common fixes:\n");
-        report.push_str("- Check the tool configuration schema at docs/tool-schema-guide.md\n");
+        report.push_str("- Check the tool configuration schema at docs/mtdf-schema.json (guide: docs/custom-tools.md)\n");
         report.push_str("- Ensure all required fields are present\n");
         report.push_str("- Verify data types match the expected schema\n");
         report.push_str("- Review suggestions above for specific field corrections\n");

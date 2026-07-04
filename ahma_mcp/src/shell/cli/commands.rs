@@ -699,15 +699,33 @@ pub(crate) fn dispatch_bundle_command(args: BundleArgs) -> Result<()> {
 pub(crate) fn run_validation_mode(target: &str) -> Result<()> {
     let result = crate::validation::run_validation(target)?;
     if result.all_valid {
-        println!("All configurations are valid.");
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "Validation failed: {}/{} files invalid.",
-            result.files_failed,
+        println!(
+            "All configurations are valid ({} file(s) checked).",
             result.files_checked
-        )
+        );
+        return Ok(());
     }
+
+    // Print the full per-failure detail to stdout so the user sees *what* is
+    // wrong and *where* — not just a count. (The same detail is also logged.)
+    for failure in &result.failures {
+        println!("\n✗ {}\n{}", failure.path, failure.detail);
+    }
+
+    // Summarize with an honest denominator. `files_checked` is the number of
+    // readable JSON files; missing targets are reported separately so we never
+    // print a nonsensical "1/0 files invalid".
+    let missing = result.missing_targets.len();
+    let schema_failures = result.files_failed.saturating_sub(missing);
+    let summary = match (schema_failures, missing) {
+        (s, 0) => format!("{s}/{} file(s) failed validation", result.files_checked),
+        (0, m) => format!("{m} target(s) not found"),
+        (s, m) => format!(
+            "{s}/{} file(s) failed validation and {m} target(s) not found",
+            result.files_checked
+        ),
+    };
+    anyhow::bail!("Validation failed: {summary}.")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

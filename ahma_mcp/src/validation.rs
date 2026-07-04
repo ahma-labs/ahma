@@ -11,6 +11,16 @@ use std::{
 };
 use tracing::{error, info};
 
+/// A single per-file validation failure, with the full human-readable report
+/// so the CLI can surface it on stdout instead of only logging it.
+pub struct FileFailure {
+    /// The file (or target string) that failed.
+    pub path: String,
+    /// The detailed, human-readable reason (schema errors, read error, or
+    /// "target not found").
+    pub detail: String,
+}
+
 /// Result of validating one or more tool configuration files.
 pub struct ValidationResult {
     /// Total number of files checked.
@@ -19,6 +29,10 @@ pub struct ValidationResult {
     pub files_passed: usize,
     /// Number of files that failed validation.
     pub files_failed: usize,
+    /// Targets that could not be found (neither a file nor a directory).
+    pub missing_targets: Vec<String>,
+    /// Per-file failure details, ready to print.
+    pub failures: Vec<FileFailure>,
     /// Whether all files passed validation.
     pub all_valid: bool,
 }
@@ -30,36 +44,49 @@ pub struct ValidationResult {
 /// - A single file
 /// - A comma-separated list of files and/or directories
 ///
-/// Returns a [`ValidationResult`] summarizing the outcome.
+/// Returns a [`ValidationResult`] summarizing the outcome, including the full
+/// per-file failure reports so callers can display them.
 pub fn run_validation(validation_target: &str) -> Result<ValidationResult> {
     let validator = MtdfValidator::new();
     let targets: Vec<String> = validation_target
         .split(',')
         .map(|s| s.trim().to_string())
         .collect();
-    let (files, all_found) = collect_validation_files(targets)?;
+    let (files, missing_targets) = collect_validation_files(targets)?;
 
     let mut passed = 0usize;
-    let mut failed = 0usize;
+    let mut failures = Vec::new();
 
     for f in &files {
-        if validate_file(&validator, f) {
-            passed += 1;
-        } else {
-            failed += 1;
+        match validate_file(&validator, f) {
+            Ok(()) => passed += 1,
+            Err(detail) => failures.push(FileFailure {
+                path: f.display().to_string(),
+                detail,
+            }),
         }
     }
 
-    if !all_found {
-        failed += 1; // count missing targets as a failure
+    for target in &missing_targets {
+        failures.push(FileFailure {
+            path: target.clone(),
+            detail: format!(
+                "target not found: no such file or directory '{target}'. \
+                 Point the validate target at a directory containing *.json tool \
+                 definitions, or at a single tool JSON file."
+            ),
+        });
     }
 
     let files_checked = files.len();
+    let files_failed = failures.len();
     Ok(ValidationResult {
         files_checked,
         files_passed: passed,
-        files_failed: failed,
-        all_valid: all_found && failed == 0,
+        files_failed,
+        all_valid: missing_targets.is_empty() && failures.is_empty(),
+        missing_targets,
+        failures,
     })
 }
 
@@ -89,10 +116,10 @@ fn normalize_validation_target(path: PathBuf) -> PathBuf {
 
 /// Resolves target strings into concrete file paths to validate.
 ///
-/// Returns the collected files and whether all targets were found.
-fn collect_validation_files(targets: Vec<String>) -> Result<(Vec<PathBuf>, bool)> {
+/// Returns the collected files and the list of targets that could not be found.
+fn collect_validation_files(targets: Vec<String>) -> Result<(Vec<PathBuf>, Vec<String>)> {
     let mut files = Vec::new();
-    let mut all_found = true;
+    let mut missing = Vec::new();
 
     for target in targets {
         let path = normalize_validation_target(PathBuf::from(target));
@@ -102,26 +129,41 @@ fn collect_validation_files(targets: Vec<String>) -> Result<(Vec<PathBuf>, bool)
             files.push(path);
         } else {
             error!("Validation target not found: {}", path.display());
-            all_found = false;
+            missing.push(path.display().to_string());
         }
     }
 
-    Ok((files, all_found))
+    Ok((files, missing))
 }
 
 /// Reads and validates a single tool configuration file.
-fn validate_file(validator: &MtdfValidator, file_path: &Path) -> bool {
-    let Ok(content) = fs::read_to_string(file_path).inspect_err(|e| {
-        error!("Failed to read file {}: {}", file_path.display(), e);
-    }) else {
-        return false;
+///
+/// Returns `Ok(())` on success, or `Err(detail)` with the full human-readable
+/// failure report (schema errors or a read error) so the caller can print it.
+fn validate_file(validator: &MtdfValidator, file_path: &Path) -> Result<(), String> {
+    let content = match fs::read_to_string(file_path) {
+        Ok(content) => content,
+        Err(e) => {
+            error!("Failed to read file {}: {}", file_path.display(), e);
+            return Err(format!("could not read '{}': {e}", file_path.display()));
+        }
     };
 
-    validator
-        .validate_tool_config(file_path, &content)
-        .inspect(|_| info!("{} is valid.", file_path.display()))
-        .inspect_err(|e| error!("Validation failed for {}: {:?}", file_path.display(), e))
-        .is_ok()
+    match validator.validate_tool_config(file_path, &content) {
+        Ok(_) => {
+            info!("{} is valid.", file_path.display());
+            Ok(())
+        }
+        Err(errors) => {
+            let report = validator.format_errors(&errors, file_path);
+            error!(
+                "Validation failed for {}: {:?}",
+                file_path.display(),
+                errors
+            );
+            Err(report)
+        }
+    }
 }
 
 /// Scans a directory for top-level `.json` files (non-recursive).
@@ -282,6 +324,14 @@ mod tests {
         let result = run_validation("/nonexistent/path/12345").expect("Should succeed");
 
         assert!(!result.all_valid);
+        // A missing target is reported as such, NOT as "1/0 files invalid":
+        // files_checked stays 0 and the target lands in missing_targets.
+        assert_eq!(result.files_checked, 0);
+        assert_eq!(result.missing_targets.len(), 1);
+        assert!(result.missing_targets[0].contains("12345"));
+        // and it surfaces a readable, actionable failure detail.
+        assert_eq!(result.failures.len(), 1);
+        assert!(result.failures[0].detail.contains("target not found"));
     }
 
     #[test]
@@ -298,6 +348,14 @@ mod tests {
 
         assert!(!result.all_valid);
         assert_eq!(result.files_failed, 1);
+        // The failure carries a detailed, human-readable report — not just a count.
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            result.failures[0].detail.contains("Invalid JSON")
+                || result.failures[0].detail.contains("Validation errors"),
+            "detail should explain the parse failure: {}",
+            result.failures[0].detail
+        );
     }
 
     #[test]
