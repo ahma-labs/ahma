@@ -14,19 +14,19 @@ AHMA has a three-tier tool model:
 
 These are implemented directly in Rust and cannot be overridden by JSON configurations. Their names are reserved.
 
-### 2. Bundled Tool Configs (opt-in via CLI flags)
-Standard tool configurations are compiled into the `ahma` binary. They are only offered to MCP clients when explicitly enabled via a CLI flag:
+### 2. Bundled Tool Configs (opt-in via the `--tools` flag)
+Standard tool configurations are compiled into the `ahma` binary. They are only offered to MCP clients when explicitly enabled via `--tools <bundle>` (repeat or comma-separate):
 
-| Flag | Tool Name | Description |
+| Bundle | Tool Name | Description |
 |------|-----------|-------------|
-| `--rust` | `cargo` | Rust build, test, clippy, fmt, etc. |
-| `--fileutils` | `file-tools` | Unix file operations (ls, cp, mv, rm, grep, etc.) |
-| `--git` | `git` | Git version control |
-| `--github` | `gh` | GitHub CLI (PRs, issues, releases) |
-| `--python` | `python` | Python interpreter and pip |
-| `--simplify` | `simplify` | Code complexity metrics |
+| `--tools rust` | `cargo` | Rust build, test, clippy, fmt, etc. |
+| `--tools fileutils` | `file-tools` | Unix file operations (ls, cp, mv, rm, grep, etc.) |
+| `--tools git` | `git` | Git version control |
+| `--tools github` | `gh` | GitHub CLI (PRs, issues, releases) |
+| `--tools python` | `python` | Python interpreter and pip |
+| `--tools simplify` | `simplify` | Code complexity metrics |
 
-Example: `ahma --mode stdio --rust --git --fileutils`
+Example: `ahma serve stdio --tools rust,git,fileutils`
 
 ### 3. Local `.ahma/` Overrides (automatic)
 If a `.ahma/` directory exists in the current working directory, all `*.json` files in it are loaded automatically at startup — no CLI flag needed.
@@ -57,19 +57,19 @@ cargo nextest run --package ahma --test tool_examples_execution_test
 
 ### 4. Verify Your Configuration Works
 
-After copying and enabling a configuration in `.ahma/`, restart the ahma server to load the new tool. If you are actively iterating on tool definitions, you can instead opt into runtime watching with `--hot-reload-tools`:
+After copying and enabling a configuration in `.ahma/`, restart the ahma server to load the new tool. If you are actively iterating on tool definitions, you can instead opt into runtime watching with `--hot-reload`:
 
 ```bash
 # Safe default: load .ahma configs once at startup
-ahma --tools-dir .ahma
+ahma serve stdio --tools-dir .ahma
 
 # Tool development only: watch for runtime changes
-ahma --tools-dir .ahma --hot-reload-tools
+ahma serve stdio --tools-dir .ahma --hot-reload
 ```
 
 ## Configuration Format
 
-All tool configurations follow the MCP Tool Definition Format (MTDF) schema. Here's a minimal example:
+All tool configurations follow the MCP Tool Definition Format (MTDF) schema. Only `name`, `description`, and `command` are required. Here's a minimal example:
 
 ```json
 {
@@ -89,12 +89,16 @@ All tool configurations follow the MCP Tool Definition Format (MTDF) schema. Her
                     "description": "What this option does",
                     "required": false
                 }
-            ],
-            "synchronous": true
+            ]
         }
     ]
 }
 ```
+
+Tools run **async-first** by default: if a command finishes within a few seconds
+its result is returned inline, otherwise you get an operation ID and the result
+arrives as a notification. Force synchronous execution globally with the `--sync`
+server flag rather than the per-subcommand `synchronous` field, which is deprecated.
 
 ## Validation Tools
 
