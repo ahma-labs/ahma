@@ -931,7 +931,7 @@ pub struct Cli {
     pub settings_path: Option<PathBuf>,
 
     /// Tool bundles to enable (e.g. --tools rust --tools python,git).
-    /// Repeat or comma-separate. Available: rust, python, git, kotlin, fileutils, github, simplify.
+    /// Repeat or comma-separate. Available: rust, python, git, fileutils, github, simplify.
     #[arg(
         long = "tools",
         value_name = "NAME",
@@ -1741,7 +1741,7 @@ pub struct ListArgs {
 #[derive(Parser, Debug)]
 pub struct InfoArgs {
     /// Tool bundles to include (e.g. --tools rust --tools python,git).
-    /// Repeat or comma-separate. Available: rust, python, git, kotlin, fileutils, github, simplify.
+    /// Repeat or comma-separate. Available: rust, python, git, fileutils, github, simplify.
     #[arg(long = "tools", value_name = "NAME", value_delimiter = ',')]
     pub tool_bundles: Vec<String>,
 
@@ -4099,9 +4099,54 @@ mod tests {
     fn test_resolve_tool_bundles_falls_back_to_settings() {
         let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
         let mut s = ahma_common::config::AhmaSettings::default();
-        s.tools.tool_bundles = vec!["git".to_string(), "git".to_string(), "kotlin".to_string()];
+        s.tools.tool_bundles = vec!["git".to_string(), "git".to_string(), "python".to_string()];
         let bundles = resolve_tool_bundles(&cli, &s);
-        assert_eq!(bundles, vec!["git".to_string(), "kotlin".to_string()]);
+        assert_eq!(bundles, vec!["git".to_string(), "python".to_string()]);
+    }
+
+    /// The `--tools` help string advertises a fixed "Available: ..." bundle
+    /// list. It drifted once (advertised a `kotlin` bundle the registry never
+    /// had). Assert the advertised list matches the registry exactly, in both
+    /// directions, so the two can never silently diverge again.
+    #[test]
+    fn advertised_tools_bundles_match_registry() {
+        use crate::mcp_service::bundle_registry::BUNDLES;
+        use clap::CommandFactory;
+
+        let cmd = Cli::command();
+        let tools_arg = cmd
+            .get_arguments()
+            .find(|a| a.get_long() == Some("tools"))
+            .expect("--tools arg must exist");
+        let help = tools_arg
+            .get_help()
+            .expect("--tools must have help text")
+            .to_string();
+        let advertised = help
+            .split("Available:")
+            .nth(1)
+            .expect("help must contain an 'Available:' list");
+
+        // Every registry bundle must be advertised.
+        for b in BUNDLES {
+            assert!(
+                advertised.contains(b.name),
+                "bundle '{}' is in the registry but missing from the --tools help list",
+                b.name
+            );
+        }
+        // Every advertised name must resolve to a real registry bundle (this is
+        // the direction that caught `kotlin`).
+        for name in advertised
+            .split([',', '.'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            assert!(
+                crate::mcp_service::bundle_registry::find_bundle(name).is_some(),
+                "--tools help advertises '{name}', which is not a registered bundle"
+            );
+        }
     }
 
     #[test]
