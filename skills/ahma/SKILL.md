@@ -110,7 +110,7 @@ Add to `.devcontainer/devcontainer.json` for Codespaces / container users:
 ```json
 {
   "features": {},
-  "postCreateCommand": "cargo install ahma",
+  "postCreateCommand": "curl -fsSL https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash",
   "customizations": {
     "vscode": {
       "settings": { "chat.mcp.autoStart": true }
@@ -414,8 +414,12 @@ Hot-reload while authoring (dev only): `ahma serve stdio --hot-reload`
 ## Key CLI Flags and Settings
 
 > [!IMPORTANT]
-> All `AHMA_*` environment variables are **retired** (R-CFG1.2) and ignored.
-> Use CLI flags (in `mcp.json` `args`) or `~/.ahma/settings.toml` instead.
+> `AHMA_*` **configuration** environment variables are **retired** (R-CFG1.2) and ignored by the
+> `ahma` binary. Use CLI flags (in `mcp.json` `args`) or `~/.ahma/settings.toml` instead.
+> This does not cover terminal-hook variables (`AHMA_HOOKS`, `AHMA_DISABLE_HOOKS`,
+> `AHMA_PREFER_OWN_SANDBOX`), which remain live, or the `scripts/install.sh`/`install.ps1`
+> bootstrap installers, which run before any `ahma` binary exists. See
+> [docs/environment-variables.md](../../docs/environment-variables.md) for the full picture.
 
 | CLI flag / Settings key | Default | Purpose |
 |----------|---------|---------|
@@ -605,9 +609,9 @@ This opens the terminal dashboard for monitoring active operations, viewing logs
 
 ```
 /ahma update                  # Install the latest published GitHub release
-/ahma update 0.7.1            # Install a specific release tag (semver, with or without 'v')
+/ahma update 0.15.2           # Install a specific release tag (semver, with or without 'v')
 /ahma update main             # Build and install from the main branch
-/ahma update feature/update   # Build and install from a named feature branch
+/ahma update <branch-name>    # Build and install from a named feature branch
 ```
 
 ### What the ref means
@@ -615,7 +619,7 @@ This opens the terminal dashboard for monitoring active operations, viewing logs
 | ref | Behaviour |
 |-----|-----------|
 | *(omitted)* | Downloads the latest pre-built release asset for the current platform |
-| semver (e.g. `0.7.1`) | Downloads that specific release asset |
+| semver (e.g. `0.15.2`) | Downloads that specific release asset |
 | branch name (e.g. `main`) | Runs `cargo install --git ... ahma_bin --branch <ref>` from GitHub source |
 
 ### Primary workflow — use the built-in `ahma update` subcommand
@@ -626,13 +630,13 @@ PATH hints, and the restart reminder automatically.  Always prefer it.
 **Step 1 — run the update:**
 
 ```
-run_terminal_command("ahma update feature/update")
-```
-
-Or for the latest release:
-
-```
 run_terminal_command("ahma update")
+```
+
+Or to build from a specific branch (replace `<branch-name>` with the real branch, e.g. `main`):
+
+```
+run_terminal_command("ahma update <branch-name>")
 ```
 
 Branch installs compile from source and take several minutes.  Watch for the
@@ -644,7 +648,7 @@ Branch installs compile from source and take several minutes.  Watch for the
 run_terminal_command("ahma --version")
 ```
 
-The output must show the expected version (e.g. `ahma 0.7.0`).
+The output must show the expected version (e.g. `ahma 0.15.2`).
 
 **Step 3 — reload the IDE**
 

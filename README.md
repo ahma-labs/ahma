@@ -21,8 +21,13 @@ Ahma is an MCP server for running real project work through existing CLI tools w
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.sh | bash
-export PATH="$HOME/.local/bin:$PATH"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc  # or ~/.bashrc — reload your shell after
 ```
+
+The installer also runs `ahma setup`, which configures MCP entries, terminal hooks, and agent
+skills for the editors it detects (Cursor, VS Code, Claude Code, …) — restart your editor
+afterward. Run `ahma setup` again any time to reconfigure, or see
+[MCP Server Connection Modes](#mcp-server-connection-modes) below to wire up `mcp.json` by hand.
 
 **Windows (PowerShell 5.1+) — first-time install**
 
@@ -40,27 +45,28 @@ ahma update main         # build from branch
 <details>
 <summary><strong>Advanced — install a specific branch (requires <a href="https://rustup.rs/">Rust</a>)</strong></summary>
 
-Use this if you need to test an unreleased branch before the next binary release.
+Use this if you need to test an unreleased branch before the next binary release. Replace
+`<branch-name>` below with the real branch you want (e.g. `main`).
 
-The workspace uses `reqwest` with the `http3` feature, so source builds require `RUSTFLAGS='--cfg reqwest_unstable'`. The `ahma update <branch>` command sets this automatically; the snippets below are only needed if you are installing for the first time without an existing `ahma` binary.
+The workspace uses `reqwest` with the `http3` feature, so source builds require `RUSTFLAGS='--cfg reqwest_unstable'`. The `ahma update <branch-name>` command sets this automatically; the snippets below are only needed if you are installing for the first time without an existing `ahma` binary.
 
 **Linux / macOS**
 
 ```bash
 # First time (no ahma yet)
 RUSTFLAGS='--cfg reqwest_unstable' \
-  cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_bin --bin ahma --root ~/.local --locked --force
+  cargo install --git https://github.com/paulirotta/ahma --branch <branch-name> ahma_bin --bin ahma --root ~/.local --locked --force
 export PATH="$HOME/.local/bin:$PATH"
 
 # After ahma is installed — the subcommand handles RUSTFLAGS automatically
-ahma update feature/update
+ahma update <branch-name>
 ```
 
 **Windows (PowerShell 5.1+)**
 
 ```powershell
 $env:RUSTFLAGS='--cfg reqwest_unstable'
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_bin --bin ahma --root $HOME\.local --locked --force
+cargo install --git https://github.com/paulirotta/ahma --branch <branch-name> ahma_bin --bin ahma --root $HOME\.local --locked --force
 ```
 
 </details>
@@ -74,10 +80,6 @@ Ask your agent to run a normal project task such as:
 > Run formatters, linting, tests, and a build for this repo. Start independent steps concurrently where possible and keep me updated on failures.
 
 With ahma, that workflow stays inside the repo boundary and the long-running steps can begin immediately as background operations. The agent can inspect results, continue other work, or start additional safe commands without waiting on one giant terminal session.
-
-![Ahma usage example](./assets/ahma-example.png)
-
-_Ahma coordinating concurrent repo work._
 
 ### Without ahma / with ahma
 
@@ -105,22 +107,24 @@ Ahma complements IDE and CLI MCP clients by making normal command-line work safe
 
 ## OS Support
 
-- **macOS** — Full support with kernel-level sandboxing (Seatbelt)
+- **macOS** — Full support with kernel-level sandboxing (Seatbelt). Prebuilt binaries are Apple Silicon only; on Intel Macs use [Source Installation](#source-installation) below.
 - **Linux (Ubuntu, RHEL)** — Intel and ARM. Full support with Landlock (kernel ≥ 5.13)
-- **Raspberry Pi** — 64-bit and 32-bit. Use `--disable-sandbox` until kernel-level sandboxing is supported (Landlock requires kernel ≥ 5.13)
+- **Raspberry Pi** — 64-bit and 32-bit. Use `--no-sandbox` until kernel-level sandboxing is supported (Landlock requires kernel ≥ 5.13)
 - **Windows** — Full support. Uses the built-in PowerShell (5.1+) included with Windows 10/11
 
 ## Source Installation
 
-If you prefer to build from source:
+If you prefer to build from source (required for Intel Macs, since prebuilt binaries are Apple Silicon only):
 
 **Linux / macOS**
 
 ```bash
 git clone https://github.com/paulirotta/ahma.git
 cd ahma
-cargo build --release
-mv target/release/ahma /usr/local/bin/
+cargo build --release -p ahma_bin
+mkdir -p ~/.local/bin
+mv target/release/ahma ~/.local/bin/
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc  # or ~/.bashrc — reload your shell after
 ```
 
 **Windows (PowerShell)**
@@ -128,7 +132,7 @@ mv target/release/ahma /usr/local/bin/
 ```powershell
 git clone https://github.com/paulirotta/ahma.git
 cd ahma
-cargo build --release
+cargo build --release -p ahma_bin
 Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 ```
 

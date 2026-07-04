@@ -6,9 +6,9 @@ If `ahma` is already installed:
 
 ```bash
 ahma update                    # latest published release
-ahma update 0.6.7              # specific release tag
+ahma update 0.15.2             # specific release tag
 ahma update main               # build from Git branch
-ahma update feature/my-branch  # build from feature branch
+ahma update <branch-name>      # build from a named feature branch
 ahma update --install-hooks    # also install user-scoped terminal hooks
 ```
 
@@ -25,14 +25,21 @@ You need `ahma` on PATH before `ahma update` works.
 
 **Latest (build from GitHub main via Cargo — requires [Rust](https://rustup.rs/)):**
 
+The workspace uses `reqwest` with the `http3` feature, so `cargo install --git` builds require
+`RUSTFLAGS='--cfg reqwest_unstable'` (config resolution for `cargo install` does not pick up the
+source repo's `.cargo/config.toml`, which sets this automatically for `cargo build` inside a
+checked-out clone — see [Build from source](#build-from-source-full-checkout) below).
+
 ```bash
-cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked --force
+RUSTFLAGS='--cfg reqwest_unstable' \
+  cargo install --git https://github.com/paulirotta/ahma ahma_bin --bin ahma --root ~/.local --locked --force
 ```
 
-**Specific branch:**
+**Specific branch** (replace `<branch-name>` with a real branch, e.g. `main`):
 
 ```bash
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_bin --bin ahma --root ~/.local --locked --force
+RUSTFLAGS='--cfg reqwest_unstable' \
+  cargo install --git https://github.com/paulirotta/ahma --branch <branch-name> ahma_bin --bin ahma --root ~/.local --locked --force
 ```
 
 **Unpushed local checkout:**
@@ -55,17 +62,18 @@ export PATH="$HOME/.local/bin:$PATH"
 irm https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install.ps1 | iex
 ```
 
-**Specific branch (builds via Cargo — requires Rust):**
+**Specific branch (builds via Cargo — requires Rust)**, replacing `<branch-name>` with a real branch, e.g. `main`:
 
 ```powershell
 # Save script locally, then:
-.\install.ps1 feature/update
+.\install.ps1 <branch-name>
 ```
 
 Or invoke Cargo directly:
 
 ```powershell
-cargo install --git https://github.com/paulirotta/ahma --branch feature/update ahma_bin --bin ahma --root $HOME\.local --locked --force
+$env:RUSTFLAGS='--cfg reqwest_unstable'
+cargo install --git https://github.com/paulirotta/ahma --branch <branch-name> ahma_bin --bin ahma --root $HOME\.local --locked --force
 ```
 
 Ensure `$HOME\.local\bin` is on your PATH.
@@ -92,9 +100,23 @@ Copy-Item target\release\ahma.exe "$HOME\.local\bin\"
 
 ## After installation
 
-- Configure your MCP client — see [connection-modes.md](connection-modes.md).
-- Optional terminal hooks — see [Terminal hooks](#terminal-hooks) below.
-- Optional agent skill — see [agent-skills.md](agent-skills.md).
+Run the setup wizard to configure everything below in one step:
+
+```bash
+ahma setup          # interactive: asks which editors/features to configure
+ahma setup -y       # non-interactive: auto-detect and configure with defaults
+```
+
+`ahma setup` writes MCP server entries, terminal hooks, and agent skills for the editors it
+detects (Cursor, VS Code, Claude Code, Codex, …). It is safe to re-run at any time — it only
+updates the pieces you ask it to (`--mcp`, `--hooks`, `--skills`, `--tls`). `ahma uninstall`
+reverses it with the same prompts. Restart your editor after it runs.
+
+To configure by hand instead, or to see what the wizard does under the hood:
+
+- MCP client config — see [connection-modes.md](connection-modes.md).
+- Terminal hooks — see [Terminal hooks](#terminal-hooks) below.
+- Agent skill — see [agent-skills.md](agent-skills.md).
 - Restart MCP clients or reload your IDE after updating the binary.
 
 ### Terminal hooks

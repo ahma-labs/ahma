@@ -1,5 +1,17 @@
 {
-    "servers": {
-        
+  "servers": {
+    "ahma": {
+      "type": "stdio",
+      "command": "ahma",
+      "args": ["serve", "stdio", "--tools", "rust,git,fileutils,github", "--sandbox", "--log-monitor"]
+    },
+    "ahma-http": {
+      "type": "http",
+      "url": "http://localhost:3000/mcp"
+    },
+    "ahma-unix": {
+      "type": "http",
+      "url": "unix:///tmp/ahma.sock#/mcp"
     }
+  }
 }

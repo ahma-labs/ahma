@@ -1,10 +1,13 @@
 # Ahma Environment Variables
 
 > [!IMPORTANT]
-> **`AHMA_*` configuration variables are RETIRED** (R-CFG1.2).
-> All `AHMA_*` variables listed below produce a `WARN` log at startup and their values are **ignored**.
-> Configure Ahma via `~/.ahma/settings.toml` or CLI flags instead.
+> **`AHMA_*` variables in the RETIRED sections below are ignored by the `ahma` binary** (R-CFG1.2),
+> logged as a `WARN` at startup. Configure Ahma via `~/.ahma/settings.toml` or CLI flags instead.
 > Run `ahma settings init` to create a pre-documented settings file, or `ahma settings show` to inspect effective values.
+> This does **not** cover the [Terminal Hooks](#terminal-hooks) variables below, which remain live
+> (hooks are invoked directly by the editor, not by `ahma`, so there is no CLI flag to replace them),
+> or variables read by the `scripts/install.sh` / `install.ps1` bootstrap installers, which run
+> before any `ahma` binary exists.
 
 ## Variable classification
 
