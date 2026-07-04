@@ -1345,15 +1345,40 @@ impl AhmaSettings {
         }
     }
 
-    /// Strict loader: returns `Err(message)` on a read or parse failure instead
-    /// of falling back to defaults. A missing file is **not** an error (returns
-    /// defaults). This is the primitive the startup path uses to fail closed
-    /// (R-CFG6.1) and that tests use to verify bad-config rejection.
+    /// Strict loader: returns `Err(message)` on a **parse** failure instead of
+    /// falling back to defaults. A file that cannot be *read* — because it is
+    /// missing (`NotFound`) or because access is denied (`PermissionDenied`) —
+    /// is **not** an error and yields compiled-in defaults. This is the
+    /// primitive the startup path uses to fail closed (R-CFG6.1) and that tests
+    /// use to verify bad-config rejection.
+    ///
+    /// The `PermissionDenied` case is load-bearing, not a mere convenience:
+    /// `~/.ahma` is **intentionally out of sandbox scope** (SPEC R5.4.8 — it holds
+    /// ahma's own settings and secrets, and the sandbox denies sandboxed
+    /// subprocesses access so a compromised tool cannot read them; widening to
+    /// it requires explicit human review via `sandbox grant`). So whenever ahma
+    /// itself runs inside its own sandbox (its test suite, a nested invocation,
+    /// or as a subprocess of another ahma), the read of `~/.ahma/settings.toml`
+    /// returns EPERM → `PermissionDenied`. Treating that as fatal made ahma
+    /// abort on every sandboxed launch. Degrading to defaults keeps ahma usable
+    /// while honoring the deny, and is fail-*safe*: the compiled-in defaults are
+    /// the secure baseline (sandbox enabled). R-CFG6.1's fail-closed rule
+    /// applies only to a file we *can* read but that fails to **parse** — a
+    /// tampered/corrupt file must never silently change behavior.
     pub fn load_from_result(path: &Path) -> Result<Self, String> {
         match std::fs::read_to_string(path) {
             Ok(contents) => toml::from_str(&contents)
                 .map_err(|e| format!("failed to parse settings file {}: {e}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                warn!(
+                    "settings file {} is not readable ({e}); this is expected when running \
+                     inside the ahma sandbox, which denies ~/.ahma by design (SPEC R5.4.8). \
+                     Using compiled-in defaults.",
+                    path.display()
+                );
+                Ok(Self::default())
+            }
             Err(e) => Err(format!("failed to read {}: {e}", path.display())),
         }
     }
@@ -1454,6 +1479,18 @@ impl AhmaSettings {
                 let text = Self::default().render_documented();
                 atomic_write_toml(path, &text)?;
                 Ok(true)
+            }
+            // `~/.ahma` is intentionally out of sandbox scope (SPEC R5.4.8), so a
+            // sandboxed ahma cannot read *or* write it. Do not abort startup
+            // trying to auto-maintain a file the sandbox (correctly) denies —
+            // skip the write and continue on compiled-in defaults.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                warn!(
+                    "settings file {} is not accessible ({e}); skipping auto-maintenance \
+                     (expected inside the ahma sandbox, which denies ~/.ahma by design).",
+                    path.display()
+                );
+                Ok(false)
             }
             Err(e) => anyhow::bail!("Failed to read {}: {e}", path.display()),
             Ok(contents) => {
@@ -2889,6 +2926,70 @@ timeout_secs = 600
                 "path should contain settings.toml: {s}"
             );
         }
+    }
+
+    /// Regression: a settings file that cannot be *read* because access is
+    /// denied must fall back to compiled-in defaults, NOT abort. `~/.ahma` is
+    /// intentionally out of sandbox scope (SPEC R5.4.8), so whenever ahma runs
+    /// inside its own sandbox the read of `~/.ahma/settings.toml` returns EPERM
+    /// (`PermissionDenied`). Treating that as fatal — the previous behavior —
+    /// made ahma abort on every sandboxed launch (~150 test failures, all
+    /// tracing to `fatal: failed to read …/settings.toml: Operation not
+    /// permitted`). The file is deliberately INVALID toml here: if the loader
+    /// could read it, it would return a parse `Err`; it must instead be unable
+    /// to read it and return `Ok(defaults)`.
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_settings_file_falls_back_to_defaults_not_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, b"this is not valid toml ========").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // If the process can read it anyway (e.g. running as root, where mode
+        // bits are not enforced), the reproduction does not hold — skip.
+        if std::fs::read_to_string(&path).is_ok() {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+            return;
+        }
+
+        let result = AhmaSettings::load_from_result(&path);
+        assert!(
+            result.is_ok(),
+            "a permission-denied settings file (the sandbox's ~/.ahma deny, SPEC R5.4.8) \
+             must fall back to defaults, not abort startup: {result:?}"
+        );
+
+        // Restore perms so the tempdir can be cleaned up on drop.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+    }
+
+    /// Companion to the above for the startup auto-maintenance path:
+    /// `ensure_current` must not `bail!` when `~/.ahma` is permission-denied by
+    /// the sandbox — it skips the write and returns `Ok(false)`.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_current_tolerates_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, b"[tools]\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        if std::fs::read_to_string(&path).is_ok() {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+            return;
+        }
+
+        let created =
+            AhmaSettings::ensure_current(&path).expect("must not bail when the file is denied");
+        assert!(
+            !created,
+            "ensure_current must skip the write (Ok(false)) when the file is permission-denied"
+        );
+
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
     }
 
     #[test]
