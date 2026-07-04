@@ -450,6 +450,15 @@ mod tests {
         }
     }
 
+    fn write_test_peers_json(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let ahma_dir = temp.path().join(".ahma").join("cluster");
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+        std::fs::write(ahma_dir.join("peers.json"), content).unwrap();
+        let path = temp.path().to_path_buf();
+        (temp, path)
+    }
+
     #[test]
     fn registry_finds_peer_by_model() {
         let reg = WorkerRegistry::new(60);
@@ -703,11 +712,8 @@ mod tests {
 
     #[test]
     fn test_load_static_peers() {
-        let temp = tempfile::tempdir().unwrap();
-        let ahma_dir = temp.path().join(".ahma").join("cluster");
-        std::fs::create_dir_all(&ahma_dir).unwrap();
-
-        let peers_json = r#"[
+        let (_temp, path) = write_test_peers_json(
+            r#"[
             {
                 "id": "static-peer-1",
                 "addr": "http://10.0.0.10:9000",
@@ -715,11 +721,11 @@ mod tests {
                 "active_ops": 0,
                 "reachable": true
             }
-        ]"#;
-        std::fs::write(ahma_dir.join("peers.json"), peers_json).unwrap();
+        ]"#,
+        );
 
         let reg = WorkerRegistry::new(60);
-        let count = reg.load_static_peers_from(temp.path()).unwrap();
+        let count = reg.load_static_peers_from(&path).unwrap();
 
         assert_eq!(count, 1);
         let peers = reg.peers_for_model("gemma");
@@ -830,14 +836,11 @@ mod tests {
     #[test]
     fn load_static_peers_malformed_json_is_an_error() {
         // Exercises the `serde_json::from_str` failure branch (line 252).
-        let temp = tempfile::tempdir().unwrap();
-        let ahma_dir = temp.path().join(".ahma").join("cluster");
-        std::fs::create_dir_all(&ahma_dir).unwrap();
-        std::fs::write(ahma_dir.join("peers.json"), "{ this is not valid json").unwrap();
+        let (_temp, path) = write_test_peers_json("{ this is not valid json");
 
         let reg = WorkerRegistry::new(60);
         let err = reg
-            .load_static_peers_from(temp.path())
+            .load_static_peers_from(&path)
             .expect_err("malformed JSON must fail to parse");
         // serde_json errors mention "expected" or a similar parse diagnostic.
         assert!(!err.to_string().is_empty());
@@ -847,20 +850,18 @@ mod tests {
     fn load_static_peers_missing_required_field_is_an_error() {
         // `models` has no `#[serde(default)]`, so a peer entry lacking it must fail
         // deserialization rather than silently defaulting to an empty list.
-        let temp = tempfile::tempdir().unwrap();
-        let ahma_dir = temp.path().join(".ahma").join("cluster");
-        std::fs::create_dir_all(&ahma_dir).unwrap();
-        let peers_json = r#"[
+        let (_temp, path) = write_test_peers_json(
+            r#"[
             {
                 "id": "incomplete-peer",
                 "addr": "http://10.0.0.11:9000"
             }
-        ]"#;
-        std::fs::write(ahma_dir.join("peers.json"), peers_json).unwrap();
+        ]"#,
+        );
 
         let reg = WorkerRegistry::new(60);
         let err = reg
-            .load_static_peers_from(temp.path())
+            .load_static_peers_from(&path)
             .expect_err("peer missing required `models` field must fail to parse");
         assert!(
             err.to_string().contains("models"),
@@ -870,13 +871,10 @@ mod tests {
 
     #[test]
     fn load_static_peers_empty_array_returns_zero() {
-        let temp = tempfile::tempdir().unwrap();
-        let ahma_dir = temp.path().join(".ahma").join("cluster");
-        std::fs::create_dir_all(&ahma_dir).unwrap();
-        std::fs::write(ahma_dir.join("peers.json"), "[]").unwrap();
+        let (_temp, path) = write_test_peers_json("[]");
 
         let reg = WorkerRegistry::new(60);
-        let count = reg.load_static_peers_from(temp.path()).unwrap();
+        let count = reg.load_static_peers_from(&path).unwrap();
         assert_eq!(count, 0);
     }
 
@@ -885,10 +883,8 @@ mod tests {
         // Two entries share the same `id`; the registry is keyed by id so only the
         // last one survives the upsert loop, even though `count` reports the raw
         // list length parsed from JSON.
-        let temp = tempfile::tempdir().unwrap();
-        let ahma_dir = temp.path().join(".ahma").join("cluster");
-        std::fs::create_dir_all(&ahma_dir).unwrap();
-        let peers_json = r#"[
+        let (_temp, path) = write_test_peers_json(
+            r#"[
             {
                 "id": "dup-peer",
                 "addr": "http://10.0.0.20:9000",
@@ -903,11 +899,11 @@ mod tests {
                 "active_ops": 5,
                 "reachable": true
             }
-        ]"#;
-        std::fs::write(ahma_dir.join("peers.json"), peers_json).unwrap();
+        ]"#,
+        );
 
         let reg = WorkerRegistry::new(60);
-        let count = reg.load_static_peers_from(temp.path()).unwrap();
+        let count = reg.load_static_peers_from(&path).unwrap();
         assert_eq!(count, 2, "count reflects the raw JSON list length");
 
         let live = reg.all_live();

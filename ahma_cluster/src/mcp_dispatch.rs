@@ -353,17 +353,23 @@ mod tests {
         assert!(!s.contains("pem-test-key"), "key must not leak via Debug");
     }
 
-    // ── dispatch() happy path ───────────────────────────────────────────────
+    // ── dispatch() helpers and happy path ───────────────────────────────────
 
-    #[tokio::test]
-    async fn dispatch_happy_path_sends_signed_manifest_and_binds_body_hash() {
+    async fn setup_mock_mcp_server(
+        session_id: &str,
+        tools_call_result: serde_json::Value,
+    ) -> (
+        wiremock::MockServer,
+        Arc<std::sync::Mutex<Vec<wiremock::Request>>>,
+    ) {
         use std::sync::Mutex;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let captured: Arc<Mutex<Vec<wiremock::Request>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = captured.clone();
+        let session_id = session_id.to_string();
 
         Mock::given(method("POST"))
             .and(path("/mcp"))
@@ -372,7 +378,7 @@ mod tests {
                 let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
                 match body.get("method").and_then(|v| v.as_str()) {
                     Some("initialize") => ResponseTemplate::new(200)
-                        .insert_header("mcp-session-id", "sess-abc123")
+                        .insert_header("mcp-session-id", &session_id)
                         .set_body_json(json!({
                             "jsonrpc": "2.0", "id": 1,
                             "result": {"protocolVersion": "2025-03-26"}
@@ -380,7 +386,7 @@ mod tests {
                     Some("notifications/initialized") => ResponseTemplate::new(202),
                     Some("tools/call") => ResponseTemplate::new(200).set_body_json(json!({
                         "jsonrpc": "2.0", "id": 1,
-                        "result": {"content": [{"type": "text", "text": "42"}]}
+                        "result": tools_call_result.clone()
                     })),
                     _ => ResponseTemplate::new(200).set_body_json(json!({})),
                 }
@@ -394,6 +400,17 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+
+        (server, captured)
+    }
+
+    #[tokio::test]
+    async fn dispatch_happy_path_sends_signed_manifest_and_binds_body_hash() {
+        let (server, captured) = setup_mock_mcp_server(
+            "sess-abc123",
+            json!({"content": [{"type": "text", "text": "42"}]}),
+        )
+        .await;
 
         let shared_key = b"integration-test-key".to_vec();
         let dispatcher = McpPeerDispatch::new(shared_key.clone(), vec![TransportMode::Http1], None);
@@ -454,37 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_session_manifest_cannot_authenticate_the_tools_call_body() {
-        use std::sync::Mutex;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        let captured: Arc<Mutex<Vec<wiremock::Request>>> = Arc::new(Mutex::new(Vec::new()));
-        let captured_clone = captured.clone();
-
-        Mock::given(method("POST"))
-            .and(path("/mcp"))
-            .respond_with(move |req: &wiremock::Request| {
-                captured_clone.lock().unwrap().push(req.clone());
-                let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
-                match body.get("method").and_then(|v| v.as_str()) {
-                    Some("initialize") => ResponseTemplate::new(200)
-                        .insert_header("mcp-session-id", "sess-split")
-                        .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
-                    Some("notifications/initialized") => ResponseTemplate::new(202),
-                    Some("tools/call") => ResponseTemplate::new(200)
-                        .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}})),
-                    _ => ResponseTemplate::new(200).set_body_json(json!({})),
-                }
-            })
-            .mount(&server)
-            .await;
-
-        Mock::given(method("DELETE"))
-            .and(path("/mcp"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
+        let (server, captured) = setup_mock_mcp_server("sess-split", json!({"ok": true})).await;
 
         let shared_key = b"split-test-key".to_vec();
         let dispatcher = McpPeerDispatch::new(shared_key.clone(), vec![], None);

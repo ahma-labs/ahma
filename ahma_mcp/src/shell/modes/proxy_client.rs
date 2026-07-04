@@ -608,21 +608,6 @@ mod tests {
         receive_call_count: Arc<AtomicUsize>,
         close_behavior: CloseBehavior,
     }
-    impl MockClient {
-        /// Default mock: no queued bridge messages, fresh close counter, clean
-        /// `Ok` close, never simulates a bridge-initiated close.
-        fn new(fail_first_n: usize, attempts: Arc<AtomicUsize>) -> Self {
-            Self {
-                fail_first_n,
-                attempts,
-                inbound: VecDeque::new(),
-                closed: Arc::new(AtomicUsize::new(0)),
-                receive_none_after: None,
-                receive_call_count: Arc::new(AtomicUsize::new(0)),
-                close_behavior: CloseBehavior::Ok,
-            }
-        }
-    }
     impl Transport<RoleClient> for MockClient {
         type Error = std::io::Error;
         fn send(
@@ -665,18 +650,46 @@ mod tests {
         }
     }
 
+    struct TestState {
+        sent: Arc<Mutex<Vec<serde_json::Value>>>,
+        attempts: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+    }
+
+    impl TestState {
+        fn new() -> Self {
+            Self {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                attempts: Arc::new(AtomicUsize::new(0)),
+                closed: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn stdio(&self, inbound: VecDeque<RxJsonRpcMessage<RoleServer>>) -> MockStdio {
+            MockStdio::new(inbound, self.sent.clone())
+        }
+
+        fn client(&self, fail_first_n: usize) -> MockClient {
+            MockClient {
+                fail_first_n,
+                attempts: self.attempts.clone(),
+                inbound: VecDeque::new(),
+                closed: self.closed.clone(),
+                receive_none_after: None,
+                receive_call_count: Arc::new(AtomicUsize::new(0)),
+                close_behavior: CloseBehavior::Ok,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn single_forward_failure_relays_error_and_keeps_session_alive() {
         // REGRESSION: one failed forward (e.g. a per-request timeout surfaced as a
         // transport error) must NOT tear the proxy down. The proxy relays a
         // JSON-RPC error for that request id and keeps serving the next request.
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let stdio = MockStdio::new(
-            VecDeque::from(vec![client_request(1), client_request(2)]),
-            sent.clone(),
-        );
-        let client = MockClient::new(1, attempts.clone());
+        let state = TestState::new();
+        let stdio = state.stdio(VecDeque::from(vec![client_request(1), client_request(2)]));
+        let client = state.client(1);
 
         let result = run_transport_proxy(stdio, client, "test", None).await;
         assert!(
@@ -684,8 +697,8 @@ mod tests {
             "proxy must survive a single forward failure"
         );
         // Both requests were attempted → the session survived the first failure.
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        let sent = sent.lock().unwrap();
+        assert_eq!(state.attempts.load(Ordering::SeqCst), 2);
+        let sent = state.sent.lock().unwrap();
         assert_eq!(sent.len(), 1, "expected one relayed error, got {sent:?}");
         assert_eq!(sent[0]["id"], serde_json::json!(1));
         assert_eq!(sent[0]["error"]["code"], serde_json::json!(-32002));
@@ -695,28 +708,24 @@ mod tests {
     async fn sustained_forward_failures_tear_down_the_session() {
         // A genuinely dead transport still exits — but only after a sustained run
         // of failures, not on the first one.
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let stdio = MockStdio::new(
-            VecDeque::from(vec![
-                client_request(1),
-                client_request(2),
-                client_request(3),
-                client_request(4),
-            ]),
-            sent.clone(),
-        );
-        let client = MockClient::new(usize::MAX, attempts.clone());
+        let state = TestState::new();
+        let stdio = state.stdio(VecDeque::from(vec![
+            client_request(1),
+            client_request(2),
+            client_request(3),
+            client_request(4),
+        ]));
+        let client = state.client(usize::MAX);
 
         let result = run_transport_proxy(stdio, client, "test", None).await;
         assert!(result.is_ok());
         // Gives up after MAX_CONSECUTIVE_FORWARD_FAILURES; request 4 is never tried.
         assert_eq!(
-            attempts.load(Ordering::SeqCst),
+            state.attempts.load(Ordering::SeqCst),
             MAX_CONSECUTIVE_FORWARD_FAILURES as usize
         );
         assert_eq!(
-            sent.lock().unwrap().len(),
+            state.sent.lock().unwrap().len(),
             MAX_CONSECUTIVE_FORWARD_FAILURES as usize
         );
     }
@@ -776,24 +785,14 @@ mod tests {
         // Bridge delivers one message which the proxy must forward to stdio; the
         // stdio side then EOFs. Because nothing was ever forwarded *to* the bridge
         // (forwarded_any == false), the teardown `client.close()` must be skipped.
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let closed = Arc::new(AtomicUsize::new(0));
-
-        let mut stdio = MockStdio::new(VecDeque::new(), sent.clone());
+        let state = TestState::new();
+        let mut stdio = state.stdio(VecDeque::new());
         // Delay EOF so the immediately-ready bridge message wins the first
         // `select!` poll and is forwarded before the loop breaks on EOF.
         stdio.eof_delay = Some(Duration::from_millis(50));
 
-        let client = MockClient {
-            fail_first_n: 0,
-            attempts: attempts.clone(),
-            inbound: VecDeque::from(vec![bridge_response(1)]),
-            closed: closed.clone(),
-            receive_none_after: None,
-            receive_call_count: Arc::new(AtomicUsize::new(0)),
-            close_behavior: CloseBehavior::Ok,
-        };
+        let mut client = state.client(0);
+        client.inbound = VecDeque::from(vec![bridge_response(1)]);
 
         let result = run_transport_proxy(stdio, client, "test", None).await;
         assert!(
@@ -801,19 +800,19 @@ mod tests {
             "bridge responded → Ok(true), got {result:?}"
         );
 
-        let sent = sent.lock().unwrap();
+        let sent = state.sent.lock().unwrap();
         assert_eq!(sent.len(), 1, "bridge message must be forwarded to stdio");
         assert_eq!(sent[0]["id"], serde_json::json!(1));
         assert_eq!(sent[0]["result"], serde_json::json!({}));
 
         // Nothing forwarded to the bridge → no session → close() must be skipped.
         assert_eq!(
-            attempts.load(Ordering::SeqCst),
+            state.attempts.load(Ordering::SeqCst),
             0,
             "no client.send should have occurred"
         );
         assert_eq!(
-            closed.load(Ordering::SeqCst),
+            state.closed.load(Ordering::SeqCst),
             0,
             "close() must not run on the forwarded_any == false path"
         );
@@ -824,28 +823,25 @@ mod tests {
         // Empty inbound on both sides: stdio EOFs immediately, the bridge never
         // responds. The loop breaks at once and the proxy reports bridge_responded
         // == false without attempting any teardown.
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let closed = Arc::new(AtomicUsize::new(0));
-
-        let stdio = MockStdio::new(VecDeque::new(), sent.clone());
-        let client = MockClient {
-            fail_first_n: 0,
-            attempts: attempts.clone(),
-            inbound: VecDeque::new(),
-            closed: closed.clone(),
-            receive_none_after: None,
-            receive_call_count: Arc::new(AtomicUsize::new(0)),
-            close_behavior: CloseBehavior::Ok,
-        };
+        let state = TestState::new();
+        let stdio = state.stdio(VecDeque::new());
+        let client = state.client(0);
 
         let result = run_transport_proxy(stdio, client, "test", None).await;
         assert!(
             matches!(result, Ok(false)),
             "no bridge response → Ok(false), got {result:?}"
         );
-        assert_eq!(sent.lock().unwrap().len(), 0, "no messages should be sent");
-        assert_eq!(closed.load(Ordering::SeqCst), 0, "close() must be skipped");
+        assert_eq!(
+            state.sent.lock().unwrap().len(),
+            0,
+            "no messages should be sent"
+        );
+        assert_eq!(
+            state.closed.load(Ordering::SeqCst),
+            0,
+            "close() must be skipped"
+        );
     }
 
     /// A client->server notification (no `id`), e.g. the standard
@@ -865,23 +861,13 @@ mod tests {
         // (e.g. broken pipe). The proxy must exit the loop without ever setting
         // bridge_responded, and — since nothing was ever forwarded to the bridge
         // — must skip the client.close() teardown.
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let closed = Arc::new(AtomicUsize::new(0));
-
-        let mut stdio = MockStdio::new(VecDeque::new(), sent.clone());
+        let state = TestState::new();
+        let mut stdio = state.stdio(VecDeque::new());
         stdio.eof_delay = Some(Duration::from_millis(50));
         stdio.fail_send = true;
 
-        let client = MockClient {
-            fail_first_n: 0,
-            attempts: attempts.clone(),
-            inbound: VecDeque::from(vec![bridge_response(1)]),
-            closed: closed.clone(),
-            receive_none_after: None,
-            receive_call_count: Arc::new(AtomicUsize::new(0)),
-            close_behavior: CloseBehavior::Ok,
-        };
+        let mut client = state.client(0);
+        client.inbound = VecDeque::from(vec![bridge_response(1)]);
 
         let result = run_transport_proxy(stdio, client, "test", None).await;
         assert!(
@@ -889,12 +875,12 @@ mod tests {
             "stdio write failure must not mark bridge_responded, got {result:?}"
         );
         assert_eq!(
-            sent.lock().unwrap().len(),
+            state.sent.lock().unwrap().len(),
             0,
             "failed send must not be recorded"
         );
         assert_eq!(
-            closed.load(Ordering::SeqCst),
+            state.closed.load(Ordering::SeqCst),
             0,
             "nothing forwarded to bridge -> no session -> close() skipped"
         );
@@ -905,29 +891,23 @@ mod tests {
         // Once a message has been forwarded to the bridge (forwarded_any), the
         // proxy attempts a teardown close(). If close() itself errors, that must
         // be logged and swallowed (non-fatal) rather than surfaced as an Err.
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let closed = Arc::new(AtomicUsize::new(0));
-
-        let stdio = MockStdio::new(VecDeque::from(vec![client_request(1)]), sent.clone());
-        let client = MockClient {
-            fail_first_n: 0,
-            attempts: attempts.clone(),
-            inbound: VecDeque::new(),
-            closed: closed.clone(),
-            receive_none_after: None,
-            receive_call_count: Arc::new(AtomicUsize::new(0)),
-            close_behavior: CloseBehavior::Err,
-        };
+        let state = TestState::new();
+        let stdio = state.stdio(VecDeque::from(vec![client_request(1)]));
+        let mut client = state.client(0);
+        client.close_behavior = CloseBehavior::Err;
 
         let result = run_transport_proxy(stdio, client, "test", None).await;
         assert!(
             matches!(result, Ok(false)),
             "close() error must be non-fatal, got {result:?}"
         );
-        assert_eq!(attempts.load(Ordering::SeqCst), 1, "request was forwarded");
         assert_eq!(
-            closed.load(Ordering::SeqCst),
+            state.attempts.load(Ordering::SeqCst),
+            1,
+            "request was forwarded"
+        );
+        assert_eq!(
+            state.closed.load(Ordering::SeqCst),
             1,
             "close() must have been attempted"
         );
@@ -939,20 +919,10 @@ mod tests {
         // proxy must give up on it (timeout branch) without surfacing an error.
         // Paused time lets tokio auto-advance past both the hang and the
         // timeout instantly instead of the test taking 6+ real seconds.
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let closed = Arc::new(AtomicUsize::new(0));
-
-        let stdio = MockStdio::new(VecDeque::from(vec![client_request(1)]), sent.clone());
-        let client = MockClient {
-            fail_first_n: 0,
-            attempts: attempts.clone(),
-            inbound: VecDeque::new(),
-            closed: closed.clone(),
-            receive_none_after: None,
-            receive_call_count: Arc::new(AtomicUsize::new(0)),
-            close_behavior: CloseBehavior::Hang(Duration::from_secs(100)),
-        };
+        let state = TestState::new();
+        let stdio = state.stdio(VecDeque::from(vec![client_request(1)]));
+        let mut client = state.client(0);
+        client.close_behavior = CloseBehavior::Hang(Duration::from_secs(100));
 
         let result = run_transport_proxy(stdio, client, "test", None).await;
         assert!(
@@ -960,7 +930,7 @@ mod tests {
             "close() timeout must be non-fatal, got {result:?}"
         );
         assert_eq!(
-            closed.load(Ordering::SeqCst),
+            state.closed.load(Ordering::SeqCst),
             1,
             "close() must have been entered before timing out"
         );
@@ -972,39 +942,30 @@ mod tests {
         // transport (`receive()` returns None). The proxy must exit the loop via
         // the "bridge connection closed" branch without ever marking
         // bridge_responded, then still attempt teardown (forwarded_any is true).
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let closed = Arc::new(AtomicUsize::new(0));
-
-        let mut stdio = MockStdio::new(VecDeque::from(vec![client_request(1)]), sent.clone());
+        let state = TestState::new();
+        let mut stdio = state.stdio(VecDeque::from(vec![client_request(1)]));
         stdio.eof_delay = Some(Duration::from_millis(50));
 
-        let client = MockClient {
-            fail_first_n: 0,
-            attempts: attempts.clone(),
-            inbound: VecDeque::new(),
-            closed: closed.clone(),
-            // 1st receive() call (iteration 1) pends so the queued stdio request
-            // is guaranteed to be selected first; 2nd call onward reports the
-            // bridge connection as closed.
-            receive_none_after: Some(2),
-            receive_call_count: Arc::new(AtomicUsize::new(0)),
-            close_behavior: CloseBehavior::Ok,
-        };
+        let mut client = state.client(0);
+        client.receive_none_after = Some(2);
 
         let result = run_transport_proxy(stdio, client, "test", None).await;
         assert!(
             matches!(result, Ok(false)),
             "bridge-initiated close must report bridge_responded == false, got {result:?}"
         );
-        assert_eq!(attempts.load(Ordering::SeqCst), 1, "request was forwarded");
         assert_eq!(
-            sent.lock().unwrap().len(),
+            state.attempts.load(Ordering::SeqCst),
+            1,
+            "request was forwarded"
+        );
+        assert_eq!(
+            state.sent.lock().unwrap().len(),
             0,
             "no bridge message was ever relayed to stdio"
         );
         assert_eq!(
-            closed.load(Ordering::SeqCst),
+            state.closed.load(Ordering::SeqCst),
             1,
             "forwarded_any == true -> close() must still be attempted"
         );
@@ -1016,28 +977,24 @@ mod tests {
         // relay an error against, so nothing is sent back to stdio — but the
         // failure still counts toward MAX_CONSECUTIVE_FORWARD_FAILURES and the
         // transport is still torn down once the threshold is hit.
-        let sent = Arc::new(Mutex::new(Vec::new()));
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let stdio = MockStdio::new(
-            VecDeque::from(vec![
-                client_notification(),
-                client_notification(),
-                client_notification(),
-                client_notification(),
-            ]),
-            sent.clone(),
-        );
-        let client = MockClient::new(usize::MAX, attempts.clone());
+        let state = TestState::new();
+        let stdio = state.stdio(VecDeque::from(vec![
+            client_notification(),
+            client_notification(),
+            client_notification(),
+            client_notification(),
+        ]));
+        let client = state.client(usize::MAX);
 
         let result = run_transport_proxy(stdio, client, "test", None).await;
         assert!(result.is_ok());
         assert_eq!(
-            attempts.load(Ordering::SeqCst),
+            state.attempts.load(Ordering::SeqCst),
             MAX_CONSECUTIVE_FORWARD_FAILURES as usize,
             "gives up after MAX_CONSECUTIVE_FORWARD_FAILURES; 4th notification never tried"
         );
         assert_eq!(
-            sent.lock().unwrap().len(),
+            state.sent.lock().unwrap().len(),
             0,
             "notifications have no id, so no error can be relayed to stdio"
         );
