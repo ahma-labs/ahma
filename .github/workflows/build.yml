@@ -578,6 +578,15 @@ jobs:
 
       - name: Deploy to GitHub Pages
         id: deployment
+        # Non-fatal: publishing the coverage/docs report to Pages is a side-artifact, not a
+        # release-correctness signal. GitHub's Pages deployment API intermittently returns
+        # "Deployment failed, try again later" (a platform-side hiccup, seen even on isolated
+        # single pushes with no concurrent deploys). Because ci-green -> job-publish-release
+        # depends on this job, a flaky Pages publish was blocking otherwise-green releases.
+        # The instrumented test run above still gates the job (a real regression fails it and
+        # blocks the release); only the external publish is allowed to flake. The report
+        # simply republishes on the next successful main push.
+        continue-on-error: true
         uses: actions/deploy-pages@v5
 
       - name: Show sccache stats
