@@ -124,7 +124,7 @@ pub struct AppConfig {
     /// provided and the cwd is a filesystem root.
     pub sandbox_directory: Option<PathBuf>,
     /// Add the sandbox_directory (~/sandbox by default) as a persistent secondary
-    /// scope that survives roots/list updates.  Set by --sandbox.
+    /// scope that survives roots/list updates.  Set by --scratch (deprecated alias: --sandbox).
     pub use_sandbox_dir: bool,
     /// Add system temp dir to sandbox scopes (AHMA_TMP_ACCESS=1).
     pub tmp_access: bool,
@@ -950,12 +950,15 @@ pub struct Cli {
     #[arg(long = "tmp", global = true)]
     pub tmp: bool,
 
-    /// Add the sandbox_directory (default ~/sandbox) as a persistent secondary scope.
+    /// Add the scratch directory (default ~/sandbox) as a persistent secondary scope.
     /// The directory is created if it does not exist and survives roots/list updates,
     /// giving the AI a stable per-user scratch space regardless of which workspace is open.
-    /// Use --sandbox-scope to specify an explicit primary scope instead.
-    #[arg(long = "sandbox", global = true)]
-    pub use_sandbox: bool,
+    /// This does NOT toggle the (always-on) kernel sandbox — use --no-sandbox for that,
+    /// or --sandbox-scope to specify an explicit primary scope.
+    /// (`--sandbox` is a deprecated alias for this flag; its name wrongly read as a
+    /// sandbox on/off switch, which it never was.)
+    #[arg(long = "scratch", alias = "sandbox", global = true)]
+    pub use_scratch: bool,
 
     /// Enable live log monitoring. Ahma tails the configured log stream through
     /// an LLM to detect issues in real time and push alerts as MCP progress
@@ -2263,7 +2266,7 @@ fn parse_sandbox_settings(
     warn_retired_security_env!("AHMA_TMP_ACCESS");
     let tmp_access = cli.tmp || s.sandbox.tmp_access;
 
-    let use_sandbox_dir = cli.use_sandbox || s.sandbox.use_sandbox_directory;
+    let use_sandbox_dir = cli.use_scratch || s.sandbox.use_sandbox_directory;
 
     // Security-tier: AHMA_DISABLE_TEMP retired — warn and ignore.
     warn_retired_security_env!("AHMA_DISABLE_TEMP");
@@ -3430,13 +3433,24 @@ mod tests {
         unsafe { std::env::remove_var("AHMA_TEST_CFG_FLAG") };
     }
 
-    // ─── --sandbox flag / use_sandbox_dir ────────────────────────────────────
+    // ─── --scratch flag (deprecated alias: --sandbox) / use_sandbox_dir ───────
 
-    /// --sandbox CLI flag is parsed to use_sandbox on Cli and threads into AppConfig.
+    /// --scratch CLI flag is parsed to use_scratch on Cli and threads into AppConfig.
     #[test]
-    fn test_cli_parse_sandbox_flag() {
+    fn test_cli_parse_scratch_flag() {
+        let cli = Cli::try_parse_from(["ahma", "--scratch", "serve", "stdio"]).unwrap();
+        assert!(cli.use_scratch, "--scratch must set use_scratch on Cli");
+    }
+
+    /// The deprecated `--sandbox` alias still resolves to the same field, so
+    /// existing mcp.json configs keep working after the rename.
+    #[test]
+    fn test_cli_parse_sandbox_alias_still_works() {
         let cli = Cli::try_parse_from(["ahma", "--sandbox", "serve", "stdio"]).unwrap();
-        assert!(cli.use_sandbox, "--sandbox must set use_sandbox on Cli");
+        assert!(
+            cli.use_scratch,
+            "deprecated --sandbox alias must still set use_scratch"
+        );
     }
 
     /// When CWD is inside the temp dir, resolve_sandbox_scopes falls back to
@@ -3517,8 +3531,8 @@ mod tests {
             "empty sandbox_scopes must not produce --sandbox-scope in bridge args: {args:?}"
         );
         assert!(
-            args.contains(&"--sandbox".to_string()),
-            "--sandbox flag must be forwarded to bridge: {args:?}"
+            args.contains(&"--scratch".to_string()),
+            "--scratch flag must be forwarded to bridge: {args:?}"
         );
     }
 
@@ -3547,8 +3561,8 @@ mod tests {
             "scope value must be present after --sandbox-scope: {args:?}"
         );
         assert!(
-            !args.contains(&"--sandbox".to_string()),
-            "--sandbox must not appear when use_sandbox_dir is false: {args:?}"
+            !args.contains(&"--scratch".to_string()),
+            "--scratch must not appear when use_sandbox_dir is false: {args:?}"
         );
     }
 
@@ -3966,7 +3980,7 @@ mod tests {
             "ahma",
             "--defer-sandbox",
             "--tmp",
-            "--sandbox",
+            "--scratch",
             "--disable-temp-files",
             "--log-monitor",
             "--monitor-rate-limit",

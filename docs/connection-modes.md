@@ -32,7 +32,7 @@ ahma serve stdio
         "Ahma": {
             "type": "stdio",
             "command": "ahma",
-            "args": ["serve", "stdio", "--sandbox", "--log-monitor"]
+            "args": ["serve", "stdio", "--scratch", "--log-monitor"]
         }
     }
 }
@@ -59,7 +59,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
         "Ahma": {
             "type": "stdio",
             "command": "ahma",
-            "args": ["serve", "stdio", "--sandbox", "--log-monitor"]
+            "args": ["serve", "stdio", "--scratch", "--log-monitor"]
         }
     }
 }
@@ -73,7 +73,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
         "Ahma": {
             "type": "stdio",
             "command": "ahma",
-            "args": ["serve", "stdio", "--sandbox", "--log-monitor"]
+            "args": ["serve", "stdio", "--scratch", "--log-monitor"]
         }
     }
 }
@@ -91,7 +91,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
         "stdio",
         "--tools",
         "simplify",
-        "--sandbox",
+        "--scratch",
         "--log-monitor",
         "--sandbox-scope",
         "~/sandbox"
@@ -111,7 +111,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
 First start the server in a terminal with your preferred flags, defaulting to port 3000:
 
 ```bash
-ahma serve http --sandbox --log-monitor
+ahma serve http --scratch --log-monitor
 ```
 
 The HTTP server requires **HTTP/2 or HTTP/3**. HTTP/1.1 connections are explicitly rejected.
@@ -219,9 +219,9 @@ Ahma treats an empty `roots/list` response as "client has no workspace roots yet
 1. **Open a workspace folder** — in Cursor: `File → Open Folder...` — so that Cursor advertises the folder as a workspace root in its next `roots/list` response.
 2. **Configure an explicit scope** — pass `--sandbox-scope /path/to/your/project` in your `mcp.json` `args` list:
    ```json
-   "args": ["serve", "stdio", "--sandbox", "--log-monitor", "--sandbox-scope", "/path/to/project"]
+   "args": ["serve", "stdio", "--scratch", "--log-monitor", "--sandbox-scope", "/path/to/project"]
    ```
-3. **Use `--sandbox`** — starts ahma with a fixed `~/sandbox` scope that never changes, suitable for clients that never provide roots.
+3. **Use `--scratch`** — starts ahma with a fixed `~/sandbox` scratch scope that never changes, suitable for clients that never provide roots. (`--sandbox` still works as a deprecated alias.)
 
 ## 3. Unix Socket Mode
 

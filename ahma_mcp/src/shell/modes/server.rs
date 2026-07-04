@@ -716,7 +716,7 @@ pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
         push(&mut args, "--defer-sandbox");
     }
     if config.use_sandbox_dir {
-        push(&mut args, "--sandbox");
+        push(&mut args, "--scratch");
     }
     if config.tmp_access {
         push(&mut args, "--tmp");
@@ -1166,12 +1166,12 @@ mod tests {
             "empty sandbox_scopes must not produce --sandbox-scope: {args:?}"
         );
         assert!(
-            args.contains(&"--sandbox".to_string()),
-            "--sandbox flag must be forwarded: {args:?}"
+            args.contains(&"--scratch".to_string()),
+            "--scratch flag must be forwarded: {args:?}"
         );
     }
 
-    /// Explicit --sandbox-scope is forwarded; --sandbox not forwarded when not set.
+    /// Explicit --sandbox-scope is forwarded; --scratch not forwarded when not set.
     #[test]
     fn test_bridge_args_explicit_scope_forwarded_no_sandbox_flag() {
         let tmp = tempdir().unwrap();
@@ -1193,12 +1193,12 @@ mod tests {
             "scope value must follow --sandbox-scope: {args:?}"
         );
         assert!(
-            !args.contains(&"--sandbox".to_string()),
-            "--sandbox must not appear when use_sandbox_dir is false: {args:?}"
+            !args.contains(&"--scratch".to_string()),
+            "--scratch must not appear when use_sandbox_dir is false: {args:?}"
         );
     }
 
-    /// Both --sandbox and explicit --sandbox-scope coexist when both are set.
+    /// Both --scratch and explicit --sandbox-scope coexist when both are set.
     #[test]
     fn test_bridge_args_both_sandbox_and_scope() {
         let tmp = tempdir().unwrap();
@@ -1212,8 +1212,8 @@ mod tests {
 
         let args = build_background_bridge_args(&cfg);
         assert!(
-            args.contains(&"--sandbox".to_string()),
-            "--sandbox must be present: {args:?}"
+            args.contains(&"--scratch".to_string()),
+            "--scratch must be present: {args:?}"
         );
         assert!(
             args.iter().any(|a| a == "--sandbox-scope"),
@@ -1609,7 +1609,7 @@ mod tests {
             "--sync",
             "--hot-reload",
             "--defer-sandbox",
-            "--sandbox",
+            "--scratch",
             "--tmp",
             "--disable-temp-files",
         ] {
@@ -1640,7 +1640,7 @@ mod tests {
             "--sync",
             "--hot-reload",
             "--defer-sandbox",
-            "--sandbox",
+            "--scratch",
             "--tmp",
             "--disable-temp-files",
         ] {
