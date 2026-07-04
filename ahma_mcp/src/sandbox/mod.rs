@@ -38,6 +38,7 @@
 //! and wrap command executions in platform-appropriate security wrappers.
 
 pub mod build_diagnostics;
+pub mod capability_denial;
 mod command;
 pub(crate) mod core;
 pub mod credential_reads;
@@ -58,6 +59,9 @@ mod types;
 #[cfg(target_os = "windows")]
 mod windows;
 
+pub use capability_denial::{
+    Capability, EnforcingLayer, capability_denial_disclosure, scan_capability_denial,
+};
 pub use command::{
     apply_egress_proxy_env, is_secret_env_name, scrub_secret_env, secret_env_keys,
     set_egress_proxy_env, set_secret_env_allow,

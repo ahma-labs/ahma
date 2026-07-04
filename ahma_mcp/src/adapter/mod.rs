@@ -1464,6 +1464,19 @@ async fn drain_remaining_stream_lines(
     }
 }
 
+/// Which sandbox layer to attribute a capability denial to, for the disclosure.
+///
+/// If a host sandbox (Cursor/VS Code/Docker/CI) wraps ahma, that host is the
+/// layer denying the credential store and ahma cannot widen it; otherwise ahma
+/// is applying its own sandbox and is authoritative.
+fn capability_enforcing_layer() -> sandbox::EnforcingLayer {
+    if sandbox::detect_host_sandbox().is_some() {
+        sandbox::EnforcingLayer::HostSandbox
+    } else {
+        sandbox::EnforcingLayer::Ahma
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finalize_streaming_operation(
     child: &mut tokio::process::Child,
@@ -1532,6 +1545,20 @@ async fn finalize_streaming_operation(
                 hint.remediation
             );
             op_monitor.append_alert(op_id, hint.remediation).await;
+        }
+
+        // A non-path capability denial (the sandbox refused the OS credential
+        // store, not a filesystem path) has no path to grant, so the scans above
+        // cannot help. Turn the opaque failure into the two-door disclosure.
+        if let Some(cap) = sandbox::scan_capability_denial(&stderr_str) {
+            let disclosure =
+                sandbox::capability_denial_disclosure(cap, capability_enforcing_layer());
+            tracing::warn!(
+                "Operation {} hit a capability denial ({:?}); surfacing disclosure",
+                op_id,
+                cap
+            );
+            op_monitor.append_alert(op_id, disclosure).await;
         }
     }
 

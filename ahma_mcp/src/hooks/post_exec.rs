@@ -18,7 +18,10 @@
 //! **stop failing silently**: turn an opaque errno into "here is what happened
 //! and what to do".
 
-use crate::sandbox::{build_diagnostics, denial_scan};
+use crate::sandbox::{
+    EnforcingLayer, build_diagnostics, capability_denial_disclosure, denial_scan,
+    scan_capability_denial,
+};
 
 /// Prefix that frames every surfaced message with the honest disclosure that the
 /// command ran under the host sandbox, not ahma's.
@@ -53,6 +56,16 @@ pub fn surface_sandbox_denial(output: &str, failed: bool) -> Option<String> {
              command with the host's full-permission/unsandboxed approval, or set \
              `AHMA_PREFER_OWN_SANDBOX=1` to apply ahma's own sandbox and then grant the path \
              (`ahma sandbox grant {path}`), or adjust the host sandbox configuration."
+        ));
+    }
+
+    // A non-path capability denial (the host sandbox refused the OS credential
+    // store). There is no path to grant, so surface the two-door disclosure.
+    // This path is host-deferred by construction, so attribute it to the host.
+    if let Some(cap) = scan_capability_denial(output) {
+        return Some(format!(
+            "{DEFER_NOTE} {}",
+            capability_denial_disclosure(cap, EnforcingLayer::HostSandbox)
         ));
     }
 
@@ -107,6 +120,30 @@ mod tests {
             Operation not permitted (os error 1)";
         let msg = surface_sandbox_denial(output, true).expect("provenance residue must surface");
         assert!(msg.contains("com.apple.provenance"), "{msg}");
+    }
+
+    #[test]
+    fn credential_store_denial_is_surfaced() {
+        // A non-path capability denial: the host sandbox refused the keychain.
+        let output =
+            "error: SecKeychain: User interaction is not allowed. (errSecInteractionNotAllowed)";
+        let msg =
+            surface_sandbox_denial(output, true).expect("credential-store denial must surface");
+        assert!(
+            msg.contains("deferred this command to the host sandbox"),
+            "must disclose host deferral: {msg}"
+        );
+        assert!(
+            msg.contains("credential store") && msg.contains("BLOCKED"),
+            "must give the two-door credential disclosure: {msg}"
+        );
+    }
+
+    #[test]
+    fn bare_401_is_not_surfaced() {
+        // gh swallows the keychain failure into a bare 401 — indistinguishable
+        // from a real logout, so it must not be surfaced as a sandbox denial.
+        assert!(surface_sandbox_denial("HTTP 401: Requires authentication", true).is_none());
     }
 
     #[test]
