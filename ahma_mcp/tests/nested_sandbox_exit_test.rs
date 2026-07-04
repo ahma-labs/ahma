@@ -1,11 +1,11 @@
 //! Nested Sandbox Exit Test (R7.6)
 //!
 //! This test verifies that when ahma_mcp is running inside another sandbox,
-//! it exits with a clear error message instructing the user to use --disable-sandbox.
+//! it exits with a clear error message instructing the user to use --no-sandbox.
 //!
 //! Per R7.6.2: "Upon detection, the system **must** exit with a clear error message
-//! instructing the user to disable the internal sandbox using the --disable-sandbox flag
-//! or AHMA_DISABLE_SANDBOX=1 environment variable."
+//! instructing the user to disable the internal sandbox using the --no-sandbox flag."
+//! The retired AHMA_DISABLE_SANDBOX environment variable is ignored (R-CFG2.3).
 //!
 //! ## Running These Tests
 //!
@@ -77,7 +77,7 @@ macro_rules! skip_if_sandboxed {
 /// The expected behavior is:
 /// 1. Process exits with non-zero code
 /// 2. stderr contains "SECURITY ERROR" or "nested sandbox"
-/// 3. stderr provides instructions about --disable-sandbox or AHMA_DISABLE_SANDBOX
+/// 3. stderr provides instructions about --no-sandbox
 ///
 /// Note: We use a sandbox profile that allows the binary to run but denies
 /// the `process-exec-interpreter` operation which is required for nested sandbox-exec.
@@ -159,9 +159,9 @@ fn test_nested_sandbox_detection_exits_with_error() {
     );
 }
 
-/// Test that ahma_mcp works normally with --disable-sandbox when inside a sandbox (R7.6)
+/// Test that ahma_mcp works normally with --no-sandbox when inside a sandbox (R7.6)
 ///
-/// When the user explicitly disables the sandbox with --disable-sandbox,
+/// When the user explicitly disables the sandbox with --no-sandbox,
 /// ahma_mcp should run successfully even inside another sandbox.
 #[test]
 fn test_no_sandbox_flag_allows_nested_execution() {
@@ -200,10 +200,10 @@ fn test_no_sandbox_flag_allows_nested_execution() {
     eprintln!("stderr:\n{}", stderr);
     eprintln!("stdout:\n{}", stdout);
 
-    // With --disable-sandbox, the process should succeed
+    // With --no-sandbox, the process should succeed
     assert!(
         output.status.success(),
-        "ahma_mcp should succeed with --disable-sandbox even inside another sandbox. stderr:\n{}",
+        "ahma_mcp should succeed with --no-sandbox even inside another sandbox. stderr:\n{}",
         stderr
     );
 

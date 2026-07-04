@@ -210,10 +210,10 @@ fn should_force_no_sandbox_for_test_server() -> bool {
     )
 }
 
-/// On macOS, spawn the test server without `--disable-sandbox` only when
+/// On macOS, spawn the test server without `--no-sandbox` only when
 /// `sandbox-exec` is known to work in the current environment.  When running
 /// inside a nested sandbox (Cursor, VS Code, Docker) `sandbox-exec` returns
-/// exit 71 / "Operation not permitted", so we fall back to `--disable-sandbox` so
+/// exit 71 / "Operation not permitted", so we fall back to `--no-sandbox` so
 /// the integration tests can still exercise the server code.
 #[cfg(target_os = "macos")]
 fn should_force_no_sandbox_for_test_server() -> bool {
@@ -467,7 +467,7 @@ pub async fn spawn_test_server_with_timeout(
         &workspace,
         &spec,
         "Failed to spawn test server",
-        "[TestServer] Sandbox unavailable on this platform/kernel; running test server with --disable-sandbox",
+        "[TestServer] Sandbox unavailable on this platform/kernel; running test server with --no-sandbox",
     )?;
 
     let startup_info = wait_for_startup_or_cleanup(

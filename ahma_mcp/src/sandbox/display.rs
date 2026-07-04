@@ -51,7 +51,7 @@ pub enum ActiveSandbox {
     /// its own enforcement (used by terminal hooks to avoid the redundant
     /// double-sandbox). Protection now depends on the host.
     DeferredToHost(super::host_detect::HostSandbox),
-    /// Nothing is enforcing (e.g. `--disable-sandbox` with no detected host).
+    /// Nothing is enforcing (e.g. `--no-sandbox` with no detected host).
     Disabled,
 }
 

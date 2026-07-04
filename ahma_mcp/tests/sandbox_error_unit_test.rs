@@ -60,24 +60,24 @@ fn test_path_outside_sandbox_error_multiple_scopes_message() {
     );
 }
 
-/// LandlockNotAvailable display is non-trivial and should mention Landlock or --disable-sandbox.
+/// LandlockNotAvailable display is non-trivial and should mention Landlock or --no-sandbox.
 #[test]
 fn test_landlock_not_available_display() {
     let err = SandboxError::LandlockNotAvailable;
     let msg = err.to_string();
     assert!(
-        msg.contains("Landlock") || msg.contains("--disable-sandbox"),
+        msg.contains("Landlock") || msg.contains("--no-sandbox"),
         "LandlockNotAvailable should guide the user: {msg}"
     );
 }
 
-/// MacOSSandboxNotAvailable display should mention sandbox-exec or --disable-sandbox.
+/// MacOSSandboxNotAvailable display should mention sandbox-exec or --no-sandbox.
 #[test]
 fn test_macos_sandbox_not_available_display() {
     let err = SandboxError::MacOSSandboxNotAvailable;
     let msg = err.to_string();
     assert!(
-        msg.contains("macOS") || msg.contains("sandbox-exec") || msg.contains("--disable-sandbox"),
+        msg.contains("macOS") || msg.contains("sandbox-exec") || msg.contains("--no-sandbox"),
         "MacOSSandboxNotAvailable should guide the user: {msg}"
     );
 }
@@ -140,13 +140,13 @@ fn test_high_security_violation_display() {
     );
 }
 
-/// NestedSandboxDetected display should mention nesting or --disable-sandbox.
+/// NestedSandboxDetected display should mention nesting or --no-sandbox.
 #[test]
 fn test_nested_sandbox_detected_display() {
     let err = SandboxError::NestedSandboxDetected;
     let msg = err.to_string();
     assert!(
-        msg.contains("nested") || msg.contains("Nested") || msg.contains("--disable-sandbox"),
+        msg.contains("nested") || msg.contains("Nested") || msg.contains("--no-sandbox"),
         "NestedSandboxDetected should explain the situation: {msg}"
     );
 }

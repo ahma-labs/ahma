@@ -143,8 +143,8 @@ mod tests {
         let err = SandboxError::LandlockNotAvailable;
         let msg = err.to_string();
         assert!(
-            msg.contains("--disable-sandbox"),
-            "Error should advise --disable-sandbox: {msg}"
+            msg.contains("--no-sandbox"),
+            "Error should advise --no-sandbox: {msg}"
         );
     }
 
@@ -154,8 +154,8 @@ mod tests {
         let err = SandboxError::MacOSSandboxNotAvailable;
         let msg = err.to_string();
         assert!(
-            msg.contains("--disable-sandbox"),
-            "Error should advise --disable-sandbox: {msg}"
+            msg.contains("--no-sandbox"),
+            "Error should advise --no-sandbox: {msg}"
         );
     }
 
