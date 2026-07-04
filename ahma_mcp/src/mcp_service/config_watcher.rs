@@ -115,16 +115,37 @@ fn parse_root_uri_to_scope(uri: &str) -> Option<PathBuf> {
     }
 }
 
+/// A directory snapshot entry: `(file_name, size, mtime)`.
+///
+/// `mtime` is `None` only when the platform/filesystem cannot report a
+/// modification time; in that case detection degrades to size-only for that
+/// file (the pre-existing behavior).
+type JsonFileSnapshot = (String, u64, Option<std::time::SystemTime>);
+
 /// Snapshot of JSON files in a directory for polling-based change detection.
-/// Tracks file names and sizes to detect additions, removals, and modifications.
-async fn snapshot_json_files(dir: &Path) -> Vec<(String, u64)> {
+///
+/// Tracks file name, size, AND last-modified time so the polling fallback can
+/// detect additions, removals, and modifications. Modification time is
+/// essential: an in-place edit that preserves the byte length (e.g. changing a
+/// description from `"original"` to `"modified"` — both 8 bytes) is invisible
+/// to a size-only snapshot, so a size-only fallback could never detect it when
+/// the OS fs-event is dropped or delayed (routinely observed with macOS
+/// FSEvents under load). mtime changes on every write, closing that blind spot.
+async fn snapshot_json_files(dir: &Path) -> Vec<JsonFileSnapshot> {
     let mut files = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
-                files.push((entry.file_name().to_string_lossy().into_owned(), size));
+                let (size, mtime) = match entry.metadata().await {
+                    Ok(m) => (m.len(), m.modified().ok()),
+                    Err(_) => (0, None),
+                };
+                files.push((
+                    entry.file_name().to_string_lossy().into_owned(),
+                    size,
+                    mtime,
+                ));
             }
         }
     }
@@ -175,8 +196,16 @@ impl AhmaMcpService {
             // pool so a slow registration never stalls this tokio worker,
             // which the debounce loop below (and callers polling this
             // service's state) depend on making progress.
+            //
+            // Bound the wait with a timeout: a stalled FSEvents registration
+            // must not delay the startup config sync below (or block forever
+            // in the case where it never returns). If it doesn't complete in
+            // time, abandon it and fall through to the polling-fallback path
+            // in the debounce loop, which detects changes without any OS
+            // watch at all — just with coarser (2s) latency.
+            const WATCHER_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
             let watch_dir = tools_dir.clone();
-            let watcher_result = tokio::task::spawn_blocking(move || {
+            let watcher_setup = tokio::task::spawn_blocking(move || {
                 let mut watcher =
                     notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
                         if let Ok(event) = res {
@@ -190,27 +219,57 @@ impl AhmaMcpService {
                                     || event.kind.is_create()
                                     || event.kind.is_remove())
                             {
-                                let _ = tx.blocking_send(());
+                                // MUST be a non-blocking `try_send`, never `blocking_send`.
+                                //
+                                // This closure runs on notify's OS event thread
+                                // (the macOS FSEvents CFRunLoop thread). The channel
+                                // is a capacity-1 "something changed, wake up" signal:
+                                // the debounce loop drains it fully and re-snapshots,
+                                // so a coalesced/dropped duplicate is harmless, and the
+                                // polling fallback catches anything an event misses.
+                                //
+                                // `blocking_send` would park this OS thread whenever the
+                                // channel is full (a burst of events while the loop is
+                                // busy reloading). If the watcher task's future is then
+                                // dropped — e.g. runtime shutdown at the end of a test —
+                                // its locals drop in reverse declaration order, so the
+                                // `notify` watcher (which joins THIS thread in its Drop)
+                                // is dropped before `rx`. The join then waits on a thread
+                                // parked in `blocking_send`, whose capacity never frees
+                                // because `rx` is dropped only afterwards: a permanent
+                                // drop-order deadlock that hangs the whole runtime (seen
+                                // as a 120s test timeout under load). `try_send` cannot
+                                // park the thread, so the deadlock cannot form.
+                                let _ = tx.try_send(());
                             }
                         }
                     })?;
                 watcher.watch(&watch_dir, RecursiveMode::Recursive)?;
                 Ok::<_, notify::Error>(watcher)
-            })
-            .await;
+            });
 
             // Never read again — held only so the OS-level watch stays
             // registered for the lifetime of this task (dropping it stops
-            // watching).
-            let _watcher = match watcher_result {
-                Ok(Ok(w)) => w,
-                Ok(Err(e)) => {
+            // watching). `None` means only the polling fallback is active.
+            let _watcher = match tokio::time::timeout(WATCHER_SETUP_TIMEOUT, watcher_setup).await {
+                Ok(Ok(Ok(w))) => Some(w),
+                Ok(Ok(Err(e))) => {
                     tracing::error!("Failed to create/watch config watcher: {}", e);
-                    return;
+                    None
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::error!("Config watcher setup task panicked: {}", e);
-                    return;
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Config watcher setup for {:?} did not complete within {:?} \
+                         (OS fs-event registration stalled); continuing with \
+                         polling-only change detection.",
+                        tools_dir,
+                        WATCHER_SETUP_TIMEOUT
+                    );
+                    None
                 }
             };
 
@@ -743,7 +802,7 @@ mod tests {
         std::fs::write(tmp.path().join("middle.json"), b"{}").unwrap();
 
         let snap = snapshot_json_files(tmp.path()).await;
-        let names: Vec<&str> = snap.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = snap.iter().map(|(n, _, _)| n.as_str()).collect();
         assert_eq!(names, vec!["alpha.json", "middle.json", "zebra.json"]);
     }
 
@@ -775,6 +834,55 @@ mod tests {
         let snap2 = snapshot_json_files(tmp.path()).await;
 
         assert_ne!(snap1, snap2, "snapshot must differ after content change");
+    }
+
+    /// Regression: a content edit that PRESERVES byte length must still change
+    /// the snapshot. `snapshot_json_files` used to track only `(name, size)`, so
+    /// a same-size edit (the real watcher's `"original"` → `"modified"` case —
+    /// both 8 bytes) was invisible to the polling fallback. When the OS fs-event
+    /// was dropped or delayed under load (routine on macOS FSEvents), nothing
+    /// detected the change and the watcher's own test hung to a hard timeout.
+    /// Including mtime closes the blind spot: the snapshot differs even when the
+    /// size is byte-for-byte identical.
+    #[tokio::test]
+    async fn snapshot_detects_same_size_content_change() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("editable.json");
+
+        // Two payloads of IDENTICAL byte length but different content.
+        let before =
+            br#"{"name":"editable","description":"original","command":"echo","enabled":true}"#;
+        let after =
+            br#"{"name":"editable","description":"modified","command":"echo","enabled":true}"#;
+        assert_eq!(before.len(), after.len(), "test payloads must be same size");
+
+        std::fs::write(&path, before).unwrap();
+        let snap1 = snapshot_json_files(tmp.path()).await;
+        assert_eq!(snap1.len(), 1);
+
+        // Rewrite same-size content until the filesystem's mtime advances (it is
+        // sub-millisecond on every platform ahma's CI runs on — APFS, ext4,
+        // NTFS — so this converges immediately; the bounded loop only guards a
+        // hypothetical coarse-granularity filesystem). The size never changes,
+        // so a size-only snapshot could never satisfy this assertion.
+        let mut snap2 = snap1.clone();
+        for _ in 0..200 {
+            std::fs::write(&path, after).unwrap();
+            snap2 = snapshot_json_files(tmp.path()).await;
+            if snap2 != snap1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            snap1[0].1, snap2[0].1,
+            "size must be unchanged (same length)"
+        );
+        assert_ne!(
+            snap1, snap2,
+            "snapshot must differ after a same-size content edit (mtime changed)"
+        );
     }
 
     #[tokio::test]
