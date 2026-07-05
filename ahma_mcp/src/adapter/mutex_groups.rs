@@ -18,6 +18,17 @@
 //! so at most one runs at a time **within each working directory**.  Commands in
 //! different directories are entirely independent and never block each other.
 //!
+//! ## Two layers of serialisation
+//!
+//! 1. **In-memory semaphore** — prevents thundering-herd wakeups within a
+//!    single process: N async tasks don't all race to the filesystem lock.
+//!
+//! 2. **Cross-process filesystem advisory lock** ([`FsLock`]) — serialises
+//!    across ahma sessions, hook invocations, and any other OS processes.
+//!    The lock is automatically released by the OS when the owning process
+//!    exits for any reason (including panic, `SIGKILL`, or crash).  No stale
+//!    locks, no manual cleanup.
+//!
 //! ## Configuration
 //!
 //! Groups are defined in `~/.ahma/settings.toml` under `[tools].mutex_groups`.
@@ -25,6 +36,7 @@
 //! all gating.
 
 use ahma_common::config::MutexGroupConfig;
+use ahma_common::fs_lock::FsLock;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -45,6 +57,24 @@ pub enum MutexGroupError {
     /// The semaphore was closed — should never happen in normal operation.
     #[error("Mutex group '{group}' semaphore was unexpectedly closed")]
     Closed { group: String },
+}
+
+// ---------------------------------------------------------------------------
+// Guard — holds both in-memory and filesystem locks
+// ---------------------------------------------------------------------------
+
+/// RAII guard returned by [`CommandMutexRegistry::acquire`].
+///
+/// Holds both the in-memory semaphore permit (intra-process) and an optional
+/// filesystem advisory lock (cross-process).  Both are released when the guard
+/// is dropped.
+#[derive(Debug)]
+pub struct MutexGroupGuard {
+    /// In-memory semaphore permit — released on drop.
+    _permit: OwnedSemaphorePermit,
+    /// Cross-process filesystem lock — released on drop (OS closes the fd).
+    /// `None` if the filesystem lock could not be acquired (degraded mode).
+    _fs_lock: Option<FsLock>,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,22 +119,29 @@ impl CommandMutexRegistry {
             .find(|g| g.prefixes.iter().any(|p| p.to_ascii_lowercase() == low))
     }
 
-    /// Acquire the semaphore permit for `(group.name, canonical(working_dir))`.
+    /// Acquire the mutex group gate for `(group.name, canonical(working_dir))`.
+    ///
+    /// This acquires **two layers** of serialisation:
+    ///
+    /// 1. An in-memory semaphore permit (prevents intra-process thundering herd).
+    /// 2. A cross-process filesystem advisory lock on
+    ///    `<working_dir>/.ahma-<group>.lock` (serialises across ahma sessions,
+    ///    hooks, and external processes).
     ///
     /// Blocks until:
-    /// * A permit becomes available (another command in the same group/dir finished), or
+    /// * Both locks become available, or
     /// * `group.max_wait_secs` elapses → returns [`MutexGroupError::Timeout`].
     ///
-    /// The returned [`OwnedSemaphorePermit`] must be held for the entire duration
-    /// of the command; dropping it releases the slot for the next queued command.
+    /// The returned [`MutexGroupGuard`] must be held for the entire duration
+    /// of the command; dropping it releases both locks.
     pub async fn acquire(
         &self,
         group: &MutexGroupConfig,
         working_dir: &Path,
-    ) -> Result<OwnedSemaphorePermit, MutexGroupError> {
+    ) -> Result<MutexGroupGuard, MutexGroupError> {
         let canonical =
             dunce::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
-        let key = (group.name.clone(), canonical);
+        let key = (group.name.clone(), canonical.clone());
 
         // Fast path: semaphore already exists.
         let sem = {
@@ -125,21 +162,59 @@ impl CommandMutexRegistry {
             }
         };
 
-        match tokio::time::timeout(
+        // ── Layer 1: in-memory semaphore (intra-process) ────────────────
+        let permit = match tokio::time::timeout(
             std::time::Duration::from_secs(group.max_wait_secs),
             sem.acquire_owned(),
         )
         .await
         {
-            Ok(Ok(permit)) => Ok(permit),
-            Ok(Err(_)) => Err(MutexGroupError::Closed {
-                group: group.name.clone(),
-            }),
-            Err(_) => Err(MutexGroupError::Timeout {
-                group: group.name.clone(),
-                secs: group.max_wait_secs,
-            }),
-        }
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return Err(MutexGroupError::Closed {
+                    group: group.name.clone(),
+                });
+            }
+            Err(_) => {
+                return Err(MutexGroupError::Timeout {
+                    group: group.name.clone(),
+                    secs: group.max_wait_secs,
+                });
+            }
+        };
+
+        // ── Layer 2: cross-process filesystem advisory lock ─────────────
+        // The lockfile lives inside the working directory so it's workspace-
+        // scoped and cleaned by `cargo clean` (if in target/).  The filename
+        // includes the group name to avoid collisions if we ever add non-cargo
+        // groups.
+        let group_name = group.name.clone();
+        let fs_lock = tokio::task::spawn_blocking(move || {
+            let lock_path = canonical.join(format!(".ahma-{group_name}.lock"));
+            match FsLock::acquire(&lock_path) {
+                Ok(lock) => Some(lock),
+                Err(e) => {
+                    // Degrade gracefully: intra-process gate still holds, just
+                    // no cross-process protection.
+                    tracing::warn!(
+                        "Could not acquire filesystem lock {}: {e} \
+                         (intra-process gate still active)",
+                        lock_path.display()
+                    );
+                    None
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("spawn_blocking for fs lock panicked: {e}");
+            None
+        });
+
+        Ok(MutexGroupGuard {
+            _permit: permit,
+            _fs_lock: fs_lock,
+        })
     }
 
     /// Returns the number of `(group, dir)` semaphores currently tracked.
@@ -208,7 +283,7 @@ mod tests {
         let group = cargo_group();
 
         // Acquire the permit in task A.
-        let permit_a = reg.acquire(&group, td.path()).await.unwrap();
+        let guard_a = reg.acquire(&group, td.path()).await.unwrap();
 
         // Task B tries to acquire — must wait.
         let reg2 = reg.clone();
@@ -219,8 +294,8 @@ mod tests {
         // Give B a moment to queue up.
         sleep(Duration::from_millis(50)).await;
 
-        // Drop A's permit — B should now succeed.
-        drop(permit_a);
+        // Drop A's guard — B should now succeed.
+        drop(guard_a);
         let result = handle.await.unwrap();
         assert!(result.is_ok(), "task B should succeed after A releases");
     }
@@ -235,7 +310,7 @@ mod tests {
         let group = cargo_group();
 
         // Acquire permit for dir1.
-        let _permit1 = reg.acquire(&group, td1.path()).await.unwrap();
+        let _guard1 = reg.acquire(&group, td1.path()).await.unwrap();
 
         // Acquiring for dir2 must NOT block (different semaphore key).
         let reg2 = reg.clone();
@@ -262,7 +337,7 @@ mod tests {
             max_wait_secs: 0, // instant timeout
         };
 
-        // Hold the permit.
+        // Hold the guard.
         let _held = reg.acquire(&short_group, td.path()).await.unwrap();
 
         // Second acquire must time out.

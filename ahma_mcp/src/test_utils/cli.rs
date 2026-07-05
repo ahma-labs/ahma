@@ -1,4 +1,5 @@
 use super::fs::get_workspace_dir;
+use ahma_common::fs_lock::FsLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -7,6 +8,10 @@ use std::time::SystemTime;
 
 /// Cached binary paths to avoid redundant builds across tests.
 /// Key: (package, binary) tuple as string "package:binary"
+///
+/// This is a **per-process** fast-path: it skips the filesystem lock entirely
+/// for repeated calls within a single test process.  Cross-process
+/// serialisation is handled by [`FsLock`] below.
 static BINARY_CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
 
 /// Newest mtime among workspace source files (`*.rs`, `Cargo.toml`, `Cargo.lock`),
@@ -121,16 +126,56 @@ pub fn get_binary_path(_package: &str, binary: &str) -> PathBuf {
 /// <bin>`): bin names are unique across the workspace, whereas callers pass the
 /// `package` arg inconsistently (`ahma_bin`, `ahma`, even `ahma_mcp`) — and it
 /// has always been ignored for path resolution too (see [`get_binary_path`]).
-/// The result is cached so later calls in the same process skip the check, and
-/// the whole operation is serialized under the cache mutex so parallel callers
-/// wait for a single build instead of racing.
+///
+/// ## Cross-process serialisation
+///
+/// `cargo nextest` runs each test in its own OS process, so an in-memory lock
+/// cannot prevent N processes from concurrently spawning `cargo build` for the
+/// same binary.  This function therefore uses **two layers** of locking:
+///
+/// 1. **Per-process fast-path** (`BINARY_CACHE`): an in-memory `OnceLock` that
+///    skips everything — including the filesystem lock — for repeated calls
+///    within the same process.
+///
+/// 2. **Cross-process serialisation** ([`FsLock`]): an OS-level advisory file
+///    lock on `<target>/debug/<binary>.build-lock`.  Only one process at a time
+///    proceeds past the lock; losers block and then re-check freshness (the
+///    winner will have already built it).  The lock is released automatically
+///    when the `FsLock` drops or the process exits for any reason — including
+///    panic, `SIGKILL`, or crash.  No stale locks, no manual cleanup.
 pub fn build_binary_cached(package: &str, binary: &str) -> PathBuf {
     let cache = BINARY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = format!("{}:{}", package, binary);
     let binary_path = get_binary_path(package, binary);
 
-    // Hold the lock across the freshness check + build: concurrent callers all
-    // want the SAME fresh binary, so serializing avoids redundant/racing builds.
+    // ── Fast-path: per-process in-memory cache ──────────────────────────
+    // If this process has already verified/built this binary, skip everything.
+    {
+        let cache_guard = cache.lock().unwrap();
+        if cache_guard.contains_key(&key) {
+            return binary_path;
+        }
+    }
+
+    // ── Cross-process serialisation via filesystem advisory lock ─────────
+    // The lockfile lives next to the binary so `cargo clean` removes it.
+    let lock_path = binary_path.with_extension("build-lock");
+    let _fs_lock = FsLock::acquire(&lock_path).unwrap_or_else(|e| {
+        // If we can't acquire the lock (e.g. read-only filesystem), fall
+        // through without cross-process protection — the build is still
+        // correct, just potentially redundant.
+        eprintln!(
+            "warning: could not acquire build lock {}: {e} (proceeding without cross-process serialisation)",
+            lock_path.display()
+        );
+        // Return a lock on a temp file so the type works out — it's
+        // released immediately but that's fine, we're in degraded mode.
+        FsLock::acquire(&std::env::temp_dir().join(format!("ahma-build-{binary}.lock")))
+            .expect("fallback lock in temp dir should always succeed")
+    });
+
+    // Re-check under the filesystem lock: another process may have built
+    // the binary while we were waiting.
     let mut cache_guard = cache.lock().unwrap();
     if cache_guard.contains_key(&key) {
         return binary_path;
