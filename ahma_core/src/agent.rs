@@ -985,6 +985,44 @@ async fn spawn_external_tool_call_http(
     call_mcp_tool_http(&client, &url, &sid, tool, arguments).await
 }
 
+/// Extract the `mcp-session-id` from an `initialize` response, or build a
+/// **diagnostic** error including the HTTP status and a bounded body snippet.
+///
+/// The bare "missing header" message hides the real failure — auth (401),
+/// session limit (429), a bridge init-forward error (500), or the request
+/// hitting an endpoint that isn't the MCP bridge at all. Because the header is
+/// absent in every one of those cases, the agent loop used to see the same
+/// opaque string and retry blindly. Surfacing status + body makes the actual
+/// cause visible in the chat and in logs. `context` distinguishes the internal
+/// vs. external handshake in the message.
+async fn session_id_from_initialize(
+    resp: reqwest::Response,
+    context: &str,
+) -> Result<String, String> {
+    if let Some(sid) = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        return Ok(sid.to_string());
+    }
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let snippet: String = body.chars().take(500).collect();
+    let body_note = if snippet.trim().is_empty() {
+        "<empty body>".to_string()
+    } else {
+        snippet
+    };
+    Err(format!(
+        "No mcp-session-id header in {context} (HTTP {status}). \
+         This usually means the request reached something other than a locked \
+         ahma bridge session — check auth, session limits, and that the bridge \
+         URL is correct. Response body: {body_note}"
+    ))
+}
+
 async fn get_or_create_external_session(
     client: &reqwest::Client,
     url: &str,
@@ -1007,12 +1045,7 @@ async fn get_or_create_external_session(
         .await
         .map_err(|e| format!("Failed to initialize external session: {e}"))?;
 
-    let sid = resp
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| "No mcp-session-id header in external initialize response".to_string())?
-        .to_string();
+    let sid = session_id_from_initialize(resp, "external initialize response").await?;
 
     let initialized_body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -1219,12 +1252,7 @@ pub async fn get_or_create_session(
         .await
         .map_err(|e| format!("Failed to initialize session: {e}"))?;
 
-    let sid = resp
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| "No mcp-session-id header in response".to_string())?
-        .to_string();
+    let sid = session_id_from_initialize(resp, "initialize response").await?;
 
     // Step 2: open the GET /mcp SSE stream BEFORE announcing readiness, so the
     // bridge has a channel to deliver its roots/list request. The listener is
@@ -3255,6 +3283,21 @@ mod tests {
             err.contains("No mcp-session-id header in external initialize response"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_external_missing_session_header_surfaces_status_and_body() {
+        // When the initialize reply has no session header, the diagnostic must
+        // expose the real HTTP status and body instead of the bare, opaque
+        // "missing header" string that made the agent loop retry blindly.
+        let base = mock_post_status(axum::http::StatusCode::FORBIDDEN).await;
+        let mut cfg = empty_mcp_config("http://127.0.0.1:9");
+        cfg.external_http_servers.insert("ext".to_string(), base);
+        let err = dispatch_tool_execution("ext::do", serde_json::json!({}), &cfg)
+            .await
+            .expect_err("missing session header must error");
+        assert!(err.contains("HTTP 403"), "status missing from: {err}");
+        assert!(err.contains("boom-body"), "body missing from: {err}");
     }
 
     // ── spawn_chat_task (mcp:// routing) ───────────────────────────────────────
