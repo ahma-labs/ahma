@@ -716,23 +716,15 @@ fn log_sandbox_mode(no_sandbox: bool, deferred_host: Option<sandbox::HostSandbox
     // Always state, loudly, which sandbox is actually protecting the user (R5.4).
     // In MCP/standalone mode ahma stays authoritative when enforcing; when its own
     // enforcement is off, protection (if any) comes from a detected host sandbox.
-    let active = if let Some(host) = deferred_host {
+    let active = match deferred_host {
         // ahma could not nest its sandbox inside a proven outer sandbox → deferring.
-        sandbox::ActiveSandbox::DeferredToHost(host)
-    } else if no_sandbox {
-        match sandbox::detect_host_sandbox() {
-            Some(host) => sandbox::ActiveSandbox::DeferredToHost(host),
-            None => sandbox::ActiveSandbox::Disabled,
-        }
-    } else {
-        // Enforcing. Actively probe whether ahma is ALSO confined by an outer host
-        // sandbox (so the effective policy is the intersection). The probe returns
+        Some(host) => sandbox::ActiveSandbox::DeferredToHost(host),
+        // Otherwise derive it from enforcement + the host / active-confinement
+        // probes — shared with the sandbox/configured notification via `observe`,
+        // so logs and clients agree. When enforcing, the confinement probe returns
         // Some only on positive proof, so this never false-positives on an
         // IDE-launched-but-unconfined MCP server.
-        match sandbox::outer_confinement() {
-            Some(host) => sandbox::ActiveSandbox::AhmaEnforcingNestedInHost(host),
-            None => sandbox::ActiveSandbox::AhmaEnforcing,
-        }
+        None => sandbox::ActiveSandbox::observe(!no_sandbox),
     };
     tracing::info!("{}", active.disclosure_line());
 

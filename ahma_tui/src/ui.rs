@@ -139,6 +139,19 @@ fn window_status_style(status: crate::state::WindowStatus, theme: &Theme) -> Sty
     }
 }
 
+/// Colour for the sandbox status chip. `NESTED: <host>` / `DEFERRED: <host>`
+/// carry a variable host suffix, so match by prefix. Nested/deferred are warnings
+/// (ahma is not the sole authority); UNSANDBOXED/FAILED are alarming.
+fn sandbox_status_style(status: &str, theme: &Theme) -> Style {
+    match status {
+        "LOCKED" => theme.success(),
+        "INITIALIZING" => theme.pending(),
+        "FAILED" | "UNSANDBOXED" => theme.failed(),
+        s if s.starts_with("NESTED") || s.starts_with("DEFERRED") => theme.pending(),
+        _ => theme.unknown_health(),
+    }
+}
+
 fn draw_collapsed_window(
     frame: &mut Frame,
     w: &crate::state::TuiWindow,
@@ -470,12 +483,7 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         15
     };
     let workspace_short = shorten_path(&state.workspace, max_path_len);
-    let sandbox_style = match state.sandbox_status.as_str() {
-        "LOCKED" => theme.success(),
-        "INITIALIZING" => theme.pending(),
-        "FAILED" => theme.failed(),
-        _ => theme.unknown_health(),
-    };
+    let sandbox_style = sandbox_status_style(&state.sandbox_status, theme);
     let sandbox_part = if !state.workspace.is_empty() {
         format!(" · sandbox: {workspace_short}")
     } else {
@@ -1593,12 +1601,7 @@ fn format_external_part(state: &AppState) -> String {
 fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let health_span = header_health_span(state, theme);
 
-    let sandbox_style = match state.sandbox_status.as_str() {
-        "LOCKED" => theme.success(),
-        "INITIALIZING" => theme.pending(),
-        "FAILED" => theme.failed(),
-        _ => theme.unknown_health(),
-    };
+    let sandbox_style = sandbox_status_style(&state.sandbox_status, theme);
 
     let session_part = state
         .session_id

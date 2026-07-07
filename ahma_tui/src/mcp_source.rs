@@ -643,13 +643,50 @@ async fn handle_sse_event(
 
     if method == Some("notifications/sandbox/configured") {
         debug!("Sandbox configured successfully!");
-        send(
-            tx,
-            SourceEvent::SandboxStatus {
-                status: "LOCKED".to_string(),
+        let params = value.get("params");
+        let active = params
+            .and_then(|p| p.get("active"))
+            .and_then(|v| v.as_str());
+        let host = params.and_then(|p| p.get("host")).and_then(|v| v.as_str());
+        let disclosure = params
+            .and_then(|p| p.get("active_disclosure"))
+            .and_then(|v| v.as_str());
+
+        // Map the active-sandbox token to a compact status-bar label. Missing
+        // params (older servers, or the bare notification) => LOCKED, preserving
+        // backward compatibility.
+        let status = match active {
+            Some("ahma_nested_in_host") => match host {
+                Some(h) => format!("NESTED: {h}"),
+                None => "NESTED".to_string(),
             },
-        )
-        .await;
+            Some("deferred_to_host") => match host {
+                Some(h) => format!("DEFERRED: {h}"),
+                None => "DEFERRED".to_string(),
+            },
+            Some("disabled") => "UNSANDBOXED".to_string(),
+            _ => "LOCKED".to_string(),
+        };
+        send(tx, SourceEvent::SandboxStatus { status }).await;
+
+        // When ahma is not the sole authority, surface the loud, actionable
+        // disclosure once in the log pane so the remediation is visible in-TUI —
+        // not just in the server's stderr the user may never see.
+        if matches!(
+            active,
+            Some("ahma_nested_in_host") | Some("deferred_to_host") | Some("disabled")
+        ) && let Some(text) = disclosure
+        {
+            send(
+                tx,
+                SourceEvent::LogLine(LogEntry {
+                    timestamp: chrono::Local::now(),
+                    level: LogLevel::Warn,
+                    message: text.to_string(),
+                }),
+            )
+            .await;
+        }
     }
 
     if method == Some("roots/list") {
@@ -1759,6 +1796,40 @@ mod tests {
             .expect("ok");
         match rx.try_recv().expect("event emitted") {
             SourceEvent::SandboxStatus { status } => assert_eq!(status, "LOCKED"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_handle_sse_event_sandbox_configured_nested_in_host() {
+        let (tx, mut rx) = mpsc::channel::<SourceEvent>(8);
+        let client = test_client();
+        let value = json!({
+            "method": "notifications/sandbox/configured",
+            "params": {
+                "active": "ahma_nested_in_host",
+                "host": "Claude Code",
+                "active_disclosure": "Sandbox: ahma kernel sandbox is ENFORCING, but ... INTERSECTION ... run ahma as a configured MCP server ..."
+            }
+        });
+        handle_sse_event(&client, "http://127.0.0.1:9/mcp", &value, "sid", None, &tx)
+            .await
+            .expect("ok");
+        // First event: the compact status-bar label naming the host.
+        match rx.try_recv().expect("status event emitted") {
+            SourceEvent::SandboxStatus { status } => assert_eq!(status, "NESTED: Claude Code"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Second event: the loud remediation surfaced as a warning log line.
+        match rx.try_recv().expect("log line emitted") {
+            SourceEvent::LogLine(entry) => {
+                assert_eq!(entry.level, LogLevel::Warn);
+                assert!(
+                    entry.message.contains("INTERSECTION"),
+                    "log must carry the disclosure: {}",
+                    entry.message
+                );
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }

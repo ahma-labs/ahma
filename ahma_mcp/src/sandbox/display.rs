@@ -64,6 +64,36 @@ pub enum ActiveSandbox {
 }
 
 impl ActiveSandbox {
+    /// Observe which sandbox is currently in effect, from whether ahma is
+    /// enforcing plus the host-detection / active-confinement probes. Shared by
+    /// the startup disclosure and the `sandbox/configured` notification so every
+    /// surface (logs, MCP clients, the TUI) reports the same state.
+    pub fn observe(enforced: bool) -> ActiveSandbox {
+        if enforced {
+            match super::confinement::outer_confinement() {
+                Some(host) => ActiveSandbox::AhmaEnforcingNestedInHost(host),
+                None => ActiveSandbox::AhmaEnforcing,
+            }
+        } else {
+            match super::host_detect::detect_host_sandbox() {
+                Some(host) => ActiveSandbox::DeferredToHost(host),
+                None => ActiveSandbox::Disabled,
+            }
+        }
+    }
+
+    /// The host label when a host sandbox is involved (nested or deferred), for a
+    /// compact status indicator; `None` when ahma is the sole authority or nothing
+    /// is enforcing.
+    pub fn host_label(self) -> Option<&'static str> {
+        match self {
+            ActiveSandbox::AhmaEnforcingNestedInHost(h) | ActiveSandbox::DeferredToHost(h) => {
+                Some(h.label())
+            }
+            ActiveSandbox::AhmaEnforcing | ActiveSandbox::Disabled => None,
+        }
+    }
+
     /// Stable machine-readable token for JSON payloads / logs.
     pub fn token(self) -> &'static str {
         match self {

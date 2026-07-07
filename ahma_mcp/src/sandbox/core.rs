@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use dunce;
 use std::path::{Path, PathBuf};
 
-use super::display::{ScopeSource, ScopeView};
+use super::display::{ActiveSandbox, ScopeSource, ScopeView};
 use super::error::SandboxError;
 use super::scopes;
 use super::types::{SandboxMode, ScopesGuard};
@@ -578,14 +578,30 @@ impl Sandbox {
     pub fn scope_json(&self, source: ScopeSource) -> serde_json::Value {
         let writes = self.scopes.read().unwrap().clone();
         let reads = self.read_scopes.read().unwrap().clone();
-        ScopeView {
+        let mut v = ScopeView {
             write_scopes: &writes,
             read_scopes: &reads,
             tmp_access: self.tmp_access,
             enforced: self.is_enforced(),
             source,
         }
-        .to_json()
+        .to_json();
+
+        // SPEC R5.4: carry the active-sandbox state (including whether ahma is
+        // nested inside a host sandbox) so clients like the TUI can render the
+        // effective posture and its remediation without a separate query.
+        let active = ActiveSandbox::observe(self.is_enforced());
+        if let serde_json::Value::Object(map) = &mut v {
+            map.insert("active".into(), serde_json::json!(active.token()));
+            map.insert(
+                "active_disclosure".into(),
+                serde_json::json!(active.disclosure_line()),
+            );
+            if let Some(host) = active.host_label() {
+                map.insert("host".into(), serde_json::json!(host));
+            }
+        }
+        v
     }
 
     /// Check if a path is within any of the sandbox scopes.
@@ -801,6 +817,18 @@ mod scope_view_tests {
         assert!(
             !writes.is_empty(),
             "expected at least one write scope: {json}"
+        );
+        // R5.4: the active-sandbox posture is carried for clients (the TUI).
+        // Not enforcing + (typically) no host detected in the test env => disabled.
+        assert!(
+            json.get("active").and_then(|v| v.as_str()).is_some(),
+            "scope_json must carry an `active` token: {json}"
+        );
+        assert!(
+            json.get("active_disclosure")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "scope_json must carry a non-empty `active_disclosure`: {json}"
         );
     }
 
