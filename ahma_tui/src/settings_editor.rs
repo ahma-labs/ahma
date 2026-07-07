@@ -454,6 +454,14 @@ impl SettingsEditor {
                 default_value: SettingValue::Bool(d.package_cache_write),
                 security_tier: true,
             },
+            SettingItem {
+                key: "sandbox.allow_keychain",
+                label: "Allow keychain",
+                description: "macOS: allow keychain read/write (gh, git-credential-osxkeychain)",
+                value: SettingValue::Bool(s.allow_keychain),
+                default_value: SettingValue::Bool(d.allow_keychain),
+                security_tier: true,
+            },
         ]
     }
 
@@ -638,6 +646,7 @@ impl SettingsEditor {
             2 => s.disable_temp = *v,
             3 => s.defer = *v,
             4 => s.package_cache_write = *v,
+            5 => s.allow_keychain = *v,
             _ => {}
         }
     }
@@ -1085,7 +1094,7 @@ mod tests {
         assert_eq!(editor.items_for_category(SettingsCategory::Tools).len(), 6);
         assert_eq!(
             editor.items_for_category(SettingsCategory::Sandbox).len(),
-            5
+            6
         );
         assert_eq!(
             editor.items_for_category(SettingsCategory::Logging).len(),
@@ -1207,12 +1216,14 @@ mod tests {
         e.apply_sandbox(2, &SettingValue::Bool(true));
         e.apply_sandbox(3, &SettingValue::Bool(true));
         e.apply_sandbox(4, &SettingValue::Bool(false));
+        e.apply_sandbox(5, &SettingValue::Bool(false));
         let s = &e.settings().sandbox;
         assert!(s.disable);
         assert!(s.tmp_access);
         assert!(s.disable_temp);
         assert!(s.defer);
         assert!(!s.package_cache_write);
+        assert!(!s.allow_keychain);
         // Non-bool early return guard.
         e.apply_sandbox(0, &SettingValue::U64(1));
         assert!(e.settings().sandbox.disable);

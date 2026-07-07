@@ -69,7 +69,8 @@ pub use command::{
 pub use core::Sandbox;
 pub use core::{add_log_exception, is_target_allowed, load_exceptions};
 pub use credential_reads::{
-    default_credential_read_denies, effective_credential_read_denies, set_credential_read_denies,
+    default_credential_read_denies, effective_credential_read_denies, keychain_access_allowed,
+    set_credential_read_denies, set_keychain_access_allowed,
 };
 pub use denial_scan::{DenialHit, scan_denial};
 pub use display::{ActiveSandbox, ScopeSource, ScopeView};

@@ -22,11 +22,30 @@ use std::sync::RwLock;
 
 static CREDENTIAL_READ_DENIES: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 
+/// Whether sandboxed tools may read/write the macOS login keychain
+/// (`~/Library/Keychains`) and the `com.apple.security*` preference plists.
+///
+/// Empty (`false`) until installed at startup via [`set_keychain_access_allowed`],
+/// matching the credential-deny-list pattern: in-process embedders and Test-mode
+/// sandboxes (which never emit a Seatbelt profile) are unaffected. On real
+/// startup it is set to the resolved `[sandbox] allow_keychain` value, which
+/// **defaults to `true`** — see [`super::seatbelt`] for the emitted rules.
+///
+/// The macOS keychain is encrypted at rest, so denying file access to it protects
+/// only against offline theft of the encrypted database, not against secret
+/// extraction (that goes through `securityd`, which is ACL-gated regardless of the
+/// sandbox and reachable via the always-allowed `mach-lookup`). Blocking it mostly
+/// just breaks `gh`, `git-credential-osxkeychain`, and similar tools, so the
+/// default is to allow it; the paranoid opt back out via `allow_keychain = false`.
+static KEYCHAIN_ACCESS_ALLOWED: RwLock<bool> = RwLock::new(false);
+
 /// Home-relative credential directories denied by default. Chosen so no common
 /// build / test / VCS tool breaks: `~/.ssh` and `~/.config/gh` are intentionally
 /// **absent** (git-over-ssh and `gh` need them) and can be added via
-/// `[sandbox] deny_credential_reads`.
-const DEFAULT_DENY_RELATIVE: [&str; 8] = [
+/// `[sandbox] deny_credential_reads`. `~/Library/Keychains` is likewise absent —
+/// it is governed by the dedicated `[sandbox] allow_keychain` toggle (default on;
+/// see [`KEYCHAIN_ACCESS_ALLOWED`]) which re-adds it to the deny set when disabled.
+const DEFAULT_DENY_RELATIVE: [&str; 7] = [
     ".ahma", // ahma's own bearer token, TLS keys, and scope-grant store
     ".aws",
     ".gnupg",
@@ -34,7 +53,6 @@ const DEFAULT_DENY_RELATIVE: [&str; 8] = [
     ".kube",
     ".docker",
     ".netrc",
-    "Library/Keychains",
 ];
 
 /// Expand a leading `~` / `~/…` against `home`; otherwise return the path as-is.
@@ -93,6 +111,22 @@ pub fn credential_read_denies() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// Install whether sandboxed tools may access the macOS keychain (called once at
+/// startup with the resolved `[sandbox] allow_keychain` value). See
+/// [`KEYCHAIN_ACCESS_ALLOWED`].
+pub fn set_keychain_access_allowed(allowed: bool) {
+    if let Ok(mut guard) = KEYCHAIN_ACCESS_ALLOWED.write() {
+        *guard = allowed;
+    }
+}
+
+/// Whether sandboxed tools may access the macOS keychain (`false` until installed
+/// at startup). Read by the Seatbelt profile builder to decide whether to emit the
+/// keychain write / security-prefs allow rules.
+pub fn keychain_access_allowed() -> bool {
+    KEYCHAIN_ACCESS_ALLOWED.read().map(|g| *g).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,10 +137,20 @@ mod tests {
         let set = default_credential_read_denies(home);
         assert!(set.contains(&home.join(".ahma")));
         assert!(set.contains(&home.join(".aws")));
-        assert!(set.contains(&home.join("Library/Keychains")));
         // git-over-ssh / gh must keep working by default.
         assert!(!set.contains(&home.join(".ssh")));
         assert!(!set.contains(&home.join(".config/gh")));
+        // The keychain is governed by the `allow_keychain` toggle (default on),
+        // not the built-in deny set, so `gh`/keychain tools work by default.
+        assert!(!set.contains(&home.join("Library/Keychains")));
+    }
+
+    #[test]
+    fn keychain_access_flag_set_and_get_roundtrip() {
+        set_keychain_access_allowed(true);
+        assert!(keychain_access_allowed());
+        set_keychain_access_allowed(false);
+        assert!(!keychain_access_allowed());
     }
 
     #[test]

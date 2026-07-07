@@ -30,6 +30,7 @@ impl Sandbox {
         let read_scopes_rules = self.get_macos_read_scopes_rules();
         let system_rules = self.get_macos_system_rules();
         let credential_deny_rules = self.get_macos_credential_deny_rules();
+        let keychain_rules = self.get_macos_keychain_rules();
         let user_tool_rules = self.get_macos_user_tool_rules();
         let temp_rules = self.get_macos_temp_rules();
         let pkg_cache_rules = self.get_macos_package_cache_write_rules();
@@ -41,7 +42,7 @@ impl Sandbox {
 (allow process*)
 (allow signal)
 (allow sysctl-read)
-{system_rules}{credential_deny_rules}{user_tool_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
+{system_rules}{credential_deny_rules}{keychain_rules}{user_tool_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
 (allow file-write* (subpath "{working_dir}"))
 {pkg_cache_rules}{temp_rules}(allow file-read* (literal "/dev/null"))
 (allow file-write* (literal "/dev/null"))
@@ -55,6 +56,7 @@ impl Sandbox {
             working_dir = wd_str,
             system_rules = system_rules,
             credential_deny_rules = credential_deny_rules,
+            keychain_rules = keychain_rules,
             user_tool_rules = user_tool_rules,
             scope_rules = scope_rules,
             read_scopes_rules = read_scopes_rules,
@@ -141,6 +143,39 @@ impl Sandbox {
             ));
         }
         rules
+    }
+
+    /// Keychain access rules, gated by `[sandbox] allow_keychain` (default on;
+    /// see [`super::credential_reads::keychain_access_allowed`]).
+    ///
+    /// When allowed, sandboxed tools need to *write* the login keychain (default
+    /// deny blocks writes; the working dir doesn't cover `~/Library/Keychains`) and
+    /// read/write the `com.apple.security*` preference plists. **Reads** of the
+    /// keychain already work via the global `(allow file-read*)` because keychain
+    /// is not in the credential-read deny set when this toggle is on. mach access
+    /// to `securityd` / `SecurityServer` is already granted by the blanket
+    /// `(allow mach-lookup)` in the base profile.
+    ///
+    /// This is the fix for `gh auth login` (and `git-credential-osxkeychain`)
+    /// silently breaking under the sandbox: the OAuth token was written somewhere
+    /// gh could not read back. When the toggle is off, no rule is emitted and the
+    /// startup wiring instead re-adds `~/Library/Keychains` to the read-deny set.
+    ///
+    /// The keychain dir is canonicalized (matching the deny rules) so the kernel
+    /// subpath matcher — which resolves against the canonical vnode — fires; falls
+    /// back to the raw path if canonicalization fails.
+    fn get_macos_keychain_rules(&self) -> String {
+        if !super::credential_reads::keychain_access_allowed() {
+            return String::new();
+        }
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
+        let keychains = std::path::Path::new(&home_dir).join("Library/Keychains");
+        let keychains = dunce::canonicalize(&keychains).unwrap_or(keychains);
+        format!(
+            "(allow file-write* (subpath \"{}\"))\n\
+             (allow file-read* file-write* (regex #\"^.*/Library/Preferences/com\\.apple\\.security.*\\.plist$\"))\n",
+            keychains.display()
+        )
     }
 
     fn get_macos_system_rules(&self) -> String {
@@ -304,6 +339,71 @@ mod tests {
         assert!(
             !profile.contains("(deny file-read* (subpath \"/tmp\"))"),
             "deny rule must not use the raw symlinked path, got:\n{profile}"
+        );
+    }
+
+    /// With keychain access on (the default), the profile grants keychain writes
+    /// and the security-prefs plist, but emits no keychain read-deny — so `gh` and
+    /// other Keychain-backed tools work. Reads already flow through the global
+    /// `(allow file-read*)`.
+    #[test]
+    fn keychain_rules_emitted_when_allowed() {
+        use super::super::credential_reads::set_keychain_access_allowed;
+
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        set_keychain_access_allowed(true);
+        let profile = sb.generate_seatbelt_profile_test(dir.path());
+        set_keychain_access_allowed(false);
+
+        assert!(
+            profile.contains("Library/Keychains"),
+            "keychain write allow must be present when allowed, got:\n{profile}"
+        );
+        assert!(
+            profile.contains("(allow file-write* (subpath") && profile.contains("Keychains\"))"),
+            "keychain dir must get a file-write* allow, got:\n{profile}"
+        );
+        assert!(
+            profile.contains("com\\.apple\\.security"),
+            "security prefs plist allow must be present, got:\n{profile}"
+        );
+    }
+
+    /// With keychain access off, no keychain allow rule is emitted (the startup
+    /// wiring separately re-adds `~/Library/Keychains` to the read-deny set).
+    #[test]
+    fn keychain_rules_absent_when_disallowed() {
+        use super::super::credential_reads::set_keychain_access_allowed;
+
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        set_keychain_access_allowed(false);
+        let profile = sb.generate_seatbelt_profile_test(dir.path());
+
+        assert!(
+            !profile.contains("com\\.apple\\.security"),
+            "no security-prefs allow when keychain access disabled, got:\n{profile}"
+        );
+        assert!(
+            !profile.contains("Keychains"),
+            "no keychain allow rule when disabled, got:\n{profile}"
         );
     }
 

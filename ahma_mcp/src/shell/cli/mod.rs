@@ -1084,6 +1084,22 @@ pub struct Cli {
     #[arg(long = "no-package-cache-write", global = true)]
     pub no_package_cache_write: bool,
 
+    /// macOS: allow sandboxed tools to read/write the login keychain (default on).
+    /// Enables `gh`, `git-credential-osxkeychain`, and other Keychain-backed tools
+    /// under the sandbox. Force-enables even when settings set `allow_keychain=false`.
+    #[arg(
+        long = "allow-keychain",
+        global = true,
+        conflicts_with = "no_allow_keychain"
+    )]
+    pub allow_keychain: bool,
+
+    /// macOS: block sandboxed tools from the login keychain for maximum
+    /// defense-in-depth. Overrides the default and any settings value.
+    /// Note: this breaks `gh` and other Keychain-backed credential tools.
+    #[arg(long = "no-allow-keychain", global = true)]
+    pub no_allow_keychain: bool,
+
     /// Watch the tools directory for JSON changes and reload tool definitions at runtime.
     #[arg(long = "hot-reload", global = true)]
     pub hot_reload: bool,
@@ -2429,15 +2445,32 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     // secret is scrubbed from tool environments (see `sandbox::base_command`).
     sandbox::set_secret_env_allow(s.sandbox.env_allow.clone());
 
+    // Resolve macOS keychain access (default on; `[sandbox] allow_keychain`).
+    // CLI flags win: `--no-allow-keychain` forces off, `--allow-keychain` forces
+    // on even when settings disable it. When off, the login keychain is added to
+    // the credential-read deny set below and keychain writes stay blocked.
+    let allow_keychain = if cli.no_allow_keychain {
+        false
+    } else if cli.allow_keychain {
+        true
+    } else {
+        s.sandbox.allow_keychain
+    };
+    sandbox::set_keychain_access_allowed(allow_keychain);
+
     // Install the macOS credential-read deny set (built-in defaults ±
-    // `[sandbox] deny_credential_reads`/`allow_credential_reads`). On macOS the
-    // Seatbelt profile grants global file-read, so these dirs are denied to
-    // sandboxed tools to prevent credential exfiltration. No-op on Linux/Windows
-    // where reads are already scoped.
+    // `[sandbox] deny_credential_reads`/`allow_credential_reads`, plus the login
+    // keychain when `allow_keychain` is off). On macOS the Seatbelt profile grants
+    // global file-read, so these dirs are denied to sandboxed tools to prevent
+    // credential exfiltration. No-op on Linux/Windows where reads are scoped.
     if let Some(home) = dirs::home_dir() {
+        let mut extra_deny = s.sandbox.deny_credential_reads.clone();
+        if !allow_keychain {
+            extra_deny.push(std::path::PathBuf::from("~/Library/Keychains"));
+        }
         let denies = sandbox::effective_credential_read_denies(
             &home,
-            &s.sandbox.deny_credential_reads,
+            &extra_deny,
             &s.sandbox.allow_credential_reads,
         );
         if cfg!(target_os = "macos") && !denies.is_empty() {
@@ -2449,6 +2482,13 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
             );
         }
         sandbox::set_credential_read_denies(denies);
+    }
+    if cfg!(target_os = "macos") && !allow_keychain {
+        tracing::info!(
+            "macOS keychain access disabled ([sandbox] allow_keychain=false / \
+             --no-allow-keychain): gh and other Keychain-backed tools will not work \
+             under the sandbox"
+        );
     }
 
     // ── Tool loading ────────────────────────────────────────────────────────

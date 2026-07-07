@@ -886,10 +886,28 @@ pub struct SandboxSettings {
     /// Default: empty list
     #[serde(default)]
     pub env_allow: Vec<String>,
+    /// macOS only. Allow sandboxed tools to read **and write** the login keychain
+    /// (`~/Library/Keychains`) and the `com.apple.security*` preference plists.
+    ///
+    /// Enabled by default so `gh`, `git-credential-osxkeychain`, and other tools
+    /// that store credentials in the Keychain keep working under the sandbox —
+    /// with it off, `gh auth login` appears to succeed but the token is written
+    /// somewhere `gh` can't read back, so every later `gh` call is unauthenticated.
+    ///
+    /// The keychain is encrypted at rest, so blocking file access to it protects
+    /// only against offline theft of the encrypted database, not against secret
+    /// extraction (that goes through `securityd`, which is ACL-gated regardless of
+    /// the sandbox). Set to `false` for maximum defense-in-depth on high-security
+    /// machines; when off, `~/Library/Keychains` is added to the credential-read
+    /// deny set and keychain writes stay blocked. Ignored on Linux/Windows.
+    /// Default: `true`
+    #[serde(default = "default_true")]
+    pub allow_keychain: bool,
     /// macOS only. Additional credential directories whose **reads** are denied
     /// to sandboxed tools, on top of the built-in default set (`~/.ahma`,
     /// `~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.kube`, `~/.docker`,
-    /// `~/.netrc`, `~/Library/Keychains`).
+    /// `~/.netrc`). The login keychain is governed separately by
+    /// [`allow_keychain`](Self::allow_keychain) (default on).
     ///
     /// macOS Seatbelt grants global file-read to sandboxed commands (an APFS
     /// firmlink workaround), so credential files would otherwise be readable and
@@ -962,6 +980,7 @@ impl Default for SandboxSettings {
             use_sandbox_directory: false,
             persistent_scopes: Vec::new(),
             env_allow: Vec::new(),
+            allow_keychain: true,
             deny_credential_reads: Vec::new(),
             allow_credential_reads: Vec::new(),
         }
@@ -1737,6 +1756,12 @@ impl AhmaSettings {
             toml_str_list(&d.sandbox.env_allow),
         );
         w.setting(
+            "macOS: allow sandboxed tools to read/write the login keychain (gh, git-credential-osxkeychain). Off = maximum defense-in-depth.",
+            "allow_keychain",
+            self.sandbox.allow_keychain.to_string(),
+            d.sandbox.allow_keychain.to_string(),
+        );
+        w.setting(
             "macOS: extra credential dirs to deny reads (on top of the built-in default set; e.g. ~/.ssh to harden further).",
             "deny_credential_reads",
             toml_path_list(&self.sandbox.deny_credential_reads),
@@ -2278,6 +2303,7 @@ mod tests {
                     note: Some("compiler cache".into()),
                 }],
                 env_allow: vec!["GITHUB_TOKEN".into()],
+                allow_keychain: false,
                 deny_credential_reads: vec![PathBuf::from("~/.ssh")],
                 allow_credential_reads: vec![PathBuf::from("~/.aws")],
             },

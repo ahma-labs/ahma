@@ -59,6 +59,25 @@ On macOS, Ahma uses Apple's built-in `sandbox-exec` with a generated Seatbelt pr
 
 **Requirements**: Any modern macOS version. `sandbox-exec` is built into macOS.
 
+To work around APFS firmlinks the profile grants global file-*read* (writes stay scoped), then denies reads of plaintext credential directories (`~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.ahma`). `~/.ssh` and `~/.config/gh` are **not** denied so git-over-ssh and `gh` keep working; add more via `[sandbox] deny_credential_reads`, or re-allow a default via `[sandbox] allow_credential_reads`.
+
+#### Keychain access (`gh auth` / `git-credential-osxkeychain`)
+
+The login **keychain** (`~/Library/Keychains`) is **allowed by default** (read + write, plus the `com.apple.security*` preference plists). This is what lets `gh`, `git-credential-osxkeychain`, and other Keychain-backed credential helpers work under the sandbox.
+
+Why it's on by default (unlike the plaintext credential dirs above): the keychain is **encrypted at rest**, so blocking file access to it only guards against offline theft of the encrypted database — not against secret extraction, which goes through the `securityd` daemon and is gated by each item's ACL (and a GUI prompt) regardless of the sandbox. Blocking it mostly just breaks tools: `gh auth login` appears to succeed but writes the OAuth token where `gh` can't read it back, so every later `gh` call falls back to unauthenticated (HTTP 401 / the anonymous IP rate limit).
+
+For maximum defense-in-depth on high-security machines, turn it off:
+
+```toml
+[sandbox]
+allow_keychain = false   # blocks keychain read+write; breaks gh and similar tools
+```
+
+or per-invocation with `--no-allow-keychain` (and `--allow-keychain` to force it on when settings disable it). When off, `~/Library/Keychains` is added to the credential-read deny set and keychain writes are blocked, so `security add-generic-password` fails with *"The authorization was denied"*.
+
+> **Note on nesting:** if you launch ahma from *inside* another sandbox (e.g. an editor's Bash sandbox), tool subprocesses run under the **intersection** of both profiles — so keychain access ahma grants can still be blocked by the outer sandbox. Start ahma outside that shell, or see [Nested Sandbox Environments](#nested-sandbox-environments-cursor-vs-code-docker).
+
 ### Windows (Job Objects + AppContainer)
 
 On Windows, Ahma uses Job Object enforcement (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) at startup, with AppContainer profile DACL grants for per-scope access control. PowerShell (5.1+) is the shell. See [SPEC.md R6.3](../SPEC.md) for status.
