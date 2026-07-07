@@ -47,9 +47,17 @@ impl ScopeSource {
 pub enum ActiveSandbox {
     /// ahma's own kernel sandbox is enforcing.
     AhmaEnforcing,
+    /// ahma's own sandbox is enforcing, but an **active probe** proved ahma is
+    /// itself running inside an outer host sandbox (Cursor/Claude Code/…). Both
+    /// apply, so the effective policy for tool subprocesses is the *intersection*
+    /// of the two — access ahma grants (e.g. the macOS keychain) can still be
+    /// blocked by the outer sandbox. Not a false positive: this is only reported
+    /// when a write outside every scope was actually blocked.
+    AhmaEnforcingNestedInHost(super::host_detect::HostSandbox),
     /// ahma detected a host sandbox and deferred to it; ahma is **not** applying
     /// its own enforcement (used by terminal hooks to avoid the redundant
-    /// double-sandbox). Protection now depends on the host.
+    /// double-sandbox, and when ahma cannot nest its own sandbox inside the host).
+    /// Protection now depends on the host.
     DeferredToHost(super::host_detect::HostSandbox),
     /// Nothing is enforcing (e.g. `--no-sandbox` with no detected host).
     Disabled,
@@ -60,6 +68,7 @@ impl ActiveSandbox {
     pub fn token(self) -> &'static str {
         match self {
             ActiveSandbox::AhmaEnforcing => "ahma",
+            ActiveSandbox::AhmaEnforcingNestedInHost(_) => "ahma_nested_in_host",
             ActiveSandbox::DeferredToHost(_) => "deferred_to_host",
             ActiveSandbox::Disabled => "disabled",
         }
@@ -73,11 +82,20 @@ impl ActiveSandbox {
                 "Sandbox: ahma kernel sandbox is ENFORCING (writes confined to the workspace scope)."
                     .to_string()
             }
+            ActiveSandbox::AhmaEnforcingNestedInHost(host) => format!(
+                "Sandbox: ahma kernel sandbox is ENFORCING, but ahma is running INSIDE {host}'s \
+                 sandbox — both apply, so the effective policy is the INTERSECTION of the two. \
+                 Access ahma grants (e.g. the macOS keychain) may still be BLOCKED by {host}. \
+                 {remediation}",
+                host = host.label(),
+                remediation = host.remediation()
+            ),
             ActiveSandbox::DeferredToHost(host) => format!(
                 "Sandbox: ahma is DEFERRING to {host}'s sandbox and is NOT applying its own. \
                  Protection now depends on {host}. If you have disabled {host}'s sandbox, this \
-                 command runs UNSANDBOXED.",
-                host = host.label()
+                 command runs UNSANDBOXED. {remediation}",
+                host = host.label(),
+                remediation = host.remediation()
             ),
             ActiveSandbox::Disabled => {
                 "Sandbox: NO sandbox is enforcing — commands run UNSANDBOXED.".to_string()
@@ -276,11 +294,33 @@ mod tests {
             deferred.contains("NOT applying its own") && deferred.contains("UNSANDBOXED"),
             "must warn that ahma is not enforcing and the risk if host sandbox is off: {deferred}"
         );
+        assert!(
+            deferred.contains("insecure_none"),
+            "deferred disclosure must include actionable remediation: {deferred}"
+        );
+
+        // Enforcing-nested (intersection): names the host, warns access may still
+        // be blocked, and tells the user how to make ahma authoritative.
+        let nested =
+            ActiveSandbox::AhmaEnforcingNestedInHost(HostSandbox::ClaudeCode).disclosure_line();
+        assert!(nested.contains("Claude Code"), "names the host: {nested}");
+        assert!(
+            nested.contains("INTERSECTION") && nested.contains("BLOCKED"),
+            "must explain the intersection and residual blocking: {nested}"
+        );
+        assert!(
+            nested.contains("MCP server"),
+            "must include actionable remediation: {nested}"
+        );
 
         let disabled = ActiveSandbox::Disabled.disclosure_line();
         assert!(disabled.contains("UNSANDBOXED"), "{disabled}");
 
         assert_eq!(ActiveSandbox::AhmaEnforcing.token(), "ahma");
+        assert_eq!(
+            ActiveSandbox::AhmaEnforcingNestedInHost(HostSandbox::ClaudeCode).token(),
+            "ahma_nested_in_host"
+        );
         assert_eq!(
             ActiveSandbox::DeferredToHost(HostSandbox::Docker).token(),
             "deferred_to_host"

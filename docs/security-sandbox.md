@@ -86,7 +86,7 @@ On Windows, Ahma uses Job Object enforcement (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOS
 
 When ahma runs inside a host that already provides its own kernel sandbox (Cursor's agent sandbox, VS Code, Docker), ahma does **not** try to mimic or coexist with the host's internals (such as the build-cache environment variables Cursor injects). Instead it picks exactly **one authoritative sandbox per execution path** and **always tells you which one is active**.
 
-ahma detects a host from environment markers (`CURSOR_SANDBOX`/`CURSOR_AGENT`, `VSCODE_*`, `/.dockerenv`/`container`).
+ahma detects a host from environment markers (`CURSOR_SANDBOX`/`CURSOR_AGENT`, `CLAUDECODE`/`CLAUDE_CODE_ENTRYPOINT`, `VSCODE_*`, `/.dockerenv`/`container`).
 
 **Terminal hooks → defer to the host.** When an ahma terminal hook fires inside a detected host sandbox, the command already runs under the host's kernel sandbox, so ahma defers: it lets the command run unchanged in the host sandbox and does **not** re-wrap it in a second sandbox. This removes the "double sandbox" friction (e.g. builds failing because the host redirected `CARGO_TARGET_DIR` outside the workspace) without ahma chasing each host's private cache variables. The hook discloses this loudly:
 
@@ -94,7 +94,23 @@ ahma detects a host from environment markers (`CURSOR_SANDBOX`/`CURSOR_AGENT`, `
 
 To force ahma's own (tighter) sandbox instead — accepting the redundant double-sandbox and the host's build-cache friction — set `AHMA_PREFER_OWN_SANDBOX=1`.
 
-**MCP server (`run_terminal_command`) → ahma stays authoritative.** Commands the agent runs through ahma's MCP tools execute in ahma's own process, which the host's terminal sandbox does **not** wrap, so ahma applies its own sandbox and remains the authority. If ahma cannot apply its own sandbox, it fails loudly (use `--disable-sandbox` to defer to the host explicitly) — it never silently runs unsandboxed.
+**MCP server (`run_terminal_command`) → ahma stays authoritative.** Commands the agent runs through ahma's MCP tools execute in ahma's own process, which the host's terminal sandbox does **not** wrap, so ahma applies its own sandbox and remains the authority.
+
+Two nested cases are handled loudly at server startup (SPEC R5.4 "nothing silent"):
+
+- **ahma cannot nest its own sandbox** (macOS `sandbox-exec` is *denied* — positive proof ahma is inside a restrictive outer sandbox): instead of hard-failing, ahma **defers to that host** and discloses it loudly, with host-specific remediation. This is fail-closed — a blocked nesting attempt proves an outer sandbox is enforcing.
+- **ahma is enforcing *on top of* a host sandbox** (the report's classic case: ahma launched from inside an IDE's Bash sandbox): ahma keeps enforcing, but an **active confinement probe** — a write attempt outside every scope — confirms it is genuinely nested, and ahma discloses that the effective policy is the **intersection** of both sandboxes (so access ahma grants, e.g. the keychain, may still be blocked by the outer one). The probe is why this never false-positives on a normal IDE-launched-but-unconfined MCP server: an IDE sets `CURSOR_SANDBOX`/`CLAUDECODE` in the server's environment without wrapping its executions, so env presence alone is not trusted — only a *blocked* out-of-scope write triggers the disclosure.
+
+Every one of these disclosures includes **actionable remediation** — how to make ahma the single authoritative sandbox for that specific host:
+
+| Host | How to make ahma authoritative |
+|------|--------------------------------|
+| **Claude Code** | Run ahma as a configured **MCP server** (Claude Code does not sandbox MCP servers — only its Bash tool), rather than from inside its Bash tool; or disable Claude Code's Bash sandbox; or start ahma from a plain terminal outside Claude Code. |
+| **Cursor** | Set Cursor's sandbox to `"insecure_none"` in `sandbox.json` (or enable the Legacy Terminal Tool). For terminal hooks specifically, `AHMA_PREFER_OWN_SANDBOX=1`. |
+| **VS Code** | Run ahma as its MCP server (VS Code has no execution sandbox of its own to disable). |
+| **Docker** | The container is a deliberate outer boundary; run ahma directly on the host if you did not intend the double layer. |
+
+If ahma cannot apply its own sandbox and this is not a recognized nesting case, it still fails loudly (use `--no-sandbox` to defer explicitly) — it never silently runs unsandboxed.
 
 **Choosing your model:**
 - Default (hooks): let the host sandbox protect; ahma defers and tells you.

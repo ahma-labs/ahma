@@ -321,9 +321,20 @@ fn resolve_sandbox_policy(cfg: &AppConfig) -> SandboxPolicy {
     }
 }
 
-fn check_sandbox_availability(no_sandbox: bool) -> Result<()> {
+/// Outcome of the startup sandbox-availability check.
+enum SandboxAvailability {
+    /// ahma can apply its own sandbox; proceed to enforce.
+    Available,
+    /// A proven outer sandbox blocks ahma from nesting its own (macOS
+    /// `sandbox-exec` denied). Rather than hard-failing, ahma defers to that
+    /// host — fail-closed, because a blocked nesting attempt is positive proof an
+    /// outer sandbox is enforcing — and discloses it loudly.
+    DeferToHost(sandbox::HostSandbox),
+}
+
+fn check_sandbox_availability(no_sandbox: bool) -> Result<SandboxAvailability> {
     if no_sandbox {
-        return Ok(());
+        return Ok(SandboxAvailability::Available);
     }
 
     if let Err(e) = sandbox::check_sandbox_prerequisites() {
@@ -333,11 +344,21 @@ fn check_sandbox_availability(no_sandbox: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         if let Err(e) = sandbox::test_sandbox_exec_available() {
-            sandbox::exit_with_sandbox_error(&e);
+            match e {
+                // We are demonstrably inside an outer sandbox that forbids nesting.
+                // Defer to it (loudly) instead of crashing at startup.
+                sandbox::SandboxError::NestedSandboxDetected => {
+                    let host = sandbox::detect_host_sandbox()
+                        .unwrap_or(sandbox::HostSandbox::Unidentified);
+                    return Ok(SandboxAvailability::DeferToHost(host));
+                }
+                // e.g. sandbox-exec missing entirely — still a hard, fail-closed stop.
+                other => sandbox::exit_with_sandbox_error(&other),
+            }
         }
     }
 
-    Ok(())
+    Ok(SandboxAvailability::Available)
 }
 
 fn canonicalize_paths(paths: &[PathBuf], context: &str) -> Result<Vec<PathBuf>> {
@@ -691,17 +712,27 @@ fn apply_platform_sandbox_enforcement(
     Ok(())
 }
 
-fn log_sandbox_mode(no_sandbox: bool) {
+fn log_sandbox_mode(no_sandbox: bool, deferred_host: Option<sandbox::HostSandbox>) {
     // Always state, loudly, which sandbox is actually protecting the user (R5.4).
     // In MCP/standalone mode ahma stays authoritative when enforcing; when its own
     // enforcement is off, protection (if any) comes from a detected host sandbox.
-    let active = if no_sandbox {
+    let active = if let Some(host) = deferred_host {
+        // ahma could not nest its sandbox inside a proven outer sandbox → deferring.
+        sandbox::ActiveSandbox::DeferredToHost(host)
+    } else if no_sandbox {
         match sandbox::detect_host_sandbox() {
             Some(host) => sandbox::ActiveSandbox::DeferredToHost(host),
             None => sandbox::ActiveSandbox::Disabled,
         }
     } else {
-        sandbox::ActiveSandbox::AhmaEnforcing
+        // Enforcing. Actively probe whether ahma is ALSO confined by an outer host
+        // sandbox (so the effective policy is the intersection). The probe returns
+        // Some only on positive proof, so this never false-positives on an
+        // IDE-launched-but-unconfined MCP server.
+        match sandbox::outer_confinement() {
+            Some(host) => sandbox::ActiveSandbox::AhmaEnforcingNestedInHost(host),
+            None => sandbox::ActiveSandbox::AhmaEnforcing,
+        }
     };
     tracing::info!("{}", active.disclosure_line());
 
@@ -2602,15 +2633,25 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn initialize_sandbox(cfg: &AppConfig) -> Result<Option<Arc<sandbox::Sandbox>>> {
-    let policy = resolve_sandbox_policy(cfg);
+    let mut policy = resolve_sandbox_policy(cfg);
 
-    check_sandbox_availability(policy.no_sandbox)?;
+    let deferred_host = match check_sandbox_availability(policy.no_sandbox)? {
+        SandboxAvailability::Available => None,
+        SandboxAvailability::DeferToHost(host) => {
+            // Cannot nest ahma's own sandbox inside the proven outer sandbox — run
+            // in Test mode (no ahma enforcement) and rely on the host. Disclosed
+            // loudly by log_sandbox_mode below.
+            policy.no_sandbox = true;
+            policy.mode = sandbox::SandboxMode::Test;
+            Some(host)
+        }
+    };
 
     let scopes = resolve_sandbox_scopes(cfg)?;
     let scopes = add_temp_scope_if_requested(scopes, policy.tmp_access);
     let sandbox = create_sandbox_instance(scopes, &policy, cfg)?;
 
-    log_sandbox_mode(policy.no_sandbox);
+    log_sandbox_mode(policy.no_sandbox, deferred_host);
     Ok(sandbox)
 }
 
@@ -3177,13 +3218,21 @@ mod tests {
     #[test]
     fn test_log_sandbox_mode_disabled() {
         init_test();
-        log_sandbox_mode(true);
+        log_sandbox_mode(true, None);
     }
 
     #[test]
     fn test_log_sandbox_mode_enabled() {
         init_test();
-        log_sandbox_mode(false);
+        log_sandbox_mode(false, None);
+    }
+
+    #[test]
+    fn test_log_sandbox_mode_deferred_to_host() {
+        init_test();
+        // Deferring to a proven outer sandbox must not panic and exercises the
+        // DeferredToHost disclosure path.
+        log_sandbox_mode(true, Some(sandbox::HostSandbox::ClaudeCode));
     }
 
     // ─── check_sandbox_availability ──────────────────────────────────────────

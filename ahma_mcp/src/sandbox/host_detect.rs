@@ -21,6 +21,8 @@ use std::path::Path;
 pub enum HostSandbox {
     /// Cursor's agent sandbox (named via `CURSOR_SANDBOX` / `CURSOR_AGENT`).
     Cursor,
+    /// Claude Code's Bash sandbox (named via `CLAUDECODE` / `CLAUDE_CODE_ENTRYPOINT`).
+    ClaudeCode,
     /// Visual Studio Code's integrated terminal/agent.
     VsCode,
     /// A Docker/OCI container.
@@ -34,9 +36,48 @@ impl HostSandbox {
     pub fn label(self) -> &'static str {
         match self {
             Self::Cursor => "Cursor",
+            Self::ClaudeCode => "Claude Code",
             Self::VsCode => "VS Code",
             Self::Docker => "Docker",
             Self::Unidentified => "an outer sandbox",
+        }
+    }
+
+    /// Actionable, host-specific guidance for resolving a double-sandbox: how to
+    /// make ahma the single authoritative sandbox (so the access ahma grants —
+    /// e.g. the macOS keychain — is not re-blocked by the outer sandbox), plus the
+    /// universal "run ahma outside the host" alternative. Rendered as part of the
+    /// loud disclosure so the user is never left with a diagnosis and no fix.
+    pub fn remediation(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => {
+                "To make ahma the sole sandbox: run ahma as a configured MCP server \
+                 (Claude Code does NOT sandbox MCP servers — only its Bash tool), rather than \
+                 launching it from inside Claude Code's Bash tool; or disable Claude Code's \
+                 Bash sandbox in its settings. Alternatively start ahma from a plain terminal \
+                 outside Claude Code."
+            }
+            Self::Cursor => {
+                "To make ahma the sole sandbox: set Cursor's sandbox to \"insecure_none\" in \
+                 its sandbox.json (or enable the Legacy Terminal Tool), so only ahma sandboxes. \
+                 For ahma terminal hooks specifically, set AHMA_PREFER_OWN_SANDBOX=1 to apply \
+                 ahma's sandbox instead of deferring. Alternatively start ahma outside Cursor."
+            }
+            Self::VsCode => {
+                "VS Code has no execution sandbox of its own to disable; run ahma as its MCP \
+                 server (VS Code does not wrap the server's executions) rather than from inside \
+                 a sandboxed extension terminal. Alternatively start ahma from a plain terminal."
+            }
+            Self::Docker => {
+                "The container IS the outer boundary — running ahma inside a container is a \
+                 supported, deliberate compose (container for isolation, ahma for scope/egress). \
+                 If you did not intend the double layer, run ahma directly on the host instead."
+            }
+            Self::Unidentified => {
+                "To make ahma the sole sandbox, start it from a plain terminal outside the outer \
+                 sandbox, or disable that outer sandbox. For ahma terminal hooks, \
+                 AHMA_PREFER_OWN_SANDBOX=1 forces ahma's own sandbox instead of deferring."
+            }
         }
     }
 }
@@ -47,6 +88,10 @@ impl HostSandbox {
 pub struct HostSignals {
     /// `CURSOR_SANDBOX` or `CURSOR_AGENT` is set.
     pub cursor: bool,
+    /// A Claude Code marker is present (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`).
+    /// Claude Code may run inside a VS Code terminal (setting `TERM_PROGRAM=vscode`
+    /// too), so Claude Code is matched before VS Code.
+    pub claude_code: bool,
     /// A VS Code marker is present (`VSCODE_PID`/`VSCODE_CWD`, or
     /// `TERM_PROGRAM=vscode`). Cursor is built on VS Code and may also set these,
     /// so Cursor is matched first.
@@ -64,6 +109,9 @@ pub struct HostSignals {
 pub fn classify(signals: &HostSignals) -> Option<HostSandbox> {
     if signals.cursor {
         return Some(HostSandbox::Cursor);
+    }
+    if signals.claude_code {
+        return Some(HostSandbox::ClaudeCode);
     }
     if signals.vscode {
         return Some(HostSandbox::VsCode);
@@ -86,6 +134,8 @@ pub fn signals_from_env() -> HostSignals {
 
     let cursor = env_set("CURSOR_SANDBOX") || env_set("CURSOR_AGENT");
 
+    let claude_code = env_set("CLAUDECODE") || env_set("CLAUDE_CODE_ENTRYPOINT");
+
     let vscode = env_set("VSCODE_PID")
         || env_set("VSCODE_CWD")
         || env_set("VSCODE_IPC_HOOK_CLI")
@@ -95,6 +145,7 @@ pub fn signals_from_env() -> HostSignals {
 
     HostSignals {
         cursor,
+        claude_code,
         vscode,
         docker,
         nested_probe: false,
@@ -148,6 +199,37 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_is_named() {
+        let s = HostSignals {
+            claude_code: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&s), Some(HostSandbox::ClaudeCode));
+    }
+
+    #[test]
+    fn claude_code_wins_over_vscode_markers() {
+        // Claude Code can run inside a VS Code terminal (setting vscode markers);
+        // it must be named Claude Code, not VS Code.
+        let s = HostSignals {
+            claude_code: true,
+            vscode: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&s), Some(HostSandbox::ClaudeCode));
+    }
+
+    #[test]
+    fn cursor_wins_over_claude_code_markers() {
+        let s = HostSignals {
+            cursor: true,
+            claude_code: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&s), Some(HostSandbox::Cursor));
+    }
+
+    #[test]
     fn docker_when_only_docker() {
         let s = HostSignals {
             docker: true,
@@ -169,6 +251,7 @@ mod tests {
     fn labels_are_distinct_and_nonempty() {
         for h in [
             HostSandbox::Cursor,
+            HostSandbox::ClaudeCode,
             HostSandbox::VsCode,
             HostSandbox::Docker,
             HostSandbox::Unidentified,
@@ -176,5 +259,29 @@ mod tests {
             assert!(!h.label().is_empty());
         }
         assert_ne!(HostSandbox::Cursor.label(), HostSandbox::VsCode.label());
+        assert_ne!(HostSandbox::ClaudeCode.label(), HostSandbox::Cursor.label());
+    }
+
+    #[test]
+    fn remediation_is_actionable_for_every_host() {
+        for h in [
+            HostSandbox::Cursor,
+            HostSandbox::ClaudeCode,
+            HostSandbox::VsCode,
+            HostSandbox::Docker,
+            HostSandbox::Unidentified,
+        ] {
+            let r = h.remediation();
+            assert!(!r.is_empty(), "{:?} remediation must be non-empty", h);
+        }
+        // The named IDEs must tell the user how to make ahma authoritative.
+        assert!(
+            HostSandbox::ClaudeCode.remediation().contains("MCP server"),
+            "Claude Code remediation should point at the MCP-server path"
+        );
+        assert!(
+            HostSandbox::Cursor.remediation().contains("insecure_none"),
+            "Cursor remediation should name the sandbox.json escape hatch"
+        );
     }
 }

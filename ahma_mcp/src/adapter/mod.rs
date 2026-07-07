@@ -1466,11 +1466,14 @@ async fn drain_remaining_stream_lines(
 
 /// Which sandbox layer to attribute a capability denial to, for the disclosure.
 ///
-/// If a host sandbox (Cursor/VS Code/Docker/CI) wraps ahma, that host is the
-/// layer denying the credential store and ahma cannot widen it; otherwise ahma
-/// is applying its own sandbox and is authoritative.
+/// Uses the active confinement probe rather than bare env detection: an IDE sets
+/// its markers (`CURSOR_SANDBOX`, `CLAUDECODE`, …) in the environment of the MCP
+/// server it launches even though it does **not** wrap that server's executions,
+/// so env presence alone would misattribute an ahma-imposed denial to the host.
+/// The probe reports a host only when ahma is genuinely confined by it (a write
+/// outside every scope was blocked); otherwise ahma is authoritative.
 fn capability_enforcing_layer() -> sandbox::EnforcingLayer {
-    if sandbox::detect_host_sandbox().is_some() {
+    if sandbox::outer_confinement().is_some() {
         sandbox::EnforcingLayer::HostSandbox
     } else {
         sandbox::EnforcingLayer::Ahma
