@@ -347,12 +347,22 @@ impl DaemonState {
     }
 
     fn prune_terminal(&mut self) {
+        self.prune_terminal_older_than(TERMINAL_OP_RETENTION);
+    }
+
+    /// Core of [`Self::prune_terminal`], parameterized on the retention
+    /// window so tests can exercise the boundary with a small duration
+    /// instead of subtracting the full production window (1h) from
+    /// `Instant::now()` — on a freshly-booted Windows CI runner (`Instant`
+    /// there is `QueryPerformanceCounter`-based, i.e. uptime-relative, not
+    /// wall-clock) that subtraction can underflow and panic.
+    fn prune_terminal_older_than(&mut self, retention: Duration) {
         for instance_ops in self.ops.values_mut() {
             instance_ops.retain(|_, op| {
                 matches!(op.status, OpStatus::Running | OpStatus::Pending)
                     || op
                         .completed_at
-                        .map(|t| t.elapsed() < TERMINAL_OP_RETENTION)
+                        .map(|t| t.elapsed() < retention)
                         .unwrap_or(true)
             });
         }
@@ -971,15 +981,21 @@ mod tests {
         );
         s.on_op_finished("i1", "op-2", "Failed", None, 0, None);
 
-        // Modify completed_at so it is older than the retention window
+        // Stamp op-2's completion now, then let real time pass past a tiny
+        // retention window — exercises the same "older than retention"
+        // boundary as production's TERMINAL_OP_RETENTION without ever
+        // subtracting a duration from `Instant::now()`, which can underflow
+        // and panic on a freshly-booted Windows CI runner (`Instant` there is
+        // `QueryPerformanceCounter`-based, i.e. uptime-relative, not
+        // wall-clock; see `prune_terminal_older_than` doc comment).
         if let Some(ops) = s.ops.get_mut("i1")
             && let Some(op) = ops.get_mut("op-2")
         {
-            op.completed_at =
-                Some(std::time::Instant::now() - (TERMINAL_OP_RETENTION + Duration::from_secs(1)));
+            op.completed_at = Some(std::time::Instant::now());
         }
+        std::thread::sleep(Duration::from_millis(20));
 
-        s.prune_terminal();
+        s.prune_terminal_older_than(Duration::from_millis(1));
         let ops = s.all_ops();
         assert_eq!(ops.len(), 1, "only running op remains");
         assert_eq!(ops[0].id, "op-1");
