@@ -276,6 +276,7 @@ mod tests {
             operation_id: "op-1".into(),
             tool_name: "cargo_build".into(),
             description: "Building".into(),
+            parent_id: None,
         })
         .unwrap();
         assert_eq!(progress, 0.0);

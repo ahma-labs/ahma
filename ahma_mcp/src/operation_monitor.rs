@@ -76,6 +76,12 @@ pub struct Operation {
     pub id: String,
     pub tool_name: String,
     pub description: String,
+    /// Operation (or synthetic group, e.g. `session:<id>` for persistent shell
+    /// sessions) that spawned this one. `None` for top-level operations.
+    /// Carried on the `Started` event and the hub wire so observers (TUI task
+    /// tree) can reconstruct the caller → subtask hierarchy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
     pub state: OperationStatus,
     pub result: Option<Value>,
     /// When the operation was created
@@ -130,6 +136,7 @@ impl Operation {
             id,
             tool_name,
             description,
+            parent_id: None,
             state: OperationStatus::Pending,
             result,
             start_time: SystemTime::now(),
@@ -157,6 +164,7 @@ impl Operation {
             id,
             tool_name,
             description,
+            parent_id: None,
             state: OperationStatus::Pending,
             result,
             start_time: SystemTime::now(),
@@ -170,6 +178,12 @@ impl Operation {
             output_file: None,
             last_activity: SystemTime::now(),
         }
+    }
+
+    /// Builder: record the operation (or synthetic group) that spawned this one.
+    pub fn with_parent(mut self, parent_id: impl Into<String>) -> Self {
+        self.parent_id = Some(parent_id.into());
+        self
     }
 
     /// Attempt the standard lifecycle transition into `next` (SPEC R23).
@@ -361,6 +375,7 @@ impl OperationMonitor {
             operation_id: operation.id.clone(),
             tool_name: operation.tool_name.clone(),
             description: operation.description.clone(),
+            parent_id: operation.parent_id.clone(),
         };
         let was_new = ops.insert(operation.id.clone(), operation).is_none();
         tracing::debug!("Total operations in monitor after add: {}", ops.len());
@@ -1246,6 +1261,31 @@ mod tests {
         } else {
             panic!("Expected OperationEvent::Completed, got {:?}", event2);
         }
+    }
+
+    /// `with_parent` stamps the causality link and the `Started` event carries
+    /// it to subscribers (SPEC R24.1 — observers must not infer hierarchy).
+    #[tokio::test]
+    async fn test_started_event_carries_parent_id() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(5)));
+        let mut rx = monitor.subscribe_events();
+
+        let op = Operation::new(
+            "child-op".to_string(),
+            "run_terminal_command".to_string(),
+            "cargo build".to_string(),
+            None,
+        )
+        .with_parent("session:dev");
+        assert_eq!(op.parent_id.as_deref(), Some("session:dev"));
+        monitor.add_operation(op).await;
+
+        let event = rx.recv().await.expect("Started event");
+        let OperationEvent::Started { parent_id, .. } = event.as_ref() else {
+            panic!("Expected Started, got {event:?}");
+        };
+        assert_eq!(parent_id.as_deref(), Some("session:dev"));
     }
 
     /// Output lines appended to a live operation are streamed on the unified

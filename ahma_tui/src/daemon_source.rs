@@ -258,6 +258,7 @@ impl DaemonState {
         self.ops.remove(id);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_op_started(
         &mut self,
         instance_id: &str,
@@ -265,11 +266,20 @@ impl DaemonState {
         tool_name: String,
         description: String,
         scope: Option<String>,
+        parent_id: Option<String>,
+        started_epoch_ms: Option<u64>,
     ) {
         let (label, pid) = self
             .instances
             .get(instance_id)
-            .map(|i| (i.label.clone(), Some(i.pid)))
+            // Prefer the detected MCP client identity ("claude-code",
+            // "cursor") over the generic instance label when available.
+            .map(|i| {
+                (
+                    i.client.clone().unwrap_or_else(|| i.label.clone()),
+                    Some(i.pid),
+                )
+            })
             .unwrap_or_else(|| (instance_id.to_string(), None));
 
         let mut op = Operation::new(&op_id, &tool_name, OpStatus::Running);
@@ -278,6 +288,15 @@ impl DaemonState {
         op.pid = pid;
         op.scope = scope;
         op.description = description;
+        op.parent_id = parent_id;
+        // Back-date the start so a replayed operation (TUI opened after the
+        // work began) shows its true elapsed time, not time-since-receipt.
+        if let Some((instant, local)) = backdate(started_epoch_ms) {
+            if let Some(i) = instant {
+                op.started_at = Some(i);
+            }
+            op.started_time = local;
+        }
 
         self.ops
             .entry(instance_id.to_string())
@@ -292,6 +311,7 @@ impl DaemonState {
         status_str: &str,
         result_summary: Option<String>,
         duration_ms: u64,
+        ended_epoch_ms: Option<u64>,
     ) {
         if let Some(instance_ops) = self.ops.get_mut(instance_id)
             && let Some(op) = instance_ops.get_mut(op_id)
@@ -299,7 +319,11 @@ impl DaemonState {
             op.status = parse_op_status(status_str);
             op.result_summary = result_summary;
             op.duration_ms = Some(duration_ms);
-            op.completed_at = Some(std::time::Instant::now());
+            // Back-date replayed completions so the retention window measures
+            // from when the operation actually finished.
+            op.completed_at = backdate(ended_epoch_ms)
+                .and_then(|(instant, _)| instant)
+                .or(Some(std::time::Instant::now()));
         }
     }
 
@@ -328,11 +352,32 @@ impl DaemonState {
                 matches!(op.status, OpStatus::Running | OpStatus::Pending)
                     || op
                         .completed_at
-                        .map(|t| t.elapsed() < Duration::from_secs(300))
+                        .map(|t| t.elapsed() < TERMINAL_OP_RETENTION)
                         .unwrap_or(true)
             });
         }
     }
+}
+
+/// How long finished operations stay in the merged view. Long enough that a
+/// user opening the TUI mid-session sees the recent history of what ran on
+/// their behalf, not just what is running right now.
+const TERMINAL_OP_RETENTION: Duration = Duration::from_secs(3600);
+
+/// Convert a wire epoch-ms timestamp into a back-dated (`Instant`, local time)
+/// pair. The `Instant` is `None` when the timestamp is in the future (clock
+/// skew) or predates what a monotonic-clock subtraction can represent.
+fn backdate(
+    epoch_ms: Option<u64>,
+) -> Option<(Option<std::time::Instant>, chrono::DateTime<chrono::Local>)> {
+    let ms = epoch_ms?;
+    let sys = std::time::UNIX_EPOCH + Duration::from_millis(ms);
+    let local = chrono::DateTime::<chrono::Local>::from(sys);
+    let instant = std::time::SystemTime::now()
+        .duration_since(sys)
+        .ok()
+        .and_then(|age| std::time::Instant::now().checked_sub(age));
+    Some((instant, local))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -652,8 +697,18 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 tool_name,
                 description,
                 scope,
+                parent_id,
+                started_epoch_ms,
             } => {
-                state.on_op_started(&instance_id, id, tool_name, description, Some(scope));
+                state.on_op_started(
+                    &instance_id,
+                    id,
+                    tool_name,
+                    description,
+                    Some(scope),
+                    parent_id,
+                    started_epoch_ms,
+                );
                 Applied::ListChanged
             }
             DaemonEvent::OpFinished {
@@ -661,8 +716,16 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 status,
                 result_summary,
                 duration_ms,
+                ended_epoch_ms,
             } => {
-                state.on_op_finished(&instance_id, &id, &status, result_summary, duration_ms);
+                state.on_op_finished(
+                    &instance_id,
+                    &id,
+                    &status,
+                    result_summary,
+                    duration_ms,
+                    ended_epoch_ms,
+                );
                 Applied::ListChanged
             }
             // Output lines are forwarded incrementally to the TUI and are NOT
@@ -745,6 +808,7 @@ mod tests {
             mode: "stdio".to_string(),
             scope: "/test".to_string(),
             label: label.to_string(),
+            client: None,
         }
     }
 
@@ -780,6 +844,8 @@ mod tests {
             "cargo_build".to_string(),
             "Build".to_string(),
             Some("/test/scope".to_string()),
+            None,
+            None,
         );
 
         let ops = s.all_ops();
@@ -801,8 +867,10 @@ mod tests {
             "tool".to_string(),
             "".to_string(),
             None,
+            None,
+            None,
         );
-        s.on_op_finished("i1", "op-1", "Completed", Some("ok".to_string()), 100);
+        s.on_op_finished("i1", "op-1", "Completed", Some("ok".to_string()), 100, None);
 
         let ops = s.all_ops();
         assert_eq!(ops[0].status, OpStatus::Succeeded);
@@ -816,7 +884,7 @@ mod tests {
         let mut s = DaemonState::new();
         s.add_instance(inst("i1", "Test"));
         // Should not panic.
-        s.on_op_finished("i1", "nonexistent-op", "Completed", None, 0);
+        s.on_op_finished("i1", "nonexistent-op", "Completed", None, 0, None);
     }
 
     #[test]
@@ -829,6 +897,8 @@ mod tests {
             "tool".to_string(),
             "".to_string(),
             None,
+            None,
+            None,
         );
         s.on_op_started(
             "i1",
@@ -836,8 +906,10 @@ mod tests {
             "tool".to_string(),
             "".to_string(),
             None,
+            None,
+            None,
         );
-        s.on_op_finished("i1", "op-a", "Completed", None, 0);
+        s.on_op_finished("i1", "op-a", "Completed", None, 0, None);
 
         let ops = s.all_ops();
         assert_eq!(ops.len(), 2);
@@ -860,12 +932,16 @@ mod tests {
             "tool".to_string(),
             "".to_string(),
             None,
+            None,
+            None,
         );
         s.on_op_started(
             "i2",
             "op-y".to_string(),
             "tool".to_string(),
             "".to_string(),
+            None,
+            None,
             None,
         );
         assert_eq!(s.all_ops().len(), 2);
@@ -881,6 +957,8 @@ mod tests {
             "tool".to_string(),
             "".to_string(),
             None,
+            None,
+            None,
         );
         s.on_op_started(
             "i1",
@@ -888,14 +966,17 @@ mod tests {
             "tool".to_string(),
             "".to_string(),
             None,
+            None,
+            None,
         );
-        s.on_op_finished("i1", "op-2", "Failed", None, 0);
+        s.on_op_finished("i1", "op-2", "Failed", None, 0, None);
 
-        // Modify completed_at so it is older than 300s to trigger pruning
+        // Modify completed_at so it is older than the retention window
         if let Some(ops) = s.ops.get_mut("i1")
             && let Some(op) = ops.get_mut("op-2")
         {
-            op.completed_at = Some(std::time::Instant::now() - Duration::from_secs(301));
+            op.completed_at =
+                Some(std::time::Instant::now() - (TERMINAL_OP_RETENTION + Duration::from_secs(1)));
         }
 
         s.prune_terminal();
@@ -986,6 +1067,8 @@ mod tests {
                     tool_name: "tool".to_string(),
                     description: "".to_string(),
                     scope: "/test/scope".to_string(),
+                    parent_id: None,
+                    started_epoch_ms: None,
                 },
             },
         );
@@ -1002,6 +1085,7 @@ mod tests {
                     status: "Completed".to_string(),
                     result_summary: Some("success".to_string()),
                     duration_ms: 1200,
+                    ended_epoch_ms: None,
                 },
             },
         );
@@ -1044,6 +1128,8 @@ mod tests {
                     tool_name: "tool".to_string(),
                     description: "".to_string(),
                     scope: "/test".to_string(),
+                    parent_id: None,
+                    started_epoch_ms: None,
                 },
             },
         );
@@ -1169,6 +1255,8 @@ mod tests {
             "tool".to_string(),
             "desc".to_string(),
             None,
+            None,
+            None,
         );
         let ops = s.all_ops();
         assert_eq!(ops.len(), 1);
@@ -1189,8 +1277,10 @@ mod tests {
             "tool".to_string(),
             "".to_string(),
             None,
+            None,
+            None,
         );
-        s.on_op_finished("i1", "op-1", "Completed", None, 5);
+        s.on_op_finished("i1", "op-1", "Completed", None, 5, None);
         s.prune_terminal();
         let ops = s.all_ops();
         assert_eq!(ops.len(), 1, "recently completed op is retained");
@@ -1436,6 +1526,8 @@ mod tests {
                 tool_name: "t".to_string(),
                 description: "d".to_string(),
                 scope: "/s".to_string(),
+                parent_id: None,
+                started_epoch_ms: None,
             },
         })
         .unwrap();
@@ -1810,6 +1902,7 @@ mod tests {
                 mode: "stdio".to_string(),
                 scope: "/test".to_string(),
                 label: "IntegrationInstance".to_string(),
+                client: None,
             },
         )
         .await
@@ -1833,6 +1926,8 @@ mod tests {
                     tool_name: "cargo_build".to_string(),
                     description: "Build".to_string(),
                     scope: "/test/scope".to_string(),
+                    parent_id: None,
+                    started_epoch_ms: None,
                 },
             },
         )
@@ -1883,6 +1978,7 @@ mod tests {
                     status: "Completed".to_string(),
                     result_summary: Some("ok".to_string()),
                     duration_ms: 42,
+                    ended_epoch_ms: None,
                 },
             },
         )

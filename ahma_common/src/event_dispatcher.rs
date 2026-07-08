@@ -44,6 +44,11 @@ pub enum OperationEvent {
         operation_id: String,
         tool_name: String,
         description: String,
+        /// Operation (or synthetic group, e.g. `session:<id>`) that spawned this
+        /// one. `None` for top-level operations. Lets subscribers (TUI task
+        /// tree, audit) reconstruct the caller → subtask hierarchy.
+        #[serde(default)]
+        parent_id: Option<String>,
     },
     /// A line of output was produced (stdout or stderr from the child process).
     OutputLine {
@@ -142,6 +147,7 @@ impl OperationEvent {
 ///     operation_id: "op-1".into(),
 ///     tool_name: "cargo_build".into(),
 ///     description: "Building project".into(),
+///     parent_id: None,
 /// });
 ///
 /// let event = sub.recv().await.unwrap();
@@ -232,6 +238,7 @@ mod tests {
             operation_id: "op-1".into(),
             tool_name: "cargo_build".into(),
             description: "Building".into(),
+            parent_id: None,
         });
 
         let ev1 = sub1.recv().await.unwrap();
@@ -286,6 +293,7 @@ mod tests {
                 operation_id: "id".into(),
                 tool_name: "t".into(),
                 description: "d".into(),
+                parent_id: None,
             },
             OperationEvent::OutputLine {
                 operation_id: "id".into(),

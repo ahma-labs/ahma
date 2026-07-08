@@ -24,6 +24,8 @@ pub enum Action {
     CancelOp,
     AwaitOp,
     PinOp,
+    /// Toggle the task tree between this project's instances and all projects.
+    ToggleProjectFilter,
     // Toggles
     ToggleHelp,
     ToggleDetail,
@@ -211,6 +213,7 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
         (Char('c'), KM::NONE) if focus == Focus::OpsDag => Action::CancelOp,
         (Char('a'), KM::NONE) if focus == Focus::OpsDag => Action::AwaitOp,
         (Char('p'), KM::NONE) if focus == Focus::OpsDag => Action::PinOp,
+        (Char('f'), KM::NONE) if focus == Focus::OpsDag => Action::ToggleProjectFilter,
 
         // Toggles
         (Char('?'), _) => Action::ToggleHelp,

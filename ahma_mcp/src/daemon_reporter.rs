@@ -52,6 +52,39 @@ pub struct WebApprovalReporting {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Client identity
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Process-wide MCP client identity (`clientInfo.name` from the `initialize`
+/// handshake, e.g. `"claude-code"` or `"cursor"`). Registration with the hub
+/// happens before any client attaches, so the reporter watches this channel
+/// and — when the identity is learned or changes — reconnects and re-registers
+/// with `client` set. Reconnect-to-relabel keeps the wire protocol field-only
+/// (no `UpdateInstance` message), which keeps mixed-version daemons working;
+/// the hub replays this instance's operations to subscribers after the
+/// re-register, so the TUI view stays complete.
+static CLIENT_IDENTITY: std::sync::LazyLock<tokio::sync::watch::Sender<Option<String>>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(None).0);
+
+/// Record the MCP client identity for this instance. Called from
+/// `on_initialized` once `clientInfo.name` is known. Idempotent: setting the
+/// same name again does not trigger a hub re-register.
+pub fn set_client_identity(name: impl Into<String>) {
+    let name = name.into();
+    if name.is_empty() {
+        return;
+    }
+    CLIENT_IDENTITY.send_if_modified(|cur| {
+        if cur.as_deref() == Some(name.as_str()) {
+            false
+        } else {
+            *cur = Some(name);
+            true
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public entry point
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -173,6 +206,9 @@ async fn run_reporter_loop(
     // Same split for the web-approval plumbing.
     let web_coordinator = web.as_ref().map(|w| w.coordinator.clone());
     let mut web_req_rx = web.map(|w| w.req_rx);
+    // Watch the client identity: learned after registration (the MCP
+    // `initialize` handshake), a change makes us reconnect and re-register.
+    let mut client_rx = CLIENT_IDENTITY.subscribe();
 
     loop {
         // ── Ensure daemon is running ─────────────────────────────────────────
@@ -202,11 +238,15 @@ async fn run_reporter_loop(
         let mut writer = write_half;
 
         // ── Register this instance ────────────────────────────────────────────
+        // borrow_and_update marks the current identity as seen so the
+        // `changed()` select branch only fires on a genuinely new value.
+        let client = client_rx.borrow_and_update().clone();
         let reg = ClientMsg::Register {
             pid,
             mode: mode.clone(),
             scope: scope.clone(),
             label: label.clone(),
+            client,
         };
         if let Err(e) = send_msg(&mut writer, &reg).await {
             debug!("daemon_reporter: register failed ({e})");
@@ -226,12 +266,7 @@ async fn run_reporter_loop(
         let mut replayed_completed = false;
         for op in &completed_ops {
             let started_ev = ClientMsg::Event {
-                payload: DaemonEvent::OpStarted {
-                    id: op.id.clone(),
-                    tool_name: op.tool_name.clone(),
-                    description: op.description.clone(),
-                    scope: scope.clone(),
-                },
+                payload: op_started_event(op, &scope),
             };
             if send_msg(&mut writer, &started_ev).await.is_err() {
                 replayed_completed = true;
@@ -248,6 +283,7 @@ async fn run_reporter_loop(
                     status: status_label(op.state),
                     result_summary: result_summary_from(op),
                     duration_ms,
+                    ended_epoch_ms: op.end_time.and_then(epoch_ms),
                 },
             };
             if send_msg(&mut writer, &finished_ev).await.is_err() {
@@ -264,12 +300,7 @@ async fn run_reporter_loop(
         let mut replayed_active = false;
         for op in &active_ops {
             let started_ev = ClientMsg::Event {
-                payload: DaemonEvent::OpStarted {
-                    id: op.id.clone(),
-                    tool_name: op.tool_name.clone(),
-                    description: op.description.clone(),
-                    scope: scope.clone(),
-                },
+                payload: op_started_event(op, &scope),
             };
             if send_msg(&mut writer, &started_ev).await.is_err() {
                 replayed_active = true;
@@ -345,6 +376,16 @@ async fn run_reporter_loop(
                             }
                         }
                         None => web_req_rx = None,
+                    }
+                }
+
+                // 2d. Client identity learned/changed → reconnect so the hub
+                // re-registers this instance with the client name attached
+                // (reconnect-to-relabel; see CLIENT_IDENTITY).
+                changed = client_rx.changed() => {
+                    if changed.is_ok() {
+                        info!("daemon_reporter: MCP client identity learned; re-registering with hub");
+                        closed = true;
                     }
                 }
 
@@ -448,6 +489,27 @@ async fn run_reporter_loop(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Convert a wall-clock time to Unix-epoch milliseconds for the hub wire.
+fn epoch_ms(t: std::time::SystemTime) -> Option<u64> {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+/// Build the replay `OpStarted` wire event for an operation, preserving its
+/// true start time and parent link so a late-joining TUI shows accurate
+/// elapsed times and hierarchy.
+fn op_started_event(op: &Operation, scope: &str) -> DaemonEvent {
+    DaemonEvent::OpStarted {
+        id: op.id.clone(),
+        tool_name: op.tool_name.clone(),
+        description: op.description.clone(),
+        scope: scope.to_string(),
+        parent_id: op.parent_id.clone(),
+        started_epoch_ms: epoch_ms(op.start_time),
+    }
+}
+
 /// Map a unified [`OperationEvent`] to the hub wire event, or `None` for
 /// events the hub does not carry (Progress, McpNotification).
 fn daemon_event_for(
@@ -455,16 +517,20 @@ fn daemon_event_for(
     scope: &str,
 ) -> Option<DaemonEvent> {
     use ahma_common::event_dispatcher::OperationEvent as Ev;
+    let now_ms = epoch_ms(std::time::SystemTime::now());
     Some(match event {
         Ev::Started {
             operation_id,
             tool_name,
             description,
+            parent_id,
         } => DaemonEvent::OpStarted {
             id: operation_id.clone(),
             tool_name: tool_name.clone(),
             description: description.clone(),
             scope: scope.to_string(),
+            parent_id: parent_id.clone(),
+            started_epoch_ms: now_ms,
         },
         Ev::OutputLine {
             operation_id,
@@ -491,6 +557,7 @@ fn daemon_event_for(
             status: "Completed".to_string(),
             result_summary: summary_from_value(result),
             duration_ms: *duration_ms,
+            ended_epoch_ms: now_ms,
         },
         Ev::Failed {
             operation_id,
@@ -501,6 +568,7 @@ fn daemon_event_for(
             status: "Failed".to_string(),
             result_summary: Some(clip_summary(error.clone())),
             duration_ms: *duration_ms,
+            ended_epoch_ms: now_ms,
         },
         Ev::Cancelled {
             operation_id,
@@ -511,6 +579,7 @@ fn daemon_event_for(
             status: "Cancelled".to_string(),
             result_summary: Some(clip_summary(reason.clone())),
             duration_ms: *duration_ms,
+            ended_epoch_ms: now_ms,
         },
         Ev::TimedOut {
             operation_id,
@@ -520,6 +589,7 @@ fn daemon_event_for(
             status: "TimedOut".to_string(),
             result_summary: Some("operation timed out".to_string()),
             duration_ms: *duration_ms,
+            ended_epoch_ms: now_ms,
         },
         _ => return None,
     })
@@ -610,6 +680,7 @@ mod tests {
             operation_id: "op-1".into(),
             tool_name: "cargo_build".into(),
             description: "Build release".into(),
+            parent_id: Some("session:dev".into()),
         };
         let result = daemon_event_for(&ev, "workspace/root");
         let Some(DaemonEvent::OpStarted {
@@ -617,6 +688,8 @@ mod tests {
             tool_name,
             description,
             scope,
+            parent_id,
+            started_epoch_ms,
         }) = result
         else {
             panic!("expected OpStarted, got {result:?}");
@@ -625,6 +698,11 @@ mod tests {
         assert_eq!(tool_name, "cargo_build");
         assert_eq!(description, "Build release");
         assert_eq!(scope, "workspace/root");
+        assert_eq!(parent_id.as_deref(), Some("session:dev"));
+        assert!(
+            started_epoch_ms.is_some(),
+            "live Started events must carry a wall-clock start"
+        );
     }
 
     #[test]
@@ -687,6 +765,7 @@ mod tests {
             status,
             duration_ms,
             result_summary,
+            ended_epoch_ms,
         }) = daemon_event_for(&ev, "ws")
         else {
             panic!("expected OpFinished");
@@ -695,6 +774,10 @@ mod tests {
         assert_eq!(status, "Completed");
         assert_eq!(duration_ms, 42);
         assert_eq!(result_summary, Some("ok".into()));
+        assert!(
+            ended_epoch_ms.is_some(),
+            "live OpFinished events must carry a wall-clock end"
+        );
     }
 
     #[test]

@@ -76,6 +76,18 @@ async fn run_ratatui(
     if let Some(ref path) = workspace_path {
         state.workspace = path.to_string_lossy().into_owned();
     }
+    // Project root for the task-tree filter: the explicit path argument, else
+    // the directory the TUI was started from. Canonicalized so it compares
+    // against instance sandbox scopes (which are canonicalized at lock time).
+    state.project_root = workspace_path
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .map(|p| {
+            std::fs::canonicalize(&p)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned()
+        });
     state.mcp_http_base_url = http_base_url(connection);
     state.token_prefs = token_prefs;
     // Cache the effective minimize state (flag > env > settings) for the status
@@ -173,6 +185,9 @@ async fn run_ratatui(
                 maybe = event_stream.next() => {
                     match maybe {
                         Some(Ok(Event::Key(key))) => {
+                            // Any keystroke disarms the startup auto-switch to
+                            // the task view — the user has taken the wheel.
+                            state.auto_view_pending = false;
                             if (key.code == crossterm::event::KeyCode::PageUp || key.code == crossterm::event::KeyCode::PageDown)
                                 && !state.is_help_open()
                                 && state.log_files_selected().is_none()
@@ -205,6 +220,9 @@ async fn run_ratatui(
                             state.last_mouse_pos.set(Some((mouse_event.column, mouse_event.row)));
                             match mouse_event.kind {
                                 crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                                    // A click is user input: disarm the startup
+                                    // auto-switch to the task view.
+                                    state.auto_view_pending = false;
                                     handle_mouse_click(mouse_event.column, mouse_event.row, &mut state);
                                 }
                                 crossterm::event::MouseEventKind::ScrollUp => {
@@ -318,6 +336,14 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         Action::ToggleHelp => state.toggle_help(),
         Action::FocusChat => {
             state.focus = crate::state::Focus::Chat;
+        }
+        Action::Enter if state.focus == crate::state::Focus::OpsDag => {
+            // Accordion: expand the selected task into its live/historic
+            // output view (or fold an instance/session header).
+            state.toggle_selected_tree_node();
+        }
+        Action::ToggleProjectFilter if state.focus == crate::state::Focus::OpsDag => {
+            state.show_all_projects = !state.show_all_projects;
         }
         Action::ToggleDetail | Action::AwaitOp | Action::Unknown | Action::Enter => {}
         _ => {}
@@ -614,9 +640,8 @@ fn scroll_focus_down(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
     match state.focus {
-        Focus::OpsDag if !state.operations.is_empty() => {
-            state.ops_selected =
-                (state.ops_selected + 1).min(state.operations.len().saturating_sub(1));
+        Focus::OpsDag if state.ops_row_count() > 0 => {
+            state.ops_selected = (state.ops_selected + 1).min(state.ops_row_count() - 1);
         }
         Focus::AiActivity => {
             let max = state.ai_activity.len().saturating_sub(1);
@@ -666,7 +691,7 @@ fn move_focus_to_bottom(state: &mut crate::state::AppState) {
     use crate::state::Focus;
 
     match state.focus {
-        Focus::OpsDag => state.ops_selected = state.operations.len().saturating_sub(1),
+        Focus::OpsDag => state.ops_selected = state.ops_row_count().saturating_sub(1),
         Focus::AiActivity => state.activity_scroll = state.ai_activity.len().saturating_sub(1),
         Focus::Log => {
             // Jump to the newest line and resume tracking new output.
@@ -816,7 +841,9 @@ fn request_cancel_selected_op(state: &mut crate::state::AppState) {
 
 #[cfg(feature = "tui")]
 fn toggle_selected_op_pin(state: &mut crate::state::AppState) {
-    if let Some(op) = state.operations.get_mut(state.ops_selected) {
+    if let Some(idx) = state.selected_op_index()
+        && let Some(op) = state.operations.get_mut(idx)
+    {
         op.pinned = !op.pinned;
     }
 }
@@ -2080,6 +2107,36 @@ fn handle_mode_nav_command(cmd: &str, state: &mut crate::state::AppState) -> boo
     }
 
     true
+}
+
+/// Startup "it just works" behavior (SPEC R24.2): if the hub replay reveals
+/// live work for this project — an MCP client (Claude Code, Cursor, …) already
+/// running operations — switch straight to the monitor task tree so the user
+/// sees what is being done on their behalf without pressing anything. Armed
+/// only until the first keystroke, and only fires while still in chat mode.
+#[cfg(feature = "tui")]
+fn maybe_auto_open_task_view(state: &mut crate::state::AppState) {
+    use crate::state::{Mode, OpStatus};
+
+    if !state.auto_view_pending || state.mode == Mode::Monitor {
+        return;
+    }
+    let project = state.project_root.as_deref();
+    let has_live_project_work = state.operations.iter().any(|op| {
+        op.instance_id.is_some()
+            && matches!(
+                op.status,
+                OpStatus::Running | OpStatus::Pending | OpStatus::Waiting
+            )
+            && match (project, op.scope.as_deref()) {
+                (Some(root), Some(scope)) => crate::task_tree::scope_matches_project(scope, root),
+                _ => true,
+            }
+    });
+    if has_live_project_work {
+        state.auto_view_pending = false;
+        set_mode_and_focus(state, Mode::Monitor, crate::state::Focus::OpsDag);
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -3657,6 +3714,7 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
                 state.upsert_operation(op);
             }
             sync_operations_to_windows(state);
+            maybe_auto_open_task_view(state);
         }
         SourceEvent::OperationOutput {
             instance_id,
@@ -4162,6 +4220,13 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
             if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
                 w.collapsed = !w.collapsed;
             }
+        }
+        ClickTarget::TreeRow(row_idx) => {
+            // Click = select + toggle: accordion-expand an operation into its
+            // live/historic output view, or fold an instance/session header.
+            state.ops_selected = row_idx;
+            state.toggle_selected_tree_node();
+            state.focus = crate::state::Focus::OpsDag;
         }
     }
 }

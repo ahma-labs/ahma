@@ -108,6 +108,11 @@ pub struct InstanceInfo {
     pub scope: String,
     /// Human-readable label, e.g. `"VS Code"` or `"Cursor"`.
     pub label: String,
+    /// MCP client identity detected from the `initialize` handshake
+    /// (`clientInfo.name`, e.g. `"claude-code"` or `"cursor"`). `None` until a
+    /// client has attached or when the instance predates this field.
+    #[serde(default)]
+    pub client: Option<String>,
 }
 
 /// An operation event forwarded from an instance to the daemon.
@@ -119,6 +124,15 @@ pub enum DaemonEvent {
         tool_name: String,
         description: String,
         scope: String,
+        /// Operation (or synthetic group, e.g. `session:<id>`) that spawned this
+        /// one; `None` for top-level operations. Drives the TUI task tree.
+        #[serde(default)]
+        parent_id: Option<String>,
+        /// Wall-clock start time (Unix epoch, milliseconds). Present so a
+        /// subscriber joining late — or receiving a replay — shows the true
+        /// elapsed time instead of measuring from receipt.
+        #[serde(default)]
+        started_epoch_ms: Option<u64>,
     },
     OpFinished {
         id: String,
@@ -126,6 +140,10 @@ pub enum DaemonEvent {
         status: String,
         result_summary: Option<String>,
         duration_ms: u64,
+        /// Wall-clock completion time (Unix epoch, milliseconds), for accurate
+        /// historic views after replay.
+        #[serde(default)]
+        ended_epoch_ms: Option<u64>,
     },
     /// A single line of live output from a running operation.
     /// Streamed as the child process produces it, so subscribers (TUI) can
@@ -146,11 +164,18 @@ pub enum DaemonEvent {
 #[serde(tag = "type")]
 pub enum ClientMsg {
     /// An ahma instance announcing itself.  Sent once immediately after connecting.
+    /// When the MCP client identity becomes known after registration (the
+    /// `initialize` handshake happens later), the instance reconnects and
+    /// re-registers with `client` set — field-only protocol evolution keeps
+    /// mixed-version daemons working.
     Register {
         pid: u32,
         mode: String,
         scope: String,
         label: String,
+        /// MCP client identity (`clientInfo.name`), when already known.
+        #[serde(default)]
+        client: Option<String>,
     },
     /// An operation event from a registered instance.
     Event { payload: DaemonEvent },
@@ -1026,7 +1051,20 @@ where
             mode,
             scope,
             label,
-        } => serve_instance(&mut reader, &mut writer, &hub, pid, mode, scope, label).await,
+            client,
+        } => {
+            serve_instance(
+                &mut reader,
+                &mut writer,
+                &hub,
+                pid,
+                mode,
+                scope,
+                label,
+                client,
+            )
+            .await
+        }
 
         ClientMsg::Subscribe => serve_subscriber(&mut writer, &hub).await,
 
@@ -1152,6 +1190,7 @@ async fn resolve_target(hub: &DaemonHub, target: Option<&str>) -> Option<String>
 
 /// Serve a registered ahma instance: register it, then exchange events and
 /// liveness pings until it disconnects, finally cleaning up its state.
+#[allow(clippy::too_many_arguments)]
 async fn serve_instance<R, W>(
     reader: &mut BufReader<R>,
     writer: &mut W,
@@ -1160,6 +1199,7 @@ async fn serve_instance<R, W>(
     mode: String,
     scope: String,
     label: String,
+    client: Option<String>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -1171,6 +1211,7 @@ async fn serve_instance<R, W>(
         mode,
         scope,
         label,
+        client,
     };
     hub.instances.lock().await.insert(id.clone(), info.clone());
 
@@ -1427,6 +1468,7 @@ mod tests {
             mode: "stdio".to_string(),
             scope: "/test".to_string(),
             label: "TestLabel".to_string(),
+            client: None,
         };
         let mut buf = Vec::<u8>::new();
         send_msg(&mut buf, &msg).await.unwrap();
@@ -1445,13 +1487,82 @@ mod tests {
                 mode,
                 scope,
                 label,
+                client,
             } => {
                 assert_eq!(pid, 42);
                 assert_eq!(mode, "stdio");
                 assert_eq!(scope, "/test");
                 assert_eq!(label, "TestLabel");
+                assert_eq!(client, None, "client field defaults to None");
             }
             other => panic!("expected Register, got {other:?}"),
+        }
+    }
+
+    /// Wire back-compat: messages serialized by a pre-causality peer (no
+    /// `parent_id` / `started_epoch_ms` / `ended_epoch_ms` / `client` fields)
+    /// must still deserialize — the task-tree protocol evolution is
+    /// field-only, so mixed-version daemon/instance/TUI combinations keep
+    /// working (SPEC R24.5).
+    #[test]
+    fn old_wire_format_without_causality_fields_still_parses() {
+        let old_started = r#"{"kind":"OpStarted","id":"op-1","tool_name":"cargo_build","description":"Build","scope":"/w"}"#;
+        let ev: DaemonEvent = serde_json::from_str(old_started).unwrap();
+        match ev {
+            DaemonEvent::OpStarted {
+                parent_id,
+                started_epoch_ms,
+                ..
+            } => {
+                assert_eq!(parent_id, None);
+                assert_eq!(started_epoch_ms, None);
+            }
+            other => panic!("expected OpStarted, got {other:?}"),
+        }
+
+        let old_finished = r#"{"kind":"OpFinished","id":"op-1","status":"Completed","result_summary":null,"duration_ms":5}"#;
+        let ev: DaemonEvent = serde_json::from_str(old_finished).unwrap();
+        match ev {
+            DaemonEvent::OpFinished { ended_epoch_ms, .. } => assert_eq!(ended_epoch_ms, None),
+            other => panic!("expected OpFinished, got {other:?}"),
+        }
+
+        let old_register =
+            r#"{"type":"Register","pid":1,"mode":"stdio","scope":"/w","label":"VS Code"}"#;
+        let msg: ClientMsg = serde_json::from_str(old_register).unwrap();
+        match msg {
+            ClientMsg::Register { client, .. } => assert_eq!(client, None),
+            other => panic!("expected Register, got {other:?}"),
+        }
+
+        let old_instance = r#"{"id":"i1","pid":1,"mode":"stdio","scope":"/w","label":"Cursor"}"#;
+        let info: InstanceInfo = serde_json::from_str(old_instance).unwrap();
+        assert_eq!(info.client, None);
+    }
+
+    /// New causality/timing fields survive an NDJ round-trip intact.
+    #[test]
+    fn causality_fields_roundtrip() {
+        let ev = DaemonEvent::OpStarted {
+            id: "op-2".into(),
+            tool_name: "run_terminal_command".into(),
+            description: "cargo nextest run".into(),
+            scope: "/w".into(),
+            parent_id: Some("session:build-loop".into()),
+            started_epoch_ms: Some(1_750_000_000_000),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: DaemonEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            DaemonEvent::OpStarted {
+                parent_id,
+                started_epoch_ms,
+                ..
+            } => {
+                assert_eq!(parent_id.as_deref(), Some("session:build-loop"));
+                assert_eq!(started_epoch_ms, Some(1_750_000_000_000));
+            }
+            other => panic!("expected OpStarted, got {other:?}"),
         }
     }
 
@@ -1464,6 +1575,7 @@ mod tests {
                 mode: "http".to_string(),
                 scope: "/project".to_string(),
                 label: "Cursor".to_string(),
+                client: None,
             }],
         };
         let mut buf = Vec::<u8>::new();
@@ -1490,6 +1602,8 @@ mod tests {
                 tool_name: "cargo_build".to_string(),
                 description: "Build workspace".to_string(),
                 scope: "/test/scope".to_string(),
+                parent_id: None,
+                started_epoch_ms: None,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -1519,6 +1633,7 @@ mod tests {
                 status: "Completed".to_string(),
                 result_summary: Some("success".to_string()),
                 duration_ms: 1500,
+                ended_epoch_ms: None,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -1743,6 +1858,7 @@ mod tests {
                 mode: "stdio".to_string(),
                 scope: "/test/scope".to_string(),
                 label: "TestInstance".to_string(),
+                client: None,
             },
         )
         .await
@@ -1766,6 +1882,8 @@ mod tests {
                     tool_name: "cargo_test".to_string(),
                     description: "Run tests".to_string(),
                     scope: "/test/scope".to_string(),
+                    parent_id: None,
+                    started_epoch_ms: None,
                 },
             },
         )
@@ -1794,6 +1912,7 @@ mod tests {
                     status: "Completed".to_string(),
                     result_summary: Some("success".to_string()),
                     duration_ms: 1200,
+                    ended_epoch_ms: None,
                 },
             },
         )
@@ -1843,6 +1962,7 @@ mod tests {
                 mode: "http".to_string(),
                 scope: "/project".to_string(),
                 label: "HttpBridge".to_string(),
+                client: None,
             },
         )
         .await
@@ -1912,6 +2032,8 @@ mod tests {
                 tool_name: "cargo_build".into(),
                 description: "build".into(),
                 scope: "/w".into(),
+                parent_id: None,
+                started_epoch_ms: None,
             },
         )
         .await;
@@ -1922,6 +2044,7 @@ mod tests {
                 status: "Completed".into(),
                 result_summary: Some("ok".into()),
                 duration_ms: 10,
+                ended_epoch_ms: None,
             },
         )
         .await;
@@ -1932,6 +2055,8 @@ mod tests {
                 tool_name: "cargo_test".into(),
                 description: "test".into(),
                 scope: "/w".into(),
+                parent_id: None,
+                started_epoch_ms: None,
             },
         )
         .await;
@@ -1993,6 +2118,8 @@ mod tests {
                 tool_name: "t".into(),
                 description: "d".into(),
                 scope: "/w".into(),
+                parent_id: None,
+                started_epoch_ms: None,
             },
         )
         .await;
@@ -2077,6 +2204,8 @@ mod tests {
                     tool_name: "t".into(),
                     description: "d".into(),
                     scope: "/w".into(),
+                    parent_id: None,
+                    started_epoch_ms: None,
                 },
             )
             .await;
@@ -2087,6 +2216,7 @@ mod tests {
                     status: "Completed".into(),
                     result_summary: None,
                     duration_ms: 1,
+                    ended_epoch_ms: None,
                 },
             )
             .await;
@@ -2104,6 +2234,8 @@ mod tests {
                 tool_name: "t".into(),
                 description: "d".into(),
                 scope: "/w".into(),
+                parent_id: None,
+                started_epoch_ms: None,
             },
         )
         .await;
@@ -2136,6 +2268,8 @@ mod tests {
                     tool_name: "t".into(),
                     description: "d".into(),
                     scope: "/w".into(),
+                    parent_id: None,
+                    started_epoch_ms: None,
                 },
             )
             .await;
@@ -2160,6 +2294,7 @@ mod tests {
                 status: "Failed".into(),
                 result_summary: None,
                 duration_ms: 0,
+                ended_epoch_ms: None,
             },
         )
         .await;
@@ -2173,6 +2308,8 @@ mod tests {
                 tool_name: "t".into(),
                 description: "d".into(),
                 scope: "/w".into(),
+                parent_id: None,
+                started_epoch_ms: None,
             },
         )
         .await;
@@ -2183,6 +2320,7 @@ mod tests {
                 status: "Failed".into(),
                 result_summary: None,
                 duration_ms: 0,
+                ended_epoch_ms: None,
             },
         )
         .await;
@@ -2225,6 +2363,7 @@ mod tests {
                 mode: "stdio".into(),
                 scope: "/w".into(),
                 label: "L".into(),
+                client: None,
             },
         );
         assert_eq!(resolve_target(&hub, None).await, Some("only".to_string()));
@@ -2319,6 +2458,7 @@ mod tests {
                 mode: "stdio".into(),
                 scope: "/w".into(),
                 label: "L".into(),
+                client: None,
             },
         )
         .await
@@ -2506,6 +2646,7 @@ mod tests {
                 mode: "stdio".into(),
                 scope: "/w".into(),
                 label: "L".into(),
+                client: None,
             },
         )
         .await
@@ -2638,6 +2779,7 @@ mod tests {
                 mode: "stdio".into(),
                 scope: "/w".into(),
                 label: "L".into(),
+                client: None,
             },
         )
         .await
@@ -2650,6 +2792,8 @@ mod tests {
                     tool_name: "cargo_build".into(),
                     description: "b".into(),
                     scope: "/w".into(),
+                    parent_id: None,
+                    started_epoch_ms: None,
                 },
             },
         )
@@ -2663,6 +2807,7 @@ mod tests {
                     status: "Completed".into(),
                     result_summary: Some("ok".into()),
                     duration_ms: 5,
+                    ended_epoch_ms: None,
                 },
             },
         )

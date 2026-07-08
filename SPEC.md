@@ -43,6 +43,7 @@
 | Logging (File + Stderr) | tests-pass | Daily rolling logs, `--log-to-stderr` for debug |
 | Live Log Monitoring (LLM) | tests-pass | `tool_type: livelog` routes to LLM analysis pipeline; `ahma_llm_monitor` crate; OpenAI-compatible providers |
 | TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
+| Live Task Tree (R24) | tests-pass | Project-scoped caller → subtask tree, current at TUI startup via hub replay with true timestamps; accordion drill-in to live/historic output; client identity via reconnect-to-relabel |
 | Local Cluster Scheduler | tests-pass | mDNS discovery and signed task dispatch to remote worker peers |
 | Configuration Standard (R-CFG) | PLANNED | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5) |
 | `ahma cluster remove` | tests-pass | Subcommand to remove worker peers from peers configuration |
@@ -1422,6 +1423,61 @@ place. This is the concrete mechanism behind R18.2 and R20.
 - **R23.6 — Exemptions.** Enums used purely as **classifiers** or **strategy
   selectors** (e.g. `GrantStatus`, `ReduceMode`, `TransportMode`) are not
   lifecycles and are exempt; they have no transitions to guard.
+
+#### R24: Live Task Tree (TUI observability)
+
+`ahma tui` opened in a project directory is a **real-time view of all work
+being done on the user's behalf in that project** — by every attached MCP
+client (Claude Code, Cursor, Antigravity, …) and by the user's own TUI/CLI
+commands — rendered as a compact caller → subtask tree. The view must be
+correct **at startup**, not only for events that happen afterwards.
+
+- **R24.1 — Causality is stamped at the source.** Every `Operation` carries an
+  optional `parent_id`: the operation — or synthetic group such as
+  `session:<id>` for persistent-shell commands — that spawned it. The parent
+  link is set where the operation is created (adapter), carried on
+  `OperationEvent::Started`, and forwarded on the hub wire
+  (`DaemonEvent::OpStarted.parent_id`). Observers **must not** infer hierarchy
+  from descriptions or naming conventions.
+
+- **R24.2 — Current at startup ("it just works").** On launch the TUI
+  subscribes to the hub daemon, which replays each instance's retained
+  operation history (`OpStarted` + terminal `OpFinished`, bounded per
+  instance) before live events. Replayed events carry wall-clock timestamps
+  (`started_epoch_ms` / `ended_epoch_ms`) so elapsed/duration displays are
+  **true times, not time-since-receipt**. When the replay reveals live work
+  for the current project from an attached client, the TUI switches to the
+  task view automatically; any user keystroke disarms this auto-switch.
+
+- **R24.3 — Project-scoped by default.** The tree shows instances whose
+  sandbox scope covers (or lives inside) the directory the TUI was started in;
+  `f` toggles all projects. Matching is component-boundary path containment in
+  either direction. Instances with no operations still render (an idle,
+  attached client is information, not noise).
+
+- **R24.4 — Compact tree with accordion drill-in.** One line per task:
+  instance headers (client identity, transport, scope, and parallel-work
+  tallies: running / queued / succeeded / failed), operations beneath them,
+  children indented under their parent (session groups, spawned subtasks —
+  arbitrary depth). Finished tasks resolve in place to a terminal glyph +
+  duration. Enter or click on a task expands it inline into its live output
+  tail (running) or historic output/result summary (finished); expanding one
+  task collapses the previously expanded one (single-expand accordion).
+  Instance and session headers fold/unfold their subtree instead.
+
+- **R24.5 — Field-only wire evolution.** The task-tree protocol additions
+  (`parent_id`, `started_epoch_ms`, `ended_epoch_ms` on `DaemonEvent`;
+  `client` on `Register`/`InstanceInfo`) are `#[serde(default)]` **field**
+  additions — never new message variants — so mixed-version daemon / instance
+  / TUI combinations keep interoperating. The MCP client identity
+  (`clientInfo.name`, learned at `initialize` — after hub registration) is
+  conveyed by the reporter **reconnecting and re-registering**
+  (reconnect-to-relabel), which also re-replays state, rather than by a new
+  `UpdateInstance` message.
+
+- **R24.6 — One task, one row.** An operation visible both through the hub
+  (instance-tagged) and through the TUI's direct MCP status poll (untagged)
+  renders once; the hub copy wins because it carries instance grouping.
 
 ---
 

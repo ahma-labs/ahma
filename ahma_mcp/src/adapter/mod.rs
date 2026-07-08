@@ -787,7 +787,10 @@ impl Adapter {
             format!("[session {session_id}] {command_str}"),
             None,
             timeout.map(Duration::from_secs),
-        );
+        )
+        // Session commands nest under a synthetic `session:<id>` group so
+        // observers (TUI task tree) render them as children of the session.
+        .with_parent(format!("session:{session_id}"));
         operation.output_file = Some(spill::operation_spill_path(&op_id));
         self.monitor.add_operation(operation).await;
 

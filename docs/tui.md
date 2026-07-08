@@ -1,50 +1,61 @@
 # TUI Control Plane
 
-> **Experimental** — introduced in v0.7. The full `ratatui`-based rendering layer is implemented as the default user interface, with a text-mode fallback available if the library features are omitted at compile-time.
+`ahma tui` opens a terminal dashboard for watching and controlling everything ahma is doing on your behalf — the operations your MCP client (Claude Code, Cursor, Antigravity, …) is running, and the commands you run yourself. It works over SSH, requires no graphical runtime, and is the primary interface for reviewing approval gates.
 
-`ahma tui` opens a terminal dashboard for monitoring and controlling active tasks. It works over SSH, requires no graphical runtime, and is the primary interface for reviewing approval gates raised by the [renewal contract](renewal-contract.md).
+It is **chat-first**: the default view is a chat/agent interface with operation cards; `/mode monitor` switches to the monitor dashboard with the live **task tree**. Switch back with `/mode chat`.
 
 ## Quickstart
 
 ```bash
-# Connect to the default ahma HTTP bridge on localhost:3000
+# In your project root — attaches to everything already running for this project
+cd ~/my-project
 ahma tui
 
 # Connect to a custom address
 ahma tui --connect http://localhost:8080
 ```
 
-The TUI polls the server every two seconds and renders the live dashboard interface until you press Ctrl-C.
+## The live task tree — current at startup
 
-## Panels
+Open `ahma tui` in a project directory while your IDE agent is working and the ongoing tasks are **already there** (SPEC R24): every ahma instance reports its operations to a per-user hub daemon, which replays recent history (with true start/end timestamps) to the TUI the moment it subscribes. If live project work is found at startup, the TUI opens straight into the task view; press any key to take over.
 
 ```
-┌──────────────────────────────────────────────────────┐
-│ AHMA  Task Control Plane     server: HEALTHY  [q] quit │
-├───────────────────────┬──────────────────────────────┤
-│ Active Tasks          │ Task Detail                   │
-│ ► op_001 [Running]   │ tool: cargo_build             │
-│   op_002 [Pending]   │ status: InProgress            │
-│                       │ elapsed: 12s                  │
-├───────────────────────┴──────────────────────────────┤
-│ Recent log                                            │
-│ 12:01:03  INFO  sandbox configured                    │
-│ 12:01:04  INFO  cargo_build started                   │
-└──────────────────────────────────────────────────────┘
-│ APPROVAL REQUIRED  op_003: renewal checkpoint        │
-│  [y] approve  [n] reject                             │
-└──────────────────────────────────────────────────────┘
+┌ Tasks · this project — [f] all ────────────────────────────┐
+│ ▾ claude-code · stdio · …/github/ahma      2⟳ 1◷ 14✓       │
+│    ⟳ cargo nextest run          [op_41]  1m12s   [P] [X]   │
+│    │ Compiling ahma_core v0.15.4                            │
+│    │ Compiling ahma_mcp v0.15.4                             │
+│    ▾ session build-loop                                     │
+│      ✓ cargo fmt --all          [op_39]  0.3s               │
+│      ⟳ cargo clippy             [op_40]  12s     [P] [X]   │
+│ ▸ cursor · stdio · …/github/ahma           3✓               │
+│ ▾ this terminal (you)                      1⟳               │
+│    ⟳ tail -f logs/ahma.log      [op_7]   4m02s   [P] [X]   │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+- **One line per task.** Instance headers show *who* is driving (the MCP client identity from the `initialize` handshake), the transport, the sandbox scope, and at-a-glance tallies of how much is running / queued / done / failed in parallel.
+- **Children indent under what spawned them** — persistent-session commands under their session, subtasks under their parent operation, to any depth.
+- **Tasks resolve in place** when they finish: the spinner becomes ✓/✗ with the duration.
+- **Accordion drill-in:** `Enter` (or click) on a task expands it inline into its live output tail — or its historic output/result if already finished — and collapses whichever task was expanded before. `Enter` on an instance or session header folds that subtree.
+- **Project-scoped by default:** only instances whose sandbox scope covers the directory you started in are shown; `f` shows all projects.
+- Finished tasks stay visible for an hour, so a TUI opened mid-session shows what *was* done, not just what is running.
 
 ## Key bindings
 
 | Key | Action |
 |-----|--------|
-| `q` | Quit |
-| `↑` / `↓` | Navigate task list |
-| `Enter` | Show task detail |
-| `y` | Approve pending gate |
-| `n` | Reject pending gate |
+| `q` / Ctrl-C | Quit |
+| `↑`/`↓` (`j`/`k`) | Navigate rows |
+| `Enter` / click | Expand task into live/historic output (accordion); fold headers |
+| `f` | Toggle this-project / all-projects |
+| `c` | Cancel selected operation |
+| `p` | Pin selected operation |
+| `a` | Await selected operation |
+| `Tab` | Cycle panes |
+| `y` / `n` | Approve / reject pending gate |
+| `/` | Command navigator |
+| `?` | Help |
 
 ## Approval gates
 

@@ -1146,6 +1146,13 @@ impl ServerHandler for AhmaMcpService {
                 }
             );
 
+            // Publish the raw client identity so the daemon reporter can
+            // re-register this instance with the hub under the client's name
+            // (the TUI task tree groups work by who is driving it).
+            if let Some(info) = context.peer.peer_info() {
+                crate::daemon_reporter::set_client_identity(info.client_info.name.clone());
+            }
+
             let peer = &context.peer;
             self.store_peer_handle_if_unset(peer);
 

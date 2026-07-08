@@ -1757,6 +1757,8 @@ fn draw_ai_activity(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
 
 #[cfg(feature = "tui")]
 fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    use crate::task_tree::{RowKind, TreeOptions, build_rows};
+
     let focused = state.focus == Focus::OpsDag;
     let border_style = if focused {
         theme.border_focused()
@@ -1764,8 +1766,13 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
         theme.border_unfocused()
     };
 
+    let title = if state.show_all_projects {
+        " Tasks · all projects — [f] this project "
+    } else {
+        " Tasks · this project — [f] all "
+    };
     let block = Block::default()
-        .title(Span::styled(" Operations ", theme.title()))
+        .title(Span::styled(title, theme.title()))
         .borders(Borders::ALL)
         .border_style(border_style);
 
@@ -1774,83 +1781,257 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
 
     state.ops_area.set(area);
 
-    if state.operations.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Span::styled("  No active operations", theme.dim())),
-            inner,
+    // Rebuild the tree for this frame; key/mouse handlers resolve the
+    // selection through the stored rows.
+    {
+        let rows = build_rows(
+            &state.operations,
+            &TreeOptions {
+                instances: &state.active_instances,
+                project_root: state.project_root.as_deref(),
+                show_all: state.show_all_projects,
+                expanded_op: state.expanded_op.as_deref(),
+                collapsed: &state.collapsed_nodes,
+            },
         );
+        *state.task_rows.borrow_mut() = rows;
+    }
+    let rows = state.task_rows.borrow();
+
+    if rows.is_empty() {
+        let hint = if state.show_all_projects {
+            "  No tasks yet — connected clients appear here as they work"
+        } else {
+            "  No tasks in this project yet — [f] shows all projects"
+        };
+        frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
         return;
     }
 
     let display_rows = inner.height as usize;
-    let visible_ops = state.operations.len();
+    let selected = state.ops_selected.min(rows.len() - 1);
 
-    // Auto-adjust scroll offset to keep selected in view
+    // Auto-adjust scroll offset to keep the selected row in view.
     let mut scroll = state.ops_scroll.get();
-    if state.ops_selected < scroll {
-        scroll = state.ops_selected;
-    } else if state.ops_selected >= scroll + display_rows {
-        scroll = state.ops_selected - display_rows + 1;
+    if selected < scroll {
+        scroll = selected;
+    } else if selected >= scroll + display_rows {
+        scroll = selected - display_rows + 1;
     }
-    scroll = scroll.min(visible_ops.saturating_sub(display_rows));
+    scroll = scroll.min(rows.len().saturating_sub(display_rows));
     state.ops_scroll.set(scroll);
 
-    let rows_to_draw = display_rows.min(visible_ops - scroll);
+    let rows_to_draw = display_rows.min(rows.len() - scroll);
 
     for i in 0..rows_to_draw {
-        let op_idx = scroll + i;
-        let op = &state.operations[op_idx];
+        let row_idx = scroll + i;
+        let row = &rows[row_idx];
         let row_area = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+        let is_selected = row_idx == selected;
 
-        // We split row horizontally:
-        // Details: Constraint::Min(5)
-        // Pin button: Constraint::Length(5)
-        // Cancel button: Constraint::Length(5)
-        let [details_a, pin_a, cancel_a] = Layout::horizontal([
-            Constraint::Min(5),
-            Constraint::Length(5),
-            Constraint::Length(5),
-        ])
-        .areas(row_area);
+        match &row.kind {
+            RowKind::Instance {
+                label,
+                detail,
+                counts,
+                collapsed,
+                ..
+            } => {
+                let line = build_instance_row(
+                    label,
+                    detail,
+                    counts,
+                    *collapsed,
+                    is_selected,
+                    state.unicode,
+                    theme,
+                    row_area.width as usize,
+                );
+                frame.render_widget(Paragraph::new(line), row_area);
+                state
+                    .click_targets
+                    .borrow_mut()
+                    .push((ClickTarget::TreeRow(row_idx), row_area));
+            }
+            RowKind::Group {
+                label, collapsed, ..
+            } => {
+                let marker = fold_marker(*collapsed, state.unicode);
+                let sel = selection_marker(is_selected, state.unicode);
+                let text = truncate(&format!("{sel}  {marker} {label}"), row_area.width as usize);
+                let style = if is_selected {
+                    theme.selected_item()
+                } else {
+                    theme.dim()
+                };
+                frame.render_widget(Paragraph::new(Span::styled(text, style)), row_area);
+                state
+                    .click_targets
+                    .borrow_mut()
+                    .push((ClickTarget::TreeRow(row_idx), row_area));
+            }
+            RowKind::Output { text, .. } => {
+                let indent = "  ".repeat(row.depth as usize);
+                let bar = if state.unicode { "│ " } else { "| " };
+                let line = truncate(&format!("  {indent}{bar}{text}"), row_area.width as usize);
+                frame.render_widget(Paragraph::new(Span::styled(line, theme.dim())), row_area);
+                state
+                    .click_targets
+                    .borrow_mut()
+                    .push((ClickTarget::TreeRow(row_idx), row_area));
+            }
+            RowKind::Op { op_index, expanded } => {
+                let Some(op) = state.operations.get(*op_index) else {
+                    continue;
+                };
+                let [details_a, pin_a, cancel_a] = Layout::horizontal([
+                    Constraint::Min(5),
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                ])
+                .areas(row_area);
 
-        // Render details
-        let item = build_ops_dag_item(op_idx, op, state, theme, details_a.width as usize);
-        frame.render_widget(Paragraph::new(item), details_a);
+                let item = build_tree_op_item(
+                    op,
+                    row.depth,
+                    *expanded,
+                    is_selected,
+                    state,
+                    theme,
+                    details_a.width as usize,
+                );
+                frame.render_widget(Paragraph::new(item), details_a);
+                state
+                    .click_targets
+                    .borrow_mut()
+                    .push((ClickTarget::TreeRow(row_idx), details_a));
 
-        // Register select click target
-        state
-            .click_targets
-            .borrow_mut()
-            .push((ClickTarget::SelectOperation(op_idx), details_a));
+                let pin_style = if op.pinned {
+                    theme.running()
+                } else {
+                    theme.dim()
+                };
+                frame.render_widget(Paragraph::new(Span::styled(" [P] ", pin_style)), pin_a);
+                state
+                    .click_targets
+                    .borrow_mut()
+                    .push((ClickTarget::PinOperation(op.id.clone()), pin_a));
 
-        // Render Pin button: "[P]"
-        let pin_text = " [P] ";
-        let pin_style = if op.pinned {
-            theme.running()
-        } else {
-            theme.dim()
-        };
-        frame.render_widget(Paragraph::new(Span::styled(pin_text, pin_style)), pin_a);
-
-        // Register pin click target
-        state
-            .click_targets
-            .borrow_mut()
-            .push((ClickTarget::PinOperation(op.id.clone()), pin_a));
-
-        // Render Cancel button: "[X]"
-        if !op.status.is_terminal() {
-            frame.render_widget(
-                Paragraph::new(Span::styled(" [X] ", theme.failed())),
-                cancel_a,
-            );
-            // Register cancel click target
-            state
-                .click_targets
-                .borrow_mut()
-                .push((ClickTarget::CancelOperation(op.id.clone()), cancel_a));
+                if !op.status.is_terminal() {
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(" [X] ", theme.failed())),
+                        cancel_a,
+                    );
+                    state
+                        .click_targets
+                        .borrow_mut()
+                        .push((ClickTarget::CancelOperation(op.id.clone()), cancel_a));
+                }
+            }
         }
     }
+}
+
+#[cfg(feature = "tui")]
+fn fold_marker(collapsed: bool, unicode: bool) -> &'static str {
+    match (collapsed, unicode) {
+        (true, true) => "▸",
+        (false, true) => "▾",
+        (true, false) => ">",
+        (false, false) => "v",
+    }
+}
+
+#[cfg(feature = "tui")]
+fn selection_marker(selected: bool, unicode: bool) -> &'static str {
+    match (selected, unicode) {
+        (true, true) => "▶",
+        (true, false) => ">",
+        (false, _) => " ",
+    }
+}
+
+/// Instance header: `▾ claude-code · stdio · …/github/ahma   2▶ 1⧗ 14✓ 1✗`
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn build_instance_row(
+    label: &str,
+    detail: &str,
+    counts: &crate::task_tree::GroupCounts,
+    collapsed: bool,
+    is_selected: bool,
+    unicode: bool,
+    theme: &Theme,
+    width: usize,
+) -> Line<'static> {
+    let sel = selection_marker(is_selected, unicode);
+    let marker = fold_marker(collapsed, unicode);
+
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(
+            format!("{sel} {marker} "),
+            if is_selected {
+                theme.selected_item()
+            } else {
+                theme.dim()
+            },
+        ),
+        Span::styled(
+            label.to_string(),
+            if is_selected {
+                theme.selected_item()
+            } else {
+                theme.title()
+            },
+        ),
+    ];
+    if !detail.is_empty() {
+        spans.push(Span::styled(format!("  {detail}"), theme.dim()));
+    }
+
+    // Right-hand tallies: how much is being done in parallel, at a glance.
+    let (r, q, s, f) = (
+        counts.running,
+        counts.queued,
+        counts.succeeded,
+        counts.failed,
+    );
+    let mut tallies: Vec<(usize, &str, Style)> = Vec::new();
+    let (run_g, que_g, ok_g, fail_g) = if unicode {
+        ("⟳", "◷", "✓", "✗")
+    } else {
+        (">", ".", "v", "x")
+    };
+    if r > 0 {
+        tallies.push((r, run_g, theme.running()));
+    }
+    if q > 0 {
+        tallies.push((q, que_g, theme.dim()));
+    }
+    if s > 0 {
+        tallies.push((s, ok_g, theme.success()));
+    }
+    if f > 0 {
+        tallies.push((f, fail_g, theme.failed()));
+    }
+    if counts.total() == 0 {
+        spans.push(Span::styled("  idle".to_string(), theme.dim()));
+    } else {
+        for (n, glyph, style) in tallies {
+            spans.push(Span::styled(format!("  {n}{glyph}"), style));
+        }
+    }
+
+    // Rough width guard: truncate the label span if the line is hopeless.
+    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total > width && width > 8 {
+        // Rebuild with a truncated label; simpler than proportional trimming.
+        let over = total - width;
+        let lbl = spans[1].content.to_string();
+        let keep = lbl.chars().count().saturating_sub(over + 1);
+        spans[1] = Span::styled(truncate(&lbl, keep.max(4)), spans[1].style);
+    }
+    Line::from(spans)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1903,38 +2084,36 @@ fn push_dag_metadata_spans(
     line_spans.push(Span::styled(truncate(display_name, rem_width), row_style));
 }
 
+/// One operation row of the task tree: indent by depth, status glyph, name,
+/// id, elapsed. The owning instance is the header above, so no instance tag.
 #[cfg(feature = "tui")]
-fn build_ops_dag_item(
-    index: usize,
+#[allow(clippy::too_many_arguments)]
+fn build_tree_op_item(
     op: &crate::state::Operation,
+    depth: u8,
+    expanded: bool,
+    is_selected: bool,
     state: &AppState,
     theme: &Theme,
     width: usize,
 ) -> Line<'static> {
-    let is_selected = index == state.ops_selected;
     let sel_symbol = if is_selected {
         if state.unicode { "▶ " } else { "> " }
     } else {
         "  "
     };
-
-    let prefix = match (op.parent_id.is_some(), state.unicode) {
-        (true, true) => "└ ",
-        (true, false) => "L ",
+    let indent = "  ".repeat(depth.max(1) as usize - 1);
+    let expand_mark = match (expanded, state.unicode) {
+        (true, true) => "▾ ",
+        (true, false) => "v ",
         (false, _) => "",
     };
 
     let clean_id_str = op.clean_id();
     let id_part = format!(" [{}]", clean_id_str);
     let elapsed_part = format!("  {}", op.elapsed_display());
-    let instance_part = if let Some(label) = &op.instance_label {
-        let pid_part = op.pid.map(|p| format!(":{}", p)).unwrap_or_default();
-        format!(" [{}{}]", label, pid_part)
-    } else {
-        String::new()
-    };
 
-    let fixed_prefix_len = sel_symbol.len() + prefix.len() + 2;
+    let fixed_prefix_len = sel_symbol.len() + indent.len() + expand_mark.len() + 2;
     let rem_width = width.saturating_sub(fixed_prefix_len);
 
     let display_name = op.display_name();
@@ -1948,14 +2127,15 @@ fn build_ops_dag_item(
                 theme.normal()
             },
         ),
-        Span::styled(prefix, theme.dim()),
+        Span::styled(indent, theme.dim()),
         Span::styled(
             format!("{} ", op.status.glyph(state.unicode)),
             theme.op_status_style(&op.status),
         ),
+        Span::styled(expand_mark, theme.dim()),
     ];
 
-    let row_style = if index == state.ops_selected {
+    let row_style = if is_selected {
         theme.selected_item()
     } else {
         theme.normal()
@@ -1966,7 +2146,7 @@ fn build_ops_dag_item(
         &display_name,
         row_style,
         &id_part,
-        &instance_part,
+        "",
         &elapsed_part,
         rem_width,
         theme,
@@ -2713,9 +2893,10 @@ fn draw_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         Focus::OpsDag => &[
             ("Tab", "next pane"),
             ("j/k", "select"),
+            ("Enter", "expand"),
+            ("f", "all projects"),
             ("c", "cancel"),
             ("p", "pin"),
-            (":", "command"),
             ("q", "quit"),
         ],
         Focus::Log => &[
@@ -2854,8 +3035,13 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("j / k", "Scroll entries"),
         ("g / G", "Top / bottom"),
         ("", ""),
-        ("OPERATIONS", ""),
-        ("j / k", "Select operation"),
+        ("TASKS (tree)", ""),
+        ("j / k", "Select row"),
+        (
+            "Enter / Click",
+            "Expand task into live/historic output (accordion); fold headers",
+        ),
+        ("f", "Toggle this-project / all-projects filter"),
         ("c", "Cancel selected"),
         ("p", "Pin to top"),
         ("a", "Await selected"),
@@ -2903,8 +3089,13 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("j / k", "Scroll entries"),
         ("g / G", "Top / bottom"),
         ("", ""),
-        ("OPERATIONS", ""),
-        ("j / k", "Select operation"),
+        ("TASKS (tree)", ""),
+        ("j / k", "Select row"),
+        (
+            "Enter / Click",
+            "Expand task into live/historic output (accordion); fold headers",
+        ),
+        ("f", "Toggle this-project / all-projects filter"),
         ("c", "Cancel selected"),
         ("p", "Pin to top"),
         ("a", "Await selected"),

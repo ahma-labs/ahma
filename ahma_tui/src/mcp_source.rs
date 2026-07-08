@@ -1001,6 +1001,9 @@ fn parse_operations(val: &Value) -> Vec<Operation> {
             if let Some(desc) = op_val.get("description").and_then(|v| v.as_str()) {
                 op.description = desc.to_string();
             }
+            if let Some(parent) = op_val.get("parent_id").and_then(|v| v.as_str()) {
+                op.parent_id = Some(parent.to_string());
+            }
 
             parse_op_times(&op_val, &mut op);
 

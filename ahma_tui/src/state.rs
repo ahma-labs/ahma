@@ -973,6 +973,9 @@ pub enum ClickTarget {
     SelectOperation(usize),
     CloseWindow(usize),
     ToggleWindow(usize),
+    /// A row of the monitor task tree: click selects it and toggles it
+    /// (accordion expand for ops, collapse for instance/session headers).
+    TreeRow(usize),
 }
 
 // ─── Command palette ──────────────────────────────────────────────────────────
@@ -1226,6 +1229,24 @@ pub struct AppState {
     pub focus: Focus,
     pub ops_selected: usize,
     pub ops_scroll: std::cell::Cell<usize>,
+
+    // ── Task tree (monitor view) ──
+    /// Operation id whose output tail is expanded inline. Accordion: setting a
+    /// new id implicitly collapses the previous one (SPEC R24).
+    pub expanded_op: Option<String>,
+    /// Collapse keys (`inst:<id>`, `grp:<gid>:<key>`) the user has folded.
+    pub collapsed_nodes: std::collections::HashSet<String>,
+    /// Show instances from every project, not just the one the TUI started in.
+    pub show_all_projects: bool,
+    /// Directory the TUI was started in; drives the project filter.
+    pub project_root: Option<String>,
+    /// Rows rendered by the last frame of the task tree; rebuilt on every draw
+    /// and read by key/mouse handlers to resolve the selection.
+    pub task_rows: std::cell::RefCell<Vec<crate::task_tree::TreeRow>>,
+    /// Armed at startup: the first hub replay that shows live project work
+    /// switches to monitor mode so the ongoing tasks are immediately visible.
+    /// Disarmed by any user input.
+    pub auto_view_pending: bool,
     #[cfg(feature = "tui")]
     pub chat_area: std::cell::Cell<Rect>,
     #[cfg(not(feature = "tui"))]
@@ -1636,6 +1657,12 @@ impl AppState {
             focus: Focus::default(),
             ops_selected: 0,
             ops_scroll: std::cell::Cell::new(0),
+            expanded_op: None,
+            collapsed_nodes: std::collections::HashSet::new(),
+            show_all_projects: false,
+            project_root: None,
+            task_rows: std::cell::RefCell::new(Vec::new()),
+            auto_view_pending: true,
             #[cfg(feature = "tui")]
             chat_area: std::cell::Cell::new(Rect::default()),
             #[cfg(not(feature = "tui"))]
@@ -1960,8 +1987,78 @@ impl AppState {
         }
     }
 
+    /// Number of navigable rows in the ops pane. When the task tree has been
+    /// drawn its rows are authoritative; before the first draw (or in tests
+    /// that never render) fall back to the flat operation list.
+    pub fn ops_row_count(&self) -> usize {
+        let rows = self.task_rows.borrow();
+        if rows.is_empty() {
+            self.operations.len()
+        } else {
+            rows.len()
+        }
+    }
+
+    /// Resolve the current ops-pane selection to an index into `operations`.
+    /// Tree rows that are not operations (instance headers, session groups)
+    /// resolve to the operation they relate to when unambiguous (`Output`
+    /// rows → their op), otherwise `None`.
+    pub fn selected_op_index(&self) -> Option<usize> {
+        let rows = self.task_rows.borrow();
+        if rows.is_empty() {
+            return if self.ops_selected < self.operations.len() {
+                Some(self.ops_selected)
+            } else {
+                None
+            };
+        }
+        match rows.get(self.ops_selected).map(|r| &r.kind) {
+            Some(crate::task_tree::RowKind::Op { op_index, .. })
+            | Some(crate::task_tree::RowKind::Output { op_index, .. }) => Some(*op_index),
+            _ => None,
+        }
+    }
+
     pub fn selected_op(&self) -> Option<&Operation> {
-        self.operations.get(self.ops_selected)
+        self.selected_op_index()
+            .and_then(|i| self.operations.get(i))
+    }
+
+    /// Enter/click on the selected task-tree row: accordion-expand an
+    /// operation (collapsing the previously expanded one), or fold/unfold an
+    /// instance or session header.
+    pub fn toggle_selected_tree_node(&mut self) {
+        use crate::task_tree::RowKind;
+        let action = {
+            let rows = self.task_rows.borrow();
+            rows.get(self.ops_selected).map(|r| match &r.kind {
+                RowKind::Instance { group_id, .. } => TreeToggle::Fold(format!("inst:{group_id}")),
+                RowKind::Group { key, .. } => TreeToggle::Fold(key.clone()),
+                RowKind::Op { op_index, .. } | RowKind::Output { op_index, .. } => {
+                    TreeToggle::Expand(*op_index)
+                }
+            })
+        };
+        match action {
+            Some(TreeToggle::Fold(key)) => self.toggle_collapse_key(key),
+            Some(TreeToggle::Expand(op_index)) => {
+                if let Some(op) = self.operations.get(op_index) {
+                    if self.expanded_op.as_deref() == Some(op.id.as_str()) {
+                        self.expanded_op = None;
+                    } else {
+                        self.expanded_op = Some(op.id.clone());
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Toggle membership of a fold key in `collapsed_nodes`.
+    fn toggle_collapse_key(&mut self, key: String) {
+        if !self.collapsed_nodes.remove(&key) {
+            self.collapsed_nodes.insert(key);
+        }
     }
 
     /// Compute which lines of `incoming` are genuinely new relative to
@@ -2102,15 +2199,104 @@ impl AppState {
     }
 
     fn clamp_ops_selection(&mut self) {
-        if !self.operations.is_empty() {
-            self.ops_selected = self.ops_selected.min(self.operations.len() - 1);
+        let count = self.ops_row_count();
+        if count > 0 {
+            self.ops_selected = self.ops_selected.min(count - 1);
         }
     }
+}
+
+/// What a task-tree toggle resolves to (see
+/// [`AppState::toggle_selected_tree_node`]).
+enum TreeToggle {
+    /// Fold/unfold a header (instance or session group) by collapse key.
+    Fold(String),
+    /// Accordion-expand the operation at this index into `operations`.
+    Expand(usize),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Selection resolves through the drawn task-tree rows (not raw operation
+    /// indices), and Enter behaves as a single-expand accordion for ops and a
+    /// fold toggle for headers (SPEC R24.4).
+    #[test]
+    #[cfg(feature = "tui")]
+    fn tree_selection_resolves_through_rows_and_toggles_accordion() {
+        use crate::task_tree::{RowKind, TreeRow};
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        s.operations
+            .push(Operation::new("op-a", "tool", OpStatus::Running));
+        s.operations
+            .push(Operation::new("op-b", "tool", OpStatus::Running));
+        // Simulate a drawn frame with deliberately reordered ops to prove the
+        // rows are authoritative for resolution.
+        *s.task_rows.borrow_mut() = vec![
+            TreeRow {
+                kind: RowKind::Instance {
+                    group_id: "i1".into(),
+                    label: "claude-code".into(),
+                    detail: String::new(),
+                    counts: Default::default(),
+                    collapsed: false,
+                },
+                depth: 0,
+            },
+            TreeRow {
+                kind: RowKind::Op {
+                    op_index: 1,
+                    expanded: false,
+                },
+                depth: 1,
+            },
+            TreeRow {
+                kind: RowKind::Op {
+                    op_index: 0,
+                    expanded: false,
+                },
+                depth: 1,
+            },
+        ];
+
+        // Header row resolves to no operation; op rows map through op_index.
+        s.ops_selected = 0;
+        assert!(s.selected_op().is_none());
+        s.ops_selected = 1;
+        assert_eq!(s.selected_op().unwrap().id, "op-b");
+
+        // Accordion: expanding a second op collapses the first implicitly.
+        s.toggle_selected_tree_node();
+        assert_eq!(s.expanded_op.as_deref(), Some("op-b"));
+        s.ops_selected = 2;
+        s.toggle_selected_tree_node();
+        assert_eq!(s.expanded_op.as_deref(), Some("op-a"));
+        // Toggling the same op collapses it.
+        s.toggle_selected_tree_node();
+        assert_eq!(s.expanded_op, None);
+
+        // Header toggle folds and unfolds the instance subtree.
+        s.ops_selected = 0;
+        s.toggle_selected_tree_node();
+        assert!(s.collapsed_nodes.contains("inst:i1"));
+        s.toggle_selected_tree_node();
+        assert!(!s.collapsed_nodes.contains("inst:i1"));
+    }
+
+    /// Before any frame is drawn the row list is empty and selection falls
+    /// back to flat operation indices, so headless/chat-only flows keep
+    /// working.
+    #[test]
+    #[cfg(feature = "tui")]
+    fn selection_falls_back_to_flat_list_before_first_draw() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        s.operations
+            .push(Operation::new("only", "tool", OpStatus::Running));
+        s.ops_selected = 0;
+        assert_eq!(s.selected_op().unwrap().id, "only");
+        assert_eq!(s.ops_row_count(), 1);
+    }
 
     #[test]
     #[cfg(feature = "tui")]

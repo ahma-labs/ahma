@@ -22,6 +22,7 @@ pub mod mcp_source;
 pub mod session_config;
 pub mod settings_editor;
 pub mod state;
+pub mod task_tree;
 pub mod theme;
 pub mod ui;
 
