@@ -7,10 +7,50 @@ readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
 description = "The ahma binary: wires the MIT ahma_mcp library with the AGPL-licensed feature crates (vault, decompose, task_tree, worker, cluster, renewal, tui)."
+repository = "https://github.com/paulirotta/ahma"
+homepage = "https://github.com/paulirotta/ahma"
 
 # All first-party copyleft crates (ahma_vault, ahma_decompose, ahma_task_tree,
 # ahma_worker, ahma_renewal, ahma_tui, ahma_cluster) are AGPL-3.0-or-later. The compiled
 # ahma binary is therefore AGPL-3.0-or-later. See README for details.
+
+# ── cargo-binstall: fetch the prebuilt, attested release binary ──────────────
+# Lets `cargo binstall --git https://github.com/paulirotta/ahma ahma_bin` pull the
+# CI-built GitHub Release asset instead of compiling from source (no RUSTFLAGS, no
+# toolchain). The release archives are flat (binary `ahma` at the archive root) and
+# named `ahma-release-<platform>.<ext>`, which is not binstall's default triple-based
+# convention — hence one explicit `pkg-url` override per published target below.
+# Keep these in sync with the `job-release-binaries` matrix in .github/workflows/build.yml.
+# Note: binstall skips the shell installer's post-download steps — Sigstore attestation
+# verification (run `ahma verify --self` afterward) and, on macOS, the hardened-runtime
+# re-sign (see README "Install with Cargo"). Targets without an override fall back to a
+# from-source build.
+[package.metadata.binstall]
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/ahma-release-darwin-arm64.tar.gz"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/ahma-release-linux-x86_64.tar.gz"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/ahma-release-linux-arm64.tar.gz"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/ahma-release-linux-x86_64-musl.tar.gz"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/ahma-release-linux-arm64-musl.tar.gz"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/ahma-release-windows-x86_64.zip"
+pkg-fmt = "zip"
 
 [[bin]]
 name = "ahma"

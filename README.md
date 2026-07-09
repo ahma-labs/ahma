@@ -74,6 +74,46 @@ cargo install --git https://github.com/paulirotta/ahma --branch <branch-name> ah
 
 </details>
 
+<details>
+<summary><strong>Alternative — install with Cargo (<code>cargo binstall</code> or <code>cargo install</code>)</strong></summary>
+
+Prefer the Rust toolchain to the curl/irm installer? Both routes below install the same
+`ahma` binary. **The interactive customization is identical** — it lives in the `ahma setup`
+wizard (MCP entries, agent skills, optional terminal hooks/TLS), which the shell installer
+simply runs for you at the end. Run it yourself after either command, and re-run it any time
+to reconfigure:
+
+```bash
+ahma setup          # interactive wizard (same prompts as the curl installer)
+ahma setup --auto   # non-interactive defaults
+```
+
+**Prebuilt, attested binary — no compile** (needs [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall); works on Linux, macOS, and Windows):
+
+```bash
+# cargo binstall downloads the CI-built, Sigstore-attested GitHub Release asset — no toolchain, no RUSTFLAGS.
+cargo binstall --git https://github.com/paulirotta/ahma ahma_bin
+ahma verify --self   # confirm the SLSA-3 build-provenance attestation (binstall skips the installer's auto-verify)
+ahma setup
+```
+
+**From source** (needs [Rust](https://rustup.rs/)):
+
+```bash
+# http3/QUIC needs the reqwest_unstable cfg; the curl installer and `ahma update` set it for you,
+# but a bare `cargo install --git` does not read the repo's .cargo/config.toml, so pass it here:
+RUSTFLAGS='--cfg reqwest_unstable' \
+  cargo install --git https://github.com/paulirotta/ahma ahma_bin --locked
+ahma setup
+```
+
+Notes:
+- `cargo binstall ahma` / `cargo install ahma` from **crates.io** are not yet available (ahma isn't published there) — use the `--git` forms above.
+- Ensure `~/.cargo/bin` is on your `PATH` (rustup adds it during setup).
+- **macOS:** a Cargo-installed binary is ad-hoc signed. If it is ever `SIGKILL`ed under memory pressure, re-sign it once with the hardened runtime (the curl installer does this automatically): `codesign --force --sign - --options runtime "$(command -v ahma)"`.
+
+</details>
+
 See [docs/installation.md](docs/installation.md) for platform details, source builds, and branch installs from local checkouts.
 
 ### Example workflow
