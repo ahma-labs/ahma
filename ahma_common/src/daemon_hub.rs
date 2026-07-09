@@ -199,6 +199,8 @@ pub enum ClientMsg {
     },
     /// TUI client response containing user's approval decision.
     SubmitApproval {
+        #[serde(default)]
+        id: Option<String>,
         approved: bool,
         target_instance_id: Option<String>,
     },
@@ -307,7 +309,11 @@ pub enum DaemonMsg {
         model: Option<String>,
     },
     /// Forward user approval to registered instance.
-    SubmitApproval { approved: bool },
+    SubmitApproval {
+        #[serde(default)]
+        id: Option<String>,
+        approved: bool,
+    },
     /// Prompt every TUI to raise a "grant access to X?" modal for an auto-detected
     /// out-of-scope path. The default/Enter choice must be the safe Deny
     /// (SPEC R5.3.1); the grant is persisted for the next start, never live.
@@ -610,6 +616,13 @@ struct OpSnapshot {
 type InstanceOpHistory = std::collections::HashMap<String, OpSnapshot>;
 
 /// Internal shared state for the running daemon.
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    id: String,
+    tool: String,
+    args: String,
+}
+
 struct DaemonHub {
     instances: Arc<Mutex<std::collections::HashMap<String, InstanceInfo>>>,
     instance_txs:
@@ -624,6 +637,7 @@ struct DaemonHub {
     op_seq: AtomicU64,
     connection_count: Arc<AtomicUsize>,
     socket_path: Option<PathBuf>,
+    pending_approvals: Arc<Mutex<std::collections::HashMap<String, PendingApproval>>>,
 }
 
 impl DaemonHub {
@@ -638,6 +652,7 @@ impl DaemonHub {
                 op_seq: AtomicU64::new(0),
                 connection_count: Arc::new(AtomicUsize::new(0)),
                 socket_path,
+                pending_approvals: Arc::new(Mutex::new(std::collections::HashMap::new())),
             },
             rx,
         )
@@ -1127,13 +1142,15 @@ where
         }
 
         ClientMsg::SubmitApproval {
+            id,
             approved,
             target_instance_id,
         } => {
-            if let Some(tid) = resolve_target(&hub, target_instance_id.as_deref()).await
-                && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
-            {
-                let _ = tx.send(DaemonMsg::SubmitApproval { approved }).await;
+            if let Some(tid) = resolve_target(&hub, target_instance_id.as_deref()).await {
+                hub.pending_approvals.lock().await.remove(&tid);
+                if let Some(tx) = hub.instance_txs.lock().await.get(&tid) {
+                    let _ = tx.send(DaemonMsg::SubmitApproval { id, approved }).await;
+                }
             }
         }
 
@@ -1253,6 +1270,14 @@ async fn serve_instance<R, W>(
                         let _ = hub.broadcast.send(DaemonMsg::ChatThinking { token });
                     }
                     Ok(ClientMsg::ApprovalRequested { id: call_id, tool, args }) => {
+                        hub.pending_approvals.lock().await.insert(
+                            id.clone(),
+                            PendingApproval {
+                                id: call_id.clone(),
+                                tool: tool.clone(),
+                                args: args.clone(),
+                            },
+                        );
                         let _ = hub.broadcast.send(DaemonMsg::ApprovalRequested { id: call_id, tool, args });
                     }
                     Ok(ClientMsg::ScopeGrantRequested { request }) => {
@@ -1310,6 +1335,7 @@ async fn serve_instance<R, W>(
     hub.instances.lock().await.remove(&id);
     hub.instance_txs.lock().await.remove(&id);
     hub.op_history.lock().await.remove(&id);
+    hub.pending_approvals.lock().await.remove(&id);
     let _ = hub
         .broadcast
         .send(DaemonMsg::InstanceUnregistered { id: id.clone() });
@@ -1339,6 +1365,23 @@ where
     for msg in hub.replay_events().await {
         if let Err(e) = send_msg(writer, &msg).await {
             debug!("daemon: subscriber replay write failed: {e}");
+            return;
+        }
+    }
+
+    // Replay pending approvals to the newly connected subscriber.
+    let approvals = {
+        let guard = hub.pending_approvals.lock().await;
+        guard.values().cloned().collect::<Vec<_>>()
+    };
+    for pending in approvals {
+        let msg = DaemonMsg::ApprovalRequested {
+            id: pending.id,
+            tool: pending.tool,
+            args: pending.args,
+        };
+        if let Err(e) = send_msg(writer, &msg).await {
+            debug!("daemon: subscriber replay pending approval write failed: {e}");
             return;
         }
     }
@@ -2691,6 +2734,7 @@ mod tests {
         send_msg(
             &mut tui2,
             &ClientMsg::SubmitApproval {
+                id: None,
                 approved: true,
                 target_instance_id: None,
             },
@@ -2698,7 +2742,7 @@ mod tests {
         .await
         .unwrap();
         match recv_msg::<_, DaemonMsg>(&mut irdr).await.unwrap() {
-            DaemonMsg::SubmitApproval { approved } => assert!(approved),
+            DaemonMsg::SubmitApproval { id: _, approved } => assert!(approved),
             other => panic!("expected SubmitApproval, got {other:?}"),
         }
 

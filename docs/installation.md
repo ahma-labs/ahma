@@ -107,8 +107,11 @@ ahma setup          # interactive: asks which editors/features to configure
 ahma setup -y       # non-interactive: auto-detect and configure with defaults
 ```
 
-`ahma setup` writes MCP server entries, terminal hooks, and agent skills for the editors it
-detects (Cursor, VS Code, Claude Code, Codex, …). It is safe to re-run at any time — it only
+`ahma setup` writes MCP server entries and agent skills for the editors it detects (Cursor, VS
+Code, Claude Code, Codex, …). [Terminal hooks](#terminal-hooks) are opt-in and excluded from the
+default selection — this is an experimental project and sandbox-exception handling isn't fully
+hardened yet, so an automatically installed hook could interfere with your work. Pass `--hooks`,
+or include hooks at the interactive prompt, to opt in. It is safe to re-run at any time — it only
 updates the pieces you ask it to (`--mcp`, `--hooks`, `--skills`, `--tls`). `ahma uninstall`
 reverses it with the same prompts. Restart your editor after it runs.
 

@@ -506,15 +506,16 @@ fn uninstall_agent_skills(dry_run: bool, interactive: bool) -> Result<()> {
     let home = ahma_common::config::ahma_home_dir()
         .ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
-    let skill_dir = home.join(".agents").join("skills").join("ahma");
-    if skill_dir.exists() {
-        if dry_run {
-            println!("[dry-run] Would remove {}", skill_dir.display());
-        } else {
-            std::fs::remove_dir_all(&skill_dir)
-                .with_context(|| format!("Failed to remove {}", skill_dir.display()))?;
-            if interactive {
-                println!("✓ Removed agent skill directory {}", skill_dir.display());
+    for skill_dir in crate::setup::skill_install_dirs(&home) {
+        if skill_dir.exists() {
+            if dry_run {
+                println!("[dry-run] Would remove {}", skill_dir.display());
+            } else {
+                std::fs::remove_dir_all(&skill_dir)
+                    .with_context(|| format!("Failed to remove {}", skill_dir.display()))?;
+                if interactive {
+                    println!("✓ Removed agent skill directory {}", skill_dir.display());
+                }
             }
         }
     }
@@ -1666,14 +1667,19 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempdir()?;
         let prev = set_home(tmp.path());
-        let skill_dir = tmp.path().join(".agents").join("skills").join("ahma");
-        std::fs::create_dir_all(&skill_dir).ok();
-        std::fs::write(skill_dir.join("SKILL.md"), "x").ok();
+        let skill_dirs = crate::setup::skill_install_dirs(tmp.path());
+        for skill_dir in &skill_dirs {
+            std::fs::create_dir_all(skill_dir).ok();
+            std::fs::write(skill_dir.join("SKILL.md"), "x").ok();
+        }
         let result = uninstall_agent_skills(false, false);
-        let still_there = skill_dir.exists();
+        let still_there: Vec<_> = skill_dirs.iter().filter(|d| d.exists()).collect();
         restore_home(prev);
         result?;
-        assert!(!still_there, "skill dir should be removed");
+        assert!(
+            still_there.is_empty(),
+            "all skill dirs should be removed, still present: {still_there:?}"
+        );
         Ok(())
     }
 
@@ -1682,13 +1688,15 @@ mod tests {
         let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempdir()?;
         let prev = set_home(tmp.path());
-        let skill_dir = tmp.path().join(".agents").join("skills").join("ahma");
-        std::fs::create_dir_all(&skill_dir).ok();
+        let skill_dirs = crate::setup::skill_install_dirs(tmp.path());
+        for skill_dir in &skill_dirs {
+            std::fs::create_dir_all(skill_dir).ok();
+        }
         let result = uninstall_agent_skills(true, true);
-        let still_there = skill_dir.exists();
+        let all_still_there = skill_dirs.iter().all(|d| d.exists());
         restore_home(prev);
         result?;
-        assert!(still_there, "dry-run keeps skill dir");
+        assert!(all_still_there, "dry-run keeps skill dirs");
         Ok(())
     }
 

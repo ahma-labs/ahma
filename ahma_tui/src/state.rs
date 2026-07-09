@@ -31,6 +31,17 @@ pub enum Mode {
     Monitor,
 }
 
+// ─── Liveness State Machine ───────────────────────────────────────────────────
+
+/// State of the turn's streaming liveness indicator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LivenessState {
+    #[default]
+    Idle,
+    Thinking,
+    Streaming,
+}
+
 // ─── Chat history ─────────────────────────────────────────────────────────────
 
 /// A single entry in the chat history.
@@ -1319,6 +1330,7 @@ pub struct AppState {
     /// quiet (proving it is still alive — vs frozen/timed-out). Two spaces when
     /// the turn is complete.
     pub liveness_glyph: String,
+    pub liveness_state: LivenessState,
     /// xorshift64 state driving the random liveness glyph. Never zero.
     pub liveness_seed: u64,
     /// When the last visible stream signal (token/thinking/tool/usage) arrived.
@@ -1405,7 +1417,8 @@ impl AppState {
     /// Record real server output (token/thinking/tool/usage) and pulse the
     /// spinner *fast*. The rapid, per-token change is the reliable "results are
     /// actively coming back" signal.
-    pub fn mark_stream_activity(&mut self) {
+    pub fn mark_stream_activity(&mut self, state: LivenessState) {
+        self.liveness_state = state;
         self.bump_liveness();
         self.last_stream_activity = Some(std::time::Instant::now());
     }
@@ -1442,6 +1455,7 @@ impl AppState {
     /// further server updates are expected for the current response line.
     pub fn reset_liveness(&mut self) {
         self.liveness_glyph = "  ".to_string();
+        self.liveness_state = LivenessState::Idle;
         self.last_stream_activity = None;
         self.last_wait_tick = None;
     }
@@ -1723,6 +1737,7 @@ impl AppState {
             window_rects: std::cell::RefCell::new(vec![]),
 
             liveness_glyph: "  ".to_string(),
+            liveness_state: LivenessState::Idle,
             liveness_seed: liveness_initial_seed(),
             last_stream_activity: None,
             last_wait_tick: None,
@@ -2418,7 +2433,7 @@ mod tests {
             "slow cadence throttles back-to-back ticks"
         );
         // Real output just arrived → waiting ticks are suppressed (tokens drive it).
-        s.mark_stream_activity();
+        s.mark_stream_activity(LivenessState::Streaming);
         assert!(
             !s.tick_waiting_spinner(),
             "no waiting tick while output is actively streaming"

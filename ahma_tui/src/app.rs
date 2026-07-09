@@ -780,6 +780,7 @@ fn resolve_approval(state: &mut crate::state::AppState, approved: bool) {
     }
 
     send_daemon_msg(ahma_common::daemon_hub::ClientMsg::SubmitApproval {
+        id: Some(gate.op_id.clone()),
         approved,
         target_instance_id: None,
     });
@@ -3272,17 +3273,18 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
     use crate::state::ChatEntry;
 
     // Any server signal that the turn is alive and more is coming re-randomises
-    // the liveness glyph in front of the `ahma` response line. Done/Error clear
+    // the liveness glyph in front of the `ahma` response line. Done/Error/ToolCall clear
     // it back to a space below.
-    if matches!(
-        event,
-        BridgeEvent::Token(_)
-            | BridgeEvent::Thinking(_)
-            | BridgeEvent::Usage(_)
-            | BridgeEvent::ToolCallStarted { .. }
-            | BridgeEvent::ToolCallFinished { .. }
-    ) {
-        state.mark_stream_activity();
+    match &event {
+        BridgeEvent::Token(_) => state.mark_stream_activity(crate::state::LivenessState::Streaming),
+        BridgeEvent::Thinking(_) => {
+            state.mark_stream_activity(crate::state::LivenessState::Thinking)
+        }
+        BridgeEvent::Usage(_) => state.mark_stream_activity(state.liveness_state),
+        BridgeEvent::ToolCallStarted { .. } | BridgeEvent::ToolCallFinished { .. } => {
+            state.reset_liveness()
+        }
+        _ => {}
     }
 
     match event {
@@ -3748,12 +3750,12 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
         }
         SourceEvent::ChatToken { token } => {
             state.chat.append_token(&token);
-            state.mark_stream_activity();
+            state.mark_stream_activity(crate::state::LivenessState::Streaming);
             state.chat_scroll = 0;
         }
         SourceEvent::ChatThinking { token } => {
             state.chat.append_thinking(&token);
-            state.mark_stream_activity();
+            state.mark_stream_activity(crate::state::LivenessState::Thinking);
             state.chat_scroll = 0;
         }
         SourceEvent::ApprovalRequested { id, tool, args } => {
@@ -3828,12 +3830,15 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             if prompt_tokens > 0 {
                 state.last_prompt_tokens = prompt_tokens;
             }
+            state.mark_stream_activity(state.liveness_state);
         }
         SourceEvent::ToolCallStarted { id, name, args } => {
+            state.reset_liveness();
             state.chat.start_tool_call(id, name, args);
             state.chat_scroll = 0;
         }
         SourceEvent::ToolCallFinished { id, result, failed } => {
+            state.reset_liveness();
             state.chat.finish_tool_call(&id, result, failed);
             state.chat_scroll = 0;
         }
@@ -4463,15 +4468,7 @@ fn update_scroll_animations(state: &mut crate::state::AppState) {
 
 #[cfg(feature = "tui")]
 fn chat_in_progress(state: &crate::state::AppState) -> bool {
-    state.chat.entries().iter().any(|entry| {
-        matches!(
-            entry,
-            crate::state::ChatEntry::Assistant {
-                streaming: true,
-                ..
-            } | crate::state::ChatEntry::ToolCall { result: None, .. }
-        )
-    })
+    state.liveness_state != crate::state::LivenessState::Idle
 }
 
 #[cfg(test)]

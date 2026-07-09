@@ -31,7 +31,7 @@ fn prompt_transport() -> &'static str {
 
 /// A thing the wizard can set up. Listed in alphabetical order (by label) for
 /// uniform, simple presentation.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SetupAction {
     Skills,
     Mcp,
@@ -258,11 +258,61 @@ pub async fn run(args: SetupArgs) -> Result<()> {
     Ok(())
 }
 
+/// Actions selected when the user accepts the default (presses Enter
+/// interactively, or runs non-interactively/`--auto` without other flags).
+///
+/// Terminal hooks are deliberately left out of this default. Hooks reroute
+/// commands the *host tool itself* runs in a terminal through ahma's sandbox,
+/// not just the tools the agent calls explicitly through MCP — installing
+/// that automatically could interfere with a user's existing workflow if a
+/// sandbox exception isn't classified correctly, and that classification is
+/// still being hardened. Users opt in explicitly, either with `--hooks` or by
+/// including "3" in an interactive selection.
+fn default_setup_actions() -> Vec<SetupAction> {
+    SETUP_ACTIONS
+        .iter()
+        .copied()
+        .filter(|a| *a != SetupAction::Hooks)
+        .collect()
+}
+
+/// Renders `actions` as the comma-separated 1-based menu numbers a user would
+/// type to select exactly them, e.g. `[Skills, Mcp, Tls]` -> `"1,2,4"`.
+fn selection_string_for(actions: &[SetupAction]) -> String {
+    SETUP_ACTIONS
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| actions.contains(a))
+        .map(|(i, _)| (i + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Explains what each setup item does in plain language, for users who may
+/// not know ahma's internals, before asking which ones to set up.
+fn print_setup_action_guidance() {
+    println!("What each of these does:");
+    println!("  Agent skills     - installs the `/ahma` skill so your AI agent knows how");
+    println!("                     to use ahma's tools well.");
+    println!("  MCP servers      - registers ahma as a tool provider with your AI tools");
+    println!("                     (Claude Code, Cursor, VS Code, etc.).");
+    println!("  Terminal hooks   - also reroutes commands your AI tool runs directly in a");
+    println!("                     terminal through ahma's sandbox, not just its MCP tool");
+    println!("                     calls. NOT selected by default: this is an experimental");
+    println!("                     project and sandbox-exception handling isn't fully");
+    println!("                     hardened yet, so an automatic hook could interfere with");
+    println!("                     your work. Include \"3\" below (or pass --hooks) once");
+    println!("                     you want to opt in.");
+    println!("  TLS certificates - generates a local TLS certificate for the HTTP bridge.");
+    println!();
+}
+
 /// Question 1: determine which actions to run.
 ///
 /// Explicit `--mcp`/`--hooks`/`--skills`/`--tls` flags select a fixed subset
-/// (for scripting). Otherwise the user is asked interactively; `--auto` and
-/// non-interactive sessions default to all actions.
+/// (for scripting). Otherwise the user is asked interactively, defaulting to
+/// every action except terminal hooks (see `default_setup_actions`); `--auto`
+/// and non-interactive sessions get that same default without prompting.
 fn select_actions(args: &SetupArgs, interactive: bool) -> Vec<SetupAction> {
     let mut flagged = Vec::new();
     if args.skills {
@@ -281,11 +331,18 @@ fn select_actions(args: &SetupArgs, interactive: bool) -> Vec<SetupAction> {
         return flagged;
     }
 
+    let default_actions = default_setup_actions();
+    if !interactive {
+        return default_actions;
+    }
+
+    print_setup_action_guidance();
     let labels: Vec<&str> = SETUP_ACTIONS.iter().map(|a| a.label()).collect();
-    let chosen = prompt_multi_select_all(
-        interactive,
+    let default = selection_string_for(&default_actions);
+    let chosen = prompt_multi_select(
         "What would you like to set up? (comma-separated numbers):",
         &labels,
+        &default,
     );
     chosen
         .into_iter()
@@ -719,7 +776,7 @@ fn setup_tls() -> Result<()> {
 ///
 /// Both are written unconditionally and idempotently; they are plain file
 /// writes with no version stamping, so `ahma update` simply overwrites them.
-fn skill_install_dirs(home: &Path) -> [PathBuf; 2] {
+pub(crate) fn skill_install_dirs(home: &Path) -> [PathBuf; 2] {
     [
         home.join(".agents").join("skills").join("ahma"),
         home.join(".claude").join("skills").join("ahma"),
@@ -1315,12 +1372,36 @@ mod tests {
     }
 
     #[test]
-    fn test_select_actions_no_flags_noninteractive_selects_all() {
+    fn test_select_actions_no_flags_noninteractive_selects_default_excluding_hooks() {
         let args = setup_args(true, false, false, false, false);
         let actions = select_actions(&args, false);
-        assert_eq!(actions.len(), SETUP_ACTIONS.len());
+        // Default excludes Terminal hooks (experimental, opt-in only).
+        assert_eq!(actions.len(), SETUP_ACTIONS.len() - 1);
+        assert!(actions.contains(&SetupAction::Skills));
         assert!(actions.contains(&SetupAction::Mcp));
         assert!(actions.contains(&SetupAction::Tls));
+        assert!(!actions.contains(&SetupAction::Hooks));
+    }
+
+    #[test]
+    fn test_select_actions_explicit_hooks_flag_still_included() {
+        let args = setup_args(false, false, true, false, false);
+        let actions = select_actions(&args, false);
+        assert_eq!(actions, vec![SetupAction::Hooks]);
+    }
+
+    #[test]
+    fn test_default_setup_actions_excludes_hooks() {
+        let actions = default_setup_actions();
+        assert!(!actions.contains(&SetupAction::Hooks));
+        assert_eq!(actions.len(), SETUP_ACTIONS.len() - 1);
+    }
+
+    #[test]
+    fn test_selection_string_for_skips_hooks() {
+        let actions = default_setup_actions();
+        // Skills=1, Mcp=2, Hooks=3 (excluded), Tls=4.
+        assert_eq!(selection_string_for(&actions), "1,2,4");
     }
 
     // ─── select_platforms ─────────────────────────────────────────────────────

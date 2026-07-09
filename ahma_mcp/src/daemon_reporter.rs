@@ -424,10 +424,16 @@ async fn run_reporter_loop(
                                 }).await;
                             }
                         }
-                        Ok(DaemonMsg::SubmitApproval { approved }) => {
-                            debug!("daemon_reporter: received SubmitApproval approved={approved}");
+                        Ok(DaemonMsg::SubmitApproval { id, approved }) => {
+                            debug!("daemon_reporter: received SubmitApproval id={id:?} approved={approved}");
                             let mut session_guard = session.lock().await;
-                            if let Some(tx) = session_guard.approval_tx.take() {
+                            if let Some(ref call_id) = id {
+                                if let Some(tx) = session_guard.approvals.remove(call_id) {
+                                    let _ = tx.send(approved);
+                                } else {
+                                    debug!("daemon_reporter: received SubmitApproval for unknown call_id={call_id}");
+                                }
+                            } else if let Some(tx) = session_guard.approval_tx.take() {
                                 let _ = tx.send(approved);
                             } else {
                                 debug!("daemon_reporter: received SubmitApproval but no approval sender pending");
@@ -1471,7 +1477,10 @@ mod tests {
         // ── 4. SubmitApproval with no pending sender (debug arm). ─────────────────
         send_msg(
             &mut server_writer,
-            &DaemonMsg::SubmitApproval { approved: true },
+            &DaemonMsg::SubmitApproval {
+                id: None,
+                approved: true,
+            },
         )
         .await
         .expect("send SubmitApproval");

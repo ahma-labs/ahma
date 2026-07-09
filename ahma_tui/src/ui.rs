@@ -746,8 +746,11 @@ fn chat_history_hint(state: &AppState) -> &'static str {
 fn build_chat_history_lines(state: &AppState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    for entry in state.chat.entries() {
-        push_chat_entry_lines(&mut lines, entry, state, theme, width);
+    let entries = state.chat.entries();
+    let count = entries.len();
+    for (idx, entry) in entries.iter().enumerate() {
+        let is_last = idx + 1 == count;
+        push_chat_entry_lines(&mut lines, entry, is_last, state, theme, width);
         lines.push(Line::default());
     }
 
@@ -758,6 +761,7 @@ fn build_chat_history_lines(state: &AppState, theme: &Theme, width: usize) -> Ve
 fn push_chat_entry_lines(
     lines: &mut Vec<Line<'static>>,
     entry: &ChatEntry,
+    is_last: bool,
     state: &AppState,
     theme: &Theme,
     width: usize,
@@ -770,11 +774,19 @@ fn push_chat_entry_lines(
         } => {
             push_user_chat_lines(lines, text, *started_at, *duration_ms, theme, width);
         }
-        ChatEntry::Thinking { content, streaming } => {
-            push_thinking_chat_lines(lines, content, *streaming, state, theme);
+        ChatEntry::Thinking {
+            content,
+            streaming: _,
+        } => {
+            let active = is_last && state.liveness_state == crate::state::LivenessState::Thinking;
+            push_thinking_chat_lines(lines, content, active, state, theme);
         }
-        ChatEntry::Assistant { content, streaming } => {
-            push_assistant_chat_lines(lines, content, *streaming, state, theme);
+        ChatEntry::Assistant {
+            content,
+            streaming: _,
+        } => {
+            let active = is_last && state.liveness_state == crate::state::LivenessState::Streaming;
+            push_assistant_chat_lines(lines, content, active, state, theme);
         }
         ChatEntry::ToolCall {
             id: _,
@@ -2022,14 +2034,31 @@ fn build_instance_row(
         }
     }
 
-    // Rough width guard: truncate the label span if the line is hopeless.
+    // Rough width guard: truncate the detail span first, then the label span if necessary.
     let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     if total > width && width > 8 {
-        // Rebuild with a truncated label; simpler than proportional trimming.
-        let over = total - width;
-        let lbl = spans[1].content.to_string();
-        let keep = lbl.chars().count().saturating_sub(over + 1);
-        spans[1] = Span::styled(truncate(&lbl, keep.max(4)), spans[1].style);
+        let mut over = total - width;
+        // Try truncating the detail span (index 2) first
+        if spans.len() > 2 {
+            let det = spans[2].content.to_string();
+            let det_len = det.chars().count();
+            if det_len > over + 5 {
+                let keep = det_len - over;
+                spans[2] = Span::styled(truncate(&det, keep), spans[2].style);
+                over = 0;
+            } else if det_len > 5 {
+                spans[2] = Span::styled(truncate(&det, 4), spans[2].style);
+                let new_total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                over = new_total.saturating_sub(width);
+            }
+        }
+
+        // If still over, truncate the label (index 1)
+        if over > 0 {
+            let lbl = spans[1].content.to_string();
+            let keep = lbl.chars().count().saturating_sub(over + 1);
+            spans[1] = Span::styled(truncate(&lbl, keep.max(4)), spans[1].style);
+        }
     }
     Line::from(spans)
 }
@@ -2168,9 +2197,46 @@ fn draw_detail(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
     state.detail_area.set(area);
 
-    match state.selected_op() {
-        None => render_empty_detail(frame, theme, area, border_style),
-        Some(op) => render_selected_detail(frame, state, theme, area, border_style, op),
+    let rows = state.task_rows.borrow();
+    let selected_row = rows.get(state.ops_selected);
+    match selected_row.map(|r| &r.kind) {
+        Some(crate::task_tree::RowKind::Instance {
+            group_id,
+            label,
+            detail,
+            counts,
+            ..
+        }) => {
+            render_selected_instance_detail(
+                frame,
+                state,
+                theme,
+                area,
+                border_style,
+                group_id,
+                label,
+                detail,
+                counts,
+            );
+        }
+        Some(crate::task_tree::RowKind::Group { key, label, .. }) => {
+            render_selected_group_detail(frame, state, theme, area, border_style, key, label);
+        }
+        Some(crate::task_tree::RowKind::Op { op_index, .. })
+        | Some(crate::task_tree::RowKind::Output { op_index, .. }) => {
+            if let Some(op) = state.operations.get(*op_index) {
+                render_selected_detail(frame, state, theme, area, border_style, op);
+            } else {
+                render_empty_detail(frame, theme, area, border_style);
+            }
+        }
+        None => {
+            if let Some(op) = state.selected_op() {
+                render_selected_detail(frame, state, theme, area, border_style, op);
+            } else {
+                render_empty_detail(frame, theme, area, border_style);
+            }
+        }
     }
 }
 
@@ -2251,6 +2317,161 @@ fn render_selected_detail(
     );
     let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     frame.render_widget(para, rest_a);
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn render_selected_instance_detail(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    area: Rect,
+    border_style: Style,
+    group_id: &str,
+    label: &str,
+    detail: &str,
+    counts: &crate::task_tree::GroupCounts,
+) {
+    let title = if group_id.is_empty() {
+        " Local Terminal (You) ".to_string()
+    } else {
+        format!(" Instance {} ", label)
+    };
+    let block = Block::default()
+        .title(Span::styled(title, theme.title()))
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let mut lines = Vec::new();
+
+    // Find instance details if not local group
+    let inst_info = if !group_id.is_empty() {
+        state
+            .active_instances
+            .iter()
+            .find(|inst| inst.id == group_id)
+    } else {
+        None
+    };
+
+    if let Some(info) = inst_info {
+        lines.push(Line::from(vec![
+            Span::styled("Client   ", theme.dim()),
+            Span::styled(
+                info.client.as_deref().unwrap_or("unknown").to_string(),
+                theme.normal(),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Label    ", theme.dim()),
+            Span::styled(info.label.to_string(), theme.normal()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("PID      ", theme.dim()),
+            Span::styled(info.pid.to_string(), theme.normal()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Mode     ", theme.dim()),
+            Span::styled(info.mode.to_string(), theme.normal()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Scope    ", theme.dim()),
+            Span::styled(info.scope.to_string(), theme.normal()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("UUID     ", theme.dim()),
+            Span::styled(info.id.to_string(), theme.normal()),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("Type     ", theme.dim()),
+            Span::styled("Local TUI Connection", theme.normal()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Label    ", theme.dim()),
+            Span::styled("this terminal (you)", theme.normal()),
+        ]));
+        if !detail.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("Detail   ", theme.dim()),
+                Span::styled(detail.to_string(), theme.normal()),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Operation Tallies:",
+        theme.title(),
+    )));
+
+    let (r, q, s, f) = (
+        counts.running,
+        counts.queued,
+        counts.succeeded,
+        counts.failed,
+    );
+    lines.push(Line::from(vec![
+        Span::styled("  Running    ", theme.dim()),
+        Span::styled(r.to_string(), theme.running()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Queued     ", theme.dim()),
+        Span::styled(q.to_string(), theme.pending()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Succeeded  ", theme.dim()),
+        Span::styled(s.to_string(), theme.success()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  Failed     ", theme.dim()),
+        Span::styled(f.to_string(), theme.failed()),
+    ]));
+
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
+}
+
+#[cfg(feature = "tui")]
+fn render_selected_group_detail(
+    frame: &mut Frame,
+    _state: &AppState,
+    theme: &Theme,
+    area: Rect,
+    border_style: Style,
+    key: &str,
+    label: &str,
+) {
+    let block = Block::default()
+        .title(Span::styled(format!(" Group {} ", label), theme.title()))
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Group Key  ", theme.dim()),
+            Span::styled(key.to_string(), theme.normal()),
+        ]),
+        Line::from(vec![
+            Span::styled("Label      ", theme.dim()),
+            Span::styled(label.to_string(), theme.normal()),
+        ]),
+    ];
+
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    frame.render_widget(para, inner);
 }
 
 #[cfg(feature = "tui")]

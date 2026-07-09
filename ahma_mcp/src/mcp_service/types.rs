@@ -14,6 +14,7 @@ use ahma_common::daemon_hub::{ClientMsg, DaemonChatMessage};
 #[derive(Default)]
 pub struct ActiveAgentSession {
     pub approval_tx: Option<tokio::sync::oneshot::Sender<bool>>,
+    pub approvals: std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>,
 }
 
 /// A trait for executing prompts via the agent loop (implemented in ahma_core).

@@ -1539,6 +1539,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         let gate = Arc::new(HubApprovalGate {
             hub_tx: hub_tx.clone(),
             session,
+            approval_mutex: tokio::sync::Mutex::new(()),
         });
 
         spawn_agent_task(
@@ -1728,15 +1729,21 @@ impl AgentApprovalGate for AutoApproveAgentGate {
 struct HubApprovalGate {
     hub_tx: tokio::sync::mpsc::Sender<ClientMsg>,
     session: Arc<tokio::sync::Mutex<ActiveAgentSession>>,
+    approval_mutex: tokio::sync::Mutex<()>,
 }
 
 #[async_trait]
 impl AgentApprovalGate for HubApprovalGate {
     async fn request_approval(&self, id: &str, tool: &str, args: &str) -> bool {
+        // Serialize approvals so concurrent tool calls prompt sequentially
+        let _guard = self.approval_mutex.lock().await;
+
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let (legacy_tx, legacy_rx) = tokio::sync::oneshot::channel();
         {
             let mut session_guard = self.session.lock().await;
-            session_guard.approval_tx = Some(tx);
+            session_guard.approval_tx = Some(legacy_tx);
+            session_guard.approvals.insert(id.to_string(), tx);
         }
 
         let msg = ClientMsg::ApprovalRequested {
@@ -1745,10 +1752,22 @@ impl AgentApprovalGate for HubApprovalGate {
             args: args.to_string(),
         };
         if self.hub_tx.send(msg).await.is_err() {
+            let mut session_guard = self.session.lock().await;
+            session_guard.approvals.remove(id);
+            session_guard.approval_tx = None;
             return false;
         }
 
-        rx.await.unwrap_or(false)
+        let approved = tokio::select! {
+            res = rx => res.unwrap_or(false),
+            res = legacy_rx => res.unwrap_or(false),
+        };
+
+        let mut session_guard = self.session.lock().await;
+        session_guard.approvals.remove(id);
+        session_guard.approval_tx = None;
+
+        approved
     }
 }
 
@@ -3361,7 +3380,11 @@ mod tests {
         let session = Arc::new(tokio::sync::Mutex::new(
             ahma_mcp::ActiveAgentSession::default(),
         ));
-        let gate = HubApprovalGate { hub_tx, session };
+        let gate = HubApprovalGate {
+            hub_tx,
+            session,
+            approval_mutex: tokio::sync::Mutex::new(()),
+        };
         assert!(!gate.request_approval("id", "write_file", "{}").await);
     }
 
@@ -3374,6 +3397,7 @@ mod tests {
         let gate = HubApprovalGate {
             hub_tx,
             session: session.clone(),
+            approval_mutex: tokio::sync::Mutex::new(()),
         };
         let handle = tokio::spawn(async move {
             gate.request_approval("id7", "write_file", "{\"p\":1}")

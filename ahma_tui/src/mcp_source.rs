@@ -340,7 +340,32 @@ async fn mcp_source_task(
                             } else {
                                 debug!("status call failed (resetting session): {e:#}");
                             }
+                            // Best-effort: tell the bridge to free this session now rather
+                            // than leaving it to expire via the idle timeout. Without this,
+                            // a transient status-poll hiccup abandons a session client-side
+                            // while it stays alive server-side, and repeated hiccups can pile
+                            // up enough orphaned sessions to blow through the server's
+                            // concurrent-session cap.
+                            let mcp_url = format!("{request_base_url}/mcp");
+                            let _ = client
+                                .delete(&mcp_url)
+                                .header("mcp-session-id", session.id())
+                                .timeout(Duration::from_secs(2))
+                                .send()
+                                .await;
                             mcp_state = None;
+                            // Same backoff as init failures — a run of status hiccups
+                            // must not re-init every 3-10s and keep growing the pile.
+                            init_fail_count = init_fail_count.saturating_add(1);
+                            let backoff_secs: u64 = match init_fail_count {
+                                1 => 1,
+                                2 => 3,
+                                3 => 8,
+                                4 => 20,
+                                _ => 60,
+                            };
+                            next_init_attempt = tokio::time::Instant::now()
+                                + tokio::time::Duration::from_secs(backoff_secs);
                             // Clear the session id in the UI so it doesn't use the dead id for tool calls.
                             send(&tx, SourceEvent::SessionId { id: String::new() }).await;
                         }

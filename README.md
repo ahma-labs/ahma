@@ -24,10 +24,13 @@ curl -sSf https://raw.githubusercontent.com/paulirotta/ahma/main/scripts/install
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc  # or ~/.bashrc — reload your shell after
 ```
 
-The installer also runs `ahma setup`, which configures MCP entries, terminal hooks, and agent
-skills for the editors it detects (Cursor, VS Code, Claude Code, …) — restart your editor
-afterward. Run `ahma setup` again any time to reconfigure, or see
-[MCP Server Connection Modes](#mcp-server-connection-modes) below to wire up `mcp.json` by hand.
+The installer also runs `ahma setup`, which configures MCP entries and agent skills for the
+editors it detects (Cursor, VS Code, Claude Code, …) — restart your editor afterward. [Terminal
+hooks](#terminal-hooks) are opt-in and not part of this default (pass `--hooks`, or select them
+at the prompt) since they're experimental and could interfere with your workflow until
+sandbox-exception handling is fully hardened. Run `ahma setup` again any time to reconfigure, or
+see [MCP Server Connection Modes](#mcp-server-connection-modes) below to wire up `mcp.json` by
+hand.
 
 **Windows (PowerShell 5.1+) — first-time install**
 

@@ -365,7 +365,8 @@ fn emit_group_ops(
 
 /// Prefer the MCP client identity over the generic instance label.
 fn display_label(info: &InstanceInfo) -> String {
-    info.client.clone().unwrap_or_else(|| info.label.clone())
+    let base = info.client.as_deref().unwrap_or(&info.label);
+    format!("{}:{}", base, info.pid)
 }
 
 /// Shorten a scope path for the header line: home-relative when possible,
@@ -461,7 +462,7 @@ mod tests {
         else {
             panic!("first row must be the instance header, got {:?}", rows[0]);
         };
-        assert_eq!(label, "claude-code", "client identity beats label");
+        assert_eq!(label, "claude-code:7", "client identity beats label");
         assert!(!c);
         assert_eq!(counts.running, 1);
         assert_eq!(counts.queued, 1);
@@ -528,7 +529,7 @@ mod tests {
             .collect();
         assert_eq!(
             labels,
-            vec!["A".to_string(), "this terminal (you)".to_string()]
+            vec!["A:7".to_string(), "this terminal (you)".to_string()]
         );
     }
 

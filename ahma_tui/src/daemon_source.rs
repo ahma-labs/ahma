@@ -1463,7 +1463,13 @@ mod tests {
     #[test]
     fn apply_msg_submit_approval_is_noop() {
         let mut s = DaemonState::new();
-        let a = apply_msg(&mut s, DaemonMsg::SubmitApproval { approved: true });
+        let a = apply_msg(
+            &mut s,
+            DaemonMsg::SubmitApproval {
+                id: None,
+                approved: true,
+            },
+        );
         assert!(matches!(a, Applied::None));
     }
 
