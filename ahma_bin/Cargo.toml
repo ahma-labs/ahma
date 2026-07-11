@@ -10,9 +10,9 @@ description = "The ahma binary: wires the MIT ahma_mcp library with the AGPL-lic
 repository = "https://github.com/paulirotta/ahma"
 homepage = "https://github.com/paulirotta/ahma"
 
-# All first-party copyleft crates (ahma_vault, ahma_decompose, ahma_task_tree,
-# ahma_worker, ahma_renewal, ahma_tui, ahma_cluster) are AGPL-3.0-or-later. The compiled
-# ahma binary is therefore AGPL-3.0-or-later. See README for details.
+# All first-party copyleft crates (ahma_vault, ahma_task_tree, ahma_tui,
+# ahma_cluster) are AGPL-3.0-or-later. The compiled ahma binary is therefore
+# AGPL-3.0-or-later. See README for details.
 
 # ── cargo-binstall: fetch the prebuilt, attested release binary ──────────────
 # Lets `cargo binstall --git https://github.com/paulirotta/ahma ahma_bin` pull the

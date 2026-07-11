@@ -68,9 +68,7 @@ name = "ahma_cluster"
 version = "0.15.6"
 dependencies = [
  "ahma_common",
- "ahma_decompose",
  "ahma_http_bridge",
- "ahma_worker",
  "anyhow",
  "chrono",
  "dirs",
@@ -132,23 +130,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "ahma_decompose"
-version = "0.15.6"
-dependencies = [
- "ahma_common",
- "ahma_llm_monitor",
- "ahma_vault",
- "anyhow",
- "futures",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "wiremock",
 ]
 
 [[package]]
@@ -320,20 +301,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ahma_renewal"
-version = "0.15.6"
-dependencies = [
- "ahma_vault",
- "anyhow",
- "chrono",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "ahma_task_tree"
 version = "0.15.6"
 dependencies = [
@@ -402,21 +369,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ahma_worker"
-version = "0.15.6"
-dependencies = [
- "ahma_vault",
- "anyhow",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
  "tokio",
  "tracing",
 ]

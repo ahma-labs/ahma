@@ -207,13 +207,13 @@ jobs:
           # turning stabilization into a slow whack-a-mole across many pushes.
           cargo nextest run --profile ci --locked --no-default-features --no-fail-fast -E 'not (test(kotlin) or test(android))'
 
-      - name: Cargo Nextest (incubating crates, non-default feature gates)
+      - name: Cargo Nextest (AGPL product crates)
         if: matrix.test_mode == 'full'
         timeout-minutes: 20
         run: |
-          echo "--- Testing quarantined incubating crates (not in default-members)"
+          echo "--- Testing AGPL product crates"
           cargo nextest run --profile ci --locked \
-            -p ahma_vault -p ahma_decompose -p ahma_worker -p ahma_renewal -p ahma_cluster \
+            -p ahma_vault -p ahma_cluster \
             -E 'not (test(kotlin) or test(android))'
 
       - name: Cargo Nextest (Landlock red-team, Linux only)
@@ -232,7 +232,7 @@ jobs:
           echo "--- ARM64 smoke: compile-only validation of key crates (no test execution)"
           cargo test --locked --no-default-features -p ahma_bin --no-run
           cargo test --locked --no-default-features -p ahma_http_bridge --no-run
-          cargo test --locked --no-default-features -p ahma_decompose --no-run
+          cargo test --locked --no-default-features -p ahma_task_tree --no-run
 
       - name: Cargo Clippy
         if: runner.os == 'Linux' && runner.arch == 'X64'

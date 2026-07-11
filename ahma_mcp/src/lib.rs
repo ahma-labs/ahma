@@ -169,12 +169,10 @@ pub mod validation;
 // AGPL-3.0-or-later crates to allow this library to
 // remain MIT OR Apache-2.0:
 //
-//   ahma_vault    — task vault, audit log, two-phase trash  (AGPL-3.0-or-later)
-//   ahma_decompose — local-LLM decompose orchestration       (AGPL-3.0-or-later)
-//   ahma_worker   — ephemeral worker code synthesis          (AGPL-3.0-or-later)
-//   ahma_renewal  — renewal contract for long-running tasks  (AGPL-3.0-or-later)
-//   ahma_tui      — ratatui TUI control plane                (AGPL-3.0-or-later)
-//   ahma_cluster  — local cluster scheduler (mDNS/QUIC)      (AGPL-3.0-or-later)
+//   ahma_vault     — task vault, audit log, two-phase trash  (AGPL-3.0-or-later)
+//   ahma_task_tree — recursive task-tree orchestration       (AGPL-3.0-or-later)
+//   ahma_tui       — ratatui TUI control plane               (AGPL-3.0-or-later)
+//   ahma_cluster   — local cluster scheduler (mDNS/QUIC)     (AGPL-3.0-or-later)
 //
 // These crates live in the same workspace and depend on this library;
 // they must NOT be depended on from this crate.

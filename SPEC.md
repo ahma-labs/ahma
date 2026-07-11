@@ -53,6 +53,22 @@
 
 ---
 
+## Removed: orphaned incubating crates (`ahma_decompose`, `ahma_worker`, `ahma_renewal`)
+
+These three AGPL-3.0-or-later crates were removed from the workspace because nothing in the
+shipped product invoked them:
+
+- **`ahma_renewal`** — renewal contract for long-running tasks. Had zero dependents and no SPEC.
+- **`ahma_worker`** — ephemeral worker code synthesis. Declared only as an (unused) dependency of `ahma_cluster`.
+- **`ahma_decompose`** — local-LLM decompose orchestration. Declared only as an (unused) dependency of `ahma_cluster`; self-flagged for deprecation in its own `lib.rs`.
+
+The related `tool_type: decompose`/`worker` handler stubs inside `ahma_mcp` and the
+`.ahma/decompose.json` example are tracked separately. The sources remain in git history if
+these roadmap features are revived; recover them from the commit that deleted the crate
+directories.
+
+---
+
 ## TODO: Python bindings (former `ahma_py` crate)
 
 The `ahma_py` crate has been removed from the workspace and the source files deleted. Before removal it served as the project's Python bindings (PyO3) to expose `ahma_core` to Python consumers and provided build notes for producing a wheel. Key points captured from the crate's source before deletion:

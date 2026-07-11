@@ -22,10 +22,7 @@ PERMISSIVE_CRATES=(
 AGPL_CRATES=(
   ahma_bin
   ahma_vault
-  ahma_decompose
   ahma_task_tree
-  ahma_worker
-  ahma_renewal
   ahma_tui
   ahma_cluster
 )
