@@ -122,6 +122,5 @@ Every allow/deny decision is recorded in `audit.jsonl` as an `egress_decision` e
 
 - [docs/security-sandbox.md](security-sandbox.md) — kernel sandbox and egress proxy details
 - [docs/egress-sandbox.md](egress-sandbox.md) — per-task network allowlist
-- [docs/renewal-contract.md](renewal-contract.md) — automatic halt for unattended sessions
 - [SPEC.md §5.8](../SPEC.md) — MTDF vault integration specification
 

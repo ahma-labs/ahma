@@ -79,5 +79,4 @@ The chat endpoint is `localhost` only. The bearer token is a random 16-byte hex 
 ## See also
 
 - [docs/task-vault.md](task-vault.md) — where artifacts are stored
-- [docs/decompose.md](decompose.md) — decompose tool results can be rendered as artifacts
 - [SPEC.md](../SPEC.md) — artifact server specification

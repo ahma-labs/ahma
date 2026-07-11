@@ -2,7 +2,7 @@
 
 > **Experimental** — introduced in v0.7. mDNS peer discovery and static peer configuration are both functional.
 
-The cluster scheduler routes decompose sub-tasks to `ahma worker` peers on your local network or Tailscale mesh. Each peer runs its own local LLM (e.g. Ollama with `gemma4`) and its own kernel sandbox. The coordinator picks the least-loaded peer that has the requested model available.
+The cluster scheduler routes sub-tasks to `ahma` worker peers on your local network or Tailscale mesh. Each peer runs its own local LLM (e.g. Ollama with `gemma4`) and its own kernel sandbox. The coordinator picks the least-loaded peer that has the requested model available.
 
 ## Why a local cluster?
 
@@ -13,7 +13,7 @@ This enables parallel AI workloads that would otherwise be throttled by a single
 ## Architecture
 
 ```
-DecomposeOrchestrator (coordinator)
+Task coordinator (caller)
   │  for each sub-task
   ▼
 ClusterScheduler
@@ -186,6 +186,5 @@ The receiving side uses `subtle::ConstantTimeEq` for the signature comparison to
 
 ## See also
 
-- [docs/decompose.md](decompose.md) — sub-tasks that the scheduler dispatches
 - [docs/task-vault.md](task-vault.md) — vault contents that travel with the task
 - [SPEC.md](../SPEC.md) — cluster scheduler design notes

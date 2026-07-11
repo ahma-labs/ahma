@@ -114,4 +114,3 @@ See [docs/cluster-scheduler.md](cluster-scheduler.md) for cluster setup.
 
 - [docs/cluster-scheduler.md](cluster-scheduler.md) — distributing tasks across peers
 - [docs/task-vault.md](task-vault.md) — per-task egress allowlist for network calls
-- [docs/decompose.md](decompose.md) — multi-model decompose tool type

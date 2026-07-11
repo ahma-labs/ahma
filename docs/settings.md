@@ -126,12 +126,13 @@ model = "openai/gpt-oss-20b"
 
 ### Using LM Studio as a named provider in tool definitions
 
-The LM Studio settings are exposed as a named provider available in decompose and
-livelog tools:
+The LM Studio settings are exposed as a named provider available in `livelog`
+tools:
 
 ```json
 {
-  "decompose": {
+  "tool_type": "livelog",
+  "livelog": {
     "llm_provider": {
       "base_url": "http://localhost:1234/v1",
       "model": "openai/gpt-oss-20b"

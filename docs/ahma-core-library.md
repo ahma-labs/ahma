@@ -32,10 +32,7 @@ those crates.
 | Crate | License | Key types |
 |-------|---------|----------|
 | `ahma_vault` | AGPL-3.0-or-later | `TaskVault`, `AuditWriter`, `TrashManager` |
-| `ahma_decompose` | AGPL-3.0-or-later | `DecomposeOrchestrator`, `DecomposeConfig`, `Reducer`, `ReduceMode` |
-| `ahma_task_tree` | AGPL-3.0-or-later | `TaskTreeOrchestrator`, `TaskTree`, `TaskNode` |
-| `ahma_worker` | AGPL-3.0-or-later | `WorkerRunner`, `WorkerConfig`, `WorkerLanguage` |
-| `ahma_renewal` | AGPL-3.0-or-later | `RenewalWatcher`, `RenewalConfig`, `RenewalHaltEvent` |
+| `ahma_task_tree` | AGPL-3.0-or-later | `parse_steps`, `ParsedStep`, `build_planning_prompt` |
 | `ahma_tui` | AGPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
 | `ahma_cluster` | **AGPL-3.0-or-later** | `ClusterScheduler`, `WorkerRegistry`, `TaskManifest`, `PeerInfo` |
 
@@ -83,6 +80,4 @@ async fn main() -> anyhow::Result<()> {
 ## See also
 
 - [docs/task-vault.md](task-vault.md)
-- [docs/decompose.md](decompose.md)
 - [docs/egress-sandbox.md](egress-sandbox.md)
-- [docs/renewal-contract.md](renewal-contract.md)

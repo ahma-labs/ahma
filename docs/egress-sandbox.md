@@ -51,7 +51,7 @@ An empty `egress.allowlist` — or no file at all — means no outbound connecti
 Add a domain only when the task explicitly needs it:
 
 ```bash
-# Allow the decompose tool to reach Ollama on localhost (already in NO_PROXY)
+# Allow a local LLM tool to reach Ollama on localhost (already in NO_PROXY)
 # No changes needed — localhost is excluded from the proxy by default.
 
 # Allow a cloud LLM for one task:

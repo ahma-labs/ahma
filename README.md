@@ -245,7 +245,6 @@ Every v0.7 feature was designed around the principle that **the kernel sandbox i
 - Prompt injection can bypass any filter with non-zero probability. Ahma's response is to make the *consequences* of a successful injection bounded by the kernel sandbox scope, not to prevent injection entirely.
 - Folder-level permission grants that survive a whole session give too much access for too long. Task vaults enforce the per-task folder discipline that responsible users already practice — but make it the only option.
 - Network egress from agent subprocesses is not controlled by filesystem sandboxing alone. The egress sandbox adds a deny-by-default HTTP proxy layer.
-- Long unattended sessions are the highest-risk usage pattern. The renewal contract halts them automatically.
 
 ### Task Vaults — isolated per-question working directories
 
@@ -259,18 +258,6 @@ Each vault gets its own kernel sandbox scope (`workdir/`), input copies, output 
 
 See [docs/task-vault.md](docs/task-vault.md).
 
-### Decompose — split complex questions across local LLMs
-
-```bash
-# .ahma/decompose.json ships pre-configured for gemma4 via Ollama
-ollama pull gemma4
-# Then ask your agent: use the decompose tool to answer "..."
-```
-
-The `decompose` MTDF tool type breaks a question into sub-questions, runs them concurrently against a local model, and aggregates results with a deterministic Rust reducer. No cloud egress required.
-
-See [docs/decompose.md](docs/decompose.md).
-
 ### TUI — terminal dashboard and approval gates
 
 ```bash
@@ -278,7 +265,7 @@ ahma tui
 ahma tui --connect http://localhost:8080
 ```
 
-A terminal dashboard for monitoring active operations and handling approval gates (renewal checkpoints, elevation requests, deletion confirmations).
+A terminal dashboard for monitoring active operations and handling approval gates (elevation requests, deletion confirmations, egress approvals).
 
 - **Redesigned Monitor Mode (`/mode monitor`)**: Features a unified operations list with clickable/touchable `[Pin]` and `[Cancel]` buttons, a detailed operation inspector with a clickable `[Analyze]` button for AI analysis of outputs/logs, and inline log viewing.
 - **Log Monitor Integration**: Type `/monitor file <path> [prompt]` in the chat input area to start a background log-monitoring operation using the built-in process-free tailing engine.
@@ -298,12 +285,6 @@ Tools can emit `outputs/result.html` — a self-contained artifact with embedded
 
 See [docs/artifacts.md](docs/artifacts.md).
 
-### Worker Code Synthesis — ephemeral Rust/Python programs
-
-The `worker` MTDF tool type compiles and runs synthesized code inside the vault sandbox. Because the program runs without an LLM in the execution loop, it cannot be re-injected mid-run. Source is deleted after execution unless `keep_source: true`.
-
-See [docs/worker-synthesis.md](docs/worker-synthesis.md).
-
 ### Bundle Audit — supply-chain security for MTDF bundles
 
 ```bash
@@ -318,27 +299,15 @@ See [docs/bundle-audit.md](docs/bundle-audit.md).
 
 ### Local Cluster Scheduler
 
-Routes decompose sub-tasks to `ahma worker` peers on your LAN or Tailscale mesh. Each peer runs its own local model. Static peer configuration is functional; mDNS peer discovery is planned.
+Routes sub-tasks to `ahma` worker peers on your LAN or Tailscale mesh. Each peer runs its own local model and kernel sandbox. Static peer configuration is functional; mDNS peer discovery is planned.
 
 See [docs/cluster-scheduler.md](docs/cluster-scheduler.md).
 
-### Renewal Contract — automatic halt for unattended sessions
-
-Any operation running unattended beyond `T_renew` seconds (default 5 minutes) is automatically halted, a checkpoint is written to the vault, and the TUI prompts for re-approval. This closes the "long unattended run" risk class.
-
-See [docs/renewal-contract.md](docs/renewal-contract.md).
-
 ### ahma_core — embedding Ahma in Rust applications
 
-The `ahma_core` crate exposes vaults, orchestration, egress, workers, and the renewal contract as a library for embedding in other Rust applications.
+The `ahma_core` crate exposes the sandbox, MCP service, and local-LLM agent runtime as a library for embedding in other Rust applications.
 
 See [docs/ahma-core-library.md](docs/ahma-core-library.md).
-
-### Recursive Task Tree — LLM-orchestrated depth-first subtask execution
-
-The `ahma_task_tree` crate implements recursive task decomposition and execution, where complex goals are broken into a tree of LLM-planned subtasks interspersed with sandboxed shell tool calls.
-
-See [docs/recursive-task-tree.md](docs/recursive-task-tree.md).
 
 ## MCP Server Connection Modes
 
@@ -391,10 +360,7 @@ The root `Cargo.toml` groups crates in one workspace, but each member crate's
 | `ahma_test_support` | MIT OR Apache-2.0 | Test helpers for workspace crates |
 | `generate_tool_schema` | MIT OR Apache-2.0 | Schema generation utility |
 | `ahma_vault` | AGPL-3.0-or-later | Task vaults and audit trail |
-| `ahma_decompose` | AGPL-3.0-or-later | Multi-step decomposition runtime |
-| `ahma_task_tree` | AGPL-3.0-or-later | Recursive task decomposition and execution |
-| `ahma_worker` | AGPL-3.0-or-later | Ephemeral code synthesis workers |
-| `ahma_renewal` | AGPL-3.0-or-later | Renewal / unattended-session controls |
+| `ahma_task_tree` | AGPL-3.0-or-later | Task planning prompt + LLM-plan step parser |
 | `ahma_tui` | AGPL-3.0-or-later | Terminal dashboard and approval flow |
 | `ahma_cluster` | AGPL-3.0-or-later | Networked worker scheduling |
 | `ahma_bin` | AGPL-3.0-or-later | Shipped `ahma` binary |
@@ -408,7 +374,7 @@ option used by many libraries.
 `AGPL-3.0-or-later` is used for the end-user and network-exposed product crates
 that define the shipped product surface and security-relevant runtime behavior.
 That includes the shipped `ahma` binary and the crates that define vaults,
-worker execution, renewal gates, cluster scheduling, and the user-facing TUI.
+cluster scheduling, and the user-facing TUI.
 
 ### AGPL + Build Verification: Supply Chain Defense
 

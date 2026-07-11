@@ -61,7 +61,6 @@ Open `ahma tui` in a project directory while your IDE agent is working and the o
 
 The TUI is the primary surface for approving or rejecting operations that require user sign-off:
 
-- **Renewal checkpoints** — a task that has run unattended beyond `T_renew` seconds halts and requires re-approval before continuing. See [docs/renewal-contract.md](renewal-contract.md).
 - **Elevation requests** — a task requesting write access outside its vault scope.
 - **Trash purge confirmation** — permanently deleting staged files.
 
@@ -121,6 +120,5 @@ The `ahma tls init` step is offered automatically during `install.sh`. The priva
 
 ## See also
 
-- [docs/renewal-contract.md](renewal-contract.md) — task renewal and approval gates
 - [docs/task-vault.md](task-vault.md) — vaults and audit logs
 - [docs/connection-modes.md](connection-modes.md) — HTTP bridge setup
