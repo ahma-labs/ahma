@@ -2440,10 +2440,10 @@ fn resolve_working_dirs_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) ->
     }
 }
 
-pub fn build_app_config(cli: &Cli) -> AppConfig {
-    // Apply process-wide overrides from CLI flags BEFORE anything reads the
-    // corresponding deprecated env vars — flags are the visible, diagnosable
-    // configuration path (no ambient OS/ENV state leaking in).
+/// Apply process-wide overrides from CLI flags BEFORE anything reads the
+/// corresponding deprecated env vars — flags are the visible, diagnosable
+/// configuration path (no ambient OS/ENV state leaking in).
+fn apply_process_wide_cli_overrides(cli: &Cli) {
     if let Some(dir) = &cli.log_dir {
         crate::utils::logging::set_log_dir_override(dir.clone());
     }
@@ -2456,22 +2456,15 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     if let Some(path) = &cli.daemon_socket {
         ahma_common::daemon_hub::set_socket_path_override(path.clone());
     }
+}
 
-    let serve = extract_serve_fields(&cli.command);
-    let tool = extract_tool_fields(&cli.command);
-
-    // Load user settings (priority layer 2: below CLI flags, above env vars)
-    let s = load_settings(cli);
-
-    // Install the tool-subprocess secret-env passthrough allowlist from
-    // `[sandbox] env_allow`. Everything not on this list that looks like a
-    // secret is scrubbed from tool environments (see `sandbox::base_command`).
-    sandbox::set_secret_env_allow(s.sandbox.env_allow.clone());
-
-    // Resolve macOS keychain access (default on; `[sandbox] allow_keychain`).
-    // CLI flags win: `--no-allow-keychain` forces off, `--allow-keychain` forces
-    // on even when settings disable it. When off, the login keychain is added to
-    // the credential-read deny set below and keychain writes stay blocked.
+/// Resolve macOS keychain access (default on; `[sandbox] allow_keychain`) and
+/// install the credential-read deny set that depends on it.
+///
+/// CLI flags win: `--no-allow-keychain` forces off, `--allow-keychain` forces
+/// on even when settings disable it. When off, the login keychain is added to
+/// the credential-read deny set and keychain writes stay blocked.
+fn configure_keychain_and_credential_denies(cli: &Cli, s: &ahma_common::config::AhmaSettings) {
     let allow_keychain = if cli.no_allow_keychain {
         false
     } else if cli.allow_keychain {
@@ -2513,6 +2506,23 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
              under the sandbox"
         );
     }
+}
+
+pub fn build_app_config(cli: &Cli) -> AppConfig {
+    apply_process_wide_cli_overrides(cli);
+
+    let serve = extract_serve_fields(&cli.command);
+    let tool = extract_tool_fields(&cli.command);
+
+    // Load user settings (priority layer 2: below CLI flags, above env vars)
+    let s = load_settings(cli);
+
+    // Install the tool-subprocess secret-env passthrough allowlist from
+    // `[sandbox] env_allow`. Everything not on this list that looks like a
+    // secret is scrubbed from tool environments (see `sandbox::base_command`).
+    sandbox::set_secret_env_allow(s.sandbox.env_allow.clone());
+
+    configure_keychain_and_credential_denies(cli, &s);
 
     // ── Tool loading ────────────────────────────────────────────────────────
     // R-CFG1.2: AHMA_TOOLS_DIR is RETIRED — warn and ignore.

@@ -537,6 +537,14 @@ async fn dispatch_tool_execution(
     }
 }
 
+/// True when a chat-completion error indicates the model/provider rejected the
+/// request because of tool definitions (as opposed to a non-recoverable failure),
+/// so the caller should retry the turn without tools instead of ending it.
+fn is_tool_unsupported_error(err: &str) -> bool {
+    let err_msg = err.to_lowercase();
+    err_msg.contains("400") || err_msg.contains("tool") || err_msg.contains("not supported")
+}
+
 /// Fetch one assistant turn. Returns `(response, content_streamed)` where
 /// `content_streamed` is `true` when the visible content was already emitted to
 /// `tx` as `AgentEvent::Token`s during the call (so callers must not re-send it).
@@ -599,11 +607,7 @@ async fn fetch_completion(
         match result {
             Ok(c) => Some((c, true)),
             Err(e) => {
-                let err_msg = e.to_string().to_lowercase();
-                if err_msg.contains("400")
-                    || err_msg.contains("tool")
-                    || err_msg.contains("not supported")
-                {
+                if is_tool_unsupported_error(&e.to_string()) {
                     info!(error = %e, "agent: model rejected tools — falling back to plain chat (no tool use this turn)");
                     let _ = tx
                         .send(AgentEvent::Error(
@@ -1184,30 +1188,49 @@ async fn run_session_sse_listener(
             if method == Some("roots/list")
                 && let Some(request_id) = value.get("id").cloned()
             {
-                let roots = vec![serde_json::json!({
-                    "uri": encode_file_uri(&workspace_root),
-                    "name": workspace_root
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("workspace"),
-                })];
-                let roots_response = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": { "roots": roots }
-                });
-                let _ = post_client
-                    .post(&sse_url)
-                    .header("Content-Type", "application/json")
-                    .header("mcp-session-id", &session_id)
-                    .json(&roots_response)
-                    .send()
-                    .await;
+                respond_to_roots_list(
+                    &post_client,
+                    &sse_url,
+                    &session_id,
+                    request_id,
+                    &workspace_root,
+                )
+                .await;
             }
         }
     }
 
     Ok(())
+}
+
+/// Answer a server-initiated `roots/list` request over the SSE session by
+/// POSTing back a single-root result describing the sandboxed workspace.
+async fn respond_to_roots_list(
+    post_client: &reqwest::Client,
+    sse_url: &str,
+    session_id: &str,
+    request_id: serde_json::Value,
+    workspace_root: &std::path::Path,
+) {
+    let roots = vec![serde_json::json!({
+        "uri": encode_file_uri(workspace_root),
+        "name": workspace_root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace"),
+    })];
+    let roots_response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": { "roots": roots }
+    });
+    let _ = post_client
+        .post(sse_url)
+        .header("Content-Type", "application/json")
+        .header("mcp-session-id", session_id)
+        .json(&roots_response)
+        .send()
+        .await;
 }
 
 /// Initialize (or reuse) an MCP session against the local bridge for a tool

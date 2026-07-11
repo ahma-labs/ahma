@@ -546,10 +546,6 @@ fn wrap_line_to_rows(line: &ratatui::text::Line<'_>, width: usize) -> Vec<Line<'
     let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
     let mut cur: Vec<(char, Style)> = Vec::new();
 
-    let flush = |cur: &mut Vec<(char, Style)>, rows: &mut Vec<Vec<(char, Style)>>| {
-        rows.push(std::mem::take(cur));
-    };
-
     let mut i = 0;
     while i < cells.len() {
         let is_space = cells[i].0.is_whitespace();
@@ -560,28 +556,9 @@ fn wrap_line_to_rows(line: &ratatui::text::Line<'_>, width: usize) -> Vec<Line<'
         let segment = &cells[start..i];
 
         if is_space {
-            // Whitespace that fits stays on the line; whitespace that would spill
-            // past the edge is dropped at the wrap point (so the next row does
-            // not start with stray leading spaces).
-            if cur.len() + segment.len() <= width {
-                cur.extend_from_slice(segment);
-            } else {
-                flush(&mut cur, &mut rows);
-            }
-        } else if segment.len() <= width {
-            // A word that fits on its own; move it to the next row if needed.
-            if cur.len() + segment.len() > width && !cur.is_empty() {
-                flush(&mut cur, &mut rows);
-            }
-            cur.extend_from_slice(segment);
+            wrap_whitespace_segment(&mut cur, &mut rows, segment, width);
         } else {
-            // A word longer than the whole width: hard-split across rows.
-            for &cell in segment {
-                if cur.len() == width {
-                    flush(&mut cur, &mut rows);
-                }
-                cur.push(cell);
-            }
+            wrap_word_segment(&mut cur, &mut rows, segment, width);
         }
     }
     if !cur.is_empty() || rows.is_empty() {
@@ -589,6 +566,50 @@ fn wrap_line_to_rows(line: &ratatui::text::Line<'_>, width: usize) -> Vec<Line<'
     }
 
     rows.into_iter().map(cells_to_line).collect()
+}
+
+/// Append a run of whitespace cells to the row under construction.
+///
+/// Whitespace that fits stays on the line; whitespace that would spill past
+/// the edge is dropped at the wrap point (so the next row does not start
+/// with stray leading spaces).
+#[cfg(feature = "tui")]
+fn wrap_whitespace_segment(
+    cur: &mut Vec<(char, Style)>,
+    rows: &mut Vec<Vec<(char, Style)>>,
+    segment: &[(char, Style)],
+    width: usize,
+) {
+    if cur.len() + segment.len() <= width {
+        cur.extend_from_slice(segment);
+    } else {
+        rows.push(std::mem::take(cur));
+    }
+}
+
+/// Append a run of non-whitespace cells (a "word") to the row under
+/// construction, wrapping to a new row as needed. Words longer than the
+/// whole width are hard-split across rows.
+#[cfg(feature = "tui")]
+fn wrap_word_segment(
+    cur: &mut Vec<(char, Style)>,
+    rows: &mut Vec<Vec<(char, Style)>>,
+    segment: &[(char, Style)],
+    width: usize,
+) {
+    if segment.len() <= width {
+        if cur.len() + segment.len() > width && !cur.is_empty() {
+            rows.push(std::mem::take(cur));
+        }
+        cur.extend_from_slice(segment);
+        return;
+    }
+    for &cell in segment {
+        if cur.len() == width {
+            rows.push(std::mem::take(cur));
+        }
+        cur.push(cell);
+    }
 }
 
 /// Coalesce a row of (char, style) cells into a styled [`Line`], merging runs of
@@ -1824,13 +1845,7 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
     let selected = state.ops_selected.min(rows.len() - 1);
 
     // Auto-adjust scroll offset to keep the selected row in view.
-    let mut scroll = state.ops_scroll.get();
-    if selected < scroll {
-        scroll = selected;
-    } else if selected >= scroll + display_rows {
-        scroll = selected - display_rows + 1;
-    }
-    scroll = scroll.min(rows.len().saturating_sub(display_rows));
+    let scroll = compute_ops_scroll(selected, state.ops_scroll.get(), display_rows, rows.len());
     state.ops_scroll.set(scroll);
 
     let rows_to_draw = display_rows.min(rows.len() - scroll);
@@ -1848,99 +1863,202 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
                 counts,
                 collapsed,
                 ..
-            } => {
-                let line = build_instance_row(
-                    label,
-                    detail,
-                    counts,
-                    *collapsed,
-                    is_selected,
-                    state.unicode,
-                    theme,
-                    row_area.width as usize,
-                );
-                frame.render_widget(Paragraph::new(line), row_area);
-                state
-                    .click_targets
-                    .borrow_mut()
-                    .push((ClickTarget::TreeRow(row_idx), row_area));
-            }
+            } => draw_instance_tree_row(
+                frame,
+                state,
+                theme,
+                row_idx,
+                row_area,
+                is_selected,
+                label,
+                detail,
+                counts,
+                *collapsed,
+            ),
             RowKind::Group {
                 label, collapsed, ..
-            } => {
-                let marker = fold_marker(*collapsed, state.unicode);
-                let sel = selection_marker(is_selected, state.unicode);
-                let text = truncate(&format!("{sel}  {marker} {label}"), row_area.width as usize);
-                let style = if is_selected {
-                    theme.selected_item()
-                } else {
-                    theme.dim()
-                };
-                frame.render_widget(Paragraph::new(Span::styled(text, style)), row_area);
-                state
-                    .click_targets
-                    .borrow_mut()
-                    .push((ClickTarget::TreeRow(row_idx), row_area));
-            }
+            } => draw_group_tree_row(
+                frame,
+                state,
+                theme,
+                row_idx,
+                row_area,
+                is_selected,
+                label,
+                *collapsed,
+            ),
             RowKind::Output { text, .. } => {
-                let indent = "  ".repeat(row.depth as usize);
-                let bar = if state.unicode { "│ " } else { "| " };
-                let line = truncate(&format!("  {indent}{bar}{text}"), row_area.width as usize);
-                frame.render_widget(Paragraph::new(Span::styled(line, theme.dim())), row_area);
-                state
-                    .click_targets
-                    .borrow_mut()
-                    .push((ClickTarget::TreeRow(row_idx), row_area));
+                draw_output_tree_row(frame, state, theme, row_idx, row_area, row.depth, text)
             }
-            RowKind::Op { op_index, expanded } => {
-                let Some(op) = state.operations.get(*op_index) else {
-                    continue;
-                };
-                let [details_a, pin_a, cancel_a] = Layout::horizontal([
-                    Constraint::Min(5),
-                    Constraint::Length(5),
-                    Constraint::Length(5),
-                ])
-                .areas(row_area);
-
-                let item = build_tree_op_item(
-                    op,
-                    row.depth,
-                    *expanded,
-                    is_selected,
-                    state,
-                    theme,
-                    details_a.width as usize,
-                );
-                frame.render_widget(Paragraph::new(item), details_a);
-                state
-                    .click_targets
-                    .borrow_mut()
-                    .push((ClickTarget::TreeRow(row_idx), details_a));
-
-                let pin_style = if op.pinned {
-                    theme.running()
-                } else {
-                    theme.dim()
-                };
-                frame.render_widget(Paragraph::new(Span::styled(" [P] ", pin_style)), pin_a);
-                state
-                    .click_targets
-                    .borrow_mut()
-                    .push((ClickTarget::PinOperation(op.id.clone()), pin_a));
-
-                if !op.status.is_terminal() {
-                    frame.render_widget(
-                        Paragraph::new(Span::styled(" [X] ", theme.failed())),
-                        cancel_a,
-                    );
-                    state
-                        .click_targets
-                        .borrow_mut()
-                        .push((ClickTarget::CancelOperation(op.id.clone()), cancel_a));
-                }
-            }
+            RowKind::Op { op_index, expanded } => draw_op_tree_row(
+                frame,
+                state,
+                theme,
+                row_idx,
+                row_area,
+                row.depth,
+                *op_index,
+                *expanded,
+                is_selected,
+            ),
         }
+    }
+}
+
+/// Adjust the tree's scroll offset so the selected row stays within the
+/// visible window, clamped to the available row count.
+#[cfg(feature = "tui")]
+fn compute_ops_scroll(
+    selected: usize,
+    current_scroll: usize,
+    display_rows: usize,
+    total_rows: usize,
+) -> usize {
+    let mut scroll = current_scroll;
+    if selected < scroll {
+        scroll = selected;
+    } else if selected >= scroll + display_rows {
+        scroll = selected - display_rows + 1;
+    }
+    scroll.min(total_rows.saturating_sub(display_rows))
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn draw_instance_tree_row(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    row_idx: usize,
+    row_area: Rect,
+    is_selected: bool,
+    label: &str,
+    detail: &str,
+    counts: &crate::task_tree::GroupCounts,
+    collapsed: bool,
+) {
+    let line = build_instance_row(
+        label,
+        detail,
+        counts,
+        collapsed,
+        is_selected,
+        state.unicode,
+        theme,
+        row_area.width as usize,
+    );
+    frame.render_widget(Paragraph::new(line), row_area);
+    state
+        .click_targets
+        .borrow_mut()
+        .push((ClickTarget::TreeRow(row_idx), row_area));
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn draw_group_tree_row(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    row_idx: usize,
+    row_area: Rect,
+    is_selected: bool,
+    label: &str,
+    collapsed: bool,
+) {
+    let marker = fold_marker(collapsed, state.unicode);
+    let sel = selection_marker(is_selected, state.unicode);
+    let text = truncate(&format!("{sel}  {marker} {label}"), row_area.width as usize);
+    let style = if is_selected {
+        theme.selected_item()
+    } else {
+        theme.dim()
+    };
+    frame.render_widget(Paragraph::new(Span::styled(text, style)), row_area);
+    state
+        .click_targets
+        .borrow_mut()
+        .push((ClickTarget::TreeRow(row_idx), row_area));
+}
+
+#[cfg(feature = "tui")]
+fn draw_output_tree_row(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    row_idx: usize,
+    row_area: Rect,
+    depth: u8,
+    text: &str,
+) {
+    let indent = "  ".repeat(depth as usize);
+    let bar = if state.unicode { "│ " } else { "| " };
+    let line = truncate(&format!("  {indent}{bar}{text}"), row_area.width as usize);
+    frame.render_widget(Paragraph::new(Span::styled(line, theme.dim())), row_area);
+    state
+        .click_targets
+        .borrow_mut()
+        .push((ClickTarget::TreeRow(row_idx), row_area));
+}
+
+#[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn draw_op_tree_row(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    row_idx: usize,
+    row_area: Rect,
+    row_depth: u8,
+    op_index: usize,
+    expanded: bool,
+    is_selected: bool,
+) {
+    let Some(op) = state.operations.get(op_index) else {
+        return;
+    };
+    let [details_a, pin_a, cancel_a] = Layout::horizontal([
+        Constraint::Min(5),
+        Constraint::Length(5),
+        Constraint::Length(5),
+    ])
+    .areas(row_area);
+
+    let item = build_tree_op_item(
+        op,
+        row_depth,
+        expanded,
+        is_selected,
+        state,
+        theme,
+        details_a.width as usize,
+    );
+    frame.render_widget(Paragraph::new(item), details_a);
+    state
+        .click_targets
+        .borrow_mut()
+        .push((ClickTarget::TreeRow(row_idx), details_a));
+
+    let pin_style = if op.pinned {
+        theme.running()
+    } else {
+        theme.dim()
+    };
+    frame.render_widget(Paragraph::new(Span::styled(" [P] ", pin_style)), pin_a);
+    state
+        .click_targets
+        .borrow_mut()
+        .push((ClickTarget::PinOperation(op.id.clone()), pin_a));
+
+    if !op.status.is_terminal() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(" [X] ", theme.failed())),
+            cancel_a,
+        );
+        state
+            .click_targets
+            .borrow_mut()
+            .push((ClickTarget::CancelOperation(op.id.clone()), cancel_a));
     }
 }
 
@@ -2034,33 +2152,41 @@ fn build_instance_row(
         }
     }
 
-    // Rough width guard: truncate the detail span first, then the label span if necessary.
-    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    if total > width && width > 8 {
-        let mut over = total - width;
-        // Try truncating the detail span (index 2) first
-        if spans.len() > 2 {
-            let det = spans[2].content.to_string();
-            let det_len = det.chars().count();
-            if det_len > over + 5 {
-                let keep = det_len - over;
-                spans[2] = Span::styled(truncate(&det, keep), spans[2].style);
-                over = 0;
-            } else if det_len > 5 {
-                spans[2] = Span::styled(truncate(&det, 4), spans[2].style);
-                let new_total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-                over = new_total.saturating_sub(width);
-            }
-        }
+    truncate_row_spans_to_width(&mut spans, width);
+    Line::from(spans)
+}
 
-        // If still over, truncate the label (index 1)
-        if over > 0 {
-            let lbl = spans[1].content.to_string();
-            let keep = lbl.chars().count().saturating_sub(over + 1);
-            spans[1] = Span::styled(truncate(&lbl, keep.max(4)), spans[1].style);
+/// Rough width guard: truncate the detail span first, then the label span if
+/// necessary, so the row fits within `width` columns.
+#[cfg(feature = "tui")]
+fn truncate_row_spans_to_width(spans: &mut [Span<'static>], width: usize) {
+    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total <= width || width <= 8 {
+        return;
+    }
+    let mut over = total - width;
+
+    // Try truncating the detail span (index 2) first
+    if spans.len() > 2 {
+        let det = spans[2].content.to_string();
+        let det_len = det.chars().count();
+        if det_len > over + 5 {
+            let keep = det_len - over;
+            spans[2] = Span::styled(truncate(&det, keep), spans[2].style);
+            over = 0;
+        } else if det_len > 5 {
+            spans[2] = Span::styled(truncate(&det, 4), spans[2].style);
+            let new_total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+            over = new_total.saturating_sub(width);
         }
     }
-    Line::from(spans)
+
+    // If still over, truncate the label (index 1)
+    if over > 0 {
+        let lbl = spans[1].content.to_string();
+        let keep = lbl.chars().count().saturating_sub(over + 1);
+        spans[1] = Span::styled(truncate(&lbl, keep.max(4)), spans[1].style);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -507,16 +507,17 @@ fn uninstall_agent_skills(dry_run: bool, interactive: bool) -> Result<()> {
         .ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
     for skill_dir in crate::setup::skill_install_dirs(&home) {
-        if skill_dir.exists() {
-            if dry_run {
-                println!("[dry-run] Would remove {}", skill_dir.display());
-            } else {
-                std::fs::remove_dir_all(&skill_dir)
-                    .with_context(|| format!("Failed to remove {}", skill_dir.display()))?;
-                if interactive {
-                    println!("✓ Removed agent skill directory {}", skill_dir.display());
-                }
-            }
+        if !skill_dir.exists() {
+            continue;
+        }
+        if dry_run {
+            println!("[dry-run] Would remove {}", skill_dir.display());
+            continue;
+        }
+        std::fs::remove_dir_all(&skill_dir)
+            .with_context(|| format!("Failed to remove {}", skill_dir.display()))?;
+        if interactive {
+            println!("✓ Removed agent skill directory {}", skill_dir.display());
         }
     }
 
@@ -756,28 +757,35 @@ fn purge_ahma_dir(dry_run: bool) -> Result<()> {
         println!("✓ Removed {}", ahma_dir.display());
     }
 
-    if sandbox_dir.exists() {
-        // Only remove the sandbox dir if it appears to have been created by ahma setup
-        // (i.e. is empty or only contains an ahma marker).  We do NOT forcibly delete
-        // a non-empty user directory named "sandbox".
-        let entries: Vec<_> = std::fs::read_dir(&sandbox_dir)
-            .map(|rd| rd.flatten().collect::<Vec<_>>())
-            .unwrap_or_default();
-        if entries.is_empty() {
-            let _ = std::fs::remove_dir(&sandbox_dir);
-            println!(
-                "✓ Removed empty Antigravity sandbox dir {}",
-                sandbox_dir.display()
-            );
-        } else {
-            println!(
-                "  Skipping non-empty {} — remove manually if desired.",
-                sandbox_dir.display()
-            );
-        }
-    }
+    remove_sandbox_dir_if_empty(&sandbox_dir);
 
     Ok(())
+}
+
+/// Remove the Antigravity `~/sandbox` directory, but only if it is empty.
+///
+/// Only removes the sandbox dir if it appears to have been created by ahma setup
+/// (i.e. is empty). We do NOT forcibly delete a non-empty user directory named
+/// "sandbox".
+fn remove_sandbox_dir_if_empty(sandbox_dir: &Path) {
+    if !sandbox_dir.exists() {
+        return;
+    }
+    let entries: Vec<_> = std::fs::read_dir(sandbox_dir)
+        .map(|rd| rd.flatten().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if entries.is_empty() {
+        let _ = std::fs::remove_dir(sandbox_dir);
+        println!(
+            "✓ Removed empty Antigravity sandbox dir {}",
+            sandbox_dir.display()
+        );
+    } else {
+        println!(
+            "  Skipping non-empty {} — remove manually if desired.",
+            sandbox_dir.display()
+        );
+    }
 }
 
 // ── Output ────────────────────────────────────────────────────────────────────

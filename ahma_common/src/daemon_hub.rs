@@ -658,6 +658,19 @@ impl DaemonHub {
         )
     }
 
+    /// Evict the oldest finished op once an instance's retained history grows
+    /// past the cap; a running op is never dropped.
+    fn evict_oldest_finished(inst: &mut InstanceOpHistory) {
+        if let Some(oldest) = inst
+            .iter()
+            .filter(|(_, s)| s.finished.is_some())
+            .min_by_key(|(_, s)| s.seq)
+            .map(|(k, _)| k.clone())
+        {
+            inst.remove(&oldest);
+        }
+    }
+
     /// Record an operation event so it can be replayed to subscribers that join
     /// later. Only `OpStarted`/`OpFinished` carry replayable state; other events
     /// (streaming output, log lines) are live-only and ignored here.
@@ -676,15 +689,7 @@ impl DaemonHub {
                     },
                 );
                 if inst.len() > MAX_OPS_PER_INSTANCE {
-                    // Evict the oldest finished op; never drop a running one.
-                    if let Some(oldest) = inst
-                        .iter()
-                        .filter(|(_, s)| s.finished.is_some())
-                        .min_by_key(|(_, s)| s.seq)
-                        .map(|(k, _)| k.clone())
-                    {
-                        inst.remove(&oldest);
-                    }
+                    Self::evict_oldest_finished(inst);
                 }
             }
             DaemonEvent::OpFinished { id, .. } => {
@@ -1108,85 +1113,34 @@ where
             model,
             target_instance_id,
         } => {
-            let target_id = resolve_target(&hub, target_instance_id.as_deref()).await;
-
-            // Route to the chosen instance. Every failure path must broadcast an
-            // AgentError so the TUI stops its elapsed counter and shows feedback
-            // — silently dropping the prompt leaves the user staring at a
-            // forever-incrementing timer with no answer and no error.
-            let delivered = match target_id {
-                Some(tid) => match hub.instance_txs.lock().await.get(&tid).cloned() {
-                    Some(tx) => tx
-                        .send(DaemonMsg::RunPrompt {
-                            messages,
-                            system_prompt,
-                            provider,
-                            model,
-                        })
-                        .await
-                        .is_ok(),
-                    None => false,
-                },
-                None => false,
-            };
-
-            if !delivered {
-                warn!("daemon: SubmitPrompt could not be routed — no instance available to run it");
-                let _ = hub.broadcast.send(DaemonMsg::AgentError {
-                    error: "No ahma instance is available to run the prompt. \
-                            Make sure an ahma server is connected (it normally \
-                            auto-starts); try reopening the TUI."
-                        .to_string(),
-                });
-            }
+            route_submit_prompt(
+                &hub,
+                target_instance_id,
+                messages,
+                system_prompt,
+                provider,
+                model,
+            )
+            .await
         }
 
         ClientMsg::SubmitApproval {
             id,
             approved,
             target_instance_id,
-        } => {
-            if let Some(tid) = resolve_target(&hub, target_instance_id.as_deref()).await {
-                hub.pending_approvals.lock().await.remove(&tid);
-                if let Some(tx) = hub.instance_txs.lock().await.get(&tid) {
-                    let _ = tx.send(DaemonMsg::SubmitApproval { id, approved }).await;
-                }
-            }
-        }
+        } => route_submit_approval(&hub, id, approved, target_instance_id).await,
 
         ClientMsg::SubmitScopeGrant {
             decision_id,
             decision,
             target_instance_id,
-        } => {
-            if let Some(tid) = resolve_target(&hub, target_instance_id.as_deref()).await
-                && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
-            {
-                let _ = tx
-                    .send(DaemonMsg::SubmitScopeGrant {
-                        decision_id,
-                        decision,
-                    })
-                    .await;
-            }
-        }
+        } => route_submit_scope_grant(&hub, decision_id, decision, target_instance_id).await,
 
         ClientMsg::SubmitWebApproval {
             decision_id,
             decision,
             target_instance_id,
-        } => {
-            if let Some(tid) = resolve_target(&hub, target_instance_id.as_deref()).await
-                && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
-            {
-                let _ = tx
-                    .send(DaemonMsg::SubmitWebApproval {
-                        decision_id,
-                        decision,
-                    })
-                    .await;
-            }
-        }
+        } => route_submit_web_approval(&hub, decision_id, decision, target_instance_id).await,
 
         _ => {
             debug!("daemon: unexpected message, closing connection");
@@ -1194,6 +1148,101 @@ where
     }
 
     hub.connection_count.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Route a `SubmitPrompt` to the chosen instance. Every failure path must
+/// broadcast an `AgentError` so the TUI stops its elapsed counter and shows
+/// feedback — silently dropping the prompt leaves the user staring at a
+/// forever-incrementing timer with no answer and no error.
+async fn route_submit_prompt(
+    hub: &Arc<DaemonHub>,
+    target_instance_id: Option<String>,
+    messages: Vec<DaemonChatMessage>,
+    system_prompt: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+) {
+    let target_id = resolve_target(hub, target_instance_id.as_deref()).await;
+
+    let delivered = match target_id {
+        Some(tid) => match hub.instance_txs.lock().await.get(&tid).cloned() {
+            Some(tx) => tx
+                .send(DaemonMsg::RunPrompt {
+                    messages,
+                    system_prompt,
+                    provider,
+                    model,
+                })
+                .await
+                .is_ok(),
+            None => false,
+        },
+        None => false,
+    };
+
+    if !delivered {
+        warn!("daemon: SubmitPrompt could not be routed — no instance available to run it");
+        let _ = hub.broadcast.send(DaemonMsg::AgentError {
+            error: "No ahma instance is available to run the prompt. \
+                    Make sure an ahma server is connected (it normally \
+                    auto-starts); try reopening the TUI."
+                .to_string(),
+        });
+    }
+}
+
+/// Route a `SubmitApproval` to the chosen instance, clearing the pending
+/// approval so it isn't replayed to newly-connected subscribers.
+async fn route_submit_approval(
+    hub: &Arc<DaemonHub>,
+    id: Option<String>,
+    approved: bool,
+    target_instance_id: Option<String>,
+) {
+    if let Some(tid) = resolve_target(hub, target_instance_id.as_deref()).await {
+        hub.pending_approvals.lock().await.remove(&tid);
+        if let Some(tx) = hub.instance_txs.lock().await.get(&tid) {
+            let _ = tx.send(DaemonMsg::SubmitApproval { id, approved }).await;
+        }
+    }
+}
+
+/// Route a `SubmitScopeGrant` decision back to the instance that raised it.
+async fn route_submit_scope_grant(
+    hub: &Arc<DaemonHub>,
+    decision_id: String,
+    decision: crate::scope_grant::GrantDecision,
+    target_instance_id: Option<String>,
+) {
+    if let Some(tid) = resolve_target(hub, target_instance_id.as_deref()).await
+        && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
+    {
+        let _ = tx
+            .send(DaemonMsg::SubmitScopeGrant {
+                decision_id,
+                decision,
+            })
+            .await;
+    }
+}
+
+/// Route a `SubmitWebApproval` decision back to the instance that raised it.
+async fn route_submit_web_approval(
+    hub: &Arc<DaemonHub>,
+    decision_id: String,
+    decision: crate::web_approval::WebApprovalDecision,
+    target_instance_id: Option<String>,
+) {
+    if let Some(tid) = resolve_target(hub, target_instance_id.as_deref()).await
+        && let Some(tx) = hub.instance_txs.lock().await.get(&tid)
+    {
+        let _ = tx
+            .send(DaemonMsg::SubmitWebApproval {
+                decision_id,
+                decision,
+            })
+            .await;
+    }
 }
 
 /// Resolve which instance a TUI request targets: the explicit id when given,

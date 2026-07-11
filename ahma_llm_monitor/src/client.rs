@@ -685,8 +685,6 @@ impl LlmClient {
         tools: &[Value],
         deltas: tokio::sync::mpsc::Sender<StreamDelta>,
     ) -> Result<ChatCompletionResponse, LlmMonitorError> {
-        use futures::StreamExt as _;
-
         if self.flavor != ApiFlavor::OpenAi {
             // Anthropic: keep the proven non-streaming path, but still feed the
             // visible content to the UI as one delta so it isn't silent.
@@ -744,50 +742,9 @@ impl LlmClient {
             )));
         }
 
-        let mut byte_stream = response.bytes_stream();
-        let mut buffer = String::new();
-        let mut acc = StreamingToolAccumulator::default();
-        let mut usage: Option<Value> = None;
-        let mut first_token_logged = false;
-
-        'outer: loop {
-            while let Some(line) = take_sse_line(&mut buffer) {
-                let Some(data) = line.strip_prefix("data: ") else {
-                    continue;
-                };
-                let data = data.trim();
-                if data == "[DONE]" {
-                    break 'outer;
-                }
-                let Ok(chunk) = serde_json::from_str::<Value>(data) else {
-                    continue;
-                };
-                if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
-                    usage = Some(u.clone());
-                }
-                let (content_delta, thinking_delta) = acc.push_chunk(&chunk);
-                if let Some(c) = content_delta {
-                    if !first_token_logged {
-                        first_token_logged = true;
-                        info!(model = %self.model, elapsed_ms = started.elapsed().as_millis(), "llm: first streamed token");
-                    }
-                    let _ = deltas.send(StreamDelta::Content(c)).await;
-                }
-                if let Some(t) = thinking_delta {
-                    let _ = deltas.send(StreamDelta::Thinking(t)).await;
-                }
-            }
-            match byte_stream.next().await {
-                None => break,
-                Some(Err(e)) => {
-                    warn!(model = %self.model, error = %e, "llm: streaming byte error");
-                    return Err(LlmMonitorError::Http(e));
-                }
-                Some(Ok(bytes)) => buffer.push_str(&String::from_utf8_lossy(&bytes)),
-            }
-        }
-
-        let response_json = acc.into_response_json(usage);
+        let byte_stream = response.bytes_stream();
+        let response_json =
+            drain_streaming_deltas(byte_stream, &deltas, &self.model, started).await?;
         let parsed = parse_chat_completion_response(response_json);
         if let Ok(ref resp) = parsed {
             let (prompt_tokens, completion_tokens) = resp
@@ -898,31 +855,38 @@ impl StreamingToolAccumulator {
                 s.to_string()
             });
 
-        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
-            for call in calls {
-                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                while self.tools.len() <= index {
-                    self.tools
-                        .push((String::new(), String::new(), String::new()));
-                }
-                let slot = &mut self.tools[index];
-                if let Some(id) = call.get("id").and_then(Value::as_str)
-                    && !id.is_empty()
-                {
-                    slot.0 = id.to_string();
-                }
-                if let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
-                    && !name.is_empty()
-                {
-                    slot.1 = name.to_string();
-                }
-                if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
-                    slot.2.push_str(args);
-                }
-            }
-        }
+        self.accumulate_tool_call_deltas(delta);
 
         (content, thinking)
+    }
+
+    /// Fold `delta.tool_calls` fragments (keyed by `index`) into `self.tools`,
+    /// growing the accumulator as new indices appear.
+    fn accumulate_tool_call_deltas(&mut self, delta: &Value) {
+        let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) else {
+            return;
+        };
+        for call in calls {
+            let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            while self.tools.len() <= index {
+                self.tools
+                    .push((String::new(), String::new(), String::new()));
+            }
+            let slot = &mut self.tools[index];
+            if let Some(id) = call.get("id").and_then(Value::as_str)
+                && !id.is_empty()
+            {
+                slot.0 = id.to_string();
+            }
+            if let Some(name) = call.pointer("/function/name").and_then(Value::as_str)
+                && !name.is_empty()
+            {
+                slot.1 = name.to_string();
+            }
+            if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
+                slot.2.push_str(args);
+            }
+        }
     }
 
     /// Reassemble into a `{choices:[{message}]}` JSON value (with optional
@@ -1058,6 +1022,68 @@ fn take_sse_line(buffer: &mut String) -> Option<String> {
     let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
     *buffer = buffer[newline_pos + 1..].to_string();
     Some(line)
+}
+
+/// Drain an OpenAI-compatible SSE byte stream to completion, forwarding
+/// content/thinking deltas live via `deltas`, and return the accumulated
+/// `{choices:[{message}]}` JSON (with `usage`, if seen) once the stream
+/// reaches `[DONE]` or ends.
+///
+/// Extracted from [`LlmClient::chat_completion_with_tools_streaming`] because
+/// the SSE line-buffering loop (labeled `break`, nested tool-call
+/// accumulation) is a self-contained responsibility distinct from request
+/// setup and response parsing.
+async fn drain_streaming_deltas(
+    mut byte_stream: impl Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin,
+    deltas: &tokio::sync::mpsc::Sender<StreamDelta>,
+    model: &str,
+    started: std::time::Instant,
+) -> Result<Value, LlmMonitorError> {
+    use futures::StreamExt as _;
+
+    let mut buffer = String::new();
+    let mut acc = StreamingToolAccumulator::default();
+    let mut usage: Option<Value> = None;
+    let mut first_token_logged = false;
+
+    'outer: loop {
+        while let Some(line) = take_sse_line(&mut buffer) {
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let data = data.trim();
+            if data == "[DONE]" {
+                break 'outer;
+            }
+            let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
+            if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
+                usage = Some(u.clone());
+            }
+            let (content_delta, thinking_delta) = acc.push_chunk(&chunk);
+            if let Some(c) = content_delta {
+                if !first_token_logged {
+                    first_token_logged = true;
+                    info!(model = %model, elapsed_ms = started.elapsed().as_millis(), "llm: first streamed token");
+                }
+                let _ = deltas.send(StreamDelta::Content(c)).await;
+            }
+            if let Some(t) = thinking_delta {
+                let _ = deltas.send(StreamDelta::Thinking(t)).await;
+            }
+        }
+        match byte_stream.next().await {
+            None => break,
+            Some(Err(e)) => {
+                warn!(model = %model, error = %e, "llm: streaming byte error");
+                return Err(LlmMonitorError::Http(e));
+            }
+            Some(Ok(bytes)) => buffer.push_str(&String::from_utf8_lossy(&bytes)),
+        }
+    }
+
+    Ok(acc.into_response_json(usage))
 }
 
 async fn chat_stream_poll(

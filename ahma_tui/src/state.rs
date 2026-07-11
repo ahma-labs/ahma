@@ -692,40 +692,50 @@ pub struct Operation {
     pub scope: Option<String>,
 }
 
+/// Strategy 1: pull `command` out of an embedded JSON blob in the description.
+fn parse_command_from_json(description: &str) -> Option<String> {
+    let start_idx = description.find('{')?;
+    let end_idx = description.rfind('}')?;
+    if start_idx >= end_idx {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(&description[start_idx..=end_idx]).ok()?;
+    val.get("command")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Strategy 2: parse the `Execute <cmd> in <cwd>` sentence form.
+fn parse_command_from_execute_sentence(description: &str) -> Option<String> {
+    if !description.starts_with("Execute ") {
+        return None;
+    }
+    let in_idx = description.rfind(" in ")?;
+    let cmd = &description["Execute ".len()..in_idx];
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd.to_string())
+    }
+}
+
+/// Strategy 3: derive a command-ish label from an `op_<n>_<words>` id.
+fn parse_command_from_op_id(id: &str) -> Option<String> {
+    if !id.starts_with("op_") {
+        return None;
+    }
+    let parts: Vec<&str> = id.split('_').collect();
+    if parts.len() >= 3 && parts[1].chars().all(|c| c.is_ascii_digit()) {
+        Some(parts[2..].join(" ").replace('_', " "))
+    } else {
+        None
+    }
+}
+
 fn try_parse_run_terminal_command(description: &str, id: &str) -> Option<String> {
-    let get_cmd_json = || -> Option<String> {
-        let start_idx = description.find('{')?;
-        let end_idx = description.rfind('}')?;
-        if start_idx >= end_idx {
-            return None;
-        }
-        let val: serde_json::Value =
-            serde_json::from_str(&description[start_idx..=end_idx]).ok()?;
-        val.get("command")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    };
-    if let Some(cmd) = get_cmd_json() {
-        return Some(cmd);
-    }
-
-    if description.starts_with("Execute ")
-        && let Some(in_idx) = description.rfind(" in ")
-    {
-        let cmd = &description["Execute ".len()..in_idx];
-        if !cmd.is_empty() {
-            return Some(cmd.to_string());
-        }
-    }
-
-    if id.starts_with("op_") {
-        let parts: Vec<&str> = id.split('_').collect();
-        if parts.len() >= 3 && parts[1].chars().all(|c| c.is_ascii_digit()) {
-            return Some(parts[2..].join(" ").replace('_', " "));
-        }
-    }
-
-    None
+    parse_command_from_json(description)
+        .or_else(|| parse_command_from_execute_sentence(description))
+        .or_else(|| parse_command_from_op_id(id))
 }
 
 impl Operation {
@@ -753,13 +763,18 @@ impl Operation {
         }
     }
 
+    /// Format a millisecond count as `<n>ms` below one second, else `<n>s`.
+    fn format_ms_duration(ms: u128) -> String {
+        if ms < 1000 {
+            format!("{ms}ms")
+        } else {
+            format!("{}s", ms / 1000)
+        }
+    }
+
     pub fn elapsed_display(&self) -> String {
         if let Some(ms) = self.duration_ms {
-            if ms < 1000 {
-                return format!("{ms}ms");
-            } else {
-                return format!("{}s", ms / 1000);
-            }
+            return Self::format_ms_duration(u128::from(ms));
         }
         if let (Some(start), Some(end)) = (self.started_at, self.completed_at) {
             let d = if end >= start {
@@ -767,12 +782,7 @@ impl Operation {
             } else {
                 std::time::Duration::ZERO
             };
-            let ms = d.as_millis();
-            if ms < 1000 {
-                format!("{ms}ms")
-            } else {
-                format!("{}s", d.as_secs())
-            }
+            Self::format_ms_duration(d.as_millis())
         } else {
             let secs = self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             format!("{secs}s")

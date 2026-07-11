@@ -90,126 +90,13 @@ pub fn spawn_embedded_hub_source(
                                 return; // TUI channel closed
                             }
                         }
-                        Applied::Output {
-                            instance_id,
-                            op_id,
-                            line,
-                            is_stderr,
-                        } => {
-                            if tx
-                                .send(SourceEvent::OperationOutput {
-                                    instance_id: Some(instance_id),
-                                    op_id,
-                                    line,
-                                    is_stderr,
-                                })
-                                .await
-                                .is_err()
+                        applied => {
+                            if let Some(event) = applied_to_event(applied)
+                                && tx.send(event).await.is_err()
                             {
                                 return; // TUI channel closed
                             }
                         }
-                        Applied::ChatToken(token) => {
-                            if tx.send(SourceEvent::ChatToken { token }).await.is_err() {
-                                return;
-                            }
-                        }
-                        Applied::ChatThinking(token) => {
-                            if tx.send(SourceEvent::ChatThinking { token }).await.is_err() {
-                                return;
-                            }
-                        }
-                        Applied::ApprovalRequested { id, tool, args } => {
-                            if tx
-                                .send(SourceEvent::ApprovalRequested { id, tool, args })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::ScopeGrantRequested { request } => {
-                            if tx
-                                .send(SourceEvent::ScopeGrantRequested { request })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::ScopeGrantDismiss { decision_id } => {
-                            if tx
-                                .send(SourceEvent::ScopeGrantDismiss { decision_id })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::WebApprovalRequested { request } => {
-                            if tx
-                                .send(SourceEvent::WebApprovalRequested { request })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::WebApprovalDismiss { decision_id } => {
-                            if tx
-                                .send(SourceEvent::WebApprovalDismiss { decision_id })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::AgentDone => {
-                            if tx.send(SourceEvent::AgentDone).await.is_err() {
-                                return;
-                            }
-                        }
-                        Applied::AgentError(error) => {
-                            if tx.send(SourceEvent::AgentError { error }).await.is_err() {
-                                return;
-                            }
-                        }
-                        Applied::Usage {
-                            prompt_tokens,
-                            completion_tokens,
-                            total_tokens,
-                        } => {
-                            if tx
-                                .send(SourceEvent::Usage {
-                                    prompt_tokens,
-                                    completion_tokens,
-                                    total_tokens,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::ToolCallStarted { id, name, args } => {
-                            if tx
-                                .send(SourceEvent::ToolCallStarted { id, name, args })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::ToolCallFinished { id, result, failed } => {
-                            if tx
-                                .send(SourceEvent::ToolCallFinished { id, result, failed })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::None => {}
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -484,126 +371,13 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
                                 return;
                             }
                         }
-                        Applied::Output {
-                            instance_id,
-                            op_id,
-                            line,
-                            is_stderr,
-                        } => {
-                            if tx
-                                .send(SourceEvent::OperationOutput {
-                                    instance_id: Some(instance_id),
-                                    op_id,
-                                    line,
-                                    is_stderr,
-                                })
-                                .await
-                                .is_err()
+                        applied => {
+                            if let Some(event) = applied_to_event(applied)
+                                && tx.send(event).await.is_err()
                             {
-                                return;
+                                return; // Channel closed — TUI exited.
                             }
                         }
-                        Applied::ChatToken(token) => {
-                            if tx.send(SourceEvent::ChatToken { token }).await.is_err() {
-                                return;
-                            }
-                        }
-                        Applied::ChatThinking(token) => {
-                            if tx.send(SourceEvent::ChatThinking { token }).await.is_err() {
-                                return;
-                            }
-                        }
-                        Applied::ApprovalRequested { id, tool, args } => {
-                            if tx
-                                .send(SourceEvent::ApprovalRequested { id, tool, args })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::ScopeGrantRequested { request } => {
-                            if tx
-                                .send(SourceEvent::ScopeGrantRequested { request })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::ScopeGrantDismiss { decision_id } => {
-                            if tx
-                                .send(SourceEvent::ScopeGrantDismiss { decision_id })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::WebApprovalRequested { request } => {
-                            if tx
-                                .send(SourceEvent::WebApprovalRequested { request })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::WebApprovalDismiss { decision_id } => {
-                            if tx
-                                .send(SourceEvent::WebApprovalDismiss { decision_id })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::AgentDone => {
-                            if tx.send(SourceEvent::AgentDone).await.is_err() {
-                                return;
-                            }
-                        }
-                        Applied::AgentError(error) => {
-                            if tx.send(SourceEvent::AgentError { error }).await.is_err() {
-                                return;
-                            }
-                        }
-                        Applied::Usage {
-                            prompt_tokens,
-                            completion_tokens,
-                            total_tokens,
-                        } => {
-                            if tx
-                                .send(SourceEvent::Usage {
-                                    prompt_tokens,
-                                    completion_tokens,
-                                    total_tokens,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::ToolCallStarted { id, name, args } => {
-                            if tx
-                                .send(SourceEvent::ToolCallStarted { id, name, args })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::ToolCallFinished { id, result, failed } => {
-                            if tx
-                                .send(SourceEvent::ToolCallFinished { id, result, failed })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        Applied::None => {}
                     }
                 }
                 Err(e) => {
@@ -791,6 +565,63 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Translate an [`Applied`] outcome into the [`SourceEvent`] the TUI should
+/// receive, or `None` when nothing should be forwarded.
+///
+/// `Applied::ListChanged` is handled separately by callers because it needs
+/// access to `DaemonState::all_ops()` (and, in [`daemon_source_task`], a
+/// prune counter) rather than data carried on the `Applied` value itself.
+fn applied_to_event(applied: Applied) -> Option<SourceEvent> {
+    match applied {
+        Applied::None | Applied::ListChanged => None,
+        Applied::Output {
+            instance_id,
+            op_id,
+            line,
+            is_stderr,
+        } => Some(SourceEvent::OperationOutput {
+            instance_id: Some(instance_id),
+            op_id,
+            line,
+            is_stderr,
+        }),
+        Applied::ChatToken(token) => Some(SourceEvent::ChatToken { token }),
+        Applied::ChatThinking(token) => Some(SourceEvent::ChatThinking { token }),
+        Applied::ApprovalRequested { id, tool, args } => {
+            Some(SourceEvent::ApprovalRequested { id, tool, args })
+        }
+        Applied::ScopeGrantRequested { request } => {
+            Some(SourceEvent::ScopeGrantRequested { request })
+        }
+        Applied::ScopeGrantDismiss { decision_id } => {
+            Some(SourceEvent::ScopeGrantDismiss { decision_id })
+        }
+        Applied::WebApprovalRequested { request } => {
+            Some(SourceEvent::WebApprovalRequested { request })
+        }
+        Applied::WebApprovalDismiss { decision_id } => {
+            Some(SourceEvent::WebApprovalDismiss { decision_id })
+        }
+        Applied::AgentDone => Some(SourceEvent::AgentDone),
+        Applied::AgentError(error) => Some(SourceEvent::AgentError { error }),
+        Applied::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        } => Some(SourceEvent::Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        }),
+        Applied::ToolCallStarted { id, name, args } => {
+            Some(SourceEvent::ToolCallStarted { id, name, args })
+        }
+        Applied::ToolCallFinished { id, result, failed } => {
+            Some(SourceEvent::ToolCallFinished { id, result, failed })
+        }
+    }
+}
 
 fn parse_op_status(s: &str) -> OpStatus {
     match s {

@@ -446,17 +446,19 @@ fn sniff_platform(args: &[String]) -> Option<HookPlatform> {
             None
         };
         if let Some(v) = val {
-            return match v.as_str() {
-                "cursor" => Some(HookPlatform::Cursor),
-                "claude" => Some(HookPlatform::Claude),
-                "codex" => Some(HookPlatform::Codex),
-                "copilot" => Some(HookPlatform::Copilot),
-                "antigravity" => Some(HookPlatform::Antigravity),
-                _ => None,
-            };
+            return parse_platform_cli_name(&v);
         }
     }
     None
+}
+
+/// Resolve a `--platform` CLI value (e.g. `"cursor"`) to its [`HookPlatform`],
+/// reusing [`HookPlatform::cli_name`] as the single source of truth so this and
+/// clap's own `ValueEnum` parsing can never drift apart.
+fn parse_platform_cli_name(value: &str) -> Option<HookPlatform> {
+    HookPlatform::all()
+        .into_iter()
+        .find(|p| p.cli_name() == value)
 }
 
 /// `ahma hooks approve-unsandboxed` — grant session-scoped consent (R5.5.3).
@@ -779,6 +781,24 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
     // tell these apart.
     let active_mcps = detect_active_mcp_configs();
     let (active, reason) = describe_activation(&active_mcps);
+    print_effective_activation_banner(active, &reason);
+
+    println!("{:<14} {:<8} {:<14} Config", "Platform", "Scope", "Status");
+    println!("{:-<14} {:-<8} {:-<14} {:-<6}", "", "", "", "");
+
+    let installed_hooks = print_hook_status_rows(&env, &scopes, &args.platforms)?;
+
+    if !installed_hooks.is_empty() && !active_mcps.is_empty() {
+        print_hooks_mcp_coexistence_note(&installed_hooks, &active_mcps);
+    }
+
+    Ok(())
+}
+
+/// Print the "Effective: ACTIVE/INACTIVE" banner shown at the top of `hooks status`.
+/// Split out of [`run_status`] so that function reads as a sequence of steps rather
+/// than an if/else concentrated alongside the status-table loop.
+fn print_effective_activation_banner(active: bool, reason: &str) {
     if active {
         println!(
             "\x1b[1mEffective: \x1b[32mACTIVE\x1b[0m\x1b[1m\x1b[0m ({reason}) — installed hooks route shell commands through ahma's sandbox.\n"
@@ -788,18 +808,22 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
             "\x1b[1mEffective: \x1b[33mINACTIVE\x1b[0m ({reason}) — installed hooks pass commands through to the default terminal \x1b[1mUNSANDBOXED\x1b[0m.\n      Force on with AHMA_HOOKS=on, or fix ahma's MCP config so `auto` detects it.\n"
         );
     }
+}
 
-    println!("{:<14} {:<8} {:<14} Config", "Platform", "Scope", "Status");
-    println!("{:-<14} {:-<8} {:-<14} {:-<6}", "", "", "", "");
-
+/// Print one status row per (scope, platform) pair and return the ones that are
+/// installed. Split out of [`run_status`] so the nested scope/platform loop is a
+/// single self-contained step in that function's flow.
+fn print_hook_status_rows(
+    env: &HookEnvironment,
+    scopes: &[HookScope],
+    requested_platforms: &[HookPlatform],
+) -> Result<Vec<(HookPlatform, HookScope, PathBuf)>> {
     let mut installed_hooks = Vec::new();
-    let mut installed_count = 0;
-    for scope in scopes {
-        for platform in selected_platforms(&args.platforms) {
+    for &scope in scopes {
+        for platform in selected_platforms(requested_platforms) {
             let path = env.config_path(platform, scope);
             let status = hook_status_string(&path, platform)?;
             if status == "installed" {
-                installed_count += 1;
                 installed_hooks.push((platform, scope, path.clone()));
             }
             println!(
@@ -811,12 +835,7 @@ fn run_status(args: HooksStatusArgs) -> Result<()> {
             );
         }
     }
-
-    if installed_count > 0 && !active_mcps.is_empty() {
-        print_hooks_mcp_coexistence_note(&installed_hooks, &active_mcps);
-    }
-
-    Ok(())
+    Ok(installed_hooks)
 }
 
 /// Print the explanatory note shown when terminal hooks AND an ahma MCP server are
@@ -941,38 +960,41 @@ fn run_observe(_args: HooksObserveArgs) -> Result<()> {
 /// payload. Cursor's `afterShellExecution` payload shape is not contractually
 /// fixed, so this reads defensively from the keys that have carried command text
 /// (top-level and a nested `tool_output` object), concatenating any it finds.
+const COMMAND_OUTPUT_KEYS: &[&str] = &[
+    "output",
+    "stdout",
+    "stderr",
+    "result",
+    "outputText",
+    "text",
+    "error",
+];
+
 fn extract_command_output(input: &Value) -> String {
-    const KEYS: &[&str] = &[
-        "output",
-        "stdout",
-        "stderr",
-        "result",
-        "outputText",
-        "text",
-        "error",
-    ];
-
-    fn collect_from(object: &Map<String, Value>, into: &mut String) {
-        for key in KEYS {
-            if let Some(s) = object.get(*key).and_then(Value::as_str)
-                && !s.is_empty()
-            {
-                if !into.is_empty() {
-                    into.push('\n');
-                }
-                into.push_str(s);
-            }
-        }
-    }
-
     let mut combined = String::new();
     if let Some(object) = input.as_object() {
-        collect_from(object, &mut combined);
+        collect_command_output_fields(object, &mut combined);
         if let Some(nested) = object.get("tool_output").and_then(Value::as_object) {
-            collect_from(nested, &mut combined);
+            collect_command_output_fields(nested, &mut combined);
         }
     }
     combined
+}
+
+/// Append the text found under any of [`COMMAND_OUTPUT_KEYS`] in `object` to `into`,
+/// newline-joined. Split out of [`extract_command_output`] so the two levels of the
+/// payload (top-level and nested `tool_output`) share one code path.
+fn collect_command_output_fields(object: &Map<String, Value>, into: &mut String) {
+    for key in COMMAND_OUTPUT_KEYS {
+        if let Some(s) = object.get(*key).and_then(Value::as_str)
+            && !s.is_empty()
+        {
+            if !into.is_empty() {
+                into.push('\n');
+            }
+            into.push_str(s);
+        }
+    }
 }
 
 /// Whether the finished command should be treated as failed. An explicit non-zero

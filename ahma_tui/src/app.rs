@@ -3267,6 +3267,53 @@ fn handle_window_finished_event(
     }
 }
 
+/// Merge freshly discovered external MCP tools into the active tools list,
+/// deduping by name and re-sorting, then notify the user in chat.
+#[cfg(feature = "tui")]
+fn handle_external_tools_refreshed(
+    manager: crate::mcp_connections::McpConnectionManager,
+    state: &mut crate::state::AppState,
+) {
+    state.mcp_connections = manager;
+    let mut merged = state.tools_list.clone();
+    for tool in state.mcp_connections.aggregate_tools() {
+        if !merged.iter().any(|existing| existing.name == tool.name) {
+            merged.push(tool);
+        }
+    }
+    merged.sort_by(|a, b| a.name.cmp(&b.name));
+    state.tools_list = merged;
+    push_assistant_message(state, "External MCP tools refreshed.");
+}
+
+/// Build an `ApprovalGate` for a requested tool call and hand it to
+/// `AppState::request_approval`. Shared by the daemon-hub (`SourceEvent`)
+/// and in-process (`BridgeEvent`) approval-request paths, which differ only
+/// in whether a responder channel is present.
+#[cfg(feature = "tui")]
+fn request_tool_approval(
+    state: &mut crate::state::AppState,
+    id: String,
+    tool: String,
+    args: String,
+    responder: Option<tokio::sync::oneshot::Sender<bool>>,
+) {
+    let diff = if tool.contains("replace") || tool == "write_file" {
+        serde_json::from_str::<serde_json::Value>(&args)
+            .ok()
+            .and_then(|val| serde_json::to_string_pretty(&val).ok())
+    } else {
+        None
+    };
+    let note = ahma_core::approvals::reask_note(std::path::Path::new(&state.workspace), &tool);
+    state.request_approval(
+        crate::state::ApprovalGate::new(id, tool.clone(), format!("Execute tool {tool}"))
+            .with_note(note)
+            .with_diff(diff),
+        responder,
+    );
+}
+
 #[cfg(feature = "tui")]
 fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate::state::AppState) {
     use crate::llm_bridge::BridgeEvent;
@@ -3361,34 +3408,10 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             handle_model_refreshed(base_url, models, state);
         }
         BridgeEvent::ExternalToolsRefreshed { manager } => {
-            state.mcp_connections = manager;
-            let mut merged = state.tools_list.clone();
-            for tool in state.mcp_connections.aggregate_tools() {
-                if !merged.iter().any(|existing| existing.name == tool.name) {
-                    merged.push(tool);
-                }
-            }
-            merged.sort_by(|a, b| a.name.cmp(&b.name));
-            state.tools_list = merged;
-            push_assistant_message(state, "External MCP tools refreshed.");
+            handle_external_tools_refreshed(manager, state);
         }
         BridgeEvent::RequestApproval { id, tool, args, tx } => {
-            let diff = if tool.contains("replace") || tool == "write_file" {
-                serde_json::from_str::<serde_json::Value>(&args)
-                    .ok()
-                    .and_then(|val| serde_json::to_string_pretty(&val).ok())
-            } else {
-                None
-            };
-
-            let note =
-                ahma_core::approvals::reask_note(std::path::Path::new(&state.workspace), &tool);
-            state.request_approval(
-                crate::state::ApprovalGate::new(id, tool.clone(), format!("Execute tool {tool}"))
-                    .with_note(note)
-                    .with_diff(diff),
-                Some(tx),
-            );
+            request_tool_approval(state, id, tool, args, Some(tx));
         }
     }
 }
@@ -3759,21 +3782,7 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             state.chat_scroll = 0;
         }
         SourceEvent::ApprovalRequested { id, tool, args } => {
-            let diff = if tool.contains("replace") || tool == "write_file" {
-                serde_json::from_str::<serde_json::Value>(&args)
-                    .ok()
-                    .and_then(|val| serde_json::to_string_pretty(&val).ok())
-            } else {
-                None
-            };
-            let note =
-                ahma_core::approvals::reask_note(std::path::Path::new(&state.workspace), &tool);
-            state.request_approval(
-                crate::state::ApprovalGate::new(id, tool.clone(), format!("Execute tool {tool}"))
-                    .with_note(note)
-                    .with_diff(diff),
-                None,
-            );
+            request_tool_approval(state, id, tool, args, None);
         }
         SourceEvent::ScopeGrantRequested { request } => {
             // A grant prompt never overwrites a different pending one silently; the
