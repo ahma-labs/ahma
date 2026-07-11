@@ -84,6 +84,8 @@ tokio = { version = "1.52", features = ["test-util"] }
 wiremock = "0.6"
 
 [features]
+# Selects the Android/Kotlin test group in CI (`--features android`).
+# Gates no library code; retained solely as the CI test selector.
 android = []
 # Code complexity analysis: depends on rust-code-analysis,
 # so it stays behind a feature gate for lean builds.
@@ -94,11 +96,7 @@ simplify = [
 	"dep:rust-code-analysis",
 	"dep:walkdir",
 ]
-# HTML artifact channel (interactive output with embedded LLM chat).
-artifact = []
-# Per-task egress HTTP proxy with domain allowlist.
-egress = []
-default = ["android", "egress", "artifact"]
+default = ["android"]
 
 # Integration tests that require non-default features
 [[test]]

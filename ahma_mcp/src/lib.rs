@@ -119,8 +119,6 @@ pub mod livelog;
 pub mod llm_service;
 /// Live log monitoring for streaming processes.
 pub mod log_monitor;
-/// Logging helpers for the core crate.
-pub mod logging;
 /// MCP client connection manager and auto-discovery.
 pub mod mcp_client;
 /// MCP server implementation.
@@ -183,9 +181,6 @@ pub mod validation;
 
 /// Egress sandbox: per-task HTTP proxy with domain allowlist.
 pub mod egress;
-
-/// HTML artifact channel: interactive output with embedded LLM chat.
-pub mod artifact;
 
 /// Bundle signing and supply-chain auditor.
 pub mod bundle;
