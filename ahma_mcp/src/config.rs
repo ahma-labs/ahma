@@ -125,36 +125,24 @@ pub struct ToolConfig {
     pub monitor_stream: Option<String>,
     /// Tool type classifier. Defaults to `Command` for normal CLI tools.
     /// Set to `Livelog` for long-running log-streaming tools that pipe output through an LLM.
-    /// Tool types implemented in separate AGPL-licensed crates (e.g. `decompose`, `worker`)
-    /// are deserialized as `Extension` and their configurations stored in the matching
-    /// opaque JSON fields below.
+    /// Any other `tool_type` string deserializes as `Extension`; its configuration block is
+    /// preserved in the flattened `extra` map and routed to a handler registered at runtime
+    /// via `register_extension_handler` (see `get_extension_key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_type: Option<ToolType>,
     /// Live log monitoring configuration. Required when `tool_type` is `Livelog`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub livelog: Option<LivelogConfig>,
-    /// Decompose orchestration configuration (opaque — parsed by `ahma_decompose` crate).
-    /// Required when `tool_type` is `decompose`; stored as raw JSON for GPL-crate consumption.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decompose: Option<serde_json::Value>,
-    /// Worker synthesis configuration (opaque — parsed by `ahma_worker` crate).
-    /// Required when `tool_type` is `worker`; stored as raw JSON for GPL-crate consumption.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker: Option<serde_json::Value>,
-    /// Task tree configuration (opaque — parsed by `ahma_task_tree` crate).
-    /// Required when `tool_type` is `task_tree`; stored as raw JSON for GPL-crate consumption.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_tree: Option<serde_json::Value>,
 }
 
 /// Classifier that determines how the MCP service routes a tool invocation.
 ///
 /// The permissive `ahma_mcp` library handles `Command` and `Livelog` natively.
-/// Tool types implemented in the AGPL-licensed sibling crates (`ahma_decompose`,
-/// `ahma_worker`, etc.) are serialised to their JSON names (e.g. `"decompose"`,
-/// `"worker"`) and round-trip correctly — they are just stored as `Extension`
-/// in this enum so the MIT library has no compile-time dependency on AGPL code.
-/// `ahma_bin` routes those calls to the appropriate AGPL crate at runtime.
+/// Any other `tool_type` string deserializes to `Extension`, keeping the MIT
+/// library free of compile-time dependencies on out-of-tree handlers. An
+/// `Extension` tool's configuration block round-trips through the flattened
+/// `extra` map and is dispatched to a handler registered at runtime via
+/// `register_extension_handler`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolType {
@@ -163,8 +151,9 @@ pub enum ToolType {
     Command,
     /// Long-running log source piped through an LLM for issue detection.
     Livelog,
-    /// Any tool type implemented outside this crate (e.g. `decompose`, `worker`).
-    /// The raw `tool_type` string is preserved for routing by the AGPL binary crates.
+    /// Any tool type implemented outside this crate, dispatched to a
+    /// runtime-registered extension handler. The raw `tool_type` string and its
+    /// config block are preserved in `extra`.
     #[serde(other)]
     Extension,
 }

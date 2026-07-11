@@ -973,67 +973,16 @@ The `source_command` executes inside the same sandbox scope as all other tools (
 
 ---
 
-### 5.6 Decompose Tool Type
+### 5.6 Removed tool types (`decompose`, `worker`, `task_tree`)
 
-Set `"tool_type": "decompose"` to split a complex business question into smaller sub-questions, dispatch each to a local LLM, and aggregate the results with a deterministic Rust reducer.  **No cloud egress required** — uses the same `LlmProviderConfig` as `livelog`.
-
-#### Fields
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `tool_type` | No | `"command"` | Set to `"decompose"` to activate |
-| `decompose` | Yes (when `tool_type=decompose`) | — | `DecomposeConfig` block |
-
-**`DecomposeConfig` fields:**
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `llm_provider` | Yes | — | `LlmProviderConfig` — prefer small local models (`gemma3:4b`, `llama3.2:3b`) |
-| `max_subtasks` | No | `5` | Maximum sub-questions to generate |
-| `max_concurrent` | No | `3` | Sub-questions to run concurrently (keep low for single-machine Ollama) |
-| `reduce_mode` | No | `"summarize"` | How to combine results: `summarize`, `extract_fields`, `classify`, `concat`, `first` |
-| `answer_prompt` | No | `"Answer concisely"` | System prompt for each sub-question LLM call |
-| `llm_timeout_seconds` | No | `30` | Timeout per LLM call |
-
-#### Pipeline
-
-1. `tools/call` returns an `operation_id` immediately.
-2. The orchestrator asks the LLM to split the question into up to `max_subtasks` sub-questions.
-3. Sub-questions are dispatched in batches of `max_concurrent` to the LLM.
-4. Results are aggregated by the deterministic `Reducer` (no additional LLM call).
-5. The aggregated answer is pushed as a `ProgressUpdate` notification.
-
-#### Example (`.ahma/decompose.json`)
-
-See the ready-to-use config in [`.ahma/decompose.json`](.ahma/decompose.json).
-
----
-
-### 5.7 Worker Tool Type
-
-Set `"tool_type": "worker"` to compile and run synthesized Rust or Python code inside a sub-vault.  The synthesized program is deterministic code — it cannot be re-injected mid-run.
-
-#### Fields
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `tool_type` | No | `"command"` | Set to `"worker"` to activate |
-| `worker` | Yes (when `tool_type=worker`) | — | `WorkerConfig` block |
-
-**`WorkerConfig` fields:**
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| `language` | No | `"rust"` | `"rust"` (requires `rustc`) or `"python"` (requires `python3`) |
-| `extra_args` | No | `[]` | Additional compiler / interpreter arguments |
-| `keep_source` | No | `false` | Retain the synthesized source file after execution |
-| `timeout_seconds` | No | `60` | Execution timeout |
-
-#### Security properties
-
-- Worker executes inside the vault's `workdir/` kernel sandbox scope.
-- Source hash (SHA-256-like digest) is recorded in `audit.jsonl`.
-- Source is deleted after execution unless `keep_source: true`.
+The `decompose`, `worker`, and `task_tree` MTDF tool types were removed. Their
+implementing crates (`ahma_decompose`, `ahma_worker`, and the `ahma_task_tree`
+orchestrator) were deleted because nothing in the shipped product dispatched
+them — no handler was registered and no example config shipped. The generic
+`Extension` tool-type mechanism (a runtime-registered handler resolved from a
+tool's `tool_type` string; see `register_extension_handler` /
+`get_extension_key`) remains available for out-of-tree handlers. Recover the
+removed crates from git history if these roadmap features are revived.
 
 ---
 

@@ -1856,15 +1856,6 @@ impl AhmaMcpService {
         if config.tool_type != Some(crate::config::ToolType::Extension) {
             return None;
         }
-        if config.task_tree.is_some() {
-            return Some("task_tree".to_string());
-        }
-        if config.decompose.is_some() {
-            return Some("decompose".to_string());
-        }
-        if config.worker.is_some() {
-            return Some("worker".to_string());
-        }
         let handlers = self.extension_handlers.read().unwrap();
         for key in config.extra.keys() {
             if handlers.contains_key(key) {
@@ -3459,29 +3450,20 @@ mod tests {
     // ==================== extension key / registration ====================
 
     #[tokio::test]
-    async fn get_extension_key_for_builtin_extension_types() {
+    async fn get_extension_key_none_without_registered_handler() {
         let service = make_service().await;
 
+        // A plain command tool is never an extension.
         let plain = cfg_from(json!({"name": "t", "description": "d", "command": "c"}));
         assert_eq!(service.get_extension_key(&plain), None);
 
-        let tt = cfg_from(json!({
+        // An extension tool whose key has no registered handler resolves to None
+        // (there are no hardcoded built-in extension keys).
+        let ext = cfg_from(json!({
             "name": "t", "description": "d", "command": "c",
-            "tool_type": "ext", "task_tree": {}
+            "tool_type": "ext", "some_ext": {}
         }));
-        assert_eq!(service.get_extension_key(&tt).as_deref(), Some("task_tree"));
-
-        let dc = cfg_from(json!({
-            "name": "t", "description": "d", "command": "c",
-            "tool_type": "ext", "decompose": {}
-        }));
-        assert_eq!(service.get_extension_key(&dc).as_deref(), Some("decompose"));
-
-        let wk = cfg_from(json!({
-            "name": "t", "description": "d", "command": "c",
-            "tool_type": "ext", "worker": {}
-        }));
-        assert_eq!(service.get_extension_key(&wk).as_deref(), Some("worker"));
+        assert_eq!(service.get_extension_key(&ext), None);
     }
 
     struct DummyExtHandler;

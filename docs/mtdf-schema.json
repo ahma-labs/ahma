@@ -109,7 +109,7 @@
       ]
     },
     "tool_type": {
-      "description": "Tool type classifier. Defaults to `Command` for normal CLI tools.\nSet to `Livelog` for long-running log-streaming tools that pipe output through an LLM.\nTool types implemented in separate AGPL-licensed crates (e.g. `decompose`, `worker`)\nare deserialized as `Extension` and their configurations stored in the matching\nopaque JSON fields below.",
+      "description": "Tool type classifier. Defaults to `Command` for normal CLI tools.\nSet to `Livelog` for long-running log-streaming tools that pipe output through an LLM.\nAny other `tool_type` string deserializes as `Extension`; its configuration block is\npreserved in the flattened `extra` map and routed to a handler registered at runtime\nvia `register_extension_handler` (see `get_extension_key`).",
       "anyOf": [
         {
           "$ref": "#/$defs/ToolType"
@@ -129,15 +129,6 @@
           "type": "null"
         }
       ]
-    },
-    "decompose": {
-      "description": "Decompose orchestration configuration (opaque — parsed by `ahma_decompose` crate).\nRequired when `tool_type` is `decompose`; stored as raw JSON for GPL-crate consumption."
-    },
-    "worker": {
-      "description": "Worker synthesis configuration (opaque — parsed by `ahma_worker` crate).\nRequired when `tool_type` is `worker`; stored as raw JSON for GPL-crate consumption."
-    },
-    "task_tree": {
-      "description": "Task tree configuration (opaque — parsed by `ahma_task_tree` crate).\nRequired when `tool_type` is `task_tree`; stored as raw JSON for GPL-crate consumption."
     }
   },
   "additionalProperties": true,
@@ -488,7 +479,7 @@
       "additionalProperties": false
     },
     "ToolType": {
-      "description": "Classifier that determines how the MCP service routes a tool invocation.\n\nThe permissive `ahma_mcp` library handles `Command` and `Livelog` natively.\nTool types implemented in the AGPL-licensed sibling crates (`ahma_decompose`,\n`ahma_worker`, etc.) are serialised to their JSON names (e.g. `\"decompose\"`,\n`\"worker\"`) and round-trip correctly — they are just stored as `Extension`\nin this enum so the MIT library has no compile-time dependency on AGPL code.\n`ahma_bin` routes those calls to the appropriate AGPL crate at runtime.",
+      "description": "Classifier that determines how the MCP service routes a tool invocation.\n\nThe permissive `ahma_mcp` library handles `Command` and `Livelog` natively.\nAny other `tool_type` string deserializes to `Extension`, keeping the MIT\nlibrary free of compile-time dependencies on out-of-tree handlers. An\n`Extension` tool's configuration block round-trips through the flattened\n`extra` map and is dispatched to a handler registered at runtime via\n`register_extension_handler`.",
       "oneOf": [
         {
           "description": "Normal command-line tool (default).",
@@ -501,7 +492,7 @@
           "const": "livelog"
         },
         {
-          "description": "Any tool type implemented outside this crate (e.g. `decompose`, `worker`).\nThe raw `tool_type` string is preserved for routing by the AGPL binary crates.",
+          "description": "Any tool type implemented outside this crate, dispatched to a\nruntime-registered extension handler. The raw `tool_type` string and its\nconfig block are preserved in `extra`.",
           "type": "string",
           "const": "extension"
         }
