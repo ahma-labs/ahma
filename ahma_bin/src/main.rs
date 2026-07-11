@@ -63,12 +63,6 @@ async fn main() -> Result<()> {
     let _telemetry_guard =
         init_logging_with_observability("info", !log_to_stderr, Some(cfg.observability.clone()))?;
 
-    // Register the task tree extension handler
-    ahma_mcp::register_global_extension_handler(
-        "task_tree".to_string(),
-        std::sync::Arc::new(ahma_task_tree::TaskTreeExtensionHandler),
-    );
-
     // Register the global prompt runner from ahma_core
     ahma_mcp::register_global_prompt_runner(std::sync::Arc::new(
         ahma_core::agent::CorePromptRunner,

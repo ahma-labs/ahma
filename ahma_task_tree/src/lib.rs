@@ -1,21 +1,18 @@
-//! # ahma_task_tree — Recursive task decomposition and execution
+//! # ahma_task_tree — Task planning prompt + step parsing
 //!
-//! This crate implements depth-first task tree execution, interleaving planning
-//! reasoning with local tool execution, while dynamically scoping filesystem,
-//! tool, and network access.
+//! This crate provides the planning-prompt builder and the LLM-plan step
+//! parser used by the `ahma tui` local-model planning flow. The recursive
+//! task-tree execution orchestrator that once lived here was removed because
+//! nothing in the shipped product invoked it (no `tool_type: task_tree` config
+//! ships and no handler is registered); recover it from git history if that
+//! roadmap feature is revived.
 //!
 //! ## License
 //!
 //! This crate is licensed under **AGPL-3.0-or-later**.
 
-pub mod config;
-pub mod handler;
-pub mod orchestrator;
 pub mod parser;
 pub mod prompt;
-pub mod tree;
 
-pub use config::{LlmProviderConfig, TaskTreeConfig};
-pub use handler::TaskTreeExtensionHandler;
-pub use orchestrator::TaskTreeOrchestrator;
-pub use tree::{NodeId, NodeResult, NodeState, TaskNode, TaskTree, TaskType};
+pub use parser::{ParsedStep, parse_steps};
+pub use prompt::build_planning_prompt;

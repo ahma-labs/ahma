@@ -305,20 +305,11 @@ name = "ahma_task_tree"
 version = "0.15.6"
 dependencies = [
  "ahma_common",
- "ahma_llm_monitor",
- "ahma_mcp",
- "ahma_vault",
  "anyhow",
- "async-trait",
- "dunce",
- "futures",
- "rmcp",
- "schemars 1.2.1",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
  "uuid",
  "wiremock",
 ]
