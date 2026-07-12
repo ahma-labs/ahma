@@ -31,9 +31,8 @@ impl Sandbox {
         let system_rules = self.get_macos_system_rules();
         let credential_deny_rules = self.get_macos_credential_deny_rules();
         let keychain_rules = self.get_macos_keychain_rules();
-        let user_tool_rules = self.get_macos_user_tool_rules();
+        let profile_rules = self.get_macos_profile_rules();
         let temp_rules = self.get_macos_temp_rules();
-        let pkg_cache_rules = self.get_macos_package_cache_write_rules();
         let network_rules = self.get_macos_network_rules();
 
         let profile = format!(
@@ -42,9 +41,9 @@ impl Sandbox {
 (allow process*)
 (allow signal)
 (allow sysctl-read)
-{system_rules}{credential_deny_rules}{keychain_rules}{user_tool_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
+{system_rules}{credential_deny_rules}{keychain_rules}{profile_rules}{scope_rules}{read_scopes_rules}(allow file-read* (subpath "{working_dir}"))
 (allow file-write* (subpath "{working_dir}"))
-{pkg_cache_rules}{temp_rules}(allow file-read* (literal "/dev/null"))
+{temp_rules}(allow file-read* (literal "/dev/null"))
 (allow file-write* (literal "/dev/null"))
 (allow file-read* (literal "/dev/tty"))
 (allow file-write* (literal "/dev/tty"))
@@ -57,10 +56,9 @@ impl Sandbox {
             system_rules = system_rules,
             credential_deny_rules = credential_deny_rules,
             keychain_rules = keychain_rules,
-            user_tool_rules = user_tool_rules,
+            profile_rules = profile_rules,
             scope_rules = scope_rules,
             read_scopes_rules = read_scopes_rules,
-            pkg_cache_rules = pkg_cache_rules,
             temp_rules = temp_rules,
             network_rules = network_rules,
         );
@@ -188,54 +186,41 @@ impl Sandbox {
         "(allow file-read*)\n".to_string()
     }
 
-    fn get_macos_user_tool_rules(&self) -> String {
-        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
-        let home_path = std::path::Path::new(&home_dir);
-        let mut rules = String::new();
-
-        let tool_paths = [".cargo", ".rustup"];
-        for tool in &tool_paths {
-            let path = home_path.join(tool);
-            if path.exists() {
-                rules.push_str(&format!(
-                    "(allow file-read* (subpath \"{}\"))\n",
-                    path.display()
-                ));
-            }
-        }
-        rules
-    }
-
-    /// Generate macOS Seatbelt write rules for package-manager caches.
+    /// Emit the rules contributed by the enabled sandbox **profiles**
+    /// (SPEC R-PERM.5) — what used to be two hard-coded path arrays plus a
+    /// cargo-shaped writable set in `pkg_cache.rs`.
     ///
-    /// When `package_cache_write` is enabled (the default), grants `file-write*`
-    /// for `registry/`, `git/`, and the two cargo lock files.  Sensitive paths
-    /// (`bin/`, `config.toml`, `credentials.toml`) receive no write rule and
-    /// remain under the existing global `file-read*` rule only.
-    fn get_macos_package_cache_write_rules(&self) -> String {
-        if !self.package_cache_write {
-            return String::new();
-        }
+    /// On macOS the *read* rules are largely redundant: `get_macos_system_rules`
+    /// already grants blanket `file-read*` because APFS firmlinks defeat read
+    /// subpath matching (a platform limitation disclosed by
+    /// [`profiles::macos_read_disclosure`]). They are emitted anyway, so the two
+    /// backends express the same profile identically and a future macOS that can
+    /// scope reads gets correct behavior for free rather than a silent hole.
+    ///
+    /// The *write* rules are the ones that matter here: without them `cargo add`
+    /// fails inside the sandbox, and the obvious workaround — granting all of
+    /// `~/.cargo` — would hand over `credentials.toml` and write access to every
+    /// binary on the user's PATH.
+    fn get_macos_profile_rules(&self) -> String {
+        use super::profiles::{RuleKind, applicable_rules};
 
-        use super::pkg_cache::{all_writable_package_cache_paths, pre_create_package_cache_paths};
-
+        let enabled = ahma_common::config::AhmaSettings::load().sandbox.profiles;
         let mut rules = String::new();
-        for cache in all_writable_package_cache_paths() {
-            pre_create_package_cache_paths(&cache);
 
-            for dir in &cache.writable_dirs {
-                rules.push_str(&format!(
-                    "(allow file-write* (subpath \"{}\"))\n",
-                    dir.display()
-                ));
-            }
-            for file in &cache.writable_files {
-                if file.exists() {
-                    rules.push_str(&format!(
-                        "(allow file-write* (literal \"{}\"))\n",
-                        file.display()
-                    ));
-                }
+        for rule in applicable_rules(&enabled, self.package_cache_write) {
+            let target = match rule.kind {
+                RuleKind::Dir => format!("(subpath \"{}\")", rule.path.display()),
+                RuleKind::File => format!("(literal \"{}\")", rule.path.display()),
+            };
+            // Read and write go out as *separate* rules rather than one combined
+            // `(allow file-read* file-write* …)`. Semantically identical, but this
+            // is byte-for-byte the SBPL the hard-coded lists used to produce — which
+            // keeps this a refactor of *where the paths come from*, not a rewrite of
+            // what the kernel is told, and lets the existing profile-text tests go on
+            // guarding it unchanged.
+            rules.push_str(&format!("(allow file-read* {target})\n"));
+            if rule.access.is_write() {
+                rules.push_str(&format!("(allow file-write* {target})\n"));
             }
         }
         rules

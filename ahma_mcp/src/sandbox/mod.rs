@@ -51,8 +51,8 @@ pub mod host_detect;
 #[cfg(target_os = "linux")]
 mod landlock;
 pub mod permission_broker;
-pub(crate) mod pkg_cache;
 mod prerequisites;
+pub mod profiles;
 mod scope_lock;
 mod scopes;
 #[cfg(target_os = "macos")]

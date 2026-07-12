@@ -1,0 +1,12 @@
+# Node.js toolchain sandbox profile.
+name = "node"
+description = "Node.js toolchain: nvm-installed runtimes and the npm cache"
+deny_write = []
+
+[[rules]]
+path = "~/.nvm"
+access = "rx"
+
+[[rules]]
+path = "~/.npm"
+access = "rx"

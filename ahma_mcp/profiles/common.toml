@@ -1,0 +1,11 @@
+# Shared cache directory used by many toolchains (XDG cache home).
+#
+# Not tied to one ecosystem, which is exactly why it is its own profile: a user
+# who wants ahma's sandbox as tight as possible can disable it alone.
+name = "common"
+description = "Shared XDG cache directory (~/.cache), read-only"
+deny_write = []
+
+[[rules]]
+path = "${XDG_CACHE_HOME:-~/.cache}"
+access = "rx"

@@ -593,6 +593,8 @@ fn print_permissions(
         println!();
         println!("ahma asks for a permission when — and only when — the sandbox actually blocks");
         println!("something. Nothing here means nothing has needed one yet.");
+        println!();
+        print_profiles(settings);
         return Ok(());
     }
 
@@ -631,11 +633,55 @@ fn print_permissions(
         println!();
     }
 
+    print_profiles(settings);
+
     println!("This file lives outside every sandbox scope, so a sandboxed command can neither");
     println!(
         "read it nor add itself to it. Revoke with `ahma permissions revoke <KIND> <SUBJECT>`."
     );
     Ok(())
+}
+
+/// Show the sandbox profiles in effect — the toolchain carve-outs ahma applies on
+/// the user's behalf (SPEC R-PERM.5).
+///
+/// These used to be hard-coded in the sandbox backends, which meant nobody could
+/// see them. Listing them here is the whole point of making them data: a grant you
+/// cannot see is a grant you cannot evaluate, and one you cannot refuse.
+fn print_profiles(settings: &ahma_common::config::AhmaSettings) {
+    use crate::sandbox::profiles::{ProfileAccess, builtin_profiles, resolved_rules};
+
+    let enabled = &settings.sandbox.profiles;
+    println!("sandbox profiles (built-in toolchain carve-outs):");
+    if enabled.is_empty() {
+        println!("  (none — every toolchain path must be granted explicitly)");
+        println!();
+        return;
+    }
+
+    let rules = resolved_rules(enabled, settings.sandbox.package_cache_write);
+    for profile in builtin_profiles() {
+        if !enabled.iter().any(|n| n == &profile.name) {
+            continue;
+        }
+        println!("  • {} — {}", profile.name, profile.description);
+        for r in rules.iter().filter(|r| r.profile == profile.name) {
+            let access = match r.access {
+                ProfileAccess::Ro => "read",
+                ProfileAccess::Rx => "read+execute",
+                ProfileAccess::Rw => "read+write",
+            };
+            println!("      {}  ({access})", r.path.display());
+        }
+    }
+    println!();
+    println!("  Disable any of these with `[sandbox] profiles` in the settings file.");
+    println!();
+
+    if let Some(note) = crate::sandbox::profiles::macos_read_disclosure() {
+        println!("  ⚠ {note}");
+        println!();
+    }
 }
 
 /// The deferred half of a revoke: applies the change and reports whether it did

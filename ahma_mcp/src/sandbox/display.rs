@@ -197,19 +197,45 @@ impl ScopeView<'_> {
         out.push_str("  source: ");
         out.push_str(self.source.as_str());
         out.push('\n');
+
+        // The platform limitation ahma cannot fix, and therefore must not hide
+        // (SPEC R-PERM.5.1). On macOS, reads are not kernel-scoped — a user who
+        // believes otherwise will make worse decisions about what to keep on this
+        // machine than one who knows. Same honesty R7.5 demands when deferring to
+        // a host sandbox.
+        if let Some(note) = super::profiles::macos_read_disclosure() {
+            out.push_str("  note  : ");
+            out.push_str(note);
+            out.push('\n');
+        }
         out
     }
 
     /// The structured form used in the `notifications/sandbox/configured`
     /// payload and any machine-readable surface.
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "enforced": self.enforced,
             "write": display_paths(self.write_scopes),
             "read": display_paths(self.read_scopes),
             "tmp": self.tmp_access,
             "source": self.source.as_str(),
-        })
+        });
+        // Machine-readable surfaces get the disclosure too — a TUI or IDE
+        // rendering this JSON must be able to show what the text form shows.
+        if let Some(note) = super::profiles::macos_read_disclosure()
+            && let Some(obj) = v.as_object_mut()
+        {
+            obj.insert(
+                "reads_unrestricted".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            obj.insert(
+                "platform_note".to_string(),
+                serde_json::Value::String(note.to_string()),
+            );
+        }
+        v
     }
 }
 

@@ -924,6 +924,37 @@ pub struct SandboxSettings {
     /// Default: empty list
     #[serde(default)]
     pub allow_credential_reads: Vec<PathBuf>,
+    /// Sandbox **profiles** to enable — the shipped toolchain carve-outs that
+    /// used to be hard-coded in the sandbox backends (SPEC R-PERM.5).
+    ///
+    /// A profile is a pre-answered bundle of grant questions: the paths a
+    /// toolchain needs (the cargo registry cache, the rustup toolchains, …) that
+    /// a user would otherwise grant one kernel denial at a time. Shipping them as
+    /// data rather than code makes them **visible** (they carry
+    /// `builtin-profile(<name>)` provenance) and **refusable** (remove a name, or
+    /// set this to `[]`, to harden further).
+    ///
+    /// Built-in: `rust`, `node`, `go`, `common`. All are enabled by default, so
+    /// out-of-the-box behavior is exactly what it has always been — the change is
+    /// that you can now see it and switch it off.
+    /// Default: all built-in profiles
+    #[serde(default = "default_sandbox_profiles")]
+    pub profiles: Vec<String>,
+}
+
+/// Every shipped profile, enabled — the opt-out default (R-PERM.5).
+///
+/// Spelled out here rather than imported because `ahma_common` sits *below*
+/// `ahma_mcp` (which owns the profile data) in the dependency graph. The two
+/// lists are pinned together by a test in `ahma_mcp::sandbox::profiles`, so they
+/// cannot drift silently.
+fn default_sandbox_profiles() -> Vec<String> {
+    vec![
+        "rust".to_string(),
+        "node".to_string(),
+        "go".to_string(),
+        "common".to_string(),
+    ]
 }
 
 impl SandboxSettings {
@@ -983,6 +1014,7 @@ impl Default for SandboxSettings {
             allow_keychain: true,
             deny_credential_reads: Vec::new(),
             allow_credential_reads: Vec::new(),
+            profiles: default_sandbox_profiles(),
         }
     }
 }
@@ -1791,6 +1823,12 @@ impl AhmaSettings {
             toml_path_list(&self.sandbox.allow_credential_reads),
             toml_path_list(&d.sandbox.allow_credential_reads),
         );
+        w.setting(
+            "Toolchain carve-out profiles to enable (rust, node, go, common). These replace the sandbox's old hard-coded path lists; set to [] to harden.",
+            "profiles",
+            toml_str_list(&self.sandbox.profiles),
+            toml_str_list(&d.sandbox.profiles),
+        );
 
         // ── Logging ──────────────────────────────────────────────────────────
         w.section("Logging", "logging");
@@ -2359,6 +2397,7 @@ mod tests {
                 allow_keychain: false,
                 deny_credential_reads: vec![PathBuf::from("~/.ssh")],
                 allow_credential_reads: vec![PathBuf::from("~/.aws")],
+                profiles: vec!["rust".into()],
             },
             logging: LoggingSettings {
                 target: "stderr".into(),

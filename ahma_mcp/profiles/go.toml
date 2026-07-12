@@ -1,0 +1,8 @@
+# Go toolchain sandbox profile.
+name = "go"
+description = "Go toolchain: the GOPATH/module directory"
+deny_write = []
+
+[[rules]]
+path = "~/.go"
+access = "rx"

@@ -1,0 +1,65 @@
+# Rust toolchain sandbox profile.
+#
+# A profile is nothing more than a *pre-answered bundle of grant questions*: the
+# same paths a user would end up granting one denial at a time, shipped so they
+# do not have to. That is why it is data, not code — it can be read, disabled,
+# and copied by anyone who needs a different toolchain (SPEC R-PERM.5).
+name = "rust"
+description = "Rust toolchain: cargo registry/git caches, rustup toolchains"
+
+# Paths this profile asserts must NEVER become writable.
+#
+# Not a mechanism — the backends are allow-lists, so a path is unwritable simply
+# by not being granted — but an *assertion* the tests check, so a later edit that
+# "simplifies" the rules below into one broad `rw` grant on ~/.cargo fails loudly
+# instead of quietly handing over the crates.io token.
+#
+#   bin/              — installed binaries; writable = arbitrary code on the
+#                       user's PATH for every future shell
+#   config.toml       — registry overrides; writable = redirect every future
+#                       dependency fetch
+#   credentials.toml  — the crates.io token
+#
+# All three stay read+execute via the ~/.cargo rule below. They are never writable.
+deny_write = [
+  "${CARGO_HOME:-~/.cargo}/bin",
+  "${CARGO_HOME:-~/.cargo}/config.toml",
+  "${CARGO_HOME:-~/.cargo}/credentials.toml",
+]
+
+# The toolchain itself: read + execute, never write. `~/.cargo/bin/cargo` and
+# `~/.rustup/toolchains/*/bin/rustc` are binaries the sandboxed command must be
+# able to *run*, which is strictly more than being able to read them.
+[[rules]]
+path = "${CARGO_HOME:-~/.cargo}"
+access = "rx"
+
+[[rules]]
+path = "${RUSTUP_HOME:-~/.rustup}"
+access = "rx"
+
+# The caches cargo writes when it fetches a new dependency. Without these,
+# `cargo add` and `cargo update` fail inside the sandbox — and the obvious
+# workaround (granting all of ~/.cargo) would hand over the credentials too.
+[[rules]]
+path = "${CARGO_HOME:-~/.cargo}/registry"
+access = "rw"
+precreate = true
+
+[[rules]]
+path = "${CARGO_HOME:-~/.cargo}/git"
+access = "rw"
+precreate = true
+
+# Cargo's cross-process lock files. They are files, not directories.
+[[rules]]
+path = "${CARGO_HOME:-~/.cargo}/.package-cache"
+access = "rw"
+kind = "file"
+precreate = true
+
+[[rules]]
+path = "${CARGO_HOME:-~/.cargo}/.package-cache-mutate"
+access = "rw"
+kind = "file"
+precreate = true

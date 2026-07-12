@@ -64,7 +64,7 @@ fn build_landlock_ruleset(
     }
 
     add_landlock_system_rules(&mut ruleset, access_read)?;
-    add_landlock_home_tool_rules(&mut ruleset, access_read, access_all, package_cache_write)?;
+    add_landlock_profile_rules(&mut ruleset, access_read, access_all, package_cache_write)?;
 
     if !no_temp_files {
         add_landlock_temp_rules(&mut ruleset, access_all)?;
@@ -220,73 +220,43 @@ fn add_landlock_system_rules(
     Ok(())
 }
 
+/// Apply the enabled sandbox **profiles** (SPEC R-PERM.5).
+///
+/// This used to be a hard-coded array of toolchain directories. It is now driven
+/// by the shipped profile data, so the same rules are visible in
+/// `ahma permissions list`, disableable via `[sandbox] profiles`, and extensible
+/// by anyone whose toolchain ahma has never heard of.
+///
+/// The access levels are not interchangeable: a toolchain directory needs
+/// `Execute` (it holds `cargo`, `rustc`, `node` — binaries the sandboxed command
+/// must be able to *run*), which Landlock's read set does not include.
 #[cfg(target_os = "linux")]
-fn add_landlock_home_tool_rules(
+fn add_landlock_profile_rules(
     ruleset: &mut landlock::RulesetCreated,
     access_read: landlock::BitFlags<landlock::AccessFs>,
     access_all: landlock::BitFlags<landlock::AccessFs>,
     package_cache_write: bool,
 ) -> Result<()> {
+    use super::profiles::{ProfileAccess, applicable_rules};
     use landlock::{AccessFs, PathBeneath, PathFd, RulesetCreatedAttr};
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = std::path::Path::new(&home);
-        let tool_paths = [".cargo", ".rustup", ".nvm", ".npm", ".go", ".cache"];
-        // Toolchain dirs hold the actual binaries (~/.cargo/bin/cargo,
-        // ~/.rustup/toolchains/*/bin/rustc, ~/.nvm/versions/node/*/bin/node):
-        // they need Execute in addition to read, but never write.
-        let access_read_execute = access_read | AccessFs::Execute;
-        for tool in &tool_paths {
-            let path = home_path.join(tool);
-            if path.exists()
-                && let Ok(fd) = PathFd::new(&path)
-            {
-                let _ = ruleset.add_rule(PathBeneath::new(fd, access_read_execute));
-            }
-        }
-    }
 
-    if package_cache_write {
-        add_landlock_package_cache_write_rules(ruleset, access_all)?;
-    }
+    let enabled = ahma_common::config::AhmaSettings::load().sandbox.profiles;
+    let access_read_execute = access_read | AccessFs::Execute;
 
-    Ok(())
-}
-
-/// Add Landlock write rules for package-manager caches when `package_cache_write` is on.
-#[cfg(target_os = "linux")]
-fn add_landlock_package_cache_write_rules(
-    ruleset: &mut landlock::RulesetCreated,
-    access_all: landlock::BitFlags<landlock::AccessFs>,
-) -> Result<()> {
-    use super::pkg_cache::{all_writable_package_cache_paths, pre_create_package_cache_paths};
-    use landlock::{PathBeneath, PathFd, RulesetCreatedAttr};
-
-    for cache in all_writable_package_cache_paths() {
-        // Ensure paths exist so PathFd::new succeeds.
-        pre_create_package_cache_paths(&cache);
-
-        for dir in &cache.writable_dirs {
-            if dir.exists()
-                && let Ok(fd) = PathFd::new(dir)
-            {
-                tracing::debug!(
-                    "Landlock: granting write access to package cache dir: {:?}",
-                    dir
-                );
-                let _ = ruleset.add_rule(PathBeneath::new(fd, access_all));
-            }
-        }
-
-        for file in &cache.writable_files {
-            if file.exists()
-                && let Ok(fd) = PathFd::new(file)
-            {
-                tracing::debug!(
-                    "Landlock: granting write access to package cache file: {:?}",
-                    file
-                );
-                let _ = ruleset.add_rule(PathBeneath::new(fd, access_all));
-            }
+    for rule in applicable_rules(&enabled, package_cache_write) {
+        let access = match rule.access {
+            ProfileAccess::Ro => access_read,
+            ProfileAccess::Rx => access_read_execute,
+            ProfileAccess::Rw => access_all,
+        };
+        if let Ok(fd) = PathFd::new(&rule.path) {
+            tracing::debug!(
+                "Landlock: profile '{}' grants {:?} on {}",
+                rule.profile,
+                rule.access,
+                rule.path.display()
+            );
+            let _ = ruleset.add_rule(PathBeneath::new(fd, access));
         }
     }
 
@@ -455,10 +425,13 @@ mod tests {
         );
     }
 
-    /// `add_landlock_home_tool_rules` must grant read+execute access to
-    /// toolchain dirs (e.g. `~/.cargo`) that actually exist under `HOME`.
+    /// `add_landlock_profile_rules` must grant read+execute access to the
+    /// toolchain dirs an enabled profile names (e.g. `~/.cargo`) when they exist.
+    ///
+    /// Read+execute, not read: `~/.cargo/bin/cargo` is a binary the sandboxed
+    /// command has to *run*, and Landlock's read set does not include `Execute`.
     #[test]
-    fn ruleset_fd_grants_home_tool_rules_when_home_has_toolchain_dirs() {
+    fn ruleset_fd_grants_profile_rules_when_home_has_toolchain_dirs() {
         let _guard = LANDLOCK_ENV_MUTEX.lock().unwrap();
         let home_dir = tempdir().unwrap();
         std::fs::create_dir_all(home_dir.path().join(".cargo")).unwrap();
