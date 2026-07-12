@@ -170,6 +170,40 @@ fn sandbox_mode_name(sandbox: &sandbox::Sandbox) -> &'static str {
     }
 }
 
+/// Cancel every operation still listed as active in `final_summary`, logging the
+/// outcome of each cancellation attempt. Self-contained tail-end of the shutdown
+/// wait: only reached once the grace period has elapsed.
+async fn cancel_remaining_operations(
+    operation_monitor: &Arc<crate::operation_monitor::OperationMonitor>,
+    final_summary: &crate::operation_monitor::ShutdownSummary,
+    shutdown_reason: &str,
+) {
+    info!(
+        "⏱️  Shutdown timeout reached - cancelling {} remaining operation(s) with reason: {}",
+        final_summary.total_active, shutdown_reason
+    );
+    for op in final_summary.operations.iter() {
+        tracing::debug!(
+            "Attempting to cancel operation '{}' ({}) with reason: '{}'",
+            op.id,
+            op.tool_name,
+            shutdown_reason
+        );
+        let cancelled = operation_monitor
+            .cancel_operation_with_reason(&op.id, Some(shutdown_reason.to_string()))
+            .await;
+        if cancelled {
+            info!("   OK Cancelled operation '{}' ({})", op.id, op.tool_name);
+        } else {
+            tracing::warn!(
+                "   WARNING Failed to cancel operation '{}' ({})",
+                op.id,
+                op.tool_name
+            );
+        }
+    }
+}
+
 async fn wait_for_active_operations(
     operation_monitor: &Arc<crate::operation_monitor::OperationMonitor>,
     shutdown_timeout: Duration,
@@ -195,30 +229,7 @@ async fn wait_for_active_operations(
 
     let final_summary = operation_monitor.get_shutdown_summary().await;
     if final_summary.total_active > 0 {
-        info!(
-            "⏱️  Shutdown timeout reached - cancelling {} remaining operation(s) with reason: {}",
-            final_summary.total_active, shutdown_reason
-        );
-        for op in final_summary.operations.iter() {
-            tracing::debug!(
-                "Attempting to cancel operation '{}' ({}) with reason: '{}'",
-                op.id,
-                op.tool_name,
-                shutdown_reason
-            );
-            let cancelled = operation_monitor
-                .cancel_operation_with_reason(&op.id, Some(shutdown_reason.to_string()))
-                .await;
-            if cancelled {
-                info!("   OK Cancelled operation '{}' ({})", op.id, op.tool_name);
-            } else {
-                tracing::warn!(
-                    "   WARNING Failed to cancel operation '{}' ({})",
-                    op.id,
-                    op.tool_name
-                );
-            }
-        }
+        cancel_remaining_operations(operation_monitor, &final_summary, shutdown_reason).await;
     }
 }
 
@@ -781,6 +792,23 @@ fn open_capture_file(path: &std::path::Path, banner: &str) -> Option<std::fs::Fi
     }
 }
 
+/// Poll the bridge's health endpoint until it responds or `timeout` elapses.
+/// Returns `true` as soon as a health check succeeds.
+async fn wait_for_bridge_healthy(
+    socket_path_opt: Option<&str>,
+    http_url_opt: Option<&str>,
+    timeout: Duration,
+) -> bool {
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < timeout {
+        if check_bridge_running(socket_path_opt, http_url_opt).await {
+            return true;
+        }
+        tokio::time::sleep(ahma_common::timeouts::TestTimeouts::poll_interval()).await;
+    }
+    false
+}
+
 async fn spawn_background_bridge(
     config: &AppConfig,
     socket_path_opt: Option<&str>,
@@ -838,17 +866,9 @@ async fn spawn_background_bridge(
     }
 
     // Wait for the background bridge to be healthy/available
-    let start_time = std::time::Instant::now();
-    let mut healthy = false;
     let timeout =
         ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick);
-    while start_time.elapsed() < timeout {
-        if check_bridge_running(socket_path_opt, http_url_opt).await {
-            healthy = true;
-            break;
-        }
-        tokio::time::sleep(ahma_common::timeouts::TestTimeouts::poll_interval()).await;
-    }
+    let healthy = wait_for_bridge_healthy(socket_path_opt, http_url_opt, timeout).await;
     if !healthy {
         let stderr_tail = read_log_tail(&stderr_path, 8192);
         if stderr_tail.is_empty() {

@@ -3221,17 +3221,25 @@ fn handle_window_output_event(window_id: usize, line: String, state: &mut crate:
         if w.is_cli {
             w.content.push(line);
         } else {
-            if w.content.is_empty() {
-                w.content.push(String::new());
-            }
-            let parts: Vec<&str> = line.split('\n').collect();
-            if let Some(last) = w.content.last_mut() {
-                last.push_str(parts[0]);
-            }
-            for part in parts.iter().skip(1) {
-                w.content.push(part.to_string());
-            }
+            append_multiline_window_output(&mut w.content, &line);
         }
+    }
+}
+
+/// Appends `line` to `content`, splitting on embedded newlines so that each
+/// resulting segment becomes its own entry (continuing the last existing
+/// entry rather than starting a fresh one for the first segment).
+#[cfg(feature = "tui")]
+fn append_multiline_window_output(content: &mut Vec<String>, line: &str) {
+    if content.is_empty() {
+        content.push(String::new());
+    }
+    let parts: Vec<&str> = line.split('\n').collect();
+    if let Some(last) = content.last_mut() {
+        last.push_str(parts[0]);
+    }
+    for part in parts.iter().skip(1) {
+        content.push(part.to_string());
     }
 }
 
@@ -3256,14 +3264,21 @@ fn handle_window_finished_event(
         }
     }
     if current_failed {
-        for w in &mut state.windows {
-            if w.status == crate::state::WindowStatus::Pending {
-                w.status = crate::state::WindowStatus::Cancelled;
-                w.finished_at = Some(std::time::Instant::now());
-            }
-        }
+        cancel_pending_windows(state);
     } else {
         run_next_pending_window(state);
+    }
+}
+
+/// Marks every still-`Pending` window as `Cancelled`, used to cascade a
+/// failure to windows that hadn't started running yet.
+#[cfg(feature = "tui")]
+fn cancel_pending_windows(state: &mut crate::state::AppState) {
+    for w in &mut state.windows {
+        if w.status == crate::state::WindowStatus::Pending {
+            w.status = crate::state::WindowStatus::Cancelled;
+            w.finished_at = Some(std::time::Instant::now());
+        }
     }
 }
 

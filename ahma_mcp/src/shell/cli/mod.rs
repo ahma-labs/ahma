@@ -571,43 +571,60 @@ fn resolve_persistent_scopes(cfg: &AppConfig) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut write = Vec::new();
     let mut read = Vec::new();
     for scope in &cfg.persistent_scopes {
-        let raw = expand_tilde(scope.path.clone());
         match scope.access {
-            ScopeAccess::Rw => match ahma_common::config::ensure_sandbox_directory(&scope.path) {
-                Ok(canonical) => {
-                    if !write.contains(&canonical) {
-                        tracing::info!(
-                            "Granted persistent scope (read+write): {} [{}]",
-                            canonical.display(),
-                            scope.granted_by.as_deref().unwrap_or("user")
-                        );
-                        write.push(canonical);
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    "Skipping persistent scope {}: could not create/canonicalize ({e})",
-                    raw.display()
-                ),
-            },
-            ScopeAccess::Ro => match dunce::canonicalize(&raw) {
-                Ok(canonical) => {
-                    if !read.contains(&canonical) {
-                        tracing::info!(
-                            "Granted persistent scope (read-only): {} [{}]",
-                            canonical.display(),
-                            scope.granted_by.as_deref().unwrap_or("user")
-                        );
-                        read.push(canonical);
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    "Skipping read-only persistent scope {} (does not exist or unreadable): {e}",
-                    raw.display()
-                ),
-            },
+            ScopeAccess::Rw => grant_persistent_write_scope(scope, &mut write),
+            ScopeAccess::Ro => grant_persistent_read_scope(scope, &mut read),
         }
     }
     (write, read)
+}
+
+/// Add a `rw` persistent scope, auto-creating the directory if it is missing.
+fn grant_persistent_write_scope(
+    scope: &ahma_common::config::PersistentScope,
+    write: &mut Vec<PathBuf>,
+) {
+    match ahma_common::config::ensure_sandbox_directory(&scope.path) {
+        Ok(canonical) => {
+            if !write.contains(&canonical) {
+                tracing::info!(
+                    "Granted persistent scope (read+write): {} [{}]",
+                    canonical.display(),
+                    scope.granted_by.as_deref().unwrap_or("user")
+                );
+                write.push(canonical);
+            }
+        }
+        Err(e) => tracing::warn!(
+            "Skipping persistent scope {}: could not create/canonicalize ({e})",
+            expand_tilde(scope.path.clone()).display()
+        ),
+    }
+}
+
+/// Add a `ro` persistent scope. Never auto-created — a missing directory is
+/// logged and skipped rather than silently materialised.
+fn grant_persistent_read_scope(
+    scope: &ahma_common::config::PersistentScope,
+    read: &mut Vec<PathBuf>,
+) {
+    let raw = expand_tilde(scope.path.clone());
+    match dunce::canonicalize(&raw) {
+        Ok(canonical) => {
+            if !read.contains(&canonical) {
+                tracing::info!(
+                    "Granted persistent scope (read-only): {} [{}]",
+                    canonical.display(),
+                    scope.granted_by.as_deref().unwrap_or("user")
+                );
+                read.push(canonical);
+            }
+        }
+        Err(e) => tracing::warn!(
+            "Skipping read-only persistent scope {} (does not exist or unreadable): {e}",
+            raw.display()
+        ),
+    }
 }
 
 fn create_sandbox_instance(
@@ -2465,13 +2482,7 @@ fn apply_process_wide_cli_overrides(cli: &Cli) {
 /// on even when settings disable it. When off, the login keychain is added to
 /// the credential-read deny set and keychain writes stay blocked.
 fn configure_keychain_and_credential_denies(cli: &Cli, s: &ahma_common::config::AhmaSettings) {
-    let allow_keychain = if cli.no_allow_keychain {
-        false
-    } else if cli.allow_keychain {
-        true
-    } else {
-        s.sandbox.allow_keychain
-    };
+    let allow_keychain = resolve_allow_keychain(cli, s);
     sandbox::set_keychain_access_allowed(allow_keychain);
 
     // Install the macOS credential-read deny set (built-in defaults ±
@@ -2480,15 +2491,7 @@ fn configure_keychain_and_credential_denies(cli: &Cli, s: &ahma_common::config::
     // global file-read, so these dirs are denied to sandboxed tools to prevent
     // credential exfiltration. No-op on Linux/Windows where reads are scoped.
     if let Some(home) = dirs::home_dir() {
-        let mut extra_deny = s.sandbox.deny_credential_reads.clone();
-        if !allow_keychain {
-            extra_deny.push(std::path::PathBuf::from("~/Library/Keychains"));
-        }
-        let denies = sandbox::effective_credential_read_denies(
-            &home,
-            &extra_deny,
-            &s.sandbox.allow_credential_reads,
-        );
+        let denies = compute_credential_read_denies(&home, s, allow_keychain);
         if cfg!(target_os = "macos") && !denies.is_empty() {
             tracing::info!(
                 "macOS credential-read protection: denying tool reads of {} dir(s): {:?} \
@@ -2506,6 +2509,32 @@ fn configure_keychain_and_credential_denies(cli: &Cli, s: &ahma_common::config::
              under the sandbox"
         );
     }
+}
+
+/// CLI flags win over settings: `--no-allow-keychain` forces off,
+/// `--allow-keychain` forces on even when settings disable it.
+fn resolve_allow_keychain(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> bool {
+    if cli.no_allow_keychain {
+        false
+    } else if cli.allow_keychain {
+        true
+    } else {
+        s.sandbox.allow_keychain
+    }
+}
+
+/// Build the effective credential-read deny set: configured denies plus the
+/// login keychain when keychain access is off.
+fn compute_credential_read_denies(
+    home: &Path,
+    s: &ahma_common::config::AhmaSettings,
+    allow_keychain: bool,
+) -> Vec<PathBuf> {
+    let mut extra_deny = s.sandbox.deny_credential_reads.clone();
+    if !allow_keychain {
+        extra_deny.push(PathBuf::from("~/Library/Keychains"));
+    }
+    sandbox::effective_credential_read_denies(home, &extra_deny, &s.sandbox.allow_credential_reads)
 }
 
 pub fn build_app_config(cli: &Cli) -> AppConfig {

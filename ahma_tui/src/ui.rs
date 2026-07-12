@@ -99,6 +99,24 @@ fn compute_window_layouts(
     }
 
     // 2. Collapse expanded windows starting from the oldest.
+    total_h = collapse_expanded_windows(&mut layouts, max_h, total_h);
+
+    // 3. If it still doesn't fit, hide oldest windows.
+    if total_h > max_h {
+        hide_overflow_windows(&mut layouts, max_h, total_h);
+    }
+
+    layouts
+}
+
+/// Collapse expanded windows, oldest first, until the total height fits within
+/// `max_h` (or every window is already collapsed). Returns the updated total height.
+#[cfg(feature = "tui")]
+fn collapse_expanded_windows(
+    layouts: &mut [RenderedWindowLayout],
+    max_h: u16,
+    mut total_h: u16,
+) -> u16 {
     for l in layouts.iter_mut() {
         if total_h <= max_h {
             break;
@@ -110,8 +128,13 @@ fn compute_window_layouts(
             total_h = total_h - old_h + 1;
         }
     }
+    total_h
+}
 
-    // 3. If it still doesn't fit, hide oldest windows.
+/// Hide the oldest windows entirely (after collapsing was not enough) until the
+/// total height fits within `max_h`.
+#[cfg(feature = "tui")]
+fn hide_overflow_windows(layouts: &mut [RenderedWindowLayout], max_h: u16, mut total_h: u16) {
     for l in layouts.iter_mut() {
         if total_h <= max_h {
             break;
@@ -123,8 +146,6 @@ fn compute_window_layouts(
             total_h -= old_h;
         }
     }
-
-    layouts
 }
 
 #[cfg(feature = "tui")]
@@ -270,24 +291,30 @@ fn draw_expanded_window(
 
     // Output lines
     for line in &w.content {
-        let style = if line.starts_with("Starting") {
-            theme.dim()
-        } else if line.starts_with("Finished successfully") {
-            theme.success()
-        } else if line.starts_with("Failed") {
-            theme.failed()
-        } else if line.starts_with("Cancelled") {
-            theme.cancelled()
-        } else if line.starts_with("──") || line.starts_with("--") {
-            theme.dim()
-        } else {
-            theme.normal()
-        };
+        let style = output_line_style(line, theme);
         content_lines.push(Line::from(Span::styled(line.clone(), style)));
     }
 
     let para = Paragraph::new(content_lines).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
+}
+
+/// Style for one line of window output, based on well-known status prefixes
+/// ("Starting", "Finished successfully", "Failed", "Cancelled") or separators.
+fn output_line_style(line: &str, theme: &Theme) -> Style {
+    if line.starts_with("Starting") {
+        theme.dim()
+    } else if line.starts_with("Finished successfully") {
+        theme.success()
+    } else if line.starts_with("Failed") {
+        theme.failed()
+    } else if line.starts_with("Cancelled") {
+        theme.cancelled()
+    } else if line.starts_with("──") || line.starts_with("--") {
+        theme.dim()
+    } else {
+        theme.normal()
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -1131,26 +1158,38 @@ fn draw_input_box(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect
     let mut rendered_lines: Vec<String> = state.chat_input.lines().to_vec();
     let is_empty = rendered_lines.len() == 1 && rendered_lines[0].is_empty();
 
-    if is_empty {
-        let placeholder = "Type a message... (! UNSANDBOXED cmd · # decompose · / commands)";
-        let text = if focused {
-            let cursor = if state.unicode { "│" } else { "|" };
-            format!("{}{}", cursor, placeholder)
-        } else {
-            placeholder.to_string()
-        };
-        let style = theme.input_placeholder().patch(theme.input_bg());
-        let para = Paragraph::new(Span::styled(text, style)).wrap(Wrap { trim: false });
-        frame.render_widget(para, inner);
+    let para = if is_empty {
+        input_placeholder_paragraph(theme, focused, state.unicode)
     } else {
         if focused {
             insert_input_cursor(&mut rendered_lines, cursor_row, cursor_col, state.unicode);
         }
-        let text = rendered_lines.join("\n");
-        let style = theme.normal().patch(theme.input_bg());
-        let para = Paragraph::new(Span::styled(text, style)).wrap(Wrap { trim: false });
-        frame.render_widget(para, inner);
-    }
+        input_text_paragraph(theme, &rendered_lines)
+    };
+    frame.render_widget(para, inner);
+}
+
+/// Paragraph shown when the chat input is empty: the placeholder hint, with a
+/// leading cursor glyph when focused.
+#[cfg(feature = "tui")]
+fn input_placeholder_paragraph(theme: &Theme, focused: bool, unicode: bool) -> Paragraph<'static> {
+    let placeholder = "Type a message... (! UNSANDBOXED cmd · # decompose · / commands)";
+    let text = if focused {
+        let cursor = if unicode { "│" } else { "|" };
+        format!("{}{}", cursor, placeholder)
+    } else {
+        placeholder.to_string()
+    };
+    let style = theme.input_placeholder().patch(theme.input_bg());
+    Paragraph::new(Span::styled(text, style)).wrap(Wrap { trim: false })
+}
+
+/// Paragraph rendering the current (non-empty) chat input lines.
+#[cfg(feature = "tui")]
+fn input_text_paragraph(theme: &Theme, rendered_lines: &[String]) -> Paragraph<'static> {
+    let text = rendered_lines.join("\n");
+    let style = theme.normal().patch(theme.input_bg());
+    Paragraph::new(Span::styled(text, style)).wrap(Wrap { trim: false })
 }
 
 #[cfg(feature = "tui")]
@@ -2767,6 +2806,24 @@ fn render_empty_log_hint(frame: &mut Frame, state: &AppState, theme: &Theme, inn
     frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
 }
 
+/// Title text for the log panel: active file (or "system"), current filter
+/// indicator, and the wrap/zoom toggle states.
+#[cfg(feature = "tui")]
+fn build_log_title(state: &AppState) -> String {
+    let log_title = if let Some(ref file) = state.active_log_file {
+        format!(" Log: {} ", file)
+    } else {
+        " Log: system ".to_string()
+    };
+    let wrap_str = if state.log_wrap_enabled { "On" } else { "Off" };
+    let zoom_str = if state.log_zoom_enabled { "On" } else { "Off" };
+    let filter_indicator = log_filter_indicator(state);
+    format!(
+        "{}{}[Wrap: {} | Zoom: {} | Press 'l' to switch] ",
+        log_title, filter_indicator, wrap_str, zoom_str
+    )
+}
+
 #[cfg(feature = "tui")]
 fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let focused = state.focus == Focus::Log;
@@ -2776,23 +2833,8 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         theme.border_unfocused()
     };
 
-    let log_title = if let Some(ref file) = state.active_log_file {
-        format!(" Log: {} ", file)
-    } else {
-        " Log: system ".to_string()
-    };
-    let wrap_str = if state.log_wrap_enabled { "On" } else { "Off" };
-    let zoom_str = if state.log_zoom_enabled { "On" } else { "Off" };
-    let filter_indicator = log_filter_indicator(state);
-
     let block = Block::default()
-        .title(Span::styled(
-            format!(
-                "{}{}[Wrap: {} | Zoom: {} | Press 'l' to switch] ",
-                log_title, filter_indicator, wrap_str, zoom_str
-            ),
-            theme.title(),
-        ))
+        .title(Span::styled(build_log_title(state), theme.title()))
         .borders(Borders::ALL)
         .border_style(border_style);
 
@@ -3676,18 +3718,7 @@ fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area:
     let content_area = chunks[1];
 
     // 1. Draw sidebar (categories list)
-    let mut sidebar_items = vec![];
-    use crate::settings_editor::SettingsCategory;
-    for (i, cat) in SettingsCategory::ALL.iter().enumerate() {
-        let is_selected = state.settings_editor.selected_category == i;
-        let style = if is_selected {
-            theme.title().bg(Color::DarkGray)
-        } else {
-            theme.normal()
-        };
-        let label = format!(" {} {}", cat.icon(), cat.label());
-        sidebar_items.push(ListItem::new(Line::from(vec![Span::styled(label, style)])));
-    }
+    let sidebar_items = build_settings_sidebar_items(state, theme);
     let sidebar_list = List::new(sidebar_items).block(
         Block::default()
             .borders(Borders::RIGHT)
@@ -3696,42 +3727,10 @@ fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area:
     frame.render_widget(sidebar_list, sidebar_area);
 
     // 2. Draw content pane (settings items for selected category)
+    use crate::settings_editor::SettingsCategory;
     let selected_cat = SettingsCategory::ALL[state.settings_editor.selected_category];
     let items = state.settings_editor.items_for_category(selected_cat);
-
-    let mut content_items = vec![];
-    for (i, item) in items.iter().enumerate() {
-        let is_selected = state.settings_editor.selected_item == i;
-        let item_style = if is_selected {
-            theme.selected_item()
-        } else {
-            theme.normal()
-        };
-
-        // Render value indicator
-        let val_string = format_setting_value(&item.value);
-
-        let sec_indicator = if item.security_tier {
-            Span::styled(" [locked]", theme.dim())
-        } else {
-            Span::raw("")
-        };
-
-        let label_style = if is_selected {
-            theme.title()
-        } else {
-            theme.normal()
-        };
-
-        let line = Line::from(vec![
-            Span::styled(format!("  {: <25}", item.label), label_style),
-            Span::styled(format!("  {: <15}", val_string), theme.success()),
-            sec_indicator,
-            Span::styled(format!("  — {}", item.description), theme.dim()),
-        ]);
-
-        content_items.push(ListItem::new(line).style(item_style));
-    }
+    let content_items = build_settings_content_items(state, theme, &items);
 
     // Split content area into items list (top) and footer/hints (bottom)
     let content_chunks =
@@ -3744,6 +3743,80 @@ fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area:
     frame.render_widget(content_list, list_area);
 
     // Draw status message and action hints
+    frame.render_widget(
+        Paragraph::new(settings_footer_line(state, theme)),
+        footer_area,
+    );
+}
+
+/// One `ListItem` per settings category, highlighting the currently selected one.
+#[cfg(feature = "tui")]
+fn build_settings_sidebar_items(state: &AppState, theme: &Theme) -> Vec<ListItem<'static>> {
+    use crate::settings_editor::SettingsCategory;
+    SettingsCategory::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, cat)| {
+            let is_selected = state.settings_editor.selected_category == i;
+            let style = if is_selected {
+                theme.title().bg(Color::DarkGray)
+            } else {
+                theme.normal()
+            };
+            let label = format!(" {} {}", cat.icon(), cat.label());
+            ListItem::new(Line::from(vec![Span::styled(label, style)]))
+        })
+        .collect()
+}
+
+/// One `ListItem` per setting in the selected category: label, current value,
+/// an optional `[locked]` indicator for security-tier settings, and description.
+#[cfg(feature = "tui")]
+fn build_settings_content_items(
+    state: &AppState,
+    theme: &Theme,
+    items: &[crate::settings_editor::SettingItem],
+) -> Vec<ListItem<'static>> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let is_selected = state.settings_editor.selected_item == i;
+            let item_style = if is_selected {
+                theme.selected_item()
+            } else {
+                theme.normal()
+            };
+
+            let val_string = format_setting_value(&item.value);
+
+            let sec_indicator = if item.security_tier {
+                Span::styled(" [locked]", theme.dim())
+            } else {
+                Span::raw("")
+            };
+
+            let label_style = if is_selected {
+                theme.title()
+            } else {
+                theme.normal()
+            };
+
+            let line = Line::from(vec![
+                Span::styled(format!("  {: <25}", item.label), label_style),
+                Span::styled(format!("  {: <15}", val_string), theme.success()),
+                sec_indicator,
+                Span::styled(format!("  — {}", item.description), theme.dim()),
+            ]);
+
+            ListItem::new(line).style(item_style)
+        })
+        .collect()
+}
+
+/// Footer line: status/dirty message on the left, key hints on the right.
+#[cfg(feature = "tui")]
+fn settings_footer_line(state: &AppState, theme: &Theme) -> Line<'static> {
     let status_str = if let Some((msg, _)) = &state.settings_editor.status_message {
         msg.clone()
     } else if state.settings_editor.dirty {
@@ -3752,14 +3825,13 @@ fn draw_settings_panel(frame: &mut Frame, state: &AppState, theme: &Theme, area:
         "".to_string()
     };
 
-    let footer_line = Line::from(vec![
+    Line::from(vec![
         Span::styled(format!("  {}", status_str), theme.pending()),
         Span::styled(
             "  [Space] Toggle  [r] Reset  [s] Save  [Esc/q] Close ",
             theme.dim(),
         ),
-    ]);
-    frame.render_widget(Paragraph::new(footer_line), footer_area);
+    ])
 }
 
 // ─── Stub when `tui` feature is disabled ─────────────────────────────────────

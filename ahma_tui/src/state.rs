@@ -2066,16 +2066,21 @@ impl AppState {
         };
         match action {
             Some(TreeToggle::Fold(key)) => self.toggle_collapse_key(key),
-            Some(TreeToggle::Expand(op_index)) => {
-                if let Some(op) = self.operations.get(op_index) {
-                    if self.expanded_op.as_deref() == Some(op.id.as_str()) {
-                        self.expanded_op = None;
-                    } else {
-                        self.expanded_op = Some(op.id.clone());
-                    }
-                }
-            }
+            Some(TreeToggle::Expand(op_index)) => self.toggle_expanded_op(op_index),
             None => {}
+        }
+    }
+
+    /// Accordion-expand the operation at `op_index`, or collapse it if it is
+    /// already the expanded one.
+    fn toggle_expanded_op(&mut self, op_index: usize) {
+        let Some(op) = self.operations.get(op_index) else {
+            return;
+        };
+        if self.expanded_op.as_deref() == Some(op.id.as_str()) {
+            self.expanded_op = None;
+        } else {
+            self.expanded_op = Some(op.id.clone());
         }
     }
 

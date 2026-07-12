@@ -65,38 +65,8 @@ pub fn spawn_embedded_hub_source(
         loop {
             match rx.recv().await {
                 Ok(msg) => {
-                    let is_instance_change = matches!(
-                        msg,
-                        DaemonMsg::InstanceList { .. }
-                            | DaemonMsg::InstanceRegistered { .. }
-                            | DaemonMsg::InstanceUnregistered { .. }
-                    );
-                    let applied = apply_msg(&mut state, msg);
-                    if is_instance_change {
-                        let _ = tx
-                            .send(SourceEvent::InstancesUpdated {
-                                instances: state.all_instances(),
-                            })
-                            .await;
-                    }
-                    match applied {
-                        Applied::ListChanged => {
-                            let ops = state.all_ops();
-                            if tx
-                                .send(SourceEvent::OperationsUpdated { ops })
-                                .await
-                                .is_err()
-                            {
-                                return; // TUI channel closed
-                            }
-                        }
-                        applied => {
-                            if let Some(event) = applied_to_event(applied)
-                                && tx.send(event).await.is_err()
-                            {
-                                return; // TUI channel closed
-                            }
-                        }
+                    if handle_daemon_msg(&mut state, &tx, msg).await.is_none() {
+                        return; // TUI channel closed
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -107,6 +77,59 @@ pub fn spawn_embedded_hub_source(
             }
         }
     });
+}
+
+/// Apply one daemon message to `state` and forward the resulting UI
+/// event(s) on `tx`.
+///
+/// Shared by [`spawn_embedded_hub_source`] and [`daemon_source_task`], which
+/// otherwise duplicate this instance-change / operation-list-changed
+/// dispatch verbatim.
+///
+/// Returns `None` when the TUI channel closed (caller should stop
+/// processing). Returns `Some(true)` when the merged operation list changed
+/// — callers that periodically prune terminal operations use this to drive
+/// their prune counter — and `Some(false)` otherwise.
+async fn handle_daemon_msg(
+    state: &mut DaemonState,
+    tx: &mpsc::Sender<SourceEvent>,
+    msg: DaemonMsg,
+) -> Option<bool> {
+    let is_instance_change = matches!(
+        msg,
+        DaemonMsg::InstanceList { .. }
+            | DaemonMsg::InstanceRegistered { .. }
+            | DaemonMsg::InstanceUnregistered { .. }
+    );
+    let applied = apply_msg(state, msg);
+    if is_instance_change {
+        let _ = tx
+            .send(SourceEvent::InstancesUpdated {
+                instances: state.all_instances(),
+            })
+            .await;
+    }
+    match applied {
+        Applied::ListChanged => {
+            let ops = state.all_ops();
+            if tx
+                .send(SourceEvent::OperationsUpdated { ops })
+                .await
+                .is_err()
+            {
+                return None;
+            }
+            Some(true)
+        }
+        applied => {
+            if let Some(event) = applied_to_event(applied)
+                && tx.send(event).await.is_err()
+            {
+                return None;
+            }
+            Some(false)
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -339,47 +362,17 @@ async fn daemon_source_task(tx: mpsc::Sender<SourceEvent>) {
 
         loop {
             match recv_msg::<_, DaemonMsg>(&mut reader).await {
-                Ok(msg) => {
-                    let is_instance_change = matches!(
-                        msg,
-                        DaemonMsg::InstanceList { .. }
-                            | DaemonMsg::InstanceRegistered { .. }
-                            | DaemonMsg::InstanceUnregistered { .. }
-                    );
-                    let applied = apply_msg(&mut state, msg);
-                    if is_instance_change {
-                        let _ = tx
-                            .send(SourceEvent::InstancesUpdated {
-                                instances: state.all_instances(),
-                            })
-                            .await;
-                    }
-                    match applied {
-                        Applied::ListChanged => {
-                            prune_counter += 1;
-                            if prune_counter >= 10 {
-                                state.prune_terminal();
-                                prune_counter = 0;
-                            }
-                            let ops = state.all_ops();
-                            if tx
-                                .send(SourceEvent::OperationsUpdated { ops })
-                                .await
-                                .is_err()
-                            {
-                                // Channel closed — TUI exited.
-                                return;
-                            }
-                        }
-                        applied => {
-                            if let Some(event) = applied_to_event(applied)
-                                && tx.send(event).await.is_err()
-                            {
-                                return; // Channel closed — TUI exited.
-                            }
+                Ok(msg) => match handle_daemon_msg(&mut state, &tx, msg).await {
+                    Some(true) => {
+                        prune_counter += 1;
+                        if prune_counter >= 10 {
+                            state.prune_terminal();
+                            prune_counter = 0;
                         }
                     }
-                }
+                    Some(false) => {}
+                    None => return, // Channel closed — TUI exited.
+                },
                 Err(e) => {
                     debug!("daemon_source: connection lost ({e})");
                     let _ = tx

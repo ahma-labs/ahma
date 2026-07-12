@@ -141,10 +141,7 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     let interactive = !args.auto && io::stdin().is_terminal() && io::stdout().is_terminal();
 
     if interactive {
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("  Ahma Uninstall Wizard");
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!();
+        print_banner("Ahma Uninstall Wizard");
     }
 
     // Question 1: which actions to perform.
@@ -164,24 +161,43 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     };
 
     // Optionally purge the ~/.ahma data directory.
-    let purge = args.purge
-        || (interactive
-            && actions.iter().any(|a| !a.is_platform_specific())
-            && prompt_yes_no(
-                "Also remove all ahma data and config in ~/.ahma? \
-(TLS, prompts, settings, logs) [y/N]: ",
-            )?);
+    let purge = should_purge_ahma_dir(&args, &actions, interactive)?;
 
     execute_actions(&actions, &platforms, args.dry_run, purge, interactive).await?;
 
     if interactive {
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!("  Uninstall completed!");
-        println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        println!();
+        print_banner("Uninstall completed!");
     }
 
     Ok(())
+}
+
+/// Prints a boxed banner with the given title line (interactive mode only).
+fn print_banner(title: &str) {
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  {}", title);
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!();
+}
+
+/// Decides whether to purge `~/.ahma`: forced via `--purge`, or (in interactive
+/// mode, when at least one non-platform-specific action was selected) by
+/// prompting the user. Non-interactive/non-forced runs default to `false`.
+fn should_purge_ahma_dir(
+    args: &UninstallArgs,
+    actions: &[UninstallAction],
+    interactive: bool,
+) -> Result<bool> {
+    if args.purge {
+        return Ok(true);
+    }
+    if !interactive || !actions.iter().any(|a| !a.is_platform_specific()) {
+        return Ok(false);
+    }
+    prompt_yes_no(
+        "Also remove all ahma data and config in ~/.ahma? \
+(TLS, prompts, settings, logs) [y/N]: ",
+    )
 }
 
 // ── Selection helpers ─────────────────────────────────────────────────────────

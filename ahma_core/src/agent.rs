@@ -336,6 +336,72 @@ async fn call_mcp_sampling_routed(
     })
 }
 
+/// Run one MCP-sampling-routed chat turn and forward the result (or error) onto
+/// the agent event channel. Non-streaming: the response arrives whole.
+async fn run_mcp_sampling_chat(
+    mcp_cfg: McpChatConfig,
+    target_label: String,
+    messages: Vec<ChatMessage>,
+    system_prompt: Option<String>,
+    tx: Sender<AgentEvent>,
+) {
+    let msg_vals: Vec<serde_json::Value> = messages
+        .into_iter()
+        .map(|msg| serde_json::json!({"role": msg.role, "content": msg.content}))
+        .collect();
+    match call_mcp_sampling_routed(&mcp_cfg, &target_label, msg_vals, system_prompt.as_deref())
+        .await
+    {
+        Ok(resp) => {
+            let _ = tx.send(AgentEvent::Token(resp.content)).await;
+            let _ = tx.send(AgentEvent::Done).await;
+        }
+        Err(e) => {
+            let _ = tx.send(AgentEvent::Error(e)).await;
+        }
+    }
+}
+
+/// Run one plain (non-MCP) streaming chat turn, forwarding tokens onto the
+/// agent event channel as they arrive.
+async fn run_streaming_chat(
+    client: LlmClient,
+    messages: Vec<ChatMessage>,
+    system_prompt: Option<String>,
+    tx: Sender<AgentEvent>,
+) {
+    let base_url = client.base_url().to_string();
+    info!(
+        provider = %base_url,
+        messages = messages.len(),
+        "chat: starting stream"
+    );
+    let stream = client.chat_stream(messages, system_prompt.as_deref());
+    tokio::pin!(stream);
+    use futures::StreamExt;
+    let mut first_token = true;
+    while let Some(res) = stream.next().await {
+        match res {
+            Ok(token) => {
+                if !token.is_empty() {
+                    if first_token {
+                        info!(provider = %base_url, "chat: first token received");
+                        first_token = false;
+                    }
+                    let _ = tx.send(AgentEvent::Token(token)).await;
+                }
+            }
+            Err(e) => {
+                warn!(provider = %base_url, error = %e, "chat: stream error");
+                let _ = tx.send(AgentEvent::Error(e.to_string())).await;
+                return;
+            }
+        }
+    }
+    info!(provider = %base_url, "chat: stream complete");
+    let _ = tx.send(AgentEvent::Done).await;
+}
+
 pub fn spawn_chat_task(
     client: LlmClient,
     messages: Vec<ChatMessage>,
@@ -353,63 +419,16 @@ pub fn spawn_chat_task(
                     .await;
                 return;
             };
-            let target_label = client.base_url().strip_prefix("mcp://").unwrap_or("");
-            let mut msg_vals = Vec::new();
-            for msg in messages {
-                msg_vals.push(serde_json::json!({
-                    "role": msg.role,
-                    "content": msg.content
-                }));
-            }
-            match call_mcp_sampling_routed(
-                &mcp_cfg,
-                target_label,
-                msg_vals,
-                system_prompt.as_deref(),
-            )
-            .await
-            {
-                Ok(resp) => {
-                    let _ = tx.send(AgentEvent::Token(resp.content)).await;
-                    let _ = tx.send(AgentEvent::Done).await;
-                }
-                Err(e) => {
-                    let _ = tx.send(AgentEvent::Error(e)).await;
-                }
-            }
+            let target_label = client
+                .base_url()
+                .strip_prefix("mcp://")
+                .unwrap_or("")
+                .to_string();
+            run_mcp_sampling_chat(mcp_cfg, target_label, messages, system_prompt, tx).await;
             return;
         }
 
-        let base_url = client.base_url().to_string();
-        info!(
-            provider = %base_url,
-            messages = messages.len(),
-            "chat: starting stream"
-        );
-        let stream = client.chat_stream(messages, system_prompt.as_deref());
-        tokio::pin!(stream);
-        use futures::StreamExt;
-        let mut first_token = true;
-        while let Some(res) = stream.next().await {
-            match res {
-                Ok(token) => {
-                    if !token.is_empty() {
-                        if first_token {
-                            info!(provider = %base_url, "chat: first token received");
-                            first_token = false;
-                        }
-                        let _ = tx.send(AgentEvent::Token(token)).await;
-                    }
-                }
-                Err(e) => {
-                    warn!(provider = %base_url, error = %e, "chat: stream error");
-                    let _ = tx.send(AgentEvent::Error(e.to_string())).await;
-                    return;
-                }
-            }
-        }
-        info!(provider = %base_url, "chat: stream complete");
-        let _ = tx.send(AgentEvent::Done).await;
+        run_streaming_chat(client, messages, system_prompt, tx).await;
     });
 }
 
@@ -545,6 +564,100 @@ fn is_tool_unsupported_error(err: &str) -> bool {
     err_msg.contains("400") || err_msg.contains("tool") || err_msg.contains("not supported")
 }
 
+/// Fetch one assistant turn via MCP sampling (when the client targets an
+/// `mcp://` base URL). Sampling is never streamed, so the caller still needs
+/// to emit the returned content.
+async fn fetch_completion_via_mcp_sampling(
+    mcp: &Option<McpChatConfig>,
+    target_label: &str,
+    msg_json: &[serde_json::Value],
+    tx: &Sender<AgentEvent>,
+    system_prompt: &Option<String>,
+) -> Option<(ahma_llm_monitor::client::ChatCompletionResponse, bool)> {
+    let Some(mcp_cfg) = mcp else {
+        let _ = tx
+            .send(AgentEvent::Error(
+                "MCP config missing for sampling".to_string(),
+            ))
+            .await;
+        return None;
+    };
+    match call_mcp_sampling_routed(
+        mcp_cfg,
+        target_label,
+        msg_json.to_vec(),
+        system_prompt.as_deref(),
+    )
+    .await
+    {
+        Ok(c) => Some((c, false)),
+        Err(e) => {
+            let _ = tx.send(AgentEvent::Error(e)).await;
+            None
+        }
+    }
+}
+
+/// Stream one chat-completion request over HTTP, forwarding each delta onto
+/// `tx` as it arrives. Dropping the internal forwarder channel (when the call
+/// returns) ends the forwarding loop.
+async fn stream_completion_via_http(
+    client: &LlmClient,
+    msg_json: &[serde_json::Value],
+    tool_defs: &[serde_json::Value],
+    tx: &Sender<AgentEvent>,
+) -> Result<ahma_llm_monitor::client::ChatCompletionResponse, ahma_llm_monitor::LlmMonitorError> {
+    let (dtx, mut drx) = tokio::sync::mpsc::channel::<ahma_llm_monitor::client::StreamDelta>(64);
+    let tx_fwd = tx.clone();
+    let forwarder = tokio::spawn(async move {
+        while let Some(d) = drx.recv().await {
+            let evt = match d {
+                ahma_llm_monitor::client::StreamDelta::Content(s) => AgentEvent::Token(s),
+                ahma_llm_monitor::client::StreamDelta::Thinking(s) => AgentEvent::Thinking(s),
+            };
+            if tx_fwd.send(evt).await.is_err() {
+                break;
+            }
+        }
+    });
+    let result = client
+        .chat_completion_with_tools_streaming(msg_json.to_vec(), tool_defs, dtx)
+        .await;
+    let _ = forwarder.await;
+    result
+}
+
+/// Handle a failed HTTP chat-completion attempt: retry the turn without tools
+/// when the provider rejected the request because of tool definitions,
+/// otherwise report the error as non-recoverable and end the turn.
+async fn handle_completion_stream_error(
+    e: ahma_llm_monitor::LlmMonitorError,
+    client: &LlmClient,
+    messages: &[ChatMessage],
+    system_prompt: &Option<String>,
+    mcp: &Option<McpChatConfig>,
+    tx: &Sender<AgentEvent>,
+) {
+    if is_tool_unsupported_error(&e.to_string()) {
+        info!(error = %e, "agent: model rejected tools — falling back to plain chat (no tool use this turn)");
+        let _ = tx
+            .send(AgentEvent::Error(
+                "Model does not support tools. Falling back to standard chat.".to_string(),
+            ))
+            .await;
+        spawn_chat_task(
+            client.clone(),
+            messages.to_vec(),
+            system_prompt.clone(),
+            mcp.clone(),
+            tx.clone(),
+        );
+    } else {
+        warn!(error = %e, "agent: chat completion failed (non-recoverable) — ending turn");
+        let _ = tx.send(AgentEvent::Error(e.to_string())).await;
+    }
+}
+
 /// Fetch one assistant turn. Returns `(response, content_streamed)` where
 /// `content_streamed` is `true` when the visible content was already emitted to
 /// `tx` as `AgentEvent::Token`s during the call (so callers must not re-send it).
@@ -558,76 +671,18 @@ async fn fetch_completion(
     system_prompt: &Option<String>,
 ) -> Option<(ahma_llm_monitor::client::ChatCompletionResponse, bool)> {
     if client.base_url().starts_with("mcp://") {
-        let Some(mcp_cfg) = mcp else {
-            let _ = tx
-                .send(AgentEvent::Error(
-                    "MCP config missing for sampling".to_string(),
-                ))
-                .await;
-            return None;
-        };
         let target_label = client.base_url().strip_prefix("mcp://").unwrap_or("");
-        match call_mcp_sampling_routed(
-            mcp_cfg,
-            target_label,
-            msg_json.to_vec(),
-            system_prompt.as_deref(),
-        )
-        .await
-        {
-            // Sampling is not streamed; caller still needs to emit the content.
-            Ok(c) => Some((c, false)),
-            Err(e) => {
-                let _ = tx.send(AgentEvent::Error(e)).await;
-                None
-            }
-        }
-    } else {
-        // Stream the turn so the UI shows live tokens + reasoning instead of
-        // blocking on one opaque request. Forward each delta onto the agent
-        // event channel; dropping `dtx` (when the call returns) ends the loop.
-        let (dtx, mut drx) =
-            tokio::sync::mpsc::channel::<ahma_llm_monitor::client::StreamDelta>(64);
-        let tx_fwd = tx.clone();
-        let forwarder = tokio::spawn(async move {
-            while let Some(d) = drx.recv().await {
-                let evt = match d {
-                    ahma_llm_monitor::client::StreamDelta::Content(s) => AgentEvent::Token(s),
-                    ahma_llm_monitor::client::StreamDelta::Thinking(s) => AgentEvent::Thinking(s),
-                };
-                if tx_fwd.send(evt).await.is_err() {
-                    break;
-                }
-            }
-        });
-        let result = client
-            .chat_completion_with_tools_streaming(msg_json.to_vec(), tool_defs, dtx)
+        return fetch_completion_via_mcp_sampling(mcp, target_label, msg_json, tx, system_prompt)
             .await;
-        let _ = forwarder.await;
-        match result {
-            Ok(c) => Some((c, true)),
-            Err(e) => {
-                if is_tool_unsupported_error(&e.to_string()) {
-                    info!(error = %e, "agent: model rejected tools — falling back to plain chat (no tool use this turn)");
-                    let _ = tx
-                        .send(AgentEvent::Error(
-                            "Model does not support tools. Falling back to standard chat."
-                                .to_string(),
-                        ))
-                        .await;
-                    spawn_chat_task(
-                        client.clone(),
-                        messages.to_vec(),
-                        system_prompt.clone(),
-                        mcp.clone(),
-                        tx.clone(),
-                    );
-                } else {
-                    warn!(error = %e, "agent: chat completion failed (non-recoverable) — ending turn");
-                    let _ = tx.send(AgentEvent::Error(e.to_string())).await;
-                }
-                None
-            }
+    }
+
+    // Stream the turn so the UI shows live tokens + reasoning instead of
+    // blocking on one opaque request.
+    match stream_completion_via_http(client, msg_json, tool_defs, tx).await {
+        Ok(c) => Some((c, true)),
+        Err(e) => {
+            handle_completion_stream_error(e, client, messages, system_prompt, mcp, tx).await;
+            None
         }
     }
 }
@@ -660,6 +715,23 @@ fn append_hint_to_field(
     }
 }
 
+/// True when a failed-tool-call hint should be appended: the call failed, the
+/// caller opted into hinting this turn, and no failure hint has been sent yet.
+fn should_inject_error_hint(failed: bool, inject_error_hint: bool, error_hinted: bool) -> bool {
+    failed && inject_error_hint && !error_hinted
+}
+
+/// True when a read-file-tool hint should be appended: the tool is a read
+/// tool, the caller opted into hinting this turn, and no read hint has been
+/// sent yet.
+fn should_inject_read_hint(
+    tool_name: &str,
+    inject_read_hint: bool,
+    read_file_hinted: bool,
+) -> bool {
+    (tool_name == "read_file" || tool_name == "list_dir") && inject_read_hint && !read_file_hinted
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_tool_message_with_hints(
     msg_json: &mut Vec<serde_json::Value>,
@@ -675,7 +747,7 @@ fn push_tool_message_with_hints(
 ) {
     let mut final_payload = payload;
     if let Some(obj) = final_payload.as_object_mut() {
-        if failed && inject_error_hint && !*error_hinted {
+        if should_inject_error_hint(failed, inject_error_hint, *error_hinted) {
             *error_hinted = true;
             let key = if obj.contains_key("error") {
                 "error"
@@ -688,10 +760,7 @@ fn push_tool_message_with_hints(
                 "\n\u{1f4a1} [Harness Hint: The previous tool call failed. Carefully read the error output above. Ensure parameter values are correct, check for typo errors, and try a different approach.]",
             );
         }
-        if (tool_name == "read_file" || tool_name == "list_dir")
-            && inject_read_hint
-            && !*read_file_hinted
-        {
+        if should_inject_read_hint(tool_name, inject_read_hint, *read_file_hinted) {
             *read_file_hinted = true;
             append_hint_to_field(
                 obj,
@@ -1177,30 +1246,45 @@ async fn run_session_sse_listener(
             let Some(value) = event_data_to_json(&raw_event) else {
                 continue;
             };
-            let method = value.get("method").and_then(|m| m.as_str());
-
-            if method == Some("notifications/sandbox/configured")
-                && let Some(tx) = locked_tx.take()
-            {
-                let _ = tx.send(());
-            }
-
-            if method == Some("roots/list")
-                && let Some(request_id) = value.get("id").cloned()
-            {
-                respond_to_roots_list(
-                    &post_client,
-                    &sse_url,
-                    &session_id,
-                    request_id,
-                    &workspace_root,
-                )
-                .await;
-            }
+            handle_session_sse_event(
+                &value,
+                &post_client,
+                &sse_url,
+                &session_id,
+                &workspace_root,
+                &mut locked_tx,
+            )
+            .await;
         }
     }
 
     Ok(())
+}
+
+/// Dispatch one decoded SSE event received during the session listener's
+/// lifetime: signal `locked_tx` on sandbox-configured confirmation, and
+/// answer server-initiated `roots/list` requests.
+async fn handle_session_sse_event(
+    value: &serde_json::Value,
+    post_client: &reqwest::Client,
+    sse_url: &str,
+    session_id: &str,
+    workspace_root: &std::path::Path,
+    locked_tx: &mut Option<tokio::sync::oneshot::Sender<()>>,
+) {
+    let method = value.get("method").and_then(|m| m.as_str());
+
+    if method == Some("notifications/sandbox/configured")
+        && let Some(tx) = locked_tx.take()
+    {
+        let _ = tx.send(());
+    }
+
+    if method == Some("roots/list")
+        && let Some(request_id) = value.get("id").cloned()
+    {
+        respond_to_roots_list(post_client, sse_url, session_id, request_id, workspace_root).await;
+    }
 }
 
 /// Answer a server-initiated `roots/list` request over the SSE session by

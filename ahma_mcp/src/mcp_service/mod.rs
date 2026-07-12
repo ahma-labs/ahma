@@ -1918,41 +1918,52 @@ impl AhmaMcpService {
     ) -> Result<CallToolResult, McpError> {
         self.guard_sandbox_ready_for_tool_calls()?;
 
-        if params.name.contains("::") {
-            let mgr = {
-                let guard = self.mcp_connections.read().await;
-                guard.clone()
-            };
-            if let Some((server_name, _)) = mgr.resolve_tool_name(&params.name)
-                && mgr.servers.iter().any(|s| s.name == server_name)
-            {
-                let arguments = params.arguments.unwrap_or_default();
-                let args_val = serde_json::Value::Object(arguments);
-                match mgr.call_tool(&params.name, args_val).await {
-                    Ok((output, is_error)) => {
-                        if is_error {
-                            return Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                                output,
-                            )]));
-                        } else {
-                            return Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                                output,
-                            )]));
-                        }
-                    }
-                    Err(e) => {
-                        return Err(McpError::internal_error(
-                            format!("External tool call failed: {e}"),
-                            None,
-                        ));
-                    }
-                }
-            }
+        if params.name.contains("::")
+            && let Some(result) = self.try_dispatch_external_mcp_tool(&params).await
+        {
+            return result;
         }
 
         let (config, flattened_subcommand) = self.resolve_configured_tool(&params.name)?;
         self.dispatch_resolved_configured_tool(params, context, config, flattened_subcommand)
             .await
+    }
+
+    /// Attempts to route a `"server::tool"`-style call to a connected external
+    /// MCP server. Returns `None` when the name doesn't resolve to a known,
+    /// connected server, so the caller falls through to local tool resolution.
+    async fn try_dispatch_external_mcp_tool(
+        &self,
+        params: &CallToolRequestParams,
+    ) -> Option<Result<CallToolResult, McpError>> {
+        let mgr = {
+            let guard = self.mcp_connections.read().await;
+            guard.clone()
+        };
+        let (server_name, _) = mgr.resolve_tool_name(&params.name)?;
+        if !mgr.servers.iter().any(|s| s.name == server_name) {
+            return None;
+        }
+
+        let arguments = params.arguments.clone().unwrap_or_default();
+        let args_val = serde_json::Value::Object(arguments);
+        Some(match mgr.call_tool(&params.name, args_val).await {
+            Ok((output, is_error)) => {
+                if is_error {
+                    Ok(CallToolResult::error(vec![rmcp::model::Content::text(
+                        output,
+                    )]))
+                } else {
+                    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+                        output,
+                    )]))
+                }
+            }
+            Err(e) => Err(McpError::internal_error(
+                format!("External tool call failed: {e}"),
+                None,
+            )),
+        })
     }
 
     fn resolve_subcommand<'a>(

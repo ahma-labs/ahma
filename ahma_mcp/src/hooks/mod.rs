@@ -646,26 +646,12 @@ pub fn set_hooks_mode_override(mode: &str) {
 }
 
 /// Testable core of [`is_ahma_hooks_active`].
+///
+/// Delegates to [`describe_activation`] (same precedence: forced override,
+/// `AHMA_HOOKS`, `AHMA_DISABLE_HOOKS`, then auto-detection) and discards the
+/// human-readable reason, so the precedence chain has exactly one implementation.
 fn is_ahma_hooks_active_with_configs(active_mcps: &[PathBuf]) -> bool {
-    if let Some(Some(forced)) = HOOKS_MODE_OVERRIDE.get() {
-        return *forced;
-    }
-    if let Ok(val) = std::env::var("AHMA_HOOKS") {
-        match val.to_lowercase().as_str() {
-            "off" | "0" | "false" | "no" => return false,
-            "on" | "1" | "true" | "yes" => return true,
-            _ => {}
-        }
-    }
-    if std::env::var("AHMA_DISABLE_HOOKS")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    // Auto: active if any editor config has an ahma MCP server configured.
-    !active_mcps.is_empty()
+    describe_activation(active_mcps).0
 }
 
 /// The effective hook activation and a short human reason, mirroring the exact
