@@ -277,6 +277,9 @@ mod tests {
             tool_name: "cargo_build".into(),
             description: "Building".into(),
             parent_id: None,
+            title: None,
+            cwd: None,
+            command: None,
         })
         .unwrap();
         assert_eq!(progress, 0.0);

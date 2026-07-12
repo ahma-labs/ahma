@@ -49,6 +49,17 @@ pub enum OperationEvent {
         /// tree, audit) reconstruct the caller → subtask hierarchy.
         #[serde(default)]
         parent_id: Option<String>,
+        /// Human title, computed here at the source where the command is known
+        /// (SPEC R24.7). Subscribers **render** this; they do not derive a name of
+        /// their own from the id or the description.
+        #[serde(default)]
+        title: Option<String>,
+        /// Working directory.
+        #[serde(default)]
+        cwd: Option<String>,
+        /// The full command, for detail views.
+        #[serde(default)]
+        command: Option<String>,
     },
     /// A line of output was produced (stdout or stderr from the child process).
     OutputLine {
@@ -148,6 +159,9 @@ impl OperationEvent {
 ///     tool_name: "cargo_build".into(),
 ///     description: "Building project".into(),
 ///     parent_id: None,
+///     title: None,
+///     cwd: None,
+///     command: None,
 /// });
 ///
 /// let event = sub.recv().await.unwrap();
@@ -239,6 +253,9 @@ mod tests {
             tool_name: "cargo_build".into(),
             description: "Building".into(),
             parent_id: None,
+            title: None,
+            cwd: None,
+            command: None,
         });
 
         let ev1 = sub1.recv().await.unwrap();
@@ -294,6 +311,9 @@ mod tests {
                 tool_name: "t".into(),
                 description: "d".into(),
                 parent_id: None,
+                title: None,
+                cwd: None,
+                command: None,
             },
             OperationEvent::OutputLine {
                 operation_id: "id".into(),

@@ -28,6 +28,24 @@ use tracing::{debug, warn};
 
 use crate::state::{OpStatus, Operation};
 
+/// The identity fields the server computed and put on the wire (SPEC R24.7).
+///
+/// Bundled rather than passed as four more positional arguments, and named for
+/// what they are: things the observer is **given**, not things it works out for
+/// itself. Reverse-engineering an operation's name from its id is the bug this
+/// whole struct exists to retire.
+#[derive(Debug, Clone, Default)]
+pub struct OpWireIdentity {
+    /// Human title of the command (see `ahma_common::op_identity::title_for`).
+    pub title: Option<String>,
+    /// Working directory it ran in.
+    pub cwd: Option<String>,
+    /// The full command, for the detail pane.
+    pub command: Option<String>,
+    /// Which attached session initiated it.
+    pub origin: Option<String>,
+}
+
 pub use crate::mcp_source::SourceEvent;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -169,6 +187,7 @@ impl DaemonState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn on_op_started(
         &mut self,
         instance_id: &str,
@@ -178,6 +197,7 @@ impl DaemonState {
         scope: Option<String>,
         parent_id: Option<String>,
         started_epoch_ms: Option<u64>,
+        identity: OpWireIdentity,
     ) {
         let (label, pid) = self
             .instances
@@ -199,6 +219,13 @@ impl DaemonState {
         op.scope = scope;
         op.description = description;
         op.parent_id = parent_id;
+        // The server computed these; do not re-derive them (SPEC R24.7).
+        op.title = identity.title;
+        op.command = identity.command;
+        op.origin = identity.origin;
+        if op.cwd.is_none() {
+            op.cwd = identity.cwd;
+        }
         // Back-date the start so a replayed operation (TUI opened after the
         // work began) shows its true elapsed time, not time-since-receipt.
         if let Some((instant, local)) = backdate(started_epoch_ms) {
@@ -214,6 +241,7 @@ impl DaemonState {
             .insert(op_id, op);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_op_finished(
         &mut self,
         instance_id: &str,
@@ -222,6 +250,7 @@ impl DaemonState {
         result_summary: Option<String>,
         duration_ms: u64,
         ended_epoch_ms: Option<u64>,
+        exit_code: Option<i64>,
     ) {
         if let Some(instance_ops) = self.ops.get_mut(instance_id)
             && let Some(op) = instance_ops.get_mut(op_id)
@@ -229,6 +258,7 @@ impl DaemonState {
             op.status = parse_op_status(status_str);
             op.result_summary = result_summary;
             op.duration_ms = Some(duration_ms);
+            op.exit_code = exit_code;
             // Back-date replayed completions so the retention window measures
             // from when the operation actually finished.
             op.completed_at = backdate(ended_epoch_ms)
@@ -476,6 +506,10 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 scope,
                 parent_id,
                 started_epoch_ms,
+                title,
+                cwd,
+                command,
+                origin,
             } => {
                 state.on_op_started(
                     &instance_id,
@@ -485,6 +519,12 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                     Some(scope),
                     parent_id,
                     started_epoch_ms,
+                    OpWireIdentity {
+                        title,
+                        cwd,
+                        command,
+                        origin,
+                    },
                 );
                 Applied::ListChanged
             }
@@ -494,6 +534,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                 result_summary,
                 duration_ms,
                 ended_epoch_ms,
+                exit_code,
             } => {
                 state.on_op_finished(
                     &instance_id,
@@ -502,6 +543,7 @@ fn apply_msg(state: &mut DaemonState, msg: DaemonMsg) -> Applied {
                     result_summary,
                     duration_ms,
                     ended_epoch_ms,
+                    exit_code,
                 );
                 Applied::ListChanged
             }
@@ -680,6 +722,7 @@ mod tests {
             Some("/test/scope".to_string()),
             None,
             None,
+            OpWireIdentity::default(),
         );
 
         let ops = s.all_ops();
@@ -703,8 +746,17 @@ mod tests {
             None,
             None,
             None,
+            OpWireIdentity::default(),
         );
-        s.on_op_finished("i1", "op-1", "Completed", Some("ok".to_string()), 100, None);
+        s.on_op_finished(
+            "i1",
+            "op-1",
+            "Completed",
+            Some("ok".to_string()),
+            100,
+            None,
+            Some(0),
+        );
 
         let ops = s.all_ops();
         assert_eq!(ops[0].status, OpStatus::Succeeded);
@@ -718,7 +770,7 @@ mod tests {
         let mut s = DaemonState::new();
         s.add_instance(inst("i1", "Test"));
         // Should not panic.
-        s.on_op_finished("i1", "nonexistent-op", "Completed", None, 0, None);
+        s.on_op_finished("i1", "nonexistent-op", "Completed", None, 0, None, None);
     }
 
     #[test]
@@ -733,6 +785,7 @@ mod tests {
             None,
             None,
             None,
+            OpWireIdentity::default(),
         );
         s.on_op_started(
             "i1",
@@ -742,8 +795,9 @@ mod tests {
             None,
             None,
             None,
+            OpWireIdentity::default(),
         );
-        s.on_op_finished("i1", "op-a", "Completed", None, 0, None);
+        s.on_op_finished("i1", "op-a", "Completed", None, 0, None, None);
 
         let ops = s.all_ops();
         assert_eq!(ops.len(), 2);
@@ -768,6 +822,7 @@ mod tests {
             None,
             None,
             None,
+            OpWireIdentity::default(),
         );
         s.on_op_started(
             "i2",
@@ -777,6 +832,7 @@ mod tests {
             None,
             None,
             None,
+            OpWireIdentity::default(),
         );
         assert_eq!(s.all_ops().len(), 2);
     }
@@ -793,6 +849,7 @@ mod tests {
             None,
             None,
             None,
+            OpWireIdentity::default(),
         );
         s.on_op_started(
             "i1",
@@ -802,8 +859,9 @@ mod tests {
             None,
             None,
             None,
+            OpWireIdentity::default(),
         );
-        s.on_op_finished("i1", "op-2", "Failed", None, 0, None);
+        s.on_op_finished("i1", "op-2", "Failed", None, 0, None, None);
 
         // Stamp op-2's completion now, then let real time pass past a tiny
         // retention window — exercises the same "older than retention"
@@ -909,6 +967,10 @@ mod tests {
                     scope: "/test/scope".to_string(),
                     parent_id: None,
                     started_epoch_ms: None,
+                    title: None,
+                    cwd: None,
+                    command: None,
+                    origin: None,
                 },
             },
         );
@@ -926,6 +988,7 @@ mod tests {
                     result_summary: Some("success".to_string()),
                     duration_ms: 1200,
                     ended_epoch_ms: None,
+                    exit_code: None,
                 },
             },
         );
@@ -970,6 +1033,10 @@ mod tests {
                     scope: "/test".to_string(),
                     parent_id: None,
                     started_epoch_ms: None,
+                    title: None,
+                    cwd: None,
+                    command: None,
+                    origin: None,
                 },
             },
         );
@@ -1097,6 +1164,7 @@ mod tests {
             None,
             None,
             None,
+            OpWireIdentity::default(),
         );
         let ops = s.all_ops();
         assert_eq!(ops.len(), 1);
@@ -1119,8 +1187,9 @@ mod tests {
             None,
             None,
             None,
+            OpWireIdentity::default(),
         );
-        s.on_op_finished("i1", "op-1", "Completed", None, 5, None);
+        s.on_op_finished("i1", "op-1", "Completed", None, 5, None, None);
         s.prune_terminal();
         let ops = s.all_ops();
         assert_eq!(ops.len(), 1, "recently completed op is retained");
@@ -1374,6 +1443,10 @@ mod tests {
                 scope: "/s".to_string(),
                 parent_id: None,
                 started_epoch_ms: None,
+                title: None,
+                cwd: None,
+                command: None,
+                origin: None,
             },
         })
         .unwrap();
@@ -1774,6 +1847,10 @@ mod tests {
                     scope: "/test/scope".to_string(),
                     parent_id: None,
                     started_epoch_ms: None,
+                    title: None,
+                    cwd: None,
+                    command: None,
+                    origin: None,
                 },
             },
         )
@@ -1825,6 +1902,7 @@ mod tests {
                     result_summary: Some("ok".to_string()),
                     duration_ms: 42,
                     ended_epoch_ms: None,
+                    exit_code: None,
                 },
             },
         )

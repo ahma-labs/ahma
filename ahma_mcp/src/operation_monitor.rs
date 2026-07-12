@@ -76,6 +76,17 @@ pub struct Operation {
     pub id: String,
     pub tool_name: String,
     pub description: String,
+    /// Human title of this operation, computed where the command is known
+    /// (SPEC R24.7). Carried on the `Started` event and the hub wire so no
+    /// observer has to guess a name from the operation id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Working directory the operation runs in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The full command, for detail views (`title` is the one-line form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     /// Operation (or synthetic group, e.g. `session:<id>` for persistent shell
     /// sessions) that spawned this one. `None` for top-level operations.
     /// Carried on the `Started` event and the hub wire so observers (TUI task
@@ -136,6 +147,9 @@ impl Operation {
             id,
             tool_name,
             description,
+            title: None,
+            cwd: None,
+            command: None,
             parent_id: None,
             state: OperationStatus::Pending,
             result,
@@ -164,6 +178,9 @@ impl Operation {
             id,
             tool_name,
             description,
+            title: None,
+            cwd: None,
+            command: None,
             parent_id: None,
             state: OperationStatus::Pending,
             result,
@@ -376,6 +393,9 @@ impl OperationMonitor {
             tool_name: operation.tool_name.clone(),
             description: operation.description.clone(),
             parent_id: operation.parent_id.clone(),
+            title: operation.title.clone(),
+            cwd: operation.cwd.clone(),
+            command: operation.command.clone(),
         };
         let was_new = ops.insert(operation.id.clone(), operation).is_none();
         tracing::debug!("Total operations in monitor after add: {}", ops.len());

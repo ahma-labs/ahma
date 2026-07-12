@@ -2305,7 +2305,15 @@ fn build_tree_op_item(
 
     let clean_id_str = op.clean_id();
     let id_part = format!(" [{}]", clean_id_str);
-    let elapsed_part = format!("  {}", op.elapsed_display());
+    // A finished row shows *how* it finished, not just how long it took. "Failed"
+    // without a code is not actionable; `exit 101` is (SPEC R24.7). Operations that
+    // are not processes have no code, and say nothing rather than inventing one.
+    let elapsed_part = match op.exit_code {
+        Some(code) if op.status.is_terminal() => {
+            format!("  exit {code} · {}", op.elapsed_display())
+        }
+        _ => format!("  {}", op.elapsed_display()),
+    };
 
     let fixed_prefix_len = sel_symbol.len() + indent.len() + expand_mark.len() + 2;
     let rem_width = width.saturating_sub(fixed_prefix_len);

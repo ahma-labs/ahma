@@ -53,6 +53,7 @@ pub mod keepalive;
 pub mod local_tls;
 pub mod net_approval;
 pub mod observability;
+pub mod op_identity;
 /// Transport-agnostic MCP peer factory abstraction (P6).
 pub mod peer_factory;
 pub mod peer_transport;

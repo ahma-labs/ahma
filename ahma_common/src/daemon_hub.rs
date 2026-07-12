@@ -133,6 +133,27 @@ pub enum DaemonEvent {
         /// elapsed time instead of measuring from receipt.
         #[serde(default)]
         started_epoch_ms: Option<u64>,
+        /// The human title of this operation, computed **server-side** where the
+        /// command is actually known (SPEC R24.7,
+        /// [`crate::op_identity::title_for`]).
+        ///
+        /// This exists because observers used to reverse-engineer a name from the
+        /// operation *id* (`op_41_echo_hello`), or fall back to the bare tool
+        /// name, which made every row in a TUI look alike. No formatter can repair
+        /// data that was never sent — so we send it.
+        #[serde(default)]
+        title: Option<String>,
+        /// Working directory the operation ran in.
+        #[serde(default)]
+        cwd: Option<String>,
+        /// The full command, for the detail pane (`title` is the one-line form).
+        #[serde(default)]
+        command: Option<String>,
+        /// Which attached session initiated the work — `cursor`, `claude-code`,
+        /// `tui`, `cli`, `hook`. What lets one timeline interleave IDE work and the
+        /// user's own TUI commands and stay readable.
+        #[serde(default)]
+        origin: Option<String>,
     },
     OpFinished {
         id: String,
@@ -144,6 +165,12 @@ pub enum DaemonEvent {
         /// historic views after replay.
         #[serde(default)]
         ended_epoch_ms: Option<u64>,
+        /// Process exit code, when the operation was a process and the runner
+        /// reported one. "Failed" without an exit code is not actionable; `exit
+        /// 101` is. `None` for cancellations, timeouts, and non-process work, where
+        /// the surface says the status word rather than inventing a code.
+        #[serde(default)]
+        exit_code: Option<i64>,
     },
     /// A single line of live output from a running operation.
     /// Streamed as the child process produces it, so subscribers (TUI) can
@@ -1473,6 +1500,81 @@ fn uuid_v4() -> String {
 
 #[cfg(test)]
 mod tests {
+    // ── Wire compatibility for the R24.7 identity fields ─────────────────────
+
+    /// A *new* event must deserialize into an *old* reader.
+    ///
+    /// R24.5 permits field-only evolution precisely so mixed-version daemon /
+    /// instance / TUI combinations keep working. If a new field made an old reader
+    /// fail, upgrading one component would silently blind the others.
+    #[test]
+    fn an_old_reader_ignores_the_new_identity_fields() {
+        #[derive(serde::Deserialize)]
+        struct OldOpStarted {
+            id: String,
+            tool_name: String,
+        }
+
+        let new = DaemonEvent::OpStarted {
+            id: "op_1".into(),
+            tool_name: "run_terminal_command".into(),
+            description: "d".into(),
+            scope: "/ws".into(),
+            parent_id: None,
+            started_epoch_ms: Some(1),
+            title: Some("cargo build".into()),
+            cwd: Some("/ws".into()),
+            command: Some("cargo build".into()),
+            origin: Some("cursor".into()),
+        };
+        let json = serde_json::to_string(&new).unwrap();
+        let old: OldOpStarted = serde_json::from_str(&json).expect("old readers still parse");
+        assert_eq!(old.id, "op_1");
+        assert_eq!(old.tool_name, "run_terminal_command");
+    }
+
+    /// An *old* event must deserialize into a *new* reader, with the new fields
+    /// absent rather than fatal — the TUI then falls back to its legacy naming.
+    #[test]
+    fn a_new_reader_accepts_an_event_with_no_identity_fields() {
+        let old_json = serde_json::json!({
+            "kind": "OpStarted",
+            "id": "op_1",
+            "tool_name": "run_terminal_command",
+            "description": "d",
+            "scope": "/ws"
+        })
+        .to_string();
+
+        let ev: DaemonEvent = serde_json::from_str(&old_json).expect("old events still parse");
+        match ev {
+            DaemonEvent::OpStarted { title, origin, .. } => {
+                assert!(title.is_none(), "no title from a pre-R24.7 server");
+                assert!(origin.is_none());
+            }
+            other => panic!("expected OpStarted, got {other:?}"),
+        }
+    }
+
+    /// The exit code survives the round trip, because "failed" without one is not
+    /// actionable.
+    #[test]
+    fn the_exit_code_round_trips() {
+        let ev = DaemonEvent::OpFinished {
+            id: "op_1".into(),
+            status: "Failed".into(),
+            result_summary: None,
+            duration_ms: 10,
+            ended_epoch_ms: None,
+            exit_code: Some(101),
+        };
+        let back: DaemonEvent = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+        match back {
+            DaemonEvent::OpFinished { exit_code, .. } => assert_eq!(exit_code, Some(101)),
+            other => panic!("expected OpFinished, got {other:?}"),
+        }
+    }
+
     use super::*;
     use tokio::io::BufReader;
 
@@ -1642,6 +1744,10 @@ mod tests {
             scope: "/w".into(),
             parent_id: Some("session:build-loop".into()),
             started_epoch_ms: Some(1_750_000_000_000),
+            title: None,
+            cwd: None,
+            command: None,
+            origin: None,
         };
         let json = serde_json::to_string(&ev).unwrap();
         let back: DaemonEvent = serde_json::from_str(&json).unwrap();
@@ -1696,6 +1802,10 @@ mod tests {
                 scope: "/test/scope".to_string(),
                 parent_id: None,
                 started_epoch_ms: None,
+                title: None,
+                cwd: None,
+                command: None,
+                origin: None,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -1726,6 +1836,7 @@ mod tests {
                 result_summary: Some("success".to_string()),
                 duration_ms: 1500,
                 ended_epoch_ms: None,
+                exit_code: None,
             },
         };
         let mut buf = Vec::<u8>::new();
@@ -1976,6 +2087,10 @@ mod tests {
                     scope: "/test/scope".to_string(),
                     parent_id: None,
                     started_epoch_ms: None,
+                    title: None,
+                    cwd: None,
+                    command: None,
+                    origin: None,
                 },
             },
         )
@@ -2005,6 +2120,7 @@ mod tests {
                     result_summary: Some("success".to_string()),
                     duration_ms: 1200,
                     ended_epoch_ms: None,
+                    exit_code: None,
                 },
             },
         )
@@ -2126,6 +2242,10 @@ mod tests {
                 scope: "/w".into(),
                 parent_id: None,
                 started_epoch_ms: None,
+                title: None,
+                cwd: None,
+                command: None,
+                origin: None,
             },
         )
         .await;
@@ -2137,6 +2257,7 @@ mod tests {
                 result_summary: Some("ok".into()),
                 duration_ms: 10,
                 ended_epoch_ms: None,
+                exit_code: None,
             },
         )
         .await;
@@ -2149,6 +2270,10 @@ mod tests {
                 scope: "/w".into(),
                 parent_id: None,
                 started_epoch_ms: None,
+                title: None,
+                cwd: None,
+                command: None,
+                origin: None,
             },
         )
         .await;
@@ -2212,6 +2337,10 @@ mod tests {
                 scope: "/w".into(),
                 parent_id: None,
                 started_epoch_ms: None,
+                title: None,
+                cwd: None,
+                command: None,
+                origin: None,
             },
         )
         .await;
@@ -2298,6 +2427,10 @@ mod tests {
                     scope: "/w".into(),
                     parent_id: None,
                     started_epoch_ms: None,
+                    title: None,
+                    cwd: None,
+                    command: None,
+                    origin: None,
                 },
             )
             .await;
@@ -2309,6 +2442,7 @@ mod tests {
                     result_summary: None,
                     duration_ms: 1,
                     ended_epoch_ms: None,
+                    exit_code: None,
                 },
             )
             .await;
@@ -2328,6 +2462,10 @@ mod tests {
                 scope: "/w".into(),
                 parent_id: None,
                 started_epoch_ms: None,
+                title: None,
+                cwd: None,
+                command: None,
+                origin: None,
             },
         )
         .await;
@@ -2362,6 +2500,10 @@ mod tests {
                     scope: "/w".into(),
                     parent_id: None,
                     started_epoch_ms: None,
+                    title: None,
+                    cwd: None,
+                    command: None,
+                    origin: None,
                 },
             )
             .await;
@@ -2387,6 +2529,7 @@ mod tests {
                 result_summary: None,
                 duration_ms: 0,
                 ended_epoch_ms: None,
+                exit_code: None,
             },
         )
         .await;
@@ -2402,6 +2545,10 @@ mod tests {
                 scope: "/w".into(),
                 parent_id: None,
                 started_epoch_ms: None,
+                title: None,
+                cwd: None,
+                command: None,
+                origin: None,
             },
         )
         .await;
@@ -2413,6 +2560,7 @@ mod tests {
                 result_summary: None,
                 duration_ms: 0,
                 ended_epoch_ms: None,
+                exit_code: None,
             },
         )
         .await;
@@ -2887,6 +3035,10 @@ mod tests {
                     scope: "/w".into(),
                     parent_id: None,
                     started_epoch_ms: None,
+                    title: None,
+                    cwd: None,
+                    command: None,
+                    origin: None,
                 },
             },
         )
@@ -2901,6 +3053,7 @@ mod tests {
                     result_summary: Some("ok".into()),
                     duration_ms: 5,
                     ended_epoch_ms: None,
+                    exit_code: None,
                 },
             },
         )

@@ -641,6 +641,19 @@ impl OpStatus {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
 
+    /// The status word as it appears on the hub wire — the vocabulary the
+    /// identity line falls back to when there is no exit code to show.
+    pub fn wire_word(&self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::Pending => "Pending",
+            Self::Succeeded => "Completed",
+            Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
+            Self::Waiting => "Waiting",
+        }
+    }
+
     pub fn glyph(&self, unicode: bool) -> &'static str {
         if unicode {
             match self {
@@ -690,6 +703,16 @@ pub struct Operation {
     pub result_summary: Option<String>,
     pub duration_ms: Option<u64>,
     pub scope: Option<String>,
+    /// The human title, computed **server-side** and carried on the wire
+    /// (SPEC R24.7). When present it is authoritative — the legacy parse chain
+    /// below is only for events from a pre-R24.7 server.
+    pub title: Option<String>,
+    /// The full command, for the detail pane.
+    pub command: Option<String>,
+    /// Which attached session initiated this work (`cursor`, `tui`, `hook`, …).
+    pub origin: Option<String>,
+    /// Process exit code, when the runner reported one.
+    pub exit_code: Option<i64>,
 }
 
 /// Strategy 1: pull `command` out of an embedded JSON blob in the description.
@@ -760,6 +783,10 @@ impl Operation {
             result_summary: None,
             duration_ms: None,
             scope: None,
+            title: None,
+            command: None,
+            origin: None,
+            exit_code: None,
         }
     }
 
@@ -789,13 +816,59 @@ impl Operation {
         }
     }
 
+    /// The name a human reads for this operation.
+    ///
+    /// The server now computes this and sends it (`title`, SPEC R24.7), because
+    /// only the server knows what command it ran. Everything below the first
+    /// branch is a **fallback for pre-R24.7 servers** — the old guessing chain
+    /// that parsed a command out of JSON, then out of an "Execute …" sentence,
+    /// then out of the operation *id*, which is how rows ended up reading
+    /// `op_41_echo_hello`. Keep it until the wire-compat window closes; do not
+    /// extend it. Guessing is what we are getting rid of.
     pub fn display_name(&self) -> String {
+        if let Some(title) = &self.title
+            && !title.trim().is_empty()
+        {
+            return title.clone();
+        }
         if self.tool_name == "run_terminal_command"
             && let Some(cmd) = try_parse_run_terminal_command(&self.description, &self.id)
         {
             return cmd;
         }
         self.tool_name.clone()
+    }
+
+    /// This operation as the one canonical identity (SPEC R24.7), ready to render
+    /// identically in chat, monitor rows, grant prompts, and log names.
+    pub fn identity(&self) -> ahma_common::op_identity::OpIdentity<'_> {
+        use ahma_common::op_identity::{OpIdentity, OpOutcome};
+
+        let outcome = match self.status {
+            OpStatus::Running | OpStatus::Pending => OpOutcome::Running {
+                elapsed_secs: self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+            },
+            _ => OpOutcome::Finished {
+                exit_code: self.exit_code,
+                status: self.status.wire_word().to_string(),
+                duration_ms: self.duration_ms.unwrap_or(0),
+            },
+        };
+
+        OpIdentity {
+            title: self.title_ref(),
+            cwd: self.cwd.as_deref(),
+            origin: self.origin.as_deref(),
+            outcome,
+        }
+    }
+
+    /// Borrow the title without allocating when the wire supplied one.
+    fn title_ref(&self) -> &str {
+        match &self.title {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => &self.tool_name,
+        }
     }
 
     pub fn clean_id(&self) -> String {
@@ -2644,6 +2717,54 @@ mod tests {
         // Test completed elapsed formatting (stops counting using duration_ms)
         op.duration_ms = Some(42000);
         assert_eq!(op.elapsed_display(), "42s");
+    }
+
+    /// The bug the user actually reported: a TUI opened after an IDE had been
+    /// working showed rows like `op_41_echo_hello` — a name reverse-engineered from
+    /// the operation *id*, because the wire carried nothing better.
+    ///
+    /// With R24.7 the server sends a title, and it wins over every heuristic.
+    #[test]
+    fn the_wire_title_wins_over_every_guess() {
+        let mut op = Operation::new(
+            "op_41_echo_hello",
+            "run_terminal_command",
+            OpStatus::Running,
+        );
+        // The description and the id are both things the old code would have mined
+        // for a name. The title outranks both, because only the server knew.
+        op.description = "Execute something misleading in /elsewhere".to_string();
+        op.title = Some("cargo nextest run -p ahma_core".to_string());
+
+        assert_eq!(op.display_name(), "cargo nextest run -p ahma_core");
+    }
+
+    /// A pre-R24.7 server sends no title, so the legacy chain still has to work —
+    /// mixed versions must not regress to a blank row.
+    #[test]
+    fn without_a_wire_title_the_legacy_chain_still_names_the_row() {
+        let mut op = Operation::new(
+            "op_41_echo_hello",
+            "run_terminal_command",
+            OpStatus::Running,
+        );
+        op.title = None;
+        op.description = String::new();
+        // This is the old, bad name — kept working on purpose for old servers.
+        assert_eq!(op.display_name(), "echo hello");
+    }
+
+    /// The identity line is what the user reads: what ran, where, and how it ended.
+    #[test]
+    fn a_finished_operation_renders_its_command_and_exit_status() {
+        let mut op = Operation::new("op_1", "run_terminal_command", OpStatus::Failed);
+        op.title = Some("cargo build".to_string());
+        op.cwd = Some("/Users/me/github/ahma".to_string());
+        op.exit_code = Some(101);
+        op.duration_ms = Some(3_400);
+
+        let line = op.identity().render(false);
+        assert_eq!(line, "✗ cargo build · ahma · exit 101 · 3s");
     }
 
     #[test]

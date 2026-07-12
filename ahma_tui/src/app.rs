@@ -3409,7 +3409,15 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             handle_window_finished_event(window_id, success, summary, state);
         }
         BridgeEvent::ToolCallStarted { id, name, args } => {
-            state.chat.start_tool_call(id, name, args);
+            // Name the chat line the same way the monitor names its rows: by what
+            // was actually run (SPEC R24.7). A column of identical
+            // `run_terminal_command` lines tells the user nothing about their own
+            // session — `cargo nextest run -p ahma_core` tells them everything.
+            let title = serde_json::from_str::<serde_json::Value>(&args)
+                .ok()
+                .map(|v| ahma_common::op_identity::title_for_value(&name, Some(&v)))
+                .unwrap_or_else(|| name.clone());
+            state.chat.start_tool_call(id, title, args);
             state.chat_scroll = 0;
         }
         BridgeEvent::ToolCallFinished { id, result, failed } => {

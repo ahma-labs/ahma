@@ -660,6 +660,20 @@ impl Adapter {
             None,
             timeout_duration,
         );
+        // Name the operation *here*, where the command is actually known
+        // (SPEC R24.7). Every observer downstream renders this title; none of them
+        // has to guess one from the operation id, which is how TUI rows used to end
+        // up reading `op_41_echo_hello`.
+        operation.title = Some(ahma_common::op_identity::title_for(
+            tool_name,
+            args.as_ref(),
+        ));
+        operation.cwd = Some(safe_wd_str.clone());
+        operation.command = args
+            .as_ref()
+            .and_then(|a| a.get("command"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
         // Advertise the full-output spill file from the start so `status`
         // callers know where the complete output lives (stdout_tail is a
         // bounded window).  The file is created lazily by the streaming task.
@@ -725,6 +739,13 @@ impl Adapter {
             None,
             timeout.map(Duration::from_secs),
         );
+        // Same identity, same source (SPEC R24.7) — a PTY command is still a command.
+        operation.title = Some(ahma_common::op_identity::title_for_value(
+            tool_name,
+            Some(&serde_json::json!({ "command": command_str })),
+        ));
+        operation.cwd = Some(safe_wd.to_string_lossy().into_owned());
+        operation.command = Some(command_str.to_string());
         operation.output_file = Some(spill::operation_spill_path(&op_id));
         self.monitor.add_operation(operation).await;
 

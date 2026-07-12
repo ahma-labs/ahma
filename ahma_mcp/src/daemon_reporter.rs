@@ -266,7 +266,7 @@ async fn run_reporter_loop(
         let mut replayed_completed = false;
         for op in &completed_ops {
             let started_ev = ClientMsg::Event {
-                payload: op_started_event(op, &scope),
+                payload: op_started_event(op, &scope, &label),
             };
             if send_msg(&mut writer, &started_ev).await.is_err() {
                 replayed_completed = true;
@@ -284,6 +284,9 @@ async fn run_reporter_loop(
                     result_summary: result_summary_from(op),
                     duration_ms,
                     ended_epoch_ms: op.end_time.and_then(epoch_ms),
+                    // Replayed completions carry their exit code too, so a
+                    // late-attaching TUI shows `exit 101`, not a bare "failed".
+                    exit_code: op.result.as_ref().and_then(exit_code_from_value),
                 },
             };
             if send_msg(&mut writer, &finished_ev).await.is_err() {
@@ -300,7 +303,7 @@ async fn run_reporter_loop(
         let mut replayed_active = false;
         for op in &active_ops {
             let started_ev = ClientMsg::Event {
-                payload: op_started_event(op, &scope),
+                payload: op_started_event(op, &scope, &label),
             };
             if send_msg(&mut writer, &started_ev).await.is_err() {
                 replayed_active = true;
@@ -321,7 +324,7 @@ async fn run_reporter_loop(
                 event_res = event_rx.recv() => {
                     match event_res {
                         Ok(event) => {
-                            let Some(payload) = daemon_event_for(&event, &scope) else {
+                            let Some(payload) = daemon_event_for(&event, &scope, &label) else {
                                 continue;
                             };
                             let client_msg = ClientMsg::Event { payload };
@@ -505,7 +508,7 @@ fn epoch_ms(t: std::time::SystemTime) -> Option<u64> {
 /// Build the replay `OpStarted` wire event for an operation, preserving its
 /// true start time and parent link so a late-joining TUI shows accurate
 /// elapsed times and hierarchy.
-fn op_started_event(op: &Operation, scope: &str) -> DaemonEvent {
+fn op_started_event(op: &Operation, scope: &str, origin: &str) -> DaemonEvent {
     DaemonEvent::OpStarted {
         id: op.id.clone(),
         tool_name: op.tool_name.clone(),
@@ -513,14 +516,30 @@ fn op_started_event(op: &Operation, scope: &str) -> DaemonEvent {
         scope: scope.to_string(),
         parent_id: op.parent_id.clone(),
         started_epoch_ms: epoch_ms(op.start_time),
+        // Replay carries the same identity the live event did, which is why fixing
+        // the wire fixes late attach for free: a TUI opened *after* an IDE has been
+        // working shows what those operations were, not what their ids looked like
+        // (SPEC R24.7 / R24.2).
+        title: op.title.clone(),
+        cwd: op.cwd.clone(),
+        command: op.command.clone(),
+        origin: Some(origin.to_string()),
     }
 }
 
 /// Map a unified [`OperationEvent`] to the hub wire event, or `None` for
 /// events the hub does not carry (Progress, McpNotification).
+/// Map a unified [`OperationEvent`] to the hub wire event.
+///
+/// `origin` is the identity of the session that owns this instance — `cursor`,
+/// `claude-code`, `tui`, `cli`. Stamped here because this is the only layer that
+/// knows it: the adapter that *runs* the command has no idea who asked. It is what
+/// lets one timeline interleave IDE work and the user's own TUI commands and stay
+/// readable (SPEC R24.7).
 fn daemon_event_for(
     event: &ahma_common::event_dispatcher::OperationEvent,
     scope: &str,
+    origin: &str,
 ) -> Option<DaemonEvent> {
     use ahma_common::event_dispatcher::OperationEvent as Ev;
     let now_ms = epoch_ms(std::time::SystemTime::now());
@@ -530,6 +549,9 @@ fn daemon_event_for(
             tool_name,
             description,
             parent_id,
+            title,
+            cwd,
+            command,
         } => DaemonEvent::OpStarted {
             id: operation_id.clone(),
             tool_name: tool_name.clone(),
@@ -537,6 +559,13 @@ fn daemon_event_for(
             scope: scope.to_string(),
             parent_id: parent_id.clone(),
             started_epoch_ms: now_ms,
+            // Computed at the source (SPEC R24.7) and forwarded verbatim. The hub
+            // is a pipe here, not an interpreter: if it started deriving names of
+            // its own we would be back to guessing.
+            title: title.clone(),
+            cwd: cwd.clone(),
+            command: command.clone(),
+            origin: Some(origin.to_string()),
         },
         Ev::OutputLine {
             operation_id,
@@ -564,6 +593,8 @@ fn daemon_event_for(
             result_summary: summary_from_value(result),
             duration_ms: *duration_ms,
             ended_epoch_ms: now_ms,
+            // "Completed" without a code is not actionable; `exit 0` is.
+            exit_code: exit_code_from_value(result),
         },
         Ev::Failed {
             operation_id,
@@ -575,6 +606,10 @@ fn daemon_event_for(
             result_summary: Some(clip_summary(error.clone())),
             duration_ms: *duration_ms,
             ended_epoch_ms: now_ms,
+            // A failed op reports its error as a string, not a result object, so
+            // there is usually no code to read. `None` renders as "failed", which
+            // is honest — better than a fabricated code.
+            exit_code: None,
         },
         Ev::Cancelled {
             operation_id,
@@ -586,6 +621,7 @@ fn daemon_event_for(
             result_summary: Some(clip_summary(reason.clone())),
             duration_ms: *duration_ms,
             ended_epoch_ms: now_ms,
+            exit_code: None,
         },
         Ev::TimedOut {
             operation_id,
@@ -596,9 +632,21 @@ fn daemon_event_for(
             result_summary: Some("operation timed out".to_string()),
             duration_ms: *duration_ms,
             ended_epoch_ms: now_ms,
+            exit_code: None,
         },
         _ => return None,
     })
+}
+
+/// Pull the process exit code out of a tool result, when it has one.
+///
+/// The shell path already puts `exit_code` in its result JSON; this simply stops
+/// throwing it away at the hub boundary. Non-process tools have none, and get
+/// `None` — the surface then says the status word rather than inventing a code.
+fn exit_code_from_value(result: &serde_json::Value) -> Option<i64> {
+    result
+        .get("exit_code")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
 }
 
 /// Extract a short human-readable summary from a result JSON value.
@@ -687,8 +735,11 @@ mod tests {
             tool_name: "cargo_build".into(),
             description: "Build release".into(),
             parent_id: Some("session:dev".into()),
+            title: None,
+            cwd: None,
+            command: None,
         };
-        let result = daemon_event_for(&ev, "workspace/root");
+        let result = daemon_event_for(&ev, "workspace/root", "test");
         let Some(DaemonEvent::OpStarted {
             id,
             tool_name,
@@ -696,10 +747,20 @@ mod tests {
             scope,
             parent_id,
             started_epoch_ms,
+            origin,
+            ..
         }) = result
         else {
             panic!("expected OpStarted, got {result:?}");
         };
+        // The reporter is the only layer that knows *who asked*, so it is where the
+        // origin is stamped (SPEC R24.7). The adapter that ran the command has no
+        // idea which session requested it.
+        assert_eq!(
+            origin.as_deref(),
+            Some("test"),
+            "the instance label becomes the operation's origin"
+        );
         assert_eq!(id, "op-1");
         assert_eq!(tool_name, "cargo_build");
         assert_eq!(description, "Build release");
@@ -718,7 +779,7 @@ mod tests {
             line: "hello stdout".into(),
             is_stderr: false,
         };
-        let result = daemon_event_for(&ev, "ws");
+        let result = daemon_event_for(&ev, "ws", "test");
         let Some(DaemonEvent::OpOutput {
             id,
             line,
@@ -739,7 +800,8 @@ mod tests {
             line: "err msg".into(),
             is_stderr: true,
         };
-        let Some(DaemonEvent::OpOutput { is_stderr, .. }) = daemon_event_for(&ev, "ws") else {
+        let Some(DaemonEvent::OpOutput { is_stderr, .. }) = daemon_event_for(&ev, "ws", "test")
+        else {
             panic!("expected OpOutput");
         };
         assert!(is_stderr);
@@ -751,7 +813,8 @@ mod tests {
             operation_id: "op-4".into(),
             message: "disk full".into(),
         };
-        let Some(DaemonEvent::LogLine { level, message }) = daemon_event_for(&ev, "ws") else {
+        let Some(DaemonEvent::LogLine { level, message }) = daemon_event_for(&ev, "ws", "test")
+        else {
             panic!("expected LogLine");
         };
         assert_eq!(level, "alert");
@@ -772,7 +835,8 @@ mod tests {
             duration_ms,
             result_summary,
             ended_epoch_ms,
-        }) = daemon_event_for(&ev, "ws")
+            exit_code: None,
+        }) = daemon_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
@@ -797,7 +861,7 @@ mod tests {
             status,
             result_summary,
             ..
-        }) = daemon_event_for(&ev, "ws")
+        }) = daemon_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
@@ -816,7 +880,7 @@ mod tests {
             status,
             result_summary,
             ..
-        }) = daemon_event_for(&ev, "ws")
+        }) = daemon_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
@@ -835,7 +899,7 @@ mod tests {
             result_summary,
             duration_ms,
             ..
-        }) = daemon_event_for(&ev, "ws")
+        }) = daemon_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
@@ -852,7 +916,7 @@ mod tests {
             percent: Some(0.5),
         };
         assert!(
-            daemon_event_for(&ev, "ws").is_none(),
+            daemon_event_for(&ev, "ws", "test").is_none(),
             "Progress should map to None"
         );
     }
@@ -865,7 +929,7 @@ mod tests {
             params: None,
         };
         assert!(
-            daemon_event_for(&ev, "ws").is_none(),
+            daemon_event_for(&ev, "ws", "test").is_none(),
             "McpNotification should map to None"
         );
     }
@@ -1059,7 +1123,8 @@ mod tests {
             error: "e".repeat(300),
             duration_ms: 1,
         };
-        let Some(DaemonEvent::OpFinished { result_summary, .. }) = daemon_event_for(&ev, "ws")
+        let Some(DaemonEvent::OpFinished { result_summary, .. }) =
+            daemon_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
@@ -1075,7 +1140,8 @@ mod tests {
             reason: "r".repeat(300),
             duration_ms: 2,
         };
-        let Some(DaemonEvent::OpFinished { result_summary, .. }) = daemon_event_for(&ev, "ws")
+        let Some(DaemonEvent::OpFinished { result_summary, .. }) =
+            daemon_event_for(&ev, "ws", "test")
         else {
             panic!("expected OpFinished");
         };
