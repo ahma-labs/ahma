@@ -77,6 +77,9 @@ pub struct ServiceBuilder<'a> {
     defer_sandbox: bool,
     monitor_rate_limit: u64,
     scope_grant_notifier: Option<Arc<dyn crate::sandbox::ScopeGrantNotifier>>,
+    /// The same object as `scope_grant_notifier` when the caller installed a
+    /// broker, kept concretely so `build` can hand it the peer once one exists.
+    permission_broker: Option<Arc<crate::sandbox::PermissionBroker>>,
 }
 
 impl<'a> ServiceBuilder<'a> {
@@ -91,6 +94,7 @@ impl<'a> ServiceBuilder<'a> {
             defer_sandbox: config.defer_sandbox,
             monitor_rate_limit: config.monitor_rate_limit_secs,
             scope_grant_notifier: None,
+            permission_broker: None,
         }
     }
 
@@ -103,6 +107,20 @@ impl<'a> ServiceBuilder<'a> {
         notifier: Arc<dyn crate::sandbox::ScopeGrantNotifier>,
     ) -> Self {
         self.scope_grant_notifier = Some(notifier);
+        self
+    }
+
+    /// Install the [`PermissionBroker`](crate::sandbox::PermissionBroker) as the
+    /// violation surface — the full question ladder (harness → TUI → fail closed)
+    /// rather than a single hard-wired surface.
+    ///
+    /// Takes the broker concretely, not as `dyn ScopeGrantNotifier`, because
+    /// [`build`](Self::build) must hand it the MCP peer once the service exists.
+    /// That ordering is forced: the adapter needs the notifier, the notifier is
+    /// built before the service, and the peer only appears when a client connects.
+    pub fn with_permission_broker(mut self, broker: Arc<crate::sandbox::PermissionBroker>) -> Self {
+        self.scope_grant_notifier = Some(broker.clone());
+        self.permission_broker = Some(broker);
         self
     }
 
@@ -227,6 +245,17 @@ impl<'a> ServiceBuilder<'a> {
 
         service.monitor_rate_limit_seconds = self.monitor_rate_limit;
         service.set_app_config(std::sync::Arc::new(config.clone()));
+
+        // Install rung 1 of the question ladder (R-PERM.3). The broker is built
+        // *before* the service (the adapter needs it), so it cannot capture the
+        // peer at construction — the peer only exists once a client connects. It
+        // shares the service's peer slot instead, and starts asking the harness the
+        // moment one attaches.
+        if let Some(broker) = &self.permission_broker {
+            broker.set_elicitation_surface(Arc::new(crate::sandbox::PeerElicitationSurface::new(
+                service.peer.clone(),
+            )));
+        }
 
         Ok(BuiltService {
             service,

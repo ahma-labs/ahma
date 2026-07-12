@@ -50,6 +50,7 @@ pub mod grant_channel;
 pub mod host_detect;
 #[cfg(target_os = "linux")]
 mod landlock;
+pub mod permission_broker;
 pub(crate) mod pkg_cache;
 mod prerequisites;
 mod scope_lock;
@@ -82,6 +83,10 @@ pub use host_detect::{HostSandbox, detect_host_sandbox};
 #[cfg(target_os = "linux")]
 pub use landlock::{
     apply_landlock_ruleset_in_child, enforce_landlock_sandbox, landlock_ruleset_fd,
+};
+pub use permission_broker::{
+    AskedAt, ElicitOutcome, ElicitationSurface, PeerElicitationSurface, PermissionBroker,
+    hook_fail_closed_message,
 };
 pub use prerequisites::{
     check_sandbox_prerequisites, exit_with_sandbox_error, test_sandbox_exec_available,

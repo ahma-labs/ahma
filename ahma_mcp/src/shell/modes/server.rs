@@ -969,9 +969,14 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     // never applied to the live session (SPEC R5.4.7).
     let grant_coordinator = Arc::new(ahma_common::scope_grant::GrantCoordinator::new());
     let (grant_req_tx, grant_req_rx) = tokio::sync::mpsc::unbounded_channel();
-    let grant_notifier: Arc<dyn crate::sandbox::ScopeGrantNotifier> = Arc::new(
-        crate::sandbox::HubGrantNotifier::new(grant_coordinator.clone(), grant_req_tx),
-    );
+    // The full question ladder (R-PERM.3), not a single hard-wired surface: ask the
+    // MCP client that requested the work first (it is where the user is looking),
+    // fall back to an attached TUI, and if neither can be asked, fail closed with a
+    // command the user can paste. The hub channel below is rung 2.
+    let permission_broker = Arc::new(crate::sandbox::PermissionBroker::new(
+        grant_coordinator.clone(),
+        Some(grant_req_tx),
+    ));
 
     // Build the MCP service: monitor → pool → adapter → configs → service.
     let BuiltService {
@@ -982,7 +987,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         loaded_tools_count,
         configs: _configs,
     } = ServiceBuilder::new(&config, sandbox.clone())
-        .with_scope_grant_notifier(grant_notifier)
+        .with_permission_broker(permission_broker)
         .build()
         .await?;
     let service_handler = service;
