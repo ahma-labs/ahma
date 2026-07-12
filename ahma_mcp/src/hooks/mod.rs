@@ -274,6 +274,47 @@ impl HookPlatform {
             Self::Antigravity => "antigravity",
         }
     }
+
+    /// Whether `ahma setup` installs terminal hooks for this client **by default**
+    /// (SPEC R-PERM.6 / R5.5.4).
+    ///
+    /// Hooks were disabled globally not because their sandbox classification was
+    /// wrong, but because a denial had nowhere to go: the user could not be asked,
+    /// so the only outcomes were "blocked, with no way forward" or "let it
+    /// through". The question ladder (R-PERM.3) fixes that — but only for clients
+    /// where the loop demonstrably closes:
+    ///
+    ///   1. a denial round-trips deny → question → grant → the **next** command
+    ///      succeeds (hooks re-derive their sandbox per command, so a grant needs
+    ///      no restart — that is the hooks path's genuine advantage);
+    ///   2. the fail-closed message is legible in that client, not a bare
+    ///      `Operation not permitted` buried in a build log;
+    ///   3. inside a detected host sandbox, R7.2 defer-to-host still applies —
+    ///      which is what removes most of the surface where hooks "got in the way".
+    ///
+    /// Clients are added here as each is exercised end-to-end. A client that is not
+    /// listed is not broken — it simply has not been proven, and `ahma setup` says
+    /// so rather than silently omitting it.
+    fn hooks_ready(self) -> bool {
+        match self {
+            // Exercised end-to-end: the denial → ask → grant → next-command-succeeds
+            // loop closes, and the fail-closed message lands where the user reads it.
+            Self::Cursor | Self::Claude => true,
+            // Not yet proven. Opt in explicitly with `--hooks` if you want them.
+            Self::Codex | Self::Copilot | Self::Antigravity => false,
+        }
+    }
+
+    /// Why hooks are not installed by default for this client — shown to the user
+    /// instead of leaving the omission unexplained (R5.5.4).
+    fn hooks_not_ready_reason(self) -> Option<&'static str> {
+        if self.hooks_ready() {
+            return None;
+        }
+        Some(
+            "the deny → ask → grant loop has not been verified end-to-end in this client yet;              install them explicitly with `ahma setup --hooks` if you want to try",
+        )
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -365,6 +406,28 @@ enum FileAction {
     Created,
     Updated,
     Unchanged,
+}
+
+/// The clients for which `ahma setup` installs terminal hooks by default, and the
+/// reason for each that it skips (SPEC R-PERM.6 / R5.5.4).
+///
+/// Returned as `(label, ready, reason)` so the caller can *explain* an omission
+/// rather than leave it as an unexplained gap. An unexplained default is how the
+/// old blanket "hooks are not ready" ended up looking arbitrary.
+pub fn hooks_readiness() -> Vec<(&'static str, bool, Option<&'static str>)> {
+    HookPlatform::all()
+        .into_iter()
+        .map(|p| (p.label(), p.hooks_ready(), p.hooks_not_ready_reason()))
+        .collect()
+}
+
+/// Whether *any* client is ready for hooks to be installed by default.
+///
+/// This is the gate that replaced the global "hooks are not ready" filter. It is
+/// no longer a property of ahma; it is a property of each client, and it became
+/// true the moment a denial could reach a human there (R-PERM.3).
+pub fn any_client_ready_for_hooks() -> bool {
+    HookPlatform::all().into_iter().any(|p| p.hooks_ready())
 }
 
 pub fn any_managed_hooks_installed(scope: HookScope) -> Result<bool> {
@@ -1232,13 +1295,45 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // `os error 1`. The native-terminal hook uses the CLI grant path (not the
         // MCP grant/restart tools).
         Err(e) => {
-            if let Some(crate::sandbox::SandboxError::RuntimeDenial { path, access, .. }) =
-                e.downcast_ref::<crate::sandbox::SandboxError>()
-            {
-                let remediation =
-                    crate::sandbox::grant_channel::runtime_denial_remediation_cli(path, *access);
-                eprintln!("{e}\n\n{remediation}");
-                return Err(anyhow!("{e}\n\n{remediation}"));
+            // Rung 3 of the question ladder, in a terminal (SPEC R-PERM.3 /
+            // R-PERM.6.1). A hooked command has no MCP session of its own, so when
+            // the sandbox blocks it the user's only surface is the terminal they
+            // are already looking at. It must therefore say what was denied and
+            // exactly how to allow it — never a bare `Operation not permitted`
+            // buried in a build log, which is the failure mode that made hooks feel
+            // like a wall rather than a boundary.
+            //
+            // Both denial shapes are covered: a *runtime* denial (the kernel blocked
+            // the write mid-command) and a *pre-exec* denial (the path was rejected
+            // before the command ran). The second used to fall through as a raw
+            // error — a denial the user could see but not act on.
+            if let Some(sandbox_err) = e.downcast_ref::<crate::sandbox::SandboxError>() {
+                let remediation = match sandbox_err {
+                    crate::sandbox::SandboxError::RuntimeDenial { path, access, .. } => Some(
+                        crate::sandbox::grant_channel::runtime_denial_remediation_cli(
+                            path, *access,
+                        ),
+                    ),
+                    crate::sandbox::SandboxError::PathOutsideSandbox { path, .. } => Some(
+                        crate::sandbox::grant_channel::runtime_denial_remediation_cli(
+                            path,
+                            ahma_common::config::ScopeAccess::Rw,
+                        ),
+                    ),
+                    _ => None,
+                };
+                if let Some(remediation) = remediation {
+                    // The grant applies to the **next command**: each hooked command
+                    // spawns a fresh `ahma hooks run-shell` that re-reads the ledger,
+                    // so there is no server to restart. Say so — it is the difference
+                    // between "fix this later" and "fix this now".
+                    let msg = format!(
+                        "{e}\n\n{remediation}\n\nThe grant takes effect on your next command \
+                         — terminal hooks re-read it each time, so nothing needs restarting."
+                    );
+                    eprintln!("{msg}");
+                    return Err(anyhow!("{msg}"));
+                }
             }
             Err(e)
         }

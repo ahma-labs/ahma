@@ -261,18 +261,26 @@ pub async fn run(args: SetupArgs) -> Result<()> {
 /// Actions selected when the user accepts the default (presses Enter
 /// interactively, or runs non-interactively/`--auto` without other flags).
 ///
-/// Terminal hooks are deliberately left out of this default. Hooks reroute
-/// commands the *host tool itself* runs in a terminal through ahma's sandbox,
-/// not just the tools the agent calls explicitly through MCP — installing
-/// that automatically could interfere with a user's existing workflow if a
-/// sandbox exception isn't classified correctly, and that classification is
-/// still being hardened. Users opt in explicitly, either with `--hooks` or by
-/// including "3" in an interactive selection.
+/// Terminal hooks used to be excluded from this default unconditionally. The
+/// stated reason was that a sandbox exception might be "classified incorrectly"
+/// — but that was never quite the real problem. The real problem was that when
+/// the sandbox blocked something the user genuinely wanted, **there was nowhere
+/// to ask them**: a hooked command's denial reached no surface at all, so the only
+/// available outcomes were "blocked, with no way forward" and "let it through".
+/// Hooks looked like they were getting in the way because, lacking a question,
+/// they were.
+///
+/// The question ladder (SPEC R-PERM.3) gives a denial somewhere to go, and the
+/// hooks path re-derives its sandbox per command — so a grant applies on the very
+/// next command with no restart. With that, readiness stops being a property of
+/// *ahma* and becomes a property of each *client*: hooks are installed by default
+/// for the clients where that loop is proven (R-PERM.6), and skipped — **with a
+/// stated reason** — for the rest.
 fn default_setup_actions() -> Vec<SetupAction> {
     SETUP_ACTIONS
         .iter()
         .copied()
-        .filter(|a| *a != SetupAction::Hooks)
+        .filter(|a| *a != SetupAction::Hooks || crate::hooks::any_client_ready_for_hooks())
         .collect()
 }
 
@@ -1372,15 +1380,18 @@ mod tests {
     }
 
     #[test]
-    fn test_select_actions_no_flags_noninteractive_selects_default_excluding_hooks() {
+    fn test_select_actions_no_flags_noninteractive_selects_the_full_default() {
         let args = setup_args(true, false, false, false, false);
         let actions = select_actions(&args, false);
-        // Default excludes Terminal hooks (experimental, opt-in only).
-        assert_eq!(actions.len(), SETUP_ACTIONS.len() - 1);
+        // Terminal hooks are now part of the default, because a denied command can
+        // finally reach the user (SPEC R-PERM.3) and a grant applies on the very
+        // next command (R-PERM.6). The *per-client* gate decides which clients get
+        // them; this is the action-level default.
+        assert_eq!(actions.len(), SETUP_ACTIONS.len());
         assert!(actions.contains(&SetupAction::Skills));
         assert!(actions.contains(&SetupAction::Mcp));
         assert!(actions.contains(&SetupAction::Tls));
-        assert!(!actions.contains(&SetupAction::Hooks));
+        assert!(actions.contains(&SetupAction::Hooks));
     }
 
     #[test]
@@ -1391,17 +1402,29 @@ mod tests {
     }
 
     #[test]
-    fn test_default_setup_actions_excludes_hooks() {
+    fn test_default_setup_actions_includes_hooks_once_a_client_is_ready() {
+        // Hooks used to be excluded from the default unconditionally, because a
+        // denied command had nowhere to ask the user and so could only be a wall.
+        // With the question ladder (SPEC R-PERM.3) a denial reaches a human, and a
+        // grant applies on the very next command — so readiness became a property
+        // of each *client* (R-PERM.6), not a blanket property of ahma.
         let actions = default_setup_actions();
-        assert!(!actions.contains(&SetupAction::Hooks));
-        assert_eq!(actions.len(), SETUP_ACTIONS.len() - 1);
+        assert!(
+            crate::hooks::any_client_ready_for_hooks(),
+            "precondition: at least one client is proven"
+        );
+        assert!(
+            actions.contains(&SetupAction::Hooks),
+            "hooks are installed by default once any client can carry a denial to a decision"
+        );
+        assert_eq!(actions.len(), SETUP_ACTIONS.len());
     }
 
     #[test]
-    fn test_selection_string_for_skips_hooks() {
+    fn test_selection_string_for_includes_hooks() {
         let actions = default_setup_actions();
-        // Skills=1, Mcp=2, Hooks=3 (excluded), Tls=4.
-        assert_eq!(selection_string_for(&actions), "1,2,4");
+        // Skills=1, Mcp=2, Hooks=3, Tls=4.
+        assert_eq!(selection_string_for(&actions), "1,2,3,4");
     }
 
     // ─── select_platforms ─────────────────────────────────────────────────────
