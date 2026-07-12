@@ -46,6 +46,7 @@
 | Live Task Tree (R24) | tests-pass | Project-scoped caller → subtask tree, current at TUI startup via hub replay with true timestamps; accordion drill-in to live/historic output; client identity via reconnect-to-relabel |
 | Local Cluster Scheduler | tests-pass | mDNS discovery and signed task dispatch to remote worker peers |
 | Configuration Standard (R-CFG) | PLANNED | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5) |
+| Unified Permissions (R-PERM) | in-progress | One ledger under `~/.ahma`, one question ladder (harness → TUI → fail-closed), sandbox profiles replacing hard-coded carve-outs, per-client hooks gating. Execution plan: `docs/permissions-ux-execution-plan.md` |
 | `ahma cluster remove` | tests-pass | Subcommand to remove worker peers from peers configuration |
 | `ahma setup` / `ahma uninstall` | tests-pass | Interactive wizard installs / removes MCP entries, hooks, skills, binary; symmetric teardown leaves other user config intact |
 | Auto-spawned Bridge Lifecycle | tests-pass | Bridges started by `ahma serve stdio` or `ahma tui` self-terminate after `--idle-timeout` seconds with no connected client; explicitly-started `ahma serve http/unix` remain persistent by default |
@@ -388,6 +389,7 @@ The sandbox scope defines the root directory boundary. AI has **full read/write 
   - Consent is collected **out-of-band** (an `elicitation/create` to an attached client/TUI, or an explicit `ahma hooks approve-unsandboxed` command) — never mid-command. Approving unsandboxed execution is maximal widening and **must** be an explicit, deliberate action, never an Enter-default.
   - Consent is scoped to **workspace + session generation** and **must not** persist across restarts (persisting would silently re-downgrade the next session).
   - While consent is active, every surface (R5.4) **must** continuously display a prominent banner stating that hooks are running unsandboxed and how many commands have done so.
+- **R5.5.4**: **Hook default-enablement is gated on the permission ladder, per client**: hooks are not installed by default until the client in question can carry a denial through to a user decision. The gate is defined in **R-PERM.6**; until a client passes it, `ahma setup` **must not** install hooks for that client, and the reason **must** be stated rather than left as an unexplained omission.
 - **R5.6**: **Lifecycle Notifications**: The system **must** emit JSON-RPC notifications for sandbox lifecycle events:
   - `notifications/sandbox/configured`: When sandbox is successfully initialized from roots.
   - `notifications/sandbox/failed`: When sandbox initialization fails (payload: `{"error": "message"}`).
@@ -479,6 +481,50 @@ A "host sandbox" is an outer kernel sandbox ahma is running inside (Cursor, VS C
 - **R7.3 (MCP / standalone — stay authoritative)**: When ahma itself executes commands (the MCP `run_terminal_command` path, or standalone), the host sandbox does **not** wrap those executions, so ahma **remains authoritative** and applies its own sandbox. If ahma cannot apply its own sandbox, it **must** fail loudly with instructions (use `--disable-sandbox` to defer to the host explicitly) — it **must never** silently run unsandboxed.
 - **R7.4**: When `--disable-sandbox` is used, the outer sandbox provides security and ahma's internal sandbox is disabled; the active-sandbox disclosure **must** reflect this (deferred-to-host when a host is detected, otherwise disabled).
 - **R7.5 (honesty limit)**: Detecting a host does **not** prove the host's sandbox is *enabled* (it may be configured off). Disclosure copy **must** therefore state that protection now depends on the host, so a user who disabled the host sandbox is informed rather than surprised.
+
+### R-PERM: Unified Permissions Model
+
+**Problem this family solves.** ahma already has every *mechanism* needed to let a user grant an exception when the sandbox blocks something they legitimately want: kernel denial detection (R5.4.7), persistent grants (R5.4.4–R5.4.8), elicitation prompts (R5.3.1), a TUI modal (R-WEB.6), and a dedup coordinator (R-WEB.7). What it lacks is **convergence**: those mechanisms live in separate code paths, persist to two different config trees, and are asked through whichever surface each subsystem happened to wire up. The consequence is that terminal hooks cannot be enabled by default — a hook denial has no realistic path to a user decision — and that the sandbox needs hard-coded, app-specific carve-outs to be usable at all.
+
+**Design principles (govern all of R-PERM), inherited from R5:** the kernel denial *is* the discovery mechanism — ahma cannot predict what the thousands of applications it will never see need, but the kernel reports the exact path at the exact moment of need. The generic loop is therefore **deny → detect → ask once, with context → remember at a chosen tier → apply**. Nothing is silent; nothing self-widens; the user is asked only on a genuine downgrade; when nobody can be asked, ahma fails closed to a shown default.
+
+#### One ledger
+
+- **R-PERM.1**: **All persistent permissions live in `~/.ahma/`, and nowhere else**: filesystem scope grants (R5.4.4), web-domain grants (R-WEB.5), per-workspace tool approvals, and hook unsandboxed consent (R5.5.3) **must** share a single control-plane directory. `~/.config/ahma/` is retired as a permission store; an existing `approvals.json` there **must** be migrated once, non-destructively, and the legacy file left in place with a `.migrated` suffix. The ledger directory inherits R5.4.8 unchanged: it is never part of any workspace scope, is kernel-unreadable and kernel-unwritable from inside the sandbox, and therefore **cannot** be authored by a sandboxed command.
+- **R-PERM.2**: **One record shape, one preview, one confirmation**: every grant, of every kind, is representable as `{kind: fs-scope | web-domain | tool | hook-unsandboxed, subject, access, tier, granted_by, granted_at, surface, note}`. `tier` is one of `once` | `session` | `always`. A `once` grant is **never** stored. A `session` grant lives **only** in memory and dies with the instance. Only `always` is written to disk, and only after the preview-and-approve exchange R5.4.5 already mandates for `sandbox_grant`, generalized to every kind: the user is shown the **absolute file path** and the **exact line(s)** that would be written, and nothing is written without explicit approval. The R5.4.5 hard denylist gates **every** write path into the ledger — the MCP tool, the CLI, and any elicitation/TUI answer — not just the `sandbox_grant` tool.
+- **R-PERM.2.1**: **One CLI, one audit trail**: `ahma permissions list | grant | revoke` **must** manage every kind through the same preview-and-confirm path, showing provenance (`granted_by`, `surface`) for each record. Kind-scoped aliases (`ahma sandbox grant|list|revoke`, `ahma web allow|list|revoke`) **must** continue to work, because they are the strings ahma itself emits as remediation. Every persist and revoke **must** append one record to an append-only audit log in `~/.ahma/`.
+
+#### The question ladder (where a permission question is asked)
+
+- **R-PERM.3**: **Surfaces are tried in a fixed order, and the harness is preferred**: when a permission question must be asked, ahma **must** try, in order:
+  1. **The initiating MCP client (harness)**, via `elicitation/create` (R5.3.1) — *iff* that client advertised the `elicitation` capability at `initialize` **and** has not been demoted this session. This is the preferred surface whenever it works: the user is already looking at it, and it carries the context of the work that triggered the denial.
+  2. **An attached ahma TUI**, via the grant modal (R-WEB.6 semantics: the modal renders over both chat and monitor modes; **Enter and Esc both deny**; the persist option names the settings file and the exact line).
+  3. **Nobody can be asked → fail closed** (never fail open): the operation fails with the structured `sandbox_denial` payload of R5.4.7 **and** a copy-pasteable remediation command (`ahma sandbox grant <path> --ro|--rw`). This rung is the universal fallback: it works in every harness, including clients that render only tool-result text, and it is the *only* rung guaranteed to exist.
+- **R-PERM.3.1**: **Demotion is for broken surfaces, not for "no" answers**: an elicitation **timeout or transport error** demotes that client's elicitation channel for the remainder of the session ("one strike") and subsequent questions skip to rung 2. A **decline is an answer**, not a failure: it resolves the question as Deny and the client stays trusted as an asking surface. Demoting on decline would train the system to abandon a working surface the moment a user says no.
+- **R-PERM.3.2**: **The user is told where the question went**: whenever a fallback occurs (rung 1 unavailable or demoted, or rung 2 absent), the resulting message **must** state that the preferred surface could not be asked. A question that silently relocates is indistinguishable from a question that was never asked.
+- **R-PERM.3.3**: **Multiple live surfaces are coordinated, not raced**: rungs 1 and 2 may both be live for the same question. The server owns the decision under one `decision_id` and applies R5.3.3 (fan-out; first answer wins; the losing surface is dismissed via `notifications/cancelled`) and R5.3.4 (most-restrictive-wins on a tie).
+- **R-PERM.4**: **Ask at most once per `(subject, access)` per session**, across all surfaces and all concurrent operations (R5.4.7, generalized). A `session`-tier answer — in **either** direction — suppresses further questions for that subject for the life of the instance. A denied subject **must not** re-prompt. The one deliberate exception is an explicit user re-raise (R-PERM.7.1), which is a fresh human action, not a repeat prompt.
+- **R-PERM.4.1**: **When an answer applies**: on the MCP server path an `always` or `session` grant **must not** widen the live locked scope (R5.1); it is persisted/recorded and reported as taking effect at the next server start, exactly as R5.4.6 already requires. On the **terminal hooks** path the sandbox is re-derived per command, so a grant **must** take effect on the very next command with no restart — this difference is a feature of hooks and **must** be stated in the confirmation message rather than papered over.
+
+#### Sandbox profiles (no app-specific exceptions in code)
+
+- **R-PERM.5**: **Toolchain carve-outs are shipped data, not compiled-in special cases**: the sandbox backends **must not** contain hard-coded application or toolchain paths (`~/.cargo`, `~/.rustup`, `~/.nvm`, `~/.npm`, `~/.go`, and the cargo package-cache write set). Each such carve-out **must** be expressed as a declarative **profile** — a data file naming scopes, their access, and any `never` exclusions within them (e.g. cargo's `bin/`, `config.toml`, `credentials.toml`, which stay denied) — and folded into the effective scope through the **same code path** as a user grant, with provenance `builtin-profile(<name>)`. A profile is nothing more than a **pre-answered bundle of grant questions**, which is why it can be shipped, community-contributed, inspected, and disabled.
+  - Profiles **must** be visible in `ahma permissions list` and in the R5.4 scope displays with their provenance, and individually disableable (`[sandbox] profiles`). Default is **opt-out**: the builtin profiles ship enabled, so existing behavior is preserved — but it becomes *visible* and *refusable* rather than invisible and mandatory.
+  - Platform-invariant rules (`/usr`, `/bin`, `/etc` read/execute; device-path denials; credential-directory denials) are **not** profiles and remain in the backends. The test is *app-specific*, not *platform-specific*.
+- **R-PERM.5.1**: **What cannot be expressed as a profile must be disclosed**: the macOS Seatbelt backend currently grants blanket read access (`(allow file-read*)`) as a workaround for APFS firmlinks/cryptexes, so on macOS **writes are kernel-scoped but reads are not**. This is a platform limitation, not a grant, and therefore cannot be represented as a profile. It **must** be disclosed in every scope surface (R5.4) — the startup banner, `ahma status`, and the TUI scope panel — in the same honest register R7.5 requires of host-sandbox deferral. A limitation the user cannot see is a limitation the user cannot compensate for.
+
+#### Hooks gating
+
+- **R-PERM.6**: **Hooks are enabled per client, gated on the ladder — not on perfect classification**: terminal hooks were disabled by default because a denial had no realistic path to a user decision, not because their sandbox classification is inadequate. A client **must** therefore be enabled for hooks by `ahma setup` only once it satisfies:
+  1. **The loop closes in that client**: a denial round-trips deny → question (on whichever rung applies) → grant → the *next* command succeeds (R-PERM.4.1).
+  2. **The fail-closed message is legible in that client**: the R-PERM.3 rung-3 message must be surfaced where the user will see it — never *only* as a bare `Operation not permitted` line buried inside a build log (the historical failure mode: a host build-cache denial inside a dependency's build script).
+  3. **Nested sandboxes still defer**: R7.2 defer-to-host remains the default inside a detected host sandbox, which removes most of the surface where hooks "get in the way" in the first place.
+- **R-PERM.6.1**: A hook denial has no MCP session of its own. Rung 1 is available **only** when a live MCP session for the same workspace can be asked; otherwise the ladder starts at rung 2 (attached TUI) and falls to rung 3 (a remediation block printed to the terminal the command ran in, *after* the command's own output, so it is not lost in scrollback).
+
+#### Making the question findable
+
+- **R-PERM.7**: **A denial is a first-class, visible event**, not just an error string: every denial **must** appear in the operation stream with the operation identity of the command that caused it (R24.7), so it is visible in the TUI monitor and chat views and in replay after late attach.
+- **R-PERM.7.1**: **A denied operation is selectable and re-raisable**: in the TUI, selecting a denied operation and confirming **must** re-raise the grant question through the same broker, with the same preview. This is an explicit human action and therefore bypasses the R-PERM.4 ask-once memo (it is not an unsolicited re-prompt). This is the "escape hatch with context" that hooks have never had.
 
 ---
 
@@ -1443,6 +1489,32 @@ correct **at startup**, not only for events that happen afterwards.
 - **R24.6 — One task, one row.** An operation visible both through the hub
   (instance-tagged) and through the TUI's direct MCP status poll (untagged)
   renders once; the hub copy wins because it carries instance grouping.
+
+- **R24.7 — One operation identity, computed at the source.** An operation's
+  human-meaningful name is **data on the wire**, not a string an observer
+  reverse-engineers. Observers **must not** derive an operation's name from its
+  id, its description prose, or any other naming convention — the historical
+  failure (rows reading `op_41_echo_hello`, or a bare tool name) is a *data*
+  defect, and no formatter can repair data that was never sent.
+  - `DaemonEvent::OpStarted` carries `title` (a human command summary computed
+    **server-side**, which is the only place that knows the command), plus
+    `cwd`, the full `command`, and `origin` — which attached session initiated
+    the work (`cursor` | `claude-code` | `tui` | `cli` | `hook` | …).
+  - `DaemonEvent::OpFinished` carries a numeric `exit_code` in addition to its
+    status string, because "failed" without an exit code is not actionable.
+  - These are `#[serde(default)]` **field** additions, permitted by R24.5;
+    mixed-version combinations keep interoperating, and a reader that receives
+    no `title` falls back to its legacy heuristics.
+  - **One identity line** is rendered from these fields and used **identically**
+    in chat history, monitor rows, grant prompts (R-PERM.7), and per-operation
+    log names: a status glyph, the `title`, the working directory, and the
+    state — elapsed time while running, `exit N` plus duration when finished, or
+    the denial reason when denied. An `origin` badge is shown when more than one
+    origin is present in view, which is what makes an interleaved timeline of
+    IDE-initiated and TUI-initiated work legible.
+  - Because history replay (R24.2) carries the same fields, fixing the wire
+    fixes late-attach replay for free: a TUI opened *after* an IDE has been
+    working shows what those operations **were**, not what their ids looked like.
 
 ---
 
