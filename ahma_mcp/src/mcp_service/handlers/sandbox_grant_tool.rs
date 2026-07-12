@@ -303,8 +303,21 @@ fn clean_path(p: &Path) -> PathBuf {
     out
 }
 
-/// Classify the risk of granting `path`. Pure: depends only on the inputs.
+/// Classify the risk of granting `path`.
+///
+/// `path` is expected to arrive canonicalized (see [`resolve_grant_path`]).
+/// `home` is canonicalized **here**, on purpose: the caller passes
+/// `ahma_home_dir()`, which is whatever the OS reports and may contain a symlink
+/// component — `/home` → `/mnt/home` on many Linux setups, an automounted
+/// corporate home, or a macOS home relocated to another volume. Comparing a
+/// resolved path against an unresolved `$HOME` makes every equality rule below
+/// silently miss, and these rules are the *hard* denylist: `$HOME` itself,
+/// `~/.ssh`, `~/.aws`, `~/.ahma`. A denylist that quietly stops matching is worse
+/// than no denylist, because everything downstream assumes it held.
 pub fn classify_grant_risk(path: &Path, home: Option<&Path>, scopes: &[PathBuf]) -> GrantRisk {
+    let home = home.map(|h| dunce::canonicalize(h).unwrap_or_else(|_| h.to_path_buf()));
+    let home = home.as_deref();
+
     // 1. A filesystem root has no parent — granting it exposes the whole drive.
     if path.parent().is_none() {
         return GrantRisk::Refused(

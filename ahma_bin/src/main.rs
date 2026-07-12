@@ -79,6 +79,11 @@ async fn main() -> Result<()> {
             Ok(false) => {}
             Err(e) => tracing::warn!("could not sync settings.toml defaults: {e}"),
         }
+        // Fold the retired ~/.config/ahma/approvals.json into the one ledger
+        // (SPEC R-PERM.1). Idempotent and non-destructive: it runs once, renames
+        // the legacy file aside rather than deleting it, and does nothing at all
+        // on the overwhelming majority of startups where no legacy file exists.
+        ahma_common::permissions::migrate_legacy_approvals_best_effort();
     }
 
     #[cfg(target_os = "windows")]

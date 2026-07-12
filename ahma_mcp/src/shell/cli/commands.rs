@@ -6,8 +6,8 @@
 
 use super::{
     AppConfig, BundleArgs, BundleAuditArgs, BundleCommand, BundleSignArgs, BundleVerifyArgs,
-    InfoArgs, PromptsArgs, PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs,
-    SettingsCommand, WebArgs, WebCommand,
+    InfoArgs, PermissionsArgs, PermissionsCommand, PromptsArgs, PromptsCommand, SandboxArgs,
+    SandboxCommand, SettingsArgs, SettingsCommand, WebArgs, WebCommand,
 };
 use crate::shell::{list_tools, resolution};
 use anyhow::{Context, Result};
@@ -337,6 +337,13 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
                 ScopeAccess::Rw
             };
             let mut settings = load(&file)?;
+
+            // The catastrophic-path denylist gates *every* write into the ledger,
+            // not just the `sandbox_grant` MCP tool (SPEC R-PERM.2). The CLI used
+            // to skip it, which meant the safest surface (a human at a terminal)
+            // had the weakest guardrail — precisely backwards.
+            refuse_denylisted_grant(&dir, &settings)?;
+
             let scope = PersistentScope {
                 path: dir.clone(),
                 access,
@@ -348,6 +355,13 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
             settings
                 .save_to(&file)
                 .with_context(|| format!("Failed to write {}", file.display()))?;
+
+            audit(
+                AuditAction::Grant,
+                GrantKind::FsScope,
+                dir.display().to_string(),
+                Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
+            );
 
             match outcome {
                 GrantOutcome::Added => {
@@ -417,6 +431,19 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
                     settings
                         .save_to(&file)
                         .with_context(|| format!("Failed to write {}", file.display()))?;
+                    audit(
+                        AuditAction::Revoke,
+                        GrantKind::FsScope,
+                        removed.path.display().to_string(),
+                        Some(
+                            if removed.access.is_write() {
+                                "rw"
+                            } else {
+                                "ro"
+                            }
+                            .to_string(),
+                        ),
+                    );
                     println!(
                         "✓ Revoked {} access to {}",
                         removed.access.label(),
@@ -435,6 +462,278 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
             }
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The unified permission ledger (SPEC R-PERM)
+// ─────────────────────────────────────────────────────────────────────────────
+
+use ahma_common::permissions::{
+    AuditAction, GrantKind, GrantTier, append_audit, audit_entry, records, workspace_key,
+};
+
+/// Record a ledger change in the audit trail. Never fails the operation it is
+/// recording: the grant was already confirmed by a human and is safely written;
+/// losing the *record* of it is the lesser harm.
+fn audit(action: AuditAction, kind: GrantKind, subject: String, access: Option<String>) {
+    append_audit(&audit_entry(
+        chrono::Local::now().to_rfc3339(),
+        action,
+        kind,
+        subject,
+        access,
+        GrantTier::Always,
+        Some("cli".to_string()),
+    ));
+}
+
+/// Refuse a filesystem grant that the hard denylist forbids (SPEC R5.4.5,
+/// generalized to every write path by R-PERM.2).
+///
+/// The denylist is not advice, and no surface may skip it: not the MCP tool, not
+/// an elicitation answer, and not the CLI. A grant of `$HOME`, a filesystem root,
+/// a parent of the live scope, a credential directory, or an OS system directory
+/// is refused outright — there is no `--force`, because every legitimate use of
+/// such a grant is better served by naming the specific subdirectory.
+fn refuse_denylisted_grant(
+    path: &std::path::Path,
+    settings: &ahma_common::config::AhmaSettings,
+) -> Result<()> {
+    use crate::mcp_service::handlers::sandbox_grant_tool::{GrantRisk, classify_grant_risk};
+
+    let expanded = ahma_common::config::expand_home(path);
+    let canonical = dunce::canonicalize(&expanded).unwrap_or(expanded);
+    let home = ahma_common::config::ahma_home_dir();
+    let live_scopes: Vec<PathBuf> = settings
+        .sandbox
+        .scopes
+        .iter()
+        .map(|p| ahma_common::config::expand_home(p))
+        .collect();
+
+    match classify_grant_risk(&canonical, home.as_deref(), &live_scopes) {
+        GrantRisk::Refused(reason) => anyhow::bail!(
+            "Refusing to grant {}:\n  {reason}\n\n\
+             This is a hard limit, not a warning — there is no override flag. If a tool \
+             genuinely needs something under that path, grant the specific subdirectory it \
+             needs instead.",
+            canonical.display()
+        ),
+        GrantRisk::High(warnings) => {
+            eprintln!("⚠ Elevated-risk grant for {}:", canonical.display());
+            for w in &warnings {
+                eprintln!("    • {w}");
+            }
+            eprintln!();
+            Ok(())
+        }
+        GrantRisk::Normal => Ok(()),
+    }
+}
+
+pub(crate) fn run_permissions_command(args: PermissionsArgs) -> Result<()> {
+    use ahma_common::config::{AhmaSettings, settings_path};
+
+    let file = settings_path()
+        .context("Cannot determine ~/.ahma/settings.toml (home directory not found)")?;
+    // Fold any retired ~/.config/ahma/approvals.json into the ledger first, so
+    // `list` shows the truth rather than a partial picture.
+    if let Err(e) = ahma_common::permissions::migrate_legacy_approvals(&file) {
+        eprintln!("warning: could not migrate legacy approvals: {e:#}");
+    }
+    let load = || -> Result<AhmaSettings> {
+        AhmaSettings::load_from_result(&file).map_err(|e| anyhow::anyhow!(e))
+    };
+
+    match args.command {
+        PermissionsCommand::List { kind } => {
+            let settings = load()?;
+            print_permissions(&settings, kind.as_deref(), &file)
+        }
+        PermissionsCommand::Revoke {
+            kind,
+            subject,
+            workspace,
+            yes,
+        } => revoke_permission(&file, load()?, &kind, &subject, workspace, yes),
+    }
+}
+
+/// Parse a kind filter/selector, naming the valid options on failure rather than
+/// silently ignoring a typo.
+fn parse_kind(s: &str) -> Result<GrantKind> {
+    match s {
+        "fs-scope" | "fs" | "scope" => Ok(GrantKind::FsScope),
+        "web-domain" | "web" | "domain" => Ok(GrantKind::WebDomain),
+        "tool" => Ok(GrantKind::Tool),
+        other => anyhow::bail!(
+            "unknown permission kind '{other}' (expected: fs-scope, web-domain, or tool)"
+        ),
+    }
+}
+
+fn print_permissions(
+    settings: &ahma_common::config::AhmaSettings,
+    kind_filter: Option<&str>,
+    file: &std::path::Path,
+) -> Result<()> {
+    let filter = kind_filter.map(parse_kind).transpose()?;
+    let all = records(settings);
+    let rows: Vec<_> = all
+        .iter()
+        .filter(|r| filter.is_none_or(|k| r.kind == k))
+        .collect();
+
+    println!("# Permissions granted to ahma");
+    println!("# File: {}", file.display());
+    println!();
+
+    if rows.is_empty() {
+        println!("(none granted)");
+        println!();
+        println!("ahma asks for a permission when — and only when — the sandbox actually blocks");
+        println!("something. Nothing here means nothing has needed one yet.");
+        return Ok(());
+    }
+
+    for kind in [GrantKind::FsScope, GrantKind::WebDomain, GrantKind::Tool] {
+        let of_kind: Vec<_> = rows.iter().filter(|r| r.kind == kind).collect();
+        if of_kind.is_empty() {
+            continue;
+        }
+        println!("{}:", kind.label());
+        for r in of_kind {
+            let access = r
+                .access
+                .as_deref()
+                .map(|a| format!("  ({a})"))
+                .unwrap_or_default();
+            println!("  • {}{access}", r.subject);
+            if let Some(ws) = &r.scope_note {
+                println!("      workspace:  {ws}");
+            }
+            let provenance = [
+                r.granted_by.as_deref().map(|b| format!("by {b}")),
+                r.granted_at.as_deref().map(|a| format!("on {a}")),
+                r.surface.as_deref().map(|s| format!("via {s}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+            if !provenance.is_empty() {
+                println!("      granted:    {provenance}");
+            }
+            if let Some(note) = &r.note {
+                println!("      note:       {note}");
+            }
+        }
+        println!();
+    }
+
+    println!("This file lives outside every sandbox scope, so a sandboxed command can neither");
+    println!(
+        "read it nor add itself to it. Revoke with `ahma permissions revoke <KIND> <SUBJECT>`."
+    );
+    Ok(())
+}
+
+/// The deferred half of a revoke: applies the change and reports whether it did
+/// anything. Built *after* the preview so the same closure both describes and
+/// performs the edit — the preview cannot drift from what `--yes` actually does.
+type RevokeFn = Box<dyn FnOnce(&mut ahma_common::config::AhmaSettings) -> bool>;
+
+fn revoke_permission(
+    file: &std::path::Path,
+    mut settings: ahma_common::config::AhmaSettings,
+    kind: &str,
+    subject: &str,
+    workspace: Option<PathBuf>,
+    yes: bool,
+) -> Result<()> {
+    let kind = parse_kind(kind)?;
+
+    // Preview first, always. A revoke is less dangerous than a grant, but the
+    // user should still never be surprised by what a command wrote (R-PERM.2).
+    let (description, apply): (String, RevokeFn) = match kind {
+        GrantKind::FsScope => {
+            let path = PathBuf::from(subject);
+            let found = settings.sandbox.find_scope(&path).is_some();
+            if !found {
+                println!("No filesystem scope matching {subject} is granted.");
+                println!("Run `ahma permissions list` to see what is.");
+                return Ok(());
+            }
+            (
+                format!("remove the filesystem scope {subject}"),
+                Box::new(move |s| s.sandbox.revoke_scope(&path).is_some()),
+            )
+        }
+        GrantKind::WebDomain => {
+            let pattern = subject.to_string();
+            if !settings.web.always_allow.iter().any(|p| p == &pattern) {
+                println!("No web domain matching {subject} is in the allow list.");
+                println!("Run `ahma permissions list` to see what is.");
+                return Ok(());
+            }
+            (
+                format!("remove the web domain {subject} from [web].always_allow"),
+                Box::new(move |s| {
+                    let before = s.web.always_allow.len();
+                    s.web.always_allow.retain(|p| p != &pattern);
+                    s.web.always_allow.len() != before
+                }),
+            )
+        }
+        GrantKind::Tool => {
+            let ws = workspace
+                .map(|w| workspace_key(&w))
+                .unwrap_or_else(|| workspace_key(&std::env::current_dir().unwrap_or_default()));
+            if !settings.permissions.is_tool_approved(&ws, subject) {
+                println!("Tool '{subject}' is not approved in {}.", ws.display());
+                println!(
+                    "Approvals are per-workspace; pass --workspace to target another one, or \
+                         run `ahma permissions list`."
+                );
+                return Ok(());
+            }
+            let tool = subject.to_string();
+            (
+                format!(
+                    "remove the tool approval '{subject}' for workspace {}",
+                    ws.display()
+                ),
+                Box::new(move |s| s.permissions.revoke_tool(&ws, &tool)),
+            )
+        }
+        GrantKind::HookUnsandboxed => anyhow::bail!(
+            "hook consent is session-scoped and never persisted; revoke it with \
+                 `ahma hooks revoke`"
+        ),
+    };
+
+    if !yes {
+        println!("Would {description}.");
+        println!();
+        println!("File: {}", file.display());
+        println!();
+        println!("Nothing was changed. Re-run with --yes to apply.");
+        return Ok(());
+    }
+
+    if apply(&mut settings) {
+        settings
+            .save_to(file)
+            .with_context(|| format!("Failed to write {}", file.display()))?;
+        audit(AuditAction::Revoke, kind, subject.to_string(), None);
+        println!("✓ Revoked: {description}");
+        println!();
+        println!("Updated: {}", file.display());
+        if kind == GrantKind::FsScope {
+            println!("Takes effect the next time an ahma server starts.");
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1710,5 +2009,167 @@ mod tests {
         // Under the test harness stdin is not a TTY, so this returns Ok and never
         // hits the interactive-error exit path.
         check_stdio_not_interactive().unwrap();
+    }
+
+    // ── The unified permission ledger (SPEC R-PERM) ──────────────────────────
+
+    /// The `settings.toml` under a guarded temp home.
+    fn ledger(home: &std::path::Path) -> std::path::PathBuf {
+        home.join(".ahma").join("settings.toml")
+    }
+
+    #[test]
+    fn sandbox_grant_cli_refuses_a_denylisted_path() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+
+        // The CLI used to skip the denylist that the `sandbox_grant` MCP tool
+        // enforced, so a human at a terminal — the *safest* surface — had the
+        // weakest guardrail. Granting $HOME exposes every dotfile, key, and
+        // credential; it must be refused outright, with no override flag.
+        let err = run_sandbox_command(SandboxArgs {
+            command: SandboxCommand::Grant {
+                path: home.path().to_path_buf(),
+                read_only: false,
+                by: None,
+                note: None,
+            },
+        })
+        .expect_err("granting $HOME must be refused");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("home directory"),
+            "the refusal must say *why*, not just 'no': {msg}"
+        );
+        assert!(
+            !ledger(home.path()).exists(),
+            "a refused grant must write nothing at all"
+        );
+    }
+
+    #[test]
+    fn sandbox_grant_cli_allows_a_normal_external_dir_and_lists_it() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let cache = home.path().join("caches").join("sccache");
+        std::fs::create_dir_all(&cache).unwrap();
+
+        run_sandbox_command(SandboxArgs {
+            command: SandboxCommand::Grant {
+                path: cache.clone(),
+                read_only: true,
+                by: Some("sccache".into()),
+                note: None,
+            },
+        })
+        .expect("an ordinary external cache dir is a legitimate grant");
+
+        let settings =
+            ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
+        let scope = settings
+            .sandbox
+            .find_scope(&cache)
+            .expect("the grant is persisted");
+        assert_eq!(scope.access, ahma_common::config::ScopeAccess::Ro);
+
+        // The unified list renders it as one row of the one ledger.
+        let rows = ahma_common::permissions::records(&settings);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ahma_common::permissions::GrantKind::FsScope);
+        assert_eq!(rows[0].access.as_deref(), Some("ro"));
+
+        // And the audit trail records that it happened.
+        let audit = home.path().join(".ahma").join("permissions-audit.jsonl");
+        let text = std::fs::read_to_string(&audit).expect("a grant is audited");
+        assert!(
+            text.contains("fs-scope"),
+            "audit line names the kind: {text}"
+        );
+        assert!(
+            text.contains("\"cli\""),
+            "audit line names the surface: {text}"
+        );
+    }
+
+    #[test]
+    fn permissions_revoke_previews_before_it_writes() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        let cache = home.path().join("caches").join("sccache");
+        std::fs::create_dir_all(&cache).unwrap();
+
+        run_sandbox_command(SandboxArgs {
+            command: SandboxCommand::Grant {
+                path: cache.clone(),
+                read_only: false,
+                by: None,
+                note: None,
+            },
+        })
+        .unwrap();
+
+        // Without --yes, a revoke is a preview: it must change nothing on disk.
+        run_permissions_command(PermissionsArgs {
+            command: PermissionsCommand::Revoke {
+                kind: "fs-scope".into(),
+                subject: cache.display().to_string(),
+                workspace: None,
+                yes: false,
+            },
+        })
+        .unwrap();
+        let settings =
+            ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
+        assert!(
+            settings.sandbox.find_scope(&cache).is_some(),
+            "a preview must not write — the user has not confirmed yet"
+        );
+
+        // With --yes, it applies.
+        run_permissions_command(PermissionsArgs {
+            command: PermissionsCommand::Revoke {
+                kind: "fs-scope".into(),
+                subject: cache.display().to_string(),
+                workspace: None,
+                yes: true,
+            },
+        })
+        .unwrap();
+        let settings =
+            ahma_common::config::AhmaSettings::load_from_result(&ledger(home.path())).unwrap();
+        assert!(
+            settings.sandbox.find_scope(&cache).is_none(),
+            "a confirmed revoke removes the grant"
+        );
+    }
+
+    #[test]
+    fn permissions_revoke_rejects_an_unknown_kind_instead_of_ignoring_it() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+
+        let err = run_permissions_command(PermissionsArgs {
+            command: PermissionsCommand::Revoke {
+                kind: "flesscope".into(),
+                subject: "/tmp/x".into(),
+                workspace: None,
+                yes: true,
+            },
+        })
+        .expect_err("a typo'd kind must be an error, never a silent no-op");
+        assert!(format!("{err:#}").contains("unknown permission kind"));
+    }
+
+    #[test]
+    fn permissions_list_runs_on_an_empty_ledger() {
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::new(home.path());
+        // "Nothing granted" is a normal, healthy state — not an error, and not a
+        // reason to create a file.
+        run_permissions_command(PermissionsArgs {
+            command: PermissionsCommand::List { kind: None },
+        })
+        .expect("listing an empty ledger succeeds");
     }
 }

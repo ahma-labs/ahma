@@ -1,62 +1,67 @@
 //! Integration coverage for the persistent tool-approval store
-//! (`ahma_core::approvals`).
+//! (`ahma_core::approvals`), now backed by the unified permission ledger
+//! (`~/.ahma/settings.toml`, `[permissions].tool_approvals` — SPEC R-PERM.1).
 //!
 //! The module's in-crate unit tests already exercise the *pure* helpers
-//! (`classify`, `parse_grants`, `reask_note_for`). What was previously
-//! uncovered — and what this file pins — is the **on-disk persistence
-//! round-trip** that actually gates whether a sandboxed agent re-prompts for a
-//! tool: `remember_tool_approval` → `is_tool_approved` / `grant_status` /
-//! `reask_note`, reading and writing a real `approvals.json`.
+//! (`classify`, `reask_note_for`). What this file pins is the **on-disk
+//! persistence round-trip** that actually gates whether a sandboxed agent
+//! re-prompts for a tool: `remember_tool_approval` → `is_tool_approved` /
+//! `grant_status` / `reask_note`, reading and writing a real `settings.toml`.
 //!
 //! These are security-relevant invariants. A silent break here is exactly the
 //! kind that gets a change reverted:
-//!   * **fail closed** — a missing/unreadable file must read as "not approved"
+//!   * **fail closed** — a missing/unreadable ledger must read as "not approved"
 //!     so the caller prompts rather than silently allowing a tool;
 //!   * **workspace scoping** — a grant in one workspace must NOT approve the
 //!     same tool in a different workspace (it only triggers a re-ask);
 //!   * **round-trip durability** — what the (sync) TUI writer persists must be
 //!     what the (async) agent reader observes;
-//!   * **idempotency** — re-granting must not duplicate entries.
+//!   * **idempotency** — re-granting must not duplicate entries;
+//!   * **migration** — an existing `~/.config/ahma/approvals.json` must be folded
+//!     into the ledger without losing a grant, and without destroying the file.
 //!
-//! `AHMA_CONFIG_DIR` is the documented test seam (`approvals::config_dir`
-//! honors it). Because that env var is process-global, the whole round-trip is
-//! pinned in a SINGLE test so there is exactly one writer of the env in this
-//! binary — correct under both `cargo nextest` (process per test) and
-//! `cargo test` (threads sharing one process).
+//! `AHMA_TEST_HOME` is the documented test seam for `~/.ahma`
+//! (`config::ahma_home_dir` honors it in debug builds); `AHMA_CONFIG_DIR` still
+//! redirects the *legacy* location so the migration path is testable. Both are
+//! process-global, so each scenario is pinned in a SINGLE test with exactly one
+//! writer of the env per test binary — correct under both `cargo nextest`
+//! (process per test) and `cargo test` (threads sharing one process).
 
 use std::path::{Path, PathBuf};
 
+use ahma_common::config::AhmaSettings;
+use ahma_common::permissions::workspace_key;
 use ahma_core::approvals::{
     GrantStatus, grant_status, is_tool_approved, reask_note, remember_tool_approval,
 };
 use tempfile::TempDir;
 
-/// Path of the persisted `approvals.json` given the `AHMA_CONFIG_DIR` root.
-/// Mirrors `approvals::config_dir`, which joins `ahma/` onto the env root.
-fn approvals_file(config_root: &Path) -> PathBuf {
-    config_root.join("ahma").join("approvals.json")
+/// Path of the ledger given the `AHMA_TEST_HOME` root.
+fn settings_file(home: &Path) -> PathBuf {
+    home.join(".ahma").join("settings.toml")
 }
 
-/// Tools recorded under `key` in the on-disk grants map (empty if absent).
-fn grants_for(file: &Path, key: &Path) -> Vec<String> {
-    let content = std::fs::read_to_string(file).expect("approvals.json should exist after a grant");
-    let map: std::collections::BTreeMap<String, Vec<String>> =
-        serde_json::from_str(&content).expect("approvals.json should be valid JSON");
-    // Writer canonicalises the key, so look it up canonically too.
-    let canonical = std::fs::canonicalize(key).unwrap_or_else(|_| key.to_path_buf());
-    map.get(&canonical.to_string_lossy().into_owned())
-        .cloned()
+/// Tools recorded for `workspace` in the on-disk ledger (empty if absent).
+fn grants_for(file: &Path, workspace: &Path) -> Vec<String> {
+    let settings = AhmaSettings::load_from_result(file).expect("ledger should parse");
+    let key = workspace_key(workspace);
+    settings
+        .permissions
+        .tool_approvals
+        .iter()
+        .find(|a| a.workspace == key)
+        .map(|a| a.tools.clone())
         .unwrap_or_default()
 }
 
 #[tokio::test]
 async fn approval_grants_persist_and_are_workspace_scoped() {
-    // Fresh, empty config dir — no approvals.json exists yet.
-    let config = TempDir::new().unwrap();
+    // Fresh, empty home — no settings.toml exists yet.
+    let home = TempDir::new().unwrap();
     // SAFETY: set once, before any approvals call; single-test binary so no
     // other thread/test races on this process-global env var.
-    unsafe { std::env::set_var("AHMA_CONFIG_DIR", config.path()) };
-    let file = approvals_file(config.path());
+    unsafe { std::env::set_var("AHMA_TEST_HOME", home.path()) };
+    let file = settings_file(home.path());
 
     // Two distinct, real workspaces so canonicalisation yields stable, different keys.
     let ws_a_dir = TempDir::new().unwrap();
@@ -64,10 +69,10 @@ async fn approval_grants_persist_and_are_workspace_scoped() {
     let ws_a = ws_a_dir.path();
     let ws_b = ws_b_dir.path();
 
-    // ---- Fail closed: nothing granted, no file on disk ----
+    // ---- Fail closed: nothing granted, no ledger on disk ----
     assert!(
         !is_tool_approved(ws_a, "cargo_build").await,
-        "an ungranted tool with no approvals file must read as NOT approved (fail closed)"
+        "an ungranted tool with no ledger must read as NOT approved (fail closed)"
     );
     assert_eq!(
         grant_status(ws_a, "cargo_build"),
@@ -80,7 +85,7 @@ async fn approval_grants_persist_and_are_workspace_scoped() {
     );
     assert!(
         !file.exists(),
-        "merely reading approvals must not create the file"
+        "merely reading approvals must not create the ledger"
     );
 
     // ---- Grant + durable round-trip (sync writer → async reader) ----
@@ -102,6 +107,17 @@ async fn approval_grants_persist_and_are_workspace_scoped() {
         grants_for(&file, ws_a),
         vec!["cargo_build".to_string()],
         "the grant must be persisted under the workspace's canonical key"
+    );
+
+    // ---- The grant lands in the one ledger, not a second file ----
+    assert!(
+        file.exists(),
+        "grants live in ~/.ahma/settings.toml — the single control-plane file the \
+         sandbox never includes (R-PERM.1)"
+    );
+    assert!(
+        !home.path().join(".config").join("ahma").exists(),
+        "nothing may be written to the retired ~/.config/ahma tree"
     );
 
     // ---- Workspace scoping: a grant must NOT leak to another workspace ----
@@ -153,4 +169,15 @@ async fn approval_grants_persist_and_are_workspace_scoped() {
     );
     // The first tool's approval is unaffected by adding a second.
     assert!(is_tool_approved(ws_a, "cargo_build").await);
+
+    // ---- Unrelated settings survive a grant ----
+    // The ledger shares a file with every other user setting, so the write path
+    // must merge rather than replace. A grant that silently reset the user's
+    // sandbox config would be a far worse bug than the one it fixes.
+    let settings = AhmaSettings::load_from_result(&file).unwrap();
+    assert_eq!(
+        settings.sandbox.disable,
+        AhmaSettings::default().sandbox.disable,
+        "granting a tool must not disturb unrelated settings"
+    );
 }

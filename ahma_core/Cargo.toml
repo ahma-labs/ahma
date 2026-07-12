@@ -17,6 +17,7 @@ ahma_mcp = { path = "../ahma_mcp" }
 ahma_common = { path = "../ahma_common" }
 ahma_llm_monitor = { path = "../ahma_llm_monitor" }
 anyhow.workspace = true
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1.52", features = ["full"] }

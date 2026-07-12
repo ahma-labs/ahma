@@ -1,79 +1,70 @@
 //! Persistent "always allow" tool-approval grants.
 //!
 //! When a user chooses **always allow** for a tool, the grant is remembered so
-//! the same tool is not re-prompted on every call. Grants are stored *outside*
-//! any workspace sandbox — in the user's config directory
-//! (`~/.config/ahma/approvals.json` on Linux/macOS) — so a sandboxed agent
-//! cannot read or tamper with the list of what it has been trusted to run.
+//! the same tool is not re-prompted on every call.
 //!
-//! Grants are keyed by **workspace root**: trusting `cargo_build` in one
-//! project does not silently trust it in another. The on-disk shape is:
+//! ## Where these live, and why it changed
 //!
-//! ```json
-//! {
-//!   "/Users/you/sandbox/ahma": ["list_dir", "cargo_build"]
-//! }
-//! ```
+//! Grants used to live in their own file, `~/.config/ahma/approvals.json`. They
+//! now live in the **unified permission ledger** (`~/.ahma/settings.toml`,
+//! `[permissions].tool_approvals`) alongside every other kind of permission
+//! ahma grants — filesystem scopes, web domains, hook consent. See SPEC R-PERM.1.
+//!
+//! The move is not cosmetic. `~/.ahma` is the one directory the sandbox **never**
+//! includes (SPEC R5.4.8): it is kernel-unreadable *and* kernel-unwritable from
+//! inside the sandbox, so a sandboxed agent can neither read the list of what it
+//! has been trusted to run nor add itself to it. `~/.config/ahma` had no such
+//! guarantee. One ledger, one place to look, one set of properties.
+//!
+//! Existing `approvals.json` files are migrated once, non-destructively, by
+//! [`ahma_common::permissions::migrate_legacy_approvals`] — called at process
+//! startup, and lazily here so a grant made in a process that skipped startup
+//! migration still lands in the right place.
+//!
+//! Grants remain keyed by **workspace root**: trusting `cargo_build` in one
+//! project does not silently trust it in another.
 //!
 //! The read path ([`is_tool_approved`]) is `async` because it runs inside the
 //! agent turn (no blocking I/O in async — see AGENTS.md). The write path
 //! ([`remember_tool_approval`]) is synchronous because it is invoked from the
 //! TUI's (non-async) input handler.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::OnceLock;
 
+use ahma_common::config::{AhmaSettings, settings_path};
+use ahma_common::permissions::{
+    AuditAction, GrantKind, GrantTier, PermissionSettings, append_audit, audit_entry,
+    migrate_legacy_approvals, workspace_key, workspace_key_async,
+};
 use tracing::{debug, warn};
 
-type Grants = BTreeMap<String, Vec<String>>;
-
-/// Base config directory for ahma. Honors `AHMA_CONFIG_DIR` (used by tests and
-/// for relocating config), else falls back to the platform config dir.
-fn config_dir() -> Option<PathBuf> {
-    std::env::var_os("AHMA_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(dirs::config_dir)
-        .map(|d| d.join("ahma"))
+/// Run the legacy-approvals migration at most once per process.
+///
+/// Startup already calls the migration, but the approvals path is also reached
+/// from contexts that may not have gone through it (a short-lived CLI, a test).
+/// The migration is cheap when there is nothing to migrate (one `stat` of a file
+/// that almost never exists) and idempotent, so guarding it with a `OnceLock` and
+/// calling it from both entry points costs nothing and closes the gap.
+fn migrate_once() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        if let Some(file) = settings_path()
+            && let Err(e) = migrate_legacy_approvals(&file)
+        {
+            warn!("approvals: legacy migration failed: {e:#}");
+        }
+    });
 }
 
-/// Location of the persisted approvals file, or `None` if no config directory
-/// can be determined for this platform/user.
-fn approvals_path() -> Option<PathBuf> {
-    config_dir().map(|d| d.join("approvals.json"))
-}
-
-/// Build the map key from a (possibly failed) canonicalisation, falling back to
-/// the original path's lossy string. Shared by the sync and async key paths so
-/// the TUI (writer) and agent (reader) agree on the exact same key.
-fn workspace_key_from(canonical: std::io::Result<PathBuf>, fallback: &Path) -> String {
-    canonical
-        .unwrap_or_else(|_| fallback.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Normalise a workspace path into the map key (synchronous; for the TUI's
-/// non-async handler). Canonicalises when possible so a symlinked or
-/// non-normalised path still matches; falls back to the lossy string otherwise.
-fn workspace_key(workspace: &Path) -> String {
-    workspace_key_from(std::fs::canonicalize(workspace), workspace)
-}
-
-/// Async counterpart used inside the agent turn — canonicalises via
-/// `tokio::fs` so no blocking I/O happens on the async runtime (see AGENTS.md).
-async fn workspace_key_async(workspace: &Path) -> String {
-    workspace_key_from(tokio::fs::canonicalize(workspace).await, workspace)
-}
-
-fn parse_grants(content: &str) -> Grants {
-    serde_json::from_str(content).unwrap_or_default()
-}
-
-fn read_grants_sync() -> Grants {
-    approvals_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|c| parse_grants(&c))
-        .unwrap_or_default()
+/// Load the ledger's permission table. A missing or unreadable settings file
+/// yields an empty table — which reads as "nothing approved", so the caller
+/// prompts. Failing closed is the only safe direction here.
+fn load_permissions() -> PermissionSettings {
+    let Some(path) = settings_path() else {
+        return PermissionSettings::default();
+    };
+    AhmaSettings::load_from(&path).permissions
 }
 
 /// Where a tool stands relative to the persisted grants for a workspace.
@@ -90,17 +81,13 @@ pub enum GrantStatus {
     Unseen,
 }
 
-fn classify(grants: &Grants, key: &str, tool: &str) -> GrantStatus {
-    let here = grants.get(key);
-    if here.is_some_and(|tools| tools.iter().any(|t| t == tool)) {
+fn classify(perms: &PermissionSettings, key: &Path, tool: &str) -> GrantStatus {
+    if perms.is_tool_approved(key, tool) {
         return GrantStatus::ApprovedHere;
     }
-    let elsewhere = grants
-        .iter()
-        .any(|(k, tools)| k != key && tools.iter().any(|t| t == tool));
-    if elsewhere {
+    if perms.tool_approved_elsewhere(key, tool) {
         GrantStatus::GrantedElsewhere
-    } else if here.is_some() {
+    } else if perms.workspace_known(key) {
         GrantStatus::Unseen
     } else {
         GrantStatus::NewWorkspace
@@ -110,7 +97,8 @@ fn classify(grants: &Grants, key: &str, tool: &str) -> GrantStatus {
 /// Classify `tool` against the persisted grants (synchronous; intended for the
 /// TUI's non-async event handler, where it runs only when a banner appears).
 pub fn grant_status(workspace: &Path, tool: &str) -> GrantStatus {
-    classify(&read_grants_sync(), &workspace_key(workspace), tool)
+    migrate_once();
+    classify(&load_permissions(), &workspace_key(workspace), tool)
 }
 
 /// A short, dim note explaining the workspace scope when a prompt appears in an
@@ -134,51 +122,75 @@ fn reask_note_for(status: GrantStatus) -> Option<String> {
 
 /// Returns `true` if `tool` has been granted "always allow" for `workspace`.
 ///
-/// Never errors: a missing or unreadable file simply means "not approved", so
-/// the caller falls back to prompting — failing closed.
+/// Never errors: a missing or unreadable ledger simply means "not approved", so
+/// the caller falls back to prompting — failing closed. In particular, when ahma
+/// runs *inside its own sandbox*, reading `~/.ahma` is denied by the kernel by
+/// design (R5.4.8); that reads as "not approved" and prompts, rather than
+/// wedging.
 pub async fn is_tool_approved(workspace: &Path, tool: &str) -> bool {
-    let Some(path) = approvals_path() else {
+    let Some(path) = settings_path() else {
         return false;
     };
-    let content = match tokio::fs::read_to_string(&path).await {
+    let contents = match tokio::fs::read_to_string(&path).await {
         Ok(c) => c,
         Err(_) => return false, // not yet created / unreadable → prompt
     };
-    let grants = parse_grants(&content);
+    let settings = match AhmaSettings::parse(&contents) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("approvals: settings file does not parse ({e}); treating as not approved");
+            return false;
+        }
+    };
     let key = workspace_key_async(workspace).await;
-    grants
-        .get(&key)
-        .is_some_and(|tools| tools.iter().any(|t| t == tool))
+    settings.permissions.is_tool_approved(&key, tool)
 }
 
 /// Persist an "always allow" grant for `tool` in `workspace`.
 ///
-/// Reads the current file (if any), inserts the grant idempotently, and writes
-/// it back. Creates the config directory if needed. Errors are logged and
-/// returned; a failed write degrades gracefully to re-prompting next time.
+/// Reads the current ledger, inserts the grant idempotently, and writes it back.
+/// Errors are logged and returned; a failed write degrades gracefully to
+/// re-prompting next time.
 pub fn remember_tool_approval(workspace: &Path, tool: &str) -> std::io::Result<()> {
-    let Some(path) = approvals_path() else {
-        warn!("approvals: no config directory available; cannot persist grant");
+    migrate_once();
+    let Some(path) = settings_path() else {
+        warn!("approvals: no home directory available; cannot persist grant");
         return Ok(());
     };
 
-    let mut grants: Grants = std::fs::read_to_string(&path)
-        .map(|c| parse_grants(&c))
-        .unwrap_or_default();
+    // Strict load on the write path: never clobber a settings file we cannot
+    // parse — it holds every other permission the user has granted.
+    let mut settings = AhmaSettings::load_from_result(&path).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("refusing to overwrite unparseable {}: {e}", path.display()),
+        )
+    })?;
 
     let key = workspace_key(workspace);
-    let entry = grants.entry(key).or_default();
-    if !entry.iter().any(|t| t == tool) {
-        entry.push(tool.to_string());
-        entry.sort();
-    }
+    let now = chrono::Local::now();
+    let added = settings.permissions.approve_tool(
+        &key,
+        tool,
+        Some(now.format("%Y-%m-%d").to_string()),
+        Some("tui".to_string()),
+    );
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    settings
+        .save_to(&path)
+        .map_err(|e| std::io::Error::other(format!("failed to write {}: {e:#}", path.display())))?;
+
+    if added {
+        append_audit(&audit_entry(
+            now.to_rfc3339(),
+            AuditAction::Grant,
+            GrantKind::Tool,
+            tool,
+            None,
+            GrantTier::Always,
+            Some("tui".to_string()),
+        ));
     }
-    let serialized = serde_json::to_string_pretty(&grants)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&path, serialized)?;
     debug!("approvals: persisted always-allow for {tool}");
     Ok(())
 }
@@ -186,63 +198,54 @@ pub fn remember_tool_approval(workspace: &Path, tool: &str) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    #[test]
-    fn parse_empty_or_garbage_yields_no_grants() {
-        assert!(parse_grants("").is_empty());
-        assert!(parse_grants("not json").is_empty());
-        assert!(parse_grants("{}").is_empty());
-    }
-
-    #[test]
-    fn parse_roundtrips_grants() {
-        let mut g: Grants = BTreeMap::new();
-        g.insert("/ws".to_string(), vec!["list_dir".to_string()]);
-        let s = serde_json::to_string(&g).unwrap();
-        let back = parse_grants(&s);
-        assert_eq!(back.get("/ws").unwrap(), &vec!["list_dir".to_string()]);
-    }
-
-    #[test]
-    fn workspace_key_is_stable_for_same_path() {
-        let p = Path::new("/some/workspace/path");
-        assert_eq!(workspace_key(p), workspace_key(p));
-    }
-
-    fn grants_of(pairs: &[(&str, &[&str])]) -> Grants {
-        pairs
-            .iter()
-            .map(|(k, tools)| (k.to_string(), tools.iter().map(|t| t.to_string()).collect()))
-            .collect()
+    fn perms(pairs: &[(&str, &[&str])]) -> PermissionSettings {
+        let mut p = PermissionSettings::default();
+        for (ws, tools) in pairs {
+            for t in *tools {
+                p.approve_tool(&PathBuf::from(ws), t, None, None);
+            }
+        }
+        p
     }
 
     #[test]
     fn classify_approved_here() {
-        let g = grants_of(&[("/ws", &["list_dir"])]);
-        assert_eq!(classify(&g, "/ws", "list_dir"), GrantStatus::ApprovedHere);
+        let p = perms(&[("/ws", &["list_dir"])]);
+        assert_eq!(
+            classify(&p, Path::new("/ws"), "list_dir"),
+            GrantStatus::ApprovedHere
+        );
     }
 
     #[test]
     fn classify_new_workspace_when_no_key_and_no_grant_anywhere() {
-        let g = grants_of(&[("/other", &["cargo_build"])]);
-        assert_eq!(classify(&g, "/ws", "list_dir"), GrantStatus::NewWorkspace);
+        let p = perms(&[("/other", &["cargo_build"])]);
+        assert_eq!(
+            classify(&p, Path::new("/ws"), "list_dir"),
+            GrantStatus::NewWorkspace
+        );
     }
 
     #[test]
     fn classify_granted_elsewhere_signals_reask() {
         // Same tool allowed under a different workspace path (e.g. canonical
         // mismatch or a different project) → we re-ask in this workspace.
-        let g = grants_of(&[("/other/path", &["list_dir"])]);
+        let p = perms(&[("/other/path", &["list_dir"])]);
         assert_eq!(
-            classify(&g, "/ws", "list_dir"),
+            classify(&p, Path::new("/ws"), "list_dir"),
             GrantStatus::GrantedElsewhere
         );
     }
 
     #[test]
     fn classify_unseen_when_workspace_known_but_tool_isnt() {
-        let g = grants_of(&[("/ws", &["cargo_build"])]);
-        assert_eq!(classify(&g, "/ws", "list_dir"), GrantStatus::Unseen);
+        let p = perms(&[("/ws", &["cargo_build"])]);
+        assert_eq!(
+            classify(&p, Path::new("/ws"), "list_dir"),
+            GrantStatus::Unseen
+        );
     }
 
     #[test]

@@ -992,7 +992,11 @@ fn default_sandbox_directory() -> Option<PathBuf> {
 }
 
 /// Expand `~` or `~/…` to the user's home directory.
-pub(crate) fn expand_home(path: &Path) -> PathBuf {
+///
+/// Public because every surface that resolves a permission subject must expand
+/// it the *same* way before comparing it against the denylist — a `~`-spelled
+/// path that skipped expansion would sail past a check keyed on the absolute one.
+pub fn expand_home(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s == "~" {
         if let Some(home) = dirs::home_dir() {
@@ -1329,6 +1333,12 @@ pub struct AhmaSettings {
     pub web: WebSettings,
     /// Subprocess network-egress restriction (SPEC R-NET).
     pub network: NetworkSettings,
+    /// The unified permission ledger (SPEC R-PERM). Holds the permissions that
+    /// had no home in this file before — per-workspace tool approvals, migrated
+    /// out of the retired `~/.config/ahma/approvals.json`. Filesystem scopes stay
+    /// in `[sandbox].persistent_scopes` and web domains in `[web]`; they are all
+    /// the *same ledger*, rendered together by `ahma permissions list`.
+    pub permissions: crate::permissions::PermissionSettings,
 }
 
 impl AhmaSettings {
@@ -1386,7 +1396,7 @@ impl AhmaSettings {
     /// tampered/corrupt file must never silently change behavior.
     pub fn load_from_result(path: &Path) -> Result<Self, String> {
         match std::fs::read_to_string(path) {
-            Ok(contents) => toml::from_str(&contents)
+            Ok(contents) => Self::parse(&contents)
                 .map_err(|e| format!("failed to parse settings file {}: {e}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -1400,6 +1410,14 @@ impl AhmaSettings {
             }
             Err(e) => Err(format!("failed to read {}: {e}", path.display())),
         }
+    }
+
+    /// Parse settings from TOML text — the in-memory half of
+    /// [`load_from_result`](Self::load_from_result), exposed so callers that have
+    /// already read the file (e.g. via async I/O inside an agent turn) do not
+    /// need a `toml` dependency of their own.
+    pub fn parse(contents: &str) -> Result<Self, String> {
+        toml::from_str(contents).map_err(|e| e.to_string())
     }
 
     /// Whether the `logging.target` resolves to stderr.
@@ -1929,6 +1947,15 @@ impl AhmaSettings {
             toml_str_list(&d.network.allow),
         );
 
+        // ── Permissions ──────────────────────────────────────────────────────
+        w.section("Permission ledger (SPEC R-PERM)", "permissions");
+        w.setting(
+            "Per-workspace \"always allow\" tool grants (manage via `ahma permissions list|revoke`). Migrated from the retired ~/.config/ahma/approvals.json.",
+            "tool_approvals",
+            toml_tool_approvals(&self.permissions.tool_approvals),
+            toml_tool_approvals(&d.permissions.tool_approvals),
+        );
+
         w.into_string()
     }
 
@@ -2041,6 +2068,32 @@ fn toml_persistent_scopes(v: &[PersistentScope]) -> String {
             }
             if let Some(n) = &ps.note {
                 parts.push(format!("note = {}", toml_str(n)));
+            }
+            format!("{{ {} }}", parts.join(", "))
+        })
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Render per-workspace tool approvals as an inline TOML array of inline tables,
+/// omitting the optional fields that are unset (matching serde's
+/// `skip_serializing_if`).
+fn toml_tool_approvals(v: &[crate::permissions::ToolApproval]) -> String {
+    let items: Vec<String> = v
+        .iter()
+        .map(|a| {
+            let mut parts = vec![
+                format!("workspace = {}", toml_path(&a.workspace)),
+                format!("tools = {}", toml_str_list(&a.tools)),
+            ];
+            if let Some(at) = &a.granted_at {
+                parts.push(format!("granted_at = {}", toml_str(at)));
+            }
+            if let Some(by) = &a.granted_by {
+                parts.push(format!("granted_by = {}", toml_str(by)));
+            }
+            if let Some(s) = &a.surface {
+                parts.push(format!("surface = {}", toml_str(s)));
             }
             format!("{{ {} }}", parts.join(", "))
         })
@@ -2342,6 +2395,15 @@ mod tests {
             network: NetworkSettings {
                 restrict: true,
                 allow: vec!["crates.io".into(), "*.crates.io".into()],
+            },
+            permissions: crate::permissions::PermissionSettings {
+                tool_approvals: vec![crate::permissions::ToolApproval {
+                    workspace: PathBuf::from("/home/u/proj"),
+                    tools: vec!["cargo_build".into(), "list_dir".into()],
+                    granted_at: Some("2026-07-12".into()),
+                    granted_by: Some("user".into()),
+                    surface: Some("tui".into()),
+                }],
             },
         }
     }

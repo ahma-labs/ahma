@@ -919,6 +919,10 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in web-egress policy management mode");
             commands::run_web_command(args)
         }
+        Subcommands::Permissions(args) => {
+            tracing::info!("Running in permission-ledger management mode");
+            commands::run_permissions_command(args)
+        }
     }
 }
 
@@ -1276,6 +1280,56 @@ pub enum Subcommands {
     /// `~/.ahma/settings.toml`, outside every sandbox scope, so a sandboxed tool
     /// cannot edit them. See `ahma web --help`.
     Web(WebArgs),
+    /// List and revoke **every** permission ahma has been granted, of every kind
+    /// — filesystem scopes, web domains, and per-workspace tool approvals — from
+    /// one place (SPEC R-PERM).
+    ///
+    /// They all live in one ledger, `~/.ahma/settings.toml`: the single directory
+    /// the sandbox never includes, so a sandboxed command can neither read what
+    /// it has been trusted with nor grant itself more. `ahma sandbox` and
+    /// `ahma web` remain as kind-scoped shortcuts into the same ledger.
+    Permissions(PermissionsArgs),
+}
+
+/// Arguments for `ahma permissions`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct PermissionsArgs {
+    /// The permissions subcommand to run.
+    #[command(subcommand)]
+    pub command: PermissionsCommand,
+}
+
+/// Subcommands for `ahma permissions` — the unified view over every grant.
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum PermissionsCommand {
+    /// Show every permission currently granted, with its kind, tier, and
+    /// provenance, and name the file that holds them.
+    List {
+        /// Show only one kind: `fs-scope`, `web-domain`, or `tool`.
+        #[arg(long = "kind", value_name = "KIND")]
+        kind: Option<String>,
+    },
+    /// Revoke a permission by kind and subject.
+    ///
+    /// Previews the exact change and requires `--yes` to write, so a revoke is
+    /// never a surprise. Examples:
+    ///   ahma permissions revoke fs-scope ~/Library/Caches/sccache
+    ///   ahma permissions revoke tool cargo_build --workspace ~/code/proj
+    Revoke {
+        /// Kind of permission: `fs-scope`, `web-domain`, or `tool`.
+        #[arg(value_name = "KIND")]
+        kind: String,
+        /// The path, domain pattern, or tool name to revoke.
+        #[arg(value_name = "SUBJECT")]
+        subject: String,
+        /// For `tool`: which workspace the approval is scoped to.
+        /// Defaults to the current directory.
+        #[arg(long = "workspace", value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        /// Apply the previewed change (without this, nothing is written).
+        #[arg(long = "yes", short = 'y')]
+        yes: bool,
+    },
 }
 
 /// Arguments for `ahma setup`.

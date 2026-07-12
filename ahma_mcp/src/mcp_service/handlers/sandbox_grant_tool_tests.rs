@@ -125,7 +125,11 @@ fn high_for_redundant_equal_scope() {
 #[test]
 fn high_for_hidden_home_dir_not_a_cache() {
     let home = tempdir().unwrap();
-    let secret = home.path().join(".secrets");
+    // In production the path always arrives canonicalized (`resolve_grant_path`),
+    // so canonicalize the home here to build the same shape — on macOS a tempdir
+    // is `/var/folders/…`, a symlink to `/private/var/folders/…`.
+    let canonical_home = dunce::canonicalize(home.path()).unwrap();
+    let secret = canonical_home.join(".secrets");
     match classify_grant_risk(&secret, Some(home.path()), &[]) {
         GrantRisk::High(w) => assert!(w.iter().any(|m| m.contains("hidden directory")), "{w:?}"),
         other => panic!("expected High, got {other:?}"),
@@ -705,5 +709,49 @@ async fn handler_reports_persist_failure_when_settings_file_unwritable() {
         err.message.contains("failed to persist grant to"),
         "{}",
         err.message
+    );
+}
+
+/// The hard denylist must hold when `$HOME` reaches ahma through a symlink.
+///
+/// `resolve_grant_path` canonicalizes the requested path, but `ahma_home_dir()`
+/// returns whatever the OS reports — and on a great many real machines that is a
+/// symlink: `/home` → `/mnt/home`, an automounted corporate home, a macOS home
+/// relocated to another volume. If the risk classifier compares a *resolved* path
+/// against an *unresolved* home, every equality rule below it silently stops
+/// matching: `$HOME` itself, `~/.ssh`, `~/.aws`, `~/.ahma` all become grantable.
+///
+/// A denylist that quietly stops matching is worse than no denylist, because
+/// everything downstream is written assuming it held.
+#[cfg(unix)]
+#[test]
+fn denylist_holds_when_home_is_reached_through_a_symlink() {
+    let tmp = tempdir().unwrap();
+    let real_home = tmp.path().join("real_home");
+    std::fs::create_dir_all(real_home.join(".ssh")).unwrap();
+
+    // `link_home` is a symlink to the real home — the shape `$HOME` often has.
+    let link_home = tmp.path().join("link_home");
+    std::os::unix::fs::symlink(&real_home, &link_home).unwrap();
+
+    // The path arrives canonicalized (as resolve_grant_path leaves it); the home
+    // arrives as the symlink (as ahma_home_dir leaves it).
+    let canonical_home = dunce::canonicalize(&real_home).unwrap();
+
+    assert!(
+        matches!(
+            classify_grant_risk(&canonical_home, Some(&link_home), &[]),
+            GrantRisk::Refused(_)
+        ),
+        "granting $HOME must be refused even when $HOME is a symlink"
+    );
+
+    let canonical_ssh = dunce::canonicalize(real_home.join(".ssh")).unwrap();
+    assert!(
+        matches!(
+            classify_grant_risk(&canonical_ssh, Some(&link_home), &[]),
+            GrantRisk::Refused(_)
+        ),
+        "granting ~/.ssh must be refused even when $HOME is a symlink"
     );
 }
