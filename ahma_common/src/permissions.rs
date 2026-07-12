@@ -551,8 +551,23 @@ pub fn migrate_legacy_approvals(settings_file: &Path) -> anyhow::Result<Migratio
         Err(_) => return Ok(MigrationOutcome::NothingToDo),
     };
 
-    let legacy_grants: BTreeMap<String, Vec<String>> =
-        serde_json::from_str(&contents).unwrap_or_default();
+    // A file we cannot parse is **not** an empty file. Treating a corrupt
+    // approvals.json as "zero grants" and then archiving it would move the user's
+    // record of what they trusted out of the path ahma reads, having migrated
+    // nothing — the grants would be silently orphaned, and the user would only
+    // find out by being re-prompted for everything. Leave it exactly where it is
+    // and say so; a human can fix or delete it.
+    let legacy_grants: BTreeMap<String, Vec<String>> = match serde_json::from_str(&contents) {
+        Ok(g) => g,
+        Err(e) => {
+            warn!(
+                "permissions: {} exists but does not parse ({e}); leaving it untouched. \
+                 Fix or delete it, then re-run ahma to migrate its grants.",
+                legacy.display()
+            );
+            return Ok(MigrationOutcome::NothingToDo);
+        }
+    };
 
     let mut settings = AhmaSettings::load_from_result(settings_file)
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -580,6 +595,33 @@ pub fn migrate_legacy_approvals(settings_file: &Path) -> anyhow::Result<Migratio
 
     if moved > 0 {
         settings.save_to(settings_file)?;
+
+        // Read the grants back before archiving the only other copy of them.
+        //
+        // The write can fail to stick for reasons this function cannot see — a
+        // concurrent ahma process re-rendering the same settings file, a full
+        // disk, a permission quirk. Archiving on the *assumption* that it worked
+        // is how a user ends up with an empty ledger and their approvals.json
+        // renamed out from under them. So: verify, then archive. If verification
+        // fails, the legacy file stays exactly where it is and the next run tries
+        // again.
+        let reloaded = AhmaSettings::load_from_result(settings_file)
+            .map_err(|e| anyhow::anyhow!("could not re-read the ledger after migrating: {e}"))?;
+        let landed: usize = reloaded
+            .permissions
+            .tool_approvals
+            .iter()
+            .map(|a| a.tools.len())
+            .sum();
+        if landed == 0 {
+            anyhow::bail!(
+                "migrated {moved} grant(s) into {} but they are not there on re-read \
+                 (another ahma process may have rewritten the file). Leaving {} in place \
+                 so nothing is lost; it will be retried on the next run.",
+                settings_file.display(),
+                legacy.display()
+            );
+        }
     }
 
     let archived_to = legacy.with_extension("json.migrated");
@@ -893,6 +935,38 @@ mod tests {
             settings
                 .permissions
                 .is_tool_approved(&canonical, "list_dir")
+        );
+    }
+
+    #[test]
+    fn a_corrupt_legacy_file_is_left_alone_not_archived() {
+        // A file we cannot parse is not an empty file. Archiving it after migrating
+        // *nothing* would move the user's only record of what they trusted out of
+        // the path ahma reads — they would discover it by being re-prompted for
+        // everything, with no obvious way back.
+        let home = tempdir().unwrap();
+        let cfg = tempdir().unwrap();
+        let settings_file = home.path().join(".ahma").join("settings.toml");
+
+        let legacy_dir = cfg.path().join("ahma");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy = legacy_dir.join("approvals.json");
+        std::fs::write(&legacy, "{ this is not json").unwrap();
+
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var("AHMA_CONFIG_DIR", cfg.path()) };
+        let outcome = migrate_legacy_approvals(&settings_file).unwrap();
+        unsafe { std::env::remove_var("AHMA_CONFIG_DIR") };
+
+        assert_eq!(outcome, MigrationOutcome::NothingToDo);
+        assert!(
+            legacy.exists(),
+            "a file we could not read must be left exactly where it is"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "{ this is not json",
+            "…and untouched, so a human can fix it"
         );
     }
 

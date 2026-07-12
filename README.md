@@ -187,7 +187,9 @@ Ahma enforces **kernel-level filesystem sandboxing** by default — Landlock on 
 
 **Network egress** is unrestricted by default. Pass `--restrict-network` (or set `[network] restrict = true`) to route every sandboxed subprocess through a guarded local proxy that forwards only the domains in `[network] allow` (deny-all when empty) and refuses private/loopback/cloud-metadata addresses. When a subprocess reaches a domain not on the list and an MCP client capable of `elicitation/create` is attached (e.g. an IDE), the proxy raises an interactive approval prompt instead of denying outright — the human can allow it once, for the session, or persist it to `[network] allow`; declining, a timeout, or no capable client all fail safe to a deny. Ahma's own web tool (`fetch_webpage`) is governed separately by the `[web]` policy.
 
-See [docs/security-sandbox.md](docs/security-sandbox.md) for platform details, nested sandbox detection, temp directory access, and example `mcp.json` configs.
+**When the sandbox blocks something you actually wanted**, ahma asks you — in your IDE if it can prompt, in the ahma TUI if one is attached, and otherwise by failing the command with the exact `ahma sandbox grant …` line that fixes it. It never fails *open*: if nobody can be asked, the answer is no. Grants live in `~/.ahma/settings.toml`, the one directory the sandbox never includes — so a sandboxed command can never grant itself anything.
+
+See [docs/permissions.md](docs/permissions.md) for how permissions work, and [docs/security-sandbox.md](docs/security-sandbox.md) for platform details, nested sandbox detection, temp directory access, and example `mcp.json` configs.
 
 ### What the sandbox does *not* cover
 

@@ -41,6 +41,26 @@ Open `ahma tui` in a project directory while your IDE agent is working and the o
 - **Project-scoped by default:** only instances whose sandbox scope covers the directory you started in are shown; `f` shows all projects.
 - Finished tasks stay visible for an hour, so a TUI opened mid-session shows what *was* done, not just what is running.
 
+## Operation names and exit status
+
+Every operation row shows **what actually ran**, not an internal id:
+
+```
+⟳ cargo nextest run -p ahma_core   [op_41]  exit 0 · 41s
+✗ touch /etc/foo                   [op_42]  denied: outside sandbox scope
+```
+
+The name is computed **by the server**, where the command is known, and sent on
+the wire (SPEC R24.7) — the TUI renders it rather than guessing. That is why rows
+are meaningful even when you open `ahma tui` *after* your IDE has already been
+working: the replayed history carries the same names and exit codes as the live
+events, so a late-attached TUI shows what those commands were, not what their ids
+looked like.
+
+A finished row shows `exit 0` / `exit 101` where the command was a process. An
+operation that was cancelled or timed out has no exit code, and says so, rather
+than showing a fabricated `exit 0`.
+
 ## Key bindings
 
 | Key | Action |

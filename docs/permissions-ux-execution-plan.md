@@ -1,6 +1,9 @@
 # Execution Plan: Unified Permissions Model, Question Ladder, and TUI Operation Identity
 
-**Status**: Approved design, ready for implementation
+**Status**: ✅ **Complete** — all phases landed on `main` (PRs #455–#461). Retained as
+the design record: it explains *why* each piece is shaped the way it is. For the
+user-facing guide see [`permissions.md`](permissions.md); for the requirements see
+SPEC R-PERM.
 **Audience**: An implementing AI agent (or human) with full workspace access
 **Origin**: Architecture/UX synthesis session, 2026-07-12 (main @ `c6fb17e9`)
 **Scope**: This plan converges existing mechanisms — it introduces almost no new invariants. Every phase applies principles already in SPEC.md: *nothing silent, no self-widening, ask only at the moment of genuine need, fail closed to a shown default.*

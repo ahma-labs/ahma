@@ -185,12 +185,17 @@ To disable (strictest isolation):
 ahma serve stdio --no-package-cache-write
 # or
 AHMA_NO_PACKAGE_CACHE_WRITE=1 ahma serve stdio
-# or in ~/.config/ahma/settings.toml:
+# or in ~/.ahma/settings.toml:
 # [sandbox]
 # package_cache_write = false
 ```
 
 `$CARGO_HOME` is respected; defaults to `~/.cargo`.
+
+> **These paths are a *profile*, not a hard-coded exception.** The cargo carve-out
+> above ships as `rust` in `[sandbox] profiles` — data, not code — so you can see
+> exactly what it grants (`ahma permissions list`) and switch it off
+> (`profiles = []`). See [permissions.md](permissions.md#sandbox-profiles).
 
 ### `cargo install` / `cargo binstall` and other tool installs
 

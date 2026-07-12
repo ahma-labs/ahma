@@ -771,7 +771,17 @@ fn revoke_permission(
         settings
             .save_to(file)
             .with_context(|| format!("Failed to write {}", file.display()))?;
-        audit(AuditAction::Revoke, kind, subject.to_string(), None);
+        // Audit the *expanded* subject, so a path's grant and its revoke carry the
+        // same string. An audit log where `~/cache` and `/home/me/cache` are two
+        // different entries cannot answer "what happened to this path?" — which is
+        // the only question anyone opens it to ask.
+        let audited = match kind {
+            GrantKind::FsScope => ahma_common::config::expand_home(std::path::Path::new(subject))
+                .display()
+                .to_string(),
+            _ => subject.to_string(),
+        };
+        audit(AuditAction::Revoke, kind, audited, None);
         println!("✓ Revoked: {description}");
         println!();
         println!("Updated: {}", file.display());

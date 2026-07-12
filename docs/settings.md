@@ -204,6 +204,29 @@ Both files coexist independently.
 
 ---
 
+## Permissions
+
+Everything ahma has been granted — filesystem scopes, web domains, per-workspace
+tool approvals — lives in this one file, and is managed with one command:
+
+```bash
+ahma permissions list           # every grant, with where it came from
+ahma permissions revoke ...     # previews the change; --yes applies it
+```
+
+Two `[sandbox]` keys are worth knowing:
+
+- **`profiles`** — the shipped toolchain carve-outs (`rust`, `node`, `go`,
+  `common`). These used to be hard-coded in the sandbox backends, invisible and
+  un-refusable; they are now data you can inspect and disable. Set to `[]` for the
+  strictest isolation.
+- **`persistent_scopes`** — the directories you have granted, surviving every
+  `roots/list` update. Written by `ahma sandbox grant` or by an approved prompt,
+  never by a sandboxed command (this file is outside every sandbox scope, by
+  design — SPEC R5.4.8).
+
+See [permissions.md](permissions.md) for the full model.
+
 ## See also
 
 - [environment-variables.md](environment-variables.md) — remaining env vars reference

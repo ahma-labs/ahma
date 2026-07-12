@@ -43,10 +43,10 @@
 | Logging (File + Stderr) | tests-pass | Daily rolling logs, `--log-to-stderr` for debug |
 | Live Log Monitoring (LLM) | tests-pass | `tool_type: livelog` routes to LLM analysis pipeline; `ahma_llm_monitor` crate; OpenAI-compatible providers |
 | TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
-| Live Task Tree (R24) | tests-pass | Project-scoped caller → subtask tree, current at TUI startup via hub replay with true timestamps; accordion drill-in to live/historic output; client identity via reconnect-to-relabel |
+| Live Task Tree (R24) | tests-pass | Project-scoped caller → subtask tree, current at TUI startup via hub replay with true timestamps; accordion drill-in to live/historic output; client identity via reconnect-to-relabel; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
 | Local Cluster Scheduler | tests-pass | mDNS discovery and signed task dispatch to remote worker peers |
 | Configuration Standard (R-CFG) | PLANNED | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5) |
-| Unified Permissions (R-PERM) | in-progress | One ledger under `~/.ahma`, one question ladder (harness → TUI → fail-closed), sandbox profiles replacing hard-coded carve-outs, per-client hooks gating. Execution plan: `docs/permissions-ux-execution-plan.md` |
+| Unified Permissions (R-PERM) | tests-pass | One ledger under `~/.ahma` (fs scopes, web domains, tool approvals; legacy `approvals.json` migrated); question ladder (harness elicitation → TUI modal → fail-closed with paste-able remediation); sandbox profiles replace the hard-coded toolchain carve-outs; hooks enabled per client. User guide: `docs/permissions.md` |
 | `ahma cluster remove` | tests-pass | Subcommand to remove worker peers from peers configuration |
 | `ahma setup` / `ahma uninstall` | tests-pass | Interactive wizard installs / removes MCP entries, hooks, skills, binary; symmetric teardown leaves other user config intact |
 | Auto-spawned Bridge Lifecycle | tests-pass | Bridges started by `ahma serve stdio` or `ahma tui` self-terminate after `--idle-timeout` seconds with no connected client; explicitly-started `ahma serve http/unix` remain persistent by default |
