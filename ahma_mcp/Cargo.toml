@@ -55,7 +55,11 @@ sigstore-verification = { version = "0.2", default-features = false, features = 
 ] }
 tar = "0.4"
 tempfile.workspace = true
-zip = "8.6.0"
+# Only `deflate` is used: we extract our own release .zip (produced by `7z a`,
+# which emits deflate) and write deflate zips in tests. zip's default features
+# additionally pull in bzip2, aes-crypto, lzma, zstd, xz, ppmd and deflate64 —
+# dead weight, and bzip2's licence is not on the `cargo deny` allow-list.
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 thiserror.workspace = true
 tokio-util.workspace = true
 tokio = "1.52"
