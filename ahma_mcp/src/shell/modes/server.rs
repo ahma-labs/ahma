@@ -399,7 +399,42 @@ async fn trigger_tcp_restart(url: &str) -> bool {
     false
 }
 
+/// Default TCP port of the shared bridge — the other machine-global endpoint.
+pub const GLOBAL_HTTP_PORT: u16 = 3000;
+
+/// True when `url` addresses the shared bridge's default port on loopback.
+fn is_global_bridge_url(url: &str) -> bool {
+    url.rsplit(':')
+        .next()
+        .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+        .is_some_and(|port| port == GLOBAL_HTTP_PORT)
+}
+
 pub async fn trigger_bridge_restart(socket_path: Option<&str>, http_url: Option<&str>) -> bool {
+    // A test must never shut down a bridge it does not own. A test-spawned ahma is
+    // a freshly built binary, so it carries a different BUILD_ID; pointed at the
+    // machine-global endpoint it decides the running bridge is "stale" and restarts
+    // whatever owns it — the developer's live MCP server, or another application's.
+    //
+    // Strip only the *global* endpoints, rather than refusing every restart: a test
+    // driving its own mock bridge on a private socket/port is legitimate.
+    let (socket_path, http_url) = if is_test_isolated() {
+        let global_socket = socket_path.is_some_and(|p| p == GLOBAL_SOCKET_PATH);
+        let global_http = http_url.is_some_and(is_global_bridge_url);
+        if global_socket || global_http {
+            tracing::warn!(
+                "Test-isolated process may not restart the shared bridge; ignoring \
+                 global endpoints (socket={socket_path:?}, http={http_url:?})"
+            );
+        }
+        (
+            socket_path.filter(|_| !global_socket),
+            http_url.filter(|_| !global_http),
+        )
+    } else {
+        (socket_path, http_url)
+    };
+
     #[cfg(unix)]
     if let Some(path) = socket_path
         && trigger_uds_restart(path).await
@@ -898,10 +933,50 @@ async fn spawn_background_bridge(
     Ok(())
 }
 
+/// The machine-global bridge socket.
+///
+/// It is a well-known singleton *by design*: several MCP clients share one bridge
+/// daemon. That sharing is exactly why a test must never resolve it — see
+/// [`is_test_isolated`] and [`default_socket_path`].
+pub const GLOBAL_SOCKET_PATH: &str = "/tmp/ahma.sock";
+
+/// True when this process is running under the test harness.
+///
+/// `cfg!(test)` covers this crate's own unit tests; the `AHMA_TEST_ISOLATION`
+/// internal plumbing variable covers the ahma binaries that integration tests
+/// *spawn* (set only by `test_utils::cli::test_command`), which `cfg!(test)`
+/// cannot see because they are ordinary release/debug binaries.
+///
+/// A test-isolated process must never touch the machine-global endpoints: it gets
+/// a private socket path, it never probes the running bridge's version, and it is
+/// refused a bridge restart.
+pub fn is_test_isolated() -> bool {
+    cfg!(test) || std::env::var_os("AHMA_TEST_ISOLATION").is_some()
+}
+
+/// Bridge socket to use when no explicit path is configured.
+///
+/// Under test isolation this is a per-process private path, so a test can never
+/// reach — much less restart — a bridge it does not own.
+fn default_socket_path() -> String {
+    if is_test_isolated() {
+        return std::env::temp_dir()
+            .join(format!("ahma-test-{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+    }
+    GLOBAL_SOCKET_PATH.to_string()
+}
+
 /// Returns true when the process is running as a server-child subprocess.
 /// In this mode we skip the background bridge spawn and run the service directly.
 /// Detection is via the `--server-child` CLI flag or the `AHMA_SERVER_CHILD`
 /// internal plumbing variable (set only by the parent ahma process).
+///
+/// Deliberately does NOT consider test isolation: this flag also disarms the
+/// parent-death watchdog, and a test-spawned server must keep that watchdog
+/// armed so it cannot outlive the test process. Test isolation is applied to the
+/// version check separately — see [`is_test_isolated`].
 fn is_test_or_server_child(config: &AppConfig) -> bool {
     std::env::var("AHMA_SERVER_CHILD").is_ok() || config.is_server_child
 }
@@ -913,7 +988,7 @@ fn resolve_bridge_endpoints(config: &AppConfig) -> (String, String) {
     // settings.toml instead. The value comes from AppConfig.unix_socket_path which
     // was already resolved at startup.
     let socket_path = if config.unix_socket_path.is_empty() {
-        "/tmp/ahma.sock".to_string()
+        default_socket_path()
     } else {
         config.unix_socket_path.clone()
     };
@@ -941,7 +1016,14 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     };
     let http_url_opt = Some(http_url.as_str());
 
-    if let Some(()) = handle_version_checks(&config, is_test, socket_path_opt, http_url_opt).await?
+    // A test-isolated process gets a private socket, but the HTTP endpoint still
+    // defaults to 127.0.0.1:3000 — a real bridge may be listening there. Skipping
+    // the version probe entirely keeps a test from ever judging (and restarting) a
+    // bridge it does not own.
+    let skip_version_check = is_test || is_test_isolated();
+
+    if let Some(()) =
+        handle_version_checks(&config, skip_version_check, socket_path_opt, http_url_opt).await?
     {
         return Ok(());
     }
@@ -1449,8 +1531,14 @@ mod tests {
     // resolve_bridge_endpoints
     // ------------------------------------------------------------------
 
+    /// A test process must NEVER resolve the machine-global bridge socket.
+    ///
+    /// Regression: a test-spawned ahma inherited `/tmp/ahma.sock`, saw a different
+    /// `BUILD_ID` on the bridge that owned it, concluded the bridge was stale, and
+    /// POSTed `/restart` — killing the developer's live MCP server (and, since the
+    /// socket is shared by design, whatever other application was using it too).
     #[test]
-    fn test_resolve_bridge_endpoints_default_socket() {
+    fn resolve_bridge_endpoints_never_returns_the_global_socket_under_test() {
         let cfg = AppConfig {
             unix_socket_path: String::new(),
             http_host: "127.0.0.1".to_string(),
@@ -1458,8 +1546,74 @@ mod tests {
             ..base_cfg()
         };
         let (socket, url) = resolve_bridge_endpoints(&cfg);
-        assert_eq!(socket, "/tmp/ahma.sock");
+
+        assert!(
+            is_test_isolated(),
+            "precondition: unit tests are test-isolated"
+        );
+        assert_ne!(
+            socket, GLOBAL_SOCKET_PATH,
+            "a test must not resolve the shared bridge socket"
+        );
+        assert!(
+            socket.contains(&format!("ahma-test-{}", std::process::id())),
+            "expected a per-process private socket, got {socket}"
+        );
         assert_eq!(url, "http://127.0.0.1:3000");
+    }
+
+    /// Defence in depth: even if a test somehow resolves the shared endpoints, it
+    /// is refused the ability to shut that bridge down.
+    #[tokio::test]
+    async fn trigger_bridge_restart_refuses_the_global_endpoints_under_test_isolation() {
+        assert!(
+            !trigger_bridge_restart(
+                Some(GLOBAL_SOCKET_PATH),
+                Some(&format!("http://127.0.0.1:{GLOBAL_HTTP_PORT}"))
+            )
+            .await,
+            "a test must never restart the shared bridge"
+        );
+    }
+
+    /// ...but a test driving its OWN mock bridge on a private port is legitimate,
+    /// so the guard must not be a blanket refusal.
+    #[test]
+    fn only_the_shared_bridge_port_counts_as_global() {
+        assert!(is_global_bridge_url("http://127.0.0.1:3000"));
+        assert!(is_global_bridge_url("http://127.0.0.1:3000/"));
+        assert!(
+            !is_global_bridge_url("http://127.0.0.1:54321"),
+            "a mock bridge on a random port is the test's own, not the shared one"
+        );
+    }
+
+    /// An explicit path still wins — tests that drive their own bridge are unaffected.
+    #[test]
+    fn resolve_bridge_endpoints_explicit_path_still_wins_under_isolation() {
+        let cfg = AppConfig {
+            unix_socket_path: "/run/custom/explicit.sock".to_string(),
+            ..base_cfg()
+        };
+        let (socket, _) = resolve_bridge_endpoints(&cfg);
+        assert_eq!(socket, "/run/custom/explicit.sock");
+    }
+
+    /// Test isolation must NOT imply server-child.
+    ///
+    /// `is_test_or_server_child` also disarms the parent-death watchdog, which is
+    /// what stops a spawned `ahma serve` from outliving the process that started
+    /// it. A test-spawned server must keep that watchdog armed, or CI accumulates
+    /// orphans. Isolation is applied to the version check instead.
+    #[test]
+    fn test_isolation_does_not_disarm_the_parent_death_watchdog() {
+        let cfg = base_cfg();
+        assert!(is_test_isolated(), "precondition: unit tests are isolated");
+        assert!(
+            !is_test_or_server_child(&cfg),
+            "isolation must not be mistaken for server-child: that would disarm \
+             the parent-death watchdog and leak orphaned test servers"
+        );
     }
 
     #[test]

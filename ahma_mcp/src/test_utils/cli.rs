@@ -14,6 +14,30 @@ use std::time::SystemTime;
 /// serialisation is handled by [`FsLock`] below.
 static BINARY_CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
 
+/// Set once, in the *test process itself*, so that every ahma binary the test
+/// spawns inherits it — however it is spawned.
+///
+/// Marking only [`test_command`] is not enough: 17 integration tests build their
+/// own `Command`, and any new test may do the same. But all of them must first
+/// call [`build_binary_cached`] to locate the binary, and a child process
+/// inherits its parent's environment — so setting the marker here covers every
+/// spawn path, present and future, without touching a single test.
+///
+/// Why it matters: an unmarked test-spawned ahma resolves the machine-global
+/// bridge socket, sees a different `BUILD_ID` (it was just rebuilt), concludes
+/// the running bridge is stale, and POSTs `/restart` — killing the developer's
+/// live MCP server, and any other application sharing that socket.
+static TEST_ISOLATION_MARKER: std::sync::Once = std::sync::Once::new();
+
+fn mark_process_test_isolated() {
+    TEST_ISOLATION_MARKER.call_once(|| {
+        // SAFETY: run exactly once, before this process spawns any ahma binary.
+        // nextest gives each test binary its own process, so the write is not
+        // visible to — and cannot race with — any other test process.
+        unsafe { std::env::set_var("AHMA_TEST_ISOLATION", "1") };
+    });
+}
+
 /// Newest mtime among workspace source files (`*.rs`, `Cargo.toml`, `Cargo.lock`),
 /// computed once per process. Used to decide whether a spawned binary is stale.
 static NEWEST_SOURCE_MTIME: OnceLock<Option<SystemTime>> = OnceLock::new();
@@ -166,6 +190,8 @@ pub fn get_binary_path(_package: &str, binary: &str) -> PathBuf {
 ///    when the `FsLock` drops or the process exits for any reason — including
 ///    panic, `SIGKILL`, or crash.  No stale locks, no manual cleanup.
 pub fn build_binary_cached(package: &str, binary: &str) -> PathBuf {
+    mark_process_test_isolated();
+
     let cache = BINARY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = format!("{}:{}", package, binary);
     let binary_path = get_binary_path(package, binary);
@@ -261,15 +287,48 @@ pub fn build_binary_cached(package: &str, binary: &str) -> PathBuf {
 /// Create a command for a binary with test mode enabled (bypasses sandbox checks).
 /// Disables the sandbox and skips probes via environment variables.
 /// The caller must add the appropriate subcommand (e.g., `serve stdio`, `run`, `tool list`).
+///
+/// `AHMA_TEST_ISOLATION` marks the spawned binary as test-owned. Without it the
+/// child resolves the machine-global bridge endpoint (`/tmp/ahma.sock`), and —
+/// because a freshly built test binary carries a different `BUILD_ID` — decides
+/// the running bridge is stale and restarts it. That bridge is the developer's
+/// live MCP server (or another application's), so a test run would tear down a
+/// session it has nothing to do with. `cfg!(test)` cannot cover this: the child
+/// is an ordinary binary, not a test harness.
 pub fn test_command(binary: &Path) -> Command {
     let mut cmd = Command::new(binary);
     cmd.args(["--no-sandbox", "--skip-probes"]);
+    cmd.env("AHMA_TEST_ISOLATION", "1");
     cmd
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Locating the binary must mark the process test-isolated, because a child
+    /// inherits its parent's environment. This is what protects the ~17 tests
+    /// that spawn ahma with a raw `Command::new` instead of [`test_command`] —
+    /// without it, they restart the developer's live bridge.
+    #[test]
+    fn build_binary_cached_marks_the_process_test_isolated() {
+        mark_process_test_isolated();
+        assert_eq!(
+            std::env::var("AHMA_TEST_ISOLATION").ok().as_deref(),
+            Some("1"),
+            "the marker must be set in the test process so every spawned ahma inherits it"
+        );
+    }
+
+    /// The harness-built command carries the marker explicitly too (belt and braces).
+    #[test]
+    fn test_command_carries_the_isolation_marker() {
+        let cmd = test_command(Path::new("/nonexistent/ahma"));
+        let marked = cmd
+            .get_envs()
+            .any(|(k, v)| k == "AHMA_TEST_ISOLATION" && v == Some("1".as_ref()));
+        assert!(marked, "test_command must mark the child as test-isolated");
+    }
 
     #[test]
     fn stale_reason_missing_binary() {

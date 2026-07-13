@@ -119,7 +119,7 @@ pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result
         let socket_path_opt = if cfg!(unix) && !cfg.unix_socket_path.is_empty() {
             Some(cfg.unix_socket_path.as_str())
         } else if cfg!(unix) {
-            Some("/tmp/ahma.sock")
+            Some(crate::shell::modes::server::GLOBAL_SOCKET_PATH)
         } else {
             None
         };
