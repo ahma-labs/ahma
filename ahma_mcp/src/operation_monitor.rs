@@ -440,6 +440,28 @@ impl OperationMonitor {
     /// persisting anything to operation state.  Used for heartbeat messages
     /// ("still running") and wait notices that are useful live but not worth
     /// storing.
+    /// The configured idle-output limit, if the watchdog is enabled.
+    ///
+    /// Exposed so the streaming loop can schedule its CPU liveness probe *inside*
+    /// that budget: probing later than the limit would let the watchdog fire before
+    /// a single sample was taken.
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.config.idle_timeout
+    }
+
+    /// Proof of life that is *not* output: the operation's process tree consumed
+    /// CPU since the last sample, so it is working — just quietly.
+    ///
+    /// Resets the idle-output watchdog clock exactly as a line of output does.
+    /// Without this, any command whose output is buffered (`… | tail`) or simply
+    /// slow to speak (a long compile) is killed for "stalling" while it is busy.
+    pub async fn note_liveness(&self, id: &str) {
+        let mut ops = self.operations.write().await;
+        if let Some(op) = ops.get_mut(id) {
+            op.last_activity = SystemTime::now();
+        }
+    }
+
     pub fn note_progress(&self, id: &str, message: String) {
         self.events.emit(OperationEvent::Progress {
             operation_id: id.to_string(),
@@ -568,13 +590,21 @@ impl OperationMonitor {
                         );
                         return Some((op.id.clone(), reason));
                     }
-                    // Idle-output watchdog: silent for longer than allowed ⇒ stalled.
+                    // Idle watchdog. `last_activity` advances on output *and* on
+                    // proof of life from the process tree's CPU (see
+                    // `note_liveness`), so reaching here means the operation has
+                    // been both silent and idle — not merely quiet.
+                    //
+                    // The reason states what was observed and does not assert a
+                    // cause: the previous wording ("likely wedged on a lock or a
+                    // denied write") was a confident guess that sent debugging in
+                    // the wrong direction when the real culprit was a buffered pipe.
                     if let Some(idle_limit) = self.config.idle_timeout {
                         let idle = now.duration_since(op.last_activity).ok()?;
                         if idle > idle_limit {
                             let reason = format!(
-                                "Operation stalled: no output for {:.1}s (idle limit: {:.1}s) — \
-                                 likely wedged on a lock or a denied write",
+                                "Operation stalled: no output and no CPU activity for {:.1}s \
+                                 (idle limit: {:.1}s)",
                                 idle.as_secs_f64(),
                                 idle_limit.as_secs_f64()
                             );
@@ -1412,6 +1442,64 @@ mod tests {
         assert!(
             reason.contains("stalled") && reason.contains("no output"),
             "reason should name the idle watchdog, got: {reason}"
+        );
+    }
+
+    /// Regression: a silent operation whose process tree is still burning CPU must
+    /// NOT be killed.
+    ///
+    /// The watchdog used to treat "no output" as "no progress" and SIGKILLed a
+    /// healthy `cargo nextest run 2>&1 | tail -25` at exactly 300s — `tail` buffers
+    /// everything until EOF, so ahma saw zero bytes and declared it wedged. CPU
+    /// activity (reported via `note_liveness`) is proof of life and resets the
+    /// same clock that output does.
+    #[tokio::test]
+    async fn cpu_activity_keeps_a_silent_operation_alive() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(
+            MonitorConfig::with_timeout(Duration::from_secs(3600))
+                .with_idle_timeout(Some(Duration::from_millis(50))),
+        );
+        // Silent for far longer than the idle limit — this is the exact shape of the
+        // operation the watchdog used to kill.
+        add_backdated_op(&monitor, "silent_but_busy", Duration::from_secs(10), None).await;
+
+        // The process tree consumed CPU: it is working, just not talking.
+        monitor.note_liveness("silent_but_busy").await;
+        monitor.check_timeouts().await;
+
+        assert!(
+            monitor.get_operation("silent_but_busy").await.is_some(),
+            "a silent operation that is still burning CPU must survive the idle watchdog"
+        );
+    }
+
+    /// The watchdog must still reap a tree that is genuinely wedged: silent AND
+    /// consuming no CPU (blocked on a lock, a denied write, a dead socket).
+    #[tokio::test]
+    async fn silent_and_cpu_idle_operation_is_still_reaped() {
+        init_test_logging();
+        let monitor = OperationMonitor::new(
+            MonitorConfig::with_timeout(Duration::from_secs(3600))
+                .with_idle_timeout(Some(Duration::from_millis(50))),
+        );
+        add_backdated_op(&monitor, "wedged", Duration::from_secs(10), None).await;
+
+        // No note_liveness(): the tree burned no CPU either.
+        monitor.check_timeouts().await;
+
+        let completed = monitor.get_completed_operations().await;
+        let op = completed
+            .iter()
+            .find(|o| o.id == "wedged")
+            .expect("a genuinely wedged op must still be timed out");
+        assert_eq!(op.state, OperationStatus::TimedOut);
+
+        let reason = op.result.as_ref().unwrap()["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("no CPU activity"),
+            "the reason must report what was observed (no output AND no CPU), \
+             not guess at a cause; got: {reason}"
         );
     }
 

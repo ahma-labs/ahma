@@ -19,6 +19,7 @@ pub mod operation;
 /// Dead-man's switch that terminates an orphaned frontend process when its
 /// spawning parent (e.g. an IDE) dies.
 pub mod parent_watchdog;
+pub mod process_cpu;
 /// Safe stdout notification delivery for the subprocess-to-bridge protocol.
 pub mod stdio;
 /// Redirection of standard output to standard error.

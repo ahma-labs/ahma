@@ -84,6 +84,26 @@ fn generate_id(tool_name: &str, command: &str) -> String {
 const MAX_STREAM_COLLECTED_LINES: usize = 5_000;
 const MAX_STREAM_COLLECTED_BYTES: usize = 1_000_000;
 
+/// Upper bound on how long an operation must be output-silent before we start
+/// sampling its process tree's CPU time.
+///
+/// The effective threshold is `min(this, idle_limit / 3)` — see
+/// [`cpu_probe_threshold`]. A fixed value would be a latent bug: with an idle
+/// limit shorter than the threshold, the watchdog would fire before a single
+/// sample was ever taken, and silent-but-working operations would be killed
+/// exactly as before.
+const CPU_LIVENESS_PROBE_AFTER: Duration = Duration::from_secs(30);
+
+/// How long to let an operation stay silent before probing its CPU.
+///
+/// `None` when the idle watchdog is disabled: nothing can kill a quiet operation,
+/// so there is no reason to pay for a process scan.
+fn cpu_probe_threshold(idle_limit: Option<Duration>) -> Option<Duration> {
+    // A third of the budget leaves room for at least two samples (a rise needs
+    // two) before the watchdog is entitled to fire.
+    idle_limit.map(|limit| (limit / 3).min(CPU_LIVENESS_PROBE_AFTER))
+}
+
 #[derive(Debug, Default)]
 struct BoundedLineCollector {
     lines: VecDeque<String>,
@@ -1357,6 +1377,18 @@ async fn execute_with_streaming(
     still_running_interval.tick().await;
     let mut elapsed_secs = 0;
 
+    // ── Liveness watchdog input ──────────────────────────────────────────────
+    // The idle watchdog kills an operation that has produced no output for
+    // `idle_timeout`. Silence is not a stall: `… | tail` buffers everything until
+    // EOF, a compile can be quiet for minutes. So once an operation has gone
+    // quiet we ask whether its process *tree* is still burning CPU, and treat
+    // that as proof of life. Sampling is deferred until the operation is actually
+    // silent, so a chatty command never pays for it.
+    let child_pid = child.id();
+    let mut last_output_at = tokio::time::Instant::now();
+    let mut last_cpu_ms: Option<u64> = None;
+    let cpu_probe_after = cpu_probe_threshold(op_monitor.idle_timeout());
+
     loop {
         tokio::select! {
             // Bias stderr to prioritize error-related output
@@ -1390,15 +1422,40 @@ async fn execute_with_streaming(
                 let elapsed_msg = format!("still running ({}s elapsed)", elapsed_secs);
                 tracing::info!("Operation {}: {}", op_id, elapsed_msg);
                 op_monitor.note_progress(op_id, elapsed_msg);
+
+                // Silent for a while? Ask whether the process tree is still working
+                // before the idle watchdog is allowed to call it wedged.
+                if let Some(probe_after) = cpu_probe_after
+                    && last_output_at.elapsed() >= probe_after
+                    && let Some(pid) = child_pid
+                    && let Some(cpu_ms) = crate::utils::process_cpu::process_tree_cpu_ms(pid)
+                {
+                    // Only a *rise* counts. A tree pinned on a lock or a denied write
+                    // holds its CPU total flat, and must still be reaped.
+                    if last_cpu_ms.is_some_and(|prev| cpu_ms > prev) {
+                        tracing::debug!(
+                            "Operation {}: silent for {}s but its process tree consumed CPU \
+                             ({}ms -> {}ms) — still working, not stalled",
+                            op_id,
+                            last_output_at.elapsed().as_secs(),
+                            last_cpu_ms.unwrap_or(0),
+                            cpu_ms
+                        );
+                        op_monitor.note_liveness(op_id).await;
+                    }
+                    last_cpu_ms = Some(cpu_ms);
+                }
             }
 
             // Read stderr line
             result = stderr_reader.next_line() => {
+                last_output_at = tokio::time::Instant::now();
                 handle_stream_line(result, true, &mut collected_stderr, &mut log_monitor, op_id, op_monitor, output_optimizer, &mut spill).await;
             }
 
             // Read stdout line
             result = stdout_reader.next_line() => {
+                last_output_at = tokio::time::Instant::now();
                 handle_stream_line(result, false, &mut collected_stdout, &mut log_monitor, op_id, op_monitor, output_optimizer, &mut spill).await;
             }
         }
@@ -1715,6 +1772,36 @@ async fn process_streaming_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CPU liveness probe must always fire *inside* the idle budget.
+    ///
+    /// A fixed 30s threshold would be a latent re-introduction of the very bug this
+    /// guards against: configure a shorter idle limit and the watchdog fires before
+    /// the first sample is ever taken, so a silent-but-working operation is killed
+    /// exactly as before. Scaling with the limit keeps at least two samples (a rise
+    /// needs two) inside the budget.
+    #[test]
+    fn cpu_probe_always_fits_inside_the_idle_budget() {
+        // Production default: 300s limit → probe at the 30s cap, not 100s.
+        assert_eq!(
+            cpu_probe_threshold(Some(Duration::from_secs(300))),
+            Some(Duration::from_secs(30))
+        );
+
+        // Short limits must scale DOWN, or the watchdog wins the race.
+        for limit_secs in [1u64, 5, 15, 60] {
+            let limit = Duration::from_secs(limit_secs);
+            let probe = cpu_probe_threshold(Some(limit)).expect("watchdog enabled");
+            assert!(
+                probe < limit,
+                "probe ({probe:?}) must fire before the idle limit ({limit:?}) or a \
+                 silent-but-busy operation is killed before it is ever sampled"
+            );
+        }
+
+        // Watchdog disabled: nothing can kill a quiet op, so never pay for a scan.
+        assert_eq!(cpu_probe_threshold(None), None);
+    }
 
     /// Regression: a timed-out/cancelled command must take down its whole process
     /// group, not just the direct child. Spawn `sh` (direct child) as a
