@@ -16,6 +16,7 @@ pub mod app;
 pub mod connection;
 pub mod daemon_source;
 pub mod keymap;
+pub mod liveness;
 pub mod llm_bridge;
 pub mod mcp_connections;
 pub mod mcp_source;

@@ -1175,6 +1175,7 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
         collapsed: false,
         finished_at: None,
         duration_ms: None,
+        last_output_at: None,
         is_cli: true,
         command: cmd_str.clone(),
         working_dir: working_dir.clone(),
@@ -3245,6 +3246,7 @@ fn handle_decomposed_event(
             collapsed: false,
             finished_at: None,
             duration_ms: None,
+            last_output_at: None,
             is_cli,
             command,
             working_dir: state.workspace.clone(),
@@ -3386,17 +3388,22 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
     use crate::llm_bridge::BridgeEvent;
     use crate::state::ChatEntry;
 
-    // Any server signal that the turn is alive and more is coming re-randomises
-    // the liveness glyph in front of the `ahma` response line. Done/Error/ToolCall clear
-    // it back to a space below.
+    // Any server signal that the turn is alive and more is coming advances the
+    // liveness panel in front of the `ahma` response line; the panel's motion
+    // direction follows the turn state (thinking shimmers, streaming rains,
+    // tool dispatch scrolls right). Done/Error clear it back to blanks below.
     match &event {
         BridgeEvent::Token(_) => state.mark_stream_activity(crate::state::LivenessState::Streaming),
         BridgeEvent::Thinking(_) => {
             state.mark_stream_activity(crate::state::LivenessState::Thinking)
         }
         BridgeEvent::Usage(_) => state.mark_stream_activity(state.liveness_state),
-        BridgeEvent::ToolCallStarted { .. } | BridgeEvent::ToolCallFinished { .. } => {
-            state.reset_liveness()
+        BridgeEvent::ToolCallStarted { .. } => {
+            state.mark_stream_activity(crate::state::LivenessState::ToolWait)
+        }
+        BridgeEvent::ToolCallFinished { .. } => {
+            // The result is back; the model resumes processing it.
+            state.mark_stream_activity(crate::state::LivenessState::Thinking)
         }
         _ => {}
     }
@@ -3685,6 +3692,7 @@ fn update_existing_window(
     w.label = window_label_for(op, multi_instance);
     w.command = op.command.clone().unwrap_or_else(|| op.display_name());
     w.duration_ms = op.duration_ms;
+    w.last_output_at = op.last_output_at;
     w.content = window_content_for(op, unicode);
 }
 
@@ -3735,6 +3743,7 @@ fn build_new_window(
             None
         },
         duration_ms: op.duration_ms,
+        last_output_at: op.last_output_at,
         is_cli: true,
         command: op.command.clone().unwrap_or_else(|| op.display_name()),
         working_dir: op.cwd.clone().unwrap_or_else(|| state.workspace.clone()),
@@ -3816,6 +3825,12 @@ fn handle_event_log_lines_updated(
     state: &mut crate::state::AppState,
 ) {
     if Some(&file) == state.active_log_file.as_ref() {
+        // The cumulative counter drives the log title's rain panel: each
+        // arriving line advances the animation one frame, so pour rate shows
+        // arrival rate.
+        state.log_lines_total = state
+            .log_lines_total
+            .wrapping_add(content.lines().count() as u64);
         if append {
             for line in content.lines() {
                 state.active_log_lines.push(line.to_string());
@@ -3951,12 +3966,12 @@ fn handle_source_event(event: crate::mcp_source::SourceEvent, state: &mut crate:
             state.mark_stream_activity(state.liveness_state);
         }
         SourceEvent::ToolCallStarted { id, name, args } => {
-            state.reset_liveness();
+            state.mark_stream_activity(crate::state::LivenessState::ToolWait);
             state.chat.start_tool_call(id, name, args);
             state.chat_scroll = 0;
         }
         SourceEvent::ToolCallFinished { id, result, failed } => {
-            state.reset_liveness();
+            state.mark_stream_activity(crate::state::LivenessState::Thinking);
             state.chat.finish_tool_call(&id, result, failed);
             state.chat_scroll = 0;
         }
@@ -3997,6 +4012,7 @@ fn handle_operation_output(
             op.stdout_tail.pop_front();
         }
         op.stdout_tail.push_back(line);
+        op.last_output_at = Some(std::time::Instant::now());
     }
 
     let op = state.operations[idx].clone();
@@ -4806,6 +4822,7 @@ mod tests {
             collapsed: true,
             finished_at: None,
             duration_ms: None,
+            last_output_at: None,
             is_cli: true,
             command: "echo test".to_string(),
             working_dir: state.workspace.clone(),
@@ -5260,6 +5277,7 @@ mod tests {
             collapsed: false,
             finished_at: None,
             duration_ms: None,
+            last_output_at: None,
             is_cli: true,
             command: "pwd".to_string(),
             working_dir: state.workspace.clone(),

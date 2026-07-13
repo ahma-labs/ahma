@@ -33,13 +33,30 @@ pub enum Mode {
 
 // ─── Liveness State Machine ───────────────────────────────────────────────────
 
-/// State of the turn's streaming liveness indicator.
+/// State of the turn's streaming liveness indicator. Each state maps to a
+/// directional panel pattern (see [`crate::liveness`]): thinking shimmers
+/// (nondeterministic exploration), streaming rains (the answer pouring down),
+/// a dispatched tool call scrolls right (data flowing out to the tool).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LivenessState {
     #[default]
     Idle,
     Thinking,
     Streaming,
+    /// A tool call is dispatched and the turn is waiting on its result.
+    ToolWait,
+}
+
+impl LivenessState {
+    /// The panel pattern this state animates with.
+    pub fn pattern(self) -> crate::liveness::PanelPattern {
+        use crate::liveness::PanelPattern;
+        match self {
+            Self::Streaming => PanelPattern::Rain,
+            Self::ToolWait => PanelPattern::ScrollRight,
+            Self::Idle | Self::Thinking => PanelPattern::Shimmer,
+        }
+    }
 }
 
 // ─── Chat history ─────────────────────────────────────────────────────────────
@@ -741,6 +758,9 @@ pub struct Operation {
     pub origin: Option<String>,
     /// Process exit code, when the runner reported one.
     pub exit_code: Option<i64>,
+    /// When the most recent live output line arrived (set locally, not from
+    /// the wire). Drives the fast-vs-slow cadence of the card's activity panel.
+    pub last_output_at: Option<Instant>,
 }
 
 /// Strategy 1: pull `command` out of an embedded JSON blob in the description.
@@ -815,6 +835,7 @@ impl Operation {
             command: None,
             origin: None,
             exit_code: None,
+            last_output_at: None,
         }
     }
 
@@ -1246,6 +1267,9 @@ pub struct TuiWindow {
     /// one-line summary. `None` while running or when the runner did not
     /// report one.
     pub duration_ms: Option<u64>,
+    /// Mirrors the backing operation's `last_output_at` — the card's activity
+    /// panel animates fast while output is arriving, slow when quiet.
+    pub last_output_at: Option<std::time::Instant>,
     pub is_cli: bool,
     pub command: String,
     pub working_dir: String,
@@ -1280,20 +1304,6 @@ fn liveness_initial_seed() -> u64 {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     nanos | 1
-}
-
-/// Map an xorshift state to a "liveness light" glyph. In unicode mode this is a
-/// random non-blank cell from the Braille Patterns block (U+2801..=U+28FF) so it
-/// reads as a shifting cluster of dots; otherwise a rotating ASCII spinner char.
-fn liveness_char(state: u64, unicode: bool) -> char {
-    if unicode {
-        // 0x2800 is the all-dots-off (blank) cell; skip it so the glyph is always visible.
-        let offset = (state % 255) as u32 + 1;
-        char::from_u32(0x2800 + offset).unwrap_or('⠿')
-    } else {
-        const ASCII: [char; 4] = ['|', '/', '-', '\\'];
-        ASCII[(state % ASCII.len() as u64) as usize]
-    }
 }
 
 /// Top-level application state — owns all panel data and UI mode.
@@ -1460,6 +1470,9 @@ pub struct AppState {
     /// Which pane is maximised to the full screen, if any (`z` toggles the
     /// focused pane; Esc restores). Replaces the old log-only zoom flag.
     pub zoomed: Option<Focus>,
+    /// Cumulative count of log lines received — the frame counter for the log
+    /// title's rain panel (fast when lines pour in, still when quiet).
+    pub log_lines_total: u64,
     #[cfg(feature = "tui")]
     pub click_targets: std::cell::RefCell<Vec<(ClickTarget, Rect)>>,
     #[cfg(not(feature = "tui"))]
@@ -1482,8 +1495,12 @@ pub struct AppState {
     /// the turn is complete.
     pub liveness_glyph: String,
     pub liveness_state: LivenessState,
-    /// xorshift64 state driving the random liveness glyph. Never zero.
+    /// Seed personalising the panel's dot pattern; fixed per session.
     pub liveness_seed: u64,
+    /// Frame counter for the directional panel. Advancing it one step moves
+    /// the dots one cell along the current pattern's direction — fast on real
+    /// stream events, slow on the waiting heartbeat.
+    pub liveness_frame: u64,
     /// When the last visible stream signal (token/thinking/tool/usage) arrived.
     /// Drives the fast-vs-slow spinner cadence. `None` until the first signal.
     pub last_stream_activity: Option<std::time::Instant>,
@@ -1547,22 +1564,17 @@ impl AppState {
         self.modal.is_open()
     }
 
-    /// Re-randomise the two-cell liveness glyph from the xorshift generator.
+    /// Advance the panel one frame along the current state's pattern.
     /// Low-level; prefer [`Self::mark_stream_activity`] (fast pulse on real
     /// output) or [`Self::tick_waiting_spinner`] (slow pulse while waiting).
     pub fn bump_liveness(&mut self) {
-        // xorshift64 — cheap, dependency-free, and seeded away from zero. Draw
-        // two cells so the indicator is wider and its motion is easier to see.
-        let mut x = self.liveness_seed;
-        let mut glyph = String::with_capacity(8);
-        for _ in 0..2 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            glyph.push(liveness_char(x, self.unicode));
-        }
-        self.liveness_seed = x;
-        self.liveness_glyph = glyph;
+        self.liveness_frame = self.liveness_frame.wrapping_add(1);
+        self.liveness_glyph = crate::liveness::panel_glyphs(
+            self.liveness_seed,
+            self.liveness_frame,
+            self.liveness_state.pattern(),
+            self.unicode,
+        );
     }
 
     /// Record real server output (token/thinking/tool/usage) and pulse the
@@ -1872,6 +1884,7 @@ impl AppState {
             active_log_lines: vec![],
             log_wrap_enabled: false,
             zoomed: None,
+            log_lines_total: 0,
             #[cfg(feature = "tui")]
             click_targets: std::cell::RefCell::new(vec![]),
             #[cfg(not(feature = "tui"))]
@@ -1891,6 +1904,7 @@ impl AppState {
             liveness_glyph: "  ".to_string(),
             liveness_state: LivenessState::Idle,
             liveness_seed: liveness_initial_seed(),
+            liveness_frame: 0,
             last_stream_activity: None,
             last_wait_tick: None,
             unicode,
@@ -2139,6 +2153,8 @@ impl AppState {
             self.log.pop_front();
         }
         self.log.push_back(entry);
+        // Advances the log title's rain panel one frame per line.
+        self.log_lines_total = self.log_lines_total.wrapping_add(1);
         // New-line auto-scroll is handled by `log_follow`: when following, the
         // log pane renders pinned to the bottom (see `draw_log`), so there is no
         // scroll offset to nudge here. The previous heuristic adjusted
@@ -2349,6 +2365,9 @@ impl AppState {
             && let Some(existing) = self.operations.iter_mut().find(|o| o.id == id)
         {
             let new_lines = Self::tail_suffix_to_append(&existing.stdout_tail, &pending);
+            if !new_lines.is_empty() {
+                existing.last_output_at = Some(Instant::now());
+            }
             for line in new_lines {
                 if existing.stdout_tail.len() >= STDOUT_TAIL_CAP {
                     existing.stdout_tail.pop_front();
@@ -2425,6 +2444,9 @@ impl AppState {
         // between the existing tail's suffix and the incoming tail's prefix,
         // then append only the genuinely new remainder.
         let new_lines = Self::tail_suffix_to_append(&existing.stdout_tail, &op.stdout_tail);
+        if !new_lines.is_empty() {
+            existing.last_output_at = Some(Instant::now());
+        }
         for line in new_lines {
             if existing.stdout_tail.len() >= STDOUT_TAIL_CAP {
                 existing.stdout_tail.pop_front();
@@ -2704,27 +2726,15 @@ mod tests {
         assert_eq!(count_wrapped_lines("one two three four five", 100), 1);
     }
 
+    /// The chat prefix pattern follows the turn state — the direction IS the
+    /// meaning (thinking shimmers, streaming rains, tool dispatch scrolls
+    /// right).
     #[test]
-    fn liveness_char_is_visible_braille_in_unicode_mode() {
-        // Every possible xorshift residue maps to a non-blank Braille cell.
-        for state in 0u64..512 {
-            let c = liveness_char(state, true);
-            let cp = c as u32;
-            assert!(
-                (0x2801..=0x28FF).contains(&cp),
-                "expected a non-blank braille cell, got U+{cp:04X}"
-            );
-        }
-    }
-
-    #[test]
-    fn liveness_char_is_ascii_spinner_without_unicode() {
-        for state in 0u64..16 {
-            assert!(matches!(
-                liveness_char(state, false),
-                '|' | '/' | '-' | '\\'
-            ));
-        }
+    fn liveness_state_maps_to_panel_pattern() {
+        use crate::liveness::PanelPattern;
+        assert_eq!(LivenessState::Thinking.pattern(), PanelPattern::Shimmer);
+        assert_eq!(LivenessState::Streaming.pattern(), PanelPattern::Rain);
+        assert_eq!(LivenessState::ToolWait.pattern(), PanelPattern::ScrollRight);
     }
 
     #[test]
@@ -3076,6 +3086,7 @@ mod tests {
             collapsed: false,
             finished_at: if finished { Some(Instant::now()) } else { None },
             duration_ms: None,
+            last_output_at: None,
             is_cli: true,
             command: String::new(),
             working_dir: String::new(),

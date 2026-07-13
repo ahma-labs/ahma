@@ -222,7 +222,7 @@ fn draw_collapsed_window(
     ];
     if w.status == crate::state::WindowStatus::Running {
         spans.push(Span::styled(
-            format!("[Running {}] ", get_running_spinner(theme.unicode)),
+            format!("[Running {}] ", window_running_panel(w, theme.unicode)),
             status_style,
         ));
         spans.push(Span::styled(w.label.clone(), theme.normal()));
@@ -264,20 +264,31 @@ fn draw_collapsed_window(
     frame.render_widget(para, area);
 }
 
+/// Milliseconds since the epoch — the clock that drives stateless panels.
 #[cfg(feature = "tui")]
-fn get_running_spinner(unicode: bool) -> &'static str {
-    let ms = std::time::SystemTime::now()
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
-    let f = (ms / 150) as usize;
-    if unicode {
-        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        frames[f % frames.len()]
-    } else {
-        let frames = ["-", "\\", "|", "/"];
-        frames[f % frames.len()]
-    }
+        .as_millis() as u64
+}
+
+/// Activity panel for a running card: dots stream right→left — output flowing
+/// in from the external process — fast while output is actually arriving,
+/// slow heartbeat when the process is alive but quiet. Seeded per window so
+/// concurrent cards animate independently.
+#[cfg(feature = "tui")]
+fn window_running_panel(w: &crate::state::TuiWindow, unicode: bool) -> String {
+    let active = w
+        .last_output_at
+        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2));
+    let frame = wall_ms() / if active { 150 } else { 700 };
+    crate::liveness::panel_glyphs(
+        w.id as u64 + 1,
+        frame,
+        crate::liveness::PanelPattern::ScrollLeft,
+        unicode,
+    )
 }
 
 #[cfg(feature = "tui")]
@@ -286,7 +297,7 @@ fn build_window_title(w: &crate::state::TuiWindow, width: u16, unicode: bool) ->
     let title_space = (width as usize).saturating_sub(border_width);
 
     let status_str = if w.status == crate::state::WindowStatus::Running {
-        format!("[Running {}]", get_running_spinner(unicode))
+        format!("[Running {}]", window_running_panel(w, unicode))
     } else {
         format!("[{}]", w.status)
     };
@@ -2363,6 +2374,25 @@ fn build_instance_row(
             },
         ),
     ];
+    if counts.running > 0 {
+        // Aggregate activity: mixed directions (CrissCross) on the slow
+        // heartbeat — several things happening under this instance at once.
+        let seed = label
+            .bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+        spans.push(Span::styled(
+            format!(
+                " {}",
+                crate::liveness::panel_glyphs(
+                    seed,
+                    wall_ms() / 700,
+                    crate::liveness::PanelPattern::CrissCross,
+                    unicode,
+                )
+            ),
+            theme.running(),
+        ));
+    }
     if !detail.is_empty() {
         spans.push(Span::styled(format!("  {detail}"), theme.dim()));
     }
@@ -3046,10 +3076,27 @@ fn build_log_title(state: &AppState) -> String {
     } else {
         "Off"
     };
+    // While tail-following, a rain panel pours at the rate log lines arrive
+    // (each line advances one frame; a slow clock term keeps it barely alive
+    // when quiet). Detached follow = frozen panel.
+    let panel = if state.log_follow {
+        let frame = state.log_lines_total.wrapping_add(wall_ms() / 2000);
+        format!(
+            "{} ",
+            crate::liveness::panel_glyphs(
+                0x10C5,
+                frame,
+                crate::liveness::PanelPattern::Rain,
+                state.unicode,
+            )
+        )
+    } else {
+        String::new()
+    };
     let filter_indicator = log_filter_indicator(state);
     format!(
-        "{}{}[Wrap: {} | Zoom: {} | Press 'l' to switch] ",
-        log_title, filter_indicator, wrap_str, zoom_str
+        "{}{}{}[Wrap: {} | Zoom: {} | Press 'l' to switch] ",
+        panel, log_title, filter_indicator, wrap_str, zoom_str
     )
 }
 
@@ -4089,6 +4136,7 @@ mod tests {
             collapsed: false,
             finished_at: None,
             duration_ms: None,
+            last_output_at: None,
             is_cli: true,
             command: String::new(),
             working_dir: String::new(),
