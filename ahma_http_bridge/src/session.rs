@@ -642,6 +642,47 @@ fn take_pending_request(
 }
 
 /// Wait for a JSON-RPC response via a oneshot channel, or return immediately for notifications.
+/// How long a session's peer cleanup (killing the subprocess) may take before we
+/// give up on it and carry on.
+///
+/// The wait used to be unbounded. A subprocess that would not die therefore kept
+/// the bridge alive *forever*: it had already torn its sessions down, so it could
+/// no longer answer anything, but it never exited and never closed its clients'
+/// connections either. One such bridge sat "Shutting down bridge process..." for
+/// five and a half hours while its client waited in silence.
+const PEER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Answer every in-flight request on `pending` with a JSON-RPC error.
+///
+/// A client that has a request in flight must be *told* the session is gone.
+/// Dropping the response channels instead surfaces as "Response channel closed"
+/// — or, if the drop never happens, as unbounded silence, which is the worst
+/// failure mode there is: indistinguishable from a slow server.
+fn fail_pending_requests(
+    pending: &DashMap<String, oneshot::Sender<Value>>,
+    session_id: &str,
+    message: &str,
+) {
+    let ids: Vec<String> = pending.iter().map(|entry| entry.key().clone()).collect();
+    if ids.is_empty() {
+        return;
+    }
+    warn!(
+        session_id = %session_id,
+        pending_count = ids.len(),
+        "Session terminated with requests in flight — answering each with an error"
+    );
+    for id in ids {
+        if let Some(sender) = take_pending_request(pending, &id) {
+            let _ = sender.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32603, "message": message }
+            }));
+        }
+    }
+}
+
 async fn await_response(
     response_rx: Option<oneshot::Receiver<Value>>,
     timeout: Option<Duration>,
@@ -1224,12 +1265,41 @@ impl SessionManager {
             session.terminated.store(true, Ordering::SeqCst);
             *session.termination_reason.lock().await = Some(reason);
 
-            // Run peer-specific cleanup (e.g. kill the subprocess).
-            if let Some(shutdown_fn) = session.peer_shutdown.lock().await.take() {
-                shutdown_fn().await;
+            // Answer in-flight requests FIRST.
+            //
+            // This used to run *after* the peer shutdown below — and the peer
+            // shutdown could hang, so it was never reached. A client with a
+            // request in flight was then never told anything at all: no result,
+            // no error, no closed channel. It simply waited until its own idle
+            // timeout fired, tens of minutes later, with nothing to show for it.
+            //
+            // Nothing here can block, so a client always learns its request died.
+            fail_pending_requests(
+                &session.pending_requests,
+                session_id,
+                "Session terminated: the ahma bridge is shutting down or restarting",
+            );
+
+            // Run peer-specific cleanup (e.g. kill the subprocess) — BOUNDED.
+            //
+            // A subprocess that refuses to die must not be able to keep the bridge
+            // alive: a bridge that has torn down its sessions can no longer serve
+            // anyone, so staying up only strands its clients.
+            if let Some(shutdown_fn) = session.peer_shutdown.lock().await.take()
+                && tokio::time::timeout(PEER_SHUTDOWN_GRACE, shutdown_fn())
+                    .await
+                    .is_err()
+            {
+                warn!(
+                    session_id = %session_id,
+                    grace_secs = PEER_SHUTDOWN_GRACE.as_secs(),
+                    "Peer shutdown did not complete within the grace period; \
+                     abandoning it so termination can finish"
+                );
             }
 
-            // Clear pending requests
+            // Anything registered after the drain above (a request that raced the
+            // teardown) still gets its channel dropped rather than leaked.
             session.pending_requests.clear();
 
             // Transition state machine to Terminated
@@ -2468,6 +2538,74 @@ mod session_logic_tests {
         assert_eq!(mgr.session_count(), 2);
         mgr.terminate_all(SessionTerminationReason::ClientRequested)
             .await;
+        assert_eq!(mgr.session_count(), 0);
+    }
+
+    /// A client with a request in flight must be TOLD the session is gone.
+    ///
+    /// Regression: termination dropped the pending response channels instead of
+    /// answering them — and it did so *after* the peer shutdown, which could hang,
+    /// so in practice the client was told nothing at all and simply waited.
+    #[tokio::test]
+    async fn terminate_session_answers_in_flight_requests_with_an_error() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let session_id = mgr.create_session().await.unwrap();
+        let session = mgr.sessions.get(&session_id).unwrap().clone();
+
+        let rx = register_pending_request(&session.pending_requests, Some(&"7".to_string()))
+            .expect("a request is now in flight");
+
+        mgr.terminate_session(&session_id, SessionTerminationReason::ClientRequested)
+            .await
+            .unwrap();
+
+        let response = rx
+            .await
+            .expect("the in-flight request must receive a response, not a dropped channel");
+        assert_eq!(response["id"], "7");
+        assert_eq!(response["error"]["code"], -32603);
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("shutting down") || message.contains("restarting"),
+            "the error must say why the request died, got: {message}"
+        );
+    }
+
+    /// A peer that refuses to die must not strand the client.
+    ///
+    /// This is the exact shape of the real incident: the bridge announced
+    /// "Shutting down bridge process...", then blocked forever waiting for a
+    /// subprocess that never exited. It never finished terminating, never exited,
+    /// and never closed the client's connection — so the client heard nothing for
+    /// tens of minutes. `PEER_SHUTDOWN_GRACE` bounds that wait.
+    #[tokio::test(start_paused = true)]
+    async fn hanging_peer_shutdown_cannot_strand_an_in_flight_request() {
+        let mgr = SessionManager::new(test_config(None, 8));
+        let session_id = mgr.create_session().await.unwrap();
+        let session = mgr.sessions.get(&session_id).unwrap().clone();
+
+        // A peer whose shutdown never completes — the subprocess that would not die.
+        let hangs_forever: PeerShutdownFn =
+            Box::new(|| Box::pin(async { std::future::pending::<()>().await }));
+        *session.peer_shutdown.lock().await = Some(hangs_forever);
+
+        let rx = register_pending_request(&session.pending_requests, Some(&"9".to_string()))
+            .expect("a request is now in flight");
+
+        // Termination must COMPLETE despite the hung peer.
+        tokio::time::timeout(
+            PEER_SHUTDOWN_GRACE + Duration::from_secs(5),
+            mgr.terminate_session(&session_id, SessionTerminationReason::ClientRequested),
+        )
+        .await
+        .expect("termination must not hang on an unresponsive peer")
+        .unwrap();
+
+        // ...and the client must have been told, not left waiting.
+        let response = rx
+            .await
+            .expect("the in-flight request must be answered even when the peer hangs");
+        assert_eq!(response["error"]["code"], -32603);
         assert_eq!(mgr.session_count(), 0);
     }
 

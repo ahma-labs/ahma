@@ -66,5 +66,8 @@ futures.workspace = true
 reqwest = { workspace = true, features = ["json", "stream", "http2", "http3"] }
 serial_test = "3.5.0"
 tempfile.workspace = true
+# `test-util` provides `#[tokio::test(start_paused = true)]`, so a test can prove a
+# multi-second shutdown grace period elapses without actually waiting for it.
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 urlencoding = "2.1"

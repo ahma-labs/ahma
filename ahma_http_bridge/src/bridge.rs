@@ -1250,6 +1250,10 @@ async fn health_check() -> impl IntoResponse {
     )
 }
 
+/// Total budget for tearing every session down during a restart, after which the
+/// process exits regardless. See [`handle_restart`].
+const RESTART_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Handler for POST /restart
 async fn handle_restart(State(state): State<Arc<BridgeState>>) -> impl IntoResponse {
     info!("Restart requested. Shutting down bridge process...");
@@ -1257,9 +1261,29 @@ async fn handle_restart(State(state): State<Arc<BridgeState>>) -> impl IntoRespo
     let listener_kind = state.listener_kind.clone();
     let session_manager = state.session_manager.clone();
     tokio::spawn(async move {
-        session_manager
-            .terminate_all(crate::session::SessionTerminationReason::ClientRequested)
-            .await;
+        // Once we have said "shutting down", we MUST exit. A bridge that announces
+        // shutdown and then lives on is the worst of both worlds: it has torn down
+        // its sessions so it can no longer serve anyone, but it holds its clients'
+        // connections open, so they hear neither a response nor a disconnect. One
+        // did exactly that for five and a half hours, and the client it stranded
+        // simply hung.
+        //
+        // Session teardown is already individually bounded (PEER_SHUTDOWN_GRACE);
+        // this outer bound is the backstop that makes exit unconditional.
+        if tokio::time::timeout(
+            RESTART_SHUTDOWN_GRACE,
+            session_manager
+                .terminate_all(crate::session::SessionTerminationReason::ClientRequested),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                grace_secs = RESTART_SHUTDOWN_GRACE.as_secs(),
+                "Session teardown exceeded the shutdown grace period; exiting anyway \
+                 rather than stranding clients on a half-dead bridge"
+            );
+        }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         #[cfg(unix)]
         if let ListenerKind::Unix(ref path) = listener_kind
