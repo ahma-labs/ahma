@@ -2,7 +2,7 @@ use super::common;
 use crate::AhmaMcpService;
 use crate::mcp_service::schema;
 use crate::operation_monitor::Operation;
-use rmcp::model::{CallToolRequestParams, CallToolResult, Content, ErrorData as McpError};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorData as McpError};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -183,7 +183,7 @@ impl AhmaMcpService {
         let Some(completed_op) = completed_ops.iter().find(|op| op.id == op_id) else {
             return common::text_result(format!("Operation {} not found", op_id));
         };
-        let mut contents = vec![Content::text(format!(
+        let mut contents = vec![ContentBlock::text(format!(
             "Operation {} already completed",
             op_id
         ))];
@@ -208,7 +208,7 @@ impl AhmaMcpService {
         &self,
         timeout_duration: std::time::Duration,
         pending_ops: &[Operation],
-    ) -> Result<Vec<Content>, Elapsed> {
+    ) -> Result<Vec<ContentBlock>, Elapsed> {
         tokio::time::timeout(timeout_duration, async {
             let futures: Vec<_> = pending_ops
                 .iter()
@@ -224,7 +224,10 @@ impl AhmaMcpService {
         .await
     }
 
-    async fn recently_completed_contents(&self, tool_filters: &[String]) -> Option<Vec<Content>> {
+    async fn recently_completed_contents(
+        &self,
+        tool_filters: &[String],
+    ) -> Option<Vec<ContentBlock>> {
         if tool_filters.is_empty() {
             return None;
         }
@@ -241,7 +244,7 @@ impl AhmaMcpService {
             return None;
         }
 
-        let mut contents = vec![Content::text(format!(
+        let mut contents = vec![ContentBlock::text(format!(
             "No pending operations for tools: {}. However, these operations recently completed:",
             tool_filters.join(", ")
         ))];
@@ -332,12 +335,12 @@ fn spawn_progress_warnings(
     (handle, rx)
 }
 
-fn build_completion_result(contents: Vec<Content>, wait_start: Instant) -> CallToolResult {
+fn build_completion_result(contents: Vec<ContentBlock>, wait_start: Instant) -> CallToolResult {
     let elapsed = wait_start.elapsed();
     if contents.is_empty() {
         return common::text_result("No operations completed within timeout period");
     }
-    let mut result_contents = vec![Content::text(format!(
+    let mut result_contents = vec![ContentBlock::text(format!(
         "Completed {} operations in {:.2}s",
         contents.len(),
         elapsed.as_secs_f64()
@@ -508,9 +511,9 @@ mod tests {
 
     #[test]
     fn test_build_completion_result_with_contents() {
-        use rmcp::model::Content;
+        use rmcp::model::ContentBlock;
         let start = Instant::now();
-        let contents = vec![Content::text("op output".to_string())];
+        let contents = vec![ContentBlock::text("op output".to_string())];
         let result = build_completion_result(contents, start);
         assert_eq!(result.content.len(), 2);
         let first = result.content.first().unwrap().as_text().unwrap();

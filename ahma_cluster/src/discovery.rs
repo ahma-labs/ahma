@@ -15,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 use tracing::{debug, info, warn};
@@ -365,29 +365,25 @@ async fn run_mdns_browse(registry: WorkerRegistry) -> anyhow::Result<()> {
     }
 }
 
-/// Convert an mDNS `ServiceInfo` into a `PeerInfo`, returning `None` if the
+/// Convert a resolved mDNS service into a `PeerInfo`, returning `None` if the
 /// service has no usable address.
-fn mdns_info_to_peer(info: &ServiceInfo) -> Option<PeerInfo> {
+fn mdns_info_to_peer(info: &ResolvedService) -> Option<PeerInfo> {
     // Prefer an IPv4 address; fall back to the first address or the hostname.
     let addr_str = info
-        .get_addresses()
+        .addresses
         .iter()
         .find(|a| a.is_ipv4())
-        .or_else(|| info.get_addresses().iter().next())
+        .or_else(|| info.addresses.iter().next())
         .map(|a| a.to_string())
-        .unwrap_or_else(|| info.get_hostname().trim_end_matches('.').to_owned());
+        .unwrap_or_else(|| info.host.trim_end_matches('.').to_owned());
 
-    let port = info.get_port();
+    let port = info.port;
     let http_addr = format!("http://{addr_str}:{port}");
 
     // Peer ID from TXT `id` property; fall back to the instance name.
-    let instance_name = info
-        .get_fullname()
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .to_owned();
+    let instance_name = info.fullname.split('.').next().unwrap_or("").to_owned();
     let id = info
+        .txt_properties
         .get_property_val_str("id")
         .unwrap_or(&instance_name)
         .to_owned();
@@ -398,6 +394,7 @@ fn mdns_info_to_peer(info: &ServiceInfo) -> Option<PeerInfo> {
 
     // Models from TXT `models` property (comma-separated).
     let models: Vec<String> = info
+        .txt_properties
         .get_property_val_str("models")
         .map(|s| {
             s.split(',')
@@ -689,7 +686,7 @@ mod tests {
         )
         .expect("failed to create ServiceInfo");
 
-        let peer = mdns_info_to_peer(&info).expect("conversion failed");
+        let peer = mdns_info_to_peer(&info.as_resolved_service()).expect("conversion failed");
         assert_eq!(peer.id, "node-abc");
         assert_eq!(peer.addr, "http://192.168.1.50:8000");
         assert_eq!(peer.models, vec!["gemma", "llama3.2"]);
@@ -706,7 +703,8 @@ mod tests {
             None::<HashMap<String, String>>,
         )
         .expect("failed to create ServiceInfo");
-        let peer_no_props = mdns_info_to_peer(&info_no_props).expect("conversion failed");
+        let peer_no_props =
+            mdns_info_to_peer(&info_no_props.as_resolved_service()).expect("conversion failed");
         assert_eq!(peer_no_props.id, "node-fallback");
     }
 
@@ -935,7 +933,7 @@ mod tests {
         .expect("failed to create ServiceInfo");
 
         assert!(
-            mdns_info_to_peer(&info).is_none(),
+            mdns_info_to_peer(&info.as_resolved_service()).is_none(),
             "an explicit empty `id` TXT property must yield no peer"
         );
     }
@@ -959,7 +957,8 @@ mod tests {
             "precondition: ServiceInfo must have no resolved addresses"
         );
 
-        let peer = mdns_info_to_peer(&info).expect("conversion should still succeed");
+        let peer = mdns_info_to_peer(&info.as_resolved_service())
+            .expect("conversion should still succeed");
         assert_eq!(peer.addr, "http://hostfallback.local:8002");
         assert_eq!(peer.id, "no-addr-instance");
     }
@@ -976,7 +975,7 @@ mod tests {
         )
         .expect("failed to create ServiceInfo");
 
-        let peer = mdns_info_to_peer(&info).expect("conversion failed");
+        let peer = mdns_info_to_peer(&info.as_resolved_service()).expect("conversion failed");
         assert!(
             peer.models.is_empty(),
             "no `models` TXT property must yield an empty model list"

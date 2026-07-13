@@ -10,7 +10,7 @@
 use anyhow::Result;
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, Content},
+    model::{CallToolRequestParams, ContentBlock},
     service::{RoleClient, RunningService},
     transport::{ConfigureCommandExt, TokioChildProcess},
 };
@@ -232,7 +232,7 @@ fn extract_id(text: &str) -> Result<String> {
     ))
 }
 
-fn join_text_contents(contents: &[Content]) -> Result<String> {
+fn join_text_contents(contents: &[ContentBlock]) -> Result<String> {
     let mut combined = String::new();
     for text_content in contents.iter().filter_map(|c| c.as_text()) {
         if !combined.is_empty() {
@@ -248,7 +248,7 @@ fn join_text_contents(contents: &[Content]) -> Result<String> {
     }
 }
 
-fn first_text_content(contents: &[Content]) -> Result<String> {
+fn first_text_content(contents: &[ContentBlock]) -> Result<String> {
     contents
         .iter()
         .find_map(|c| c.as_text().map(|t| t.text.clone()))
@@ -292,8 +292,8 @@ mod tests {
     #[test]
     fn join_text_contents_merges_segments() {
         let contents = vec![
-            Content::text("first chunk".to_string()),
-            Content::text("second chunk".to_string()),
+            ContentBlock::text("first chunk".to_string()),
+            ContentBlock::text("second chunk".to_string()),
         ];
         let combined = join_text_contents(&contents).unwrap();
         assert_eq!(combined, "first chunk\n\nsecond chunk");
@@ -301,15 +301,15 @@ mod tests {
 
     #[test]
     fn join_text_contents_errors_when_empty() {
-        let contents: Vec<Content> = Vec::new();
+        let contents: Vec<ContentBlock> = Vec::new();
         assert!(join_text_contents(&contents).is_err());
     }
 
     #[test]
     fn first_text_content_returns_first_available_segment() {
         let contents = vec![
-            Content::text("alpha".to_string()),
-            Content::text("beta".to_string()),
+            ContentBlock::text("alpha".to_string()),
+            ContentBlock::text("beta".to_string()),
         ];
         let first = first_text_content(&contents).unwrap();
         assert_eq!(first, "alpha");
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn first_text_content_errors_when_absent() {
-        let contents: Vec<Content> = Vec::new();
+        let contents: Vec<ContentBlock> = Vec::new();
         assert!(first_text_content(&contents).is_err());
     }
 }

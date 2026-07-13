@@ -860,10 +860,9 @@ impl ClientHandler for ScriptedElicitClient {
     fn get_info(&self) -> ClientInfo {
         let mut caps = ClientCapabilities::default();
         if self.capable {
-            caps.elicitation = Some(ElicitationCapability {
-                form: Some(FormElicitationCapability::default()),
-                url: None,
-            });
+            let mut elicitation = ElicitationCapability::default();
+            elicitation.form = Some(FormElicitationCapability::default());
+            caps.elicitation = Some(elicitation);
         }
         ClientInfo::new(caps, Implementation::default())
     }
@@ -887,11 +886,9 @@ impl ClientHandler for ScriptedElicitClient {
             ElicitReply::Decline => (ElicitationAction::Decline, None),
             ElicitReply::Cancel => (ElicitationAction::Cancel, None),
         };
-        Ok(CreateElicitationResult {
-            action,
-            content,
-            meta: None,
-        })
+        let mut result = CreateElicitationResult::new(action);
+        result.content = content;
+        Ok(result)
     }
 }
 

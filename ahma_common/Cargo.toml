@@ -16,7 +16,7 @@ anyhow.workspace = true
 dirs.workspace = true
 dunce.workspace = true
 url.workspace = true
-rcgen = "0.13.2"
+rcgen = "0.14.8"
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }

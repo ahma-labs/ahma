@@ -3,7 +3,7 @@
 //! Contains handlers for executing sequence tools that invoke multiple
 //! other tools in order, both synchronously and asynchronously.
 
-use rmcp::model::{CallToolRequestParams, CallToolResult, Content, ErrorData as McpError};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorData as McpError};
 use rmcp::service::{RequestContext, RoleServer};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -180,7 +180,7 @@ async fn handle_sequence_tool_sync(
         if should_skip_step_with_context(&kind, step, &working_directory) {
             final_result
                 .content
-                .push(Content::text(format_step_skipped_message(&kind, step)));
+                .push(ContentBlock::text(format_step_skipped_message(&kind, step)));
             continue;
         }
 
@@ -236,7 +236,7 @@ async fn handle_sequence_tool_sync(
                     step.subcommand,
                     e
                 );
-                final_result.content.push(Content::text(format!(
+                final_result.content.push(ContentBlock::text(format!(
                     "Sequence failed at step {}:\n\n{}",
                     index + 1,
                     all_outputs.join("\n\n")
@@ -249,7 +249,7 @@ async fn handle_sequence_tool_sync(
         apply_step_delay(step_delay_ms, index, sequence.len()).await;
     }
 
-    final_result.content.push(Content::text(format!(
+    final_result.content.push(ContentBlock::text(format!(
         "All {} sequence steps completed successfully:\n\n{}",
         sequence.len(),
         all_outputs.join("\n\n")
@@ -277,7 +277,7 @@ async fn handle_sequence_tool_async(
         if should_skip_step_with_context(&kind, step, &working_directory) {
             final_result
                 .content
-                .push(Content::text(format_step_skipped_message(&kind, step)));
+                .push(ContentBlock::text(format_step_skipped_message(&kind, step)));
             continue;
         }
 
@@ -313,7 +313,9 @@ async fn handle_sequence_tool_async(
             Ok(id) => {
                 final_result
                     .content
-                    .push(Content::text(format_step_started_message(&kind, step, &id)));
+                    .push(ContentBlock::text(format_step_started_message(
+                        &kind, step, &id,
+                    )));
             }
             Err(e) => {
                 let error_message = format!(
@@ -385,7 +387,9 @@ pub async fn handle_subcommand_sequence(
             Ok(id) => {
                 final_result
                     .content
-                    .push(Content::text(format_step_started_message(&kind, step, &id)));
+                    .push(ContentBlock::text(format_step_started_message(
+                        &kind, step, &id,
+                    )));
             }
             Err(e) => {
                 let msg = format!(

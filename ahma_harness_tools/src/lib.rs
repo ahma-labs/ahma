@@ -295,8 +295,9 @@ pub fn grep_search(
 /// Render a fetched HTML body into a [`WebFetchResult`]: HTML → plain text,
 /// optional case-insensitive line filter, and `<title>` extraction. Pure, so
 /// the parsing/filtering behaviour is unit-testable without any network.
-fn render_webpage(url: &str, body: &str, query: Option<&str>) -> WebFetchResult {
-    let rendered = html2text::from_read(body.as_bytes(), 120);
+fn render_webpage(url: &str, body: &str, query: Option<&str>) -> Result<WebFetchResult> {
+    let rendered =
+        html2text::from_read(body.as_bytes(), 120).context("Failed to render HTML as text")?;
 
     let filtered = match query {
         Some(q) if !q.trim().is_empty() => {
@@ -317,11 +318,11 @@ fn render_webpage(url: &str, body: &str, query: Option<&str>) -> WebFetchResult 
         .and_then(|s| s.split("</title>").next())
         .map(|s| s.trim().to_string());
 
-    WebFetchResult {
+    Ok(WebFetchResult {
         url: url.to_string(),
         title,
         text: filtered,
-    }
+    })
 }
 
 /// Fetch a URL and render its HTML as plain text.
@@ -366,7 +367,7 @@ async fn fetch_webpage_guarded(
         .await
         .with_context(|| format!("Failed to fetch URL: {url}"))?;
     let body = resp.text().await.context("Failed to read response body")?;
-    Ok(render_webpage(url, &body, query))
+    render_webpage(url, &body, query)
 }
 
 #[cfg(test)]
@@ -656,11 +657,11 @@ mod tests {
     fn render_webpage_extracts_title_and_filters() {
         let body =
             "<html><head><title>  Hi  </title></head><body><p>alpha</p><p>beta</p></body></html>";
-        let full = render_webpage("http://x/", body, None);
+        let full = render_webpage("http://x/", body, None).unwrap();
         assert_eq!(full.title, Some("Hi".to_string()));
         assert!(full.text.contains("alpha") && full.text.contains("beta"));
 
-        let filtered = render_webpage("http://x/", body, Some("beta"));
+        let filtered = render_webpage("http://x/", body, Some("beta")).unwrap();
         assert!(filtered.text.contains("beta"));
         assert!(!filtered.text.contains("alpha"));
     }

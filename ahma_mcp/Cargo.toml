@@ -49,13 +49,13 @@ schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 ring = { version = "0.17", features = ["std"] }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 sigstore-verification = { version = "0.2", default-features = false, features = [
 	"rustls",
 ] }
 tar = "0.4"
 tempfile.workspace = true
-zip = "2.4.2"
+zip = "8.6.0"
 thiserror.workspace = true
 tokio-util.workspace = true
 tokio = "1.52"

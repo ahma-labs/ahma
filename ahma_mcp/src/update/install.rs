@@ -1,7 +1,6 @@
 //! Download, verify, and install release archives.
 
 use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -125,8 +124,7 @@ async fn fetch_archive_checksum(
 fn verify_file_checksum(path: &Path, expected_hex: &str) -> Result<()> {
     let bytes =
         std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let digest = Sha256::digest(&bytes);
-    let actual = format!("{digest:x}");
+    let actual = super::sha256_hex(&bytes);
     if actual != expected_hex {
         bail!(
             "Checksum mismatch for {}: expected {expected_hex}, got {actual}",
@@ -363,7 +361,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("test.bin");
         std::fs::write(&file, b"hello").unwrap();
-        let digest = format!("{:x}", Sha256::digest(b"hello"));
+        let digest = crate::update::sha256_hex(b"hello");
         verify_file_checksum(&file, &digest).unwrap();
     }
 
@@ -915,7 +913,7 @@ mod tests {
         let archive_bytes = make_tar_gz_bytes(binary_name, b"#!/bin/sh\necho ahma 0.7.0\n");
 
         // Pre-compute the hash of the bytes we're about to serve
-        let correct_hash = format!("{:x}", Sha256::digest(&archive_bytes));
+        let correct_hash = crate::update::sha256_hex(&archive_bytes);
         let sums_body = format!("{correct_hash}  {asset_name}\n");
 
         Mock::given(method("GET"))

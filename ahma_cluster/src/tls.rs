@@ -70,8 +70,12 @@ pub fn generate_self_signed_cluster_certs(out_dir: &Path) -> Result<()> {
         rcgen::ExtendedKeyUsagePurpose::ClientAuth,
         rcgen::ExtendedKeyUsagePurpose::ServerAuth,
     ];
+    // rcgen 0.14 signs against an `Issuer` (DN + key usages + signing key) rather
+    // than a (certificate, key) pair; `from_params` borrows the CA params we just
+    // self-signed, so the issuer identity is identical to the written ca.pem.
+    let ca_issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
     let leaf_cert = leaf_params
-        .signed_by(&leaf_key, &ca_cert, &ca_key)
+        .signed_by(&leaf_key, &ca_issuer)
         .context("Failed to sign leaf certificate with CA")?;
 
     // Write PEM files

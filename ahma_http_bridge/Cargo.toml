@@ -12,7 +12,7 @@ version.workspace = true
 ahma_common = { path = "../ahma_common" }
 anyhow.workspace = true
 axum = { version = "0.8", features = ["http2", "tokio"] }
-bytes = "1.11"
+bytes = "1.12"
 hyper = { version = "1", features = ["http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5" }
@@ -41,7 +41,7 @@ tokio = { workspace = true, features = [
 ] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { workspace = true, features = ["io", "codec"] }
-tower-http = { version = "0.6", features = ["trace", "cors", "set-header"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "set-header"] }
 tower_governor = "0.8"
 
 # QUIC / HTTP/3 support
@@ -50,7 +50,7 @@ h3 = "0.0.8"
 h3-quinn = "0.0.10"
 http-body-util = "0.1"
 quinn = "0.11"
-rcgen = "0.13.2"
+rcgen = "0.14.8"
 rustls = "0.23"
 rustls-pki-types = "1"
 tracing-opentelemetry = { workspace = true }

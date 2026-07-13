@@ -247,12 +247,9 @@ pub async fn push_progress(
     message: String,
     must_deliver: bool,
 ) {
-    let params = ProgressNotificationParam {
-        progress_token,
-        progress,
-        total: Some(100.0),
-        message: Some(message),
-    };
+    let mut params = ProgressNotificationParam::new(progress_token, progress);
+    params.total = Some(100.0);
+    params.message = Some(message);
     if let Err(e) = peer.notify_progress(params).await {
         if must_deliver {
             tracing::warn!(

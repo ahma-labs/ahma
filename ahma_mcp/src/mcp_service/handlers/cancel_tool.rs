@@ -1,6 +1,6 @@
 use crate::AhmaMcpService;
 use crate::mcp_service::schema;
-use rmcp::model::{CallToolResult, Content, ErrorData as McpError};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData as McpError};
 use serde_json::{Map, Value};
 use std::sync::Arc;
 
@@ -113,8 +113,8 @@ impl AhmaMcpService {
         });
 
         Ok(CallToolResult::success(vec![
-            Content::text(result_message),
-            Content::text(suggestion.to_string()),
+            ContentBlock::text(result_message),
+            ContentBlock::text(suggestion.to_string()),
         ]))
     }
 
@@ -153,8 +153,8 @@ impl AhmaMcpService {
         });
 
         CallToolResult::success(vec![
-            Content::text(message),
-            Content::text(suggestion.to_string()),
+            ContentBlock::text(message),
+            ContentBlock::text(suggestion.to_string()),
         ])
     }
 }

@@ -1,5 +1,5 @@
 use crate::operation_monitor::Operation;
-use rmcp::model::{CallToolResult, Content, ErrorData as McpError};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData as McpError};
 use serde_json::{Map, Value};
 
 struct CommandOutput {
@@ -22,11 +22,11 @@ pub fn parse_comma_separated_filter(args: &Map<String, Value>, key: &str) -> Vec
 }
 
 /// Serializes operations to Content text entries, logging errors.
-pub fn serialize_operations_to_content(operations: &[Operation]) -> Vec<Content> {
+pub fn serialize_operations_to_content(operations: &[Operation]) -> Vec<ContentBlock> {
     operations
         .iter()
         .filter_map(|op| match serde_json::to_string_pretty(op) {
-            Ok(s) => Some(Content::text(s)),
+            Ok(s) => Some(ContentBlock::text(s)),
             Err(e) => {
                 tracing::error!("Serialization error: {}", e);
                 None
@@ -59,7 +59,7 @@ pub fn parse_id(args: &Map<String, Value>) -> Option<String> {
 
 /// Returns a successful MCP result with a single text content block.
 pub fn text_result(text: impl Into<String>) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(text.into())])
+    CallToolResult::success(vec![ContentBlock::text(text.into())])
 }
 
 /// Builds an internal MCP error with no extra data payload.

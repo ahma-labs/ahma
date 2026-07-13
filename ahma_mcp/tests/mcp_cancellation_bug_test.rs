@@ -85,10 +85,10 @@ async fn test_mcp_cancellation_does_not_trigger_canceled_canceled_message() {
     println!("🔍 Test 1: MCP cancellation with no active operations");
 
     // Simulate MCP cancellation notification
-    let _cancellation_notification = CancelledNotificationParam {
-        request_id: RequestId::String("test_request_1".into()),
-        reason: Some("User cancelled from VS Code".to_string()),
-    };
+    let _cancellation_notification = CancelledNotificationParam::new(
+        Some(RequestId::String("test_request_1".into())),
+        Some("User cancelled from VS Code".to_string()),
+    );
 
     // Create mock notification context
     // Note: This is complex to create properly, so we'll test the logic indirectly

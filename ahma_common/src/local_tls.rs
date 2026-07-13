@@ -169,12 +169,12 @@ pub fn generate_and_save(config: &LocalTlsConfig) -> Result<LocalTlsCerts> {
     std::fs::create_dir_all(&config.dir)
         .with_context(|| format!("Failed to create TLS directory {}", config.dir.display()))?;
 
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string(), "localhost".to_string()])
             .context("Failed to generate self-signed certificate")?;
 
     let cert_der = cert.der().to_vec();
-    let key_der = key_pair.serialize_der();
+    let key_der = signing_key.serialize_der();
 
     std::fs::write(config.cert_path(), &cert_der)
         .with_context(|| format!("Failed to write {}", config.cert_path().display()))?;

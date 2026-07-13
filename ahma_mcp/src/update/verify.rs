@@ -26,7 +26,6 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 const OWNER: &str = "paulirotta";
@@ -164,7 +163,7 @@ fn should_skip_verify() -> bool {
 fn sha256_hex(path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(&bytes)))
+    Ok(super::sha256_hex(&bytes))
 }
 
 #[cfg(test)]

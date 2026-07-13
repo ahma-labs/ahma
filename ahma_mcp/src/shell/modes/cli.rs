@@ -13,7 +13,7 @@ use crate::{
 use anyhow::Result;
 use rmcp::{
     ServiceExt,
-    model::{CallToolRequestParams, Content},
+    model::{CallToolRequestParams, ContentBlock},
     transport::async_rw::AsyncRwTransport,
 };
 use serde_json::Value;
@@ -120,7 +120,7 @@ async fn execute_via_mcp_service(
     Ok(text)
 }
 
-fn extract_text_content(content: &[Content]) -> String {
+fn extract_text_content(content: &[ContentBlock]) -> String {
     content
         .iter()
         .filter_map(|item| item.as_text().map(|text| text.text.clone()))

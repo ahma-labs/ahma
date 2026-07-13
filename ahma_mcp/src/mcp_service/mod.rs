@@ -1108,10 +1108,10 @@ impl ServerHandler for AhmaMcpService {
                   For read-only file inspection (read, grep, glob, replace) keep using the IDE's native \
                   file tools — that is what they are for.".to_string();
 
+        let mut tools_capability = ToolsCapability::default();
+        tools_capability.list_changed = Some(true);
         let capabilities = ServerCapabilities::builder()
-            .enable_tools_with(ToolsCapability {
-                list_changed: Some(true),
-            })
+            .enable_tools_with(tools_capability)
             .build();
 
         let server_info = Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
@@ -1655,9 +1655,9 @@ impl AhmaMcpService {
         }
 
         match outcome {
-            GuardOutcome::Block(msg) => {
-                Some(CallToolResult::error(vec![rmcp::model::Content::text(msg)]))
-            }
+            GuardOutcome::Block(msg) => Some(CallToolResult::error(vec![
+                rmcp::model::ContentBlock::text(msg),
+            ])),
             GuardOutcome::Proceed => None,
         }
     }
@@ -1950,13 +1950,13 @@ impl AhmaMcpService {
         Some(match mgr.call_tool(&params.name, args_val).await {
             Ok((output, is_error)) => {
                 if is_error {
-                    Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                        output,
-                    )]))
+                    Ok(CallToolResult::error(vec![
+                        rmcp::model::ContentBlock::text(output),
+                    ]))
                 } else {
-                    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
-                        output,
-                    )]))
+                    Ok(CallToolResult::success(vec![
+                        rmcp::model::ContentBlock::text(output),
+                    ]))
                 }
             }
             Err(e) => Err(McpError::internal_error(
@@ -4056,10 +4056,9 @@ mod tests {
         let service = make_service().await;
         let args = Some(obj(json!({"x": 1})));
 
-        let err_result: Result<CallToolResult, McpError> =
-            Ok(CallToolResult::error(vec![rmcp::model::Content::text(
-                "boom",
-            )]));
+        let err_result: Result<CallToolResult, McpError> = Ok(CallToolResult::error(vec![
+            rmcp::model::ContentBlock::text("boom"),
+        ]));
         for _ in 0..3 {
             service.record_result_in_loop_detector("mytool", &args, &err_result);
         }

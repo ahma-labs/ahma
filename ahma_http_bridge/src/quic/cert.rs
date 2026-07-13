@@ -54,12 +54,12 @@ pub fn load_or_generate() -> SelfSignedCert {
 
 /// Generate a self-signed TLS certificate valid for `127.0.0.1` and `localhost`.
 pub fn generate_self_signed_cert() -> Result<SelfSignedCert> {
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string(), "localhost".to_string()])
             .context("Failed to generate self-signed certificate")?;
 
     let cert_der = cert.der().to_vec();
-    let key_der = key_pair.serialize_der();
+    let key_der = signing_key.serialize_der();
 
     Ok(SelfSignedCert { cert_der, key_der })
 }

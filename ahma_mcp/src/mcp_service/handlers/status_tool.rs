@@ -2,7 +2,7 @@ use super::common;
 use crate::AhmaMcpService;
 use crate::mcp_service::schema;
 use crate::operation_monitor::Operation;
-use rmcp::model::{CallToolResult, Content, ErrorData as McpError};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData as McpError};
 use serde_json::{Map, Value};
 use std::sync::Arc;
 
@@ -79,25 +79,29 @@ impl AhmaMcpService {
             )
         };
 
-        contents.push(Content::text(summary));
+        contents.push(ContentBlock::text(summary));
 
         // Add concurrency efficiency analysis
         if !completed_ops.is_empty()
             && let Some(efficiency_analysis) = Self::run_concurrency_analysis(&completed_ops)
         {
-            contents.push(Content::text(format!(
+            contents.push(ContentBlock::text(format!(
                 "\nConcurrency Analysis:\n{}",
                 efficiency_analysis
             )));
         }
 
         if !active_ops.is_empty() {
-            contents.push(Content::text("\n=== ACTIVE OPERATIONS ===".to_string()));
+            contents.push(ContentBlock::text(
+                "\n=== ACTIVE OPERATIONS ===".to_string(),
+            ));
             contents.extend(common::serialize_operations_to_content(&active_ops));
         }
 
         if !completed_ops.is_empty() {
-            contents.push(Content::text("\n=== COMPLETED OPERATIONS ===".to_string()));
+            contents.push(ContentBlock::text(
+                "\n=== COMPLETED OPERATIONS ===".to_string(),
+            ));
             contents.extend(common::serialize_operations_to_content(&completed_ops));
         }
 

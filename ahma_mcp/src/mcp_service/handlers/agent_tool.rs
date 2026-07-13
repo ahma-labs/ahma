@@ -7,7 +7,7 @@ use super::common::{mcp_internal, mcp_invalid_params, text_result};
 use crate::AhmaMcpService;
 use crate::mcp_service::schema;
 use ahma_common::daemon_hub::DaemonChatMessage;
-use rmcp::model::{CallToolResult, Content, ErrorData as McpError};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData as McpError};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
@@ -56,7 +56,7 @@ impl AhmaMcpService {
             Ok(text) => Ok(text_result(text)),
             // A failed delegation is a tool-level error, not a protocol error, so
             // the calling model can read it and adapt.
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "agent sub-task failed: {e}"
             ))])),
         }
