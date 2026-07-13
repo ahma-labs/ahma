@@ -522,12 +522,14 @@ impl Adapter {
         // scan stderr and (best-effort, never blocking the result) offer to grant
         // an out-of-scope path it references.
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let result = interpret_sync_command_output(output);
         if result.is_err() {
             sandbox::grant_channel::notify_stderr_denial(
                 &self.sandbox,
                 self.scope_grant_notifier.as_ref(),
                 &stderr,
+                &stdout,
                 command,
             )
             .await;
@@ -535,7 +537,7 @@ impl Adapter {
             // it as a typed error so the MCP boundary attaches a structured
             // `sandbox_denial` payload (path + grant->restart->retry remediation)
             // instead of leaving the agent with a raw `os error 1`.
-            if let Some(hit) = sandbox::scan_denial(&stderr)
+            if let Some(hit) = sandbox::scan_denial_streams(&stderr, &stdout)
                 && !self.sandbox.is_path_in_scope(&hit.path)
             {
                 let details = result.err().map(|e| e.to_string()).unwrap_or_default();
@@ -1594,6 +1596,7 @@ async fn finalize_streaming_operation(
             sandbox,
             scope_grant_notifier,
             &stderr_str,
+            &stdout_str,
             tool,
         )
         .await;
@@ -1602,7 +1605,7 @@ async fn finalize_streaming_operation(
         // the async path (the result is delivered later as text), so attach the
         // grant -> restart -> retry remediation as an operation alert. Mirrors the
         // typed `RuntimeDenial` the sync path returns.
-        if let Some(hit) = sandbox::scan_denial(&stderr_str)
+        if let Some(hit) = sandbox::scan_denial_streams(&stderr_str, &stdout_str)
             && !sandbox.is_path_in_scope(&hit.path)
         {
             let remediation =

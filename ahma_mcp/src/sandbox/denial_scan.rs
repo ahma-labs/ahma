@@ -1,10 +1,20 @@
-//! Heuristic extraction of a denied path from a failed command's stderr.
+//! Heuristic extraction of a denied path from a failed command's output.
 //!
 //! A runtime kernel denial (Landlock `EACCES`, Seatbelt `deny`, a read-only
 //! remount) does **not** hand ahma the offending path — the command merely exits
 //! non-zero and may print an error mentioning the path. This module recognises a
 //! few well-known denial signatures and pulls out a *candidate* path so the
 //! grant flow can offer "grant access to X?".
+//!
+//! Two things it must get right, because getting them wrong pushes an agent to
+//! give up on the sandbox and re-run the command outside it:
+//!
+//! * **Both streams.** Use [`scan_denial_streams`], not [`scan_denial`], wherever
+//!   stdout is available: `cmd 2>&1 | tail` empties stderr, and a denial that
+//!   disappears when the caller merges the streams is a trap.
+//! * **The tool's words, not just the kernel's.** Crates that take an advisory
+//!   file lock catch the errno themselves and report e.g. "attempted to take an
+//!   exclusive lock on a read-only path" — no "Permission denied" anywhere.
 //!
 //! ## This only ever *suggests*
 //!
@@ -45,7 +55,24 @@ pub struct DenialHit {
 /// path bleed into a much later denial.
 const MULTILINE_LOOKBACK: usize = 5;
 
-/// Scan `stderr` for the first kernel-denial signature and extract its path.
+/// Scan a failed command's **stderr, then stdout**, for a denial signature.
+///
+/// Prefer this over [`scan_denial`] at any call site that has both streams.
+///
+/// Scanning stderr alone loses the denial whenever the two streams are merged —
+/// and `2>&1` is not an exotic case, it is what agents and shell pipelines write
+/// by habit (`cargo deny check 2>&1 | tail`). With stderr emptied, the denial is
+/// invisible, the agent gets a bare "exit code 1", and the grant flow it should
+/// have entered never engages. The observed consequence is the bad one: the agent
+/// concludes the sandbox is broken and re-runs the command *outside* it.
+///
+/// stderr wins when both carry a signature: it is the stream the denial was
+/// actually written to when the command did not merge them.
+pub fn scan_denial_streams(stderr: &str, stdout: &str) -> Option<DenialHit> {
+    scan_denial(stderr).or_else(|| scan_denial(stdout))
+}
+
+/// Scan one stream for the first kernel-denial signature and extract its path.
 /// Returns `None` when nothing matches or no absolute path can be associated with
 /// a denial.
 ///
@@ -108,7 +135,14 @@ fn denial_keyword_access(line: &str) -> Option<ScopeAccess> {
     if is_seatbelt && line.contains("file-read") {
         return Some(ScopeAccess::Ro);
     }
-    if line.contains("Read-only file system") || line.contains("Operation not permitted") {
+    // Kept in step with `scan_line`: a tool that reports the errno in its own words
+    // ("...on a read-only path") may equally split the path and the reason across
+    // lines, so the multi-line shape must recognise the same wording.
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("read-only file system")
+        || lower.contains("read-only path")
+        || lower.contains("operation not permitted")
+    {
         return Some(ScopeAccess::Rw);
     }
     if line.contains("Access is denied") || line.contains("Permission denied") {
@@ -146,7 +180,17 @@ fn scan_line(line: &str) -> Option<DenialHit> {
     }
 
     // A write that hit a read-only mount or an explicitly-denied write op ⇒ `Rw`.
-    if (line.contains("Read-only file system") || line.contains("Operation not permitted"))
+    //
+    // `read-only path` is not the kernel's wording but a tool's: crates that take
+    // an advisory file lock (cargo-deny's advisory DB, cargo's package cache)
+    // catch the errno themselves and report e.g. "attempted to take an exclusive
+    // lock on a read-only path". That is a *write* denial, and missing it is not
+    // academic — it is the exact denial that sent an agent off to re-run the
+    // command outside the sandbox instead of asking for a grant.
+    let lower = line.to_ascii_lowercase();
+    if (lower.contains("read-only file system")
+        || lower.contains("read-only path")
+        || lower.contains("operation not permitted"))
         && let Some(path) = extract_abs_path(line)
     {
         return Some(DenialHit {
@@ -457,5 +501,59 @@ error: failed to read /mnt/disk/file
 Caused by:
   (os error 5)";
         assert!(scan_denial(stderr).is_none());
+    }
+
+    /// Regression: a tool that catches the errno itself and reports it in its own
+    /// words must still be recognised.
+    ///
+    /// This is the verbatim message from `cargo deny`, whose advisory DB lives in
+    /// `~/.cargo` — outside the workspace scope, so the sandbox correctly made it
+    /// read-only. It says neither "Permission denied" nor "Read-only file system",
+    /// so the scanner missed it entirely: the agent got a bare failure, no grant
+    /// was offered, and it re-ran the command *outside* the sandbox instead.
+    #[test]
+    fn tool_reported_read_only_lock_is_a_denial() {
+        let stderr = "error: failed to acquire advisory database lock: failed to obtain lock \
+                      file '/Users/me/.cargo/advisory-dbs/db.lock': attempted to take an \
+                      exclusive lock on a read-only path";
+        let hit = scan_denial(stderr).expect("a tool-reported read-only lock is a write denial");
+        assert_eq!(
+            hit.path,
+            PathBuf::from("/Users/me/.cargo/advisory-dbs/db.lock")
+        );
+        assert_eq!(
+            hit.access,
+            ScopeAccess::Rw,
+            "taking an exclusive lock is a write"
+        );
+    }
+
+    /// Regression: a denial must not vanish because the caller merged the streams.
+    ///
+    /// `cmd 2>&1 | tail` is what agents and shell pipelines write by habit — it
+    /// empties stderr entirely. Scanning stderr alone therefore lost the denial
+    /// exactly when a human or agent had been thorough enough to capture output.
+    #[test]
+    fn denial_on_stdout_is_found_when_stderr_was_merged_away() {
+        let stdout = "error: failed to create directory `/opt/ext/cache`: Read-only file system";
+        assert!(
+            scan_denial("").is_none(),
+            "precondition: stderr is empty (2>&1 merged it into stdout)"
+        );
+
+        let hit = scan_denial_streams("", stdout)
+            .expect("the denial is on stdout because the caller merged the streams");
+        assert_eq!(hit.path, PathBuf::from("/opt/ext/cache"));
+        assert_eq!(hit.access, ScopeAccess::Rw);
+    }
+
+    /// stderr wins when both streams carry a signature: it is where the denial was
+    /// actually written when the command did not merge them.
+    #[test]
+    fn stderr_takes_precedence_over_stdout() {
+        let stderr = "error: failed to create directory `/opt/from-stderr`: Read-only file system";
+        let stdout = "error: failed to create directory `/opt/from-stdout`: Read-only file system";
+        let hit = scan_denial_streams(stderr, stdout).expect("stderr matches");
+        assert_eq!(hit.path, PathBuf::from("/opt/from-stderr"));
     }
 }

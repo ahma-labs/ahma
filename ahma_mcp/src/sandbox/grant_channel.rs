@@ -258,10 +258,13 @@ pub async fn notify_stderr_denial(
     sandbox: &super::Sandbox,
     notifier: Option<&Arc<dyn ScopeGrantNotifier>>,
     stderr: &str,
+    stdout: &str,
     tool: &str,
 ) {
     let Some(n) = notifier else { return };
-    let Some(hit) = super::denial_scan::scan_denial(stderr) else {
+    // stdout too: a merged pipeline (`… 2>&1 | tail`) leaves stderr empty, and a
+    // denial that disappears when a caller adds `2>&1` is a trap, not a feature.
+    let Some(hit) = super::denial_scan::scan_denial_streams(stderr, stdout) else {
         return;
     };
     if sandbox.is_path_in_scope(&hit.path) {
@@ -358,7 +361,7 @@ mod tests {
         let notifier: Arc<dyn ScopeGrantNotifier> = rec.clone();
         let stderr =
             "error: failed to create directory `/opt/out/of/scope/cache`: Read-only file system";
-        notify_stderr_denial(&sandbox, Some(&notifier), stderr, "sccache").await;
+        notify_stderr_denial(&sandbox, Some(&notifier), stderr, "", "sccache").await;
 
         let seen = rec.seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "an out-of-scope denial is offered");
@@ -384,7 +387,7 @@ mod tests {
         // scope problem — do not offer to grant it.
         let in_scope = scope.path().join("locked.txt");
         let stderr = format!("cat: {}: Permission denied", in_scope.display());
-        notify_stderr_denial(&sandbox, Some(&notifier), &stderr, "cat").await;
+        notify_stderr_denial(&sandbox, Some(&notifier), &stderr, "", "cat").await;
         assert!(
             rec.seen.lock().unwrap().is_empty(),
             "in-scope denials must not raise a grant prompt"
@@ -434,7 +437,7 @@ mod tests {
         let scope = tempfile::tempdir().unwrap();
         let sandbox = test_sandbox(scope.path());
         // Simply must not panic with notifier = None.
-        notify_stderr_denial(&sandbox, None, "/x: Permission denied", "t").await;
+        notify_stderr_denial(&sandbox, None, "/x: Permission denied", "", "t").await;
         let err = anyhow::anyhow!("x");
         notify_pre_exec(None, &err, "t").await;
     }
@@ -485,7 +488,7 @@ mod tests {
         // A write denial naming a specific out-of-scope cache *file*.
         let stderr =
             "error writing `/opt/ext/sccache/0/object.o`: Operation not permitted (os error 1)";
-        notify_stderr_denial(&sandbox, Some(&notifier), stderr, "sccache").await;
+        notify_stderr_denial(&sandbox, Some(&notifier), stderr, "", "sccache").await;
 
         let seen = rec.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);

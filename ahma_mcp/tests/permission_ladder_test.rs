@@ -90,7 +90,7 @@ async fn an_approval_at_the_harness_is_persisted_without_widening_the_live_sandb
 
     // A real kernel denial, as it appears in a sandboxed command's stderr.
     let denied = "error: failed to create directory `/opt/ext/sccache/0`: Read-only file system";
-    notify_stderr_denial(&sandbox, Some(&notifier), denied, "sccache").await;
+    notify_stderr_denial(&sandbox, Some(&notifier), denied, "", "sccache").await;
 
     assert_eq!(
         harness.asks.load(Ordering::SeqCst),

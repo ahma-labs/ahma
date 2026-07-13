@@ -75,7 +75,7 @@ pub use credential_reads::{
     default_credential_read_denies, effective_credential_read_denies, keychain_access_allowed,
     set_credential_read_denies, set_keychain_access_allowed,
 };
-pub use denial_scan::{DenialHit, scan_denial};
+pub use denial_scan::{DenialHit, scan_denial, scan_denial_streams};
 pub use display::{ActiveSandbox, ScopeSource, ScopeView};
 pub use error::SandboxError;
 pub use grant_channel::{HubGrantNotifier, LoggingGrantNotifier, ScopeGrantNotifier};
