@@ -55,18 +55,40 @@ fn newest_source_mtime() -> Option<SystemTime> {
     })
 }
 
-/// Decide whether `binary_path` must be (re)built: true if it is missing, or if
-/// any workspace source file is newer than the binary. When the source mtime
-/// can't be determined, an existing binary is trusted (returns false) so we
-/// never rebuild — and therefore never change its feature set — under a binary
-/// CI deliberately built (e.g. `--no-default-features`).
-fn binary_needs_build(binary_path: &Path) -> bool {
+/// Why a binary must be (re)built — carried into the rebuild log line so a
+/// test that spends its timeout budget inside a surprise rebuild is
+/// diagnosable from the captured output alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleReason {
+    /// No binary at the expected path (fresh checkout, `cargo clean`, or a
+    /// build interrupted mid-write — e.g. by a full disk).
+    Missing,
+    /// A workspace source file is newer than the binary.
+    OlderThanSource,
+}
+
+impl StaleReason {
+    fn describe(self) -> &'static str {
+        match self {
+            StaleReason::Missing => "missing",
+            StaleReason::OlderThanSource => "older than the newest workspace source file",
+        }
+    }
+}
+
+/// Decide whether `binary_path` must be (re)built and why: `Missing` if there
+/// is no readable binary, `OlderThanSource` if any workspace source file is
+/// newer. When the source mtime can't be determined, an existing binary is
+/// trusted (returns `None`) so we never rebuild — and therefore never change
+/// its feature set — under a binary CI deliberately built (e.g.
+/// `--no-default-features`).
+fn stale_reason(binary_path: &Path) -> Option<StaleReason> {
     let Ok(bin_mtime) = binary_path.metadata().and_then(|m| m.modified()) else {
-        return true; // missing or unreadable → build
+        return Some(StaleReason::Missing); // missing or unreadable → build
     };
     match newest_source_mtime() {
-        Some(src_mtime) => bin_mtime < src_mtime,
-        None => false, // can't tell → trust the existing binary
+        Some(src_mtime) if bin_mtime < src_mtime => Some(StaleReason::OlderThanSource),
+        _ => None, // fresh, or can't tell → trust the existing binary
     }
 }
 
@@ -181,10 +203,24 @@ pub fn build_binary_cached(package: &str, binary: &str) -> PathBuf {
         return binary_path;
     }
 
-    if !binary_needs_build(&binary_path) {
+    let Some(reason) = stale_reason(&binary_path) else {
         cache_guard.insert(key, binary_path.clone());
         return binary_path;
-    }
+    };
+
+    // Be LOUD: this rebuild runs inside whichever test happened to call the
+    // harness first, so its cost counts against that test's timeout budget.
+    // Without these lines a cold or damaged `target/` shows up as a random
+    // integration test timing out with no indication why.
+    eprintln!(
+        "[ahma test harness] binary `{}` is {} — rebuilding it now, inside the \
+         current test's timeout budget. If this test times out here, the rebuild \
+         is the cause, not the test; prebuild with `cargo build --bin {}` and re-run.",
+        binary,
+        reason.describe(),
+        binary
+    );
+    let rebuild_started = std::time::Instant::now();
 
     let workspace = get_workspace_dir();
     let output = Command::new("cargo")
@@ -192,6 +228,13 @@ pub fn build_binary_cached(package: &str, binary: &str) -> PathBuf {
         .args(["build", "--bin", binary])
         .output()
         .expect("Failed to run cargo build");
+
+    eprintln!(
+        "[ahma test harness] rebuild of `{}` finished in {:.1}s (success: {})",
+        binary,
+        rebuild_started.elapsed().as_secs_f64(),
+        output.status.success()
+    );
 
     // If the build fails but a binary is already present, prefer not to break the
     // test on a transient/edge build issue — use what's there. Only a missing
@@ -222,4 +265,50 @@ pub fn test_command(binary: &Path) -> Command {
     let mut cmd = Command::new(binary);
     cmd.args(["--no-sandbox", "--skip-probes"]);
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_reason_missing_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("no-such-binary");
+        assert_eq!(stale_reason(&path), Some(StaleReason::Missing));
+    }
+
+    #[test]
+    fn stale_reason_fresh_binary_is_trusted() {
+        // A file created now is newer than every workspace source file, so it
+        // must be trusted as-is (this is what protects CI's
+        // `--no-default-features` binary from a feature-flipping rebuild).
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fresh-binary");
+        std::fs::write(&path, b"bin").unwrap();
+        assert_eq!(stale_reason(&path), None);
+    }
+
+    #[test]
+    fn stale_reason_old_binary_needs_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("old-binary");
+        std::fs::write(&path, b"bin").unwrap();
+        // Backdate the binary to well before any workspace source file.
+        let epoch = std::fs::FileTimes::new()
+            .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(epoch)
+            .unwrap();
+        assert_eq!(stale_reason(&path), Some(StaleReason::OlderThanSource));
+    }
+
+    #[test]
+    fn stale_reasons_describe_themselves() {
+        assert_eq!(StaleReason::Missing.describe(), "missing");
+        assert!(StaleReason::OlderThanSource.describe().contains("older"));
+    }
 }
