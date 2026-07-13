@@ -243,6 +243,9 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
         (Char('f'), KM::NONE) if focus == Focus::OpsDag => Action::ToggleProjectFilter,
         (Char(' '), KM::NONE) if focus == Focus::OpsDag => Action::ToggleNode,
 
+        // Zoom the focused pane to full screen and back.
+        (Char('z'), KM::NONE) if focus.is_zoomable() => Action::ToggleZoom,
+
         // Toggles
         (Char('?'), _) => Action::ToggleHelp,
         (Char('d'), KM::NONE) => Action::ToggleDetail,
@@ -384,6 +387,34 @@ mod tests {
                 false
             ),
             Action::Unknown
+        );
+    }
+
+    #[test]
+    fn z_zooms_zoomable_panes_only() {
+        for focus in [Focus::OpsDag, Focus::Log] {
+            assert_eq!(
+                map_key(
+                    kn(KeyCode::Char('z')),
+                    Mode::Monitor,
+                    focus,
+                    &none_modal(),
+                    false
+                ),
+                Action::ToggleZoom,
+                "focus {focus:?}"
+            );
+        }
+        // In chat focus 'z' is just a typed character.
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('z')),
+                Mode::Chat,
+                Focus::Chat,
+                &none_modal(),
+                false
+            ),
+            Action::InputChar('z')
         );
     }
 
@@ -1034,7 +1065,7 @@ mod tests {
             map_key(
                 k(KeyCode::Char('c'), KeyModifiers::CONTROL),
                 Mode::Monitor,
-                Focus::AiActivity,
+                Focus::OpsDag,
                 &none_modal(),
                 false
             ),
@@ -1378,10 +1409,10 @@ mod tests {
 
     #[test]
     fn global_unknown_fallthrough() {
-        // 'z' with no modifier matches no global arm.
+        // 'x' with no modifier matches no global arm ('z' is now zoom).
         assert_eq!(
             map_key(
-                kn(KeyCode::Char('z')),
+                kn(KeyCode::Char('x')),
                 Mode::Monitor,
                 Focus::OpsDag,
                 &none_modal(),
@@ -1398,7 +1429,7 @@ mod tests {
             map_key(
                 kn(KeyCode::Char('w')),
                 Mode::Monitor,
-                Focus::AiActivity,
+                Focus::OpsDag,
                 &none_modal(),
                 false
             ),

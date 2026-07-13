@@ -549,7 +549,6 @@ pub enum Focus {
     /// Chat input box (default in Chat mode).
     #[default]
     Chat,
-    AiActivity,
     OpsDag,
     Log,
     Palette,
@@ -560,7 +559,6 @@ impl Focus {
     pub fn cycle_next(self) -> Self {
         match self {
             Self::Chat => Self::OpsDag,
-            Self::AiActivity => Self::OpsDag,
             Self::OpsDag => Self::Log,
             Self::Log => Self::Chat,
             Self::Palette => Self::Chat,
@@ -570,11 +568,15 @@ impl Focus {
     pub fn cycle_prev(self) -> Self {
         match self {
             Self::Chat => Self::Log,
-            Self::AiActivity => Self::Chat,
             Self::OpsDag => Self::Chat,
             Self::Log => Self::OpsDag,
             Self::Palette => Self::Chat,
         }
+    }
+
+    /// Panes that can be maximised to the full screen with `z`.
+    pub fn is_zoomable(self) -> bool {
+        matches!(self, Self::OpsDag | Self::Log)
     }
 }
 
@@ -621,6 +623,32 @@ pub struct AiActivityEntry {
     /// Short human-readable result, e.g. `"ok"` or `"error: ..."`
     pub summary: Option<String>,
     pub op_id: Option<String>,
+}
+
+// ─── Operation events (monitor activity feed) ────────────────────────────────
+
+/// Ring capacity for the monitor activity feed.
+const EVENT_RING_CAP: usize = 200;
+
+/// One entry in the monitor activity feed: an operation started or reached a
+/// terminal state on any connected instance. Rows are clickable — they open
+/// the operation's full-screen detail view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpEvent {
+    pub timestamp: chrono::DateTime<chrono::Local>,
+    pub kind: OpEventKind,
+    pub op_id: String,
+    /// Human title at the time of the event (`Operation::display_name`).
+    pub title: String,
+    pub instance: Option<String>,
+    /// Set on `Finished` events when the runner reported a duration.
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpEventKind {
+    Started,
+    Finished(OpStatus),
 }
 
 // ─── Operations ───────────────────────────────────────────────────────────────
@@ -1305,6 +1333,8 @@ pub struct AppState {
 
     // ── Panel data ──
     pub ai_activity: VecDeque<AiActivityEntry>,
+    /// Monitor activity feed: op started/finished transitions, newest first.
+    pub events: VecDeque<OpEvent>,
     pub operations: Vec<Operation>,
     /// Live output lines that arrived (via the daemon hub) before the operation
     /// they belong to was materialised in `operations`. Keyed by op id. The
@@ -1412,7 +1442,6 @@ pub struct AppState {
     /// the rendered line count so key handlers can clamp (`G`, `j`).
     pub detail_max_scroll: std::cell::Cell<usize>,
     pub log_max_scroll: std::cell::Cell<usize>,
-    pub activity_scroll: usize,
     /// Tracked token usage for the current session.
     pub token_usage: ahma_llm_monitor::client::TokenUsage,
 
@@ -1428,7 +1457,9 @@ pub struct AppState {
     pub active_log_file: Option<String>,
     pub active_log_lines: Vec<String>,
     pub log_wrap_enabled: bool,
-    pub log_zoom_enabled: bool,
+    /// Which pane is maximised to the full screen, if any (`z` toggles the
+    /// focused pane; Esc restores). Replaces the old log-only zoom flag.
+    pub zoomed: Option<Focus>,
     #[cfg(feature = "tui")]
     pub click_targets: std::cell::RefCell<Vec<(ClickTarget, Rect)>>,
     #[cfg(not(feature = "tui"))]
@@ -1765,6 +1796,7 @@ impl AppState {
             minimize_tokens: false,
             last_prompt_tokens: 0,
             ai_activity: VecDeque::with_capacity(ACTIVITY_RING_CAP),
+            events: VecDeque::with_capacity(EVENT_RING_CAP),
             operations: vec![],
             pending_output: HashMap::new(),
             log: VecDeque::with_capacity(LOG_RING_CAP),
@@ -1830,7 +1862,6 @@ impl AppState {
             chat_max_scroll: std::cell::Cell::new(0),
             detail_max_scroll: std::cell::Cell::new(0),
             log_max_scroll: std::cell::Cell::new(0),
-            activity_scroll: 0,
             token_usage: ahma_llm_monitor::client::TokenUsage::default(),
             log_scroll: 0,
             log_follow: true,
@@ -1840,7 +1871,7 @@ impl AppState {
             active_log_file: None,
             active_log_lines: vec![],
             log_wrap_enabled: false,
-            log_zoom_enabled: false,
+            zoomed: None,
             #[cfg(feature = "tui")]
             click_targets: std::cell::RefCell::new(vec![]),
             #[cfg(not(feature = "tui"))]
@@ -1899,7 +1930,6 @@ impl AppState {
         // Reset scroll positions to their startup defaults.
         self.chat_scroll = 0;
         self.chat_max_scroll.set(0);
-        self.activity_scroll = 0;
         self.ops_selected = 0;
         self.ops_scroll.set(0);
         self.sync_chat_scroll_to_animation();
@@ -2089,6 +2119,14 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    /// Append to the monitor activity feed, newest first, bounded.
+    pub fn push_op_event(&mut self, event: OpEvent) {
+        if self.events.len() >= EVENT_RING_CAP {
+            self.events.pop_back();
+        }
+        self.events.push_front(event);
+    }
+
     pub fn push_activity(&mut self, entry: AiActivityEntry) {
         if self.ai_activity.len() >= ACTIVITY_RING_CAP {
             self.ai_activity.pop_back();
@@ -2262,13 +2300,46 @@ impl AppState {
 
     pub fn upsert_operation(&mut self, op: Operation) {
         let id = op.id.clone();
-        match self
+        // Feed the monitor activity ring exactly once per transition: Started
+        // on first sight of a live op, Finished when a merge crosses from
+        // live to terminal (or when an op is first seen already terminal,
+        // e.g. a hub replay — stamped with the op's own start time, not now).
+        let event = match self
             .operations
             .iter_mut()
             .find(|o| o.id == op.id && o.instance_id == op.instance_id)
         {
-            Some(existing) => Self::merge_operation(existing, op),
-            None => self.operations.push(op),
+            Some(existing) => {
+                let was_terminal = existing.status.is_terminal();
+                Self::merge_operation(existing, op);
+                (!was_terminal && existing.status.is_terminal()).then(|| OpEvent {
+                    timestamp: chrono::Local::now(),
+                    kind: OpEventKind::Finished(existing.status.clone()),
+                    op_id: existing.id.clone(),
+                    title: existing.display_name(),
+                    instance: existing.instance_label.clone(),
+                    duration_ms: existing.duration_ms,
+                })
+            }
+            None => {
+                let event = OpEvent {
+                    timestamp: op.started_time,
+                    kind: if op.status.is_terminal() {
+                        OpEventKind::Finished(op.status.clone())
+                    } else {
+                        OpEventKind::Started
+                    },
+                    op_id: op.id.clone(),
+                    title: op.display_name(),
+                    instance: op.instance_label.clone(),
+                    duration_ms: op.duration_ms,
+                };
+                self.operations.push(op);
+                Some(event)
+            }
+        };
+        if let Some(event) = event {
+            self.push_op_event(event);
         }
         // Flush any output that arrived before this op was materialised (see
         // `pending_output`). Append into the (now present) op's tail via the
@@ -2456,6 +2527,64 @@ mod tests {
         assert!(s.collapsed_nodes.contains("inst:i1"));
         s.toggle_selected_tree_node();
         assert!(!s.collapsed_nodes.contains("inst:i1"));
+    }
+
+    /// The activity feed records exactly one Started per live op and one
+    /// Finished per terminal transition — repeated terminal upserts (status
+    /// re-polls) must not duplicate events.
+    #[test]
+    fn op_events_fire_once_per_transition() {
+        use crate::state::{OpEvent, OpEventKind};
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+
+        let mut op = Operation::new("op-e", "run_terminal_command", OpStatus::Running);
+        op.title = Some("cargo build".into());
+        s.upsert_operation(op.clone());
+        assert_eq!(s.events.len(), 1);
+        assert!(matches!(s.events[0].kind, OpEventKind::Started));
+        assert_eq!(s.events[0].title, "cargo build");
+
+        // Same op re-sent still running → no new event.
+        s.upsert_operation(op.clone());
+        assert_eq!(s.events.len(), 1);
+
+        // Terminal transition → one Finished event.
+        op.status = OpStatus::Succeeded;
+        op.duration_ms = Some(2100);
+        s.upsert_operation(op.clone());
+        assert_eq!(s.events.len(), 2);
+        assert!(matches!(
+            s.events[0].kind,
+            OpEventKind::Finished(OpStatus::Succeeded)
+        ));
+        assert_eq!(s.events[0].duration_ms, Some(2100));
+
+        // Re-poll of the already-terminal op → still no new event.
+        s.upsert_operation(op);
+        assert_eq!(s.events.len(), 2);
+
+        // First sight of an already-finished op (hub replay) → Finished,
+        // stamped with the op's own start time.
+        let mut replay = Operation::new("op-r", "tool", OpStatus::Failed);
+        replay.title = Some("failing thing".into());
+        s.upsert_operation(replay);
+        assert!(matches!(
+            s.events[0].kind,
+            OpEventKind::Finished(OpStatus::Failed)
+        ));
+
+        // The ring is bounded.
+        for i in 0..300 {
+            s.push_op_event(OpEvent {
+                timestamp: chrono::Local::now(),
+                kind: OpEventKind::Started,
+                op_id: format!("op-{i}"),
+                title: "t".into(),
+                instance: None,
+                duration_ms: None,
+            });
+        }
+        assert!(s.events.len() <= 200);
     }
 
     /// Enter drills into the full-screen detail overlay for op rows and keeps
@@ -3035,7 +3164,6 @@ mod tests {
 
         // Dirty scroll state that clear must reset.
         s.chat_scroll = 42;
-        s.activity_scroll = 7;
         s.ops_selected = 3;
         s.ops_scroll.set(9);
         s.log_follow = false;
@@ -3047,7 +3175,6 @@ mod tests {
         assert!(s.chat.is_empty(), "completed chat entries cleared");
         assert_eq!(s.log.len(), 1, "log feed preserved");
         assert_eq!(s.chat_scroll, 0);
-        assert_eq!(s.activity_scroll, 0);
         assert_eq!(s.ops_selected, 0);
         assert_eq!(s.ops_scroll.get(), 0);
         assert!(s.log_follow, "log re-engages tail-follow");

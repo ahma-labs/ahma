@@ -9,7 +9,7 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
@@ -1462,8 +1462,9 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
 #[cfg(feature = "tui")]
 fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     let full = frame.area();
-    if state.log_zoom_enabled {
-        let [header_a, log_a, footer_a] = Layout::vertical([
+    // A zoomed pane owns the whole screen between header and footer.
+    if let Some(zoom) = state.zoomed {
+        let [header_a, pane_a, footer_a] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(4),
             Constraint::Length(1),
@@ -1471,7 +1472,10 @@ fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         .areas(full);
 
         draw_chat_header(frame, state, theme, header_a);
-        draw_log(frame, state, theme, log_a);
+        match zoom {
+            Focus::OpsDag => draw_ops_dag(frame, state, theme, pane_a),
+            _ => draw_log(frame, state, theme, pane_a),
+        }
         draw_chat_footer(frame, state, theme, footer_a);
         return;
     }
@@ -1500,10 +1504,19 @@ fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         .clamp(1.0, 6.0) as u16;
     let input_h = input_lines + 2; // borders
 
+    // Activity feed: recent op started/finished transitions across all
+    // instances. Hidden until the first event arrives.
+    let events_h: u16 = if state.events.is_empty() {
+        0
+    } else {
+        (state.events.len() as u16 + 2).clamp(3, 9)
+    };
+
     let [
         header_a,
         monitor_a,
         approval_a,
+        events_a,
         chat_history_a,
         input_a,
         footer_a,
@@ -1511,6 +1524,7 @@ fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         Constraint::Length(1),
         Constraint::Percentage(50),
         Constraint::Length(approval_h),
+        Constraint::Length(events_h),
         Constraint::Min(4),
         Constraint::Length(input_h),
         Constraint::Length(1),
@@ -1536,12 +1550,73 @@ fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         draw_approval(frame, state, theme, approval_a);
     }
 
+    if events_h > 0 {
+        draw_activity_feed(frame, state, theme, events_a);
+    }
+
     draw_chat_history(frame, state, theme, chat_history_a);
     draw_input_box(frame, state, theme, input_a);
     draw_chat_footer(frame, state, theme, footer_a);
 
     if state.palette().is_some() {
         draw_palette(frame, state, theme, full);
+    }
+}
+
+/// Recent operation transitions across all connected instances — monitor
+/// mode's "what has been happening" history, newest first. Every row is a
+/// click target that opens the operation's full-screen detail view.
+#[cfg(feature = "tui")]
+fn draw_activity_feed(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
+    use crate::state::OpEventKind;
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Activity — click a row for details ",
+            theme.title(),
+        ))
+        .borders(Borders::ALL)
+        .border_style(theme.border_unfocused());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    for (i, event) in state.events.iter().take(inner.height as usize).enumerate() {
+        let (glyph, style) = match &event.kind {
+            OpEventKind::Started => (if state.unicode { "▶" } else { ">" }, theme.running()),
+            OpEventKind::Finished(status) => {
+                (status.glyph(state.unicode), theme.op_status_style(status))
+            }
+        };
+        let instance = event
+            .instance
+            .as_deref()
+            .map(|l| format!(" ({l})"))
+            .unwrap_or_default();
+        let duration = event
+            .duration_ms
+            .map(|ms| format!(" {}", format_duration_short(ms)))
+            .unwrap_or_default();
+
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {} ", event.timestamp.format("%H:%M:%S")),
+                theme.dim(),
+            ),
+            Span::styled(format!("{glyph} "), style),
+            Span::styled(
+                truncate(&event.title, (inner.width as usize).saturating_sub(24)),
+                theme.normal(),
+            ),
+            Span::styled(instance, theme.dim()),
+            Span::styled(duration, theme.dim()),
+        ]);
+
+        let row_rect = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+        frame.render_widget(Paragraph::new(line), row_rect);
+        state.click_targets.borrow_mut().push((
+            ClickTarget::OpenOperationDetail(event.op_id.clone()),
+            row_rect,
+        ));
     }
 }
 
@@ -1957,96 +2032,6 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 
     let para = Paragraph::new(line).style(theme.header_bar());
     frame.render_widget(para, area);
-}
-
-// ─── AI Activity ──────────────────────────────────────────────────────────────
-
-#[cfg(feature = "tui")]
-fn draw_ai_activity(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    let focused = state.focus == Focus::AiActivity;
-    let border_style = if focused {
-        theme.border_focused()
-    } else {
-        theme.border_unfocused()
-    };
-
-    let block = Block::default()
-        .title(Span::styled(" AI Activity ", theme.title()))
-        .borders(Borders::ALL)
-        .border_style(border_style);
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if state.ai_activity.is_empty() {
-        let hint = if state.server_healthy {
-            "  Awaiting AI activity…"
-        } else {
-            "  Connecting to server…"
-        };
-        frame.render_widget(Paragraph::new(Span::styled(hint, theme.dim())), inner);
-        return;
-    }
-
-    let visible_h = inner.height as usize;
-    let scroll = state
-        .activity_scroll
-        .min(state.ai_activity.len().saturating_sub(1));
-
-    let items: Vec<ListItem> = state
-        .ai_activity
-        .iter()
-        .skip(scroll)
-        .take(visible_h)
-        .map(|e| {
-            let glyph = e.status.glyph(state.unicode);
-            let ts = e.timestamp.format("%H:%M:%S").to_string();
-            let elapsed = e
-                .elapsed
-                .map(|d| {
-                    let ms = d.as_millis();
-                    if ms < 1000 {
-                        format!(" {ms}ms")
-                    } else {
-                        format!(" {}s", d.as_secs())
-                    }
-                })
-                .unwrap_or_default();
-            let summary = e
-                .summary
-                .as_deref()
-                .map(|s| format!("  → {}", truncate(s, 25)))
-                .unwrap_or_default();
-
-            let line = Line::from(vec![
-                Span::styled(format!(" {ts} "), theme.dim()),
-                Span::styled(format!("{glyph} "), theme.activity_status_style(&e.status)),
-                Span::styled(format!("{:<12}", e.method), theme.dim()),
-                Span::styled(format!("{:<18}", e.tool), theme.normal()),
-                Span::styled(elapsed, theme.dim()),
-                Span::styled(summary, theme.dim()),
-            ]);
-            ListItem::new(line)
-        })
-        .collect();
-
-    let mut list_state = if focused {
-        ListState::default().with_selected(Some(0))
-    } else {
-        ListState::default()
-    };
-
-    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, inner, &mut list_state);
-
-    draw_scrollbar(
-        frame,
-        theme,
-        state.ai_activity.len(),
-        visible_h,
-        scroll,
-        inner,
-    );
 }
 
 // ─── Operations DAG ───────────────────────────────────────────────────────────
@@ -3056,7 +3041,11 @@ fn build_log_title(state: &AppState) -> String {
         " Log: system ".to_string()
     };
     let wrap_str = if state.log_wrap_enabled { "On" } else { "Off" };
-    let zoom_str = if state.log_zoom_enabled { "On" } else { "Off" };
+    let zoom_str = if state.zoomed == Some(Focus::Log) {
+        "On"
+    } else {
+        "Off"
+    };
     let filter_indicator = log_filter_indicator(state);
     format!(
         "{}{}[Wrap: {} | Zoom: {} | Press 'l' to switch] ",
@@ -3512,18 +3501,12 @@ fn draw_approval(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect)
 #[cfg(feature = "tui")]
 fn draw_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let keys: &[(&str, &str)] = match state.focus {
-        Focus::AiActivity => &[
-            ("Tab", "next pane"),
-            ("j/k", "scroll"),
-            (":", "command"),
-            ("q", "quit"),
-            ("?", "help"),
-        ],
         Focus::OpsDag => &[
             ("Tab", "next pane"),
             ("j/k", "select"),
             ("Enter", "details"),
             ("Space", "fold"),
+            ("z", "zoom"),
             ("f", "all projects"),
             ("c", "cancel"),
             ("p", "pin"),
@@ -3534,6 +3517,7 @@ fn draw_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
             ("j/k", "scroll"),
             ("/", "filter"),
             ("g/G", "top/bottom"),
+            ("z", "zoom"),
             ("q", "quit"),
         ],
         Focus::Palette => &[("Esc", "close"), ("Tab", "complete"), ("Enter", "run")],
@@ -3662,10 +3646,6 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Click [+]/[-]", "Toggle expand/collapse"),
         ("Click card", "Open operation details"),
         ("", ""),
-        ("AI ACTIVITY", ""),
-        ("j / k", "Scroll entries"),
-        ("g / G", "Top / bottom"),
-        ("", ""),
         ("TASKS (tree)", ""),
         ("j / k", "Select row"),
         ("Enter", "Open full-screen operation details; fold headers"),
@@ -3716,10 +3696,6 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Type", "Filter providers or models"),
         ("Up / Down", "Move selection"),
         ("Enter / Esc", "Choose / cancel"),
-        ("", ""),
-        ("AI ACTIVITY", ""),
-        ("j / k", "Scroll entries"),
-        ("g / G", "Top / bottom"),
         ("", ""),
         ("TASKS (tree)", ""),
         ("j / k", "Select row"),

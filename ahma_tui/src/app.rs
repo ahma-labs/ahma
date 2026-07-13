@@ -335,7 +335,13 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
         Action::BackTab => state.focus = state.focus.cycle_prev(),
         Action::ToggleHelp => state.toggle_help(),
         Action::FocusChat => {
-            state.focus = crate::state::Focus::Chat;
+            // Esc backs out one level: restore a zoomed pane first, then
+            // return focus to the chat input.
+            if state.zoomed.is_some() {
+                state.zoomed = None;
+            } else {
+                state.focus = crate::state::Focus::Chat;
+            }
         }
         Action::Enter if state.focus == crate::state::Focus::OpsDag => {
             // Drill in: open the full-screen detail view for an operation
@@ -440,7 +446,13 @@ fn handle_log_monitor_action(
             true
         }
         Action::ToggleZoom => {
-            state.log_zoom_enabled = !state.log_zoom_enabled;
+            // Maximise/restore the focused pane. Enter on the log pane and
+            // `z` on any zoomable pane both land here.
+            if state.zoomed.is_some() {
+                state.zoomed = None;
+            } else if state.focus.is_zoomable() {
+                state.zoomed = Some(state.focus);
+            }
             true
         }
         Action::OpenLogSwitcher => {
@@ -654,7 +666,6 @@ fn scroll_focus_up(state: &mut crate::state::AppState) {
 
     match state.focus {
         Focus::OpsDag => state.ops_selected = state.ops_selected.saturating_sub(1),
-        Focus::AiActivity => state.activity_scroll = state.activity_scroll.saturating_sub(1),
         Focus::Log => {
             state.detach_log_follow();
             state.log_scroll = state.log_scroll.saturating_sub(1);
@@ -676,10 +687,6 @@ fn scroll_focus_down(state: &mut crate::state::AppState) {
     match state.focus {
         Focus::OpsDag if state.ops_row_count() > 0 => {
             state.ops_selected = (state.ops_selected + 1).min(state.ops_row_count() - 1);
-        }
-        Focus::AiActivity => {
-            let max = state.ai_activity.len().saturating_sub(1);
-            state.activity_scroll = (state.activity_scroll + 1).min(max);
         }
         // While following we are already pinned to the bottom — nothing to do
         // (falls through to the no-op arm below).
@@ -706,7 +713,6 @@ fn move_focus_to_top(state: &mut crate::state::AppState) {
 
     match state.focus {
         Focus::OpsDag => state.ops_selected = 0,
-        Focus::AiActivity => state.activity_scroll = 0,
         Focus::Log => {
             state.log_follow = false;
             state.log_scroll = 0;
@@ -726,7 +732,6 @@ fn move_focus_to_bottom(state: &mut crate::state::AppState) {
 
     match state.focus {
         Focus::OpsDag => state.ops_selected = state.ops_row_count().saturating_sub(1),
-        Focus::AiActivity => state.activity_scroll = state.ai_activity.len().saturating_sub(1),
         Focus::Log => {
             // Jump to the newest line and resume tracking new output.
             state.log_follow = true;
@@ -931,7 +936,7 @@ fn close_palette(state: &mut crate::state::AppState) {
     if state.palette().is_some() {
         state.close_modal();
     }
-    state.focus = crate::state::Focus::AiActivity;
+    state.focus = crate::state::Focus::OpsDag;
 }
 
 #[cfg(feature = "tui")]
@@ -2142,10 +2147,13 @@ fn handle_mode_nav_command(cmd: &str, state: &mut crate::state::AppState) -> boo
         "/mode chat" => {
             set_mode_and_focus(state, crate::state::Mode::Chat, crate::state::Focus::Chat)
         }
+        // Focus the task tree — the pane the user came to see. (This used to
+        // focus the removed AiActivity pane, so the first keystrokes landed
+        // in a pane that was never drawn.)
         "/mode monitor" => set_mode_and_focus(
             state,
             crate::state::Mode::Monitor,
-            crate::state::Focus::AiActivity,
+            crate::state::Focus::OpsDag,
         ),
         _ => return false,
     }
@@ -5285,6 +5293,40 @@ mod tests {
             state.windows[0].status,
             crate::state::WindowStatus::Cancelled
         );
+    }
+
+    /// `z`/Enter zoom toggles the focused pane full-screen; Esc restores the
+    /// layout before it returns focus to chat.
+    #[test]
+    fn zoom_toggles_focused_pane_and_esc_restores() {
+        use crate::keymap::Action;
+        use crate::state::{AppState, Focus};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+
+        state.focus = Focus::OpsDag;
+        super::handle_action(Action::ToggleZoom, &mut state);
+        assert_eq!(state.zoomed, Some(Focus::OpsDag));
+
+        // Esc: first unzoom (focus stays), then focus chat.
+        super::handle_action(Action::FocusChat, &mut state);
+        assert_eq!(state.zoomed, None);
+        assert_eq!(state.focus, Focus::OpsDag);
+        super::handle_action(Action::FocusChat, &mut state);
+        assert_eq!(state.focus, Focus::Chat);
+
+        // Chat focus is not zoomable.
+        super::handle_action(Action::ToggleZoom, &mut state);
+        assert_eq!(state.zoomed, None);
+    }
+
+    /// `/mode monitor` must land focus on a pane that is actually drawn.
+    #[test]
+    fn mode_monitor_focuses_task_tree() {
+        use crate::state::{AppState, Focus, Mode};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        assert!(super::handle_mode_nav_command("/mode monitor", &mut state));
+        assert_eq!(state.mode, Mode::Monitor);
+        assert_eq!(state.focus, Focus::OpsDag);
     }
 
     /// Clicking a card's body drills into the operation detail overlay;
