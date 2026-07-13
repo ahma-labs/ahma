@@ -1131,6 +1131,7 @@ fn run_unsandboxed_command(cmd_str: String, state: &mut crate::state::AppState) 
         content: vec![],
         collapsed: false,
         finished_at: None,
+        duration_ms: None,
         is_cli: true,
         command: cmd_str.clone(),
         working_dir: working_dir.clone(),
@@ -3193,6 +3194,7 @@ fn handle_decomposed_event(
             content: vec![format!("Task: {}", step.task)],
             collapsed: false,
             finished_at: None,
+            duration_ms: None,
             is_cli,
             command,
             working_dir: state.workspace.clone(),
@@ -3490,17 +3492,26 @@ fn extract_args_summary(tool_name: &str, description: &str) -> Option<String> {
 }
 
 #[cfg(feature = "tui")]
-fn format_friendly_start(
-    tool_name: &str,
-    description: &str,
-    start_time: chrono::DateTime<chrono::Local>,
-) -> String {
-    let args_summary = extract_args_summary(tool_name, description).unwrap_or_default();
-    let time_str = start_time.format("%H:%M:%S").to_string();
-    if args_summary.is_empty() {
-        format!("Starting {tool_name} at {time_str}")
+fn format_friendly_start(op: &crate::state::Operation) -> String {
+    let time_str = op.started_time.format("%H:%M:%S").to_string();
+    // When the wire carried the real command it is already shown in the
+    // window's `$` header — a bare timestamp is enough here. The parsed args
+    // summary is only a fallback for pre-R24.7 servers.
+    if op.command.is_some() {
+        return format!("Started at {time_str}");
+    }
+    let display = op.display_name();
+    // A display name other than the raw tool name already carries the parsed
+    // command — repeating it as an args summary would print it twice.
+    let args_summary = if display == op.tool_name {
+        extract_args_summary(&op.tool_name, &op.description).unwrap_or_default()
     } else {
-        format!("Starting {tool_name} ({args_summary}) at {time_str}")
+        String::new()
+    };
+    if args_summary.is_empty() {
+        format!("Starting {display} at {time_str}")
+    } else {
+        format!("Starting {display} ({args_summary}) at {time_str}")
     }
 }
 
@@ -3548,11 +3559,7 @@ fn window_content_for(op: &crate::state::Operation, unicode: bool) -> Vec<String
     );
 
     let mut content = Vec::with_capacity(op.stdout_tail.len() + 3);
-    content.push(format_friendly_start(
-        &op.tool_name,
-        &op.description,
-        op.started_time,
-    ));
+    content.push(format_friendly_start(op));
 
     // Live output tail — the command's stdout/stderr as it streams in.
     content.extend(op.stdout_tail.iter().cloned());
@@ -3583,11 +3590,35 @@ fn window_status_for(op: &crate::state::Operation) -> crate::state::WindowStatus
     }
 }
 
+/// Whether cards from several distinct instances currently interleave. With a
+/// single active instance the per-card instance suffix is pure repetition.
+#[cfg(feature = "tui")]
+fn has_multiple_instances(ops: &[crate::state::Operation]) -> bool {
+    let distinct: std::collections::HashSet<&str> = ops
+        .iter()
+        .map(|o| o.instance_label.as_deref().unwrap_or("local"))
+        .collect();
+    distinct.len() > 1
+}
+
+/// The window label: the operation's human title (`display_name`, SPEC R24.7).
+/// The owning instance is appended only when more than one instance is active —
+/// in a single-instance session the suffix would repeat on every card.
+#[cfg(feature = "tui")]
+fn window_label_for(op: &crate::state::Operation, multi_instance: bool) -> String {
+    let name = op.display_name();
+    match (&op.instance_label, multi_instance) {
+        (Some(instance), true) => format!("{name} ({instance})"),
+        _ => name,
+    }
+}
+
 #[cfg(feature = "tui")]
 fn update_existing_window(
     w: &mut crate::state::TuiWindow,
     op: &crate::state::Operation,
     unicode: bool,
+    multi_instance: bool,
 ) {
     w.status = window_status_for(op);
 
@@ -3599,6 +3630,11 @@ fn update_existing_window(
         w.finished_at = Some(std::time::Instant::now());
     }
 
+    // The server-computed title/command can arrive on a later upsert than the
+    // one that materialised the window — refresh identity, not just content.
+    w.label = window_label_for(op, multi_instance);
+    w.command = op.command.clone().unwrap_or_else(|| op.display_name());
+    w.duration_ms = op.duration_ms;
     w.content = window_content_for(op, unicode);
 }
 
@@ -3606,15 +3642,12 @@ fn update_existing_window(
 fn build_new_window(
     op: &crate::state::Operation,
     state: &mut crate::state::AppState,
+    multi_instance: bool,
 ) -> crate::state::TuiWindow {
     let win_id = state.next_window_id;
     state.next_window_id = (state.next_window_id + 1) % 100;
 
-    let label = format!(
-        "Operation: {} (instance: {})",
-        op.tool_name,
-        op.instance_label.as_deref().unwrap_or("local")
-    );
+    let label = window_label_for(op, multi_instance);
 
     let status = window_status_for(op);
     let content = window_content_for(op, state.unicode);
@@ -3651,8 +3684,9 @@ fn build_new_window(
         } else {
             None
         },
+        duration_ms: op.duration_ms,
         is_cli: true,
-        command: op.tool_name.clone(),
+        command: op.command.clone().unwrap_or_else(|| op.display_name()),
         working_dir: op.cwd.clone().unwrap_or_else(|| state.workspace.clone()),
         llm_model: None,
         visible: true,
@@ -3666,15 +3700,17 @@ fn sync_operations_to_windows(state: &mut crate::state::AppState) {
     let mut to_add = Vec::new();
     let ops = state.operations.clone();
 
+    let multi_instance = has_multiple_instances(&ops);
+
     for op in &ops {
         if let Some(w) = state
             .windows
             .iter_mut()
             .find(|w| w.op_id.as_deref() == Some(&op.id))
         {
-            update_existing_window(w, op, state.unicode);
+            update_existing_window(w, op, state.unicode, multi_instance);
         } else if !state.window_suppressed_by_clear(op) {
-            let w = build_new_window(op, state);
+            let w = build_new_window(op, state, multi_instance);
             to_add.push(w);
         }
     }
@@ -3915,12 +3951,13 @@ fn handle_operation_output(
 
     let op = state.operations[idx].clone();
     let unicode = state.unicode;
+    let multi_instance = has_multiple_instances(&state.operations);
     if let Some(w) = state
         .windows
         .iter_mut()
         .find(|w| w.op_id.as_deref() == Some(op_id))
     {
-        update_existing_window(w, &op, unicode);
+        update_existing_window(w, &op, unicode, multi_instance);
     }
 }
 
@@ -4656,6 +4693,7 @@ mod tests {
             content: vec![],
             collapsed: true,
             finished_at: None,
+            duration_ms: None,
             is_cli: true,
             command: "echo test".to_string(),
             working_dir: state.workspace.clone(),
@@ -5109,6 +5147,7 @@ mod tests {
             content: vec![],
             collapsed: false,
             finished_at: None,
+            duration_ms: None,
             is_cli: true,
             command: "pwd".to_string(),
             working_dir: state.workspace.clone(),
@@ -5141,6 +5180,79 @@ mod tests {
         assert_eq!(
             state.windows[0].status,
             crate::state::WindowStatus::Cancelled
+        );
+    }
+
+    /// The chat card must show the server-computed title and the real command
+    /// (SPEC R24.7), not the raw tool name — and refresh them when identity
+    /// arrives on a later upsert than the one that materialised the window.
+    #[tokio::test]
+    async fn window_cards_carry_op_title_and_command() {
+        use crate::state::{AppState, OpStatus, Operation};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+
+        let mut op = Operation::new("op_1", "run_terminal_command", OpStatus::Running);
+        op.instance_label = Some("antigravity-client".into());
+        state.operations.push(op);
+        super::sync_operations_to_windows(&mut state);
+
+        // No title yet, single instance → tool-name fallback, no instance suffix.
+        assert_eq!(state.windows[0].label, "run_terminal_command");
+        assert_eq!(state.windows[0].command, "run_terminal_command");
+
+        // Title + command arrive later (e.g. post-reconnect snapshot).
+        state.operations[0].title = Some("cargo nextest run".into());
+        state.operations[0].command = Some("cargo nextest run --workspace".into());
+        state.operations[0].status = OpStatus::Succeeded;
+        state.operations[0].duration_ms = Some(2140);
+        super::sync_operations_to_windows(&mut state);
+
+        assert_eq!(state.windows[0].label, "cargo nextest run");
+        assert_eq!(state.windows[0].command, "cargo nextest run --workspace");
+        assert_eq!(state.windows[0].duration_ms, Some(2140));
+        assert_eq!(
+            state.windows[0].status,
+            crate::state::WindowStatus::Finished
+        );
+    }
+
+    /// With operations from several instances, each card names its instance.
+    #[tokio::test]
+    async fn window_label_names_instance_only_when_multiple() {
+        use crate::state::{AppState, OpStatus, Operation};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+
+        let mut a = Operation::new("op_a", "run_terminal_command", OpStatus::Running);
+        a.title = Some("cargo build".into());
+        a.instance_label = Some("cursor".into());
+        let mut b = Operation::new("op_b", "run_terminal_command", OpStatus::Running);
+        b.title = Some("git status".into());
+        b.instance_label = Some("claude-code".into());
+        state.operations.push(a);
+        state.operations.push(b);
+        super::sync_operations_to_windows(&mut state);
+
+        assert_eq!(state.windows[0].label, "cargo build (cursor)");
+        assert_eq!(state.windows[1].label, "git status (claude-code)");
+    }
+
+    /// With a wire command the start line is a bare timestamp — the `$` header
+    /// already shows the command, so repeating it is noise.
+    #[test]
+    fn friendly_start_is_timestamp_only_when_command_known() {
+        use crate::state::{OpStatus, Operation};
+        let mut op = Operation::new("op_1", "run_terminal_command", OpStatus::Running);
+        op.command = Some("cargo build".into());
+        assert!(super::format_friendly_start(&op).starts_with("Started at "));
+
+        op.command = None;
+        op.title = Some("cargo build".into());
+        assert_eq!(
+            super::format_friendly_start(&op),
+            format!(
+                "Starting cargo build at {}",
+                op.started_time.format("%H:%M:%S")
+            )
         );
     }
 }

@@ -1200,6 +1200,10 @@ pub struct TuiWindow {
     pub content: Vec<String>,
     pub collapsed: bool,
     pub finished_at: Option<std::time::Instant>,
+    /// Wall-clock duration of the finished operation, for the collapsed
+    /// one-line summary. `None` while running or when the runner did not
+    /// report one.
+    pub duration_ms: Option<u64>,
     pub is_cli: bool,
     pub command: String,
     pub working_dir: String,
@@ -1207,6 +1211,22 @@ pub struct TuiWindow {
     pub visible: bool,
     pub abort_tx: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     pub op_id: Option<String>,
+}
+
+impl TuiWindow {
+    /// The most recent real output line — the collapsed running row shows it as
+    /// a live "what is it doing" tail. Skips the live-edge marker, separators,
+    /// and the friendly start line, which carry no activity information.
+    pub fn last_output_line(&self) -> Option<&str> {
+        self.content.iter().rev().map(|s| s.trim()).find(|s| {
+            !s.is_empty()
+                && *s != "____"
+                && !s.starts_with("Starting ")
+                && !s.starts_with("Started ")
+                && !s.starts_with("──")
+                && !s.starts_with("--")
+        })
+    }
 }
 
 /// Seed the liveness xorshift generator from the wall clock, forced non-zero
@@ -2827,6 +2847,7 @@ mod tests {
             content: vec![],
             collapsed: false,
             finished_at: if finished { Some(Instant::now()) } else { None },
+            duration_ms: None,
             is_cli: true,
             command: String::new(),
             working_dir: String::new(),
@@ -2835,6 +2856,25 @@ mod tests {
             abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(Some(abort_tx))),
             op_id: None,
         }
+    }
+
+    /// The live tail skips markers and friendly lines so the collapsed running
+    /// row shows real output, not scaffolding.
+    #[test]
+    fn last_output_line_skips_markers() {
+        let mut w = test_window(1, WindowStatus::Running, false);
+        w.content = vec![
+            "Started at 06:06:33".into(),
+            "Compiling ahma_core v0.16.1".into(),
+            "____".into(),
+        ];
+        assert_eq!(w.last_output_line(), Some("Compiling ahma_core v0.16.1"));
+
+        w.content = vec![
+            "Starting run_terminal_command at 06:06:33".into(),
+            "____".into(),
+        ];
+        assert_eq!(w.last_output_line(), None);
     }
 
     #[test]

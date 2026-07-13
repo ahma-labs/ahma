@@ -66,6 +66,9 @@ struct RenderedWindowLayout {
     height: u16,
     collapsed: bool,
     visible: bool,
+    /// Error windows are never auto-collapsed by the layout budget — a failure
+    /// the user has not looked at yet must not shrink to one line on its own.
+    keep_open: bool,
 }
 
 #[cfg(feature = "tui")]
@@ -88,6 +91,7 @@ fn compute_window_layouts(
                 height: preferred_h,
                 collapsed: w.collapsed,
                 visible: true,
+                keep_open: w.status == crate::state::WindowStatus::Error,
             }
         })
         .collect();
@@ -121,7 +125,7 @@ fn collapse_expanded_windows(
         if total_h <= max_h {
             break;
         }
-        if !l.collapsed {
+        if !l.collapsed && !l.keep_open {
             let old_h = l.height;
             l.collapsed = true;
             l.height = 1;
@@ -173,6 +177,35 @@ fn sandbox_status_style(status: &str, theme: &Theme) -> Style {
     }
 }
 
+/// One-character outcome mark for a terminal window status.
+fn status_glyph(status: crate::state::WindowStatus, unicode: bool) -> &'static str {
+    use crate::state::WindowStatus;
+    match (status, unicode) {
+        (WindowStatus::Finished, true) => "✓",
+        (WindowStatus::Finished, false) => "v",
+        (WindowStatus::Error, true) => "✗",
+        (WindowStatus::Error, false) => "x",
+        (WindowStatus::Cancelled, true) => "⊘",
+        (WindowStatus::Cancelled, false) => "~",
+        (WindowStatus::Pending, true) => "…",
+        (WindowStatus::Pending, false) => ".",
+        (WindowStatus::Running, _) => "",
+    }
+}
+
+/// `842ms` below one second, `2.1s` above — compact enough for a one-line row.
+fn format_duration_short(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
+/// A collapsed window is one line. Running rows keep full contrast, animate,
+/// and carry a live tail of the latest output so "what is it doing" is visible
+/// without expanding. Terminal rows compress to a dim glyph + duration + title
+/// summary that stays scannable in a stack of finished operations.
 fn draw_collapsed_window(
     frame: &mut Frame,
     w: &crate::state::TuiWindow,
@@ -180,31 +213,42 @@ fn draw_collapsed_window(
     theme: &Theme,
     status_style: Style,
 ) {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let f = (ms / 150) as usize;
-    let status_str = if w.status == crate::state::WindowStatus::Running {
-        let spinner = if theme.unicode {
-            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            frames[f % frames.len()]
-        } else {
-            let frames = ["-", "\\", "|", "/"];
-            frames[f % frames.len()]
-        };
-        format!("Running {}", spinner)
-    } else {
-        w.status.label().to_string()
-    };
-
     let mut spans = vec![
         Span::styled(" [+] ", theme.dim()),
         Span::styled(format!("{} ", w.id), theme.normal()),
-        Span::styled(format!("[{}] ", status_str), status_style),
-        Span::styled(w.label.clone(), theme.normal()),
     ];
-    let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
+    if w.status == crate::state::WindowStatus::Running {
+        spans.push(Span::styled(
+            format!("[Running {}] ", get_running_spinner(theme.unicode)),
+            status_style,
+        ));
+        spans.push(Span::styled(w.label.clone(), theme.normal()));
+        if let Some(tail) = w.last_output_line() {
+            let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+            let budget = (area.width as usize).saturating_sub(used + format!(" x{}", w.id).len());
+            if budget > 4 {
+                let sep = if theme.unicode { " — " } else { " - " };
+                spans.push(Span::styled(
+                    format!("{sep}{}", truncate(tail, budget.saturating_sub(sep.len()))),
+                    theme.dim(),
+                ));
+            }
+        }
+    } else {
+        spans.push(Span::styled(
+            format!("{} ", status_glyph(w.status, theme.unicode)),
+            status_style,
+        ));
+        if let Some(ms) = w.duration_ms {
+            spans.push(Span::styled(
+                format!("{} ", format_duration_short(ms)),
+                theme.dim(),
+            ));
+        }
+        spans.push(Span::styled(w.label.clone(), theme.dim()));
+    }
+
+    let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     let right_str = format!(" x{}", w.id);
     let pad_width = (area.width as usize).saturating_sub(left_len + right_str.len());
     if pad_width > 0 {
@@ -302,7 +346,7 @@ fn draw_expanded_window(
 /// Style for one line of window output, based on well-known status prefixes
 /// ("Starting", "Finished successfully", "Failed", "Cancelled") or separators.
 fn output_line_style(line: &str, theme: &Theme) -> Style {
-    if line.starts_with("Starting") {
+    if line.starts_with("Starting") || line.starts_with("Started at") {
         theme.dim()
     } else if line.starts_with("Finished successfully") {
         theme.success()
@@ -2681,6 +2725,12 @@ fn push_detail_summary_lines(
     theme: &Theme,
     width: usize,
 ) {
+    if let Some(cmd) = &op.command {
+        lines.push(Line::from(vec![
+            Span::styled("cmd     ", theme.dim()),
+            Span::styled(truncate(cmd, width.saturating_sub(10)), theme.normal()),
+        ]));
+    }
     if let Some(cwd) = &op.cwd {
         lines.push(Line::from(vec![
             Span::styled("cwd     ", theme.dim()),
@@ -2693,7 +2743,9 @@ fn push_detail_summary_lines(
             Span::styled(pid.to_string(), theme.normal()),
         ]));
     }
-    if !op.args.is_empty() {
+    // args are a legacy guess at the command line — redundant once the wire
+    // carries the real command.
+    if op.command.is_none() && !op.args.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("args    ", theme.dim()),
             Span::styled(
@@ -3863,6 +3915,65 @@ mod tests {
     fn char_heuristic_estimator_divides_by_four() {
         assert_eq!(CharHeuristicEstimator.estimate_tokens(4000), 1000);
         assert_eq!(CharHeuristicEstimator.estimate_tokens(3), 0);
+    }
+
+    fn layout_window(
+        status: crate::state::WindowStatus,
+        content_lines: usize,
+    ) -> crate::state::TuiWindow {
+        crate::state::TuiWindow {
+            id: 0,
+            label: "w".into(),
+            status,
+            content: vec!["line".into(); content_lines],
+            collapsed: false,
+            finished_at: None,
+            duration_ms: None,
+            is_cli: true,
+            command: String::new(),
+            working_dir: String::new(),
+            llm_model: None,
+            visible: true,
+            abort_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            op_id: None,
+        }
+    }
+
+    /// The layout budget collapses old windows to fit — but never an Error
+    /// window: a failure the user has not seen must stay readable.
+    #[test]
+    fn error_windows_survive_auto_collapse() {
+        use crate::state::WindowStatus;
+        let windows = vec![
+            layout_window(WindowStatus::Error, 6),
+            layout_window(WindowStatus::Finished, 6),
+            layout_window(WindowStatus::Finished, 6),
+        ];
+        // Each expanded window wants 8 rows; force a squeeze into 12.
+        let layouts = compute_window_layouts(&windows, 12);
+        assert!(
+            !layouts[0].collapsed,
+            "error window must not be auto-collapsed"
+        );
+        assert!(
+            layouts[1].collapsed && layouts[2].collapsed,
+            "finished windows are the ones that fold"
+        );
+    }
+
+    #[test]
+    fn status_glyphs_distinguish_outcomes() {
+        use crate::state::WindowStatus;
+        assert_eq!(status_glyph(WindowStatus::Finished, true), "✓");
+        assert_eq!(status_glyph(WindowStatus::Error, true), "✗");
+        assert_eq!(status_glyph(WindowStatus::Finished, false), "v");
+        assert_eq!(status_glyph(WindowStatus::Error, false), "x");
+    }
+
+    #[test]
+    fn duration_short_formats_ms_and_seconds() {
+        assert_eq!(format_duration_short(842), "842ms");
+        assert_eq!(format_duration_short(2140), "2.1s");
     }
 
     #[test]
