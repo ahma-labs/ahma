@@ -391,12 +391,18 @@ Before you stop work / hand off / claim “all green”, you MUST run:
 
 1. The normal test suite: `cargo nextest run`
 2. All ignored tests that apply to your platform: `cargo nextest run --workspace --run-ignored all`
+3. **Whenever you touch `Cargo.toml` or `Cargo.lock`**: the full `cargo deny check`
 
 Notes:
 - “Ignored” tests in this repo are typically expensive stress/regression coverage. They are part of the required verification set.
 - If an ignored test cannot be run due to missing prerequisites (e.g., platform-only features) or it is currently broken, you must:
   - record the reason (and how to reproduce) in your handoff/PR description
   - and fix it or open/track an issue before considering the work complete
+- **`cargo deny check`, not `cargo deny check advisories`.** The full check also enforces
+  **licences**, bans and sources — and a licence is what actually got through: `zip 8.6`'s
+  default features silently pulled in `bzip2`, whose licence is not on the allow-list, and
+  main went red (#470). A new transitive dependency arrives with a licence you did not choose,
+  so the advisories subset alone proves nothing about it.
 
 ### Before Committing
 1. **Run quality pipeline**: `cargo fmt --all && cargo clippy --all-targets && cargo nextest run` must pass

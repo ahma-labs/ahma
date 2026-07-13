@@ -1,14 +1,21 @@
 name: Fast Tier
 
 # FAST FEEDBACK for the AI/dev iteration loop. Runs on every pull-request push and gives a
-# verdict in ~5 min: cargo fmt --check, clippy, and the nextest `smoke` profile (Linux only,
-# in-process tests only — no subprocess integration suite). It is NOT the merge gate: the full
-# cross-platform matrix (.github/workflows/build.yml) runs at the merge queue and is the
-# required "CI green" check that actually authorizes a land. Keep this tier cheap and quick;
-# put thoroughness in the merge gate, not here.
+# verdict in ~5 min: cargo fmt --check, cargo deny, clippy, and the nextest `smoke` profile
+# (Linux only, in-process tests only — no subprocess integration suite).
 #
-# Trigger model: PR only. The full matrix deliberately does NOT run on pull_request, so this
-# is the sole signal during iteration. Superseded pushes are cancelled to save runner minutes.
+# This IS the merge gate. The merge-queue design was abandoned (the `merge_queue` ruleset is
+# unavailable on this repo), so `Fast Tier` is the single *required* status check on main and
+# `gh pr merge --auto` lands a PR the moment it passes. The full cross-platform matrix
+# (.github/workflows/build.yml) runs on `push` to main — i.e. AFTER the merge — as a safety
+# net; it cannot gate a PR because it does not run on `pull_request`.
+#
+# The corollary drives what belongs here: anything that can redden main and is NOT covered by
+# fmt/clippy/smoke must be added to this job, or it is caught only post-merge. `cargo deny` is
+# here for exactly that reason (see the step below). Keep the tier cheap — but "cheap" cannot
+# mean "unable to catch a whole class of breakage before it lands".
+#
+# Trigger model: PR only. Superseded pushes are cancelled to save runner minutes.
 
 permissions:
   contents: read
@@ -94,10 +101,10 @@ jobs:
             echo "LANG=C"
           } >> "$GITHUB_ENV"
 
-      - name: Install sccache and nextest
+      - name: Install sccache, nextest and cargo-deny
         uses: taiki-e/install-action@v2
         with:
-          tool: sccache,nextest
+          tool: sccache,nextest,cargo-deny
 
       - name: Add Cargo Bin to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -105,6 +112,15 @@ jobs:
       # Cheapest check first: fail in <1s on a formatting violation before any compile.
       - name: Cargo fmt --check
         run: cargo fmt --all --check
+
+      # Dependency policy. This reads Cargo.lock — no compile — so it is seconds, and it
+      # belongs HERE rather than only in build.yml: build.yml runs on `push` to main, never
+      # on `pull_request`, so before this step a licence/advisory/ban violation could not be
+      # caught by any PR gate and was *guaranteed* to land and redden main. (It did: zip 8.6's
+      # default features pulled in bzip2, whose licence is not on the allow-list — #470.)
+      # The full check, not just `advisories`: licences are exactly what got through.
+      - name: Cargo deny check
+        run: cargo deny check
 
       - name: Cargo Clippy
         run: cargo clippy --all-targets --locked
