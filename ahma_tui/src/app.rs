@@ -338,10 +338,17 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
             state.focus = crate::state::Focus::Chat;
         }
         Action::Enter if state.focus == crate::state::Focus::OpsDag => {
-            // Accordion: expand the selected task into its live/historic
-            // output view (or fold an instance/session header).
+            // Drill in: open the full-screen detail view for an operation
+            // (or fold an instance/session header).
+            state.open_selected_tree_detail();
+        }
+        Action::ToggleNode if state.focus == crate::state::Focus::OpsDag => {
+            // Space: inline accordion-expand the selected task into its
+            // live/historic output view (or fold a header) without leaving
+            // the tree.
             state.toggle_selected_tree_node();
         }
+        Action::DetailClose => state.close_modal(),
         Action::ToggleProjectFilter if state.focus == crate::state::Focus::OpsDag => {
             state.show_all_projects = !state.show_all_projects;
         }
@@ -603,6 +610,17 @@ fn handle_navigation_action(
 ) -> bool {
     use crate::keymap::Action;
 
+    // The full-screen operation detail overlay captures navigation while open.
+    if matches!(state.modal, crate::state::ModalState::OperationDetail(_)) {
+        return match action {
+            Action::Up | Action::Down | Action::Top | Action::Bottom => {
+                scroll_detail_overlay(action, state);
+                true
+            }
+            _ => false,
+        };
+    }
+
     match action {
         Action::Up => scroll_focus_up(state),
         Action::Down => scroll_focus_down(state),
@@ -612,6 +630,22 @@ fn handle_navigation_action(
     }
 
     true
+}
+
+/// Scroll the operation-detail overlay; the max is computed at draw time.
+#[cfg(feature = "tui")]
+fn scroll_detail_overlay(action: &crate::keymap::Action, state: &mut crate::state::AppState) {
+    use crate::keymap::Action;
+    let max = state.detail_max_scroll.get();
+    if let crate::state::ModalState::OperationDetail(d) = &mut state.modal {
+        match action {
+            Action::Up => d.scroll = d.scroll.saturating_sub(1),
+            Action::Down => d.scroll = (d.scroll + 1).min(max),
+            Action::Top => d.scroll = 0,
+            Action::Bottom => d.scroll = max,
+            _ => {}
+        }
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -818,11 +852,15 @@ fn handle_operation_action(
 fn request_cancel_selected_op(state: &mut crate::state::AppState) {
     use crate::state::{LogEntry, LogLevel};
 
-    let Some(op) = state.selected_op() else {
+    // Inside the detail overlay `c` cancels the operation being viewed, not
+    // whatever the tree selection happens to be behind it.
+    let id = if let crate::state::ModalState::OperationDetail(d) = &state.modal {
+        d.op_id.clone()
+    } else if let Some(op) = state.selected_op() {
+        op.id.clone()
+    } else {
         return;
     };
-
-    let id = op.id.clone();
     state.push_log(LogEntry {
         timestamp: chrono::Local::now(),
         level: LogLevel::Info,
@@ -1872,7 +1910,11 @@ fn handle_chat_input_key(
     use crate::state::Focus;
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    if state.focus != Focus::Chat || state.text_entry_modal_open() || state.log_filter_active {
+    if state.focus != Focus::Chat
+        || state.text_entry_modal_open()
+        || state.log_filter_active
+        || matches!(state.modal, crate::state::ModalState::OperationDetail(_))
+    {
         return false;
     }
 
@@ -4302,6 +4344,9 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
             state.toggle_selected_tree_node();
             state.focus = crate::state::Focus::OpsDag;
         }
+        ClickTarget::OpenOperationDetail(op_id) => {
+            state.open_operation_detail(op_id);
+        }
     }
 }
 
@@ -4310,7 +4355,8 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
 /// the click to be on the title row.
 #[cfg(feature = "tui")]
 fn is_close_button_click(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
-    let in_close_zone = col >= rect.x + rect.width.saturating_sub(5);
+    // Wide enough for the explicit "[x99]" close cell plus its margin.
+    let in_close_zone = col >= rect.x + rect.width.saturating_sub(6);
     if rect.height == 1 {
         in_close_zone
     } else {
@@ -4324,6 +4370,7 @@ fn handle_window_rect_click(col: u16, row: u16, state: &mut crate::state::AppSta
     enum Hit {
         Close(usize),
         Toggle(usize),
+        Detail(usize),
     }
     let hit = {
         let rects = state.window_rects.borrow();
@@ -4333,8 +4380,10 @@ fn handle_window_rect_click(col: u16, row: u16, state: &mut crate::state::AppSta
             }
             if is_close_button_click(col, row, rect) {
                 Some(Hit::Close(win_id))
-            } else {
+            } else if is_collapse_marker_click(col, row, rect) {
                 Some(Hit::Toggle(win_id))
+            } else {
+                Some(Hit::Detail(win_id))
             }
         })
     };
@@ -4350,8 +4399,40 @@ fn handle_window_rect_click(col: u16, row: u16, state: &mut crate::state::AppSta
             }
             true
         }
+        Some(Hit::Detail(win_id)) => {
+            // Click on the card body = drill into the operation's full-screen
+            // detail view. Windows without a backing operation (UNSANDBOXED
+            // CLI runs, LLM steps) keep the old expand/collapse behavior.
+            let op_id = state
+                .windows
+                .iter()
+                .find(|w| w.id == win_id)
+                .and_then(|w| w.op_id.clone());
+            match op_id {
+                Some(id) => state.open_operation_detail(id),
+                None => {
+                    if let Some(w) = state.windows.iter_mut().find(|w| w.id == win_id) {
+                        w.collapsed = !w.collapsed;
+                    }
+                }
+            }
+            true
+        }
         None => false,
     }
+}
+
+/// The `[+] N` / `[-] N` marker at the left edge of a card's title row —
+/// clicking it toggles expand/collapse rather than drilling into the detail
+/// view. Collapsed cards are one row; expanded cards count only their top row.
+#[cfg(feature = "tui")]
+fn is_collapse_marker_click(col: u16, row: u16, rect: ratatui::layout::Rect) -> bool {
+    let on_title_row = if rect.height == 1 {
+        true
+    } else {
+        row == rect.y
+    };
+    on_title_row && col < rect.x + 8
 }
 
 #[cfg(feature = "tui")]
@@ -4391,6 +4472,17 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
 
 #[cfg(feature = "tui")]
 fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
+    // The operation-detail overlay covers the screen — wheel scrolls it.
+    let detail_max = state.detail_max_scroll.get();
+    if let crate::state::ModalState::OperationDetail(d) = &mut state.modal {
+        d.scroll = if up {
+            d.scroll.saturating_sub(1)
+        } else {
+            (d.scroll + 1).min(detail_max)
+        };
+        return;
+    }
+
     let chat_area = state.chat_area.get();
     if col >= chat_area.x
         && col < chat_area.x + chat_area.width
@@ -4462,6 +4554,18 @@ fn page_size_for_height(height: u16) -> f64 {
 
 #[cfg(feature = "tui")]
 fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
+    // The operation-detail overlay captures paging while open.
+    let detail_max = state.detail_max_scroll.get();
+    if let crate::state::ModalState::OperationDetail(d) = &mut state.modal {
+        let page = 10;
+        d.scroll = if up {
+            d.scroll.saturating_sub(page)
+        } else {
+            (d.scroll + page).min(detail_max)
+        };
+        return;
+    }
+
     let panel = determine_scrolled_panel(state);
 
     if panel == "chat" {
@@ -5181,6 +5285,43 @@ mod tests {
             state.windows[0].status,
             crate::state::WindowStatus::Cancelled
         );
+    }
+
+    /// Clicking a card's body drills into the operation detail overlay;
+    /// the `[+]` marker zone still toggles collapse; the `[x]` zone closes.
+    #[tokio::test]
+    async fn card_click_zones_route_detail_toggle_and_close() {
+        use crate::state::{AppState, ModalState, OpStatus, Operation};
+        use ratatui::layout::Rect;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+
+        let mut op = Operation::new("op_9", "run_terminal_command", OpStatus::Running);
+        op.title = Some("cargo build".into());
+        state.operations.push(op);
+        super::sync_operations_to_windows(&mut state);
+        let win_id = state.windows[0].id;
+
+        // Simulate the drawn frame: card occupies a 40x3 rect at origin.
+        let rect = Rect::new(0, 0, 40, 3);
+        state.window_rects.borrow_mut().push((win_id, rect));
+
+        // Body click (below the title row) → detail overlay.
+        assert!(super::handle_window_rect_click(20, 1, &mut state));
+        match &state.modal {
+            ModalState::OperationDetail(d) => assert_eq!(d.op_id, "op_9"),
+            other => panic!("expected detail overlay, got {other:?}"),
+        }
+        state.modal = ModalState::None;
+
+        // Collapse-marker click (title row, far left) → toggle, no overlay.
+        let was_collapsed = state.windows[0].collapsed;
+        assert!(super::handle_window_rect_click(2, 0, &mut state));
+        assert_eq!(state.windows[0].collapsed, !was_collapsed);
+        assert!(matches!(state.modal, ModalState::None));
+
+        // Close-cell click (title row, far right) → hidden.
+        assert!(super::handle_window_rect_click(38, 0, &mut state));
+        assert!(!state.windows[0].visible);
     }
 
     /// The chat card must show the server-computed title and the real command

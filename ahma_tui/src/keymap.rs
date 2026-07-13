@@ -24,6 +24,11 @@ pub enum Action {
     CancelOp,
     AwaitOp,
     PinOp,
+    /// Fold/unfold the selected task-tree node inline (Space) — Enter drills
+    /// into the full-screen detail view instead.
+    ToggleNode,
+    /// Close the full-screen operation detail overlay.
+    DetailClose,
     /// Toggle the task tree between this project's instances and all projects.
     ToggleProjectFilter,
     // Toggles
@@ -97,6 +102,7 @@ pub fn map_key(
         ModalState::Navigator(_) => return map_navigator_key(key),
         ModalState::LogFiles { .. } => return map_log_modal_key(key),
         ModalState::Palette(_) => return map_palette_key(key),
+        ModalState::OperationDetail(_) => return map_op_detail_key(key),
         _ => {}
     }
 
@@ -176,6 +182,27 @@ fn map_log_modal_key(key: KeyEvent) -> Action {
     }
 }
 
+// ─── Operation detail overlay ─────────────────────────────────────────────────
+
+/// Keys inside the full-screen operation detail view: close (Esc/q/Enter),
+/// scroll (j/k/arrows, g/G), and cancel the viewed operation (c).
+#[cfg(feature = "tui")]
+fn map_op_detail_key(key: KeyEvent) -> Action {
+    use KeyCode::*;
+    use KeyModifiers as KM;
+
+    match (key.code, key.modifiers) {
+        (Esc, _) | (Char('q'), KM::NONE) | (Enter, _) => Action::DetailClose,
+        (Char('c'), KM::CONTROL) => Action::Quit,
+        (Up, _) | (Char('k'), KM::NONE) => Action::Up,
+        (Down, _) | (Char('j'), KM::NONE) => Action::Down,
+        (Char('g'), KM::NONE) => Action::Top,
+        (Char('G'), KM::SHIFT) | (Char('G'), KM::NONE) => Action::Bottom,
+        (Char('c'), KM::NONE) => Action::CancelOp,
+        _ => Action::Unknown,
+    }
+}
+
 // ─── Global (monitor) keys ───────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
@@ -214,6 +241,7 @@ fn map_global_key(key: KeyEvent, focus: Focus) -> Action {
         (Char('a'), KM::NONE) if focus == Focus::OpsDag => Action::AwaitOp,
         (Char('p'), KM::NONE) if focus == Focus::OpsDag => Action::PinOp,
         (Char('f'), KM::NONE) if focus == Focus::OpsDag => Action::ToggleProjectFilter,
+        (Char(' '), KM::NONE) if focus == Focus::OpsDag => Action::ToggleNode,
 
         // Toggles
         (Char('?'), _) => Action::ToggleHelp,
@@ -312,6 +340,65 @@ mod tests {
 
     fn none_modal() -> ModalState {
         ModalState::None
+    }
+
+    fn op_detail_modal() -> ModalState {
+        ModalState::OperationDetail(crate::state::OperationDetailState {
+            op_id: "op_1".into(),
+            scroll: 0,
+        })
+    }
+
+    // ─── Operation detail overlay dispatch (map_op_detail_key) ──────────────────
+
+    #[test]
+    fn op_detail_close_and_scroll_keys() {
+        for (key, want) in [
+            (kn(KeyCode::Esc), Action::DetailClose),
+            (kn(KeyCode::Char('q')), Action::DetailClose),
+            (kn(KeyCode::Enter), Action::DetailClose),
+            (kn(KeyCode::Char('j')), Action::Down),
+            (kn(KeyCode::Char('k')), Action::Up),
+            (kn(KeyCode::Char('g')), Action::Top),
+            (k(KeyCode::Char('G'), KeyModifiers::SHIFT), Action::Bottom),
+            (kn(KeyCode::Char('c')), Action::CancelOp),
+        ] {
+            assert_eq!(
+                map_key(key, Mode::Chat, Focus::Chat, &op_detail_modal(), false),
+                want,
+                "key {key:?}"
+            );
+        }
+    }
+
+    /// The overlay outranks chat-input mapping even while chat is focused —
+    /// typing must not leak into the input box behind the overlay.
+    #[test]
+    fn op_detail_swallows_plain_chars() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('x')),
+                Mode::Chat,
+                Focus::Chat,
+                &op_detail_modal(),
+                false
+            ),
+            Action::Unknown
+        );
+    }
+
+    #[test]
+    fn space_folds_tree_node_in_ops_focus() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char(' ')),
+                Mode::Monitor,
+                Focus::OpsDag,
+                &none_modal(),
+                false
+            ),
+            Action::ToggleNode
+        );
     }
 
     // ─── Navigator modal dispatch (map_navigator_key) ───────────────────────────

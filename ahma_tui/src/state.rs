@@ -1070,6 +1070,8 @@ pub enum ClickTarget {
     /// A row of the monitor task tree: click selects it and toggles it
     /// (accordion expand for ops, collapse for instance/session headers).
     TreeRow(usize),
+    /// Open the full-screen detail view for the operation with this id.
+    OpenOperationDetail(String),
 }
 
 // ─── Command palette ──────────────────────────────────────────────────────────
@@ -1139,6 +1141,18 @@ pub enum ModalState {
     ModelPicker(PickerState),
     /// The log-file switcher, with the highlighted row index.
     LogFiles { selected: usize },
+    /// Full-screen drill-in for one operation (Enter or click on it).
+    OperationDetail(OperationDetailState),
+}
+
+/// State of the full-screen operation detail overlay.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OperationDetailState {
+    /// Id of the operation being inspected.
+    pub op_id: String,
+    /// Scroll offset into the rendered lines; clamped at draw time via
+    /// [`AppState::detail_max_scroll`].
+    pub scroll: usize,
 }
 
 impl ModalState {
@@ -1394,6 +1408,9 @@ pub struct AppState {
     pub chat_input_height_target: std::cell::Cell<f64>,
     pub chat_input_height_current: std::cell::Cell<f64>,
     pub chat_max_scroll: std::cell::Cell<usize>,
+    /// Max scroll of the operation-detail overlay, computed at draw time from
+    /// the rendered line count so key handlers can clamp (`G`, `j`).
+    pub detail_max_scroll: std::cell::Cell<usize>,
     pub log_max_scroll: std::cell::Cell<usize>,
     pub activity_scroll: usize,
     /// Tracked token usage for the current session.
@@ -1811,6 +1828,7 @@ impl AppState {
             chat_input_height_target: std::cell::Cell::new(1.0),
             chat_input_height_current: std::cell::Cell::new(1.0),
             chat_max_scroll: std::cell::Cell::new(0),
+            detail_max_scroll: std::cell::Cell::new(0),
             log_max_scroll: std::cell::Cell::new(0),
             activity_scroll: 0,
             token_usage: ahma_llm_monitor::client::TokenUsage::default(),
@@ -2142,6 +2160,39 @@ impl AppState {
             .and_then(|i| self.operations.get(i))
     }
 
+    /// Open the full-screen detail overlay for one operation.
+    pub fn open_operation_detail(&mut self, op_id: String) {
+        self.detail_max_scroll.set(0);
+        self.modal = ModalState::OperationDetail(OperationDetailState { op_id, scroll: 0 });
+    }
+
+    /// Enter on the selected task-tree row: drill into an operation's
+    /// full-screen detail view; fold/unfold an instance or session header.
+    /// (The inline accordion toggle stays on [`Self::toggle_selected_tree_node`].)
+    pub fn open_selected_tree_detail(&mut self) {
+        use crate::task_tree::RowKind;
+        let action = {
+            let rows = self.task_rows.borrow();
+            rows.get(self.ops_selected).map(|r| match &r.kind {
+                RowKind::Instance { group_id, .. } => TreeToggle::Fold(format!("inst:{group_id}")),
+                RowKind::Group { key, .. } => TreeToggle::Fold(key.clone()),
+                RowKind::Op { op_index, .. } | RowKind::Output { op_index, .. } => {
+                    TreeToggle::Expand(*op_index)
+                }
+            })
+        };
+        match action {
+            Some(TreeToggle::Fold(key)) => self.toggle_collapse_key(key),
+            Some(TreeToggle::Expand(op_index)) => {
+                if let Some(op) = self.operations.get(op_index) {
+                    let id = op.id.clone();
+                    self.open_operation_detail(id);
+                }
+            }
+            None => {}
+        }
+    }
+
     /// Enter/click on the selected task-tree row: accordion-expand an
     /// operation (collapsing the previously expanded one), or fold/unfold an
     /// instance or session header.
@@ -2405,6 +2456,54 @@ mod tests {
         assert!(s.collapsed_nodes.contains("inst:i1"));
         s.toggle_selected_tree_node();
         assert!(!s.collapsed_nodes.contains("inst:i1"));
+    }
+
+    /// Enter drills into the full-screen detail overlay for op rows and keeps
+    /// the fold behavior for instance headers.
+    #[test]
+    #[cfg(feature = "tui")]
+    fn enter_opens_detail_overlay_for_ops_and_folds_headers() {
+        use crate::task_tree::{RowKind, TreeRow};
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        s.operations
+            .push(Operation::new("op-a", "tool", OpStatus::Running));
+        *s.task_rows.borrow_mut() = vec![
+            TreeRow {
+                kind: RowKind::Instance {
+                    group_id: "i1".into(),
+                    label: "claude-code".into(),
+                    detail: String::new(),
+                    counts: Default::default(),
+                    collapsed: false,
+                },
+                depth: 0,
+            },
+            TreeRow {
+                kind: RowKind::Op {
+                    op_index: 0,
+                    expanded: false,
+                },
+                depth: 1,
+            },
+        ];
+
+        // Op row → detail overlay opens on that op, scroll reset.
+        s.ops_selected = 1;
+        s.open_selected_tree_detail();
+        match &s.modal {
+            ModalState::OperationDetail(d) => {
+                assert_eq!(d.op_id, "op-a");
+                assert_eq!(d.scroll, 0);
+            }
+            other => panic!("expected OperationDetail modal, got {other:?}"),
+        }
+
+        // Header row → folds, no overlay.
+        s.modal = ModalState::None;
+        s.ops_selected = 0;
+        s.open_selected_tree_detail();
+        assert!(matches!(s.modal, ModalState::None));
+        assert!(s.collapsed_nodes.contains("inst:i1"));
     }
 
     /// Before any frame is drawn the row list is empty and selection falls

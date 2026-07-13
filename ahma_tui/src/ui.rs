@@ -43,6 +43,9 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
         crate::state::ModalState::LogFiles { .. } => {
             draw_log_files_modal(frame, state, theme, full)
         }
+        crate::state::ModalState::OperationDetail(detail) => {
+            draw_operation_detail(frame, state, detail, theme, full)
+        }
     }
     if state.settings_editor.open {
         draw_settings_panel(frame, state, theme, full);
@@ -249,7 +252,7 @@ fn draw_collapsed_window(
     }
 
     let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let right_str = format!(" x{}", w.id);
+    let right_str = format!(" [x{}]", w.id);
     let pad_width = (area.width as usize).saturating_sub(left_len + right_str.len());
     if pad_width > 0 {
         spans.push(Span::raw(" ".repeat(pad_width)));
@@ -289,7 +292,7 @@ fn build_window_title(w: &crate::state::TuiWindow, width: u16, unicode: bool) ->
     };
 
     let title_left = format!(" [-] {} {} {}", w.id, status_str, w.label);
-    let title_right = format!("x{} ", w.id);
+    let title_right = format!("[x{}] ", w.id);
     let pad_width = title_space.saturating_sub(title_left.len() + title_right.len());
     if pad_width > 0 {
         format!("{}{}{}", title_left, " ".repeat(pad_width), title_right)
@@ -341,6 +344,183 @@ fn draw_expanded_window(
 
     let para = Paragraph::new(content_lines).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
+}
+
+/// Full-screen drill-in for one operation (Enter or click on a card/tree row).
+///
+/// Shows the complete identity (title, real command, cwd, instance, origin),
+/// the outcome (status, exit code, duration), alerts, and a scrollable view of
+/// the buffered output tail. Scroll state lives in [`OperationDetailState`];
+/// the max offset is published through `state.detail_max_scroll` so the key
+/// handlers can clamp without re-rendering.
+#[cfg(feature = "tui")]
+fn draw_operation_detail(
+    frame: &mut Frame,
+    state: &AppState,
+    detail: &crate::state::OperationDetailState,
+    theme: &Theme,
+    area: Rect,
+) {
+    // The overlay owns the screen: drop click targets and window rects that
+    // the layers underneath registered this frame so a click cannot reach a
+    // covered card or tree row.
+    state.click_targets.borrow_mut().clear();
+    state.window_rects.borrow_mut().clear();
+
+    frame.render_widget(Clear, area);
+
+    let op = state.operations.iter().find(|o| o.id == detail.op_id);
+    let title = match op {
+        Some(op) => format!(" Operation — {} ", truncate(&op.display_name(), 60)),
+        None => " Operation (no longer tracked) ".to_string(),
+    };
+    let block = Block::default()
+        .title(Span::styled(title, theme.title()))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 2 {
+        return;
+    }
+
+    let Some(op) = op else {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "This operation is gone (cleared or from a closed instance). Esc to close.",
+                theme.dim(),
+            ))),
+            inner,
+        );
+        state.detail_max_scroll.set(0);
+        return;
+    };
+
+    // Bottom row: action buttons + key hints; everything above scrolls.
+    let [body_a, footer_a] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    let lines = operation_detail_lines(op, theme, body_a.width as usize);
+    let max_scroll = lines.len().saturating_sub(body_a.height as usize);
+    state.detail_max_scroll.set(max_scroll);
+    let scroll = detail.scroll.min(max_scroll);
+
+    let para = Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll as u16, 0));
+    frame.render_widget(para, body_a);
+
+    // Footer: clickable actions on the left, key hints on the right.
+    let is_live = matches!(
+        op.status,
+        crate::state::OpStatus::Running
+            | crate::state::OpStatus::Pending
+            | crate::state::OpStatus::Waiting
+    );
+    let cancel_btn = if is_live { " [Cancel] " } else { "" };
+    let pin_btn = if op.pinned { " [Unpin] " } else { " [Pin] " };
+    let analyze_btn = " [Analyze] ";
+
+    let mut x = footer_a.x;
+    let mut register = |label: &str, target: Option<ClickTarget>| -> Span<'static> {
+        let w = label.chars().count() as u16;
+        if let Some(t) = target
+            && w > 0
+        {
+            let rect = Rect::new(x, footer_a.y, w.min(footer_a.width), 1);
+            state.click_targets.borrow_mut().push((t, rect));
+        }
+        x += w;
+        Span::styled(label.to_string(), theme.running())
+    };
+    let spans = vec![
+        register(
+            cancel_btn,
+            (!cancel_btn.is_empty()).then(|| ClickTarget::CancelOperation(op.id.clone())),
+        ),
+        register(pin_btn, Some(ClickTarget::PinOperation(op.id.clone()))),
+        register(
+            analyze_btn,
+            Some(ClickTarget::AnalyzeOperation(op.id.clone())),
+        ),
+        Span::styled(
+            "  Esc close · j/k scroll · g/G top/bottom · c cancel",
+            theme.dim(),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(spans)), footer_a);
+}
+
+/// The scrollable body of the operation detail overlay.
+#[cfg(feature = "tui")]
+fn operation_detail_lines(
+    op: &crate::state::Operation,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let kv = |k: &str, v: String, style: Style| {
+        Line::from(vec![
+            Span::styled(format!("{k:<10}"), theme.dim()),
+            Span::styled(v, style),
+        ])
+    };
+
+    let mut lines = vec![kv("id", op.id.clone(), theme.normal())];
+    if let Some(instance) = &op.instance_label {
+        lines.push(kv("instance", instance.clone(), theme.normal()));
+    }
+    if let Some(origin) = &op.origin {
+        lines.push(kv("origin", origin.clone(), theme.normal()));
+    }
+    let mut status = format!("{:?}", op.status);
+    if let Some(code) = op.exit_code {
+        status.push_str(&format!(" (exit {code})"));
+    }
+    lines.push(kv("status", status, theme.op_status_style(&op.status)));
+    lines.push(kv(
+        "started",
+        op.started_time.format("%Y-%m-%d %H:%M:%S").to_string(),
+        theme.normal(),
+    ));
+    lines.push(kv("duration", op.elapsed_display(), theme.normal()));
+    if let Some(cwd) = &op.cwd {
+        lines.push(kv("cwd", cwd.clone(), theme.normal()));
+    }
+    if let Some(pid) = op.pid {
+        lines.push(kv("pid", pid.to_string(), theme.normal()));
+    }
+    if let Some(cmd) = &op.command {
+        // The full command, wrapped by the Paragraph — shown in full, this is
+        // the detail view's reason to exist.
+        lines.push(kv("command", format!("$ {cmd}"), theme.normal()));
+    }
+    for alert in &op.alerts {
+        lines.push(kv("alert", format!("⚠ {alert}"), theme.failed()));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "─".repeat(width.max(1)),
+        theme.dim(),
+    )));
+
+    if op.stdout_tail.is_empty() {
+        lines.push(Line::from(Span::styled("(no output yet)", theme.dim())));
+    } else {
+        for out in &op.stdout_tail {
+            lines.push(Line::from(Span::styled(out.clone(), theme.normal())));
+        }
+    }
+    if let Some(summary) = &op.result_summary {
+        lines.push(Line::from(Span::styled(
+            "─".repeat(width.max(1)),
+            theme.dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            summary.clone(),
+            theme.op_status_style(&op.status),
+        )));
+    }
+    lines
 }
 
 /// Style for one line of window output, based on well-known status prefixes
@@ -3342,7 +3522,8 @@ fn draw_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         Focus::OpsDag => &[
             ("Tab", "next pane"),
             ("j/k", "select"),
-            ("Enter", "expand"),
+            ("Enter", "details"),
+            ("Space", "fold"),
             ("f", "all projects"),
             ("c", "cancel"),
             ("p", "pin"),
@@ -3477,8 +3658,9 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("/n", "Restore/expand window n"),
         ("/xn", "Close/cancel window n"),
         ("/quit", "Quit the application"),
-        ("Mouse Click on Xn", "Close/cancel window"),
-        ("Mouse Click on Window", "Toggle expand/collapse"),
+        ("Click [xn]", "Close/cancel window"),
+        ("Click [+]/[-]", "Toggle expand/collapse"),
+        ("Click card", "Open operation details"),
         ("", ""),
         ("AI ACTIVITY", ""),
         ("j / k", "Scroll entries"),
@@ -3486,8 +3668,9 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("", ""),
         ("TASKS (tree)", ""),
         ("j / k", "Select row"),
+        ("Enter", "Open full-screen operation details; fold headers"),
         (
-            "Enter / Click",
+            "Space / Click",
             "Expand task into live/historic output (accordion); fold headers",
         ),
         ("f", "Toggle this-project / all-projects filter"),
@@ -3540,8 +3723,9 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("", ""),
         ("TASKS (tree)", ""),
         ("j / k", "Select row"),
+        ("Enter", "Open full-screen operation details; fold headers"),
         (
-            "Enter / Click",
+            "Space / Click",
             "Expand task into live/historic output (accordion); fold headers",
         ),
         ("f", "Toggle this-project / all-projects filter"),
