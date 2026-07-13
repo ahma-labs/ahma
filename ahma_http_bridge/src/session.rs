@@ -1037,6 +1037,30 @@ impl SessionManager {
         self.sessions.get(session_id).map(|s| s.clone())
     }
 
+    /// Mark a session's sandbox as `Failed`, so `tools/call` returns a definite
+    /// 403 with `reason` instead of leaving the client to guess.
+    ///
+    /// Used when the sandbox provably cannot be established — e.g. the client
+    /// returned no roots and no fallback scope is configured. Saying so at once
+    /// beats parking the session in `AwaitingRoots` until the handshake times out,
+    /// which is both a worse message and a window in which some *other* event could
+    /// open the gate.
+    pub fn fail_sandbox(&self, session_id: &str, reason: &str) {
+        let Some(session) = self.get_session(session_id) else {
+            return;
+        };
+        if let Err(e) = session
+            .sandbox_state_machine
+            .transition_to_failed(reason.to_string())
+        {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "Could not mark sandbox Failed (already in a terminal state)"
+            );
+        }
+    }
+
     /// Get all active sessions
     pub fn get_all_sessions(&self) -> Vec<Arc<Session>> {
         self.sessions

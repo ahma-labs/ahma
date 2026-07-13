@@ -185,10 +185,23 @@ fn build_server_spec(
         sandbox_scope.to_string_lossy().to_string(),
     ];
 
-    if let Some(timeout) = handshake_timeout_secs {
-        args.push("--handshake-timeout".to_string());
-        args.push(timeout.to_string());
-    }
+    // The server's handshake deadline must be as patient as the client's wait.
+    //
+    // Tests that do not care pass `None` — which used to leave the bridge on its
+    // unscaled 45s default while the *client* waited a platform-scaled 240s
+    // (60s × 4) on Windows. On a slow runner the server's sweeper then terminated
+    // the session at 45s and the client spent the next three minutes retrying
+    // against a corpse, failing with "HTTP 403 ... Session not found or
+    // terminated" — which is exactly how `test_roots_uri_parsing_file_localhost`
+    // failed on windows-latest.
+    //
+    // Scaling both ends with the same policy removes the asymmetry. Tests that
+    // deliberately exercise handshake *timeout* behaviour pass an explicit
+    // `Some(..)` and are unaffected.
+    let handshake_timeout_secs = handshake_timeout_secs
+        .unwrap_or_else(|| TestTimeouts::get(TimeoutCategory::Handshake).as_secs());
+    args.push("--handshake-timeout".to_string());
+    args.push(handshake_timeout_secs.to_string());
 
     args.extend([
         "serve".to_string(),

@@ -771,12 +771,40 @@ async fn try_lock_sandbox_from_roots(
         return;
     };
 
+    // An empty roots list is a *decision point*, not a no-op.
+    //
+    // This used to just `return`, leaving the session parked in `AwaitingRoots`
+    // forever: `resolve_sandbox_scopes` — which already knows exactly what to do
+    // here (use the configured fallback scope, or reject with an actionable
+    // message) — was never even called. The session then hung on whatever won the
+    // race: the gate correctly 409ing, or the subprocess's own zero-scope
+    // `configured` notification prematurely opening it.
+    //
+    // So: with a fallback scope configured, fall through and let
+    // `resolve_sandbox_scopes` apply it. Without one, fail the session *now*, with
+    // the reason, so `tools/call` returns a deterministic 403 instead of hanging
+    // until the handshake times out.
     if !should_lock_sandbox(&mcp_roots) {
+        if session_manager.requires_client_roots() {
+            warn!(
+                session_id = %session_id,
+                "Client returned an empty roots list and no fallback sandbox scope is \
+                 configured; failing the session rather than leaving it unlocked"
+            );
+            session_manager.fail_sandbox(
+                session_id,
+                "Client did not provide roots/list entries. Configure an explicit sandbox \
+                 scope on server startup (e.g. --sandbox-scope /path/to/project) or use a \
+                 client that supports roots/list.",
+            );
+            return;
+        }
+
         debug!(
             session_id = %session_id,
-            "Skipping sandbox lock: roots list is empty (client has no workspace folder open)"
+            "Roots list is empty (client has no workspace folder open); using the configured \
+             fallback sandbox scope"
         );
-        return;
     }
 
     info!(
@@ -1847,17 +1875,63 @@ mod tests {
 
     // ─── try_lock_sandbox_from_roots ────────────────────────────────────
 
+    /// Empty roots with no fallback scope must FAIL the session, not leave it in
+    /// limbo.
+    ///
+    /// This test previously asserted the session stayed in `AwaitingRoots` — which
+    /// encoded the bug. Parking there meant `resolve_sandbox_scopes` (which has a
+    /// correct, actionable rejection for exactly this case) was never called, and
+    /// the session's fate was decided by whatever won a race: the `tools/call` gate
+    /// correctly 409ing, or the subprocess's own zero-scope `configured`
+    /// notification prematurely flipping it to `Active` and opening the gate. That
+    /// race is the CI flake in `test_empty_roots_rejection`.
+    ///
+    /// Failing immediately is both the honest answer and a deterministic one.
     #[tokio::test]
-    async fn try_lock_sandbox_from_empty_roots_does_not_lock() {
+    async fn empty_roots_without_a_fallback_scope_fails_the_session() {
         let mgr = keepalive_manager();
+        assert!(
+            mgr.requires_client_roots(),
+            "precondition: no fallback scope is configured"
+        );
         let id = mgr.create_session().await.expect("create session");
-        let result = json!({"roots": []});
-        try_lock_sandbox_from_roots(&mgr, &id, &result).await;
-        // Sandbox must remain unlocked (still AwaitingRoots) for empty roots.
-        assert!(matches!(
-            mgr.get_session(&id).unwrap().current_sandbox_state(),
-            SandboxState::AwaitingRoots
-        ));
+
+        try_lock_sandbox_from_roots(&mgr, &id, &json!({"roots": []})).await;
+
+        match mgr.get_session(&id).unwrap().current_sandbox_state() {
+            SandboxState::Failed { error } => assert!(
+                error.contains("roots/list") && error.contains("sandbox scope"),
+                "the failure must tell the user how to fix it, got: {error}"
+            ),
+            other => panic!("empty roots must fail the session, got {other:?}"),
+        }
+    }
+
+    /// With a fallback scope configured, empty roots are not an error at all — the
+    /// fallback applies. The early `return` used to skip that too.
+    #[tokio::test]
+    async fn empty_roots_with_a_fallback_scope_locks_to_the_fallback() {
+        let scope = std::env::temp_dir().join("ahma-fallback-scope");
+        let mgr = manager_with(
+            Some(scope.clone()),
+            10,
+            3600,
+            Arc::new(KeepAlivePeerFactory),
+        );
+        assert!(
+            !mgr.requires_client_roots(),
+            "precondition: fallback exists"
+        );
+        let id = mgr.create_session().await.expect("create session");
+
+        try_lock_sandbox_from_roots(&mgr, &id, &json!({"roots": []})).await;
+
+        match mgr.get_session(&id).unwrap().current_sandbox_state() {
+            SandboxState::Configuring { scopes } | SandboxState::Active { scopes } => {
+                assert_eq!(scopes, vec![scope], "the fallback scope must be applied");
+            }
+            other => panic!("expected the fallback scope to be locked, got {other:?}"),
+        }
     }
 
     // ─── forward_notification_sse ───────────────────────────────────────

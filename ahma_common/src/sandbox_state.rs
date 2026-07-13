@@ -179,11 +179,39 @@ impl SandboxStateMachine {
     /// provided `scopes` win. Terminal states (`Failed`, `Terminated`) are
     /// preserved and yield an error. Already-`Active` is a no-op success
     /// (idempotent).
+    ///
+    /// From `AwaitingRoots`, however, **empty `scopes` are refused**. There is no
+    /// `Configuring` state to fall back on, so an empty notification would lock the
+    /// session to *nothing* while opening the `tools/call` gate — a sandbox that was
+    /// never established. Only a notification that actually names scopes may lock
+    /// directly from `AwaitingRoots`.
     pub fn transition_to_active_with_scopes(
         &self,
         scopes: Vec<PathBuf>,
     ) -> Result<(), InvalidTransition> {
         self.inner.modify(|state| match state {
+            // From `AwaitingRoots` the bridge has not yet validated the client's
+            // roots, so the notification is the *only* evidence of a scope. If it
+            // carries none, there is nothing to enforce and this is not a lock —
+            // refuse it, or the `tools/call` gate opens on a sandbox that was never
+            // established (SPEC: tools/call before lock must return 409 / -32001).
+            //
+            // This is not hypothetical. A subprocess whose own deferred sandbox
+            // falls back to zero scopes emits `configured` with an empty scope
+            // list; the bridge flipped `AwaitingRoots -> Active`, opened the gate,
+            // and forwarded a `tools/call` to a subprocess so unscoped it could not
+            // read its own tools directory — which surfaced as the nonsense error
+            // "Tool 'pwd' not found", and only on a slow enough machine for the
+            // notification to win the race.
+            SandboxState::AwaitingRoots if scopes.is_empty() => (
+                false,
+                Err(InvalidTransition {
+                    from: "AwaitingRoots",
+                    action: "to_active_with_scopes(empty)",
+                }),
+            ),
+            // A notification that *does* name scopes still locks directly from
+            // `AwaitingRoots` — that is what fixes the stuck-session race above.
             SandboxState::AwaitingRoots => {
                 *state = SandboxState::Active { scopes };
                 (true, Ok(()))
@@ -471,5 +499,69 @@ mod tests {
             &*rx.borrow_and_update(),
             SandboxState::Configuring { .. }
         ));
+    }
+
+    /// A `configured` notification carrying NO scopes must not lock the session.
+    ///
+    /// Regression (the CI flake in `test_empty_roots_rejection`): a subprocess whose
+    /// own deferred sandbox fell back to zero scopes emitted `configured` with an
+    /// empty scope list. The bridge flipped `AwaitingRoots -> Active`, opening the
+    /// `tools/call` gate on a sandbox that was never established — violating the
+    /// invariant that tools/call before lock returns 409 / -32001. It then forwarded
+    /// the call to a subprocess so unscoped it could not read its own tools
+    /// directory, which surfaced as the nonsense error "Tool 'pwd' not found".
+    ///
+    /// Only reproducible when the notification won a race, so it presented as
+    /// flakiness. It is a state-machine bug, and it is pinned here as one.
+    #[test]
+    fn awaiting_roots_refuses_an_empty_scope_lock() {
+        let sm = SandboxStateMachine::new();
+        assert!(matches!(sm.current(), SandboxState::AwaitingRoots));
+
+        let err = sm
+            .transition_to_active_with_scopes(vec![])
+            .expect_err("an empty `configured` is not a lock and must be refused");
+        assert_eq!(err.from, "AwaitingRoots");
+
+        assert!(
+            matches!(sm.current(), SandboxState::AwaitingRoots),
+            "the session must stay gated, not become Active with nothing to enforce"
+        );
+    }
+
+    /// ...but a notification that DOES name scopes still locks directly from
+    /// `AwaitingRoots`. This is what fixes the older stuck-session race (a
+    /// `configured` arriving before `AwaitingRoots -> Configuring` used to be a
+    /// no-op, leaving `tools/call` 409ing forever), so the fix above must not
+    /// regress it.
+    #[test]
+    fn awaiting_roots_still_locks_when_the_notification_names_scopes() {
+        let sm = SandboxStateMachine::new();
+        let scope = std::env::temp_dir().join("ws");
+
+        sm.transition_to_active_with_scopes(vec![scope.clone()])
+            .expect("a scoped `configured` locks directly from AwaitingRoots");
+
+        match sm.current() {
+            SandboxState::Active { scopes } => assert_eq!(scopes, vec![scope]),
+            other => panic!("expected Active, got {other:?}"),
+        }
+    }
+
+    /// From `Configuring`, an empty notification still reuses the in-flight scopes —
+    /// there the bridge HAS validated roots, so the scope is already known.
+    #[test]
+    fn configuring_still_reuses_scopes_on_an_empty_notification() {
+        let sm = SandboxStateMachine::new();
+        let scope = std::env::temp_dir().join("ws");
+        sm.transition_to_configuring(vec![scope.clone()]).unwrap();
+
+        sm.transition_to_active_with_scopes(vec![])
+            .expect("empty scopes from Configuring reuse the in-flight ones");
+
+        match sm.current() {
+            SandboxState::Active { scopes } => assert_eq!(scopes, vec![scope]),
+            other => panic!("expected Active, got {other:?}"),
+        }
     }
 }

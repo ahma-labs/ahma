@@ -586,11 +586,22 @@ mod tests {
 
     /// Read one chunk of the proxy's response with a timeout.
     /// Returns the bytes read (may be empty if the proxy closed the connection).
+    ///
+    /// The timeout is a *hang bound*, not an assertion: these tests assert on the
+    /// bytes the proxy writes back, never on how quickly it writes them. A
+    /// hard-coded 5s was therefore a latent flake — on a loaded 2-core CI runner the
+    /// proxy simply hadn't answered yet, and `connect_session_denied_domain_returns_
+    /// 407_without_reprompting` failed with "read timed out" on macOS. Use the shared,
+    /// platform-scaled policy (30s, ×4 on Windows) so a slow runner is tolerated while
+    /// a genuine hang is still caught.
     async fn read_chunk(client: &mut TcpStream) -> Vec<u8> {
         let mut resp = vec![0u8; 2048];
-        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut resp))
+        let timeout = ahma_common::timeouts::TestTimeouts::get(
+            ahma_common::timeouts::TimeoutCategory::HttpRequest,
+        );
+        let n = tokio::time::timeout(timeout, client.read(&mut resp))
             .await
-            .expect("read timed out")
+            .expect("proxy did not respond before the hang bound")
             .expect("read failed");
         resp.truncate(n);
         resp
