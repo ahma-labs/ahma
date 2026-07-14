@@ -146,14 +146,53 @@ where
     .map_err(|_| anyhow!("reconnect: timed out waiting for roots/list"))?
 }
 
+/// Async hook that respawns the background bridge. Provided by the frontend
+/// path (which owns the `AppConfig` needed to spawn); `None` elsewhere.
+#[cfg(unix)]
+pub type BridgeRespawnFn = Box<
+    dyn FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> + Send,
+>;
+
+/// True when a reconnect failure indicates the bridge endpoint itself is gone
+/// (socket file unlinked, nothing listening) rather than a transient error on
+/// a live endpoint. Re-dialing a gone endpoint can never succeed — only
+/// respawning the bridge restores service.
+#[cfg(unix)]
+fn reconnect_failure_wants_respawn(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>()
+            && matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+        {
+            return true;
+        }
+    }
+    // Some transport layers stringify the underlying io error instead of
+    // preserving it in the error chain.
+    let text = format!("{err:#}");
+    text.contains("No such file or directory")
+        || text.contains("Connection refused")
+        || text.contains("(os error 2)")
+        || text.contains("(os error 61)")
+}
+
 /// Rebuild the bridge connection (via `reconnect`) and replay the cached
 /// handshake, retrying up to [`MAX_RECONNECT_ATTEMPTS`] times with a short
 /// backoff. Returns the freshly reconnected client on success.
+///
+/// When an attempt fails because the bridge endpoint is *gone* (not merely
+/// glitching) and a `respawn` hook is available, the hook is invoked before
+/// the next attempt so the retry has a live bridge to dial — without this the
+/// proxy could only re-dial a socket that no longer exists until the attempts
+/// were exhausted, and the client saw the server as dead.
 #[cfg(unix)]
 async fn reconnect_with_retries<C>(
     reconnect: &mut dyn FnMut() -> Result<C>,
     handshake: &CachedHandshake,
     transport: &str,
+    mut respawn: Option<&mut BridgeRespawnFn>,
 ) -> Result<C>
 where
     C: Transport<RoleClient>,
@@ -177,6 +216,23 @@ where
                     error = %e,
                     "Reconnect attempt failed"
                 );
+                if attempt < MAX_RECONNECT_ATTEMPTS
+                    && let Some(respawn) = respawn.as_deref_mut()
+                    && reconnect_failure_wants_respawn(&e)
+                {
+                    tracing::warn!(
+                        transport,
+                        "Bridge endpoint is gone; respawning background bridge before \
+                         the next reconnect attempt"
+                    );
+                    if let Err(spawn_err) = respawn().await {
+                        tracing::warn!(
+                            transport,
+                            error = %spawn_err,
+                            "Background bridge respawn failed"
+                        );
+                    }
+                }
                 last_err = Some(e);
             }
         }
@@ -217,13 +273,17 @@ fn reconnect_backoff_base() -> Duration {
 /// message (normal session end).  Returns `Ok(false)` or `Err` when the bridge
 /// closed the connection before sending any response back to the client, which
 /// typically indicates a stale or incompatible bridge daemon.
-pub async fn run_proxy_client(uds_path: Option<&str>, http_url: Option<&str>) -> Result<bool> {
+pub async fn run_proxy_client(
+    uds_path: Option<&str>,
+    http_url: Option<&str>,
+    respawn_bridge: Option<BridgeRespawnFn>,
+) -> Result<bool> {
     let handshake_deadline = frontend_handshake_deadline();
 
     #[cfg(unix)]
     if let Some(path) = uds_path {
         tracing::info!(socket = path, "Proxying stdio to Unix Domain Socket");
-        return run_proxy_client_unix(path, handshake_deadline).await;
+        return run_proxy_client_unix(path, handshake_deadline, respawn_bridge).await;
     }
 
     if let Some(url) = http_url {
@@ -241,6 +301,7 @@ pub async fn run_proxy_client(uds_path: Option<&str>, http_url: Option<&str>) ->
 async fn run_proxy_client_unix(
     socket_path: &str,
     handshake_deadline: Option<Duration>,
+    respawn_bridge: Option<BridgeRespawnFn>,
 ) -> Result<bool> {
     use ahma_http_mcp_client::unix_client::unix_socket_transport;
 
@@ -260,6 +321,7 @@ async fn run_proxy_client_unix(
         "unix",
         handshake_deadline,
         &mut reconnect,
+        respawn_bridge,
     )
     .await;
     if let Err(ref e) = result {
@@ -275,6 +337,7 @@ async fn run_transport_proxy<S, C>(
     transport: &str,
     handshake_deadline: Option<Duration>,
     reconnect: &mut dyn FnMut() -> Result<C>,
+    mut respawn_bridge: Option<BridgeRespawnFn>,
 ) -> Result<bool>
 where
     S: Transport<RoleServer> + Send + 'static,
@@ -370,7 +433,14 @@ where
                         // (mirrors the handshake-deadline exit above: an
                         // unhandshaked connection is abandoned, not resumed).
                         if handshake.init_request.is_some() {
-                            match reconnect_with_retries(reconnect, &handshake, transport).await {
+                            match reconnect_with_retries(
+                                reconnect,
+                                &handshake,
+                                transport,
+                                respawn_bridge.as_mut(),
+                            )
+                            .await
+                            {
                                 Ok(fresh) => {
                                     tracing::warn!(
                                         transport,
@@ -1009,7 +1079,7 @@ mod tests {
         let client = state.client(1);
         let mut reconnect = || -> Result<MockClient> { Err(anyhow!("no reconnect in this test")) };
 
-        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect).await;
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
         assert!(
             result.is_ok(),
             "proxy must survive a single forward failure"
@@ -1040,7 +1110,7 @@ mod tests {
             panic!("must not attempt reconnect without an observed handshake")
         };
 
-        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect).await;
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
         assert!(result.is_ok());
         // Gives up after MAX_CONSECUTIVE_FORWARD_FAILURES; request 4 is never tried.
         assert_eq!(
@@ -1103,7 +1173,7 @@ mod tests {
             };
 
             let result =
-                run_transport_proxy(stdio, dead_client, "test", None, &mut reconnect).await;
+                run_transport_proxy(stdio, dead_client, "test", None, &mut reconnect, None).await;
             assert!(
                 result.is_ok_and(|responded| responded),
                 "reconnect must mark the bridge as having responded"
@@ -1161,12 +1231,136 @@ mod tests {
             };
 
             let result =
-                run_transport_proxy(stdio, dead_client, "test", None, &mut reconnect).await;
+                run_transport_proxy(stdio, dead_client, "test", None, &mut reconnect, None).await;
             assert!(result.is_ok(), "proxy must exit cleanly, not error out");
             assert_eq!(
                 reconnect_calls.load(Ordering::SeqCst),
                 MAX_RECONNECT_ATTEMPTS as usize,
                 "must try reconnecting exactly MAX_RECONNECT_ATTEMPTS times, then give up"
+            );
+        })
+        .await;
+    }
+
+    /// Endpoint-gone errors (socket unlinked, nothing listening) call for a
+    /// bridge respawn; other reconnect failures do not.
+    #[test]
+    fn reconnect_failure_wants_respawn_classifies_errors() {
+        let not_found = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory",
+        ))
+        .context("Failed to reconnect proxy to UDS /tmp/ahma.sock");
+        assert!(reconnect_failure_wants_respawn(&not_found));
+
+        let refused = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Connection refused",
+        ));
+        assert!(reconnect_failure_wants_respawn(&refused));
+
+        // Stringified io error (chain lost by an intermediate layer).
+        let stringified = anyhow!(
+            "UnexpectedServerResponse: Client(Io(Os {{ code: 2, kind: NotFound, \
+             message: \"No such file or directory\" }}))"
+        );
+        assert!(reconnect_failure_wants_respawn(&stringified));
+
+        let unrelated = anyhow!("bridge answered with a malformed initialize response");
+        assert!(!reconnect_failure_wants_respawn(&unrelated));
+    }
+
+    /// REGRESSION (2026-07-14 live incident): when the bridge endpoint is gone
+    /// — its socket was unlinked out from under it — re-dialing can never
+    /// succeed. The proxy must invoke the respawn hook and then reconnect to
+    /// the freshly spawned bridge, resuming the session instead of exhausting
+    /// retries and presenting a dead server to the client.
+    #[tokio::test]
+    async fn respawn_hook_revives_a_gone_bridge_endpoint() {
+        with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let stdio = MockStdio::new(
+                VecDeque::from(vec![
+                    client_initialize(0),
+                    client_request(1),
+                    client_request(2),
+                    client_request(3),
+                ]),
+                sent.clone(),
+            );
+
+            let dead_client = MockClient {
+                fail_first_n: usize::MAX,
+                attempts: Arc::new(AtomicUsize::new(0)),
+                inbound: VecDeque::new(),
+                closed: Arc::new(AtomicUsize::new(0)),
+                receive_none_after: None,
+                receive_call_count: Arc::new(AtomicUsize::new(0)),
+                close_behavior: CloseBehavior::Ok,
+                sent: None,
+            };
+
+            // Until the respawn hook has run, reconnecting fails exactly the
+            // way a gone endpoint does (io NotFound). After respawn, dialing
+            // succeeds.
+            let respawned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let respawned_for_reconnect = respawned.clone();
+            let fresh_attempts = Arc::new(AtomicUsize::new(0));
+            let fresh_attempts_inner = fresh_attempts.clone();
+            let mut reconnect = move || -> Result<MockClient> {
+                if !respawned_for_reconnect.load(Ordering::SeqCst) {
+                    return Err(anyhow::Error::from(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "No such file or directory",
+                    ))
+                    .context("Failed to reconnect proxy to UDS /tmp/test.sock"));
+                }
+                Ok(MockClient {
+                    fail_first_n: 0,
+                    attempts: fresh_attempts_inner.clone(),
+                    inbound: VecDeque::from(vec![bridge_response(0)]),
+                    closed: Arc::new(AtomicUsize::new(0)),
+                    receive_none_after: None,
+                    receive_call_count: Arc::new(AtomicUsize::new(0)),
+                    close_behavior: CloseBehavior::Ok,
+                    sent: None,
+                })
+            };
+
+            let respawn_calls = Arc::new(AtomicUsize::new(0));
+            let respawn_calls_inner = respawn_calls.clone();
+            let respawned_inner = respawned.clone();
+            let respawn: BridgeRespawnFn = Box::new(move || {
+                let respawn_calls = respawn_calls_inner.clone();
+                let respawned = respawned_inner.clone();
+                Box::pin(async move {
+                    respawn_calls.fetch_add(1, Ordering::SeqCst);
+                    respawned.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+
+            let result = run_transport_proxy(
+                stdio,
+                dead_client,
+                "test",
+                None,
+                &mut reconnect,
+                Some(respawn),
+            )
+            .await;
+            assert!(
+                result.is_ok_and(|responded| responded),
+                "session must resume against the respawned bridge"
+            );
+            assert_eq!(
+                respawn_calls.load(Ordering::SeqCst),
+                1,
+                "the respawn hook must run exactly once"
+            );
+            assert!(
+                fresh_attempts.load(Ordering::SeqCst) > 0,
+                "traffic must flow to the respawned bridge"
             );
         })
         .await;
@@ -1293,7 +1487,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_proxy_client_without_target_errors() {
-        let result = run_proxy_client(None, None).await;
+        let result = run_proxy_client(None, None, None).await;
         let err = result.expect_err("no socket or URL must be an error");
         assert!(
             err.to_string().contains("No socket or HTTP URL provided"),
@@ -1316,7 +1510,7 @@ mod tests {
         client.inbound = VecDeque::from(vec![bridge_response(1)]);
 
         let mut reconnect = no_reconnect;
-        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect).await;
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
         assert!(
             matches!(result, Ok(true)),
             "bridge responded → Ok(true), got {result:?}"
@@ -1350,7 +1544,7 @@ mod tests {
         let client = state.client(0);
 
         let mut reconnect = no_reconnect;
-        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect).await;
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
         assert!(
             matches!(result, Ok(false)),
             "no bridge response → Ok(false), got {result:?}"
@@ -1393,7 +1587,7 @@ mod tests {
         client.inbound = VecDeque::from(vec![bridge_response(1)]);
 
         let mut reconnect = no_reconnect;
-        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect).await;
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
         assert!(
             matches!(result, Ok(false)),
             "stdio write failure must not mark bridge_responded, got {result:?}"
@@ -1421,7 +1615,7 @@ mod tests {
         client.close_behavior = CloseBehavior::Err;
 
         let mut reconnect = no_reconnect;
-        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect).await;
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
         assert!(
             matches!(result, Ok(false)),
             "close() error must be non-fatal, got {result:?}"
@@ -1450,7 +1644,7 @@ mod tests {
         client.close_behavior = CloseBehavior::Hang(Duration::from_secs(100));
 
         let mut reconnect = no_reconnect;
-        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect).await;
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
         assert!(
             matches!(result, Ok(false)),
             "close() timeout must be non-fatal, got {result:?}"
@@ -1476,7 +1670,7 @@ mod tests {
         client.receive_none_after = Some(2);
 
         let mut reconnect = no_reconnect;
-        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect).await;
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
         assert!(
             matches!(result, Ok(false)),
             "bridge-initiated close must report bridge_responded == false, got {result:?}"
@@ -1514,7 +1708,7 @@ mod tests {
         let client = state.client(usize::MAX);
 
         let mut reconnect = no_reconnect;
-        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect).await;
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
         assert!(result.is_ok());
         assert_eq!(
             state.attempts.load(Ordering::SeqCst),

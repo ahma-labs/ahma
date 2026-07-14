@@ -577,8 +577,12 @@ async fn proxy_to_matching_bridge(
     tracing::info!(
         "Local bridge server is already running (v{bridge_version_raw}). Forwarding stdio as a proxy client."
     );
+    // No respawn hook here: this path has no AppConfig to spawn with, and a
+    // stale same-version bridge already falls back to restart-and-respawn
+    // below (AHMA_RESTARTED lineage guard).
     let proxy_result =
-        crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt).await;
+        crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt, None)
+            .await;
     match proxy_result {
         // Bridge responded normally — this was a real MCP session that ended cleanly.
         Ok(true) => Ok(Some(())),
@@ -1203,11 +1207,33 @@ async fn run_as_frontend_and_proxy(
     crate::utils::parent_watchdog::spawn_parent_death_watchdog();
 
     spawn_background_bridge(config, socket_path_opt, http_url_opt).await?;
+
+    // Respawn hook: if the bridge later dies or its socket vanishes (e.g. it
+    // was killed out-of-band), the proxy's reconnect loop can bring a fresh
+    // bridge up instead of re-dialing a gone endpoint until it gives up.
+    let respawn_bridge: crate::shell::modes::proxy_client::BridgeRespawnFn = {
+        let config = config.clone();
+        let socket_path = socket_path_opt.map(str::to_string);
+        let http_url = http_url_opt.map(str::to_string);
+        Box::new(move || {
+            let config = config.clone();
+            let socket_path = socket_path.clone();
+            let http_url = http_url.clone();
+            Box::pin(async move {
+                spawn_background_bridge(&config, socket_path.as_deref(), http_url.as_deref()).await
+            })
+        })
+    };
+
     // Proceed with proxy setup — map Ok(bool) → Ok(()) since the caller only
     // cares about success/failure at this final stage.
-    crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
-        .await
-        .map(|_| ())
+    crate::shell::modes::proxy_client::run_proxy_client(
+        socket_path_opt,
+        http_url_opt,
+        Some(respawn_bridge),
+    )
+    .await
+    .map(|_| ())
 }
 
 #[cfg(test)]
