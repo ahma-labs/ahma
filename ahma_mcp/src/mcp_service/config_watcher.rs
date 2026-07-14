@@ -697,12 +697,17 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
-    /// Poll interval / timeout for [`assert_eventually`] in this module's
-    /// config-watcher tests. Generous enough to absorb scheduler contention on
-    /// a busy dev machine or CI runner (the watcher's own debounce is 200ms,
-    /// plus a 2s polling-fallback cycle) without slowing the common case,
-    /// since `assert_eventually` returns as soon as the condition is true.
-    const WATCHER_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Timeout for [`assert_eventually`] in this module's config-watcher tests.
+    ///
+    /// A reload runs the tool-availability probes, which spawn subprocesses, so
+    /// this tracks the shared `ProcessSpawn` budget and inherits its platform
+    /// multipliers (Windows CI, coverage builds). A flat 10s used to be hard-coded
+    /// here and timed out under the process-spawn contention of a full-suite run —
+    /// nothing is lost by waiting longer, because `assert_eventually` polls and
+    /// returns the moment the condition holds.
+    fn watcher_timeout() -> Duration {
+        TestTimeouts::get(TimeoutCategory::ProcessSpawn)
+    }
     const WATCHER_POLL: Duration = Duration::from_millis(25);
 
     // ── parse_root_uri_to_scope ──────────────────────────────────────────────
@@ -1236,7 +1241,7 @@ mod tests {
         // Wait for the startup sync to complete (polled, not a fixed sleep —
         // a fixed delay flakes under scheduler contention).
         assert_eventually(
-            WATCHER_TIMEOUT,
+            watcher_timeout(),
             WATCHER_POLL,
             "pre_existing tool loaded by the startup sync",
             || async { service.configs.read().unwrap().contains_key("pre_existing") },
@@ -1266,7 +1271,7 @@ mod tests {
         // Wait for the watcher's debounce + reload to pick it up (polled, not
         // a fixed sleep — a fixed delay flakes under scheduler contention).
         assert_eventually(
-            WATCHER_TIMEOUT,
+            watcher_timeout(),
             WATCHER_POLL,
             "dynamic_tool detected and loaded by the fs watcher",
             || async { service.configs.read().unwrap().contains_key("dynamic_tool") },
@@ -1295,7 +1300,7 @@ mod tests {
         // spawned watcher task may not have reached the startup-sync step
         // yet on a busy machine).
         assert_eventually(
-            WATCHER_TIMEOUT,
+            watcher_timeout(),
             WATCHER_POLL,
             "remove_me loaded by startup sync",
             || async { service.configs.read().unwrap().contains_key("remove_me") },
@@ -1307,7 +1312,7 @@ mod tests {
 
         // Wait for the watcher to fire and reload.
         assert_eventually(
-            WATCHER_TIMEOUT,
+            watcher_timeout(),
             WATCHER_POLL,
             "remove_me removed after the file is deleted",
             || async { !service.configs.read().unwrap().contains_key("remove_me") },
@@ -1335,7 +1340,7 @@ mod tests {
         // the overwrite below genuinely exercises the fs-watcher reload path
         // rather than racing to be included in the startup sync itself.
         assert_eventually(
-            WATCHER_TIMEOUT,
+            watcher_timeout(),
             WATCHER_POLL,
             "editable loaded with its original description by startup sync",
             || async {
@@ -1359,7 +1364,7 @@ mod tests {
 
         // Wait for the watcher to detect and reload.
         assert_eventually(
-            WATCHER_TIMEOUT,
+            watcher_timeout(),
             WATCHER_POLL,
             "editable description updated to 'modified' after reload",
             || async {
