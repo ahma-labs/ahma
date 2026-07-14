@@ -392,6 +392,16 @@ AGPL and build verification work together as a two-layer supply chain defense:
   backed by Sigstore, ensuring the binary was built directly from the official repository
   by the CI pipeline. The installer verifies this attestation before writing anything to disk.
 
+`ahma update` and `ahma verify --self` check this attestation automatically, but that check
+runs *in-band* — inside the very binary whose integrity is in question. For the higher standard,
+verify **out-of-band** instead: an independent tool queries Sigstore's public transparency log
+directly, so the result doesn't depend on trusting the artifact you're trying to verify.
+
+```bash
+gh attestation verify ahma-release-linux-x86_64.tar.gz \
+  --repo paulirotta/ahma
+```
+
 Together they protect against:
 
 | Attack | AGPL | Verification |
