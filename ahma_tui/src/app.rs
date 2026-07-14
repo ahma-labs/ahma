@@ -3454,6 +3454,16 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
             });
             state.chat_scroll = 0;
         }
+        BridgeEvent::Truncated { reason } => {
+            // Never leave a cut-off response looking like a silent hang: a
+            // visible note in the transcript itself, right where the user is
+            // already looking, before the continuation's tokens start arriving.
+            state.chat.push(ChatEntry::Assistant {
+                content: format!("[{reason}]"),
+                streaming: false,
+            });
+            state.chat_scroll = 0;
+        }
         BridgeEvent::Decomposed { steps } => {
             handle_decomposed_event(steps, state);
         }

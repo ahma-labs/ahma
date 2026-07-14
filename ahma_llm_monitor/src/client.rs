@@ -197,6 +197,20 @@ pub struct ChatCompletionResponse {
     pub tool_calls: Vec<ChatToolCall>,
     pub assistant_message: Value,
     pub usage: Option<TokenUsage>,
+    /// Why the model stopped generating, normalized across providers:
+    /// `"length"` means the response was cut off by a token/context limit
+    /// (OpenAI/Ollama's own `"length"`, Anthropic's `"max_tokens"`) rather
+    /// than the model actually finishing its turn. `None` when the provider
+    /// didn't report one.
+    pub finish_reason: Option<String>,
+}
+
+impl ChatCompletionResponse {
+    /// Whether this response was cut off by a length/token limit rather than
+    /// the model finishing its turn on its own. See [`Self::finish_reason`].
+    pub fn is_length_truncated(&self) -> bool {
+        matches!(self.finish_reason.as_deref(), Some("length"))
+    }
 }
 
 /// A discovered local LLM provider.
@@ -891,7 +905,7 @@ impl StreamingToolAccumulator {
 
     /// Reassemble into a `{choices:[{message}]}` JSON value (with optional
     /// `usage`) for [`parse_chat_completion_response`].
-    fn into_response_json(self, usage: Option<Value>) -> Value {
+    fn into_response_json(self, usage: Option<Value>, finish_reason: Option<String>) -> Value {
         let tool_calls: Vec<Value> = self
             .tools
             .into_iter()
@@ -915,7 +929,11 @@ impl StreamingToolAccumulator {
         if !tool_calls.is_empty() {
             message["tool_calls"] = Value::Array(tool_calls);
         }
-        let mut out = json!({ "choices": [{ "message": message }] });
+        let mut choice = json!({ "message": message });
+        if let Some(reason) = finish_reason {
+            choice["finish_reason"] = json!(reason);
+        }
+        let mut out = json!({ "choices": [choice] });
         if let Some(u) = usage {
             out["usage"] = u;
         }
@@ -1044,6 +1062,7 @@ async fn drain_streaming_deltas(
     let mut buffer = String::new();
     let mut acc = StreamingToolAccumulator::default();
     let mut usage: Option<Value> = None;
+    let mut finish_reason: Option<String> = None;
     let mut first_token_logged = false;
 
     'outer: loop {
@@ -1060,6 +1079,12 @@ async fn drain_streaming_deltas(
             };
             if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
                 usage = Some(u.clone());
+            }
+            if let Some(reason) = chunk
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+            {
+                finish_reason = Some(reason.to_string());
             }
             let (content_delta, thinking_delta) = acc.push_chunk(&chunk);
             if let Some(c) = content_delta {
@@ -1083,7 +1108,7 @@ async fn drain_streaming_deltas(
         }
     }
 
-    Ok(acc.into_response_json(usage))
+    Ok(acc.into_response_json(usage, finish_reason))
 }
 
 async fn chat_stream_poll(
@@ -1192,11 +1217,17 @@ fn parse_chat_completion_response(json: Value) -> Result<ChatCompletionResponse,
         total_tokens: u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0) as u32,
     });
 
+    let finish_reason = json
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .map(String::from);
+
     Ok(ChatCompletionResponse {
         content,
         tool_calls,
         assistant_message,
         usage,
+        finish_reason,
     })
 }
 
@@ -1255,7 +1286,7 @@ mod tests {
         assert_eq!(content, "On it. ");
         assert_eq!(thinking, "Let me check.");
 
-        let resp = parse_chat_completion_response(acc.into_response_json(None)).unwrap();
+        let resp = parse_chat_completion_response(acc.into_response_json(None, None)).unwrap();
         assert_eq!(resp.content, "On it. ");
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].id, "call_a");
@@ -1268,7 +1299,7 @@ mod tests {
         let mut acc = StreamingToolAccumulator::default();
         acc.push_chunk(&json!({"choices":[{"delta":{"content":"Hello"}}]}));
         acc.push_chunk(&json!({"choices":[{"delta":{"content":" world"}}]}));
-        let resp = parse_chat_completion_response(acc.into_response_json(None)).unwrap();
+        let resp = parse_chat_completion_response(acc.into_response_json(None, None)).unwrap();
         assert_eq!(resp.content, "Hello world");
         assert!(resp.tool_calls.is_empty());
     }
@@ -1344,5 +1375,70 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.completion_tokens, 50);
         assert_eq!(usage.total_tokens, 150);
+    }
+
+    #[test]
+    fn parse_chat_completion_response_extracts_finish_reason() {
+        let response = json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "cut off mid" },
+                "finish_reason": "length"
+            }]
+        });
+        let parsed = parse_chat_completion_response(response).unwrap();
+        assert_eq!(parsed.finish_reason.as_deref(), Some("length"));
+        assert!(parsed.is_length_truncated());
+    }
+
+    #[test]
+    fn parse_chat_completion_response_normal_stop_is_not_truncated() {
+        let response = json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "Done." },
+                "finish_reason": "stop"
+            }]
+        });
+        let parsed = parse_chat_completion_response(response).unwrap();
+        assert_eq!(parsed.finish_reason.as_deref(), Some("stop"));
+        assert!(!parsed.is_length_truncated());
+    }
+
+    #[test]
+    fn parse_chat_completion_response_missing_finish_reason_is_not_truncated() {
+        let response = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "Done." } }]
+        });
+        let parsed = parse_chat_completion_response(response).unwrap();
+        assert_eq!(parsed.finish_reason, None);
+        assert!(!parsed.is_length_truncated());
+    }
+
+    #[tokio::test]
+    async fn drain_streaming_deltas_captures_finish_reason_from_sse() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+                   data: [DONE]\n\n";
+        let stream = futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse))]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let json = drain_streaming_deltas(stream, &tx, "test-model", std::time::Instant::now())
+            .await
+            .unwrap();
+        let resp = parse_chat_completion_response(json).unwrap();
+        assert_eq!(resp.content, "hi");
+        assert!(resp.is_length_truncated());
+    }
+
+    #[tokio::test]
+    async fn drain_streaming_deltas_normal_stop_is_not_truncated() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                   data: [DONE]\n\n";
+        let stream = futures::stream::iter(vec![Ok::<_, reqwest::Error>(bytes::Bytes::from(sse))]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let json = drain_streaming_deltas(stream, &tx, "test-model", std::time::Instant::now())
+            .await
+            .unwrap();
+        let resp = parse_chat_completion_response(json).unwrap();
+        assert!(!resp.is_length_truncated());
     }
 }

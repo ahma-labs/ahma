@@ -47,6 +47,11 @@ pub enum BridgeEvent {
         tx: tokio::sync::oneshot::Sender<bool>,
     },
     Usage(ahma_llm_monitor::client::TokenUsage),
+    /// The model's response was cut off by a length/context limit; the agent
+    /// is requesting a continuation. See [`ahma_core::agent::AgentEvent::Truncated`].
+    Truncated {
+        reason: String,
+    },
 }
 
 pub type McpChatConfig = ahma_core::agent::McpChatConfig;
@@ -107,6 +112,9 @@ pub fn spawn_agent_task(
                     BridgeEvent::ToolCallFinished { id, result, failed }
                 }
                 ahma_core::agent::AgentEvent::Usage(u) => BridgeEvent::Usage(u),
+                ahma_core::agent::AgentEvent::Truncated { reason } => {
+                    BridgeEvent::Truncated { reason }
+                }
             };
             let _ = tx.send(bridge_evt).await;
         }
@@ -136,6 +144,9 @@ pub fn spawn_chat_task(
                     BridgeEvent::ToolCallFinished { id, result, failed }
                 }
                 ahma_core::agent::AgentEvent::Usage(u) => BridgeEvent::Usage(u),
+                ahma_core::agent::AgentEvent::Truncated { reason } => {
+                    BridgeEvent::Truncated { reason }
+                }
             };
             let _ = tx.send(bridge_evt).await;
         }

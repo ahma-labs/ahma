@@ -29,6 +29,13 @@ pub enum AgentEvent {
         failed: bool,
     },
     Usage(ahma_llm_monitor::client::TokenUsage),
+    /// The model's response was cut off by a length/context limit rather than
+    /// finishing on its own — surfaced loudly (never silently) so a stalled
+    /// "thinking forever" turn is visibly explained, right before the agent
+    /// requests a continuation.
+    Truncated {
+        reason: String,
+    },
 }
 
 #[async_trait]
@@ -328,11 +335,20 @@ async fn call_mcp_sampling_routed(
         }
     }
 
+    // MCP sampling's stopReason: "endTurn" | "stopSequence" | "maxTokens" | ….
+    // Normalize to the same "length" convention used for the direct HTTP
+    // providers so callers have one truncation signal to check.
+    let finish_reason = result
+        .get("stopReason")
+        .and_then(|r| r.as_str())
+        .map(|r| if r == "maxTokens" { "length" } else { r }.to_string());
+
     Ok(ahma_llm_monitor::client::ChatCompletionResponse {
         content: completion_text,
         tool_calls: Vec::new(),
         assistant_message: serde_json::Value::Null,
         usage: None,
+        finish_reason,
     })
 }
 
@@ -826,6 +842,44 @@ pub async fn execute_agent_turn(
         "content": completion.content.clone(),
         "tool_calls": completion.assistant_message.get("tool_calls").cloned().unwrap_or(serde_json::Value::Null)
     }));
+
+    if completion.tool_calls.is_empty() && completion.is_length_truncated() {
+        // The model was cut off by a length/context limit mid-response — the
+        // classic "stuck thinking forever" failure for small local models with
+        // small context windows. Never leave this silent: surface it, then
+        // request a continuation on the next turn (bounded by the caller's
+        // existing max_turns loop, same as any other turn).
+        warn!(
+            content_chars = completion.content.len(),
+            "agent: response was cut off by a length/context limit — requesting a continuation"
+        );
+        let _ = tx
+            .send(AgentEvent::Truncated {
+                reason: "response was cut off by a length/context limit; continuing".to_string(),
+            })
+            .await;
+        if !content_streamed && !completion.content.is_empty() {
+            let _ = tx.send(AgentEvent::Token(completion.content)).await;
+        }
+        msg_json.push(serde_json::json!({
+            "role": "user",
+            "content": "[Your previous response was cut off by a length limit. Continue \
+                         exactly where you left off — do not repeat what you already said.]"
+        }));
+        return true;
+    }
+
+    if completion.is_length_truncated() && !completion.tool_calls.is_empty() {
+        // Rarer: cut off while emitting a tool call, so its arguments may be
+        // incomplete. Not auto-recoverable the same way (nothing to "continue"
+        // that isn't already a malformed tool call) — proceed as-is, but make
+        // the risk visible rather than silently trusting truncated JSON.
+        warn!(
+            tool_calls = completion.tool_calls.len(),
+            "agent: response was cut off by a length limit while requesting tool call(s) — \
+             arguments may be incomplete"
+        );
+    }
 
     if completion.tool_calls.is_empty() {
         info!("agent: final answer received (no tool calls) — ending agentic loop");
@@ -1680,6 +1734,12 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
                     prompt_tokens: usage.prompt_tokens,
                     completion_tokens: usage.completion_tokens,
                     total_tokens: usage.total_tokens,
+                },
+                // No dedicated hub wire type for this yet — surfaced as a plain
+                // visible chat token so it is never silent, same as the direct
+                // (non-hub) llm_bridge path's dedicated note.
+                AgentEvent::Truncated { reason } => ClientMsg::ChatToken {
+                    token: format!("[{reason}]"),
                 },
             };
 
@@ -3683,6 +3743,133 @@ mod tests {
             AgentEvent::Error(e) => assert!(e.contains("MCP is not configured"), "{e}"),
             o => panic!("unexpected {o:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_agent_turn_length_truncated_requests_continuation() {
+        // The classic small-model failure this fix targets: the model's
+        // response is cut off by a length/context limit (finish_reason ==
+        // "length"), with no tool calls. The turn must not treat that as a
+        // final answer — it should surface it loudly and signal "loop again"
+        // so the caller's existing turn loop drives one continuation.
+        let router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial thin\"}}]}\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n",
+                    "data: [DONE]\n",
+                );
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(body.to_string())
+                    .unwrap()
+            }),
+        );
+        let base = serve_router(router).await;
+        let client = LlmClient::new(base, "m", None);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut msg_json = vec![serde_json::json!({"role": "user", "content": "go"})];
+        let mut read_hinted = false;
+        let mut error_hinted = false;
+
+        let cont = execute_agent_turn(
+            &client,
+            &mut msg_json,
+            &[],
+            &None,
+            &tx,
+            &[],
+            &None,
+            &mut read_hinted,
+            &mut error_hinted,
+            Arc::new(AutoApproveGate),
+        )
+        .await;
+
+        assert!(cont, "a truncated response must signal 'loop again'");
+        // The partial content was recorded as an assistant turn, followed by a
+        // continuation request — never silently dropped or lost.
+        assert_eq!(msg_json.len(), 3);
+        assert_eq!(msg_json[1]["role"], "assistant");
+        assert_eq!(msg_json[1]["content"], "partial thin");
+        assert_eq!(msg_json[2]["role"], "user");
+        assert!(
+            msg_json[2]["content"].as_str().unwrap().contains("cut off"),
+            "{msg_json:?}"
+        );
+
+        let mut saw_truncated = false;
+        let mut saw_partial_token = false;
+        while let Ok(evt) = rx.try_recv() {
+            match evt {
+                AgentEvent::Truncated { reason } => {
+                    saw_truncated = true;
+                    assert!(reason.contains("length"), "{reason}");
+                }
+                AgentEvent::Token(t) if t == "partial thin" => saw_partial_token = true,
+                _ => {}
+            }
+        }
+        assert!(saw_truncated, "truncation must be surfaced, never silent");
+        assert!(
+            saw_partial_token,
+            "streamed content was already emitted during streaming"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_agent_turn_truncated_with_tool_calls_proceeds_with_warning_not_silent_loss() {
+        // Rarer: cut off mid tool-call. Not auto-recoverable the same way, but
+        // must still proceed with whatever was parsed rather than silently
+        // discarding it — existing tool-call handling takes over normally.
+        let router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                let body = concat!(
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"t\",\"arguments\":\"{}\"}}]}}]}\n",
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n",
+                    "data: [DONE]\n",
+                );
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(body.to_string())
+                    .unwrap()
+            }),
+        );
+        let base = serve_router(router).await;
+        let client = LlmClient::new(base, "m", None);
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut msg_json = vec![serde_json::json!({"role": "user", "content": "go"})];
+        let mut read_hinted = false;
+        let mut error_hinted = false;
+
+        let cont = execute_agent_turn(
+            &client,
+            &mut msg_json,
+            &[],
+            &None, // MCP not configured → tool dispatch reports an error, but the
+            // turn must still proceed through the tool-call path, not the
+            // truncation-continuation path.
+            &tx,
+            &[],
+            &None,
+            &mut read_hinted,
+            &mut error_hinted,
+            Arc::new(AutoApproveGate),
+        )
+        .await;
+
+        assert!(!cont, "tool-call path took over, not the continuation path");
+        let mut saw_mcp_not_configured_error = false;
+        while let Ok(evt) = rx.try_recv() {
+            if let AgentEvent::Error(e) = evt
+                && e.contains("MCP is not configured")
+            {
+                saw_mcp_not_configured_error = true;
+            }
+        }
+        assert!(saw_mcp_not_configured_error, "{msg_json:?}");
     }
 
     // ── fetch_completion branches ─────────────────────────────────────────────

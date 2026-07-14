@@ -276,11 +276,20 @@ pub fn parse_messages_response(json: Value) -> Result<ChatCompletionResponse, Ll
         }
     });
 
+    // Normalize Anthropic's stop_reason ("end_turn" | "max_tokens" |
+    // "stop_sequence" | "tool_use") to the same "length" convention the
+    // OpenAI-flavored parser uses, so callers have one truncation signal.
+    let finish_reason = json
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .map(|r| if r == "max_tokens" { "length" } else { r }.to_string());
+
     Ok(ChatCompletionResponse {
         content: text,
         tool_calls,
         assistant_message,
         usage,
+        finish_reason,
     })
 }
 
@@ -424,6 +433,28 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 100);
         assert_eq!(usage.completion_tokens, 50);
         assert_eq!(usage.total_tokens, 150);
+    }
+
+    #[test]
+    fn parse_response_normalizes_max_tokens_stop_reason_to_length() {
+        let resp = parse_messages_response(json!({
+            "content": [{"type": "text", "text": "cut off"}],
+            "stop_reason": "max_tokens"
+        }))
+        .unwrap();
+        assert_eq!(resp.finish_reason.as_deref(), Some("length"));
+        assert!(resp.is_length_truncated());
+    }
+
+    #[test]
+    fn parse_response_passes_through_other_stop_reasons() {
+        let resp = parse_messages_response(json!({
+            "content": [{"type": "text", "text": "Done."}],
+            "stop_reason": "end_turn"
+        }))
+        .unwrap();
+        assert_eq!(resp.finish_reason.as_deref(), Some("end_turn"));
+        assert!(!resp.is_length_truncated());
     }
 
     #[test]
