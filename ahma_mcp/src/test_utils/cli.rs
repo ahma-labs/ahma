@@ -295,6 +295,10 @@ pub fn build_binary_cached(package: &str, binary: &str) -> PathBuf {
 /// live MCP server (or another application's), so a test run would tear down a
 /// session it has nothing to do with. `cfg!(test)` cannot cover this: the child
 /// is an ordinary binary, not a test harness.
+///
+/// Under `cargo nextest` the inherited `NEXTEST` variable now provides the same
+/// isolation as a fail-closed backstop (SPEC R-ISO.1), but this explicit
+/// variable remains authoritative: plain `cargo test` sets nothing comparable.
 pub fn test_command(binary: &Path) -> Command {
     let mut cmd = Command::new(binary);
     cmd.args(["--no-sandbox", "--skip-probes"]);

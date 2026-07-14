@@ -145,6 +145,8 @@ AHMA_DISABLE_HOOKS=1
 | `AHMA_DAEMON_SOCK` | Isolates each test process's daemon to a unique Unix socket path |
 | `AHMA_DAEMON_PORT` | Isolates each test process's daemon to a unique TCP port (Windows) |
 | `AHMA_TEST_BINARY` | Locates the compiled test binary for in-process test helpers |
+| `AHMA_TEST_ISOLATION` | Set by test harnesses on spawned ahma binaries: forces private (non-global) bridge/daemon endpoints (SPEC R-ISO.1) |
+| `NEXTEST` / `NEXTEST_RUN_ID` | Set by `cargo nextest`, inherited by spawned binaries; read solely to force the same private-endpoint isolation as `AHMA_TEST_ISOLATION` — the single R-CFG9.2 carve-out (SPEC R-ISO.1) |
 
 ---
 

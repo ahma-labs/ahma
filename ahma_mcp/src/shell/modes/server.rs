@@ -947,16 +947,20 @@ pub const GLOBAL_SOCKET_PATH: &str = "/tmp/ahma.sock";
 
 /// True when this process is running under the test harness.
 ///
-/// `cfg!(test)` covers this crate's own unit tests; the `AHMA_TEST_ISOLATION`
-/// internal plumbing variable covers the ahma binaries that integration tests
-/// *spawn* (set only by `test_utils::cli::test_command`), which `cfg!(test)`
-/// cannot see because they are ordinary release/debug binaries.
+/// `cfg!(test)` covers this crate's own unit tests;
+/// [`ahma_common::test_isolation::spawned_under_test_harness`] covers the ahma
+/// binaries that integration tests *spawn*, which `cfg!(test)` cannot see
+/// because they are ordinary release/debug binaries. It detects both the
+/// explicit `AHMA_TEST_ISOLATION` plumbing variable and the `NEXTEST` variable
+/// that `cargo nextest` exports to every test process (and which children
+/// inherit), so a spawn site that forgets the explicit variable can no longer
+/// reach the machine-global endpoints (SPEC R-ISO.1).
 ///
 /// A test-isolated process must never touch the machine-global endpoints: it gets
 /// a private socket path, it never probes the running bridge's version, and it is
 /// refused a bridge restart.
 pub fn is_test_isolated() -> bool {
-    cfg!(test) || std::env::var_os("AHMA_TEST_ISOLATION").is_some()
+    cfg!(test) || ahma_common::test_isolation::spawned_under_test_harness()
 }
 
 /// Bridge socket to use when no explicit path is configured.

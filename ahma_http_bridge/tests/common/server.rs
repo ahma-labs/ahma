@@ -334,6 +334,10 @@ fn configure_server_command(
     cmd.args(args)
         .current_dir(workspace)
         .env_remove("AHMA_HANDSHAKE_TIMEOUT_SECS")
+        // Mark the spawned server test-owned so it never resolves the
+        // machine-global bridge/daemon endpoints (SPEC R-ISO.1). NEXTEST
+        // detection also covers this, but plain `cargo test` does not set it.
+        .env("AHMA_TEST_ISOLATION", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

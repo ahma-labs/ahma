@@ -74,6 +74,16 @@ pub fn daemon_port() -> u16 {
     {
         return p;
     }
+    // Safety net (SPEC R-ISO.1): a test-spawned process that did not go through
+    // `init_test_daemon_isolation` must still not reach the live daemon port.
+    // Derive a stable per-run port so every process in the test run agrees.
+    if crate::test_isolation::spawned_under_test_harness() {
+        let disc = crate::test_isolation::test_run_discriminator();
+        let hash: u32 = disc.bytes().fold(0u32, |acc, b| {
+            acc.wrapping_mul(31).wrapping_add(u32::from(b))
+        });
+        return 49152 + (hash % 16000) as u16;
+    }
     WINDOWS_DAEMON_PORT
 }
 
@@ -468,6 +478,18 @@ pub fn default_socket_path() -> PathBuf {
              Use the --daemon-socket flag instead."
         );
         return PathBuf::from(v);
+    }
+
+    // Safety net (SPEC R-ISO.1): a test-spawned process that did not go through
+    // `init_test_daemon_isolation` (which sets AHMA_DAEMON_SOCK, handled above)
+    // must still never rendezvous on the developer's live daemon socket. The
+    // discriminator is stable across the whole test run's process tree, so a
+    // test and the binaries it spawns agree on the same private path.
+    if crate::test_isolation::spawned_under_test_harness() {
+        return std::env::temp_dir().join(format!(
+            "ahma-test-daemon-{}.sock",
+            crate::test_isolation::test_run_discriminator()
+        ));
     }
 
     #[cfg(unix)]
@@ -2366,22 +2388,85 @@ mod tests {
     fn daemon_port_default_and_override() {
         let _g = ENV_MUTEX.lock().unwrap();
         let prev = std::env::var_os("AHMA_DAEMON_PORT");
+        let prev_iso = std::env::var_os("AHMA_TEST_ISOLATION");
+        let prev_nextest = std::env::var_os("NEXTEST");
 
         // Valid override is honored.
         unsafe { std::env::set_var("AHMA_DAEMON_PORT", "54321") };
         assert_eq!(daemon_port(), 54321);
 
-        // Unparseable value falls back to the platform default.
+        // Unparseable value falls back: under a test harness (R-ISO.1) to a
+        // stable per-run private port in the ephemeral range, never the live
+        // daemon port.
         unsafe { std::env::set_var("AHMA_DAEMON_PORT", "not-a-port") };
+        unsafe { std::env::set_var("NEXTEST", "1") };
+        let port = daemon_port();
+        assert_ne!(
+            port, WINDOWS_DAEMON_PORT,
+            "a test-harness process must not fall back to the live daemon port"
+        );
+        assert!(
+            (49152..65152).contains(&port),
+            "per-run port must be in the ephemeral range, got {port}"
+        );
+        assert_eq!(daemon_port(), port, "per-run port must be stable");
+
+        // Outside any test harness the platform default applies.
+        unsafe { std::env::remove_var("NEXTEST") };
+        unsafe { std::env::remove_var("AHMA_TEST_ISOLATION") };
         assert_eq!(
             daemon_port(),
             WINDOWS_DAEMON_PORT,
-            "invalid AHMA_DAEMON_PORT must fall back to the default"
+            "invalid AHMA_DAEMON_PORT must fall back to the default in production"
         );
 
         match prev {
             Some(v) => unsafe { std::env::set_var("AHMA_DAEMON_PORT", v) },
             None => unsafe { std::env::remove_var("AHMA_DAEMON_PORT") },
+        }
+        match prev_iso {
+            Some(v) => unsafe { std::env::set_var("AHMA_TEST_ISOLATION", v) },
+            None => unsafe { std::env::remove_var("AHMA_TEST_ISOLATION") },
+        }
+        match prev_nextest {
+            Some(v) => unsafe { std::env::set_var("NEXTEST", v) },
+            None => unsafe { std::env::remove_var("NEXTEST") },
+        }
+    }
+
+    /// R-ISO.1: a test-harness process without explicit daemon-socket isolation
+    /// must still resolve a private per-run socket, never the live daemon's.
+    #[test]
+    fn default_socket_path_private_under_test_harness() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        if SOCKET_PATH_OVERRIDE.get().is_some() {
+            return;
+        }
+        let prev_sock = std::env::var_os("AHMA_DAEMON_SOCK");
+        let prev_nextest = std::env::var_os("NEXTEST");
+        unsafe { std::env::remove_var("AHMA_DAEMON_SOCK") };
+        unsafe { std::env::set_var("NEXTEST", "1") };
+
+        let path = default_socket_path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("ahma-test-daemon-"),
+            "test-harness fallback must be a private per-run socket, got {}",
+            path.display()
+        );
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "private socket must live in the temp dir, got {}",
+            path.display()
+        );
+
+        match prev_sock {
+            Some(v) => unsafe { std::env::set_var("AHMA_DAEMON_SOCK", v) },
+            None => unsafe { std::env::remove_var("AHMA_DAEMON_SOCK") },
+        }
+        match prev_nextest {
+            Some(v) => unsafe { std::env::set_var("NEXTEST", v) },
+            None => unsafe { std::env::remove_var("NEXTEST") },
         }
     }
 

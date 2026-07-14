@@ -1052,10 +1052,61 @@ async fn start_bridge_tcp(config: BridgeConfig) -> Result<()> {
     }
 }
 
+/// Prepare `socket_path` for binding without stealing a live server's socket
+/// (SPEC R-ISO.2).
+///
+/// A leftover socket *file* from a crashed bridge must be removed before
+/// `bind()` can succeed, but blindly unlinking would also destroy the
+/// rendezvous point of a bridge that is alive and serving — the classic
+/// failure being a test-spawned bridge deleting the developer's live
+/// `/tmp/ahma.sock` out from under their MCP session. Probe-connect first: a
+/// successful connection means a live server owns the path and this process
+/// must refuse to bind; a refused connection means the file is stale and safe
+/// to unlink.
+#[cfg(unix)]
+fn prepare_unix_socket_path(socket_path: &str) -> Result<()> {
+    use std::io::ErrorKind;
+
+    // Abstract sockets (leading NUL) have no filesystem entry to clean up.
+    if socket_path.starts_with('\0') || !std::path::Path::new(socket_path).exists() {
+        return Ok(());
+    }
+
+    match std::os::unix::net::UnixStream::connect(socket_path) {
+        Ok(_) => Err(BridgeError::HttpServer(format!(
+            "refusing to bind Unix socket {socket_path}: another server is live on it. \
+             Stop that server first, or pass --socket-path to use a private socket."
+        ))),
+        Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound) => {
+            std::fs::remove_file(socket_path).map_err(|e| {
+                BridgeError::HttpServer(format!(
+                    "failed to remove stale socket file {socket_path}: {e}"
+                ))
+            })
+        }
+        Err(e) => Err(BridgeError::HttpServer(format!(
+            "cannot probe existing socket {socket_path}: {e}"
+        ))),
+    }
+}
+
+/// Identity (device, inode) of the socket file this process bound, used to
+/// ensure shutdown removes only a socket it still owns (SPEC R-ISO.3): if
+/// another process has since replaced the path, the file is theirs.
+#[cfg(unix)]
+fn unix_socket_identity(socket_path: &str) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(socket_path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
 /// Serve MCP Streamable HTTP over a Unix domain socket.
 ///
 /// The socket path may use the `@` prefix for Linux abstract sockets.
-/// Filesystem socket files are removed before binding and on graceful shutdown.
+/// A stale (dead) socket file is removed before binding; a *live* socket is
+/// never stolen — binding fails loudly instead. On graceful shutdown the
+/// socket file is removed only if this process still owns it.
 #[cfg(unix)]
 async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Result<()> {
     // Translate `@name` → `\0name` (Linux abstract namespace).
@@ -1093,14 +1144,20 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
         config.rate_limit_burst,
     );
 
-    // Remove a stale filesystem socket file from a previous run, if any.
-    // Abstract sockets start with '\0' and have no filesystem entry.
-    if !socket_path.starts_with('\0') {
-        let _ = tokio::fs::remove_file(&socket_path).await;
-    }
+    // Remove a stale socket file from a previous run — but never a live one
+    // (SPEC R-ISO.2). Abstract sockets start with '\0' and have no file.
+    prepare_unix_socket_path(&socket_path)?;
 
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .map_err(|e| BridgeError::HttpServer(format!("Failed to bind Unix socket: {}", e)))?;
+
+    // Record which inode we bound so shutdown removes only our own socket
+    // (SPEC R-ISO.3).
+    let owned_socket_identity = if socket_path.starts_with('\0') {
+        None
+    } else {
+        unix_socket_identity(&socket_path)
+    };
 
     // Restrict to owner-only (0600) so other local users cannot connect and drive
     // the bridge. No-op for abstract sockets (leading NUL).
@@ -1125,7 +1182,12 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
             .session_manager
             .terminate_all(crate::session::SessionTerminationReason::Timeout)
             .await;
-        if !socket_path_for_shutdown.starts_with('\0') {
+        // Remove the socket file only if it is still the one this process
+        // bound (SPEC R-ISO.3) — if another server has replaced the path in
+        // the meantime, deleting it would orphan *their* live socket.
+        if let Some(owned) = owned_socket_identity
+            && unix_socket_identity(&socket_path_for_shutdown) == Some(owned)
+        {
             let _ = std::fs::remove_file(&raw_socket_path_for_shutdown);
         }
         std::process::exit(0);
@@ -2999,6 +3061,78 @@ for line in sys.stdin:
             counter.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "counter must remain 0; terminating a non-existent session must not underflow"
+        );
+    }
+
+    /// R-ISO.2: binding must not disturb a path with no socket file.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_unix_socket_path_ok_when_absent() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("absent.sock");
+        assert!(prepare_unix_socket_path(path.to_str().unwrap()).is_ok());
+    }
+
+    /// R-ISO.2: a stale socket file (its listener is gone) is removed so the
+    /// new server can bind.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_unix_socket_path_removes_stale_socket() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("stale.sock");
+        {
+            // Bind and immediately drop the listener; the file stays behind.
+            let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        }
+        assert!(
+            path.exists(),
+            "socket file should linger after listener drop"
+        );
+        assert!(prepare_unix_socket_path(path.to_str().unwrap()).is_ok());
+        assert!(!path.exists(), "stale socket file must be removed");
+    }
+
+    /// R-ISO.2: a live socket must never be stolen — preparation fails loudly
+    /// and the live listener's socket file is left untouched. This is the
+    /// regression test for a test-spawned bridge deleting the developer's
+    /// live /tmp/ahma.sock.
+    #[cfg(unix)]
+    #[test]
+    fn prepare_unix_socket_path_refuses_live_socket() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("live.sock");
+        let _live_listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+        let err = prepare_unix_socket_path(path.to_str().unwrap())
+            .expect_err("must refuse to bind over a live socket");
+        assert!(
+            err.to_string().contains("another server is live"),
+            "error must name the live-socket cause, got: {err}"
+        );
+        assert!(path.exists(), "the live socket file must not be removed");
+    }
+
+    /// R-ISO.3 helper: identity is stable for the same file and changes when
+    /// the path is replaced by a new socket (new inode).
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_identity_tracks_inode_replacement() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("ident.sock");
+        let path_str = path.to_str().unwrap();
+
+        let _first = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let first_identity = unix_socket_identity(path_str).expect("bound socket has metadata");
+        assert_eq!(unix_socket_identity(path_str), Some(first_identity));
+
+        // Replace the path with a fresh socket (what another server taking
+        // over the path does): identity must change.
+        std::fs::remove_file(&path).unwrap();
+        let _second = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let second_identity = unix_socket_identity(path_str).expect("rebound socket has metadata");
+        assert_ne!(
+            first_identity, second_identity,
+            "a replaced socket path must have a new identity"
         );
     }
 }

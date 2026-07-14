@@ -64,6 +64,7 @@ pub mod sandbox_state;
 pub mod scope_decision;
 pub mod scope_grant;
 pub mod state_machine;
+pub mod test_isolation;
 pub mod timeouts;
 pub mod web_approval;
 pub mod web_policy;
