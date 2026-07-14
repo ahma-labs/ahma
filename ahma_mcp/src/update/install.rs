@@ -174,17 +174,63 @@ async fn install_binary(source: &Path, target: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // Atomic out-of-place install (SPEC R-SIGN.2): stage the new binary
+        // next to the target, then rename over it. The path never holds a
+        // partially-written file, and the running binary's inode is never
+        // written through — overwriting it in place invalidates the mapped
+        // code signature on macOS and the kernel SIGKILLs the live server.
+        let staged = target.with_extension("new");
+        let _ = fs::remove_file(&staged).await;
+        fs::copy(source, &staged)
+            .await
+            .with_context(|| format!("Failed to stage binary at {}", staged.display()))?;
+        let mut perms = fs::metadata(&staged).await?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&staged, perms).await?;
+
+        // Re-sign the staged binary with the hardened runtime (SPEC R-SIGN.1,
+        // local part): a linker-ad-hoc signature fails code-page re-validation
+        // under memory pressure and gets the process SIGKILLed. Best-effort —
+        // an install must not fail because codesign is unavailable.
+        #[cfg(target_os = "macos")]
+        {
+            let result = tokio::process::Command::new("codesign")
+                .args(["--force", "--sign", "-", "--options", "runtime"])
+                .arg(&staged)
+                .output()
+                .await;
+            match result {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => eprintln!(
+                    "warning: codesign of {} failed ({}); the binary may be killed \
+                     under memory pressure (SPEC R-SIGN.1): {}",
+                    staged.display(),
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ),
+                Err(e) => eprintln!(
+                    "warning: could not run codesign for {}: {e} (SPEC R-SIGN.1)",
+                    staged.display()
+                ),
+            }
+        }
+
+        // Keep a rollback copy. Best-effort: even if this rename fails, the
+        // atomic rename below still replaces the path without touching the
+        // old inode's pages.
         if target.exists() {
             let backup = target.with_extension("old");
             let _ = fs::remove_file(&backup).await;
-            fs::rename(target, &backup).await.ok();
+            let _ = fs::rename(target, &backup).await;
         }
-        fs::copy(source, target)
-            .await
-            .with_context(|| format!("Failed to copy binary to {}", target.display()))?;
-        let mut perms = fs::metadata(target).await?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(target, perms).await?;
+
+        fs::rename(&staged, target).await.with_context(|| {
+            format!(
+                "Failed to atomically install {} over {}",
+                staged.display(),
+                target.display()
+            )
+        })?;
     }
 
     #[cfg(windows)]
@@ -577,6 +623,42 @@ mod tests {
         assert!(
             perms.mode() & 0o111 != 0,
             "installed binary should be executable"
+        );
+    }
+
+    /// R-SIGN.2: installing over an existing binary must never write through
+    /// the old inode (that is what invalidates a running process's mapped
+    /// code signature on macOS). The path must get a fresh inode, the old
+    /// inode's bytes must survive untouched, and no staged temp may remain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_install_binary_never_writes_through_old_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source_bin");
+        let target = dir.path().join("installed_bin");
+
+        std::fs::write(&target, b"old binary").unwrap();
+        std::fs::write(&source, b"new binary").unwrap();
+        let old_inode = std::fs::metadata(&target).unwrap().ino();
+
+        install_binary(&source, &target).await.unwrap();
+
+        let new_inode = std::fs::metadata(&target).unwrap().ino();
+        assert_ne!(
+            old_inode, new_inode,
+            "target must be a fresh inode, never the old one written in place"
+        );
+        let backup = target.with_extension("old");
+        assert_eq!(
+            std::fs::metadata(&backup).unwrap().ino(),
+            old_inode,
+            "the old inode must survive untouched as the backup"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old binary");
+        assert!(
+            !target.with_extension("new").exists(),
+            "no staged temp file may remain after install"
         );
     }
 

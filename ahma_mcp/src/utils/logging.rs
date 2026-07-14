@@ -25,6 +25,33 @@ static INIT: Once = Once::new();
 /// Passes the OTEL guard out of the `call_once` closure to the caller.
 static PENDING_GUARD: Mutex<Option<TelemetryGuard>> = Mutex::new(None);
 
+/// Flush guard for the non-blocking file writer. Held here (not leaked) so
+/// [`flush_file_log`] can drop it on abnormal exit, flushing the buffered tail
+/// (SPEC R-SIGN.5).
+static FILE_LOG_FLUSH_GUARD: Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
+    Mutex::new(None);
+
+/// Flush the buffered file log by dropping the writer's guard. Idempotent;
+/// after this, further log lines may be dropped — call only on the way out
+/// (panic hook, abnormal-exit paths).
+pub fn flush_file_log() {
+    if let Ok(mut guard) = FILE_LOG_FLUSH_GUARD.lock() {
+        drop(guard.take());
+    }
+}
+
+/// Chain a panic hook that flushes the file log after the default hook has
+/// printed the panic, so the log's final buffered lines survive an abort
+/// (SPEC R-SIGN.5). SIGKILL cannot be hooked; that path is mitigated by the
+/// atomic-install requirement (R-SIGN.2) instead.
+fn install_panic_flush_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        flush_file_log();
+    }));
+}
+
 static LOG_ROLE: OnceLock<&'static str> = OnceLock::new();
 
 /// Rolling structured log basename (daily rotation appends `.YYYY-MM-DD`).
@@ -412,7 +439,7 @@ fn do_setup_logging(
         None
     };
     if let Some(file_appender) = file_appender_opt {
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
         tracing_subscriber::registry()
             .with(env_filter)
             .with(otel_layer)
@@ -423,7 +450,11 @@ fn do_setup_logging(
                     .with_ansi(false),
             )
             .init();
-        Box::leak(Box::new(_guard));
+        // Keep the writer's flush guard reachable so a panic can flush the
+        // buffered tail (SPEC R-SIGN.5) — a leaked guard could never be
+        // dropped, so the final lines before an abnormal exit were lost.
+        *FILE_LOG_FLUSH_GUARD.lock().unwrap() = Some(guard);
+        install_panic_flush_hook();
         log_traceparent();
         disclose_log_location_once();
         return;

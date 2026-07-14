@@ -90,8 +90,8 @@ impl PeerFactory for SubprocessPeerFactory {
                 Stdio::inherit()
             };
 
-            let mut child = Command::new(&command)
-                .args(&args)
+            let mut cmd = Command::new(&command);
+            cmd.args(&args)
                 // A subprocess peer is ALWAYS a server-child: it serves exactly one
                 // bridge session and must never run the IDE-facing frontend path
                 // (which spawns its own background bridge). We pass `--server-child`
@@ -128,7 +128,17 @@ impl PeerFactory for SubprocessPeerFactory {
                 .stderr(stderr_mode)
                 // Ensures the subprocess does not outlive this process when
                 // a test exits early or a session is dropped unexpectedly.
-                .kill_on_drop(true)
+                .kill_on_drop(true);
+
+            // Stripping NEXTEST above must not strip endpoint isolation
+            // (SPEC R-ISO.1): if this bridge is itself test-owned, the peer
+            // must inherit that fact explicitly or it would resolve the
+            // machine-global daemon endpoints from inside a test run.
+            if ahma_common::test_isolation::spawned_under_test_harness() {
+                cmd.env("AHMA_TEST_ISOLATION", "1");
+            }
+
+            let mut child = cmd
                 .spawn()
                 .map_err(|e| anyhow::anyhow!("Failed to spawn subprocess: {}", e))?;
 
@@ -151,10 +161,45 @@ impl PeerFactory for SubprocessPeerFactory {
 
             info!(command = %command, "Subprocess peer spawned for new bridge session");
 
-            // Explicit shutdown: kill the child on session termination.
+            // A monitor task owns the child so its ExitStatus can be observed
+            // and an abnormal (signal) death reported loudly (SPEC R-SIGN.5) —
+            // previously death was visible only as pipe EOF, indistinguishable
+            // from a clean exit. Explicit shutdown is requested over a oneshot;
+            // dropping the shutdown closure without calling it also kills the
+            // child (the receiver errors), preserving the old kill-on-drop
+            // semantics for abandoned sessions.
+            type KillAck = tokio::sync::oneshot::Sender<()>;
+            let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<KillAck>();
+            let command_for_log = command.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    status = child.wait() => match status {
+                        Ok(status) => report_peer_exit(&command_for_log, status),
+                        Err(e) => tracing::warn!(
+                            command = %command_for_log,
+                            "could not observe subprocess peer exit status: {e}"
+                        ),
+                    },
+                    ack = kill_rx => {
+                        // Ok: explicit session shutdown. Err: the shutdown
+                        // closure was dropped un-called (abandoned session).
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        if let Ok(ack) = ack {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            });
+
+            // Explicit shutdown: ask the monitor task to kill the child and
+            // wait for its acknowledgement so termination stays synchronous.
             let shutdown_fn: PeerShutdownFn = Box::new(move || {
                 Box::pin(async move {
-                    let _ = child.kill().await;
+                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                    if kill_tx.send(ack_tx).is_ok() {
+                        let _ = ack_rx.await;
+                    }
                 })
             });
 
@@ -168,9 +213,93 @@ impl PeerFactory for SubprocessPeerFactory {
     }
 }
 
+/// Log a peer subprocess's exit, loudly when it died by signal (SPEC R-SIGN.5).
+///
+/// A signal death was previously indistinguishable from a clean exit (both
+/// surface as pipe EOF), leaving nothing to explain a dead session. SIGKILL on
+/// macOS gets the known likely cause spelled out: the kernel's code-signing
+/// enforcement killing an ad-hoc-signed binary whose mapped pages were
+/// invalidated by an in-place rebuild or evicted under memory pressure.
+fn report_peer_exit(command: &str, status: std::process::ExitStatus) {
+    match describe_abnormal_exit(status) {
+        Some(cause) => tracing::error!(command = %command, "server subprocess died: {cause}"),
+        None if status.success() => {
+            tracing::debug!(command = %command, "server subprocess exited cleanly")
+        }
+        None => tracing::warn!(
+            command = %command,
+            "server subprocess exited with {status}"
+        ),
+    }
+}
+
+/// Describe an abnormal (signal) exit, or `None` for a normal exit.
+fn describe_abnormal_exit(status: std::process::ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let sig = status.signal()?;
+        // SIGKILL is 9 on every Unix.
+        if sig == 9 {
+            let mac_hint = if cfg!(target_os = "macos") {
+                " On macOS this is commonly the kernel's code-signing enforcement \
+                 (SPEC R-SIGN): an ad-hoc-signed binary was rebuilt in place or its \
+                 code pages were evicted under memory pressure and failed \
+                 re-validation. Remediation: never overwrite a running binary \
+                 (install via atomic rename, e.g. `ahma update`), and re-sign local \
+                 builds with `codesign --force --sign - --options runtime`."
+            } else {
+                ""
+            };
+            return Some(format!(
+                "killed by SIGKILL (possible OOM-kill or code-signing kill).{mac_hint}"
+            ));
+        }
+        Some(format!("killed by signal {sig}"))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no signals; abnormal deaths appear as exit codes and are
+        // reported by the non-success arm of `report_peer_exit`.
+        let _ = status;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R-SIGN.5: a SIGKILLed child must be classified as an abnormal death
+    /// with the cause named, not mistaken for a normal exit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn describe_abnormal_exit_names_sigkill() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        child.start_kill().expect("send SIGKILL");
+        let status = child.wait().await.expect("reap child");
+
+        let desc = describe_abnormal_exit(status).expect("SIGKILL must classify as abnormal");
+        assert!(desc.contains("SIGKILL"), "must name the signal: {desc}");
+        #[cfg(target_os = "macos")]
+        assert!(
+            desc.contains("code-signing"),
+            "macOS must include the R-SIGN cause and remediation: {desc}"
+        );
+    }
+
+    /// A clean exit is not classified as abnormal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn describe_abnormal_exit_ignores_clean_exit() {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        let status = child.wait().await.expect("reap child");
+        assert!(status.success());
+        assert!(describe_abnormal_exit(status).is_none());
+    }
 
     #[test]
     fn subprocess_factory_stores_fields() {

@@ -50,7 +50,7 @@
 | `ahma cluster remove` | tests-pass | Subcommand to remove worker peers from peers configuration |
 | `ahma setup` / `ahma uninstall` | tests-pass | Interactive wizard installs / removes MCP entries, hooks, skills, binary; symmetric teardown leaves other user config intact |
 | Auto-spawned Bridge Lifecycle | tests-pass | Bridges started by `ahma serve stdio` or `ahma tui` self-terminate after `--idle-timeout` seconds with no connected client; explicitly-started `ahma serve http/unix` remain persistent by default |
-| Binary Code Signing (R-SIGN) | not-started | macOS ad-hoc binary gets `SIGKILL (Code Signature Invalid)` under heavy-build memory pressure / in-place rebuild → opaque `Connection closed`; needs stable signing + atomic out-of-place install. Windows = distribution-only (verify WDAC/SAC); Linux = N/A |
+| Binary Code Signing (R-SIGN) | in-progress | macOS ad-hoc binary gets `SIGKILL (Code Signature Invalid)` under heavy-build memory pressure / in-place rebuild → opaque `Connection closed`. Done: atomic out-of-place install + local re-sign in `ahma update` (R-SIGN.2, R-SIGN.1-local); signal-death classification + panic log-flush (R-SIGN.5 partial). Pending: Developer-ID release signing (R-SIGN.1), MCP-error surfacing to the client (R-SIGN.5), Windows WDAC/SAC verify (R-SIGN.3) |
 
 ---
 
@@ -1164,9 +1164,11 @@ These three mechanisms together bound how long any abandoned `ahma serve stdio` 
 - **R-ISO.3 (remove only what you own).** On shutdown a server MUST remove its socket file only if the path still refers to the socket it bound (device+inode match). If another process has since replaced the path, deleting it would orphan *that* server's live socket.
 - **R-ISO.4 (regression tests).** Unit tests MUST pin: harness detection via both variables; refusal to bind over a live socket; stale-socket cleanup; and identity-checked shutdown removal.
 
-### R-SIGN: Binary Code Signing — TODO (macOS runtime stability; Windows/Linux distribution-only)
+### R-SIGN: Binary Code Signing — in-progress (macOS runtime stability; Windows/Linux distribution-only)
 
-> **Status:** `not-started`. Tracks a confirmed macOS failure mode plus the cross-platform signing posture.
+> **Status:** `in-progress`. Tracks a confirmed macOS failure mode plus the cross-platform signing posture.
+> Done: R-SIGN.2 (atomic staged-rename install in `ahma update`, inode-pinned by regression test), the local-build half of R-SIGN.1 (`codesign --force --sign - --options runtime` on the staged binary during install, best-effort), and the R-SIGN.5 halves that need no protocol change (bridge classifies a peer's signal death — SIGKILL gets the code-signing/memory-pressure cause and remediation logged at ERROR — and the file logger flushes from a panic hook instead of leaking its guard).
+> Pending: Developer-ID signing + notarization of release binaries (R-SIGN.1), surfacing the classified cause as a specific MCP error to the client instead of only the log (R-SIGN.5), and the Windows WDAC/SAC verification (R-SIGN.3).
 
 **Problem (macOS / Apple Silicon).** The installed `ahma` binary is `Signature=adhoc, linker-signed` (the cargo default; `TeamIdentifier=not set`). The long-lived MCP server gets `SIGKILL`ed by the kernel with `EXC_BAD_ACCESS · SIGKILL (Code Signature Invalid)` / `termination namespace=CODESIGNING, "Invalid Page"` when its mapped code pages are invalidated — either by a dev rebuild overwriting the in-use binary, or by code-page eviction under the memory pressure of a heavy in-workspace build (e.g. `cargo clippy --all-targets && cargo nextest run`) where ad-hoc page re-validation fails on fault-in. To the MCP client this surfaces as an opaque `Connection closed` mid-operation; SIGKILL leaves no panic, an empty (buffered) `~/.ahma/logs` for the dead session, and often no fresh `.ips` (`ReportCrash` throttles repeats). `codesign --verify --strict` on the file passes — it is the running mapping, not the on-disk file, that is invalidated.
 
