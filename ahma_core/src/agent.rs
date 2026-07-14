@@ -82,6 +82,36 @@ const DEFAULT_CONVERSATION_CHAR_BUDGET: usize = 240_000;
 /// Tighter conversation budget under `--small-model-harness`.
 const SMALL_MODEL_CONVERSATION_CHAR_BUDGET: usize = 24_000;
 
+/// Fraction of the context window (measured from real reported prompt-token
+/// usage) at which proactive compaction triggers for small/local models.
+/// Tighter than [`DEFAULT_COMPACTION_THRESHOLD`]: quality degrades earlier
+/// for small models than for large hosted ones.
+const SMALL_MODEL_COMPACTION_THRESHOLD: f32 = 0.70;
+/// Fraction of the context window at which proactive compaction triggers
+/// when the model is not flagged as small/local.
+const DEFAULT_COMPACTION_THRESHOLD: f32 = 0.85;
+/// How many of the most recent raw messages proactive compaction always
+/// leaves untouched, verbatim — recency matters most for the model's
+/// immediate coherence, and tool-call/tool-result pairs must stay adjacent.
+const COMPACTION_KEEP_RECENT_MESSAGES: usize = 4;
+
+/// Instructions for the isolated, tools-off compaction call — sent as that
+/// call's only user message (not layered onto the real conversation's system
+/// prompt). Structured sections (not "just summarize") survive repeated
+/// compaction rounds without drifting, and give the model something concrete
+/// to act on afterward instead of a vague paragraph.
+const COMPACTION_INSTRUCTIONS: &str = "You are compacting an earlier portion of a long tool-using \
+    conversation so work can continue without the full history. Do not call any tools. \
+    Read the transcript below and respond with EXACTLY this structure, one section per line \
+    (bullet points under each, terse, no preamble):\n\n\
+    Goal: <the original task, one line>\n\
+    Decisions and facts established: <bullets>\n\
+    Files touched: <bullets, with paths and line numbers where known>\n\
+    Approaches already tried and why they failed: <bullets, or \"none\">\n\
+    Pending todos: <bullets>\n\
+    Next step: <one line>\n\n\
+    Transcript to compact:\n\n";
+
 /// System-prompt suffix that asks for terse output when minimizing tokens.
 const MINIMIZE_CONCISENESS_RULE: &str = "\n\nRespond concisely. No preamble, no conversational filler. Output only the tool call, code, or bare answer.";
 
@@ -98,6 +128,20 @@ pub trait ContextStrategy: Send + Sync {
     /// Optional suffix appended to the system prompt (e.g. a conciseness rule
     /// when minimizing tokens). `None` leaves the prompt unchanged.
     fn system_prompt_suffix(&self) -> Option<&'static str> {
+        None
+    }
+    /// Fraction of the context window (0.0-1.0), measured from the *real*
+    /// reported prompt-token usage, at which proactive compaction should
+    /// trigger — replacing the oldest non-recent history with a structured
+    /// summary before the model ever runs out of room. `None` disables
+    /// proactive compaction; [`trim_conversation`]'s reactive hard-drop stays
+    /// as the last-resort safety net either way.
+    ///
+    /// Quality degrades well before the hard token wall ("lost in the
+    /// middle"), and that cliff comes sooner for small/local models than for
+    /// large hosted ones — so the default is deliberately tighter under
+    /// `small_model_harness`.
+    fn compaction_threshold(&self) -> Option<f32> {
         None
     }
 }
@@ -134,6 +178,19 @@ impl ContextStrategy for BudgetStrategy {
 
     fn system_prompt_suffix(&self) -> Option<&'static str> {
         self.minimize_tokens.then_some(MINIMIZE_CONCISENESS_RULE)
+    }
+
+    fn compaction_threshold(&self) -> Option<f32> {
+        // Only meaningful when the window size is actually known — without it
+        // there is no denominator to compute a fill fraction against, so the
+        // reactive char-budget trim remains the only safety net.
+        self.context_length.map(|_| {
+            if self.small_model_harness {
+                SMALL_MODEL_COMPACTION_THRESHOLD
+            } else {
+                DEFAULT_COMPACTION_THRESHOLD
+            }
+        })
     }
 }
 
@@ -189,6 +246,22 @@ pub fn truncate_middle(s: &str, cap: usize) -> String {
 /// message), the **first user message** — the original task/goal, so a long run
 /// can never trim away its own objective and start wandering — and the two most
 /// recent messages (the immediate task state).
+/// Index of the first message that may be dropped/compacted: past any system
+/// prompt (index 0) and the first user message right after it (the original
+/// goal), both of which are always preserved verbatim so a long run can never
+/// lose sight of its own objective.
+fn protected_head(msg_json: &[serde_json::Value]) -> usize {
+    let role_at = |i: usize| -> Option<&str> {
+        msg_json
+            .get(i)
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+    };
+    let base_head = usize::from(role_at(0) == Some("system"));
+    let pin_goal = role_at(base_head) == Some("user");
+    base_head + usize::from(pin_goal)
+}
+
 pub fn trim_conversation(msg_json: &mut Vec<serde_json::Value>, budget: usize) {
     let total = |msgs: &[serde_json::Value]| -> usize {
         msgs.iter()
@@ -205,18 +278,7 @@ pub fn trim_conversation(msg_json: &mut Vec<serde_json::Value>, budget: usize) {
         return;
     }
 
-    let role_at = |i: usize| -> Option<&str> {
-        msg_json
-            .get(i)
-            .and_then(|m| m.get("role"))
-            .and_then(|r| r.as_str())
-    };
-
-    let base_head = usize::from(role_at(0) == Some("system"));
-    // Pin the first user message (the original goal) right after any system
-    // prompt, so the model never loses sight of what it was asked to do.
-    let pin_goal = role_at(base_head) == Some("user");
-    let protected_head = base_head + usize::from(pin_goal);
+    let protected_head = protected_head(msg_json);
 
     let mut dropped = 0usize;
     while total(msg_json) > budget && msg_json.len() > protected_head + 2 {
@@ -235,6 +297,118 @@ pub fn trim_conversation(msg_json: &mut Vec<serde_json::Value>, budget: usize) {
                 "content": format!("[{dropped} earlier message(s) were removed to fit your context window. Continue from the latest state below.]"),
             }),
         );
+    }
+}
+
+/// Proactively compact the conversation when real reported usage crosses the
+/// context strategy's [`ContextStrategy::compaction_threshold`] — replacing
+/// the oldest non-recent history with a structured summary *before* the model
+/// ever runs out of room, rather than reacting after the fact
+/// ([`trim_conversation`]'s hard-drop, which remains the safety net if this
+/// is disabled, fails, or there still isn't enough to compact).
+///
+/// Always preserves, verbatim: the system prompt, the pinned first user
+/// message (the original goal — see [`protected_head`]), and the last
+/// [`COMPACTION_KEEP_RECENT_MESSAGES`] raw messages (tool-call/result pairs
+/// must stay adjacent, and recency matters most for immediate coherence).
+///
+/// `last_prompt_tokens` is the *real* prompt-token count reported by the most
+/// recent completion — the actual measure of how full the window is, not a
+/// char-count guess. `0` (no usage reported yet) is treated as "unknown,
+/// nothing to do" rather than "0% full, trigger constantly".
+async fn maybe_compact_conversation(
+    client: &LlmClient,
+    msg_json: &mut Vec<serde_json::Value>,
+    cfg: &McpChatConfig,
+    last_prompt_tokens: u32,
+) {
+    if last_prompt_tokens == 0 {
+        return;
+    }
+    let strategy = cfg.context_strategy();
+    let (Some(threshold), Some(context_length)) =
+        (strategy.compaction_threshold(), cfg.context_length)
+    else {
+        return;
+    };
+    if context_length == 0 {
+        return;
+    }
+    let fill = last_prompt_tokens as f32 / context_length as f32;
+    if fill < threshold {
+        return;
+    }
+
+    let protected_head = protected_head(msg_json);
+    let keep_recent =
+        COMPACTION_KEEP_RECENT_MESSAGES.min(msg_json.len().saturating_sub(protected_head));
+    let compact_end = msg_json.len().saturating_sub(keep_recent);
+    // Nothing meaningful to compact yet (conversation too short) — let it
+    // grow; trim_conversation's hard limit is still there as a backstop.
+    if compact_end <= protected_head {
+        return;
+    }
+
+    let transcript = msg_json[protected_head..compact_end]
+        .iter()
+        .map(|m| {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            format!("[{role}] {content}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let dropped = compact_end - protected_head;
+
+    // Isolated call: tools disabled, a fresh bounded prompt containing only
+    // the material to compact — not "one more turn" appended to the
+    // already-near-full conversation being compacted. Summarizing well is
+    // itself hard; the same model already under context pressure is the
+    // worst place to ask for it, so this deliberately does not reuse the
+    // live msg_json / turn loop at all.
+    let compaction_messages = vec![serde_json::json!({
+        "role": "user",
+        "content": format!("{COMPACTION_INSTRUCTIONS}{transcript}")
+    })];
+
+    match client
+        .chat_completion_with_tools(compaction_messages, &[])
+        .await
+    {
+        Ok(resp) if !resp.content.trim().is_empty() => {
+            let summary_msg = serde_json::json!({
+                "role": "user",
+                "content": format!(
+                    "[{dropped} earlier message(s) were proactively compacted to stay under \
+                     {threshold:.0}% of the model's context window. Summary of what happened:]\n\n{}",
+                    resp.content
+                )
+            });
+            msg_json.splice(protected_head..compact_end, [summary_msg]);
+            tracing::warn!(
+                fill,
+                threshold,
+                dropped,
+                "agent: proactively compacted conversation history"
+            );
+        }
+        Ok(_) => {
+            tracing::warn!(
+                fill,
+                threshold,
+                "agent: proactive compaction returned an empty summary; leaving history as-is \
+                 (reactive trim remains the backstop)"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                fill,
+                threshold,
+                error = %e,
+                "agent: proactive compaction call failed; leaving history as-is \
+                 (reactive trim remains the backstop)"
+            );
+        }
     }
 }
 
@@ -804,8 +978,10 @@ pub async fn execute_agent_turn(
     read_file_hinted: &mut bool,
     error_hinted: &mut bool,
     gate: Arc<dyn AgentApprovalGate>,
+    last_prompt_tokens: &mut u32,
 ) -> bool {
     if let Some(cfg) = mcp {
+        maybe_compact_conversation(client, msg_json, cfg, *last_prompt_tokens).await;
         trim_conversation(msg_json, conversation_char_budget(cfg));
     }
 
@@ -835,6 +1011,9 @@ pub async fn execute_agent_turn(
 
     if let Some(usage) = &completion.usage {
         let _ = tx.send(AgentEvent::Usage(usage.clone())).await;
+        if usage.prompt_tokens > 0 {
+            *last_prompt_tokens = usage.prompt_tokens;
+        }
     }
 
     msg_json.push(serde_json::json!({
@@ -977,6 +1156,7 @@ pub fn spawn_agent_task(
         let mut completed = false;
         let mut read_file_hinted = false;
         let mut error_hinted = false;
+        let mut last_prompt_tokens: u32 = 0;
 
         info!(
             max_turns,
@@ -998,6 +1178,7 @@ pub fn spawn_agent_task(
                 &mut read_file_hinted,
                 &mut error_hinted,
                 gate.clone(),
+                &mut last_prompt_tokens,
             )
             .await
             {
@@ -3670,6 +3851,7 @@ mod tests {
         let mut msg_json = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let mut read_hinted = false;
         let mut error_hinted = false;
+        let mut last_prompt_tokens: u32 = 0;
 
         let cont = execute_agent_turn(
             &client,
@@ -3682,6 +3864,7 @@ mod tests {
             &mut read_hinted,
             &mut error_hinted,
             Arc::new(AutoApproveGate),
+            &mut last_prompt_tokens,
         )
         .await;
 
@@ -3723,6 +3906,7 @@ mod tests {
         let mut msg_json = vec![serde_json::json!({"role": "user", "content": "go"})];
         let mut read_hinted = false;
         let mut error_hinted = false;
+        let mut last_prompt_tokens: u32 = 0;
 
         let cont = execute_agent_turn(
             &client,
@@ -3735,6 +3919,7 @@ mod tests {
             &mut read_hinted,
             &mut error_hinted,
             Arc::new(AutoApproveGate),
+            &mut last_prompt_tokens,
         )
         .await;
 
@@ -3772,6 +3957,7 @@ mod tests {
         let mut msg_json = vec![serde_json::json!({"role": "user", "content": "go"})];
         let mut read_hinted = false;
         let mut error_hinted = false;
+        let mut last_prompt_tokens: u32 = 0;
 
         let cont = execute_agent_turn(
             &client,
@@ -3784,6 +3970,7 @@ mod tests {
             &mut read_hinted,
             &mut error_hinted,
             Arc::new(AutoApproveGate),
+            &mut last_prompt_tokens,
         )
         .await;
 
@@ -3843,6 +4030,7 @@ mod tests {
         let mut msg_json = vec![serde_json::json!({"role": "user", "content": "go"})];
         let mut read_hinted = false;
         let mut error_hinted = false;
+        let mut last_prompt_tokens: u32 = 0;
 
         let cont = execute_agent_turn(
             &client,
@@ -3857,6 +4045,7 @@ mod tests {
             &mut read_hinted,
             &mut error_hinted,
             Arc::new(AutoApproveGate),
+            &mut last_prompt_tokens,
         )
         .await;
 
@@ -3870,6 +4059,252 @@ mod tests {
             }
         }
         assert!(saw_mcp_not_configured_error, "{msg_json:?}");
+    }
+
+    // ── maybe_compact_conversation ────────────────────────────────────────────
+
+    /// A mock `/chat/completions` endpoint that always answers with a fixed
+    /// non-streaming JSON completion, recording how many times it was called.
+    async fn mock_chat_completions_json(
+        content: &str,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> String {
+        let content = content.to_string();
+        let router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(move || {
+                let content = content.clone();
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"role": "assistant", "content": content}}]
+                    }))
+                }
+            }),
+        );
+        serve_router(router).await
+    }
+
+    /// A long-ish conversation: system + pinned goal, then several
+    /// user/assistant pairs — enough for compaction to have real middle
+    /// content to work with once the head and recent tail are excluded.
+    fn long_conversation() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "the original goal"}),
+            serde_json::json!({"role": "user", "content": "step 1"}),
+            serde_json::json!({"role": "assistant", "content": "did step 1"}),
+            serde_json::json!({"role": "user", "content": "step 2"}),
+            serde_json::json!({"role": "assistant", "content": "did step 2"}),
+            serde_json::json!({"role": "user", "content": "step 3"}),
+            serde_json::json!({"role": "assistant", "content": "did step 3"}),
+            serde_json::json!({"role": "user", "content": "step 4 (recent)"}),
+            serde_json::json!({"role": "assistant", "content": "did step 4 (recent)"}),
+        ]
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_conversation_below_threshold_is_a_noop() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = mock_chat_completions_json("MUST NOT BE USED", calls.clone()).await;
+        let client = LlmClient::new(&base, "m", None);
+        let cfg = McpChatConfig {
+            context_length: Some(10_000),
+            small_model_harness: true, // threshold 0.70
+            ..empty_mcp_config(&base)
+        };
+        let mut msg_json = long_conversation();
+        let before = msg_json.clone();
+
+        // 1_000 / 10_000 = 10% full, well under the 70% threshold.
+        maybe_compact_conversation(&client, &mut msg_json, &cfg, 1_000).await;
+
+        assert_eq!(msg_json, before, "must not touch history below threshold");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "must not call the LLM at all below threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_conversation_zero_usage_is_treated_as_unknown() {
+        // No usage reported yet (0) must not be read as "0% full → always
+        // trigger" — it means "we don't know yet", so skip.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = mock_chat_completions_json("MUST NOT BE USED", calls.clone()).await;
+        let client = LlmClient::new(&base, "m", None);
+        let cfg = McpChatConfig {
+            context_length: Some(10_000),
+            small_model_harness: true,
+            ..empty_mcp_config(&base)
+        };
+        let mut msg_json = long_conversation();
+        let before = msg_json.clone();
+
+        maybe_compact_conversation(&client, &mut msg_json, &cfg, 0).await;
+
+        assert_eq!(msg_json, before);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_conversation_unknown_context_length_is_a_noop() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = mock_chat_completions_json("MUST NOT BE USED", calls.clone()).await;
+        let client = LlmClient::new(&base, "m", None);
+        let cfg = McpChatConfig {
+            context_length: None, // unknown window → no denominator, no trigger
+            small_model_harness: true,
+            ..empty_mcp_config(&base)
+        };
+        let mut msg_json = long_conversation();
+        let before = msg_json.clone();
+
+        maybe_compact_conversation(&client, &mut msg_json, &cfg, 999_999).await;
+
+        assert_eq!(msg_json, before);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_conversation_above_threshold_summarizes_and_preserves_head_and_tail() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = mock_chat_completions_json(
+            "Goal: ship the feature\nPending todos: none",
+            calls.clone(),
+        )
+        .await;
+        let client = LlmClient::new(&base, "m", None);
+        let cfg = McpChatConfig {
+            context_length: Some(10_000),
+            small_model_harness: true, // threshold 0.70
+            ..empty_mcp_config(&base)
+        };
+        let mut msg_json = long_conversation();
+        let original_len = msg_json.len();
+
+        // 8_000 / 10_000 = 80% full, over the 70% threshold.
+        maybe_compact_conversation(&client, &mut msg_json, &cfg, 8_000).await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the isolated compaction call must have been made exactly once"
+        );
+        assert!(
+            msg_json.len() < original_len,
+            "history must have shrunk: {msg_json:?}"
+        );
+        // System prompt and pinned goal survive untouched.
+        assert_eq!(msg_json[0]["role"], "system");
+        assert_eq!(msg_json[0]["content"], "sys");
+        assert_eq!(msg_json[1]["role"], "user");
+        assert_eq!(msg_json[1]["content"], "the original goal");
+        // The most recent messages survive untouched, verbatim, in order.
+        let tail: Vec<_> = msg_json[msg_json.len() - COMPACTION_KEEP_RECENT_MESSAGES..].to_vec();
+        let expected_tail =
+            &long_conversation()[long_conversation().len() - COMPACTION_KEEP_RECENT_MESSAGES..];
+        assert_eq!(tail, expected_tail);
+        // The compacted middle became one summary message carrying the
+        // mock's returned content.
+        let summary = &msg_json[2];
+        assert_eq!(summary["role"], "user");
+        assert!(
+            summary["content"]
+                .as_str()
+                .unwrap()
+                .contains("ship the feature"),
+            "{summary:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_conversation_llm_failure_leaves_history_untouched() {
+        let router = axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "boom")
+            }),
+        );
+        let base = serve_router(router).await;
+        let client = LlmClient::new(&base, "m", None);
+        let cfg = McpChatConfig {
+            context_length: Some(10_000),
+            small_model_harness: true,
+            ..empty_mcp_config(&base)
+        };
+        let mut msg_json = long_conversation();
+        let before = msg_json.clone();
+
+        // Must not panic, and must leave history exactly as it was —
+        // trim_conversation (called right after, by the real turn loop)
+        // remains the backstop.
+        maybe_compact_conversation(&client, &mut msg_json, &cfg, 8_000).await;
+
+        assert_eq!(
+            msg_json, before,
+            "a failed compaction call must not corrupt history"
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_compact_conversation_too_short_to_compact_is_a_noop() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let base = mock_chat_completions_json("MUST NOT BE USED", calls.clone()).await;
+        let client = LlmClient::new(&base, "m", None);
+        let cfg = McpChatConfig {
+            context_length: Some(10_000),
+            small_model_harness: true,
+            ..empty_mcp_config(&base)
+        };
+        // Only the protected head plus a couple of recent messages — nothing
+        // left in the "middle" once both are excluded.
+        let mut msg_json = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "goal"}),
+            serde_json::json!({"role": "assistant", "content": "a"}),
+        ];
+        let before = msg_json.clone();
+
+        maybe_compact_conversation(&client, &mut msg_json, &cfg, 8_000).await;
+
+        assert_eq!(msg_json, before);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn compaction_threshold_is_none_without_a_known_context_length() {
+        let strategy = BudgetStrategy {
+            context_length: None,
+            small_model_harness: true,
+            minimize_tokens: false,
+        };
+        assert_eq!(strategy.compaction_threshold(), None);
+    }
+
+    #[test]
+    fn compaction_threshold_is_tighter_for_small_models() {
+        let small = BudgetStrategy {
+            context_length: Some(8_192),
+            small_model_harness: true,
+            minimize_tokens: false,
+        };
+        let normal = BudgetStrategy {
+            context_length: Some(8_192),
+            small_model_harness: false,
+            minimize_tokens: false,
+        };
+        assert_eq!(
+            small.compaction_threshold(),
+            Some(SMALL_MODEL_COMPACTION_THRESHOLD)
+        );
+        assert_eq!(
+            normal.compaction_threshold(),
+            Some(DEFAULT_COMPACTION_THRESHOLD)
+        );
+        assert!(small.compaction_threshold() < normal.compaction_threshold());
     }
 
     // ── fetch_completion branches ─────────────────────────────────────────────
