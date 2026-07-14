@@ -1042,6 +1042,54 @@ fn take_sse_line(buffer: &mut String) -> Option<String> {
     Some(line)
 }
 
+/// Result of parsing and folding one SSE `data:` line into the in-progress
+/// accumulation state, for [`drain_streaming_deltas`].
+enum StreamLineOutcome {
+    /// Not a `data:` line, or not valid JSON — nothing to do.
+    Skip,
+    /// The `[DONE]` sentinel — the caller should stop consuming.
+    Done,
+    /// A parsed chunk, with any content/thinking fragments to forward live.
+    Chunk {
+        content: Option<String>,
+        thinking: Option<String>,
+    },
+}
+
+/// Parse one SSE `data:` line and fold it into `acc`/`usage`/`finish_reason`.
+///
+/// Pure (no I/O): isolates the per-line parsing/accumulation decision from
+/// the async byte-stream loop in [`drain_streaming_deltas`], which is
+/// otherwise responsible for forwarding deltas and reading more bytes.
+fn process_stream_line(
+    line: &str,
+    acc: &mut StreamingToolAccumulator,
+    usage: &mut Option<Value>,
+    finish_reason: &mut Option<String>,
+) -> StreamLineOutcome {
+    let Some(data) = line.strip_prefix("data: ") else {
+        return StreamLineOutcome::Skip;
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return StreamLineOutcome::Done;
+    }
+    let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+        return StreamLineOutcome::Skip;
+    };
+    if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
+        *usage = Some(u.clone());
+    }
+    if let Some(reason) = chunk
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+    {
+        *finish_reason = Some(reason.to_string());
+    }
+    let (content, thinking) = acc.push_chunk(&chunk);
+    StreamLineOutcome::Chunk { content, thinking }
+}
+
 /// Drain an OpenAI-compatible SSE byte stream to completion, forwarding
 /// content/thinking deltas live via `deltas`, and return the accumulated
 /// `{choices:[{message}]}` JSON (with `usage`, if seen) once the stream
@@ -1067,26 +1115,12 @@ async fn drain_streaming_deltas(
 
     'outer: loop {
         while let Some(line) = take_sse_line(&mut buffer) {
-            let Some(data) = line.strip_prefix("data: ") else {
-                continue;
+            let outcome = process_stream_line(&line, &mut acc, &mut usage, &mut finish_reason);
+            let (content_delta, thinking_delta) = match outcome {
+                StreamLineOutcome::Skip => continue,
+                StreamLineOutcome::Done => break 'outer,
+                StreamLineOutcome::Chunk { content, thinking } => (content, thinking),
             };
-            let data = data.trim();
-            if data == "[DONE]" {
-                break 'outer;
-            }
-            let Ok(chunk) = serde_json::from_str::<Value>(data) else {
-                continue;
-            };
-            if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
-                usage = Some(u.clone());
-            }
-            if let Some(reason) = chunk
-                .pointer("/choices/0/finish_reason")
-                .and_then(Value::as_str)
-            {
-                finish_reason = Some(reason.to_string());
-            }
-            let (content_delta, thinking_delta) = acc.push_chunk(&chunk);
             if let Some(c) = content_delta {
                 if !first_token_logged {
                     first_token_logged = true;

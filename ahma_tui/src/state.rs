@@ -2357,25 +2357,23 @@ impl AppState {
         if let Some(event) = event {
             self.push_op_event(event);
         }
-        // Flush any output that arrived before this op was materialised (see
-        // `pending_output`). Append into the (now present) op's tail via the
-        // same overlap-dedup merge the poll/hub paths use, so a later poll that
-        // re-sends the full tail does not duplicate these lines.
-        if let Some(pending) = self.pending_output.remove(&id)
-            && let Some(existing) = self.operations.iter_mut().find(|o| o.id == id)
-        {
-            let new_lines = Self::tail_suffix_to_append(&existing.stdout_tail, &pending);
-            if !new_lines.is_empty() {
-                existing.last_output_at = Some(Instant::now());
-            }
-            for line in new_lines {
-                if existing.stdout_tail.len() >= STDOUT_TAIL_CAP {
-                    existing.stdout_tail.pop_front();
-                }
-                existing.stdout_tail.push_back(line);
-            }
-        }
+        self.flush_pending_output(&id);
         self.clamp_ops_selection();
+    }
+
+    /// Flush any output that arrived before operation `id` was materialised
+    /// (see `pending_output`). Appends into the (now present) op's tail via
+    /// the same overlap-dedup merge the poll/hub paths use, so a later poll
+    /// that re-sends the full tail does not duplicate these lines.
+    fn flush_pending_output(&mut self, id: &str) {
+        let Some(pending) = self.pending_output.remove(id) else {
+            return;
+        };
+        let Some(existing) = self.operations.iter_mut().find(|o| o.id == id) else {
+            return;
+        };
+        let new_lines = Self::tail_suffix_to_append(&existing.stdout_tail, &pending);
+        Self::append_stdout_lines(existing, new_lines);
     }
 
     /// Stash a live output line for an operation not yet present in
@@ -2444,15 +2442,7 @@ impl AppState {
         // between the existing tail's suffix and the incoming tail's prefix,
         // then append only the genuinely new remainder.
         let new_lines = Self::tail_suffix_to_append(&existing.stdout_tail, &op.stdout_tail);
-        if !new_lines.is_empty() {
-            existing.last_output_at = Some(Instant::now());
-        }
-        for line in new_lines {
-            if existing.stdout_tail.len() >= STDOUT_TAIL_CAP {
-                existing.stdout_tail.pop_front();
-            }
-            existing.stdout_tail.push_back(line);
-        }
+        Self::append_stdout_lines(existing, new_lines);
 
         // Append new alerts (deduplicate by content).
         for alert in op.alerts {
@@ -2463,6 +2453,23 @@ impl AppState {
 
         // pinned is sticky — once pinned it stays pinned.
         existing.pinned = existing.pinned || op.pinned;
+    }
+
+    /// Append `new_lines` to `existing`'s stdout tail, evicting from the
+    /// front once the tail exceeds `STDOUT_TAIL_CAP`. Bumps
+    /// `last_output_at` when any line is appended. Shared by the poll-merge
+    /// (`merge_operation`) and pending-output-flush (`flush_pending_output`)
+    /// paths, which both append to a capped tail using the same eviction rule.
+    fn append_stdout_lines(existing: &mut Operation, new_lines: Vec<String>) {
+        if !new_lines.is_empty() {
+            existing.last_output_at = Some(Instant::now());
+        }
+        for line in new_lines {
+            if existing.stdout_tail.len() >= STDOUT_TAIL_CAP {
+                existing.stdout_tail.pop_front();
+            }
+            existing.stdout_tail.push_back(line);
+        }
     }
 
     fn clamp_ops_selection(&mut self) {

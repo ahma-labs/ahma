@@ -966,6 +966,61 @@ fn push_tool_message_with_hints(
     }));
 }
 
+/// Handle a possibly length-truncated completion, right after it is fetched
+/// and before the caller decides how to continue the turn.
+///
+/// Returns `Some(true)` when the caller must immediately return `true` from
+/// `execute_agent_turn` (a continuation turn was queued). Returns `None` when
+/// the completion was not truncated, or was truncated mid tool-call (already
+/// warned here) — either way the caller should keep processing normally.
+async fn handle_length_truncated_completion(
+    completion: &ahma_llm_monitor::client::ChatCompletionResponse,
+    msg_json: &mut Vec<serde_json::Value>,
+    tx: &Sender<AgentEvent>,
+    content_streamed: bool,
+) -> Option<bool> {
+    if !completion.is_length_truncated() {
+        return None;
+    }
+
+    if !completion.tool_calls.is_empty() {
+        // Rarer: cut off while emitting a tool call, so its arguments may be
+        // incomplete. Not auto-recoverable the same way (nothing to "continue"
+        // that isn't already a malformed tool call) — proceed as-is, but make
+        // the risk visible rather than silently trusting truncated JSON.
+        warn!(
+            tool_calls = completion.tool_calls.len(),
+            "agent: response was cut off by a length limit while requesting tool call(s) — \
+             arguments may be incomplete"
+        );
+        return None;
+    }
+
+    // The model was cut off by a length/context limit mid-response — the
+    // classic "stuck thinking forever" failure for small local models with
+    // small context windows. Never leave this silent: surface it, then
+    // request a continuation on the next turn (bounded by the caller's
+    // existing max_turns loop, same as any other turn).
+    warn!(
+        content_chars = completion.content.len(),
+        "agent: response was cut off by a length/context limit — requesting a continuation"
+    );
+    let _ = tx
+        .send(AgentEvent::Truncated {
+            reason: "response was cut off by a length/context limit; continuing".to_string(),
+        })
+        .await;
+    if !content_streamed && !completion.content.is_empty() {
+        let _ = tx.send(AgentEvent::Token(completion.content.clone())).await;
+    }
+    msg_json.push(serde_json::json!({
+        "role": "user",
+        "content": "[Your previous response was cut off by a length limit. Continue \
+                     exactly where you left off — do not repeat what you already said.]"
+    }));
+    Some(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_agent_turn(
     client: &LlmClient,
@@ -1022,42 +1077,10 @@ pub async fn execute_agent_turn(
         "tool_calls": completion.assistant_message.get("tool_calls").cloned().unwrap_or(serde_json::Value::Null)
     }));
 
-    if completion.tool_calls.is_empty() && completion.is_length_truncated() {
-        // The model was cut off by a length/context limit mid-response — the
-        // classic "stuck thinking forever" failure for small local models with
-        // small context windows. Never leave this silent: surface it, then
-        // request a continuation on the next turn (bounded by the caller's
-        // existing max_turns loop, same as any other turn).
-        warn!(
-            content_chars = completion.content.len(),
-            "agent: response was cut off by a length/context limit — requesting a continuation"
-        );
-        let _ = tx
-            .send(AgentEvent::Truncated {
-                reason: "response was cut off by a length/context limit; continuing".to_string(),
-            })
-            .await;
-        if !content_streamed && !completion.content.is_empty() {
-            let _ = tx.send(AgentEvent::Token(completion.content)).await;
-        }
-        msg_json.push(serde_json::json!({
-            "role": "user",
-            "content": "[Your previous response was cut off by a length limit. Continue \
-                         exactly where you left off — do not repeat what you already said.]"
-        }));
-        return true;
-    }
-
-    if completion.is_length_truncated() && !completion.tool_calls.is_empty() {
-        // Rarer: cut off while emitting a tool call, so its arguments may be
-        // incomplete. Not auto-recoverable the same way (nothing to "continue"
-        // that isn't already a malformed tool call) — proceed as-is, but make
-        // the risk visible rather than silently trusting truncated JSON.
-        warn!(
-            tool_calls = completion.tool_calls.len(),
-            "agent: response was cut off by a length limit while requesting tool call(s) — \
-             arguments may be incomplete"
-        );
+    if let Some(result) =
+        handle_length_truncated_completion(&completion, msg_json, tx, content_streamed).await
+    {
+        return result;
     }
 
     if completion.tool_calls.is_empty() {

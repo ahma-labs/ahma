@@ -312,18 +312,10 @@ fn handle_prompts_update() -> Result<()> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
-    use ahma_common::config::{
-        AhmaSettings, GrantOutcome, PersistentScope, ScopeAccess, settings_path,
-    };
+    use ahma_common::config::settings_path;
 
     let file = settings_path()
         .context("Cannot determine ~/.ahma/settings.toml (home directory not found)")?;
-
-    // Strict load on the write paths: refuse to clobber a settings file we cannot
-    // parse. A missing file is fine (returns defaults) — the first grant creates it.
-    let load = |p: &std::path::Path| -> Result<AhmaSettings> {
-        AhmaSettings::load_from_result(p).map_err(|e| anyhow::anyhow!(e))
-    };
 
     match args.command {
         SandboxCommand::Grant {
@@ -331,138 +323,153 @@ pub(crate) fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
             read_only,
             by,
             note,
-        } => {
-            let access = if read_only {
-                ScopeAccess::Ro
-            } else {
-                ScopeAccess::Rw
-            };
-            let mut settings = load(&file)?;
+        } => run_sandbox_grant(&file, dir, read_only, by, note),
+        SandboxCommand::List => run_sandbox_list(&file),
+        SandboxCommand::Revoke { path: dir } => run_sandbox_revoke(&file, dir),
+    }
+}
 
-            // The catastrophic-path denylist gates *every* write into the ledger,
-            // not just the `sandbox_grant` MCP tool (SPEC R-PERM.2). The CLI used
-            // to skip it, which meant the safest surface (a human at a terminal)
-            // had the weakest guardrail — precisely backwards.
-            refuse_denylisted_grant(&dir, &settings)?;
+/// Strict load on the write paths: refuse to clobber a settings file we cannot
+/// parse. A missing file is fine (returns defaults) — the first grant creates it.
+fn load_sandbox_settings(file: &std::path::Path) -> Result<ahma_common::config::AhmaSettings> {
+    ahma_common::config::AhmaSettings::load_from_result(file).map_err(|e| anyhow::anyhow!(e))
+}
 
-            let scope = PersistentScope {
-                path: dir.clone(),
-                access,
-                granted_by: by,
-                granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
-                note,
-            };
-            let outcome = settings.sandbox.grant_scope(scope);
-            settings
-                .save_to(&file)
-                .with_context(|| format!("Failed to write {}", file.display()))?;
+fn run_sandbox_grant(
+    file: &std::path::Path,
+    dir: PathBuf,
+    read_only: bool,
+    by: Option<String>,
+    note: Option<String>,
+) -> Result<()> {
+    use ahma_common::config::{GrantOutcome, PersistentScope, ScopeAccess};
 
-            audit(
-                AuditAction::Grant,
-                GrantKind::FsScope,
-                dir.display().to_string(),
-                Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
-            );
+    let access = if read_only {
+        ScopeAccess::Ro
+    } else {
+        ScopeAccess::Rw
+    };
+    let mut settings = load_sandbox_settings(file)?;
 
-            match outcome {
-                GrantOutcome::Added => {
-                    println!("✓ Granted {} access to {}", access.label(), dir.display());
-                }
-                GrantOutcome::Updated(old) => {
-                    println!(
-                        "✓ Updated grant for {}: {} → {}",
-                        dir.display(),
-                        old.access.label(),
-                        access.label()
-                    );
-                }
-            }
-            println!();
-            println!("Recorded in: {}", file.display());
-            println!("  This file lives outside every sandbox scope, so a sandboxed *command*");
-            println!("  cannot touch it. Only you — or the AI's `sandbox_grant` tool, and only");
-            println!(
-                "  after you confirm a previewed line — can change it. Edit it by hand, or run"
-            );
-            println!(
-                "  `ahma sandbox revoke {}` to remove this grant.",
-                dir.display()
-            );
-            println!();
-            println!("Takes effect the next time an ahma server starts (restart your IDE's MCP");
-            println!("connection, or `ahma serve …`, to apply it now).");
-            Ok(())
+    // The catastrophic-path denylist gates *every* write into the ledger,
+    // not just the `sandbox_grant` MCP tool (SPEC R-PERM.2). The CLI used
+    // to skip it, which meant the safest surface (a human at a terminal)
+    // had the weakest guardrail — precisely backwards.
+    refuse_denylisted_grant(&dir, &settings)?;
+
+    let scope = PersistentScope {
+        path: dir.clone(),
+        access,
+        granted_by: by,
+        granted_at: Some(chrono::Local::now().format("%Y-%m-%d").to_string()),
+        note,
+    };
+    let outcome = settings.sandbox.grant_scope(scope);
+    settings
+        .save_to(file)
+        .with_context(|| format!("Failed to write {}", file.display()))?;
+
+    audit(
+        AuditAction::Grant,
+        GrantKind::FsScope,
+        dir.display().to_string(),
+        Some(if access.is_write() { "rw" } else { "ro" }.to_string()),
+    );
+
+    match outcome {
+        GrantOutcome::Added => {
+            println!("✓ Granted {} access to {}", access.label(), dir.display());
         }
-        SandboxCommand::List => {
-            let settings = load(&file)?;
-            let scopes = &settings.sandbox.persistent_scopes;
-            println!("# Persistent sandbox scopes");
-            println!("# File: {}", file.display());
-            println!();
-
-            if scopes.is_empty() {
-                println!("(none granted)");
-                println!();
-                println!(
-                    "Grant one with:  ahma sandbox grant <PATH> [--read-only] [--by WHO] [--note TEXT]"
-                );
-                return Ok(());
-            }
-            for s in scopes {
-                println!("• {}  ({})", s.path.display(), s.access.label());
-                if let Some(by) = &s.granted_by {
-                    println!("    granted by: {by}");
-                }
-                if let Some(at) = &s.granted_at {
-                    println!("    granted on: {at}");
-                }
-                if let Some(note) = &s.note {
-                    println!("    note:       {note}");
-                }
-            }
-            println!();
-            println!("These survive every roots/list update. Use `ahma sandbox grant|revoke` (or");
-            println!("edit the file directly) to change them; restart the server to apply.");
-            Ok(())
-        }
-        SandboxCommand::Revoke { path: dir } => {
-            let mut settings = load(&file)?;
-            match settings.sandbox.revoke_scope(&dir) {
-                Some(removed) => {
-                    settings
-                        .save_to(&file)
-                        .with_context(|| format!("Failed to write {}", file.display()))?;
-                    audit(
-                        AuditAction::Revoke,
-                        GrantKind::FsScope,
-                        removed.path.display().to_string(),
-                        Some(
-                            if removed.access.is_write() {
-                                "rw"
-                            } else {
-                                "ro"
-                            }
-                            .to_string(),
-                        ),
-                    );
-                    println!(
-                        "✓ Revoked {} access to {}",
-                        removed.access.label(),
-                        removed.path.display()
-                    );
-                    println!();
-                    println!("Updated: {}", file.display());
-                    println!("Takes effect the next time an ahma server starts.");
-                    Ok(())
-                }
-                None => {
-                    println!("No persistent scope matching {} was found.", dir.display());
-                    println!("Run `ahma sandbox list` to see current grants.");
-                    Ok(())
-                }
-            }
+        GrantOutcome::Updated(old) => {
+            println!(
+                "✓ Updated grant for {}: {} → {}",
+                dir.display(),
+                old.access.label(),
+                access.label()
+            );
         }
     }
+    println!();
+    println!("Recorded in: {}", file.display());
+    println!("  This file lives outside every sandbox scope, so a sandboxed *command*");
+    println!("  cannot touch it. Only you — or the AI's `sandbox_grant` tool, and only");
+    println!("  after you confirm a previewed line — can change it. Edit it by hand, or run");
+    println!(
+        "  `ahma sandbox revoke {}` to remove this grant.",
+        dir.display()
+    );
+    println!();
+    println!("Takes effect the next time an ahma server starts (restart your IDE's MCP");
+    println!("connection, or `ahma serve …`, to apply it now).");
+    Ok(())
+}
+
+fn run_sandbox_list(file: &std::path::Path) -> Result<()> {
+    let settings = load_sandbox_settings(file)?;
+    let scopes = &settings.sandbox.persistent_scopes;
+    println!("# Persistent sandbox scopes");
+    println!("# File: {}", file.display());
+    println!();
+
+    if scopes.is_empty() {
+        println!("(none granted)");
+        println!();
+        println!(
+            "Grant one with:  ahma sandbox grant <PATH> [--read-only] [--by WHO] [--note TEXT]"
+        );
+        return Ok(());
+    }
+    for s in scopes {
+        println!("• {}  ({})", s.path.display(), s.access.label());
+        if let Some(by) = &s.granted_by {
+            println!("    granted by: {by}");
+        }
+        if let Some(at) = &s.granted_at {
+            println!("    granted on: {at}");
+        }
+        if let Some(note) = &s.note {
+            println!("    note:       {note}");
+        }
+    }
+    println!();
+    println!("These survive every roots/list update. Use `ahma sandbox grant|revoke` (or");
+    println!("edit the file directly) to change them; restart the server to apply.");
+    Ok(())
+}
+
+fn run_sandbox_revoke(file: &std::path::Path, dir: PathBuf) -> Result<()> {
+    let mut settings = load_sandbox_settings(file)?;
+    let Some(removed) = settings.sandbox.revoke_scope(&dir) else {
+        println!("No persistent scope matching {} was found.", dir.display());
+        println!("Run `ahma sandbox list` to see current grants.");
+        return Ok(());
+    };
+
+    settings
+        .save_to(file)
+        .with_context(|| format!("Failed to write {}", file.display()))?;
+    audit(
+        AuditAction::Revoke,
+        GrantKind::FsScope,
+        removed.path.display().to_string(),
+        Some(
+            if removed.access.is_write() {
+                "rw"
+            } else {
+                "ro"
+            }
+            .to_string(),
+        ),
+    );
+    println!(
+        "✓ Revoked {} access to {}",
+        removed.access.label(),
+        removed.path.display()
+    );
+    println!();
+    println!("Updated: {}", file.display());
+    println!("Takes effect the next time an ahma server starts.");
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -606,30 +613,7 @@ fn print_permissions(
         }
         println!("{}:", kind.label());
         for r in of_kind {
-            let access = r
-                .access
-                .as_deref()
-                .map(|a| format!("  ({a})"))
-                .unwrap_or_default();
-            println!("  • {}{access}", r.subject);
-            if let Some(ws) = &r.scope_note {
-                println!("      workspace:  {ws}");
-            }
-            let provenance = [
-                r.granted_by.as_deref().map(|b| format!("by {b}")),
-                r.granted_at.as_deref().map(|a| format!("on {a}")),
-                r.surface.as_deref().map(|s| format!("via {s}")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(", ");
-            if !provenance.is_empty() {
-                println!("      granted:    {provenance}");
-            }
-            if let Some(note) = &r.note {
-                println!("      note:       {note}");
-            }
+            print_permission_record(r);
         }
         println!();
     }
@@ -641,6 +625,37 @@ fn print_permissions(
         "read it nor add itself to it. Revoke with `ahma permissions revoke <KIND> <SUBJECT>`."
     );
     Ok(())
+}
+
+/// Print a single permission record's subject line plus its indented detail
+/// lines (workspace, provenance, note) — the body of the per-kind loop in
+/// [`print_permissions`], pulled out so that loop reads as "for each record,
+/// print it" rather than a wall of formatting.
+fn print_permission_record(r: &ahma_common::permissions::GrantRecord) {
+    let access = r
+        .access
+        .as_deref()
+        .map(|a| format!("  ({a})"))
+        .unwrap_or_default();
+    println!("  • {}{access}", r.subject);
+    if let Some(ws) = &r.scope_note {
+        println!("      workspace:  {ws}");
+    }
+    let provenance = [
+        r.granted_by.as_deref().map(|b| format!("by {b}")),
+        r.granted_at.as_deref().map(|a| format!("on {a}")),
+        r.surface.as_deref().map(|s| format!("via {s}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
+    if !provenance.is_empty() {
+        println!("      granted:    {provenance}");
+    }
+    if let Some(note) = &r.note {
+        println!("      note:       {note}");
+    }
 }
 
 /// Show the sandbox profiles in effect — the toolchain carve-outs ahma applies on
@@ -690,6 +705,76 @@ fn print_profiles(settings: &ahma_common::config::AhmaSettings) {
 /// performs the edit — the preview cannot drift from what `--yes` actually does.
 type RevokeFn = Box<dyn FnOnce(&mut ahma_common::config::AhmaSettings) -> bool>;
 
+/// Preview an fs-scope revoke: `None` means "not found" (message already
+/// printed to the user); `Some` carries the description and the deferred edit.
+fn preview_revoke_fs_scope(
+    settings: &ahma_common::config::AhmaSettings,
+    subject: &str,
+) -> Option<(String, RevokeFn)> {
+    let path = PathBuf::from(subject);
+    if settings.sandbox.find_scope(&path).is_none() {
+        println!("No filesystem scope matching {subject} is granted.");
+        println!("Run `ahma permissions list` to see what is.");
+        return None;
+    }
+    Some((
+        format!("remove the filesystem scope {subject}"),
+        Box::new(move |s: &mut ahma_common::config::AhmaSettings| {
+            s.sandbox.revoke_scope(&path).is_some()
+        }),
+    ))
+}
+
+/// Preview a web-domain revoke; see [`preview_revoke_fs_scope`] for the `None` contract.
+fn preview_revoke_web_domain(
+    settings: &ahma_common::config::AhmaSettings,
+    subject: &str,
+) -> Option<(String, RevokeFn)> {
+    let pattern = subject.to_string();
+    if !settings.web.always_allow.iter().any(|p| p == &pattern) {
+        println!("No web domain matching {subject} is in the allow list.");
+        println!("Run `ahma permissions list` to see what is.");
+        return None;
+    }
+    Some((
+        format!("remove the web domain {subject} from [web].always_allow"),
+        Box::new(move |s: &mut ahma_common::config::AhmaSettings| {
+            let before = s.web.always_allow.len();
+            s.web.always_allow.retain(|p| p != &pattern);
+            s.web.always_allow.len() != before
+        }),
+    ))
+}
+
+/// Preview a tool-approval revoke; see [`preview_revoke_fs_scope`] for the `None` contract.
+fn preview_revoke_tool(
+    settings: &ahma_common::config::AhmaSettings,
+    subject: &str,
+    workspace: Option<PathBuf>,
+) -> Option<(String, RevokeFn)> {
+    let ws = workspace
+        .map(|w| workspace_key(&w))
+        .unwrap_or_else(|| workspace_key(&std::env::current_dir().unwrap_or_default()));
+    if !settings.permissions.is_tool_approved(&ws, subject) {
+        println!("Tool '{subject}' is not approved in {}.", ws.display());
+        println!(
+            "Approvals are per-workspace; pass --workspace to target another one, or \
+                 run `ahma permissions list`."
+        );
+        return None;
+    }
+    let tool = subject.to_string();
+    Some((
+        format!(
+            "remove the tool approval '{subject}' for workspace {}",
+            ws.display()
+        ),
+        Box::new(move |s: &mut ahma_common::config::AhmaSettings| {
+            s.permissions.revoke_tool(&ws, &tool)
+        }),
+    ))
+}
+
 fn revoke_permission(
     file: &std::path::Path,
     mut settings: ahma_common::config::AhmaSettings,
@@ -702,61 +787,17 @@ fn revoke_permission(
 
     // Preview first, always. A revoke is less dangerous than a grant, but the
     // user should still never be surprised by what a command wrote (R-PERM.2).
-    let (description, apply): (String, RevokeFn) = match kind {
-        GrantKind::FsScope => {
-            let path = PathBuf::from(subject);
-            let found = settings.sandbox.find_scope(&path).is_some();
-            if !found {
-                println!("No filesystem scope matching {subject} is granted.");
-                println!("Run `ahma permissions list` to see what is.");
-                return Ok(());
-            }
-            (
-                format!("remove the filesystem scope {subject}"),
-                Box::new(move |s| s.sandbox.revoke_scope(&path).is_some()),
-            )
-        }
-        GrantKind::WebDomain => {
-            let pattern = subject.to_string();
-            if !settings.web.always_allow.iter().any(|p| p == &pattern) {
-                println!("No web domain matching {subject} is in the allow list.");
-                println!("Run `ahma permissions list` to see what is.");
-                return Ok(());
-            }
-            (
-                format!("remove the web domain {subject} from [web].always_allow"),
-                Box::new(move |s| {
-                    let before = s.web.always_allow.len();
-                    s.web.always_allow.retain(|p| p != &pattern);
-                    s.web.always_allow.len() != before
-                }),
-            )
-        }
-        GrantKind::Tool => {
-            let ws = workspace
-                .map(|w| workspace_key(&w))
-                .unwrap_or_else(|| workspace_key(&std::env::current_dir().unwrap_or_default()));
-            if !settings.permissions.is_tool_approved(&ws, subject) {
-                println!("Tool '{subject}' is not approved in {}.", ws.display());
-                println!(
-                    "Approvals are per-workspace; pass --workspace to target another one, or \
-                         run `ahma permissions list`."
-                );
-                return Ok(());
-            }
-            let tool = subject.to_string();
-            (
-                format!(
-                    "remove the tool approval '{subject}' for workspace {}",
-                    ws.display()
-                ),
-                Box::new(move |s| s.permissions.revoke_tool(&ws, &tool)),
-            )
-        }
+    let preview = match kind {
+        GrantKind::FsScope => preview_revoke_fs_scope(&settings, subject),
+        GrantKind::WebDomain => preview_revoke_web_domain(&settings, subject),
+        GrantKind::Tool => preview_revoke_tool(&settings, subject, workspace),
         GrantKind::HookUnsandboxed => anyhow::bail!(
             "hook consent is session-scoped and never persisted; revoke it with \
                  `ahma hooks revoke`"
         ),
+    };
+    let Some((description, apply)) = preview else {
+        return Ok(());
     };
 
     if !yes {

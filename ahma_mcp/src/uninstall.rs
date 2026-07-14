@@ -411,16 +411,15 @@ pub fn remove_mcp_entry(path: &Path, servers_key: &str, dry_run: bool) -> Result
         return Ok(()); // servers key absent — nothing to do
     };
 
-    if let Some(servers_obj) = servers_val.as_object_mut() {
-        if servers_obj.remove("Ahma").is_none() {
-            return Ok(()); // Ahma key already absent
-        }
-        // Intentionally leave the (possibly now-empty) servers object in place.
-        // `{ "mcpServers": {} }` is the canonical minimal MCP config, so we keep it
-        // rather than pruning the key and risking an "empty" file.
-    } else {
+    let Some(servers_obj) = servers_val.as_object_mut() else {
         return Ok(());
+    };
+    if servers_obj.remove("Ahma").is_none() {
+        return Ok(()); // Ahma key already absent
     }
+    // Intentionally leave the (possibly now-empty) servers object in place.
+    // `{ "mcpServers": {} }` is the canonical minimal MCP config, so we keep it
+    // rather than pruning the key and risking an "empty" file.
 
     if dry_run {
         return Ok(());
@@ -678,11 +677,7 @@ fn uninstall_binary(dry_run: bool) -> Result<()> {
     });
 
     if dry_run {
-        for path in [&binary_path, &old_path] {
-            if path.exists() {
-                println!("[dry-run] Would remove {}", path.display());
-            }
-        }
+        print_dry_run_binary_removal(&[&binary_path, &old_path]);
         return Ok(());
     }
 
@@ -693,6 +688,15 @@ fn uninstall_binary(dry_run: bool) -> Result<()> {
     print_windows_removal_instructions(&binary_path, &old_path);
 
     Ok(())
+}
+
+/// Print `[dry-run] Would remove ...` for each path that exists.
+fn print_dry_run_binary_removal(paths: &[&Path]) {
+    for path in paths {
+        if path.exists() {
+            println!("[dry-run] Would remove {}", path.display());
+        }
+    }
 }
 
 /// Delete the installed binary (and any leftover `ahma.old`) on Unix.

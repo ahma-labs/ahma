@@ -1294,50 +1294,52 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // grant ...` recovery line so the agent gets a next step instead of a raw
         // `os error 1`. The native-terminal hook uses the CLI grant path (not the
         // MCP grant/restart tools).
-        Err(e) => {
-            // Rung 3 of the question ladder, in a terminal (SPEC R-PERM.3 /
-            // R-PERM.6.1). A hooked command has no MCP session of its own, so when
-            // the sandbox blocks it the user's only surface is the terminal they
-            // are already looking at. It must therefore say what was denied and
-            // exactly how to allow it — never a bare `Operation not permitted`
-            // buried in a build log, which is the failure mode that made hooks feel
-            // like a wall rather than a boundary.
-            //
-            // Both denial shapes are covered: a *runtime* denial (the kernel blocked
-            // the write mid-command) and a *pre-exec* denial (the path was rejected
-            // before the command ran). The second used to fall through as a raw
-            // error — a denial the user could see but not act on.
-            if let Some(sandbox_err) = e.downcast_ref::<crate::sandbox::SandboxError>() {
-                let remediation = match sandbox_err {
-                    crate::sandbox::SandboxError::RuntimeDenial { path, access, .. } => Some(
-                        crate::sandbox::grant_channel::runtime_denial_remediation_cli(
-                            path, *access,
-                        ),
-                    ),
-                    crate::sandbox::SandboxError::PathOutsideSandbox { path, .. } => Some(
-                        crate::sandbox::grant_channel::runtime_denial_remediation_cli(
-                            path,
-                            ahma_common::config::ScopeAccess::Rw,
-                        ),
-                    ),
-                    _ => None,
-                };
-                if let Some(remediation) = remediation {
-                    // The grant applies to the **next command**: each hooked command
-                    // spawns a fresh `ahma hooks run-shell` that re-reads the ledger,
-                    // so there is no server to restart. Say so — it is the difference
-                    // between "fix this later" and "fix this now".
-                    let msg = format!(
-                        "{e}\n\n{remediation}\n\nThe grant takes effect on your next command \
-                         — terminal hooks re-read it each time, so nothing needs restarting."
-                    );
-                    eprintln!("{msg}");
-                    return Err(anyhow!("{msg}"));
-                }
-            }
-            Err(e)
-        }
+        Err(e) => report_shell_execution_error(e),
     }
+}
+
+/// Turn a failed hooked-shell-command execution into its final `Result`.
+///
+/// Rung 3 of the question ladder, in a terminal (SPEC R-PERM.3 / R-PERM.6.1). A
+/// hooked command has no MCP session of its own, so when the sandbox blocks it
+/// the user's only surface is the terminal they are already looking at. It must
+/// therefore say what was denied and exactly how to allow it — never a bare
+/// `Operation not permitted` buried in a build log, which is the failure mode
+/// that made hooks feel like a wall rather than a boundary.
+///
+/// Both denial shapes are covered: a *runtime* denial (the kernel blocked the
+/// write mid-command) and a *pre-exec* denial (the path was rejected before the
+/// command ran). The second used to fall through as a raw error — a denial the
+/// user could see but not act on.
+fn report_shell_execution_error(e: anyhow::Error) -> Result<()> {
+    let Some(sandbox_err) = e.downcast_ref::<crate::sandbox::SandboxError>() else {
+        return Err(e);
+    };
+    let remediation = match sandbox_err {
+        crate::sandbox::SandboxError::RuntimeDenial { path, access, .. } => {
+            Some(crate::sandbox::grant_channel::runtime_denial_remediation_cli(path, *access))
+        }
+        crate::sandbox::SandboxError::PathOutsideSandbox { path, .. } => Some(
+            crate::sandbox::grant_channel::runtime_denial_remediation_cli(
+                path,
+                ahma_common::config::ScopeAccess::Rw,
+            ),
+        ),
+        _ => None,
+    };
+    let Some(remediation) = remediation else {
+        return Err(e);
+    };
+    // The grant applies to the **next command**: each hooked command spawns a
+    // fresh `ahma hooks run-shell` that re-reads the ledger, so there is no
+    // server to restart. Say so — it is the difference between "fix this
+    // later" and "fix this now".
+    let msg = format!(
+        "{e}\n\n{remediation}\n\nThe grant takes effect on your next command \
+         — terminal hooks re-read it each time, so nothing needs restarting."
+    );
+    eprintln!("{msg}");
+    Err(anyhow!("{msg}"))
 }
 
 /// Fallback path when ahma's own execution cannot sandbox the command (SPEC

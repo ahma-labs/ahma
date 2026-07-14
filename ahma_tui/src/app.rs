@@ -4518,11 +4518,7 @@ fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::A
     }
 
     let chat_area = state.chat_area.get();
-    if col >= chat_area.x
-        && col < chat_area.x + chat_area.width
-        && row >= chat_area.y
-        && row < chat_area.y + chat_area.height
-    {
+    if inside_rect(col, row, chat_area) {
         let max = state.chat_max_scroll.get();
         if up {
             state.chat_scroll = (state.chat_scroll + 1).min(max);
@@ -4534,11 +4530,7 @@ fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::A
     }
 
     let log_area = state.log_area.get();
-    if col >= log_area.x
-        && col < log_area.x + log_area.width
-        && row >= log_area.y
-        && row < log_area.y + log_area.height
-    {
+    if inside_rect(col, row, log_area) {
         if up {
             state.detach_log_follow();
             state.log_scroll = state.log_scroll.saturating_sub(1);

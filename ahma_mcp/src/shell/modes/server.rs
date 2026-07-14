@@ -15,7 +15,6 @@ use ahma_http_mcp_client::client::HttpMcpTransport;
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
 use std::{
-    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -905,24 +904,7 @@ async fn spawn_background_bridge(
         ahma_common::timeouts::TestTimeouts::get(ahma_common::timeouts::TimeoutCategory::Quick);
     let healthy = wait_for_bridge_healthy(socket_path_opt, http_url_opt, timeout).await;
     if !healthy {
-        let stderr_tail = read_log_tail(&stderr_path, 8192);
-        if stderr_tail.is_empty() {
-            tracing::error!(
-                bridge_stderr = %stderr_path.display(),
-                "Background bridge failed health check within {timeout:?}; bridge stderr capture is empty"
-            );
-        } else {
-            tracing::error!(
-                bridge_stderr = %stderr_path.display(),
-                bridge_stderr_tail = %stderr_tail,
-                "Background bridge failed health check within {timeout:?}"
-            );
-        }
-        return Err(anyhow::anyhow!(
-            "Background bridge server failed to become healthy within {timeout:?}. \
-             Check {} and logs/ahma.log for details.",
-            stderr_path.display()
-        ));
+        return Err(bridge_unhealthy_error(&stderr_path, timeout));
     }
     tracing::info!(
         bridge_stdout = %stdout_path.display(),
@@ -931,6 +913,29 @@ async fn spawn_background_bridge(
     );
 
     Ok(())
+}
+
+/// Build the error returned when the freshly spawned background bridge does not
+/// become healthy in time, logging whatever stderr it managed to capture first.
+fn bridge_unhealthy_error(stderr_path: &std::path::Path, timeout: Duration) -> anyhow::Error {
+    let stderr_tail = read_log_tail(stderr_path, 8192);
+    if stderr_tail.is_empty() {
+        tracing::error!(
+            bridge_stderr = %stderr_path.display(),
+            "Background bridge failed health check within {timeout:?}; bridge stderr capture is empty"
+        );
+    } else {
+        tracing::error!(
+            bridge_stderr = %stderr_path.display(),
+            bridge_stderr_tail = %stderr_tail,
+            "Background bridge failed health check within {timeout:?}"
+        );
+    }
+    anyhow::anyhow!(
+        "Background bridge server failed to become healthy within {timeout:?}. \
+         Check {} and logs/ahma.log for details.",
+        stderr_path.display()
+    )
 }
 
 /// The machine-global bridge socket.
@@ -1150,25 +1155,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     );
 
     if !is_test {
-        // This is the IDE-facing frontend: it was spawned by an editor/agent
-        // over a stdin/stdout pipe and proxies to the detached background
-        // bridge. Arm the parent-death watchdog so we exit if that IDE dies
-        // without cleanly closing our stdin (uncaught kill, inherited pipe
-        // fds, or a hang before the proxy loop begins reading). This is the
-        // backstop that prevents orphaned `ahma serve stdio` processes from
-        // accumulating across IDE sessions. The detached bridge/daemon are
-        // deliberately NOT armed (they outlive their spawner by design and
-        // self-terminate via idle-timeout).
-        crate::utils::parent_watchdog::spawn_parent_death_watchdog();
-
-        let resolved_scopes: Vec<PathBuf> = sandbox.scopes().to_vec();
-        let _ = resolved_scopes; // kept for startup log below; not forwarded to bridge
-        spawn_background_bridge(&config, socket_path_opt, http_url_opt).await?;
-        // Proceed with proxy setup — map Ok(bool) → Ok(()) since the caller only
-        // cares about success/failure at this final stage.
-        return crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
-            .await
-            .map(|_| ());
+        return run_as_frontend_and_proxy(&config, socket_path_opt, http_url_opt).await;
     }
 
     use crate::transport_patch::PatchedStdioTransport;
@@ -1193,6 +1180,30 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
     result?;
 
     Ok(())
+}
+
+/// Run this process as the IDE-facing frontend: it was spawned by an editor/agent
+/// over a stdin/stdout pipe and proxies to the detached background bridge.
+///
+/// Arms the parent-death watchdog so we exit if that IDE dies without cleanly
+/// closing our stdin (uncaught kill, inherited pipe fds, or a hang before the
+/// proxy loop begins reading). This is the backstop that prevents orphaned
+/// `ahma serve stdio` processes from accumulating across IDE sessions. The
+/// detached bridge/daemon are deliberately NOT armed (they outlive their
+/// spawner by design and self-terminate via idle-timeout).
+async fn run_as_frontend_and_proxy(
+    config: &AppConfig,
+    socket_path_opt: Option<&str>,
+    http_url_opt: Option<&str>,
+) -> Result<()> {
+    crate::utils::parent_watchdog::spawn_parent_death_watchdog();
+
+    spawn_background_bridge(config, socket_path_opt, http_url_opt).await?;
+    // Proceed with proxy setup — map Ok(bool) → Ok(()) since the caller only
+    // cares about success/failure at this final stage.
+    crate::shell::modes::proxy_client::run_proxy_client(socket_path_opt, http_url_opt)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]
