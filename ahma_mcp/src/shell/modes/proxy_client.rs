@@ -148,7 +148,11 @@ where
 
 /// Async hook that respawns the background bridge. Provided by the frontend
 /// path (which owns the `AppConfig` needed to spawn); `None` elsewhere.
-#[cfg(unix)]
+///
+/// Not `#[cfg(unix)]`: the alias appears in cross-platform signatures
+/// (`run_proxy_client`, the server frontend). Only the *consumer* — the
+/// Unix-transport reconnect loop — is platform-gated; on Windows the hook is
+/// accepted and unused.
 pub type BridgeRespawnFn = Box<
     dyn FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> + Send,
 >;
@@ -292,7 +296,7 @@ pub async fn run_proxy_client(
     }
 
     #[cfg(not(unix))]
-    let _ = uds_path;
+    let _ = (uds_path, respawn_bridge);
 
     Err(anyhow!("No socket or HTTP URL provided for proxy client"))
 }
