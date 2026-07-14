@@ -96,13 +96,26 @@ jobs:
           token: ${{ github.token }}
           persist-credentials: true
 
-      - name: Configure Windows Defender exclusions
+      # Keeping antivirus out of the build tree is a speed optimization, not a
+      # correctness requirement. Add-MpPreference is a live call to the Defender
+      # service, which on hosted runners is sometimes disabled or unreachable
+      # (WMI 0x800106ba) -- so it must never be able to fail the job.
+      - name: Configure Windows Defender exclusions (best effort)
         if: runner.os == 'Windows'
         shell: powershell
+        continue-on-error: true
         run: |
-          Add-MpPreference -ExclusionPath "${{ github.workspace }}"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
-          Add-MpPreference -ExclusionPath "$env:TEMP"
+          $paths = @("${{ github.workspace }}", "$env:USERPROFILE\.cargo", "$env:TEMP")
+          foreach ($path in $paths) {
+            try {
+              Add-MpPreference -ExclusionPath $path -ErrorAction Stop
+              Write-Host "Defender exclusion added: $path"
+            } catch {
+              # Collapse newlines: a raw newline truncates a ::warning:: annotation.
+              $reason = ($_.Exception.Message -replace '\s+', ' ').Trim()
+              Write-Host "::warning::Defender exclusion skipped for ${path}: ${reason} -- builds may be slower, but correctness is unaffected."
+            }
+          }
 
       - name: Get current day number
         id: day-number
@@ -696,13 +709,26 @@ jobs:
           token: ${{ github.token }}
           persist-credentials: true
 
-      - name: Configure Windows Defender exclusions
+      # Keeping antivirus out of the build tree is a speed optimization, not a
+      # correctness requirement. Add-MpPreference is a live call to the Defender
+      # service, which on hosted runners is sometimes disabled or unreachable
+      # (WMI 0x800106ba) -- so it must never be able to fail the job.
+      - name: Configure Windows Defender exclusions (best effort)
         if: runner.os == 'Windows'
         shell: powershell
+        continue-on-error: true
         run: |
-          Add-MpPreference -ExclusionPath "${{ github.workspace }}"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
-          Add-MpPreference -ExclusionPath "$env:TEMP"
+          $paths = @("${{ github.workspace }}", "$env:USERPROFILE\.cargo", "$env:TEMP")
+          foreach ($path in $paths) {
+            try {
+              Add-MpPreference -ExclusionPath $path -ErrorAction Stop
+              Write-Host "Defender exclusion added: $path"
+            } catch {
+              # Collapse newlines: a raw newline truncates a ::warning:: annotation.
+              $reason = ($_.Exception.Message -replace '\s+', ' ').Trim()
+              Write-Host "::warning::Defender exclusion skipped for ${path}: ${reason} -- builds may be slower, but correctness is unaffected."
+            }
+          }
 
       - name: Get current day number
         id: day-number
