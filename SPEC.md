@@ -45,7 +45,7 @@
 | TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
 | Live Task Tree (R24) | tests-pass | Project-scoped caller → subtask tree, current at TUI startup via hub replay with true timestamps; accordion drill-in to live/historic output; client identity via reconnect-to-relabel; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
 | Local Cluster Scheduler | tests-pass | mDNS discovery and signed task dispatch to remote worker peers |
-| Configuration Standard (R-CFG) | PLANNED | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5) |
+| Configuration Standard (R-CFG) | in-progress | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5). Done: Security-tier `AHMA_*` retirement (warn-and-ignore, R-CFG1.2/R-CFG7.1) and settings-file/`--no-settings` resolution. Pending: settings provenance (`ahma settings show --origin`, R-CFG5.1) |
 | Unified Permissions (R-PERM) | tests-pass | One ledger under `~/.ahma` (fs scopes, web domains, tool approvals; legacy `approvals.json` migrated); question ladder (harness elicitation → TUI modal → fail-closed with paste-able remediation); sandbox profiles replace the hard-coded toolchain carve-outs; hooks enabled per client. User guide: `docs/permissions.md` |
 | `ahma cluster remove` | tests-pass | Subcommand to remove worker peers from peers configuration |
 | `ahma setup` / `ahma uninstall` | tests-pass | Interactive wizard installs / removes MCP entries, hooks, skills, binary; symmetric teardown leaves other user config intact |
@@ -1262,7 +1262,6 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Cluster scheduler | [docs/cluster-scheduler.md](docs/cluster-scheduler.md) | — |
 | Renewal contract | [docs/renewal-contract.md](docs/renewal-contract.md) | — |
 | ahma_core library | [docs/ahma-core-library.md](docs/ahma-core-library.md) | — |
-| Recursive task tree | [docs/recursive-task-tree.md](docs/recursive-task-tree.md) | — |
 
 ### 8.1 Core Principle: Use Ahma
 

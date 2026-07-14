@@ -1,27 +1,42 @@
 # ahma_task_tree Crate Specification
 
-* **Status**: Approved
-* **Date**: 2026-06-09
+* **Status**: Approved (reduced scope)
+* **Date**: 2026-07-14
 
-## 1. User Story / Problem Statement
+## 1. Purpose
 
-*As a user or agent with a complex, multi-step problem, I want the system to dynamically decompose the goal into a recursive tree of subtasks, interleave tool calls with reasoning, and recover from intermediate failures automatically.*
+`ahma_task_tree` provides the **planning-prompt builder** and the **LLM-plan
+step parser** used by the `ahma tui` local-model planning flow. It contains no
+execution machinery — it only turns a goal into a planning prompt and turns an
+LLM's JSON response back into typed steps.
 
 ## 2. Acceptance Criteria
 
-- **Recursive Decomposition**: Evaluates whether a task is atomic or needs further decomposition, supporting tree depths up to `max_depth` (default 4).
-- **Depth-First Traversal**: Traverses and executes tasks in depth-first order by default.
-- **Controlled Parallelism**: Supports parallel execution of sibling subtasks when annotated by the planner.
-- **Context Branching**: Packs only parent summaries and completed sibling results in the context window, keeping token counts low.
-- **Summarisation Pipeline**: Automatically summarizes tool stdout/stderr exceeding threshold size before feeding to parent context.
-- **Backtracking & Recovery**: If a leaf subtask fails, re-invokes the parent planner to retry, re-plan, escalate, or abort.
-- **Dynamic Scoping**: Restricts child subtask sandbox scopes and network permissions to be narrower than (or equal to) parent scopes.
+- **Prompt building**: Builds planning, output-summarisation, and
+  failure-recovery prompts by filling the shared templates from
+  `ahma_common::prompts::AhmaPrompts` (goal, task description, branch context,
+  step budget, failed-step details, remaining steps).
+- **Plan parsing**: Parses an LLM JSON plan response into typed steps
+  (`ParsedStep`: task, type, optional command/instructions/subgoal, and
+  optional sandbox-scope / allowed-tool / allowed-domain narrowing hints).
+- **Recovery parsing**: Parses an LLM recovery response into a
+  `RecoveryDecision` (`re_plan` with new steps, or `fail` with a reason).
+- **Tolerant input, strict output**: Markdown code fences around the JSON are
+  stripped before parsing; a response that still fails to parse returns an
+  error with the cleaned payload for diagnosis (never a silent empty plan).
 
-## 3. Non-Functional Requirements
+## 3. Out of Scope
 
-- **Token Efficiency**: Keeps context size under 3,000 tokens even at depth 4.
-- **Robustness**: Enforces safety limits against infinite decomposition loops.
-
-## 4. Out of Scope
-
+- **Task execution of any kind.** The recursive task-tree execution
+  orchestrator (recursive decomposition, depth-first traversal, controlled
+  parallelism, backtracking/recovery execution, dynamic scoping) that once
+  lived in this crate was **removed** because nothing in the shipped product
+  invoked it — no `tool_type: task_tree` config ships and no handler is
+  registered. See root [SPEC.md §5.6](../SPEC.md) ("Removed tool types") and
+  recover the orchestrator from git history if that roadmap feature is
+  revived.
 - Scheduling tasks to remote machines (handled by `ahma_cluster`).
+
+## 4. License
+
+AGPL-3.0-or-later.

@@ -70,21 +70,34 @@
 //! }
 //! ```
 //!
-//! ## Environment Variables
+//! ## Environment Variables (Retired)
 //!
-//! The `ahma` binary (and any binary built on this library) reads the following
-//! environment variables at startup to configure runtime behaviour. All `AHMA_*`
-//! boolean flags accept `1`, `true`, `yes`, or `on` as truthy values.
+//! `AHMA_*` environment variables are **retired** as a configuration source
+//! (SPEC R-CFG1.2). Setting one produces a startup `warn` naming it, and the
+//! value is otherwise **ignored** — configuration comes from CLI flags and
+//! `~/.ahma/settings.toml` instead (`--no-settings` skips the settings file).
+//! Replacements for the previously documented variables:
 //!
-//! | Category | Variables |
+//! | Retired variable | Replacement |
 //! |---|---|
-//! | **Tool management** | `AHMA_TOOLS_DIR`, `AHMA_TIMEOUT`, `AHMA_SYNC`, `AHMA_HOT_RELOAD`, `AHMA_SKIP_PROBES` |
-//! | **Sandbox & security** | `AHMA_DISABLE_SANDBOX`, `AHMA_SANDBOX_SCOPE`, `AHMA_SANDBOX_DEFER`, `AHMA_WORKING_DIRS`, `AHMA_TMP_ACCESS`, `AHMA_DISABLE_TEMP` |
-//! | **Logging** | `RUST_LOG`, `AHMA_LOG_TARGET`, `AHMA_LOG_MONITOR`, `AHMA_MONITOR_RATE_LIMIT` |
-//! | **HTTP transport** | `AHMA_DISABLE_QUIC`, `AHMA_DISABLE_HTTP1_1`, `AHMA_HANDSHAKE_TIMEOUT` |
+//! | `AHMA_DISABLE_SANDBOX` | `--no-sandbox` (CLI-flag-only, R-CFG2.3) |
+//! | `AHMA_SANDBOX_SCOPE` | `--sandbox-scope <PATH>` |
+//! | `AHMA_SANDBOX_DEFER` | `--defer-sandbox` |
+//! | `AHMA_WORKING_DIRS` | `--working-dir <PATH>` |
+//! | `AHMA_TMP_ACCESS` | `--tmp` |
+//! | `AHMA_DISABLE_TEMP` | `--disable-temp-files` |
+//! | `AHMA_TOOLS_DIR` | `--tools-dir <PATH>` |
+//! | `AHMA_TIMEOUT` / `AHMA_SYNC` / `AHMA_HOT_RELOAD` / `AHMA_SKIP_PROBES` | `--timeout <SECS>` / `--sync` / `--hot-reload` / `--skip-probes` |
+//! | `AHMA_LOG_TARGET` | `--log-to-stderr` or `[logging] target` in settings.toml |
+//! | `AHMA_LOG_MONITOR` / `AHMA_MONITOR_RATE_LIMIT` | `--log-monitor` / `--monitor-rate-limit <SECS>` |
+//! | `AHMA_DISABLE_QUIC` / `AHMA_DISABLE_HTTP1_1` / `AHMA_HANDSHAKE_TIMEOUT` | CLI flags & settings keys |
 //!
-//! See [`shell::cli::AppConfig`] for where each variable is consumed, and the project's
-//! `docs/environment-variables.md` for descriptions, defaults, and usage examples.
+//! Platform/ecosystem-standard variables such as `RUST_LOG` remain honored
+//! (R-CFG1.3 allowlist), and internal parent→child plumbing variables are
+//! documented as `INTERNAL` in `docs/environment-variables.md`.
+//!
+//! See [`shell::cli::AppConfig`] for the resolved configuration structure, and the
+//! project's `docs/environment-variables.md` for the full retirement table.
 //!
 //! ## Module Overview
 //!
