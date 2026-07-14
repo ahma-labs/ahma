@@ -34,6 +34,7 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 3;
 /// answered `roots/list` once and does not expect — and in practice will not
 /// resend — either on a mid-session reconnect. The proxy replays its own cached
 /// copies against a freshly built bridge connection instead.
+#[cfg(unix)]
 #[derive(Default, Clone)]
 struct CachedHandshake {
     /// The raw `initialize` request the client sent, if seen yet.
@@ -50,6 +51,7 @@ struct CachedHandshake {
     roots_response: Option<serde_json::Value>,
 }
 
+#[cfg(unix)]
 impl CachedHandshake {
     /// Observe a message forwarded from the client (stdio) to the bridge, and
     /// cache it if the reconnect replay will need it.
@@ -83,6 +85,7 @@ impl CachedHandshake {
 /// bridge's `roots/list` request from the cached response. None of this reaches
 /// `stdio` — the downstream client already completed this handshake once and
 /// must not see it repeated.
+#[cfg(unix)]
 async fn replay_handshake<C>(client: &mut C, handshake: &CachedHandshake) -> Result<()>
 where
     C: Transport<RoleClient>,
@@ -146,6 +149,7 @@ where
 /// Rebuild the bridge connection (via `reconnect`) and replay the cached
 /// handshake, retrying up to [`MAX_RECONNECT_ATTEMPTS`] times with a short
 /// backoff. Returns the freshly reconnected client on success.
+#[cfg(unix)]
 async fn reconnect_with_retries<C>(
     reconnect: &mut dyn FnMut() -> Result<C>,
     handshake: &CachedHandshake,
@@ -198,6 +202,7 @@ fn frontend_handshake_deadline() -> Option<Duration> {
 /// Base backoff between reconnect attempts (multiplied by the attempt number).
 /// Overridable via `AHMA_RECONNECT_BACKOFF_MS` so tests exercising the retry
 /// path stay fast and deterministic instead of waiting on production timing.
+#[cfg(unix)]
 fn reconnect_backoff_base() -> Duration {
     let ms = std::env::var("AHMA_RECONNECT_BACKOFF_MS")
         .ok()
