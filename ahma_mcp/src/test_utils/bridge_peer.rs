@@ -82,6 +82,7 @@ impl PeerFactory for NullPeerFactory {
                 stdout: Box::new(bridge_read),
                 stderr: None,
                 shutdown_fn: None,
+                exit_cause: None,
             })
         })
     }
@@ -213,6 +214,7 @@ impl PeerFactory for InProcessMcpPeerFactory {
                 stdout: Box::new(bridge_read),
                 stderr: None,
                 shutdown_fn: None,
+                exit_cause: None,
             })
         })
     }

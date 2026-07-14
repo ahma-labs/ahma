@@ -179,6 +179,9 @@ pub struct Session {
     /// For subprocess peers this kills the child process.  For in-memory peers
     /// this is `None` (drop semantics handle cleanup).
     peer_shutdown: Mutex<Option<PeerShutdownFn>>,
+    /// Classified cause of an abnormal peer death (SPEC R-SIGN.5), sent by the
+    /// peer's exit monitor. `None` for peers without a monitor.
+    exit_cause: Mutex<Option<oneshot::Receiver<String>>>,
 
     /// Handshake state machine (atomic transitions via the shared StateMachine
     /// wrapper). Transition methods return a `HandshakeAction` to run outside the
@@ -969,6 +972,7 @@ impl SessionManager {
             stdout,
             stderr,
             shutdown_fn,
+            exit_cause,
         } = match &self.config.peer_factory {
             Some(factory) => factory
                 .create()
@@ -1000,6 +1004,7 @@ impl SessionManager {
             terminated: AtomicBool::new(false),
             termination_reason: Mutex::new(None),
             peer_shutdown: Mutex::new(shutdown_fn),
+            exit_cause: Mutex::new(exit_cause),
             handshake_state: StateMachine::new(HandshakeState::AwaitingBoth),
             mcp_initialized_notify: Notify::new(),
             sandbox_state_machine: Arc::new(SandboxStateMachine::new()),
@@ -1489,6 +1494,22 @@ impl SessionManager {
                 pending_count = pending_count,
                 "Session terminated with pending requests - sending error responses"
             );
+            // R-SIGN.5: if the peer died abnormally, its exit monitor has
+            // classified the cause (e.g. the macOS code-signing SIGKILL).
+            // Surface that to the client instead of a bare "terminated
+            // unexpectedly". Wait briefly — the exit status can land a moment
+            // after the pipe EOF that broke the I/O loop.
+            let cause = match session.exit_cause.lock().await.take() {
+                Some(rx) => tokio::time::timeout(Duration::from_millis(500), rx)
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok()),
+                None => None,
+            };
+            let message = match cause {
+                Some(cause) => format!("Session terminated: server subprocess died: {cause}"),
+                None => "Session terminated unexpectedly - subprocess may have crashed or handshake failed".to_string(),
+            };
             // Drain all pending requests and send error response
             let pending: Vec<_> = session
                 .pending_requests
@@ -1502,7 +1523,7 @@ impl SessionManager {
                         "id": id,
                         "error": {
                             "code": -32603,
-                            "message": "Session terminated unexpectedly - subprocess may have crashed or handshake failed"
+                            "message": message
                         }
                     });
                     let _ = sender.send(error_response);
@@ -1595,6 +1616,7 @@ mod session_logic_tests {
             terminated: AtomicBool::new(false),
             termination_reason: Mutex::new(None),
             peer_shutdown: Mutex::new(None),
+            exit_cause: Mutex::new(None),
             handshake_state: StateMachine::new(HandshakeState::AwaitingBoth),
             mcp_initialized_notify: Notify::new(),
             sandbox_state_machine: Arc::new(SandboxStateMachine::new()),
@@ -2327,6 +2349,7 @@ mod session_logic_tests {
                     stdout: Box::new(bridge_stdout),
                     stderr: None,
                     shutdown_fn: None,
+                    exit_cause: None,
                 })
             })
         }
@@ -2419,6 +2442,78 @@ mod session_logic_tests {
         mgr.create_session().await.unwrap();
         let err = mgr.create_session().await.unwrap_err();
         assert!(err.to_string().contains("Session limit exceeded"));
+    }
+
+    /// A peer that stays alive until the test drops its retained end, and whose
+    /// `exit_cause` channel is handed back so the test can play the role of the
+    /// exit monitor.
+    struct DyingPeerFactory {
+        peer_end: std::sync::Mutex<Option<tokio::io::DuplexStream>>,
+        cause_tx: std::sync::Mutex<Option<oneshot::Sender<String>>>,
+    }
+
+    impl PeerFactory for DyingPeerFactory {
+        fn create(&self) -> crate::peer::BoxFuture<anyhow::Result<PeerStreams>> {
+            let (bridge_end, peer_end) = tokio::io::duplex(8192);
+            *self.peer_end.lock().unwrap() = Some(peer_end);
+            let (cause_tx, cause_rx) = oneshot::channel();
+            *self.cause_tx.lock().unwrap() = Some(cause_tx);
+            let (bridge_read, bridge_write) = tokio::io::split(bridge_end);
+            Box::pin(async move {
+                Ok(PeerStreams {
+                    stdin: Box::new(bridge_write),
+                    stdout: Box::new(bridge_read),
+                    stderr: None,
+                    shutdown_fn: None,
+                    exit_cause: Some(cause_rx),
+                })
+            })
+        }
+    }
+
+    /// R-SIGN.5: when the peer dies abnormally, the classified cause from the
+    /// exit monitor must reach the client's JSON-RPC error — not a bare
+    /// "Session terminated unexpectedly".
+    #[tokio::test]
+    async fn peer_death_cause_reaches_pending_request_error() {
+        let factory = Arc::new(DyingPeerFactory {
+            peer_end: std::sync::Mutex::new(None),
+            cause_tx: std::sync::Mutex::new(None),
+        });
+        let config = SessionManagerConfig {
+            server_command: "unused".to_string(),
+            server_args: vec![],
+            default_scope: None,
+            enable_colored_output: false,
+            handshake_timeout_secs: 45,
+            max_sessions: 8,
+            peer_factory: Some(factory.clone()),
+        };
+        let mgr = SessionManager::new(config);
+        let id = mgr.create_session().await.unwrap();
+        let session = mgr.get_session(&id).unwrap();
+
+        // A request is in flight when the peer dies.
+        let (tx, rx) = oneshot::channel();
+        session.pending_requests.insert("42".to_string(), tx);
+
+        // Play the exit monitor: classify the death, THEN let the bridge see
+        // the pipe EOF (the order the race can also produce in production).
+        let cause_tx = factory.cause_tx.lock().unwrap().take().unwrap();
+        cause_tx
+            .send("killed by SIGKILL (possible OOM-kill or code-signing kill).".to_string())
+            .unwrap();
+        drop(factory.peer_end.lock().unwrap().take());
+
+        let response = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("pending request must be answered")
+            .expect("error response must be sent, not dropped");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("SIGKILL"),
+            "client error must name the classified cause: {message}"
+        );
     }
 
     #[tokio::test]

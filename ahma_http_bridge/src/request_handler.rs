@@ -1290,6 +1290,7 @@ mod tests {
                     stdout: Box::new(bridge_read),
                     stderr: None,
                     shutdown_fn: None,
+                    exit_cause: None,
                 })
             })
         }

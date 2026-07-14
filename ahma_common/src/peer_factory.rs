@@ -51,6 +51,10 @@ pub struct PeerStreams {
     pub stderr: Option<Box<dyn tokio::io::AsyncRead + Send + Unpin + 'static>>,
     /// Async cleanup hook invoked on explicit session termination.
     pub shutdown_fn: Option<PeerShutdownFn>,
+    /// Receives the classified abnormal-exit description (R-SIGN.5) when the
+    /// peer dies by signal (e.g. the macOS code-signing SIGKILL cause).
+    /// `None` for peers without an exit monitor (in-process test peers).
+    pub exit_cause: Option<tokio::sync::oneshot::Receiver<String>>,
 }
 
 /// Factory that produces [`PeerStreams`] for each new bridge session.

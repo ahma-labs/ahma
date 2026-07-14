@@ -170,11 +170,19 @@ impl PeerFactory for SubprocessPeerFactory {
             // semantics for abandoned sessions.
             type KillAck = tokio::sync::oneshot::Sender<()>;
             let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<KillAck>();
+            // The classified cause travels to the session so the client's
+            // JSON-RPC error names it instead of a bare "session terminated"
+            // (SPEC R-SIGN.5). Receiver dropped ⇒ send fails harmlessly.
+            let (cause_tx, cause_rx) = tokio::sync::oneshot::channel::<String>();
             let command_for_log = command.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     status = child.wait() => match status {
-                        Ok(status) => report_peer_exit(&command_for_log, status),
+                        Ok(status) => {
+                            if let Some(cause) = report_peer_exit(&command_for_log, status) {
+                                let _ = cause_tx.send(cause);
+                            }
+                        }
                         Err(e) => tracing::warn!(
                             command = %command_for_log,
                             "could not observe subprocess peer exit status: {e}"
@@ -208,28 +216,38 @@ impl PeerFactory for SubprocessPeerFactory {
                 stdout: Box::new(stdout_handle),
                 stderr: stderr_opt,
                 shutdown_fn: Some(shutdown_fn),
+                exit_cause: Some(cause_rx),
             })
         })
     }
 }
 
-/// Log a peer subprocess's exit, loudly when it died by signal (SPEC R-SIGN.5).
+/// Log a peer subprocess's exit, loudly when it died by signal (SPEC R-SIGN.5),
+/// and return the classified cause so it can also be surfaced to the client.
 ///
 /// A signal death was previously indistinguishable from a clean exit (both
 /// surface as pipe EOF), leaving nothing to explain a dead session. SIGKILL on
 /// macOS gets the known likely cause spelled out: the kernel's code-signing
 /// enforcement killing an ad-hoc-signed binary whose mapped pages were
 /// invalidated by an in-place rebuild or evicted under memory pressure.
-fn report_peer_exit(command: &str, status: std::process::ExitStatus) {
+fn report_peer_exit(command: &str, status: std::process::ExitStatus) -> Option<String> {
     match describe_abnormal_exit(status) {
-        Some(cause) => tracing::error!(command = %command, "server subprocess died: {cause}"),
-        None if status.success() => {
-            tracing::debug!(command = %command, "server subprocess exited cleanly")
+        Some(cause) => {
+            tracing::error!(command = %command, "server subprocess died: {cause}");
+            Some(cause)
         }
-        None => tracing::warn!(
-            command = %command,
-            "server subprocess exited with {status}"
-        ),
+        None if status.success() => {
+            tracing::debug!(command = %command, "server subprocess exited cleanly");
+            None
+        }
+        None => {
+            tracing::warn!(
+                command = %command,
+                "server subprocess exited with {status}"
+            );
+            // A non-zero exit code is abnormal enough to tell the client about.
+            Some(format!("exited with {status}"))
+        }
     }
 }
 

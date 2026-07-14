@@ -162,6 +162,7 @@ impl ahma_common::peer_factory::PeerFactory for FakePeerFactory {
                 stdout: Box::new(bridge_read),
                 stderr: None,
                 shutdown_fn: None,
+                exit_cause: None,
             })
         })
     }
