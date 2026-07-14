@@ -111,7 +111,11 @@ pub fn set_log_dir_from_scope(dir: PathBuf) {
 /// 2. `AHMA_LOG_DIR` env var (deprecated)
 /// 3. Primary sandbox scope `<scope>/logs` (set after `roots/list`)
 /// 4. `<cwd>/logs` if writable
-/// 5. `~/.ahma/logs`
+/// 5. `~/.ahma/logs/<project-namespace>` — a per-project subdirectory, not one
+///    shared flat file: the sandbox already enforces per-project isolation on
+///    disk, and a single shared log would quietly undo that at the
+///    observability layer (one project's commands/paths/errors readable
+///    alongside every other project ahma has ever touched).
 pub fn project_log_dir() -> PathBuf {
     if let Some(dir) = LOG_DIR_OVERRIDE.get() {
         return dir.clone();
@@ -142,10 +146,156 @@ pub fn project_log_dir() -> PathBuf {
     }
 
     if let Some(home) = dirs::home_dir() {
-        return home.join(".ahma").join("logs");
+        return home
+            .join(".ahma")
+            .join("logs")
+            .join(project_log_namespace());
     }
 
     PathBuf::from(".").join("logs")
+}
+
+/// A stable, filesystem-safe, human-legible directory name for this project,
+/// used to namespace the `~/.ahma/logs` fallback so it never mixes different
+/// projects' logs into one shared file. Combines the cwd's own directory name
+/// (for legibility — `ahma`, `my-app`, …) with a short hash of the full
+/// canonicalized path (to disambiguate same-named checkouts in different
+/// locations). Falls back to `"unknown"` when the cwd cannot be resolved.
+fn project_log_namespace() -> String {
+    use std::hash::{Hash, Hasher};
+
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return "unknown".to_string(),
+    };
+    let canonical = dunce::canonicalize(&cwd).unwrap_or(cwd);
+    let name: String = canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    let digest = hasher.finish();
+
+    format!("{name}-{digest:08x}", digest = digest & 0xFFFF_FFFF)
+}
+
+/// Walk up from `start` looking for a `.git` entry (a directory for a normal
+/// clone, a file for a worktree or submodule), returning the repo root when
+/// found.
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Best-effort check for whether `log_dir` is already covered by some
+/// `.gitignore` between its parent and `repo_root` (inclusive). This is a
+/// heuristic — it matches a bare directory-name line (`logs`, `/logs`,
+/// `logs/`), not the full gitignore glob grammar — good enough to avoid
+/// nagging when a reasonable ignore rule already exists, without pulling in a
+/// full gitignore-pattern engine for this one check.
+fn is_log_dir_gitignored(repo_root: &Path, log_dir: &Path) -> bool {
+    let dir_name = log_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if dir_name.is_empty() {
+        return false;
+    }
+    let mut dir = log_dir.parent().map(Path::to_path_buf);
+    while let Some(d) = dir {
+        let candidate = d.join(".gitignore");
+        if let Ok(contents) = std::fs::read_to_string(&candidate) {
+            for line in contents.lines() {
+                let pattern = line.trim().trim_start_matches('/').trim_end_matches('/');
+                if pattern == dir_name && !pattern.is_empty() && !line.trim().starts_with('#') {
+                    return true;
+                }
+            }
+        }
+        if d == repo_root {
+            break;
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    false
+}
+
+static LOG_LOCATION_DISCLOSED: Once = Once::new();
+
+/// Emit a one-time, loud disclosure of the active log directory — so it is
+/// never ambiguous which of the possible locations ([`project_log_dir`]'s
+/// priority order) ended up active — and, if that directory lives inside a
+/// git repository without an existing ignore rule, a warning that plaintext
+/// operational logs (including full tool-call transcripts) are about to be
+/// written into the tracked working tree, with the remedy. Safe to call from
+/// multiple places; only the first call does anything.
+pub fn disclose_log_location_once() {
+    LOG_LOCATION_DISCLOSED.call_once(|| {
+        let log_dir = project_log_dir();
+        tracing::info!(
+            log_dir = %log_dir.display(),
+            "ahma: writing operational logs to this directory"
+        );
+
+        if let Some(repo_root) = find_git_root(&log_dir)
+            && !is_log_dir_gitignored(&repo_root, &log_dir)
+        {
+            tracing::warn!(
+                log_dir = %log_dir.display(),
+                "ahma is writing plaintext operational logs — including full tool-call \
+                 transcripts — into a directory inside this git repository, and it is not \
+                 yet covered by .gitignore. Run `ahma logs gitignore` to add an ignore rule, \
+                 or set --log-dir to a path outside the repo to avoid this entirely."
+            );
+        }
+    });
+}
+
+/// Add an ignore rule for the active log directory to the nearest
+/// `.gitignore` (creating one at the repo root if none exists yet). Returns
+/// `Ok(true)` if an entry was added, `Ok(false)` if one already covered it.
+/// Errors if the active log directory is not inside a git repository at all.
+pub fn ensure_gitignore_entry() -> Result<bool> {
+    let log_dir = project_log_dir();
+    let repo_root = find_git_root(&log_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} is not inside a git repository — nothing to gitignore",
+            log_dir.display()
+        )
+    })?;
+    if is_log_dir_gitignored(&repo_root, &log_dir) {
+        return Ok(false);
+    }
+    let dir_name = log_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("could not determine the log directory's name"))?;
+
+    let gitignore_path = repo_root.join(".gitignore");
+    let mut contents = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(dir_name);
+    contents.push_str("/\n");
+    std::fs::write(&gitignore_path, contents)
+        .with_context(|| format!("Failed to write {}", gitignore_path.display()))?;
+    Ok(true)
 }
 
 fn is_writeable(path: &Path) -> bool {
@@ -167,6 +317,7 @@ pub fn bridge_capture_paths() -> (PathBuf, PathBuf) {
 
 /// Ensure `logs/` exists, prune stale files, and create bridge capture files with a header.
 pub fn prepare_bridge_capture_files() -> Result<(PathBuf, PathBuf)> {
+    disclose_log_location_once();
     let log_dir = project_log_dir();
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("Failed to create log directory {}", log_dir.display()))?;
@@ -274,6 +425,7 @@ fn do_setup_logging(
             .init();
         Box::leak(Box::new(_guard));
         log_traceparent();
+        disclose_log_location_once();
         return;
     }
 
@@ -522,7 +674,17 @@ mod tests {
         if std::env::set_current_dir(Path::new("/")).is_ok() {
             let dir = project_log_dir();
             if let Some(home) = dirs::home_dir() {
-                assert_eq!(dir, home.join(".ahma").join("logs"));
+                // Namespaced per-project (see project_log_namespace): the root
+                // has no file_name, so the namespace falls back to "unknown-<hash>".
+                assert_eq!(
+                    dir.parent().map(Path::to_path_buf),
+                    Some(home.join(".ahma").join("logs"))
+                );
+                let leaf = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                assert!(
+                    leaf.starts_with("unknown-"),
+                    "expected an 'unknown-<hash>' namespace, got {leaf:?}"
+                );
             } else {
                 assert_eq!(dir, PathBuf::from(".").join("logs"));
             }
@@ -700,6 +862,170 @@ mod tests {
                 "current-log symlink should exist on unix"
             );
         }
+    }
+
+    #[test]
+    fn test_project_log_namespace_is_filesystem_safe_and_stable() {
+        let temp = tempdir().unwrap();
+        let sub = temp.path().join("My Project!");
+        fs::create_dir_all(&sub).unwrap();
+        let temp_canon = dunce::canonicalize(&sub).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp_canon).unwrap();
+
+        let first = project_log_namespace();
+        let second = project_log_namespace();
+
+        let _ = std::env::set_current_dir(prev);
+
+        assert_eq!(first, second, "namespace must be stable across calls");
+        assert!(
+            first
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "namespace must be filesystem-safe, got {first:?}"
+        );
+        assert!(
+            first.starts_with("My-Project-"),
+            "namespace should stay legible, got {first:?}"
+        );
+    }
+
+    #[test]
+    fn test_project_log_namespace_disambiguates_same_named_dirs() {
+        let temp = tempdir().unwrap();
+        let a = temp.path().join("a").join("shared-name");
+        let b = temp.path().join("b").join("shared-name");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let prev = std::env::current_dir().unwrap();
+
+        std::env::set_current_dir(dunce::canonicalize(&a).unwrap()).unwrap();
+        let ns_a = project_log_namespace();
+        std::env::set_current_dir(dunce::canonicalize(&b).unwrap()).unwrap();
+        let ns_b = project_log_namespace();
+
+        let _ = std::env::set_current_dir(prev);
+
+        assert_ne!(
+            ns_a, ns_b,
+            "two directories with the same name in different locations must not collide"
+        );
+    }
+
+    #[test]
+    fn test_find_git_root_walks_up_to_dot_git() {
+        let temp = tempdir().unwrap();
+        let repo_root = dunce::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+        let nested = repo_root.join("logs").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(find_git_root(&nested), Some(repo_root.clone()));
+        assert_eq!(find_git_root(&repo_root), Some(repo_root));
+    }
+
+    #[test]
+    fn test_find_git_root_none_outside_a_repo() {
+        let temp = tempdir().unwrap();
+        let dir = dunce::canonicalize(temp.path()).unwrap();
+        assert_eq!(find_git_root(&dir), None);
+    }
+
+    #[test]
+    fn test_is_log_dir_gitignored_matches_bare_dir_name() {
+        let temp = tempdir().unwrap();
+        let repo_root = dunce::canonicalize(temp.path()).unwrap();
+        fs::write(repo_root.join(".gitignore"), "target/\nlogs/\n").unwrap();
+        let log_dir = repo_root.join("logs");
+
+        assert!(is_log_dir_gitignored(&repo_root, &log_dir));
+    }
+
+    #[test]
+    fn test_is_log_dir_gitignored_false_when_uncovered() {
+        let temp = tempdir().unwrap();
+        let repo_root = dunce::canonicalize(temp.path()).unwrap();
+        fs::write(repo_root.join(".gitignore"), "target/\n").unwrap();
+        let log_dir = repo_root.join("logs");
+
+        assert!(!is_log_dir_gitignored(&repo_root, &log_dir));
+    }
+
+    #[test]
+    fn test_is_log_dir_gitignored_false_with_no_gitignore_at_all() {
+        let temp = tempdir().unwrap();
+        let repo_root = dunce::canonicalize(temp.path()).unwrap();
+        let log_dir = repo_root.join("logs");
+
+        assert!(!is_log_dir_gitignored(&repo_root, &log_dir));
+    }
+
+    #[test]
+    fn test_ensure_gitignore_entry_creates_file_when_missing() {
+        let temp = tempdir().unwrap();
+        let repo_root = dunce::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&repo_root).unwrap();
+
+        let added = ensure_gitignore_entry();
+
+        let _ = std::env::set_current_dir(prev);
+
+        assert!(matches!(added, Ok(true)));
+        let contents = fs::read_to_string(repo_root.join(".gitignore")).unwrap();
+        assert!(contents.contains("logs/"), "got: {contents:?}");
+    }
+
+    #[test]
+    fn test_ensure_gitignore_entry_appends_without_clobbering_existing_content() {
+        let temp = tempdir().unwrap();
+        let repo_root = dunce::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+        fs::write(repo_root.join(".gitignore"), "target/").unwrap(); // no trailing newline
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&repo_root).unwrap();
+
+        let added = ensure_gitignore_entry();
+
+        let _ = std::env::set_current_dir(prev);
+
+        assert!(matches!(added, Ok(true)));
+        let contents = fs::read_to_string(repo_root.join(".gitignore")).unwrap();
+        assert_eq!(contents, "target/\nlogs/\n");
+    }
+
+    #[test]
+    fn test_ensure_gitignore_entry_is_a_noop_when_already_covered() {
+        let temp = tempdir().unwrap();
+        let repo_root = dunce::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+        fs::write(repo_root.join(".gitignore"), "logs/\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&repo_root).unwrap();
+
+        let added = ensure_gitignore_entry();
+        let contents_before = fs::read_to_string(repo_root.join(".gitignore")).unwrap();
+
+        let _ = std::env::set_current_dir(prev);
+
+        assert!(matches!(added, Ok(false)));
+        assert_eq!(contents_before, "logs/\n", "must not duplicate the entry");
+    }
+
+    #[test]
+    fn test_ensure_gitignore_entry_errors_outside_a_git_repo() {
+        let temp = tempdir().unwrap();
+        let dir = dunce::canonicalize(temp.path()).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let result = ensure_gitignore_entry();
+
+        let _ = std::env::set_current_dir(prev);
+
+        assert!(result.is_err());
     }
 
     fn role_for_args(args: &[&str]) -> &'static str {

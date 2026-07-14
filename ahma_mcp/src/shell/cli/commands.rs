@@ -6,8 +6,9 @@
 
 use super::{
     AppConfig, BundleArgs, BundleAuditArgs, BundleCommand, BundleSignArgs, BundleVerifyArgs,
-    InfoArgs, PermissionsArgs, PermissionsCommand, PromptsArgs, PromptsCommand, SandboxArgs,
-    SandboxCommand, SettingsArgs, SettingsCommand, WebArgs, WebCommand,
+    InfoArgs, LogsArgs, LogsCommand, PermissionsArgs, PermissionsCommand, PromptsArgs,
+    PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs, SettingsCommand, WebArgs,
+    WebCommand,
 };
 use crate::shell::{list_tools, resolution};
 use anyhow::{Context, Result};
@@ -961,6 +962,31 @@ fn format_decision(decision: &ahma_common::web_policy::WebDecision) -> String {
         WebDecision::Deny { reason } => format!("DENY ({reason})"),
         WebDecision::Prompt { domain } => {
             format!("PROMPT — '{domain}' would require approval (default_policy = deny)")
+        }
+    }
+}
+
+pub(crate) fn run_logs_command(args: LogsArgs) -> Result<()> {
+    match args.command {
+        LogsCommand::Gitignore => {
+            let log_dir = crate::utils::logging::project_log_dir();
+            match crate::utils::logging::ensure_gitignore_entry() {
+                Ok(true) => {
+                    println!(
+                        "✓ Added an ignore rule for {} to .gitignore",
+                        log_dir.display()
+                    );
+                    Ok(())
+                }
+                Ok(false) => {
+                    println!(
+                        "{} is already covered by .gitignore — nothing to do.",
+                        log_dir.display()
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
     }
 }
@@ -2215,6 +2241,41 @@ mod tests {
         })
         .expect_err("a typo'd kind must be an error, never a silent no-op");
         assert!(format!("{err:#}").contains("unknown permission kind"));
+    }
+
+    #[test]
+    fn logs_gitignore_adds_entry_and_reports_success() {
+        let temp = TempDir::new().unwrap();
+        let repo_root = dunce::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir_all(repo_root.join(".git")).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&repo_root).unwrap();
+
+        let result = run_logs_command(LogsArgs {
+            command: LogsCommand::Gitignore,
+        });
+
+        let _ = std::env::set_current_dir(prev);
+
+        result.expect("gitignore command should succeed inside a git repo");
+        let contents = std::fs::read_to_string(repo_root.join(".gitignore")).unwrap();
+        assert!(contents.contains("logs/"), "got: {contents:?}");
+    }
+
+    #[test]
+    fn logs_gitignore_errors_outside_a_git_repo() {
+        let temp = TempDir::new().unwrap();
+        let dir = dunce::canonicalize(temp.path()).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let result = run_logs_command(LogsArgs {
+            command: LogsCommand::Gitignore,
+        });
+
+        let _ = std::env::set_current_dir(prev);
+
+        assert!(result.is_err(), "must error outside a git repository");
     }
 
     #[test]

@@ -911,6 +911,10 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
             tracing::info!("Running in prompts mode");
             run_prompts_command(args)
         }
+        Subcommands::Logs(args) => {
+            tracing::info!("Running in logs mode");
+            commands::run_logs_command(args)
+        }
         Subcommands::Sandbox(args) => {
             tracing::info!("Running in sandbox-scope management mode");
             commands::run_sandbox_command(args)
@@ -1280,6 +1284,8 @@ pub enum Subcommands {
     /// `~/.ahma/settings.toml`, outside every sandbox scope, so a sandboxed tool
     /// cannot edit them. See `ahma web --help`.
     Web(WebArgs),
+    /// Manage where ahma writes its operational logs (see `ahma logs --help`).
+    Logs(LogsArgs),
     /// List and revoke **every** permission ahma has been granted, of every kind
     /// — filesystem scopes, web domains, and per-workspace tool approvals — from
     /// one place (SPEC R-PERM).
@@ -1553,6 +1559,31 @@ pub enum WebCommand {
         #[arg(value_name = "URL")]
         url: String,
     },
+}
+
+// ── logs ─────────────────────────────────────────────────────────────────────
+
+/// Arguments for `ahma logs`.
+#[derive(clap::Args, Debug, Clone)]
+#[command(after_help = "EXAMPLES:
+  ahma logs gitignore")]
+pub struct LogsArgs {
+    #[command(subcommand)]
+    pub command: LogsCommand,
+}
+
+/// Subcommands for `ahma logs` — manage where ahma writes its operational
+/// logs. The active directory follows a priority order (`--log-dir` flag,
+/// `AHMA_LOG_DIR`, sandbox scope, `<cwd>/logs`, then a per-project directory
+/// under `~/.ahma/logs`); ahma discloses which one is active at startup.
+#[derive(Subcommand, Debug, Clone)]
+pub enum LogsCommand {
+    /// Add an ignore rule for the active log directory to the nearest
+    /// `.gitignore`, so plaintext operational logs (including full
+    /// tool-call transcripts) are never accidentally committed. A no-op if
+    /// already covered; an error if the active log directory is not inside
+    /// a git repository.
+    Gitignore,
 }
 
 // ── prompts ──────────────────────────────────────────────────────────────────
