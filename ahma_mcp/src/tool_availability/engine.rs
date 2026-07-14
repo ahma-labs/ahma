@@ -6,14 +6,12 @@ use anyhow::Result;
 use tracing::debug;
 
 use crate::config::ToolConfig;
-use crate::shell_pool::ShellPoolManager;
 
 use super::builder::build_probe_plans;
 use super::types::{ProbeOutcome, ProbePlan};
 use super::{AvailabilitySummary, DisabledSubcommand, DisabledTool};
 
 pub(super) async fn evaluate_tool_availability_impl(
-    shell_pool: Arc<ShellPoolManager>,
     configs: HashMap<String, ToolConfig>,
     default_working_dir: &Path,
     sandbox: &crate::sandbox::Sandbox,
@@ -47,7 +45,7 @@ pub(super) async fn evaluate_tool_availability_impl(
     }
 
     let sandbox_arc = Arc::new(sandbox.clone());
-    let outcomes = execute_probes(shell_pool, plans, sandbox_arc).await;
+    let outcomes = execute_probes(plans, sandbox_arc).await;
     let (disabled_tools, disabled_subcommands) =
         process_probe_outcomes(outcomes, &mut filtered_configs);
 
@@ -99,16 +97,14 @@ fn process_probe_outcomes(
 }
 
 async fn execute_probes(
-    shell_pool: Arc<ShellPoolManager>,
     plans: Vec<ProbePlan>,
     sandbox: Arc<crate::sandbox::Sandbox>,
 ) -> Vec<ProbeOutcome> {
     let probe_tasks: Vec<_> = plans
         .into_iter()
         .map(|plan| {
-            let shell_pool = shell_pool.clone();
             let sandbox = sandbox.clone();
-            tokio::spawn(async move { plan.execute(shell_pool, &sandbox).await })
+            tokio::spawn(async move { plan.execute(&sandbox).await })
         })
         .collect();
 

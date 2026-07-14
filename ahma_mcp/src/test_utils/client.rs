@@ -465,14 +465,7 @@ pub fn create_test_config(workspace_dir: &Path) -> Result<Arc<Adapter>> {
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
 
     let shell_pool_config = ShellPoolConfig {
-        enabled: true,
-        shells_per_directory: 2,
-        max_total_shells: config.max_concurrent_tasks,
-        shell_idle_timeout: Duration::from_secs(1800),
-        pool_cleanup_interval: Duration::from_secs(300),
-        shell_spawn_timeout: config.quick_timeout,
         command_timeout: config.default_timeout,
-        health_check_interval: Duration::from_secs(60),
     };
     let shell_pool_manager = Arc::new(ShellPoolManager::new(shell_pool_config));
 

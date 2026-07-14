@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -8,7 +7,6 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::config::{SubcommandConfig, ToolConfig};
-use crate::shell_pool::ShellPoolManager;
 use crate::tool_availability::{DisabledSubcommand, DisabledTool};
 
 fn find_subcommand_mut_in<'a>(
@@ -77,39 +75,32 @@ impl ProbeTarget {
 }
 
 impl ProbePlan {
-    pub(super) async fn execute(
-        self,
-        _shell_pool: Arc<ShellPoolManager>,
-        sandbox: &crate::sandbox::Sandbox,
-    ) -> ProbeOutcome {
-        let result = self.execute_direct(sandbox).await;
-        let success = self.success_codes.contains(&result.exit_code);
+    pub(super) async fn execute(self, sandbox: &crate::sandbox::Sandbox) -> ProbeOutcome {
+        let (exit_code, stdout, stderr) = self.execute_direct(sandbox).await;
+        let success = self.success_codes.contains(&exit_code);
 
         ProbeOutcome {
             plan: self,
             success,
-            exit_code: Some(result.exit_code),
-            stdout: result.stdout,
-            stderr: result.stderr,
+            exit_code: Some(exit_code),
+            stdout,
+            stderr,
         }
     }
 
-    async fn execute_direct(
-        &self,
-        sandbox: &crate::sandbox::Sandbox,
-    ) -> crate::shell_pool::ShellResponse {
+    /// Run the probe command directly inside the sandbox, returning
+    /// `(exit_code, stdout, stderr)`.
+    async fn execute_direct(&self, sandbox: &crate::sandbox::Sandbox) -> (i32, String, String) {
         let (program, args) = self.prepare_direct_command();
 
         let mut command = match sandbox.create_command(&program, &args, &self.working_dir) {
             Ok(cmd) => cmd,
             Err(e) => {
-                return crate::shell_pool::ShellResponse {
-                    id: format!("direct-availability-{:?}", self.target),
-                    exit_code: 1,
-                    stdout: String::new(),
-                    stderr: format!("Failed to create sandboxed command: {e}"),
-                    duration_ms: 0,
-                };
+                return (
+                    1,
+                    String::new(),
+                    format!("Failed to create sandboxed command: {e}"),
+                );
             }
         };
         command.kill_on_drop(true);
@@ -117,15 +108,7 @@ impl ProbePlan {
         let timeout_duration = Duration::from_millis(self.timeout_ms);
         let result = timeout(timeout_duration, command.output()).await;
 
-        let (exit_code, stdout, stderr) = self.process_direct_output(result);
-
-        crate::shell_pool::ShellResponse {
-            id: format!("direct-availability-{:?}", self.target),
-            exit_code,
-            stdout,
-            stderr,
-            duration_ms: 0,
-        }
+        self.process_direct_output(result)
     }
 
     fn prepare_direct_command(&self) -> (String, Vec<String>) {

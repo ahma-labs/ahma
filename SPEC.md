@@ -8,7 +8,7 @@
 |-----------|--------|-------|
 | Core Tool Execution | tests-pass | `ahma` adapter executes CLI tools via MTDF JSON |
 | Async-First Operations | tests-pass | Operations return `id`, push results via MCP notifications |
-| Shell Pool | in-progress | Pool prewarms shells but is NOT wired into the async hot path — commands spawn directly (~6ms median measured by `latency_guard_test`); decide: wire in or remove |
+| Shell Pool | removed | Dead prewarmed pool removed — commands spawn directly (~6ms median measured by `latency_guard_test`); `shell_pool` module retains platform shell selection + command timeout config |
 | Unified Operation Event Stream | tests-pass | Single `OperationEvent` stream (`ahma_common::event_dispatcher`); `OperationMonitor` is the sole lifecycle emitter; subscribers: MCP progress push, daemon hub, vault audit, TUI |
 | Output Spill Files | tests-pass | Complete per-operation output at `<log dir>/operations/<id>.log`; advertised as `output_file` in results; retention-cleaned |
 | Small-Model Context Harness | tests-pass | `ahma tui` budgets tool results + trims conversation for limited-context local models; `--context-length`, `--small-model-harness`/`--no-small-model-harness` |
@@ -17,7 +17,7 @@
 | Linux Sandbox (Landlock) | tests-pass | Kernel-level FS sandboxing on Linux 5.13+ |
 | macOS Sandbox (Seatbelt) | tests-pass | Kernel-level FS sandboxing via `sandbox-exec` |
 | Nested Sandbox Detection | tests-pass | Detects Cursor/VS Code/Docker outer sandboxes; hooks defer to host, MCP stays authoritative, active sandbox always disclosed (R7) |
-| Windows Runtime (PowerShell) | in-progress | Built-in PowerShell (5.1+) shell pool; cross-platform path security + file URI; parity tests green |
+| Windows Runtime (PowerShell) | in-progress | Built-in PowerShell (5.1+) runtime; cross-platform path security + file URI; parity tests green |
 | Windows Sandbox backend | in-progress | Job Object enforcement done; AppContainer spawn isolation pending Windows CI proof |
 | Windows Pre-built Releases | in-progress | `x86_64-pc-windows-msvc`; `.zip` CI artifacts; `install.ps1` |
 | STDIO Mode | tests-pass | Direct MCP server over stdio for IDE integration |
@@ -115,7 +115,7 @@ _"Create agents from your command line tools with one JSON file, then watch them
 | `adapter` | Primary engine for executing external CLI tools (sync/async) |
 | `mcp_service` | Implements `rmcp::ServerHandler` - handles `tools/list`, `tools/call`, etc. |
 | `operation_monitor` | Tracks background operations (progress, timeout, cancellation) |
-| `shell_pool` | Pre-warmed bash/PowerShell (5.1+) shells for 5-20ms command startup latency |
+| `shell_pool` | Platform shell selection (bash/PowerShell 5.1+) and default command timeout config |
 | `sandbox` | Kernel-level sandboxing (Landlock on Linux, Seatbelt on macOS) |
 | `config` | MTDF (Multi-Tool Definition Format) configuration models |
 | `ahma_common::event_dispatcher` | Unified `OperationEvent` broadcast stream (Started/OutputLine/Progress/Alert/terminal) |
@@ -151,7 +151,8 @@ These tools are always available regardless of JSON configuration:
                   │
                   ▼
             ┌───────────────┐
-            │  ShellPool    │ ──▶ Pre-warmed bash/PowerShell shells
+            │ Direct spawn /│ ──▶ Sandboxed bash/PowerShell processes
+            │ PTY sessions  │     (persistent sessions via `session_id`)
             └───────────────┘
 ```
 
@@ -242,8 +243,8 @@ All operation lifecycle data flows through ONE broadcast stream of
 
 ### R3: Performance
 
-- **R3.1**: The system **must** use a pre-warmed shell pool for 5-20ms command startup latency.
-- **R3.2**: Shell processes are pooled per working directory and automatically cleaned up.
+- **R3.1**: Command dispatch **must** stay low-latency via direct sandboxed spawns (~6ms median, guarded by the `latency_guard_test` benchmarks). The former prewarmed shell pool was removed as dead code.
+- **R3.2**: Persistent shell sessions (opt-in via `session_id`) are tracked per session and automatically cleaned up on shutdown.
 
 ### R4: JSON Schema Validation
 
@@ -1833,7 +1834,7 @@ let interval = TestTimeouts::poll_interval();  // 100ms on Unix, 500ms on Window
 
 | Category | Base (Unix) | Windows | Coverage Mode | Purpose |
 |----------|-------------|---------|---------------|---------|
-| `ProcessSpawn` | 30s | 120s | 240s | Binary loading, shell pool init |
+| `ProcessSpawn` | 30s | 120s | 240s | Binary loading, process startup |
 | `Handshake` | 60s | 240s | 480s | MCP initialize + roots exchange |
 | `ToolCall` | 30s | 120s | 240s | Individual tool execution |
 | `SandboxReady` | 60s | 240s | 480s | Post-roots sandbox activation |
@@ -1919,7 +1920,7 @@ This repo has a recurring failure mode: tests can pass while real-world usage is
 |---------|--------|-------------|
 | Adapter execution | PASS | Sync/async CLI tool execution |
 | MCP ServerHandler | PASS | Complete MCP protocol implementation |
-| Shell pool | PASS | Pre-warmed processes, per-directory pooling |
+| Shell sessions | PASS | Persistent PTY sessions (`session_id`); prewarmed pool removed as dead code |
 | Linux sandbox | PASS | Landlock enforcement |
 | macOS sandbox | PASS | Seatbelt/sandbox-exec enforcement |
 | Nested sandbox detection | PASS | Detect outer sandboxes |

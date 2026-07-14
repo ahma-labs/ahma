@@ -15,19 +15,16 @@
 //! To achieve high performance without sacrificing correctness, the adapter chooses
 //! between two primary execution paths:
 //!
-//! 1. **Performance Path (Async + Shell Pooling)**:
-//!    By default, tools execute asynchronously. The adapter requests a pre-warmed
-//!    shell process from the [`ShellPoolManager`](crate::shell_pool::ShellPoolManager).
-//!    This avoids the 200ms-500ms latency typically associated with spawning a new
-//!    shell and loading environment profiles. Results are tracked via the
-//!    [`OperationMonitor`](crate::operation_monitor::OperationMonitor) and pushed
-//!    back via notifications.
+//! 1. **Performance Path (Async)**:
+//!    By default, tools execute asynchronously in a spawned task. Results are
+//!    tracked via the [`OperationMonitor`](crate::operation_monitor::OperationMonitor)
+//!    and pushed back via notifications.
 //!
 //! 2. **Correctness Path (Synchronous / Direct Spawn)**:
 //!    Some operations (like `cargo add` or configuration changes) require immediate
 //!    completion to prevent race conditions. When a tool is marked as `synchronous`
-//!    or when the `--sync` flag is active, the adapter bypasses the shell pool and
-//!    spawns a direct process, waiting for it to exit before returning.
+//!    or when the `--sync` flag is active, the adapter spawns a direct process,
+//!    waiting for it to exit before returning.
 //!
 //! ## Key Design Trade-offs
 //!
@@ -159,12 +156,10 @@ impl BoundedLineCollector {
 ///
 /// # Responsibilities
 ///
-/// *   **Command Execution**: Executes tools using either a pre-warmed shell pool (for async
-///     performance) or standard process spawning.
+/// *   **Command Execution**: Executes tools via standard process spawning (async tasks or
+///     synchronous direct spawns).
 /// *   **Resource Management**: Manages temporary files created for complex arguments and
 ///     ensures they are cleaned up.
-/// *   **Shell Pooling**: Integrates with `ShellPoolManager` to reuse shell processes,
-///     reducing latency for frequent commands.
 /// *   **Operation Tracking**: Uses `OperationMonitor` to track the status (running, completed,
 ///     failed) of asynchronous operations.
 /// *   **Sandboxing**: Enforces path security by validating operations against a root directory.
@@ -185,7 +180,7 @@ impl BoundedLineCollector {
 pub struct Adapter {
     /// Operation monitor for async tasks.
     monitor: Arc<OperationMonitor>,
-    /// Pre-warmed shell pool manager for async execution.
+    /// Holder for the shared default command timeout.
     shell_pool: Arc<ShellPoolManager>,
     /// Security sandbox context.
     sandbox: Arc<sandbox::Sandbox>,
@@ -217,12 +212,12 @@ impl Adapter {
     /// Creates a new `Adapter` instance.
     ///
     /// The adapter requires an `OperationMonitor` for tracking async tasks, a `ShellPoolManager`
-    /// for efficient shell execution, and a `Sandbox` for security context.
+    /// holding the default command timeout, and a `Sandbox` for security context.
     ///
     /// # Arguments
     ///
     /// * `monitor` - Shared reference to the operation monitor
-    /// * `shell_pool` - Shared reference to the shell pool manager
+    /// * `shell_pool` - Shared reference to the command-timeout configuration holder
     /// * `sandbox` - Shared reference to the security sandbox
     pub fn new(
         monitor: Arc<OperationMonitor>,
@@ -373,11 +368,7 @@ impl Adapter {
             drain_task_handle(&id, handle).await;
         }
 
-        // 3) Shut down all shell pools (kills any lingering shell processes)
-        tracing::info!("Shutting down shell pools");
-        self.shell_pool.shutdown_all().await;
-
-        // 4) Kill persistent session shells
+        // 3) Kill persistent session shells
         self.shell_sessions.shutdown_all().await;
 
         tracing::info!("Adapter shutdown complete");
@@ -603,9 +594,8 @@ impl Adapter {
 
     /// Asynchronously starts a command, returning an operation ID immediately.
     ///
-    /// This method queues the command for execution in a background task, potentially using a
-    /// pre-warmed shell from the pool. The result will be reported via the `OperationMonitor`
-    /// and any registered callbacks.
+    /// This method queues the command for execution in a background task. The result will be
+    /// reported via the `OperationMonitor` and any registered callbacks.
     ///
     /// # Arguments
     ///

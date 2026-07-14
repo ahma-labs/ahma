@@ -39,7 +39,6 @@ mod tests {
         let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
         let shell_pool_config = ShellPoolConfig::default();
         let shell_pool_manager = Arc::new(ShellPoolManager::new(shell_pool_config));
-        shell_pool_manager.clone().start_background_tasks();
         let sandbox = Arc::new(
             Sandbox::new(
                 vec![std::env::current_dir().unwrap()],
@@ -142,7 +141,6 @@ mod tests {
         let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
         let shell_pool_config = ShellPoolConfig::default();
         let shell_pool_manager = Arc::new(ShellPoolManager::new(shell_pool_config));
-        shell_pool_manager.clone().start_background_tasks();
         let sandbox = Arc::new(
             Sandbox::new(
                 vec![std::env::current_dir().unwrap()],

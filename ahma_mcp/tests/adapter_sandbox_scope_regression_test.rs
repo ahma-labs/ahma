@@ -29,14 +29,7 @@ async fn adapter_uses_global_sandbox_scope_not_adapter_root_path() {
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
 
     let shell_pool_config = ShellPoolConfig {
-        enabled: false,
-        shells_per_directory: 0,
-        max_total_shells: 0,
-        shell_idle_timeout: Duration::from_secs(1),
-        pool_cleanup_interval: Duration::from_secs(1),
-        shell_spawn_timeout: Duration::from_secs(1),
         command_timeout: Duration::from_secs(5),
-        health_check_interval: Duration::from_secs(60),
     };
     let shell_pool = Arc::new(ShellPoolManager::new(shell_pool_config));
 

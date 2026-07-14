@@ -95,14 +95,7 @@ async fn test_service_creation_with_custom_shell_config() {
 
     // This test specifically exercises a non-default ShellPoolConfig.
     let shell_config = ShellPoolConfig {
-        enabled: true,
-        shells_per_directory: 1,
-        max_total_shells: 5,
-        shell_idle_timeout: Duration::from_secs(30),
-        pool_cleanup_interval: Duration::from_secs(60),
-        shell_spawn_timeout: Duration::from_secs(10),
         command_timeout: Duration::from_secs(120),
-        health_check_interval: Duration::from_secs(30),
     };
     let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
     let sandbox = Arc::new(
@@ -266,16 +259,9 @@ async fn test_service_disabled_shell_pool() {
     let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(300));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
 
-    // This test specifically exercises a disabled shell pool.
+    // This test specifically exercises a non-default command timeout.
     let shell_config = ShellPoolConfig {
-        enabled: false,
-        shells_per_directory: 1,
-        max_total_shells: 1,
-        shell_idle_timeout: Duration::from_secs(30),
-        pool_cleanup_interval: Duration::from_secs(60),
-        shell_spawn_timeout: Duration::from_secs(10),
         command_timeout: Duration::from_secs(120),
-        health_check_interval: Duration::from_secs(30),
     };
     let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
     let sandbox = Arc::new(

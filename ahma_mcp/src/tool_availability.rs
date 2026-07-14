@@ -11,10 +11,8 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
-use std::sync::Arc;
 
 use crate::config::ToolConfig;
-use crate::shell_pool::ShellPoolManager;
 use anyhow::Result;
 
 /// Summary of a disabled tool and why it was disabled.
@@ -115,13 +113,12 @@ mod builder;
 mod engine;
 mod types;
 
-/// Evaluate tool availability in parallel using the shell pool. Tools or subcommands whose
-/// probes fail will be disabled and recorded in the returned summary.
+/// Evaluate tool availability by running probes in parallel inside the sandbox. Tools or
+/// subcommands whose probes fail will be disabled and recorded in the returned summary.
 pub async fn evaluate_tool_availability(
-    shell_pool: Arc<ShellPoolManager>,
     configs: HashMap<String, ToolConfig>,
     default_working_dir: &Path,
     sandbox: &crate::sandbox::Sandbox,
 ) -> Result<AvailabilitySummary> {
-    engine::evaluate_tool_availability_impl(shell_pool, configs, default_working_dir, sandbox).await
+    engine::evaluate_tool_availability_impl(configs, default_working_dir, sandbox).await
 }

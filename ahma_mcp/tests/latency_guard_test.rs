@@ -6,8 +6,7 @@
 //! they catch order-of-magnitude regressions (an accidental sync wait, a
 //! per-line lock turning quadratic), not millisecond drift.
 //!
-//! Note: commands are spawned directly through the sandboxed process path —
-//! the prewarmed shell pool is not part of the async hot path.
+//! Note: commands are spawned directly through the sandboxed process path.
 
 use ahma_mcp::adapter::Adapter;
 use ahma_mcp::operation_monitor::{MonitorConfig, OperationMonitor};

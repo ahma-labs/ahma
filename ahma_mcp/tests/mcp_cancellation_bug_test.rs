@@ -37,11 +37,9 @@ async fn test_mcp_cancellation_does_not_trigger_canceled_canceled_message() {
     let monitor_config = MonitorConfig::with_timeout(Duration::from_secs(30));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
 
-    // Set up shell pool
+    // Set up execution timeout config
     let shell_config = ShellPoolConfig {
-        enabled: true,
         command_timeout: Duration::from_secs(30),
-        ..Default::default()
     };
     let shell_pool = Arc::new(ShellPoolManager::new(shell_config));
 

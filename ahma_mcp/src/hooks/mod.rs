@@ -1234,7 +1234,6 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
 
     let shell_pool_config = crate::shell_pool::ShellPoolConfig {
         command_timeout: std::time::Duration::from_secs(cfg.timeout_secs),
-        ..Default::default()
     };
     let shell_pool_manager =
         std::sync::Arc::new(crate::shell_pool::ShellPoolManager::new(shell_pool_config));

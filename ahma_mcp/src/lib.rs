@@ -21,9 +21,10 @@
 //!    block the agent's thought process. Ahma returns operation IDs immediately and
 //!    pushes results back via notifications when complete.
 //!
-//! 3. **High-Performance Shell Pooling**: To eliminate the hundreds of milliseconds
-//!    typically lost to shell startup, Ahma maintains a pool of pre-warmed shell processes
-//!    ready to execute commands in any directory.
+//! 3. **Persistent Shell Sessions**: Stateful PTY shell sessions
+//!    ([`ShellSessionManager`](crate::shell_session::ShellSessionManager)) let agents keep
+//!    environment state (cwd, exported variables) across commands when they opt in via
+//!    `session_id`.
 //!
 //! ## Practical Integration Guide
 //!

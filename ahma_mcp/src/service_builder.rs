@@ -9,7 +9,7 @@
 //! All transport modes share the same init chain:
 //! ```text
 //! MonitorConfig → OperationMonitor
-//!   → ShellPoolConfig → ShellPoolManager (+ start_background_tasks)
+//!   → ShellPoolConfig → ShellPoolManager
 //!     → Adapter
 //!       → load_tool_configs
 //!         → evaluate_tool_availability
@@ -177,10 +177,8 @@ impl<'a> ServiceBuilder<'a> {
 
         let shell_pool_config = ShellPoolConfig {
             command_timeout: Duration::from_secs(config.timeout_secs),
-            ..Default::default()
         };
         let shell_pool_manager = Arc::new(ShellPoolManager::new(shell_pool_config));
-        shell_pool_manager.clone().start_background_tasks();
 
         let mutex_registry = Arc::new(crate::adapter::CommandMutexRegistry::from_config(
             &config.mutex_groups,
@@ -200,7 +198,7 @@ impl<'a> ServiceBuilder<'a> {
         let adapter = Arc::new(
             Adapter::new_with_registry(
                 operation_monitor.clone(),
-                shell_pool_manager.clone(),
+                shell_pool_manager,
                 sandbox.clone(),
                 mutex_registry,
             )?
@@ -216,13 +214,9 @@ impl<'a> ServiceBuilder<'a> {
             Arc::new(raw_configs)
         } else {
             let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let availability_summary = evaluate_tool_availability(
-                shell_pool_manager,
-                raw_configs,
-                working_dir.as_path(),
-                sandbox.as_ref(),
-            )
-            .await?;
+            let availability_summary =
+                evaluate_tool_availability(raw_configs, working_dir.as_path(), sandbox.as_ref())
+                    .await?;
 
             log_availability_warnings(&availability_summary);
             Arc::new(availability_summary.filtered_configs)

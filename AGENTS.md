@@ -501,7 +501,7 @@ The `--tmp` flag (or `AHMA_TMP_ACCESS=1` environment variable) adds the system t
 
 ### Windows Platform Development
 
-> **Status**: Runtime (PowerShell shell pool, path model) is `in-progress`.
+> **Status**: Runtime (PowerShell shell, path model) is `in-progress`.
 > Job Object sandbox enforcement (`enforce_windows_sandbox`) is **done** and wired into startup.
 > AppContainer spawn isolation is **pending**; do not mark it done until Windows CI proves
 > write attempts outside the sandbox are OS-blocked.
@@ -512,7 +512,7 @@ The `--tmp` flag (or `AHMA_TMP_ACCESS=1` environment variable) adds the system t
   If a test is genuinely Unix-only (e.g., because it calls `std::os::unix::fs::symlink`), using `#[cfg(unix)]` without a Windows arm is correct — do not force-write a broken Windows version just to fill the gap.
 - **Root path checks** in `sandbox/scopes.rs` use `is_filesystem_root()` — never compare  
   directly to `Path::new("/")` because `C:\` and UNC roots have different representations.
-- **Shell invocations** must go through `shell_binary()` / `shell_args()` (in `shell_pool.rs`) — do not hard-code `bash` or `/bin/sh`.  
+- **Shell invocations** must go through `platform_shell_program()` (in `shell_pool.rs`) — do not hard-code `bash` or `/bin/sh`.  
   The removed `is_shell_program_invocation()` function caused a double `-c` bug; do not re-introduce it.
 - **Path separators**: always use `std::path::MAIN_SEPARATOR` or `Path`/`PathBuf` APIs.  
   String-based separator assumptions (`"/"`, `"\\"`) break cross-platform.

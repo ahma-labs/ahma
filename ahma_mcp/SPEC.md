@@ -21,7 +21,7 @@
 
 ## 3. Non-Functional Requirements
 
-- **Latency**: End-to-end async dispatch (start → terminal event) for a trivial command must stay well under 1s (guarded by the ignored `latency_guard_test` benchmarks; currently ~6ms median via direct sandboxed spawn). Note: the pre-warmed shell pool exists but is not currently wired into the async hot path.
+- **Latency**: End-to-end async dispatch (start → terminal event) for a trivial command must stay well under 1s (guarded by the ignored `latency_guard_test` benchmarks; currently ~6ms median via direct sandboxed spawn). Note: the former pre-warmed shell pool was removed as dead code; execution runs via direct sandboxed spawns and `ShellSessionManager` PTY sessions.
 - **Streaming Cost**: Per-line streaming (redaction, bounded collection, spill, tail/event emission) must stay non-pathological — 5000 lines under 10s (currently ~37ms).
 - **Security**: Strict path validation preventing directory traversal or symlink escapes (`dunce::canonicalize`).
 - **Hygiene**: Strict async I/O hygiene; child process spawns must enforce `kill_on_drop(true)`.

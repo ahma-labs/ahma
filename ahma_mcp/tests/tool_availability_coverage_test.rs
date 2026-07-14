@@ -3,7 +3,6 @@
 //! These tests cover the helper functions and edge cases in tool_availability.rs
 
 use ahma_mcp::config::{AvailabilityCheck, SubcommandConfig, ToolConfig, ToolHints};
-use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
 use ahma_mcp::tool_availability::{
     AvailabilitySummary, DisabledSubcommand, DisabledTool, evaluate_tool_availability,
     format_install_guidance,
@@ -11,7 +10,6 @@ use ahma_mcp::tool_availability::{
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 fn platform_shell_program_for_test() -> &'static str {
     #[cfg(target_os = "windows")]
@@ -208,7 +206,6 @@ fn test_format_install_guidance_whitespace_only_instructions() {
 
 #[tokio::test]
 async fn test_evaluate_empty_configs() -> Result<()> {
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let configs: HashMap<String, ToolConfig> = HashMap::new();
 
     let sandbox = ahma_mcp::sandbox::Sandbox::new(
@@ -219,7 +216,7 @@ async fn test_evaluate_empty_configs() -> Result<()> {
         false,
     )
     .unwrap();
-    let summary = evaluate_tool_availability(shell_pool, configs, Path::new("."), &sandbox).await?;
+    let summary = evaluate_tool_availability(configs, Path::new("."), &sandbox).await?;
 
     assert!(summary.filtered_configs.is_empty());
     assert!(summary.disabled_tools.is_empty());
@@ -230,7 +227,6 @@ async fn test_evaluate_empty_configs() -> Result<()> {
 
 #[tokio::test]
 async fn test_evaluate_tool_already_disabled() -> Result<()> {
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let mut disabled_tool = base_tool("some_cmd");
     disabled_tool.name = "disabled_tool".to_string();
     disabled_tool.enabled = false;
@@ -246,7 +242,7 @@ async fn test_evaluate_tool_already_disabled() -> Result<()> {
         false,
     )
     .unwrap();
-    let summary = evaluate_tool_availability(shell_pool, configs, Path::new("."), &sandbox).await?;
+    let summary = evaluate_tool_availability(configs, Path::new("."), &sandbox).await?;
 
     // Tool was already disabled, so it shouldn't be probed or appear in disabled_tools
     let config = summary.filtered_configs.get("disabled_tool").unwrap();
@@ -265,7 +261,6 @@ async fn test_evaluate_tool_already_disabled() -> Result<()> {
 
 #[tokio::test]
 async fn test_evaluate_sequence_tool_skipped() -> Result<()> {
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let mut sequence_tool = base_tool("sequence");
     sequence_tool.name = "sequence_tool".to_string();
     sequence_tool.command = "sequence".to_string();
@@ -281,7 +276,7 @@ async fn test_evaluate_sequence_tool_skipped() -> Result<()> {
         false,
     )
     .unwrap();
-    let summary = evaluate_tool_availability(shell_pool, configs, Path::new("."), &sandbox).await?;
+    let summary = evaluate_tool_availability(configs, Path::new("."), &sandbox).await?;
 
     // Sequence tools should be skipped (not probed)
     let config = summary.filtered_configs.get("sequence_tool").unwrap();
@@ -296,7 +291,6 @@ async fn test_evaluate_sequence_tool_skipped() -> Result<()> {
 
 #[tokio::test]
 async fn test_evaluate_project_relative_command_skipped() -> Result<()> {
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let mut relative_tool = base_tool("./gradlew");
     relative_tool.name = "gradlew_tool".to_string();
     // No availability_check, so it should be skipped
@@ -312,7 +306,7 @@ async fn test_evaluate_project_relative_command_skipped() -> Result<()> {
         false,
     )
     .unwrap();
-    let summary = evaluate_tool_availability(shell_pool, configs, Path::new("."), &sandbox).await?;
+    let summary = evaluate_tool_availability(configs, Path::new("."), &sandbox).await?;
 
     // Project-relative commands without availability_check should be skipped
     let config = summary.filtered_configs.get("gradlew_tool").unwrap();
@@ -330,7 +324,6 @@ async fn test_evaluate_project_relative_command_skipped() -> Result<()> {
 
 #[tokio::test]
 async fn test_evaluate_tool_with_available_command() -> Result<()> {
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let mut echo_tool = base_tool("echo");
     echo_tool.name = "echo_tool".to_string();
     echo_tool.availability_check = Some(AvailabilityCheck {
@@ -351,7 +344,7 @@ async fn test_evaluate_tool_with_available_command() -> Result<()> {
         false,
     )
     .unwrap();
-    let summary = evaluate_tool_availability(shell_pool, configs, Path::new("."), &sandbox).await?;
+    let summary = evaluate_tool_availability(configs, Path::new("."), &sandbox).await?;
 
     // echo should be available on all systems
     let config = summary.filtered_configs.get("echo_tool").unwrap();
@@ -366,7 +359,6 @@ async fn test_evaluate_tool_with_available_command() -> Result<()> {
 
 #[tokio::test]
 async fn test_evaluate_tool_with_unavailable_command() -> Result<()> {
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let mut unavailable_tool = base_tool("nonexistent_cmd_xyz_12345");
     unavailable_tool.name = "unavailable_tool".to_string();
     unavailable_tool.install_instructions = Some("brew install xyz".to_string());
@@ -382,7 +374,7 @@ async fn test_evaluate_tool_with_unavailable_command() -> Result<()> {
         false,
     )
     .unwrap();
-    let summary = evaluate_tool_availability(shell_pool, configs, Path::new("."), &sandbox).await?;
+    let summary = evaluate_tool_availability(configs, Path::new("."), &sandbox).await?;
 
     // Tool should be disabled
     let config = summary.filtered_configs.get("unavailable_tool").unwrap();
@@ -400,7 +392,6 @@ async fn test_evaluate_tool_with_unavailable_command() -> Result<()> {
 
 #[tokio::test]
 async fn test_evaluate_subcommand_disabled_when_probe_fails() -> Result<()> {
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let shell_prog = platform_shell_program_for_test();
     let shell_arg = if cfg!(target_os = "windows") {
         "-Command"
@@ -450,7 +441,7 @@ async fn test_evaluate_subcommand_disabled_when_probe_fails() -> Result<()> {
         false,
     )
     .unwrap();
-    let summary = evaluate_tool_availability(shell_pool, configs, Path::new("."), &sandbox).await?;
+    let summary = evaluate_tool_availability(configs, Path::new("."), &sandbox).await?;
 
     let config = summary.filtered_configs.get(&tool_name).unwrap();
     assert!(config.enabled, "Parent tool should remain enabled");
@@ -467,7 +458,6 @@ async fn test_evaluate_subcommand_disabled_when_probe_fails() -> Result<()> {
 
 #[tokio::test]
 async fn test_evaluate_already_disabled_subcommand_not_probed() -> Result<()> {
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let mut tool = base_tool("bash");
     tool.name = "bash_test".to_string();
     tool.availability_check = Some(AvailabilityCheck {
@@ -497,7 +487,7 @@ async fn test_evaluate_already_disabled_subcommand_not_probed() -> Result<()> {
         false,
     )
     .unwrap();
-    let summary = evaluate_tool_availability(shell_pool, configs, Path::new("."), &sandbox).await?;
+    let summary = evaluate_tool_availability(configs, Path::new("."), &sandbox).await?;
 
     // Subcommand was already disabled, so it shouldn't appear in disabled_subcommands
     assert!(
@@ -513,7 +503,6 @@ async fn test_evaluate_already_disabled_subcommand_not_probed() -> Result<()> {
 
 #[tokio::test]
 async fn test_evaluate_nested_subcommands() -> Result<()> {
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let shell_prog = platform_shell_program_for_test();
     let shell_arg = if cfg!(target_os = "windows") {
         "-Command"
@@ -556,7 +545,7 @@ async fn test_evaluate_nested_subcommands() -> Result<()> {
         false,
     )
     .unwrap();
-    let summary = evaluate_tool_availability(shell_pool, configs, Path::new("."), &sandbox).await?;
+    let summary = evaluate_tool_availability(configs, Path::new("."), &sandbox).await?;
 
     // The nested child should be disabled
     let config = summary.filtered_configs.get(&tool_name).unwrap();
@@ -582,7 +571,6 @@ async fn test_evaluate_nested_subcommands() -> Result<()> {
 
 #[tokio::test]
 async fn test_evaluate_custom_success_exit_codes() -> Result<()> {
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let shell_prog = platform_shell_program_for_test();
     let shell_arg = if cfg!(target_os = "windows") {
         "-Command"
@@ -611,7 +599,7 @@ async fn test_evaluate_custom_success_exit_codes() -> Result<()> {
         false,
     )
     .unwrap();
-    let summary = evaluate_tool_availability(shell_pool, configs, Path::new("."), &sandbox).await?;
+    let summary = evaluate_tool_availability(configs, Path::new("."), &sandbox).await?;
 
     let config = summary.filtered_configs.get(&tool_name).unwrap();
     assert!(

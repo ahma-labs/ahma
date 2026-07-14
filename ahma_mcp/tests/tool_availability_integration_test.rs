@@ -1,8 +1,6 @@
 use ahma_mcp::config::load_tool_configs;
-use ahma_mcp::shell_pool::{ShellPoolConfig, ShellPoolManager};
 use ahma_mcp::tool_availability::{AvailabilitySummary, evaluate_tool_availability};
 use anyhow::Result;
-use std::sync::Arc;
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -50,7 +48,6 @@ async fn test_tool_availability_integration_with_tempfile() -> Result<()> {
     assert!(raw_configs.contains_key("missing_tool"));
 
     // 5. Evaluate availability
-    let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
     let sandbox = ahma_mcp::sandbox::Sandbox::new(
         vec![temp_dir.path().to_path_buf()],
         ahma_mcp::sandbox::SandboxMode::Test,
@@ -61,7 +58,7 @@ async fn test_tool_availability_integration_with_tempfile() -> Result<()> {
     let working_dir = std::path::Path::new(".");
 
     let summary: AvailabilitySummary =
-        evaluate_tool_availability(shell_pool, raw_configs, working_dir, &sandbox).await?;
+        evaluate_tool_availability(raw_configs, working_dir, &sandbox).await?;
 
     // 6. Assert standard expectations
     // - echo_tool should be enabled (and not in disabled_tools)
