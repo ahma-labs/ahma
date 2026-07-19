@@ -7,8 +7,8 @@
 use super::{
     AppConfig, BundleArgs, BundleAuditArgs, BundleCommand, BundleSignArgs, BundleVerifyArgs,
     InfoArgs, LogsArgs, LogsCommand, PermissionsArgs, PermissionsCommand, PromptsArgs,
-    PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs, SettingsCommand, WebArgs,
-    WebCommand,
+    PromptsCommand, SandboxArgs, SandboxCommand, SettingsArgs, SettingsCommand, SettingsOriginCtx,
+    WebArgs, WebCommand,
 };
 use crate::shell::{list_tools, resolution};
 use anyhow::{Context, Result};
@@ -18,7 +18,132 @@ use std::path::PathBuf;
 // Settings command
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub(crate) fn run_settings_command(args: SettingsArgs) -> Result<()> {
+/// One displayed setting: its dotted key, effective (file-resolved) value, and
+/// compiled-in default value, both pre-rendered with `{:?}`.
+struct SettingRow {
+    key: &'static str,
+    value: String,
+    default: String,
+}
+
+/// Flatten the displayed subset of [`AhmaSettings`] into dotted-key rows.
+///
+/// Single source of truth for *which* settings both `settings show` variants
+/// print, so the plain and `--origin` outputs can never drift apart.
+fn setting_rows(
+    s: &ahma_common::config::AhmaSettings,
+    d: &ahma_common::config::AhmaSettings,
+) -> Vec<SettingRow> {
+    let mut rows = Vec::new();
+    macro_rules! row {
+        ($key:expr, $field:ident . $($rest:ident).+) => {
+            rows.push(SettingRow {
+                key: $key,
+                value: format!("{:?}", s.$field.$($rest).+),
+                default: format!("{:?}", d.$field.$($rest).+),
+            });
+        };
+    }
+    row!("features.simplify", features.simplify);
+    row!("features.vault", features.vault);
+    row!("features.cluster", features.cluster);
+    row!("features.egress", features.egress);
+    row!("features.artifact", features.artifact);
+    row!("features.decompose", features.decompose);
+    row!("lmstudio.base_url", lmstudio.base_url);
+    row!("lmstudio.model", lmstudio.model);
+    row!("tools.timeout_secs", tools.timeout_secs);
+    row!("tools.force_sync", tools.force_sync);
+    row!("tools.hot_reload", tools.hot_reload);
+    row!("tools.skip_probes", tools.skip_probes);
+    row!("sandbox.disable", sandbox.disable);
+    row!("sandbox.tmp_access", sandbox.tmp_access);
+    row!("sandbox.disable_temp", sandbox.disable_temp);
+    row!("sandbox.defer", sandbox.defer);
+    row!("sandbox.sandbox_directory", sandbox.sandbox_directory);
+    row!(
+        "sandbox.use_sandbox_directory",
+        sandbox.use_sandbox_directory
+    );
+    row!("logging.target", logging.target);
+    row!("logging.log_monitor", logging.log_monitor);
+    row!(
+        "logging.monitor_rate_limit_secs",
+        logging.monitor_rate_limit_secs
+    );
+    row!("http.handshake_timeout_secs", http.handshake_timeout_secs);
+    row!("http.disable_quic", http.disable_quic);
+    row!("http.disable_http1_1", http.disable_http1_1);
+    row!("auth.require_token_path", auth.require_token_path);
+    row!("auth.rate_limit_rps", auth.rate_limit_rps);
+    row!("auth.rate_limit_burst", auth.rate_limit_burst);
+    row!("instance.label", instance.label);
+    rows
+}
+
+/// Whether the raw settings-file TOML explicitly sets `dotted` (e.g.
+/// `"tools.timeout_secs"`), regardless of what value it sets it to.
+fn file_sets_key(file_toml: Option<&toml::Value>, dotted: &str) -> bool {
+    let Some(mut v) = file_toml else { return false };
+    for part in dotted.split('.') {
+        match v.get(part) {
+            Some(next) => v = next,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Render the `ahma settings show --origin` report (R-CFG5.1): every setting
+/// with its effective value and true source — `cli` (flag passed this
+/// invocation), `user (<file>)` (key explicitly set in the settings file, even
+/// if to the default value), or `default` (compiled in).
+fn render_settings_origin(
+    rows: &[SettingRow],
+    file_path: Option<&std::path::Path>,
+    file_toml: Option<&toml::Value>,
+    ctx: &SettingsOriginCtx,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    out.push_str("# Effective Ahma settings with provenance (R-CFG5.1)\n");
+    out.push_str(
+        "# Sources: cli = command-line flag  user = settings file  default = compiled-in\n",
+    );
+    match (ctx.no_settings, file_path) {
+        (true, _) => out.push_str("# --no-settings: settings files are ignored this invocation.\n"),
+        (false, Some(p)) => {
+            let _ = writeln!(out, "# User settings file: {}", p.display());
+        }
+        (false, None) => out.push_str("# User settings file: <no home directory found>\n"),
+    }
+    out.push_str(
+        "# Project-tier settings (<workspace>/.ahma/settings.toml, R-CFG3) are not yet consulted.\n\n",
+    );
+
+    let user_label = file_path
+        .map(|p| format!("user ({})", p.display()))
+        .unwrap_or_else(|| "user".to_string());
+    for row in rows {
+        let cli_value = ctx
+            .cli_overrides
+            .iter()
+            .find(|(k, _)| *k == row.key)
+            .map(|(_, v)| v);
+        let (value, source) = match cli_value {
+            Some(v) => (v.as_str(), "cli"),
+            None if file_sets_key(file_toml, row.key) => (row.value.as_str(), user_label.as_str()),
+            None => (row.value.as_str(), "default"),
+        };
+        let _ = writeln!(out, "{:<45} = {}  # {}", row.key, value, source);
+    }
+    out
+}
+
+pub(crate) fn run_settings_command(
+    args: SettingsArgs,
+    origin_ctx: &SettingsOriginCtx,
+) -> Result<()> {
     use ahma_common::config::{AhmaSettings, settings_path};
 
     match args.command {
@@ -33,106 +158,67 @@ pub(crate) fn run_settings_command(args: SettingsArgs) -> Result<()> {
             println!("Run `ahma settings show` to see the effective configuration.");
             Ok(())
         }
-        SettingsCommand::Show => {
-            // Load from the standard location and print each field with its source.
-            let s = AhmaSettings::load();
+        SettingsCommand::Show { origin } => {
+            // Honor --no-settings / --settings-path exactly like server startup
+            // does, so `settings show` reports the configuration actually in
+            // effect for this invocation.
+            let file_path = if origin_ctx.no_settings {
+                None
+            } else {
+                origin_ctx.settings_path.clone().or_else(settings_path)
+            };
+            let s = match &file_path {
+                Some(p) => AhmaSettings::load_from(p),
+                None => AhmaSettings::default(),
+            };
             let d = AhmaSettings::default();
+            let rows = setting_rows(&s, &d);
+
+            if origin {
+                // True provenance (R-CFG5.1): parse the raw file to learn which
+                // keys it explicitly sets, instead of inferring from value diffs.
+                let file_toml: Option<toml::Value> = file_path
+                    .as_deref()
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .and_then(|text| toml::from_str(&text).ok());
+                print!(
+                    "{}",
+                    render_settings_origin(
+                        &rows,
+                        file_path.as_deref(),
+                        file_toml.as_ref(),
+                        origin_ctx
+                    )
+                );
+                return Ok(());
+            }
 
             println!("# Effective Ahma settings");
             println!(
                 "# Sources: [file] = ~/.ahma/settings.toml  [env] = AHMA_* (deprecated)  [default] = compiled-in"
             );
+            println!("# Run `ahma settings show --origin` for exact per-key provenance.");
             println!();
 
-            macro_rules! show_field {
-                ($label:expr, $val:expr, $def:expr) => {
-                    let source = if $val != $def { "[file]" } else { "[default]" };
-                    println!("{:<45} = {:?}  # {}", $label, $val, source);
+            let mut section = "";
+            for row in &rows {
+                let (sec, key) = row.key.split_once('.').unwrap_or(("", row.key));
+                if sec != section {
+                    if !section.is_empty() {
+                        println!();
+                    }
+                    println!("[{sec}]");
+                    section = sec;
+                }
+                let source = if row.value != row.default {
+                    "[file]"
+                } else {
+                    "[default]"
                 };
+                println!("{:<45} = {}  # {}", key, row.value, source);
             }
 
-            println!("[features]");
-            show_field!("simplify", s.features.simplify, d.features.simplify);
-            show_field!("vault", s.features.vault, d.features.vault);
-            show_field!("cluster", s.features.cluster, d.features.cluster);
-            show_field!("egress", s.features.egress, d.features.egress);
-            show_field!("artifact", s.features.artifact, d.features.artifact);
-            show_field!("decompose", s.features.decompose, d.features.decompose);
-            println!();
-            println!("[lmstudio]");
-            show_field!("base_url", &s.lmstudio.base_url, &d.lmstudio.base_url);
-            show_field!("model", &s.lmstudio.model, &d.lmstudio.model);
-            println!();
-            println!("[tools]");
-            show_field!("timeout_secs", s.tools.timeout_secs, d.tools.timeout_secs);
-            show_field!("force_sync", s.tools.force_sync, d.tools.force_sync);
-            show_field!("hot_reload", s.tools.hot_reload, d.tools.hot_reload);
-            show_field!("skip_probes", s.tools.skip_probes, d.tools.skip_probes);
-            println!();
-            println!("[sandbox]");
-            show_field!("disable", s.sandbox.disable, d.sandbox.disable);
-            show_field!("tmp_access", s.sandbox.tmp_access, d.sandbox.tmp_access);
-            show_field!(
-                "disable_temp",
-                s.sandbox.disable_temp,
-                d.sandbox.disable_temp
-            );
-            show_field!("defer", s.sandbox.defer, d.sandbox.defer);
-            show_field!(
-                "sandbox_directory",
-                &s.sandbox.sandbox_directory,
-                &d.sandbox.sandbox_directory
-            );
-            show_field!(
-                "use_sandbox_directory",
-                s.sandbox.use_sandbox_directory,
-                d.sandbox.use_sandbox_directory
-            );
-            println!();
-            println!("[logging]");
-            show_field!("target", &s.logging.target, &d.logging.target);
-            show_field!("log_monitor", s.logging.log_monitor, d.logging.log_monitor);
-            show_field!(
-                "monitor_rate_limit_secs",
-                s.logging.monitor_rate_limit_secs,
-                d.logging.monitor_rate_limit_secs
-            );
-            println!();
-
-            println!("[http]");
-            show_field!(
-                "handshake_timeout_secs",
-                s.http.handshake_timeout_secs,
-                d.http.handshake_timeout_secs
-            );
-            show_field!("disable_quic", s.http.disable_quic, d.http.disable_quic);
-            show_field!(
-                "disable_http1_1",
-                s.http.disable_http1_1,
-                d.http.disable_http1_1
-            );
-            println!();
-            println!("[auth]");
-            show_field!(
-                "require_token_path",
-                &s.auth.require_token_path,
-                &d.auth.require_token_path
-            );
-            show_field!(
-                "rate_limit_rps",
-                s.auth.rate_limit_rps,
-                d.auth.rate_limit_rps
-            );
-            show_field!(
-                "rate_limit_burst",
-                s.auth.rate_limit_burst,
-                d.auth.rate_limit_burst
-            );
-            println!();
-            println!("[instance]");
-            show_field!("label", &s.instance.label, &d.instance.label);
-
-            if let Some(p) = settings_path() {
+            if let Some(p) = &file_path {
                 println!();
                 if p.exists() {
                     println!("# Settings file: {}", p.display());
@@ -1510,7 +1596,7 @@ mod tests {
                 path: Some(target.clone()),
             },
         };
-        run_settings_command(args).unwrap();
+        run_settings_command(args, &SettingsOriginCtx::default()).unwrap();
         assert!(target.exists(), "settings file should be written");
         let body = std::fs::read_to_string(&target).unwrap();
         assert!(!body.is_empty());
@@ -1527,7 +1613,7 @@ mod tests {
                 path: Some(target.clone()),
             },
         };
-        let err = run_settings_command(args).unwrap_err();
+        let err = run_settings_command(args, &SettingsOriginCtx::default()).unwrap_err();
         assert!(err.to_string().contains("already exists"));
         // Original content preserved.
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "pre-existing");
@@ -1544,7 +1630,7 @@ mod tests {
                 path: Some(target.clone()),
             },
         };
-        run_settings_command(args).unwrap();
+        run_settings_command(args, &SettingsOriginCtx::default()).unwrap();
         let body = std::fs::read_to_string(&target).unwrap();
         assert_ne!(body, "old");
         assert!(body.contains("settings.toml"));
@@ -1560,7 +1646,7 @@ mod tests {
                 path: None,
             },
         };
-        run_settings_command(args).unwrap();
+        run_settings_command(args, &SettingsOriginCtx::default()).unwrap();
         assert!(tmp.path().join(".ahma").join("settings.toml").exists());
     }
 
@@ -1570,19 +1656,130 @@ mod tests {
         let _home = HomeGuard::new(tmp.path());
 
         // First with no settings file → "[default]" sources + "not found" footer.
-        run_settings_command(SettingsArgs {
-            command: SettingsCommand::Show,
-        })
+        run_settings_command(
+            SettingsArgs {
+                command: SettingsCommand::Show { origin: false },
+            },
+            &SettingsOriginCtx::default(),
+        )
         .unwrap();
 
         // Now write a settings file with a non-default value so the "[file]"
-        // branch of the show_field! macro is exercised, plus the "exists" footer.
+        // branch is exercised, plus the "exists" footer.
         let dir = tmp.path().join(".ahma");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("settings.toml"), "[tools]\ntimeout_secs = 999\n").unwrap();
-        run_settings_command(SettingsArgs {
-            command: SettingsCommand::Show,
-        })
+        run_settings_command(
+            SettingsArgs {
+                command: SettingsCommand::Show { origin: false },
+            },
+            &SettingsOriginCtx::default(),
+        )
+        .unwrap();
+    }
+
+    // ── settings show --origin (R-CFG5.1) ───────────────────────────────────
+
+    /// Build (rows, file_toml) from raw settings-file TOML text.
+    fn origin_fixtures(
+        file_text: &str,
+    ) -> (
+        Vec<SettingRow>,
+        toml::Value,
+        ahma_common::config::AhmaSettings,
+    ) {
+        let s = ahma_common::config::AhmaSettings::parse(file_text).unwrap();
+        let d = ahma_common::config::AhmaSettings::default();
+        let rows = setting_rows(&s, &d);
+        let file_toml: toml::Value = toml::from_str(file_text).unwrap();
+        (rows, file_toml, d)
+    }
+
+    #[test]
+    fn origin_reports_file_source_even_for_default_valued_key() {
+        // The file explicitly sets timeout_secs to the compiled-in default —
+        // value-diff inference would call this "default"; true provenance
+        // (R-CFG5.1) must call it "user" and name the file.
+        let d = ahma_common::config::AhmaSettings::default();
+        let text = format!("[tools]\ntimeout_secs = {}\n", d.tools.timeout_secs);
+        let (rows, file_toml, _) = origin_fixtures(&text);
+        let path = std::path::Path::new("settings.toml");
+        let out = render_settings_origin(
+            &rows,
+            Some(path),
+            Some(&file_toml),
+            &SettingsOriginCtx::default(),
+        );
+
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("tools.timeout_secs"))
+            .unwrap();
+        assert!(
+            line.contains("# user (settings.toml)"),
+            "explicitly-set key must be attributed to the file: {line}"
+        );
+        // A key the file does not set stays attributed to the default.
+        let other = out
+            .lines()
+            .find(|l| l.starts_with("tools.force_sync"))
+            .unwrap();
+        assert!(
+            other.contains("# default"),
+            "unset key must be default: {other}"
+        );
+    }
+
+    #[test]
+    fn origin_cli_override_wins_over_file_and_shows_cli_value() {
+        let (rows, file_toml, _) = origin_fixtures("[tools]\ntimeout_secs = 999\n");
+        let ctx = SettingsOriginCtx {
+            no_settings: false,
+            settings_path: None,
+            cli_overrides: vec![("tools.timeout_secs", "30".to_string())],
+        };
+        let path = std::path::Path::new("settings.toml");
+        let out = render_settings_origin(&rows, Some(path), Some(&file_toml), &ctx);
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("tools.timeout_secs"))
+            .unwrap();
+        assert!(line.contains("= 30"), "cli value must be shown: {line}");
+        assert!(line.contains("# cli"), "cli source must win: {line}");
+    }
+
+    #[test]
+    fn origin_no_settings_ignores_file_entirely() {
+        let (rows, _file_toml, _) = origin_fixtures("");
+        let ctx = SettingsOriginCtx {
+            no_settings: true,
+            ..SettingsOriginCtx::default()
+        };
+        let out = render_settings_origin(&rows, None, None, &ctx);
+        assert!(out.contains("--no-settings"));
+        assert!(
+            !out.contains("# user"),
+            "no key may be attributed to a settings file under --no-settings"
+        );
+    }
+
+    #[test]
+    fn origin_end_to_end_via_command_with_settings_path() {
+        // Full command path: --settings-path routed through SettingsOriginCtx.
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("custom-settings.toml");
+        std::fs::write(&file, "[tools]\nhot_reload = true\n").unwrap();
+        let ctx = SettingsOriginCtx {
+            no_settings: false,
+            settings_path: Some(file),
+            cli_overrides: vec![],
+        };
+        run_settings_command(
+            SettingsArgs {
+                command: SettingsCommand::Show { origin: true },
+            },
+            &ctx,
+        )
         .unwrap();
     }
 

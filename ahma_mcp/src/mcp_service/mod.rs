@@ -1167,7 +1167,7 @@ impl ServerHandler for AhmaMcpService {
                 Arc::new(self.clone()),
                 self.last_received_signal.clone(),
                 env!("CARGO_PKG_VERSION").to_string(),
-                "todo-hash".to_string(), // TODO: inject build hash
+                ahma_common::BUILD_ID.to_string(),
             );
 
             if self.defer_sandbox {

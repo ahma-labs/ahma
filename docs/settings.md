@@ -8,8 +8,15 @@ It replaces the old `AHMA_*` environment variables with a single, self-documenti
 ```bash
 ahma settings init        # create with all defaults commented out
 ahma settings show        # print effective configuration (with source annotations)
+ahma settings show --origin  # print exact per-key provenance (cli / user / default + file path)
 ahma --no-settings serve stdio  # ignore settings file for one invocation
 ```
+
+`--origin` reports the *true* source of each setting: `cli` when a flag passed in
+the same invocation overrides the key (e.g. `ahma --timeout 30 settings show --origin`),
+`user (<path>)` when the settings file explicitly sets the key — even if it sets it
+to the default value — and `default` otherwise. Both `--settings-path` and
+`--no-settings` are honored.
 
 ## File location
 

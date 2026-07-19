@@ -459,17 +459,19 @@ pub fn spawn_window_cli_task(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_window_llm_task(
     window_id: usize,
     base_url: String,
     model: String,
+    num_ctx: Option<u32>,
     instructions: String,
     mcp: Option<McpChatConfig>,
     mut abort_rx: tokio::sync::oneshot::Receiver<()>,
     tx: Sender<BridgeEvent>,
 ) {
     tokio::spawn(async move {
-        let client = LlmClient::new(base_url, model, None);
+        let client = LlmClient::new(base_url, model, None).with_num_ctx(num_ctx);
         let system_msg = "You are a reasoning agent performing a subtask. Follow the instructions carefully and output the results.";
         let messages = vec![ChatMessage::user(instructions)];
 

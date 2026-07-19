@@ -515,6 +515,21 @@ impl AhmaConfig {
             })?;
         entry.resolve()
     }
+
+    /// The declared context window (`num_ctx`) of the provider whose base URL
+    /// matches `base_url`, ignoring a trailing-slash difference.
+    ///
+    /// Providers are often addressed by URL rather than name (the TUI persists
+    /// the selected provider's URL; auto-discovered local servers only have a
+    /// URL), and the context window must remain discoverable on those paths so
+    /// proactive compaction has a denominator (issue #484).
+    pub fn num_ctx_for_base_url(&self, base_url: &str) -> Option<u32> {
+        let want = base_url.trim_end_matches('/');
+        self.providers
+            .iter()
+            .find(|p| p.base_url.trim_end_matches('/') == want)
+            .and_then(|p| p.num_ctx)
+    }
 }
 
 /// Resolve the user's home directory for locating the `~/.ahma` directory.

@@ -1294,6 +1294,7 @@ mod tests {
             minimize_tokens: false,
             small_model_harness: false,
             mutex_groups: ahma_common::config::default_mutex_groups(),
+            settings_origin: crate::shell::cli::SettingsOriginCtx::default(),
         }
     }
 

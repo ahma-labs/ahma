@@ -201,6 +201,11 @@ pub struct AppConfig {
     /// True when this process was launched as a child server subprocess (--server-child flag or AHMA_SERVER_CHILD env var).
     /// Prevents the child from itself trying to spawn a background bridge and become a proxy client.
     pub is_server_child: bool,
+
+    // ── Settings provenance (R-CFG5.1) ──────────────────────────────────────
+    /// Which settings file is in effect and which keys CLI flags overrode this
+    /// invocation — consumed by `ahma settings show --origin`.
+    pub settings_origin: SettingsOriginCtx,
 }
 
 impl Default for AppConfig {
@@ -253,6 +258,7 @@ impl Default for AppConfig {
             idle_timeout_secs: None,
             max_sessions: 10,
             is_server_child: false,
+            settings_origin: SettingsOriginCtx::default(),
         }
     }
 }
@@ -905,7 +911,7 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
         }
         Subcommands::Settings(args) => {
             tracing::info!("Running in settings mode");
-            run_settings_command(args)
+            run_settings_command(args, &cfg.settings_origin)
         }
         Subcommands::Prompts(args) => {
             tracing::info!("Running in prompts mode");
@@ -930,8 +936,8 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
     }
 }
 
-fn run_settings_command(args: SettingsArgs) -> Result<()> {
-    commands::run_settings_command(args)
+fn run_settings_command(args: SettingsArgs, origin_ctx: &SettingsOriginCtx) -> Result<()> {
+    commands::run_settings_command(args, origin_ctx)
 }
 
 fn run_prompts_command(args: PromptsArgs) -> Result<()> {
@@ -1459,7 +1465,90 @@ pub enum SettingsCommand {
     ///
     /// Shows the current value of each setting and where it came from:
     /// settings file, deprecated environment variable, or compiled-in default.
-    Show,
+    Show {
+        /// Print each setting with its true provenance (R-CFG5.1): the source
+        /// (`cli` / `user` / `default`) that supplied the effective value, and
+        /// for file sources the settings-file path. Unlike the plain output,
+        /// this reports the file as the source even when the value it sets
+        /// happens to equal the compiled-in default.
+        #[arg(long)]
+        origin: bool,
+    },
+}
+
+/// Provenance context for `ahma settings show --origin` (R-CFG5.1): which
+/// settings file is in effect for this invocation, and every settings key a
+/// CLI flag explicitly overrode, with the value that flag supplied.
+///
+/// Captured once from [`Cli`] in [`build_app_config`] (R-CFG4.1: resolve once)
+/// and carried on [`AppConfig`] so the `settings` subcommand handler can render
+/// true per-key provenance without re-reading the environment.
+#[derive(Debug, Clone, Default)]
+pub struct SettingsOriginCtx {
+    /// `--no-settings`: no settings file is consulted at all.
+    pub no_settings: bool,
+    /// `--settings-path` override; `None` means the default `~/.ahma/settings.toml`.
+    pub settings_path: Option<PathBuf>,
+    /// `(dotted settings key, rendered value)` for each CLI flag passed this
+    /// invocation that overrides a settings key (e.g. `("tools.timeout_secs", "30")`).
+    pub cli_overrides: Vec<(&'static str, String)>,
+}
+
+/// Build the [`SettingsOriginCtx`] for this invocation by mapping every
+/// settings-overriding CLI flag that was explicitly passed to the dotted
+/// settings key it overrides.
+pub fn settings_origin_ctx(cli: &Cli) -> SettingsOriginCtx {
+    let mut cli_overrides: Vec<(&'static str, String)> = Vec::new();
+    {
+        let mut flag = |on: bool, key: &'static str| {
+            if on {
+                cli_overrides.push((key, "true".to_string()));
+            }
+        };
+        flag(cli.sync, "tools.force_sync");
+        flag(cli.hot_reload, "tools.hot_reload");
+        flag(cli.skip_probes, "tools.skip_probes");
+        flag(cli.no_sandbox, "sandbox.disable");
+        flag(cli.defer_sandbox, "sandbox.defer");
+        flag(cli.tmp, "sandbox.tmp_access");
+        flag(cli.no_temp_files, "sandbox.disable_temp");
+        flag(cli.use_scratch, "sandbox.use_sandbox_directory");
+        flag(cli.log_monitor, "logging.log_monitor");
+        flag(cli.disable_quic, "http.disable_quic");
+        flag(cli.disable_http1_1, "http.disable_http1_1");
+    }
+    if cli.log_to_stderr {
+        cli_overrides.push(("logging.target", "\"stderr\"".to_string()));
+    }
+    if let Some(v) = cli.timeout {
+        cli_overrides.push(("tools.timeout_secs", v.to_string()));
+    }
+    if let Some(v) = cli.monitor_rate_limit {
+        cli_overrides.push(("logging.monitor_rate_limit_secs", v.to_string()));
+    }
+    if let Some(v) = cli.handshake_timeout {
+        cli_overrides.push(("http.handshake_timeout_secs", v.to_string()));
+    }
+    if let Some(p) = &cli.require_token_path {
+        cli_overrides.push((
+            "auth.require_token_path",
+            format!("{:?}", p.display().to_string()),
+        ));
+    }
+    if let Some(v) = cli.rate_limit_rps {
+        cli_overrides.push(("auth.rate_limit_rps", v.to_string()));
+    }
+    if let Some(v) = cli.rate_limit_burst {
+        cli_overrides.push(("auth.rate_limit_burst", v.to_string()));
+    }
+    if let Some(l) = &cli.instance_label {
+        cli_overrides.push(("instance.label", format!("{l:?}")));
+    }
+    SettingsOriginCtx {
+        no_settings: cli.no_settings,
+        settings_path: cli.settings_path.clone(),
+        cli_overrides,
+    }
 }
 
 // ── sandbox scope grants ─────────────────────────────────────────────────────
@@ -2741,6 +2830,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         idle_timeout_secs,
         max_sessions: cli.max_sessions.unwrap_or(10),
         is_server_child: cli.server_child || std::env::var("AHMA_SERVER_CHILD").is_ok(),
+        settings_origin: settings_origin_ctx(cli),
     }
 }
 
@@ -2936,6 +3026,7 @@ mod tests {
             idle_timeout_secs: None,
             max_sessions: 10,
             is_server_child: false,
+            settings_origin: SettingsOriginCtx::default(),
         }
     }
 

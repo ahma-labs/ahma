@@ -1845,7 +1845,11 @@ fn resolve_llm_connection(
 ) -> Result<(String, String, Option<String>, Option<u32>), String> {
     if let Some(p_name) = provider {
         if provider_is_url(&p_name) {
-            return Ok((p_name, model.unwrap_or_default(), None, None));
+            // The TUI persists the selected provider by URL, so a configured
+            // provider's declared context window must still be recovered here
+            // (issue #484 — a lost `num_ctx` silently disables compaction).
+            let num_ctx = ahma_common::config::AhmaConfig::load().num_ctx_for_base_url(&p_name);
+            return Ok((p_name, model.unwrap_or_default(), None, num_ctx));
         }
         let config = ahma_common::config::AhmaConfig::load();
         let resolved = config
@@ -2050,7 +2054,34 @@ async fn build_agent_run_context(
         get_mcp_base_url(app_config_ref)
     };
 
-    let mcp_config = McpChatConfig {
+    let mcp_config = assemble_hub_chat_config(
+        local_mcp_base_url,
+        workspace_root,
+        mcp_connections,
+        &settings,
+        max_turns_override,
+        num_ctx,
+    );
+
+    Ok((client, mcp_config, available_tools))
+}
+
+/// Assemble the hub-path [`McpChatConfig`] from already-resolved inputs.
+///
+/// `num_ctx` is the provider's declared context window from
+/// `~/.ahma/config.toml`; it becomes [`McpChatConfig::context_length`] so
+/// proactive compaction and the context budgets have a denominator on the
+/// daemon-hub `SubmitPrompt` path (issue #484 — a `None` here made both
+/// features silently inert for every hub-routed chat).
+fn assemble_hub_chat_config(
+    local_mcp_base_url: String,
+    workspace_root: PathBuf,
+    mcp_connections: ahma_mcp::mcp_client::McpConnectionManager,
+    settings: &ahma_common::config::AhmaSettings,
+    max_turns_override: Option<u32>,
+    num_ctx: Option<u32>,
+) -> McpChatConfig {
+    McpChatConfig {
         base_url: local_mcp_base_url,
         workspace_root,
         session_id: None,
@@ -2060,10 +2091,8 @@ async fn build_agent_run_context(
         mcp_connections,
         minimize_tokens: settings.tools.minimize_tokens,
         small_model_harness: settings.tools.small_model_harness,
-        context_length: None,
-    };
-
-    Ok((client, mcp_config, available_tools))
+        context_length: num_ctx,
+    }
 }
 
 /// Convert hub `DaemonChatMessage`s into agent `ChatMessage`s.
@@ -2170,6 +2199,40 @@ mod tests {
             small_model_harness,
             context_length,
         }
+    }
+
+    /// Regression for issue #484: the hub `SubmitPrompt` path hardcoded
+    /// `context_length: None`, silently disabling proactive compaction and the
+    /// context budgets. The provider's resolved `num_ctx` must flow through to
+    /// `McpChatConfig::context_length` whenever it is configured.
+    #[test]
+    fn hub_chat_config_carries_provider_num_ctx_as_context_length() {
+        let settings = ahma_common::config::AhmaSettings::default();
+        let cfg = assemble_hub_chat_config(
+            "http://localhost:3000".to_string(),
+            PathBuf::from("/tmp"),
+            ahma_mcp::mcp_client::McpConnectionManager::default(),
+            &settings,
+            None,
+            Some(16_384),
+        );
+        assert_eq!(cfg.context_length, Some(16_384));
+        // And the compaction trigger actually engages with that denominator.
+        assert!(
+            cfg.context_strategy().compaction_threshold().is_some(),
+            "a known context window must enable a compaction threshold"
+        );
+
+        // Unknown window stays None (compaction correctly stays inert).
+        let cfg = assemble_hub_chat_config(
+            "http://localhost:3000".to_string(),
+            PathBuf::from("/tmp"),
+            ahma_mcp::mcp_client::McpConnectionManager::default(),
+            &settings,
+            None,
+            None,
+        );
+        assert_eq!(cfg.context_length, None);
     }
 
     #[test]
@@ -3364,11 +3427,16 @@ mod tests {
         assert!(!needs_approval("server::read_file", false));
     }
 
-    // ── resolve_llm_connection (URL fast-path, no config dependency) ──
+    // ── resolve_llm_connection (URL fast-path) ──
+    // Note: a URL provider never *requires* config, but `num_ctx` is enriched
+    // from a matching configured provider when one exists (#484), so these
+    // tests do not assert on `num_ctx` — its value depends on the local
+    // ~/.ahma/config.toml. The URL-matching lookup itself is unit-tested as
+    // `AhmaConfig::num_ctx_for_base_url` in ahma_common.
 
     #[test]
     fn resolve_llm_connection_url_provider_bypasses_config() {
-        let (base, model, key, num_ctx) = resolve_llm_connection(
+        let (base, model, key, _num_ctx) = resolve_llm_connection(
             Some("http://localhost:1234/v1".to_string()),
             Some("my-model".to_string()),
         )
@@ -3376,18 +3444,16 @@ mod tests {
         assert_eq!(base, "http://localhost:1234/v1");
         assert_eq!(model, "my-model");
         assert!(key.is_none());
-        assert!(num_ctx.is_none());
     }
 
     #[test]
     fn resolve_llm_connection_url_provider_uses_empty_default_model() {
-        let (base, model, key, num_ctx) =
+        let (base, model, key, _num_ctx) =
             resolve_llm_connection(Some("unix:///run/ahma.sock".to_string()), None)
                 .expect("unix URL provider resolves");
         assert_eq!(base, "unix:///run/ahma.sock");
         assert_eq!(model, "", "missing model defaults to empty string");
         assert!(key.is_none());
-        assert!(num_ctx.is_none());
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -1113,7 +1113,8 @@ fn maybe_decompose_goal(
             level: LogLevel::Info,
             message: format!("Decomposing goal: {}", goal),
         });
-        let client = LlmClient::new(base_url.to_string(), model.to_string(), None);
+        let client = LlmClient::new(base_url.to_string(), model.to_string(), None)
+            .with_num_ctx(provider_num_ctx(base_url));
         if let Some(tx) = &state.bridge_tx {
             spawn_decompose_task(client, goal, tx.clone());
         }
@@ -1504,11 +1505,25 @@ fn resolve_token_prefs(state: &crate::state::AppState) -> (bool, bool, Option<u3
         .small_model_harness
         .or_else(|| env_bool("AHMA_SMALL_MODEL_HARNESS"))
         .unwrap_or(settings.tools.small_model_harness);
-    (
-        minimize_tokens,
-        small_model_harness,
-        state.token_prefs.context_length,
-    )
+    // Explicit --context-length wins; otherwise fall back to the selected
+    // provider's declared window (`num_ctx` in ~/.ahma/config.toml) so
+    // proactive compaction has a denominator without any flag (issue #484).
+    let context_length = state.token_prefs.context_length.or_else(|| {
+        let (base_url, _model) = parse_llm_selection(state);
+        if base_url.is_empty() {
+            None
+        } else {
+            provider_num_ctx(&base_url)
+        }
+    });
+    (minimize_tokens, small_model_harness, context_length)
+}
+
+/// The configured context window (`num_ctx`) of the provider whose base URL
+/// matches `base_url`, from `~/.ahma/config.toml`.
+#[cfg(feature = "tui")]
+fn provider_num_ctx(base_url: &str) -> Option<u32> {
+    ahma_common::config::AhmaConfig::load().num_ctx_for_base_url(base_url)
 }
 
 #[cfg(feature = "tui")]
@@ -4115,7 +4130,8 @@ fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
             } else {
                 None
             };
-            spawn_window_llm_task(win_id, base_url, model, command, mcp, abort_rx, tx);
+            let num_ctx = provider_num_ctx(&base_url);
+            spawn_window_llm_task(win_id, base_url, model, num_ctx, command, mcp, abort_rx, tx);
         }
     }
 }
@@ -4674,6 +4690,42 @@ fn chat_in_progress(state: &crate::state::AppState) -> bool {
 mod tests {
     use super::parse_run_command;
     use serde_json::json;
+
+    /// Regression for issue #484: the provider's declared `num_ctx` must be
+    /// discoverable from its base URL so `resolve_token_prefs` can populate
+    /// `context_length` without an explicit `--context-length` flag.
+    #[test]
+    fn provider_num_ctx_matches_base_url_ignoring_trailing_slash() {
+        use ahma_common::config::{AhmaConfig, ProviderEntry, ProviderKind};
+        let cfg = AhmaConfig {
+            providers: vec![
+                ProviderEntry {
+                    name: "ollama-local".to_string(),
+                    kind: ProviderKind::OpenAi,
+                    base_url: "http://localhost:11434/v1/".to_string(),
+                    default_model: "m".to_string(),
+                    api_key: None,
+                    num_ctx: Some(16_384),
+                },
+                ProviderEntry {
+                    name: "no-ctx".to_string(),
+                    kind: ProviderKind::OpenAi,
+                    base_url: "http://localhost:9999/v1".to_string(),
+                    default_model: "m".to_string(),
+                    api_key: None,
+                    num_ctx: None,
+                },
+            ],
+            ..AhmaConfig::default()
+        };
+        assert_eq!(
+            cfg.num_ctx_for_base_url("http://localhost:11434/v1"),
+            Some(16_384),
+            "trailing-slash difference must not hide the provider"
+        );
+        assert_eq!(cfg.num_ctx_for_base_url("http://localhost:9999/v1"), None);
+        assert_eq!(cfg.num_ctx_for_base_url("http://elsewhere/v1"), None);
+    }
 
     #[test]
     fn parse_run_command_defaults_to_empty_object() {

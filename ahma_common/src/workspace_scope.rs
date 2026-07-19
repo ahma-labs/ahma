@@ -40,6 +40,10 @@ pub enum CommitOutcome {
         established: Vec<PathBuf>,
         proposed: Vec<PathBuf>,
     },
+    /// A TUI answer given while no IDE session was live (R5.3.6). The scope is
+    /// parked — shown as pending, not enforced as active — and is applied when
+    /// the next IDE session attaches to the workspace instance.
+    Pending(Vec<PathBuf>),
     /// The workspace scope is terminated; no further commits are possible.
     Terminated,
 }
@@ -47,6 +51,12 @@ pub enum CommitOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
     Awaiting,
+    /// A TUI-only answer awaiting the next IDE session (R5.3.6). Not active:
+    /// nothing is enforced against it and `scopes()`/`source()` report `None`.
+    Pending {
+        scopes: Vec<PathBuf>,
+        source: ScopeSourceToken,
+    },
     Active {
         scopes: Vec<PathBuf>,
         source: ScopeSourceToken,
@@ -82,10 +92,27 @@ impl WorkspaceScope {
     }
 
     /// The single commit point (R5.1.1). See [`CommitOutcome`].
+    ///
+    /// A commit made while a TUI-only answer is parked ([`State::Pending`],
+    /// R5.3.6) is the moment "the next IDE session attaches": the pending scope
+    /// is applied (promoted to active) first, and the proposed scope is then
+    /// evaluated against it through the normal downgrade gate — same is a
+    /// no-op, narrower applies, wider requires consent.
     pub fn commit(&self, proposed: Vec<PathBuf>, source: ScopeSourceToken) -> CommitOutcome {
         let mut inner = self.inner.lock().unwrap();
+        if let State::Pending {
+            scopes,
+            source: pending_source,
+        } = &inner.state
+        {
+            inner.state = State::Active {
+                scopes: scopes.clone(),
+                source: pending_source,
+            };
+        }
         match &inner.state {
             State::Terminated => CommitOutcome::Terminated,
+            State::Pending { .. } => unreachable!("promoted above"),
             State::Awaiting => {
                 inner.state = State::Active {
                     scopes: proposed.clone(),
@@ -108,6 +135,86 @@ impl WorkspaceScope {
                     proposed,
                 },
             },
+        }
+    }
+
+    /// Park a scope answered in the TUI while **no IDE session is live**
+    /// (R5.3.6). The scope is recorded and shown as *pending* — it is **not**
+    /// locked as active, because no live session is using it. It is applied
+    /// when the next IDE session attaches ([`Self::promote_pending`], or
+    /// implicitly by that session's first [`Self::commit`]).
+    ///
+    /// While already pending, a same-or-narrower answer replaces the parked
+    /// scope; a widening answer requires consent, exactly like the active
+    /// gate (Enter alone must never widen — R5.3.1). If the scope is already
+    /// active a live session is using it, so the answer flows through the
+    /// normal [`Self::commit`] gate instead.
+    pub fn commit_pending(
+        &self,
+        proposed: Vec<PathBuf>,
+        source: ScopeSourceToken,
+    ) -> CommitOutcome {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            match &inner.state {
+                State::Terminated => return CommitOutcome::Terminated,
+                State::Awaiting => {
+                    inner.state = State::Pending {
+                        scopes: proposed.clone(),
+                        source,
+                    };
+                    return CommitOutcome::Pending(proposed);
+                }
+                State::Pending { scopes, .. } => match classify_scope_change(scopes, &proposed) {
+                    ScopeDelta::Same => return CommitOutcome::Pending(scopes.clone()),
+                    ScopeDelta::Narrows => {
+                        inner.state = State::Pending {
+                            scopes: proposed.clone(),
+                            source,
+                        };
+                        return CommitOutcome::Pending(proposed);
+                    }
+                    ScopeDelta::Widens => {
+                        return CommitOutcome::RequiresConsent {
+                            established: scopes.clone(),
+                            proposed,
+                        };
+                    }
+                },
+                State::Active { .. } => {} // fall through to the live gate
+            }
+        }
+        self.commit(proposed, source)
+    }
+
+    /// Apply a parked TUI-only scope now that an IDE session has attached
+    /// (R5.3.6). Returns the established scope, or `None` when nothing was
+    /// pending (already active, still awaiting, or terminated).
+    pub fn promote_pending(&self) -> Option<Vec<PathBuf>> {
+        let mut inner = self.inner.lock().unwrap();
+        if let State::Pending { scopes, source } = &inner.state {
+            let scopes = scopes.clone();
+            inner.state = State::Active {
+                scopes: scopes.clone(),
+                source,
+            };
+            Some(scopes)
+        } else {
+            None
+        }
+    }
+
+    /// True while a TUI-only answer is parked awaiting the next IDE session.
+    pub fn is_pending(&self) -> bool {
+        matches!(self.inner.lock().unwrap().state, State::Pending { .. })
+    }
+
+    /// The parked pending write roots, if any (shown as *pending* — R5.3.6
+    /// requires this state to be visible, never silently treated as active).
+    pub fn pending_scopes(&self) -> Option<Vec<PathBuf>> {
+        match &self.inner.lock().unwrap().state {
+            State::Pending { scopes, .. } => Some(scopes.clone()),
+            _ => None,
         }
     }
 
@@ -240,6 +347,94 @@ mod tests {
             CommitOutcome::Terminated
         );
         assert!(!ws.is_active());
+    }
+
+    // ── R5.3.6: TUI-only establishment is pending ────────────────────────────
+
+    #[test]
+    fn tui_only_answer_parks_as_pending_not_active() {
+        let ws = WorkspaceScope::new();
+        let out = ws.commit_pending(paths(&["/ws/proj"]), "elicited");
+        assert_eq!(out, CommitOutcome::Pending(paths(&["/ws/proj"])));
+        // Shown as pending — never silently locked as if a live session used it.
+        assert!(ws.is_pending());
+        assert!(!ws.is_active());
+        assert_eq!(ws.scopes(), None, "a pending scope is not enforced");
+        assert_eq!(ws.pending_scopes(), Some(paths(&["/ws/proj"])));
+    }
+
+    #[test]
+    fn pending_is_applied_when_the_next_ide_session_attaches() {
+        let ws = WorkspaceScope::new();
+        ws.commit_pending(paths(&["/ws/proj"]), "elicited");
+        let promoted = ws.promote_pending();
+        assert_eq!(promoted, Some(paths(&["/ws/proj"])));
+        assert!(ws.is_active());
+        assert!(!ws.is_pending());
+        assert_eq!(
+            ws.source(),
+            Some("elicited"),
+            "provenance survives promotion"
+        );
+    }
+
+    #[test]
+    fn attaching_session_commit_promotes_pending_then_gates_its_roots() {
+        // Same roots as the pending answer → promoted, then a no-op.
+        let ws = WorkspaceScope::new();
+        ws.commit_pending(paths(&["/ws/proj"]), "elicited");
+        let out = ws.commit(paths(&["/ws/proj"]), "roots/list");
+        assert_eq!(out, CommitOutcome::AlreadyActive(paths(&["/ws/proj"])));
+        assert!(ws.is_active());
+
+        // Wider roots than the pending answer → pending is applied, widening
+        // still requires consent (the TUI answer can never be silently widened).
+        let ws = WorkspaceScope::new();
+        ws.commit_pending(paths(&["/ws/proj"]), "elicited");
+        let out = ws.commit(paths(&["/ws"]), "roots/list");
+        assert_eq!(
+            out,
+            CommitOutcome::RequiresConsent {
+                established: paths(&["/ws/proj"]),
+                proposed: paths(&["/ws"]),
+            }
+        );
+        assert_eq!(ws.scopes(), Some(paths(&["/ws/proj"])));
+    }
+
+    #[test]
+    fn pending_replacement_narrows_but_never_widens() {
+        let ws = WorkspaceScope::new();
+        ws.commit_pending(paths(&["/ws/proj"]), "elicited");
+        // Narrower re-answer replaces the parked scope.
+        let out = ws.commit_pending(paths(&["/ws/proj/src"]), "elicited");
+        assert_eq!(out, CommitOutcome::Pending(paths(&["/ws/proj/src"])));
+        // Wider re-answer is refused, parked scope unchanged.
+        let out = ws.commit_pending(paths(&["/ws"]), "elicited");
+        assert!(matches!(out, CommitOutcome::RequiresConsent { .. }));
+        assert_eq!(ws.pending_scopes(), Some(paths(&["/ws/proj/src"])));
+    }
+
+    #[test]
+    fn pending_answer_on_an_active_scope_routes_through_the_live_gate() {
+        let ws = WorkspaceScope::new();
+        ws.commit(paths(&["/ws/proj"]), "roots/list");
+        // A live session is using this scope — the answer is not parked.
+        let out = ws.commit_pending(paths(&["/ws"]), "elicited");
+        assert!(matches!(out, CommitOutcome::RequiresConsent { .. }));
+        assert!(!ws.is_pending());
+    }
+
+    #[test]
+    fn terminate_discards_pending_and_blocks_promotion() {
+        let ws = WorkspaceScope::new();
+        ws.commit_pending(paths(&["/ws/proj"]), "elicited");
+        ws.terminate();
+        assert_eq!(ws.promote_pending(), None);
+        assert_eq!(
+            ws.commit_pending(paths(&["/ws/proj"]), "elicited"),
+            CommitOutcome::Terminated
+        );
     }
 
     #[test]
