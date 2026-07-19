@@ -158,6 +158,10 @@ pub struct AhmaMcpService {
             >,
         >,
     >,
+    /// The session's grant coordinator, when a permission broker is wired
+    /// (server mode). Read by the keep-alive path to disclose the number of
+    /// grants awaiting a human decision in the heartbeat payload (#485).
+    pub grant_coordinator: Arc<RwLock<Option<Arc<ahma_common::scope_grant::GrantCoordinator>>>>,
 }
 
 impl AhmaMcpService {
@@ -607,6 +611,7 @@ impl AhmaMcpService {
             )),
             web_approval: Arc::new(ahma_common::web_approval::WebApprovalCoordinator::new()),
             web_approval_tx: Arc::new(std::sync::Mutex::new(None)),
+            grant_coordinator: Arc::new(RwLock::new(None)),
         };
         service.spawn_vault_audit_subscriber();
         Ok(service)
@@ -2257,8 +2262,14 @@ impl ahma_common::keepalive::KeepAlive for AhmaMcpService {
 
     async fn send_enhanced_heartbeat(
         &self,
-        payload: ahma_common::keepalive::HeartbeatPayload,
+        mut payload: ahma_common::keepalive::HeartbeatPayload,
     ) -> anyhow::Result<()> {
+        // Session-health disclosure (#485): surface how many sandbox grants are
+        // parked on a human decision, so a slow-polling ahma peer converges even
+        // if it missed the grant_pending event.
+        if let Some(coordinator) = self.grant_coordinator.read().unwrap().as_ref() {
+            payload.pending_grants = coordinator.pending_count() as u32;
+        }
         let peer_opt = self.peer.read().unwrap().clone();
         if let Some(peer) = peer_opt {
             let params = serde_json::to_value(payload)?;
@@ -4112,6 +4123,7 @@ mod tests {
             version: "0.0.0".to_string(),
             hash: "abc".to_string(),
             timestamp: 1,
+            ..Default::default()
         };
         assert!(service.send_enhanced_heartbeat(payload).await.is_ok());
     }

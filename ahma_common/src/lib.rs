@@ -63,6 +63,7 @@ pub mod prompts;
 pub mod sandbox_state;
 pub mod scope_decision;
 pub mod scope_grant;
+pub mod session_event;
 pub mod state_machine;
 pub mod test_isolation;
 pub mod timeouts;

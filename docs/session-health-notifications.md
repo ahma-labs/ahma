@@ -1,6 +1,7 @@
 # Session-Health and Pending-Grant Notifications — Design (#485)
 
-**Status:** proposed design — no code changes yet
+**Status:** P1 (proxy reconnect disclosure) and P2 (grant events + heartbeat
+fields) implemented; P3 (client integration guidance, SPEC rows) pending
 **Issue:** [#485](https://github.com/paulirotta/ahma/issues/485)
 **Related:** #479 (transparent proxy reconnect), SPEC R5.3/R5.4 (grant flow), R8.4 (bridge sessions)
 
@@ -67,7 +68,7 @@ custom notifications degrade safely. The repo already relies on this for
 
    ```json
    {
-     "kind": "reconnected | reconnect_failed | session_rebuilt |
+     "kind": "reconnected | reconnect_failed |
               grant_pending | grant_decided | health",
      "timestamp": 1789000000000,
      "seq": 42,
@@ -98,7 +99,6 @@ custom notifications degrade safely. The repo already relies on this for
        // new, all optional/defaulted for wire compatibility:
        pub pending_grants: u32,      // grants awaiting a human decision
        pub reconnects: u32,          // proxy reconnects this session
-       pub last_event_seq: u64,      // highest session_event seq emitted
    }
    ```
 
@@ -124,12 +124,12 @@ custom notifications degrade safely. The repo already relies on this for
 **Passive disclosure is the contract; actionability is opt-in where a stable
 handle exists.**
 
-- `reconnected` / `session_rebuilt` — disclosure only (log line / toast).
-  The event's `detail` carries `{attempt, cause, dropped_operations: [op_id…]}`.
-  Any operation that was in flight when the transport died is *listed*, and the
-  client (or its user) can re-issue; the existing `status`/`await` tools
-  already let a client check whether an `op_id` survived. No new actionable
-  surface is required.
+- `reconnected` — disclosure only (log line / toast). The event's `detail`
+  carries `{cause, reconnects, message}`. Requests in flight when the
+  transport died were each answered with a JSON-RPC error, and the client (or
+  its user) can re-issue; the existing `status`/`await` tools already let a
+  client check whether an `op_id` survived. No new actionable surface is
+  required.
 - `reconnect_failed` — terminal disclosure (level `error`) emitted *before*
   the proxy exits, so the pipe death that follows is at least explained. A
   capable client may prompt the user to restart the server; a passive one

@@ -244,6 +244,24 @@ impl GrantCoordinator {
         req
     }
 
+    /// Snapshot of the decisions currently awaiting an answer, for
+    /// session-health disclosure (#485): the `grant_pending` event and the
+    /// heartbeat `pending_grants` count. Order is unspecified.
+    pub fn pending(&self) -> Vec<ScopeGrantRequest> {
+        self.inner
+            .lock()
+            .unwrap()
+            .in_flight
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Number of decisions currently awaiting an answer.
+    pub fn pending_count(&self) -> usize {
+        self.inner.lock().unwrap().in_flight.len()
+    }
+
     /// Whether `decision_id` is still awaiting an answer.
     pub fn is_in_flight(&self, decision_id: &str) -> bool {
         self.inner
@@ -456,6 +474,23 @@ mod tests {
             c.begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn pending_tracks_in_flight_decisions() {
+        let c = coord();
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        assert_eq!(c.pending_count(), 0);
+        let req = c
+            .begin(p, ScopeAccess::Rw, GrantReason::PreExecViolation, None)
+            .unwrap();
+        assert_eq!(c.pending_count(), 1);
+        assert_eq!(c.pending()[0].decision_id, req.decision_id);
+        // Any resolution (here: deny) empties the pending set.
+        c.resolve(&req.decision_id, GrantDecision::Deny);
+        assert_eq!(c.pending_count(), 0);
+        assert!(c.pending().is_empty());
     }
 
     #[test]

@@ -4,7 +4,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Payload sent with enhanced Ahma keep-alive / heartbeat notifications.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+///
+/// The session-health fields (`pending_grants`, `reconnects`) are `#[serde(default)]`
+/// so old and new peers stay wire-compatible in both directions: an old payload
+/// deserializes here with zeros, and an old peer ignores the extra fields
+/// (issue #485, `docs/session-health-notifications.md` §3.1).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct HeartbeatPayload {
     /// Application version (e.g., "0.11.9")
     pub version: String,
@@ -12,6 +17,14 @@ pub struct HeartbeatPayload {
     pub hash: String,
     /// Timestamp for latency calculation and deduplication
     pub timestamp: u64,
+    /// Sandbox scope grants currently awaiting a human decision. Filled by the
+    /// server from its `GrantCoordinator`; `0` when none (or an old server).
+    #[serde(default)]
+    pub pending_grants: u32,
+    /// Transparent bridge reconnects performed this session. Overlaid by the
+    /// stdio proxy — the server behind it cannot know; `0` from the server.
+    #[serde(default)]
+    pub reconnects: u32,
 }
 
 /// Abstract trait for sending a keep-alive signal over a specific transport.
@@ -88,6 +101,7 @@ pub fn spawn_keepalive_task<T: KeepAlive + Send + Sync + 'static>(
                     version: executable_version.clone(),
                     hash: executable_hash.clone(),
                     timestamp: now,
+                    ..Default::default()
                 };
 
                 let res = if connection.is_ahma_peer() {
@@ -430,5 +444,38 @@ mod tests {
             heartbeats.is_empty(),
             "heartbeat should be skipped because of rate limiting"
         );
+    }
+
+    /// Wire-compat both ways for the #485 session-health fields: an old
+    /// three-field payload deserializes under the new struct (defaults), and a
+    /// new payload deserializes under an old-shaped consumer (extra fields
+    /// ignored by serde's default unknown-field handling).
+    #[test]
+    fn heartbeat_payload_wire_compat_across_versions() {
+        let old_wire = serde_json::json!({
+            "version": "0.16.0", "hash": "abc", "timestamp": 42u64
+        });
+        let new: HeartbeatPayload = serde_json::from_value(old_wire).unwrap();
+        assert_eq!(new.pending_grants, 0);
+        assert_eq!(new.reconnects, 0);
+
+        #[derive(serde::Deserialize)]
+        struct OldPayload {
+            version: String,
+            #[allow(dead_code)]
+            hash: String,
+            #[allow(dead_code)]
+            timestamp: u64,
+        }
+        let new_wire = serde_json::to_value(HeartbeatPayload {
+            version: "0.17.0".into(),
+            hash: "def".into(),
+            timestamp: 43,
+            pending_grants: 2,
+            reconnects: 1,
+        })
+        .unwrap();
+        let old: OldPayload = serde_json::from_value(new_wire).unwrap();
+        assert_eq!(old.version, "0.17.0");
     }
 }

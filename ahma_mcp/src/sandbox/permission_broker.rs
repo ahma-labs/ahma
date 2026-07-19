@@ -115,6 +115,10 @@ pub struct PermissionBroker {
     /// Rung 2: the hub channel a connected TUI drains to show its modal.
     hub_tx: Option<tokio::sync::mpsc::UnboundedSender<ScopeGrantRequest>>,
     harness: Mutex<HarnessState>,
+    /// Session-health disclosure (#485): `grant_pending` / `grant_decided`
+    /// events emitted *beside* the asking surfaces, never instead of them.
+    /// Installed with the elicitation surface; `None` in bare-CLI runs.
+    session_events: RwLock<Option<Arc<crate::session_events::SessionEventSender>>>,
 }
 
 impl PermissionBroker {
@@ -131,12 +135,31 @@ impl PermissionBroker {
             elicitation: RwLock::new(None),
             hub_tx,
             harness: Mutex::new(HarnessState::Untried),
+            session_events: RwLock::new(None),
         }
     }
 
     /// Install rung 1 once the MCP peer is known.
     pub fn set_elicitation_surface(&self, surface: Arc<dyn ElicitationSurface>) {
         *self.elicitation.write().unwrap() = Some(surface);
+    }
+
+    /// Install the session-health event sender (#485). Like the elicitation
+    /// surface, it shares the service's peer slot and is installed at build time.
+    pub fn set_session_events(&self, sender: Arc<crate::session_events::SessionEventSender>) {
+        *self.session_events.write().unwrap() = Some(sender);
+    }
+
+    /// Fire a session-health event, if a sender is installed. Detached and
+    /// best-effort: disclosure must never block or fail the grant flow.
+    fn emit_event(
+        &self,
+        kind: ahma_common::session_event::SessionEventKind,
+        detail: serde_json::Value,
+    ) {
+        if let Some(sender) = self.session_events.read().unwrap().as_ref() {
+            sender.emit_detached(kind, detail);
+        }
     }
 
     /// The coordinator this broker gates on — shared with the daemon reporter so a
@@ -218,7 +241,30 @@ impl PermissionBroker {
     /// session — R5.1). A decline resolves too, which is what stops the same
     /// question coming back for the rest of the session.
     fn apply(&self, req: &ScopeGrantRequest, decision: GrantDecision) {
-        match self.coordinator.resolve(&req.decision_id, decision) {
+        let outcome = self.coordinator.resolve(&req.decision_id, decision);
+        // Close the disclosure loop (#485): a client that showed grant_pending
+        // can clear it. Emitted for real resolutions only — AlreadyResolved /
+        // Unknown are no-ops whose grant_decided was (or will be) sent by the
+        // surface that actually resolved first.
+        match &outcome {
+            GrantResolveOutcome::Persist { access, .. } => self.emit_event(
+                ahma_common::session_event::SessionEventKind::GrantDecided,
+                serde_json::json!({
+                    "grant_id": req.decision_id,
+                    "outcome": "granted",
+                    "access": access.label(),
+                }),
+            ),
+            GrantResolveOutcome::Denied { .. } => self.emit_event(
+                ahma_common::session_event::SessionEventKind::GrantDecided,
+                serde_json::json!({
+                    "grant_id": req.decision_id,
+                    "outcome": "declined",
+                }),
+            ),
+            GrantResolveOutcome::AlreadyResolved | GrantResolveOutcome::Unknown => {}
+        }
+        match outcome {
             GrantResolveOutcome::Persist { path, access, tool } => {
                 let granted_at = chrono::Local::now();
                 let Some(file) = settings_path() else {
@@ -310,6 +356,19 @@ impl ScopeGrantNotifier for PermissionBroker {
         let Some(req) = self.coordinator.begin(path, access, reason, tool) else {
             return;
         };
+        // Disclose the pending question before the (possibly long-blocking)
+        // ask, so a client that is not itself the asking surface learns a
+        // decision is parked somewhere (#485). The path was already disclosed
+        // to this client in the sandbox_denial error payload.
+        self.emit_event(
+            ahma_common::session_event::SessionEventKind::GrantPending,
+            serde_json::json!({
+                "grant_id": req.decision_id,
+                "path": req.path.display().to_string(),
+                "access": req.access.label(),
+                "reason": req.reason,
+            }),
+        );
         self.ask(req).await;
     }
 }

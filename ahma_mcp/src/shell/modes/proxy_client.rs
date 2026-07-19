@@ -146,6 +146,62 @@ where
     .map_err(|_| anyhow!("reconnect: timed out waiting for roots/list"))?
 }
 
+/// Session-health disclosure (#485): the proxy is the *only* party that knows
+/// a transparent reconnect happened — the rebuilt bridge session is brand-new
+/// and the downstream client was deliberately kept unaware of the replay. So
+/// the proxy synthesizes the disclosure itself, downstream only: a canonical
+/// `notifications/ahma/session_event` plus its `notifications/message` mirror
+/// for foreign clients. Best-effort — a failed send must never affect the
+/// session that was just saved.
+#[cfg(unix)]
+async fn emit_session_event_downstream<S>(
+    stdio: &mut S,
+    seq: &mut u64,
+    kind: ahma_common::session_event::SessionEventKind,
+    detail: serde_json::Value,
+) where
+    S: Transport<RoleServer>,
+    S::Error: std::fmt::Debug,
+{
+    use ahma_common::session_event::{event_notification, message_mirror_notification};
+    *seq += 1;
+    let now = ahma_common::keepalive::current_timestamp_ms();
+    for val in [
+        event_notification(kind, *seq, now, detail.clone()),
+        message_mirror_notification(kind, *seq, now, detail),
+    ] {
+        match serde_json::from_value::<TxJsonRpcMessage<RoleServer>>(val) {
+            Ok(msg) => {
+                if let Err(e) = stdio.send(msg).await {
+                    tracing::debug!(
+                        kind = kind.as_str(),
+                        error = ?e,
+                        "session event emission to stdio failed (non-fatal)"
+                    );
+                }
+            }
+            Err(e) => tracing::debug!(
+                kind = kind.as_str(),
+                error = %e,
+                "session event did not serialize as a notification (non-fatal)"
+            ),
+        }
+    }
+}
+
+/// Overlay the proxy's reconnect count onto a forwarded
+/// `notifications/ahma/heartbeat` (#485): the server behind the proxy cannot
+/// know how many times its transport was rebuilt, so the proxy owns this field.
+#[cfg(unix)]
+fn overlay_heartbeat_reconnects(val: &mut serde_json::Value, reconnects: u32) {
+    if reconnects > 0
+        && val.get("method").and_then(|m| m.as_str()) == Some("notifications/ahma/heartbeat")
+        && let Some(params) = val.get_mut("params").and_then(|p| p.as_object_mut())
+    {
+        params.insert("reconnects".to_string(), serde_json::json!(reconnects));
+    }
+}
+
 /// Async hook that respawns the background bridge. Provided by the frontend
 /// path (which owns the `AppConfig` needed to spawn); `None` elsewhere.
 ///
@@ -364,6 +420,10 @@ where
     // success. A single failure no longer tears the session down (see
     // MAX_CONSECUTIVE_FORWARD_FAILURES).
     let mut consecutive_forward_failures: u32 = 0;
+    // Session-health disclosure (#485): transparent reconnects this session and
+    // the monotonic seq for the events that disclose them.
+    let mut reconnects: u32 = 0;
+    let mut event_seq: u64 = 0;
 
     // Handshake deadline: if the client never sends its first message (the
     // `initialize` handshake) within this window, the connection was spawned
@@ -464,6 +524,24 @@ where
                                     // The reconnect handshake just proved the
                                     // (fresh) bridge is alive and responsive.
                                     bridge_responded = true;
+                                    reconnects += 1;
+                                    // Disclose the rebuild to the client (#485).
+                                    // The request that tripped the failure was
+                                    // answered with a -32002 error above; name
+                                    // it so the client can re-issue.
+                                    emit_session_event_downstream(
+                                        &mut stdio,
+                                        &mut event_seq,
+                                        ahma_common::session_event::SessionEventKind::Reconnected,
+                                        serde_json::json!({
+                                            "cause": "transport_failure",
+                                            "reconnects": reconnects,
+                                            "message": "ahma bridge session was rebuilt \
+                                                        transparently; in-flight requests were \
+                                                        answered with an error and can be retried",
+                                        }),
+                                    )
+                                    .await;
                                     continue;
                                 }
                                 Err(e) => {
@@ -474,6 +552,21 @@ where
                                         "Proxy exiting: bridge transport failed repeatedly and \
                                          reconnect also failed"
                                     );
+                                    // Terminal disclosure (#485): the pipe dies
+                                    // next; at least say why.
+                                    emit_session_event_downstream(
+                                        &mut stdio,
+                                        &mut event_seq,
+                                        ahma_common::session_event::SessionEventKind::ReconnectFailed,
+                                        serde_json::json!({
+                                            "cause": e.to_string(),
+                                            "attempts": MAX_RECONNECT_ATTEMPTS,
+                                            "message": "ahma bridge is unreachable and reconnect \
+                                                        attempts are exhausted; the server \
+                                                        connection is closing",
+                                        }),
+                                    )
+                                    .await;
                                     break;
                                 }
                             }
@@ -498,8 +591,11 @@ where
                     );
                     break;
                 };
-                let val = serde_json::to_value(msg).unwrap();
+                let mut val = serde_json::to_value(msg).unwrap();
                 handshake.observe_bridge_to_client(&val);
+                // The server cannot know its transport was rebuilt; the proxy
+                // owns the heartbeat's `reconnects` field (#485).
+                overlay_heartbeat_reconnects(&mut val, reconnects);
                 let tx_msg = serde_json::from_value(val).unwrap();
                 if let Err(e) = stdio.send(tx_msg).await {
                     tracing::error!(
@@ -1194,11 +1290,34 @@ mod tests {
                 MAX_CONSECUTIVE_FORWARD_FAILURES as usize
             );
             // The fresh client sees: the replayed initialize, then request(3)
-            // and request(4) forwarded normally after reconnect.
+            // and request(4) forwarded normally after reconnect — and nothing
+            // else: session events must never leak upstream to the bridge.
             assert_eq!(fresh_attempts.load(Ordering::SeqCst), 3);
             let sent = sent.lock().unwrap();
             let error_count = sent.iter().filter(|m| m.get("error").is_some()).count();
             assert_eq!(error_count, 3, "expected 3 relayed errors, got {sent:?}");
+            // Session-health disclosure (#485): exactly one `reconnected`
+            // event reached the client, with its `notifications/message`
+            // mirror for foreign clients.
+            let events: Vec<_> = sent
+                .iter()
+                .filter(|m| {
+                    m.get("method").and_then(|m| m.as_str())
+                        == Some(ahma_common::session_event::SESSION_EVENT_METHOD)
+                })
+                .collect();
+            assert_eq!(events.len(), 1, "expected 1 session event, got {sent:?}");
+            assert_eq!(events[0]["params"]["kind"], "reconnected");
+            assert_eq!(events[0]["params"]["detail"]["reconnects"], 1);
+            let mirrors: Vec<_> = sent
+                .iter()
+                .filter(|m| {
+                    m.get("method").and_then(|m| m.as_str()) == Some("notifications/message")
+                })
+                .collect();
+            assert_eq!(mirrors.len(), 1, "expected 1 logging mirror, got {sent:?}");
+            assert_eq!(mirrors[0]["params"]["level"], "warning");
+            assert_eq!(mirrors[0]["params"]["data"]["kind"], "reconnected");
         })
         .await;
     }
@@ -1244,6 +1363,81 @@ mod tests {
             );
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_exhaustion_discloses_reconnect_failed_before_exit() {
+        // Session-health disclosure (#485): when the proxy gives up and the
+        // pipe is about to die, the client receives a terminal
+        // `reconnect_failed` event (error-level mirror) explaining why.
+        with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let stdio = MockStdio::new(
+                VecDeque::from(vec![
+                    client_initialize(0),
+                    client_request(1),
+                    client_request(2),
+                ]),
+                sent.clone(),
+            );
+            let dead_client = MockClient {
+                fail_first_n: usize::MAX,
+                attempts: Arc::new(AtomicUsize::new(0)),
+                inbound: VecDeque::new(),
+                closed: Arc::new(AtomicUsize::new(0)),
+                receive_none_after: None,
+                receive_call_count: Arc::new(AtomicUsize::new(0)),
+                close_behavior: CloseBehavior::Ok,
+                sent: None,
+            };
+            let mut reconnect =
+                move || -> Result<MockClient> { Err(anyhow!("simulated: bridge gone")) };
+
+            let result =
+                run_transport_proxy(stdio, dead_client, "test", None, &mut reconnect, None).await;
+            assert!(result.is_ok());
+            let sent = sent.lock().unwrap();
+            let events: Vec<_> = sent
+                .iter()
+                .filter(|m| {
+                    m.get("method").and_then(|m| m.as_str())
+                        == Some(ahma_common::session_event::SESSION_EVENT_METHOD)
+                })
+                .collect();
+            assert_eq!(
+                events.len(),
+                1,
+                "expected 1 reconnect_failed event, got {sent:?}"
+            );
+            assert_eq!(events[0]["params"]["kind"], "reconnect_failed");
+            let mirror = sent
+                .iter()
+                .find(|m| m.get("method").and_then(|m| m.as_str()) == Some("notifications/message"))
+                .expect("logging mirror present");
+            assert_eq!(mirror["params"]["level"], "error");
+        })
+        .await;
+    }
+
+    #[test]
+    fn heartbeat_overlay_injects_reconnects_only_when_nonzero() {
+        let mut hb = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/ahma/heartbeat",
+            "params": {"version": "1", "hash": "h", "timestamp": 1}
+        });
+        overlay_heartbeat_reconnects(&mut hb, 0);
+        assert!(hb["params"].get("reconnects").is_none(), "0 → untouched");
+        overlay_heartbeat_reconnects(&mut hb, 2);
+        assert_eq!(hb["params"]["reconnects"], 2);
+
+        // Non-heartbeat messages are never touched.
+        let mut other = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": {}
+        });
+        let before = other.clone();
+        overlay_heartbeat_reconnects(&mut other, 5);
+        assert_eq!(other, before);
     }
 
     /// Endpoint-gone errors (socket unlinked, nothing listening) call for a

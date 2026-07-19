@@ -249,6 +249,14 @@ impl<'a> ServiceBuilder<'a> {
             broker.set_elicitation_surface(Arc::new(crate::sandbox::PeerElicitationSurface::new(
                 service.peer.clone(),
             )));
+            // Session-health disclosure (#485): the broker emits
+            // grant_pending/grant_decided events over the same peer slot, and
+            // the keep-alive path reads the coordinator's pending count into
+            // the heartbeat payload.
+            broker.set_session_events(Arc::new(crate::session_events::SessionEventSender::new(
+                service.peer.clone(),
+            )));
+            *service.grant_coordinator.write().unwrap() = Some(broker.coordinator().clone());
         }
 
         Ok(BuiltService {

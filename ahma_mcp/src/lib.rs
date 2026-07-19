@@ -149,6 +149,7 @@ pub mod sandbox;
 pub mod schema_validation;
 /// Unified service builder for all transport modes.
 pub mod service_builder;
+pub mod session_events;
 /// Setup wizard for MCP, hooks, TLS, and skills.
 pub mod setup;
 /// CLI shell entry points.
