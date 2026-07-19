@@ -34,6 +34,7 @@
 | Sequence Tools | tests-pass | Chain multiple commands into workflows |
 | Tool Hot-Reload | tests-pass | Opt-in `--hot-reload-tools` watches `tools/` directory and reloads on changes |
 | MCP Progress Push | tests-pass | Event-stream subscriber pushes `notifications/progress` per registered operation (replaces legacy callback chain) |
+| Session-Health Disclosure (R8.8) | tests-pass | `notifications/ahma/session_event` + `notifications/message` mirror; proxy reconnect disclosure (#479/#485); `grant_pending`/`grant_decided` beside the asking surfaces; heartbeat `pending_grants`/`reconnects`. Design: `docs/session-health-notifications.md` |
 | HTTP MCP Client | tests-pass | Connect to external HTTP MCP servers |
 | OAuth 2.0 + PKCE | tests-pass | Authentication for HTTP MCP servers |
 | `ahma --validate` | tests-pass | Validate tool configs against MTDF schema |
@@ -1200,6 +1201,12 @@ These three mechanisms together bound how long any abandoned `ahma serve stdio` 
   - **R8.7.1**: HTTP/3 uses QUIC (UDP-based) for reduced connection latency and improved multiplexing compared to HTTP/2 over TCP.
   - **R8.7.2**: Transparent fallback to HTTP/2 or HTTP/1.1 when the server does not support HTTP/3.
   - **R8.7.3**: Both SSE and HTTP streaming endpoints work correctly with HTTP/3-capable clients.
+- **R8.8**: **Session-Health Disclosure** (issue #485; design: `docs/session-health-notifications.md`): structured server→client disclosure of session-health changes the client cannot otherwise observe. Events are **information only** — they never demand a response, never gate server progress, and emission failure must never fail or block the operation that triggered the event.
+  - **R8.8.1**: Canonical event notification `notifications/ahma/session_event` with envelope `{kind, timestamp, seq, detail}`; `seq` is per-emitter monotonic so a client can detect gaps. Kinds: `reconnected`, `reconnect_failed`, `grant_pending`, `grant_decided`, `health`.
+  - **R8.8.2**: Every event is mirrored as a standard `notifications/message` logging notification (`data` = the event params; level `error` for `reconnect_failed`, `warning` for reconnect/grant kinds, `info` for `health`) so foreign clients surface the disclosure with zero ahma-specific code. The mirror is emitted with the standard wire shape directly (rmcp 2.0 deprecates the typed logging API per SEP-2577).
+  - **R8.8.3**: The stdio proxy — the only party that knows a transparent reconnect (#479) happened — synthesizes `reconnected` after a successful rebuild and a terminal `reconnect_failed` before exiting on exhaustion, **downstream only**: session events must never reach the (fresh) bridge session, mirroring how the replayed handshake never reaches stdio.
+  - **R8.8.4**: The `notifications/ahma/heartbeat` payload carries `pending_grants` (grants awaiting a human decision, filled by the server from the `GrantCoordinator`) and `reconnects` (overlaid by the proxy — the server behind it cannot know). Both fields are `#[serde(default)]` and wire-compatible in both directions with pre-R8.8 peers.
+  - **R8.8.5**: The permission broker emits `grant_pending` (with `grant_id` = the coordinator's `decision_id`) once per deduped `(path, access)` before the question ladder asks, and `grant_decided` (`granted`/`declined`) on resolution — **beside**, never instead of, the human asking surfaces. The R5.3/R5.4 grant security gates and session scope-immutability are unaffected: disclosure carries no approval authority.
 
 ### R10: Session Isolation
 

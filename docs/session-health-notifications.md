@@ -1,7 +1,6 @@
 # Session-Health and Pending-Grant Notifications — Design (#485)
 
-**Status:** P1 (proxy reconnect disclosure) and P2 (grant events + heartbeat
-fields) implemented; P3 (client integration guidance, SPEC rows) pending
+**Status:** implemented (P1–P3) — SPEC R8.8; client integration guidance in §7
 **Issue:** [#485](https://github.com/paulirotta/ahma/issues/485)
 **Related:** #479 (transparent proxy reconnect), SPEC R5.3/R5.4 (grant flow), R8.4 (bridge sessions)
 
@@ -225,3 +224,76 @@ Three landable slices, each independently useful:
   under the new struct; new payload deserializes under a three-field struct.
 - Negative test: `session_event` emission failure (closed pipe) must not fail
   the operation that triggered it.
+
+## 7. Client integration reference (P3)
+
+Everything below is observable behavior pinned by tests; treat it as a stable
+contract (SPEC R8.8).
+
+### 7.1 Event reference
+
+Method: `notifications/ahma/session_event`. Params envelope:
+
+```json
+{ "kind": "<kind>", "timestamp": <unix ms>, "seq": <per-emitter monotonic>, "detail": { } }
+```
+
+| `kind` | Mirror level | `detail` fields | Emitted by |
+|---|---|---|---|
+| `reconnected` | `warning` | `cause` (`"transport_failure"`), `reconnects` (count so far), `message` | stdio proxy, after a transparent #479 rebuild |
+| `reconnect_failed` | `error` | `cause`, `attempts`, `message` | stdio proxy, right before it exits; the pipe dies next |
+| `grant_pending` | `warning` | `grant_id`, `path`, `access` (`ro`/`rw`), `reason` | server broker, before the question ladder asks |
+| `grant_decided` | `warning` | `grant_id`, `outcome` (`granted`/`declined`), `access` (granted only) | server broker, on resolution |
+| `health` | `info` | reserved | reserved for future telemetry |
+
+`seq` is monotonic **per emitter** (the proxy and the server count
+independently); a gap means you missed events, and the heartbeat fields below
+let you re-converge. Two emitters ⇒ do not assume a single global ordering.
+
+### 7.2 The `notifications/message` mirror
+
+Every event is also sent as a standard MCP logging notification:
+
+```json
+{ "method": "notifications/message",
+  "params": { "level": "warning", "logger": "ahma.session", "data": { ...same envelope... } } }
+```
+
+Note MCP has deprecated the logging primitive (SEP-2577), so the mirror is a
+compatibility bridge for today's clients, not the long-term contract — the
+canonical `session_event` is.
+
+### 7.3 Heartbeat convergence fields
+
+`notifications/ahma/heartbeat` params now include (both `0` when idle, both
+absent from pre-R8.8 servers — treat missing as `0`):
+
+- `pending_grants` — grants currently awaiting a human decision (server-filled)
+- `reconnects` — transparent transport rebuilds this session (proxy-overlaid)
+
+### 7.4 Recipes
+
+**Foreign client (Claude Code, Cursor, any MCP client):** nothing to do.
+The mirror arrives as an ordinary logging notification and is surfaced by the
+client's existing log/notification UI. To do better, parse `params.data.kind`
+from notifications with `logger == "ahma.session"`.
+
+**Ahma-aware client (TUI, custom integrations):** handle the
+`notifications/ahma/session_event` method (unknown methods are safe to ignore,
+so shipping the handler is backward-compatible with old servers). Suggested
+reactions, all optional:
+
+- `reconnected` → toast/log line; requests that were in flight got a JSON-RPC
+  error and can simply be re-issued (`status`/`await` tell you whether an
+  `op_id` survived).
+- `reconnect_failed` → show the message; the connection is about to die, so
+  offer a restart.
+- `grant_pending` → display "a sandbox grant for `<path>` is awaiting approval".
+  To pull the decision into your own UI instead, call the `sandbox_grant` tool
+  with the same path — the coordinator's dedup makes the surfaces converge on
+  one decision (first answer wins).
+- `grant_decided` → clear the corresponding `grant_pending` display.
+
+**What you may never do with events:** treat them as approval authority. A
+`grant_decided` event does not grant anything by itself — persistence happened
+(or didn't) server-side through the R5.3/R5.4-gated flow; events only report it.

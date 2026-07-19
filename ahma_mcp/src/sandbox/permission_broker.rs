@@ -118,7 +118,7 @@ pub struct PermissionBroker {
     /// Session-health disclosure (#485): `grant_pending` / `grant_decided`
     /// events emitted *beside* the asking surfaces, never instead of them.
     /// Installed with the elicitation surface; `None` in bare-CLI runs.
-    session_events: RwLock<Option<Arc<crate::session_events::SessionEventSender>>>,
+    session_events: RwLock<Option<Arc<dyn crate::session_events::SessionEventSink>>>,
 }
 
 impl PermissionBroker {
@@ -144,21 +144,22 @@ impl PermissionBroker {
         *self.elicitation.write().unwrap() = Some(surface);
     }
 
-    /// Install the session-health event sender (#485). Like the elicitation
-    /// surface, it shares the service's peer slot and is installed at build time.
-    pub fn set_session_events(&self, sender: Arc<crate::session_events::SessionEventSender>) {
-        *self.session_events.write().unwrap() = Some(sender);
+    /// Install the session-health event sink (#485). Like the elicitation
+    /// surface, the production sink shares the service's peer slot and is
+    /// installed at build time.
+    pub fn set_session_events(&self, sink: Arc<dyn crate::session_events::SessionEventSink>) {
+        *self.session_events.write().unwrap() = Some(sink);
     }
 
-    /// Fire a session-health event, if a sender is installed. Detached and
+    /// Fire a session-health event, if a sink is installed. Detached and
     /// best-effort: disclosure must never block or fail the grant flow.
     fn emit_event(
         &self,
         kind: ahma_common::session_event::SessionEventKind,
         detail: serde_json::Value,
     ) {
-        if let Some(sender) = self.session_events.read().unwrap().as_ref() {
-            sender.emit_detached(kind, detail);
+        if let Some(sink) = self.session_events.read().unwrap().as_ref() {
+            sink.emit_event(kind, detail);
         }
     }
 
@@ -252,7 +253,9 @@ impl PermissionBroker {
                 serde_json::json!({
                     "grant_id": req.decision_id,
                     "outcome": "granted",
-                    "access": access.label(),
+                    // The serde form ("ro"/"rw") — a machine-stable wire value,
+                    // not the human label (R8.8.5 / docs §7.1).
+                    "access": access,
                 }),
             ),
             GrantResolveOutcome::Denied { .. } => self.emit_event(
@@ -365,7 +368,7 @@ impl ScopeGrantNotifier for PermissionBroker {
             serde_json::json!({
                 "grant_id": req.decision_id,
                 "path": req.path.display().to_string(),
-                "access": req.access.label(),
+                "access": req.access,
                 "reason": req.reason,
             }),
         );
@@ -555,6 +558,77 @@ mod tests {
                 Some("cargo_build".into()),
             )
             .await;
+    }
+
+    /// Records every session-health event the broker emits (R8.8.5), so the
+    /// disclosure contract is testable without a live MCP peer.
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        events: Mutex<
+            Vec<(
+                ahma_common::session_event::SessionEventKind,
+                serde_json::Value,
+            )>,
+        >,
+    }
+
+    impl crate::session_events::SessionEventSink for RecordingSink {
+        fn emit_event(
+            &self,
+            kind: ahma_common::session_event::SessionEventKind,
+            detail: serde_json::Value,
+        ) {
+            self.events.lock().unwrap().push((kind, detail));
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_pending_fires_once_per_deduped_path_and_decided_closes_it() {
+        use ahma_common::session_event::SessionEventKind;
+        // R8.8.5: one grant_pending per deduped (path, access), before the ask;
+        // grant_decided carries the same grant_id and closes the loop.
+        let h = ScriptedHarness::new(vec![ElicitOutcome::Answered(GrantDecision::Deny)]);
+        let (broker, _rx) = broker_with(Some(h.clone()), true);
+        let sink = Arc::new(RecordingSink::default());
+        broker.set_session_events(sink.clone());
+
+        violate(&broker, "/opt/cache").await;
+        // Same (path, access) again: deduped by the coordinator → no second ask
+        // and no second grant_pending.
+        violate(&broker, "/opt/cache").await;
+
+        let events = sink.events.lock().unwrap();
+        let pending: Vec<_> = events
+            .iter()
+            .filter(|(k, _)| *k == SessionEventKind::GrantPending)
+            .collect();
+        assert_eq!(
+            pending.len(),
+            1,
+            "one grant_pending per deduped path, got {events:?}"
+        );
+        assert_eq!(pending[0].1["path"], "/opt/cache");
+        assert_eq!(pending[0].1["access"], "rw");
+        let decided: Vec<_> = events
+            .iter()
+            .filter(|(k, _)| *k == SessionEventKind::GrantDecided)
+            .collect();
+        assert_eq!(decided.len(), 1, "the deny resolution is disclosed");
+        assert_eq!(decided[0].1["outcome"], "declined");
+        assert_eq!(
+            decided[0].1["grant_id"], pending[0].1["grant_id"],
+            "grant_decided must correlate to the grant_pending it closes"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_sink_installed_means_disclosure_is_a_silent_noop() {
+        // Bare-CLI runs have no MCP peer and install no sink; the grant flow
+        // must work identically (events are information-only, R8.8).
+        let h = ScriptedHarness::new(vec![ElicitOutcome::Answered(GrantDecision::Deny)]);
+        let (broker, _rx) = broker_with(Some(h.clone()), true);
+        violate(&broker, "/opt/cache").await;
+        assert_eq!(h.asks(), 1, "the ladder runs unchanged without a sink");
     }
 
     #[tokio::test]

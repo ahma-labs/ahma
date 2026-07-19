@@ -2250,6 +2250,18 @@ impl AhmaMcpService {
     }
 }
 
+impl AhmaMcpService {
+    /// Fill the session-health fields of an outgoing heartbeat (R8.8.4):
+    /// `pending_grants` from the session's grant coordinator, so a slow-polling
+    /// ahma peer converges even if it missed the `grant_pending` event.
+    /// (`reconnects` is owned by the stdio proxy, which overlays it in transit.)
+    fn enrich_heartbeat(&self, payload: &mut ahma_common::keepalive::HeartbeatPayload) {
+        if let Some(coordinator) = self.grant_coordinator.read().unwrap().as_ref() {
+            payload.pending_grants = coordinator.pending_count() as u32;
+        }
+    }
+}
+
 impl ahma_common::keepalive::KeepAlive for AhmaMcpService {
     async fn send_standard_ping(&self) -> anyhow::Result<()> {
         let peer_opt = self.peer.read().unwrap().clone();
@@ -2264,12 +2276,7 @@ impl ahma_common::keepalive::KeepAlive for AhmaMcpService {
         &self,
         mut payload: ahma_common::keepalive::HeartbeatPayload,
     ) -> anyhow::Result<()> {
-        // Session-health disclosure (#485): surface how many sandbox grants are
-        // parked on a human decision, so a slow-polling ahma peer converges even
-        // if it missed the grant_pending event.
-        if let Some(coordinator) = self.grant_coordinator.read().unwrap().as_ref() {
-            payload.pending_grants = coordinator.pending_count() as u32;
-        }
+        self.enrich_heartbeat(&mut payload);
         let peer_opt = self.peer.read().unwrap().clone();
         if let Some(peer) = peer_opt {
             let params = serde_json::to_value(payload)?;
@@ -4126,5 +4133,30 @@ mod tests {
             ..Default::default()
         };
         assert!(service.send_enhanced_heartbeat(payload).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reports_pending_grants_from_the_coordinator() {
+        // R8.8.4: the heartbeat's pending_grants mirrors the coordinator's
+        // in-flight decision count, and stays 0 when no coordinator is wired.
+        let service = make_service().await;
+        let mut payload = HeartbeatPayload::default();
+        service.enrich_heartbeat(&mut payload);
+        assert_eq!(payload.pending_grants, 0, "no coordinator wired → 0");
+
+        let coordinator = Arc::new(ahma_common::scope_grant::GrantCoordinator::new());
+        *service.grant_coordinator.write().unwrap() = Some(coordinator.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        coordinator
+            .begin(
+                tmp.path(),
+                ahma_common::config::ScopeAccess::Rw,
+                ahma_common::scope_grant::GrantReason::PreExecViolation,
+                None,
+            )
+            .expect("fresh path begins a decision");
+
+        service.enrich_heartbeat(&mut payload);
+        assert_eq!(payload.pending_grants, 1);
     }
 }

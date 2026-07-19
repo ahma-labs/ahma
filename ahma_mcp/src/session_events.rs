@@ -24,6 +24,15 @@ use ahma_common::session_event::{
 use rmcp::model::CustomNotification;
 use rmcp::service::{Peer, RoleServer};
 
+/// A fire-and-forget sink for session-health events, behind a trait so
+/// emitters (the permission broker) can be tested without a live MCP peer —
+/// the same precedent as
+/// [`ElicitationSurface`](crate::sandbox::ElicitationSurface).
+pub trait SessionEventSink: Send + Sync + std::fmt::Debug {
+    /// Deliver one event, best-effort, without blocking the caller.
+    fn emit_event(&self, kind: SessionEventKind, detail: serde_json::Value);
+}
+
 /// Emits session-health events to the connected MCP client, if any.
 ///
 /// Shares the service's peer slot (the same pattern as
@@ -33,7 +42,7 @@ use rmcp::service::{Peer, RoleServer};
 #[derive(Debug)]
 pub struct SessionEventSender {
     peer: Arc<RwLock<Option<Peer<RoleServer>>>>,
-    seq: AtomicU64,
+    seq: Arc<AtomicU64>,
 }
 
 impl SessionEventSender {
@@ -41,7 +50,7 @@ impl SessionEventSender {
     pub fn new(peer: Arc<RwLock<Option<Peer<RoleServer>>>>) -> Self {
         Self {
             peer,
-            seq: AtomicU64::new(0),
+            seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -80,10 +89,14 @@ impl SessionEventSender {
             }
         }
     }
+}
 
-    /// Fire-and-forget emission from a synchronous context.
-    pub fn emit_detached(self: &Arc<Self>, kind: SessionEventKind, detail: serde_json::Value) {
-        let sender = self.clone();
+impl SessionEventSink for SessionEventSender {
+    fn emit_event(&self, kind: SessionEventKind, detail: serde_json::Value) {
+        let sender = SessionEventSender {
+            peer: self.peer.clone(),
+            seq: self.seq.clone(),
+        };
         tokio::spawn(async move {
             sender.emit(kind, detail).await;
         });
