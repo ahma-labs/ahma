@@ -160,9 +160,13 @@ struct ServerSpec {
     env: Vec<(String, String)>,
 }
 
+/// Build the argv for a test server.
+///
+/// `sandbox_scope: None` omits `--sandbox-scope` entirely, putting the bridge in
+/// strict-roots mode — see [`FallbackScope`].
 fn build_server_spec(
     tools_dir: &Path,
-    sandbox_scope: &Path,
+    sandbox_scope: Option<&Path>,
     handshake_timeout_secs: Option<u64>,
 ) -> ServerSpec {
     let mut args = vec![
@@ -181,9 +185,12 @@ fn build_server_spec(
         "--skip-probes".to_string(),
         "--tools-dir".to_string(),
         tools_dir.to_string_lossy().to_string(),
-        "--sandbox-scope".to_string(),
-        sandbox_scope.to_string_lossy().to_string(),
     ];
+
+    if let Some(scope) = sandbox_scope {
+        args.push("--sandbox-scope".to_string());
+        args.push(scope.to_string_lossy().to_string());
+    }
 
     // The server's handshake deadline must be as patient as the client's wait.
     //
@@ -211,13 +218,6 @@ fn build_server_spec(
     ]);
 
     ServerSpec { args, env: vec![] }
-}
-
-/// Remove every `flag <value>` pair from an argument vector.
-fn remove_flag_with_value(args: &mut Vec<String>, flag: &str) {
-    while let Some(pos) = args.iter().position(|a| a == flag) {
-        args.drain(pos..=(pos + 1).min(args.len() - 1));
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -483,7 +483,7 @@ pub async fn spawn_test_server_with_timeout(
     let tools_dir = workspace.join(".ahma");
     let temp_dir = TempDir::new().map_err(|e| format!("Failed to create temp dir: {}", e))?;
     let sandbox_scope = temp_dir.path().to_path_buf();
-    let spec = build_server_spec(&tools_dir, &sandbox_scope, handshake_timeout_secs);
+    let spec = build_server_spec(&tools_dir, Some(&sandbox_scope), handshake_timeout_secs);
 
     eprintln!("[TestServer] Starting test server with dynamic port");
     let (mut child, line_rx) = spawn_server_child(
@@ -553,7 +553,7 @@ pub async fn spawn_server_guard_with_config_extra_env(
         e
     })?;
     let workspace = workspace_dir();
-    let mut spec = build_server_spec(tools_dir, sandbox_scope, handshake_timeout_secs);
+    let mut spec = build_server_spec(tools_dir, Some(sandbox_scope), handshake_timeout_secs);
     let mut filtered_env = Vec::new();
     for (k, v) in extra_env {
         if k == "AHMA_TASK_VAULT" {
@@ -627,8 +627,8 @@ pub async fn spawn_server_guard_with_deferred_sandbox(
 }
 
 /// Whether a deferred-sandbox test server is given an explicit fallback scope.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum FallbackScope {
+#[derive(Clone, Copy)]
+enum FallbackScope {
     /// Pass `--sandbox-scope <workspace>`. A client that returns no roots still
     /// gets a sandbox, locked from that explicit fallback.
     Workspace,
@@ -636,6 +636,25 @@ pub enum FallbackScope {
     /// A client that returns no roots never gets a sandbox, so `tools/call`
     /// stays gated forever instead of racing an eventual lock.
     None,
+}
+
+impl FallbackScope {
+    /// The `--sandbox-scope` argument this mode implies, if any.
+    fn scope_arg(self, workspace: &Path) -> Option<&Path> {
+        match self {
+            // Deferred — the real scope comes from roots/list; this is only the
+            // fallback used when the client supplies none.
+            Self::Workspace => Some(workspace),
+            Self::None => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::None => "none (strict roots)",
+        }
+    }
 }
 
 /// Spawn a deferred-sandbox server in **strict-roots** mode (no fallback scope).
@@ -659,12 +678,7 @@ async fn spawn_deferred_sandbox_server(
         e
     })?;
     let workspace = workspace_dir();
-    let sandbox_scope = workspace.clone(); // deferred — real scope comes from roots/list
-    let mut spec = build_server_spec(tools_dir, &sandbox_scope, None);
-
-    if fallback == FallbackScope::None {
-        remove_flag_with_value(&mut spec.args, "--sandbox-scope");
-    }
+    let mut spec = build_server_spec(tools_dir, fallback.scope_arg(&workspace), None);
 
     // Insert --defer-sandbox before the `serve` subcommand.
     if let Some(pos) = spec.args.iter().position(|a| a == "serve") {
@@ -674,11 +688,7 @@ async fn spawn_deferred_sandbox_server(
     eprintln!(
         "[TestServer] Starting deferred-sandbox server (tools: {}, fallback scope: {})",
         tools_dir.display(),
-        if fallback == FallbackScope::None {
-            "none (strict roots)"
-        } else {
-            "workspace"
-        }
+        fallback.label()
     );
 
     let mut cmd = Command::new(&binary);

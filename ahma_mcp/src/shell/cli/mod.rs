@@ -218,7 +218,7 @@ impl Default for AppConfig {
             explicit_tools_dir: false,
             tool_bundles: vec![],
             timeout_secs: 600,
-            await_timeout_secs: 540,
+            await_timeout_secs: ahma_common::config::default_await_timeout_secs(),
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
@@ -2464,10 +2464,19 @@ pub fn load_settings(cli: &Cli) -> ahma_common::config::AhmaSettings {
     }
 }
 
-fn parse_execution_settings(
-    cli: &Cli,
-    s: &ahma_common::config::AhmaSettings,
-) -> (u64, u64, bool, bool, bool) {
+/// Resolved execution-tier settings (see [`parse_execution_settings`]).
+///
+/// A struct rather than a tuple: the two `u64`s are adjacent and same-typed, so a
+/// positional destructure would silently accept them transposed.
+struct ExecutionSettings {
+    timeout_secs: u64,
+    await_timeout_secs: u64,
+    force_sync: bool,
+    hot_reload_tools: bool,
+    skip_availability_probes: bool,
+}
+
+fn parse_execution_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> ExecutionSettings {
     // R-CFG1.2: preference-tier env vars are RETIRED — warn and ignore.
     warn_retired_env!("AHMA_TIMEOUT");
     warn_retired_env!("AHMA_SYNC");
@@ -2475,19 +2484,13 @@ fn parse_execution_settings(
     warn_retired_env!("AHMA_SKIP_PROBES");
 
     // CLI > settings > compiled-in default.
-    let timeout_secs = cli.timeout.unwrap_or(s.tools.timeout_secs);
-    let await_timeout_secs = cli.await_timeout.unwrap_or(s.tools.await_timeout_secs);
-    let force_sync = cli.sync || s.tools.force_sync;
-    let hot_reload_tools = cli.hot_reload || s.tools.hot_reload;
-    let skip_availability_probes = cli.skip_probes || s.tools.skip_probes;
-
-    (
-        timeout_secs,
-        await_timeout_secs,
-        force_sync,
-        hot_reload_tools,
-        skip_availability_probes,
-    )
+    ExecutionSettings {
+        timeout_secs: cli.timeout.unwrap_or(s.tools.timeout_secs),
+        await_timeout_secs: cli.await_timeout.unwrap_or(s.tools.await_timeout_secs),
+        force_sync: cli.sync || s.tools.force_sync,
+        hot_reload_tools: cli.hot_reload || s.tools.hot_reload,
+        skip_availability_probes: cli.skip_probes || s.tools.skip_probes,
+    }
 }
 
 fn parse_sandbox_settings(
@@ -2754,8 +2757,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     let working_dirs = resolve_working_dirs_cli(cli, &s);
 
     // ── Parse settings sections via modular helper functions ─────────────────
-    let (timeout_secs, await_timeout_secs, force_sync, hot_reload_tools, skip_availability_probes) =
-        parse_execution_settings(cli, &s);
+    let exec = parse_execution_settings(cli, &s);
 
     let (
         no_sandbox,
@@ -2786,11 +2788,11 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         tools_dir,
         explicit_tools_dir,
         tool_bundles,
-        timeout_secs,
-        await_timeout_secs,
-        force_sync,
-        hot_reload_tools,
-        skip_availability_probes,
+        timeout_secs: exec.timeout_secs,
+        await_timeout_secs: exec.await_timeout_secs,
+        force_sync: exec.force_sync,
+        hot_reload_tools: exec.hot_reload_tools,
+        skip_availability_probes: exec.skip_availability_probes,
         minimize_tokens,
         small_model_harness,
         mutex_groups,
@@ -4234,10 +4236,10 @@ mod tests {
         s.tools.force_sync = true;
         s.tools.hot_reload = true;
         s.tools.skip_probes = true;
-        let (timeout, await_timeout, sync, hot, skip) = parse_execution_settings(&cli, &s);
-        assert_eq!(timeout, 42);
-        assert_eq!(await_timeout, 24);
-        assert!(sync && hot && skip);
+        let exec = parse_execution_settings(&cli, &s);
+        assert_eq!(exec.timeout_secs, 42);
+        assert_eq!(exec.await_timeout_secs, 24);
+        assert!(exec.force_sync && exec.hot_reload_tools && exec.skip_availability_probes);
     }
 
     #[test]
@@ -4256,10 +4258,10 @@ mod tests {
             "stdio",
         ]);
         let s = ahma_common::config::AhmaSettings::default();
-        let (timeout, await_timeout, sync, hot, skip) = parse_execution_settings(&cli, &s);
-        assert_eq!(timeout, 120);
-        assert_eq!(await_timeout, 180);
-        assert!(sync && hot && skip);
+        let exec = parse_execution_settings(&cli, &s);
+        assert_eq!(exec.timeout_secs, 120);
+        assert_eq!(exec.await_timeout_secs, 180);
+        assert!(exec.force_sync && exec.hot_reload_tools && exec.skip_availability_probes);
     }
 
     // ─── parse_sandbox_settings ──────────────────────────────────────────────

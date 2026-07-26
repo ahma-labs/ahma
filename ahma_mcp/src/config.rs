@@ -839,8 +839,23 @@ pub async fn load_tool_configs(
     config: &crate::shell::cli::AppConfig,
     tools_dir: Option<&Path>,
 ) -> anyhow::Result<HashMap<String, ToolConfig>> {
-    let all_dirs: Vec<std::path::PathBuf> =
-        tools_dir.map(|p| vec![p.to_path_buf()]).unwrap_or_default();
+    match tools_dir {
+        Some(dir) => load_tool_configs_from_dirs(config, &[dir]).await,
+        None => load_tool_configs_from_dirs(config, &[]).await,
+    }
+}
+
+/// [`load_tool_configs`] over several directories.
+///
+/// Directories are loaded in order and a later one wins a name collision, so callers
+/// list them least- to most-specific. This exists for per-client discovery, which must
+/// layer a connecting client's `<root>/.ahma` *on top of* the operator's configured
+/// tools dir rather than replacing it.
+pub async fn load_tool_configs_from_dirs(
+    config: &crate::shell::cli::AppConfig,
+    tools_dirs: &[&Path],
+) -> anyhow::Result<HashMap<String, ToolConfig>> {
+    let all_dirs: Vec<std::path::PathBuf> = tools_dirs.iter().map(|p| p.to_path_buf()).collect();
 
     let mut configs = HashMap::new();
 

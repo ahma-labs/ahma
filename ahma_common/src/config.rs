@@ -639,6 +639,15 @@ pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234/v1";
 /// names elsewhere; read them from settings (which is seeded from this const).
 pub const DEFAULT_LMSTUDIO_MODEL: &str = "openai/gpt-oss-20b";
 
+/// Built-in default timeout for the `await` tool, in seconds.
+///
+/// Chosen to sit under the 10-minute idle disconnect common MCP clients apply, so a
+/// long wait returns a soft timeout before the client drops the connection. This is
+/// the single source of truth — do not hardcode `540` elsewhere; read it from
+/// settings (which is seeded from this const) or from
+/// [`default_await_timeout_secs`].
+pub const DEFAULT_AWAIT_TIMEOUT_SECS: u64 = 540;
+
 impl Default for LmStudioSettings {
     fn default() -> Self {
         Self {
@@ -673,7 +682,7 @@ pub struct ToolSettings {
     /// Default: `600`
     pub timeout_secs: u64,
     /// Default timeout for the `await` tool in seconds.
-    /// Default: `540` (9 minutes)
+    /// Default: [`DEFAULT_AWAIT_TIMEOUT_SECS`] (9 minutes)
     #[serde(default = "default_await_timeout_secs")]
     pub await_timeout_secs: u64,
     /// Run all tools synchronously.  By default tools are async-first: if a result
@@ -725,7 +734,7 @@ impl Default for ToolSettings {
     fn default() -> Self {
         Self {
             timeout_secs: 600,
-            await_timeout_secs: 540,
+            await_timeout_secs: default_await_timeout_secs(),
             force_sync: false,
             hot_reload: false,
             skip_probes: false,
@@ -739,9 +748,9 @@ impl Default for ToolSettings {
     }
 }
 
-/// Default await tool timeout in seconds.
+/// Default await tool timeout in seconds (see [`DEFAULT_AWAIT_TIMEOUT_SECS`]).
 pub fn default_await_timeout_secs() -> u64 {
-    540
+    DEFAULT_AWAIT_TIMEOUT_SECS
 }
 
 /// Default maximum agent tool-call turns (see [`ToolSettings::max_turns`]).

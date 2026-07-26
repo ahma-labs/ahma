@@ -464,7 +464,20 @@ impl AhmaMcpService {
             "Discovered per-client tools directory: {}",
             candidate.display()
         );
-        match load_tool_configs(&app_config, Some(&candidate)).await {
+
+        // Layer the client's `.ahma` *on top of* the configured tools dir rather than
+        // replacing it. Loading `candidate` alone keeps the built-ins but drops every
+        // tool from an operator's `--tools-dir`, so a client whose root happens to
+        // contain `.ahma/` silently deleted the explicitly-selected tool set — surfacing
+        // later as a baffling "Tool '<name>' not found". Candidate is listed last so a
+        // per-client definition still wins a name collision.
+        let mut dirs: Vec<&Path> = Vec::with_capacity(2);
+        if let Some(configured) = app_config.tools_dir.as_deref() {
+            dirs.push(configured);
+        }
+        dirs.push(&candidate);
+
+        match crate::config::load_tool_configs_from_dirs(&app_config, &dirs).await {
             Ok(new_configs) => {
                 let count = new_configs.len();
                 self.update_tools(new_configs).await;
@@ -1174,6 +1187,57 @@ mod tests {
             service.current_tools_dir.read().unwrap().as_deref(),
             Some(ahma_dir.as_path()),
             "current_tools_dir should point to the .ahma directory that was just loaded"
+        );
+    }
+
+    /// Per-client discovery must ADD to the configured tools dir, not replace it.
+    ///
+    /// Regression: `maybe_load_per_client_tools` loaded the client's `.ahma` alone, which
+    /// keeps the built-ins but drops every tool from an operator's `--tools-dir`. A
+    /// client whose root happened to contain `.ahma/` therefore silently deleted the
+    /// explicitly-selected tool set, surfacing later as "Tool '<name>' not found".
+    #[tokio::test]
+    async fn maybe_load_per_client_keeps_configured_tools_dir() {
+        let tmp = TempDir::new().unwrap();
+        let service = build_service_for_tests(tmp.path()).await;
+
+        // The operator's explicit --tools-dir, with a tool only it provides.
+        let configured = TempDir::new().unwrap();
+        tokio::fs::write(
+            configured.path().join("operator_tool.json"),
+            r#"{"name":"operator_tool","description":"From --tools-dir","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        // The connecting client's workspace root, with its own tool.
+        let ahma_dir = tmp.path().join(".ahma");
+        tokio::fs::create_dir_all(&ahma_dir).await.unwrap();
+        tokio::fs::write(
+            ahma_dir.join("pclient.json"),
+            r#"{"name":"pclient","description":"Per-client tool","command":"echo","enabled":true}"#,
+        )
+        .await
+        .unwrap();
+
+        service.set_app_config(std::sync::Arc::new(crate::shell::cli::AppConfig {
+            explicit_tools_dir: true,
+            tools_dir: Some(configured.path().to_path_buf()),
+            ..Default::default()
+        }));
+
+        service
+            .maybe_load_per_client_tools(Some(tmp.path().to_path_buf()))
+            .await;
+
+        let configs = service.configs.read().unwrap();
+        assert!(
+            configs.contains_key("operator_tool"),
+            "the explicitly-configured --tools-dir must survive per-client discovery"
+        );
+        assert!(
+            configs.contains_key("pclient"),
+            "the per-client tool must still be discovered and added"
         );
     }
 

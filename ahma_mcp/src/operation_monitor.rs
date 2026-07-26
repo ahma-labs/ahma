@@ -29,6 +29,14 @@ use tracing;
 /// per-operation watch channel plus `completion_history`.
 const EVENT_STREAM_CAPACITY: usize = 1024;
 
+/// Default bound for [`OperationMonitor::wait_for_operation`].
+///
+/// This is a backstop for callers with no deadline of their own. It is deliberately
+/// *shorter* than the `await` tool's configurable timeout, so `await` must opt out of
+/// it via [`OperationMonitor::wait_for_operation_bounded`] with `None` rather than
+/// inherit it.
+pub const DEFAULT_WAIT_FOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(300);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 /// Represents the current state of an operation
 pub enum OperationStatus {
@@ -872,9 +880,27 @@ impl OperationMonitor {
     ///    holds `true` and `wait_for` returns immediately.
     /// 4. After the channel signals, the op is guaranteed to be in history (the channel
     ///    is sent *after* the history write), so a single history lookup suffices.
+    ///
+    /// Bounded by [`DEFAULT_WAIT_FOR_OPERATION_TIMEOUT`]. Callers that impose their own
+    /// deadline — notably the `await` tool, whose timeout is user-configurable and may
+    /// exceed this bound — must use [`Self::wait_for_operation_bounded`] with `None`,
+    /// or this inner cap silently pre-empts theirs.
     pub async fn wait_for_operation(&self, id: &str) -> Option<Operation> {
-        let timeout = Duration::from_secs(300);
+        self.wait_for_operation_bounded(id, Some(DEFAULT_WAIT_FOR_OPERATION_TIMEOUT))
+            .await
+    }
 
+    /// [`Self::wait_for_operation`] with an explicit bound.
+    ///
+    /// `timeout: None` waits indefinitely, for callers that already wrap the future in
+    /// their own `tokio::time::timeout` and need that outer deadline to be the only one
+    /// — otherwise the inner cap fires first and a timeout is misreported as
+    /// "completed but no result available".
+    pub async fn wait_for_operation_bounded(
+        &self,
+        id: &str,
+        timeout: Option<Duration>,
+    ) -> Option<Operation> {
         // Fast path: already completed.
         if let Some(op) = self.check_completion_history_pub(id).await {
             return Some(op);
@@ -898,9 +924,15 @@ impl OperationMonitor {
         //
         // Note: `watch::Ref` wraps an `RwLockReadGuard` which is not `Send`, so we
         // extract a plain `bool` and drop the guard before the next `await`.
-        let timed_out = tokio::time::timeout(timeout, rx.wait_for(|done| *done))
-            .await
-            .is_err();
+        let timed_out = match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, rx.wait_for(|done| *done))
+                .await
+                .is_err(),
+            None => {
+                let _ = rx.wait_for(|done| *done).await;
+                false
+            }
+        };
         if timed_out {
             tracing::warn!("Wait for operation {} timed out.", id);
             None
@@ -1127,6 +1159,81 @@ mod tests {
         // 6. Verify it IS in the completion history map
         let history = monitor.completion_history.read().await;
         assert!(history.contains_key(&op_id));
+    }
+
+    /// The default bound must not outlive a caller's own, longer deadline.
+    ///
+    /// Regression: `wait_for_operation` capped every wait at 300s. The `await` tool
+    /// wraps it in a `tokio::time::timeout` of the *configured* await timeout (540s by
+    /// default), so past 300s the inner cap fired first and returned `None` — which the
+    /// handler reports as "completed but no result available" for an operation that is
+    /// still running, and which the tool-filter path drops from the result entirely.
+    /// `None` opts out so the caller's deadline is the only one.
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_operation_unbounded_outlives_default_cap() {
+        init_test_logging();
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(3600),
+        )));
+        let op_id = "slow-op".to_string();
+        monitor
+            .add_operation(Operation::new(
+                op_id.clone(),
+                "cargo_build".to_string(),
+                "A long build".to_string(),
+                None,
+            ))
+            .await;
+
+        // Time is paused, so tokio auto-advances whenever every task is parked on a
+        // timer. A wait that gives up on its own therefore resolves; one that does not
+        // lets *our* deadline be the thing that expires.
+        let caller_deadline = DEFAULT_WAIT_FOR_OPERATION_TIMEOUT + Duration::from_secs(600);
+
+        let unbounded = tokio::time::timeout(
+            caller_deadline,
+            monitor.wait_for_operation_bounded(&op_id, None),
+        )
+        .await;
+        assert!(
+            unbounded.is_err(),
+            "unbounded wait gave up on its own ({:?}) — the {}s default cap still \
+             pre-empts the caller's deadline",
+            unbounded,
+            DEFAULT_WAIT_FOR_OPERATION_TIMEOUT.as_secs()
+        );
+
+        // Contrast, so the assertion above is known to discriminate: the default-bounded
+        // variant *does* give up at the cap, well inside the same caller deadline.
+        let bounded = tokio::time::timeout(
+            caller_deadline,
+            monitor.wait_for_operation_bounded(&op_id, Some(DEFAULT_WAIT_FOR_OPERATION_TIMEOUT)),
+        )
+        .await;
+        assert!(
+            matches!(bounded, Ok(None)),
+            "default-bounded wait should time out at the cap and yield None"
+        );
+
+        // An unbounded wait must still deliver the result once the op completes.
+        let waiter = tokio::spawn({
+            let monitor = Arc::clone(&monitor);
+            let op_id = op_id.clone();
+            async move { monitor.wait_for_operation_bounded(&op_id, None).await }
+        });
+        tokio::task::yield_now().await;
+        monitor
+            .update_status(
+                &op_id,
+                OperationStatus::Completed,
+                Some(serde_json::json!({"ok": true})),
+            )
+            .await;
+        let completed = waiter.await.expect("waiter task panicked");
+        assert_eq!(
+            completed.map(|op| op.state),
+            Some(OperationStatus::Completed)
+        );
     }
 
     /// Tests that waiting for an operation that never existed returns `None`

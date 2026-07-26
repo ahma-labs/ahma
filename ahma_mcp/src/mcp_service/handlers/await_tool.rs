@@ -27,10 +27,33 @@ impl AhmaMcpService {
             "timeout_seconds".to_string(),
             serde_json::json!({
                 "type": "integer",
-                "description": "Maximum time to wait in seconds (optional; defaults to configured settings or 540 seconds)"
+                "description": format!(
+                    "Maximum time to wait in seconds (optional; defaults to the configured \
+                     await timeout, currently {}s). Expiry is a soft timeout: the operation \
+                     keeps running and await can be called again.",
+                    self.resolved_await_timeout_secs(None)
+                )
             }),
         );
         schema::object_input_schema(properties, &[])
+    }
+
+    /// Resolve the await timeout per SPEC R2.5: call argument > `--await-timeout`
+    /// flag / `tools.await_timeout_secs` setting > compiled-in default.
+    ///
+    /// The flag and the setting are already collapsed into [`AppConfig`] by
+    /// `build_app_config`, so this is the single place the remaining precedence
+    /// (argument over config) is decided.
+    ///
+    /// [`AppConfig`]: crate::shell::cli::AppConfig
+    fn resolved_await_timeout_secs(&self, timeout_override: Option<u64>) -> u64 {
+        timeout_override.unwrap_or_else(|| {
+            self.app_config
+                .read()
+                .ok()
+                .and_then(|cfg| cfg.as_ref().map(|c| c.await_timeout_secs))
+                .unwrap_or_else(ahma_common::config::default_await_timeout_secs)
+        })
     }
 
     /// Handles the 'await' tool call.
@@ -44,29 +67,28 @@ impl AhmaMcpService {
         let tool_filters = common::parse_tool_filters(&args);
         let timeout_override = args.get("timeout_seconds").and_then(|v| v.as_u64());
 
-        // Resolve await default timeout from app_config
-        let config_await_timeout = self
-            .app_config
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|cfg| cfg.await_timeout_secs)
-            .unwrap_or(540); // default fallback to 9 minutes
-
         // If id is specified, wait for that specific operation
         if let Some(op_id) = id_filter {
             return self
-                .handle_await_specific_operation(op_id, timeout_override, config_await_timeout)
+                .handle_await_specific_operation(
+                    op_id,
+                    self.resolved_await_timeout_secs(timeout_override),
+                )
                 .await;
         }
 
-        // Original behavior: wait for operations by tool filter
-        // Use timeout_seconds parameter if provided, otherwise calculate intelligent timeout
-        let timeout_seconds = if let Some(t) = timeout_override {
-            t as f64
-        } else {
-            self.calculate_intelligent_timeout(&tool_filters, config_await_timeout as f64)
+        // Original behavior: wait for operations by tool filter. An explicit
+        // `timeout_seconds` is honoured as given; otherwise the resolved default is
+        // raised to cover the longest-running pending operation.
+        let timeout_seconds = match timeout_override {
+            Some(t) => t as f64,
+            None => {
+                self.calculate_intelligent_timeout(
+                    &tool_filters,
+                    self.resolved_await_timeout_secs(None) as f64,
+                )
                 .await
+            }
         };
         let timeout_duration = std::time::Duration::from_secs(timeout_seconds as u64);
 
@@ -172,21 +194,24 @@ impl AhmaMcpService {
     async fn handle_await_specific_operation(
         &self,
         op_id: String,
-        timeout_override: Option<u64>,
-        config_await_timeout: u64,
+        timeout_secs: u64,
     ) -> Result<CallToolResult, McpError> {
         if self.operation_monitor.get_operation(&op_id).await.is_none() {
             return Ok(self.format_already_completed_or_not_found(&op_id).await);
         }
 
         tracing::info!("Waiting for operation: {}", op_id);
-        let timeout_secs = timeout_override.unwrap_or(config_await_timeout);
         let timeout_duration = std::time::Duration::from_secs(timeout_secs);
         let wait_start = Instant::now();
 
+        // `None` bound: `timeout_duration` below is the only deadline. The monitor's
+        // own 300s cap would otherwise fire first for any configured await timeout
+        // above it (the 540s default included) and surface as `Ok(None)` — reporting
+        // a still-running operation as "completed but no result available".
         let wait_result = tokio::time::timeout(
             timeout_duration,
-            self.operation_monitor.wait_for_operation(&op_id),
+            self.operation_monitor
+                .wait_for_operation_bounded(&op_id, None),
         )
         .await;
 
@@ -201,23 +226,20 @@ impl AhmaMcpService {
                 op_id
             ))),
             Err(_) => {
-                let still_running = self.operation_monitor.get_operation(&op_id).await;
-                let running_msg = if let Some(op) = still_running {
-                    format!(
-                        "The operation {} ({}) is still running.",
-                        op.id, op.tool_name
-                    )
-                } else {
-                    format!("The operation {} is still running.", op_id)
-                };
+                let tool = self
+                    .operation_monitor
+                    .get_operation(&op_id)
+                    .await
+                    .map(|op| format!(" ({})", op.tool_name))
+                    .unwrap_or_default();
                 Ok(common::text_result(format!(
-                    "Timeout waiting for operation {} after {}s.\n\n\
-                    {}\n\n\
-                    IMPORTANT: This is a soft timeout to prevent the IDE from disconnecting. \
-                    The process has NOT been cancelled and continues to run in the background. \
-                    If you have no other tasks to perform, you MUST call the 'await' tool again with \
-                    `id: \"{}\"` to continue waiting for its completion.",
-                    op_id, timeout_secs, running_msg, op_id
+                    "Timeout waiting for operation {op_id} after {timeout_secs}s.\n\n\
+                    The operation {op_id}{tool} is still running.\n\n\
+                    {}",
+                    soft_timeout_notice(
+                        SoftTimeoutSubject::One,
+                        &format!(" with `id: \"{op_id}\"`")
+                    )
                 )))
             }
         }
@@ -255,9 +277,16 @@ impl AhmaMcpService {
         pending_ops: &[Operation],
     ) -> Result<Vec<ContentBlock>, Elapsed> {
         tokio::time::timeout(timeout_duration, async {
+            // `None` bound — see `handle_await_specific_operation`. Here the inner cap
+            // was worse than a misreport: a `None` return is dropped by `.flatten()`
+            // below, so past 300s a still-running operation silently vanished from an
+            // otherwise successful result.
             let futures: Vec<_> = pending_ops
                 .iter()
-                .map(|op| self.operation_monitor.wait_for_operation(&op.id))
+                .map(|op| {
+                    self.operation_monitor
+                        .wait_for_operation_bounded(&op.id, None)
+                })
                 .collect();
             let completed: Vec<Operation> = futures::future::join_all(futures)
                 .await
@@ -482,6 +511,39 @@ fn append_default_remediation_steps(steps: &mut Vec<String>) {
     );
 }
 
+/// Whether a [`soft_timeout_notice`] describes one operation or several.
+#[derive(Clone, Copy)]
+enum SoftTimeoutSubject {
+    One,
+    Many,
+}
+
+/// The SPEC R2.5.1 soft-timeout disclosure, shared by both await timeout paths.
+///
+/// This wording is the contract with the calling agent: it must say that the wait
+/// ended but the work did not, so the agent waits again instead of re-running work
+/// that is still in flight. Keep it in one place — the two await paths must never
+/// tell the agent different things.
+///
+/// `resume_hint` is appended to "call the 'await' tool again", e.g.
+/// `" with \`id: \"op-7\"\`"`, or empty for the tool-filter path.
+fn soft_timeout_notice(subject: SoftTimeoutSubject, resume_hint: &str) -> String {
+    let (noun, verb) = match subject {
+        SoftTimeoutSubject::One => ("process has", "continues"),
+        SoftTimeoutSubject::Many => ("processes have", "continue"),
+    };
+    let them = match subject {
+        SoftTimeoutSubject::One => "its completion",
+        SoftTimeoutSubject::Many => "them",
+    };
+    format!(
+        "IMPORTANT: This is a soft timeout to prevent the IDE from disconnecting. \
+         The {noun} NOT been cancelled and {verb} to run in the background. \
+         If you have no other tasks to perform, you MUST call the 'await' tool again\
+         {resume_hint} to continue waiting for {them}."
+    )
+}
+
 fn format_timeout_error_message(
     elapsed: std::time::Duration,
     timeout_seconds: f64,
@@ -494,15 +556,14 @@ fn format_timeout_error_message(
         "Wait operation timed out after {:.2}s (configured timeout: {:.0}s).\n\n\
         Progress: {}/{} operations completed during await.\n\
         Still running: {} operations.\n\n\
-        IMPORTANT: This is a soft timeout to prevent the IDE from disconnecting. \
-        The processes have NOT been cancelled and continue to run in the background. \
-        If you have no other tasks to perform, you MUST call the 'await' tool again to continue waiting for them.\n\n\
+        {}\n\n\
         Suggestions:",
         elapsed.as_secs_f64(),
         timeout_seconds,
         completed_during_wait,
         pending_count,
-        still_running.len()
+        still_running.len(),
+        soft_timeout_notice(SoftTimeoutSubject::Many, "")
     );
     for step in remediation_steps {
         error_message.push_str(&format!("\n{}", step));
@@ -790,6 +851,39 @@ mod tests {
         assert!(properties.contains_key("tools"));
         assert!(properties.contains_key("id"));
         assert!(properties.contains_key("timeout_seconds"));
+    }
+
+    /// The schema must advertise the *resolved* default, not a baked-in number that
+    /// drifts when `tools.await_timeout_secs` is set.
+    #[tokio::test]
+    async fn test_input_schema_reports_resolved_await_timeout() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        let schema = service.generate_input_schema_for_wait();
+        let description = schema["properties"]["timeout_seconds"]["description"]
+            .as_str()
+            .expect("timeout_seconds needs a description");
+        assert!(
+            description.contains(&format!("{}s", service.resolved_await_timeout_secs(None))),
+            "schema should state the resolved default, got: {description}"
+        );
+    }
+
+    /// SPEC R2.5.1: both await timeout paths must give the agent the same guarantee.
+    /// Pinning the shared helper keeps a reword from silently applying to only one.
+    #[test]
+    fn test_soft_timeout_notice_states_the_guarantee_for_both_subjects() {
+        let one = soft_timeout_notice(SoftTimeoutSubject::One, " with `id: \"op-7\"`");
+        assert!(one.contains("The process has NOT been cancelled"));
+        assert!(one.contains("call the 'await' tool again with `id: \"op-7\"`"));
+
+        let many = soft_timeout_notice(SoftTimeoutSubject::Many, "");
+        assert!(many.contains("The processes have NOT been cancelled"));
+        assert!(many.contains("call the 'await' tool again to continue waiting for them"));
+
+        for notice in [&one, &many] {
+            assert!(notice.contains("soft timeout"));
+            assert!(notice.contains("continue"));
+        }
     }
 
     // ===================================================================
