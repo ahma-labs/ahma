@@ -2850,16 +2850,16 @@ mod tests {
         op.timeout_duration = Some(Duration::from_secs(600));
         monitor.add_operation(op).await;
 
-        let t_any = service.calculate_intelligent_timeout(&[]).await;
+        let t_any = service.calculate_intelligent_timeout(&[], 600.0).await;
         assert!(t_any >= 600.0);
 
         let t_filtered_miss = service
-            .calculate_intelligent_timeout(&["nope".to_string()])
+            .calculate_intelligent_timeout(&["nope".to_string()], 240.0)
             .await;
         assert!(t_filtered_miss >= 240.0);
 
         let t_filtered_hit = service
-            .calculate_intelligent_timeout(&["beta".to_string()])
+            .calculate_intelligent_timeout(&["beta".to_string()], 240.0)
             .await;
         assert!(t_filtered_hit >= 600.0);
     }

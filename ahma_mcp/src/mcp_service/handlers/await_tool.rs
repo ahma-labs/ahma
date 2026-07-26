@@ -23,6 +23,13 @@ impl AhmaMcpService {
             "id".to_string(),
             schema::string_property("Specific operation ID to await for (optional)"),
         );
+        properties.insert(
+            "timeout_seconds".to_string(),
+            serde_json::json!({
+                "type": "integer",
+                "description": "Maximum time to wait in seconds (optional; defaults to configured settings or 540 seconds)"
+            }),
+        );
         schema::object_input_schema(properties, &[])
     }
 
@@ -35,15 +42,32 @@ impl AhmaMcpService {
 
         let id_filter = common::parse_id(&args);
         let tool_filters = common::parse_tool_filters(&args);
+        let timeout_override = args.get("timeout_seconds").and_then(|v| v.as_u64());
+
+        // Resolve await default timeout from app_config
+        let config_await_timeout = self
+            .app_config
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|cfg| cfg.await_timeout_secs)
+            .unwrap_or(540); // default fallback to 9 minutes
 
         // If id is specified, wait for that specific operation
         if let Some(op_id) = id_filter {
-            return self.handle_await_specific_operation(op_id).await;
+            return self
+                .handle_await_specific_operation(op_id, timeout_override, config_await_timeout)
+                .await;
         }
 
         // Original behavior: wait for operations by tool filter
-        // Always use intelligent timeout calculation (no user-provided timeout parameter)
-        let timeout_seconds = self.calculate_intelligent_timeout(&tool_filters).await;
+        // Use timeout_seconds parameter if provided, otherwise calculate intelligent timeout
+        let timeout_seconds = if let Some(t) = timeout_override {
+            t as f64
+        } else {
+            self.calculate_intelligent_timeout(&tool_filters, config_await_timeout as f64)
+                .await
+        };
         let timeout_duration = std::time::Duration::from_secs(timeout_seconds as u64);
 
         let pending_ops = self.pending_operations_for_filters(&tool_filters).await;
@@ -108,9 +132,11 @@ impl AhmaMcpService {
     }
 
     /// Calculate intelligent timeout based on operation timeouts and default await timeout
-    pub async fn calculate_intelligent_timeout(&self, tool_filters: &[String]) -> f64 {
-        const DEFAULT_AWAIT_TIMEOUT: f64 = 600.0;
-
+    pub async fn calculate_intelligent_timeout(
+        &self,
+        tool_filters: &[String],
+        default_await_timeout: f64,
+    ) -> f64 {
         let pending_ops = self.operation_monitor.get_all_active_operations().await;
 
         let max_op_timeout = pending_ops
@@ -122,7 +148,7 @@ impl AhmaMcpService {
             .map(|t| t.as_secs_f64())
             .fold(0.0, f64::max);
 
-        DEFAULT_AWAIT_TIMEOUT.max(max_op_timeout)
+        default_await_timeout.max(max_op_timeout)
     }
 
     async fn handle_await_no_pending_ops(
@@ -146,13 +172,16 @@ impl AhmaMcpService {
     async fn handle_await_specific_operation(
         &self,
         op_id: String,
+        timeout_override: Option<u64>,
+        config_await_timeout: u64,
     ) -> Result<CallToolResult, McpError> {
         if self.operation_monitor.get_operation(&op_id).await.is_none() {
             return Ok(self.format_already_completed_or_not_found(&op_id).await);
         }
 
         tracing::info!("Waiting for operation: {}", op_id);
-        let timeout_duration = std::time::Duration::from_secs(300);
+        let timeout_secs = timeout_override.unwrap_or(config_await_timeout);
+        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
         let wait_start = Instant::now();
 
         let wait_result = tokio::time::timeout(
@@ -171,10 +200,26 @@ impl AhmaMcpService {
                 "Operation {} completed but no result available",
                 op_id
             ))),
-            Err(_) => Ok(common::text_result(format!(
-                "Timeout waiting for operation {}",
-                op_id
-            ))),
+            Err(_) => {
+                let still_running = self.operation_monitor.get_operation(&op_id).await;
+                let running_msg = if let Some(op) = still_running {
+                    format!(
+                        "The operation {} ({}) is still running.",
+                        op.id, op.tool_name
+                    )
+                } else {
+                    format!("The operation {} is still running.", op_id)
+                };
+                Ok(common::text_result(format!(
+                    "Timeout waiting for operation {} after {}s.\n\n\
+                    {}\n\n\
+                    IMPORTANT: This is a soft timeout to prevent the IDE from disconnecting. \
+                    The process has NOT been cancelled and continues to run in the background. \
+                    If you have no other tasks to perform, you MUST call the 'await' tool again with \
+                    `id: \"{}\"` to continue waiting for its completion.",
+                    op_id, timeout_secs, running_msg, op_id
+                )))
+            }
         }
     }
 
@@ -448,7 +493,11 @@ fn format_timeout_error_message(
     let mut error_message = format!(
         "Wait operation timed out after {:.2}s (configured timeout: {:.0}s).\n\n\
         Progress: {}/{} operations completed during await.\n\
-        Still running: {} operations.\n\nSuggestions:",
+        Still running: {} operations.\n\n\
+        IMPORTANT: This is a soft timeout to prevent the IDE from disconnecting. \
+        The processes have NOT been cancelled and continue to run in the background. \
+        If you have no other tasks to perform, you MUST call the 'await' tool again to continue waiting for them.\n\n\
+        Suggestions:",
         elapsed.as_secs_f64(),
         timeout_seconds,
         completed_during_wait,
@@ -592,7 +641,7 @@ mod tests {
     #[tokio::test]
     async fn test_calculate_intelligent_timeout() {
         let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
-        let timeout = service.calculate_intelligent_timeout(&[]).await;
+        let timeout = service.calculate_intelligent_timeout(&[], 600.0).await;
         assert!(timeout >= 600.0);
     }
 
@@ -740,6 +789,7 @@ mod tests {
         let properties = schema.get("properties").unwrap().as_object().unwrap();
         assert!(properties.contains_key("tools"));
         assert!(properties.contains_key("id"));
+        assert!(properties.contains_key("timeout_seconds"));
     }
 
     // ===================================================================
@@ -860,6 +910,43 @@ mod tests {
         assert!(text.text.contains("Completed"));
     }
 
+    // ----- handle_await id: `timeout_seconds` bounds the wait, and expiry is
+    // SOFT — the operation keeps running (SPEC R2.5 / R2.5.1). -----
+    #[tokio::test]
+    async fn test_handle_await_id_timeout_is_soft_and_honors_override() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_active_op(&service, "slow-1", "cargo_build").await;
+
+        // Without the override this would block on the configured default
+        // (540s); with it the call must return in about a second.
+        let start = Instant::now();
+        let result = service
+            .handle_await(await_params(
+                serde_json::json!({"id": "slow-1", "timeout_seconds": 1}),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "timeout_seconds override was ignored; waited {:?}",
+            start.elapsed()
+        );
+
+        let text = &result.content.first().unwrap().as_text().unwrap().text;
+        assert!(text.contains("Timeout waiting for operation slow-1 after 1s"));
+        assert!(text.contains("still running"));
+        assert!(text.contains("NOT been cancelled"));
+        assert!(text.contains("cargo_build"));
+
+        // The operation itself must be untouched by the soft timeout.
+        let op = service
+            .operation_monitor
+            .get_operation("slow-1")
+            .await
+            .expect("soft timeout must not remove the operation");
+        assert_eq!(op.state, OperationStatus::InProgress);
+    }
+
     // ----- handle_await with tool filter: op completes during wait -----
     // Covers handle_await wait path (55-81), pending_operations_for_filters
     // (196-205), wait_for_pending_operations (207-225), and the Ok(contents)
@@ -926,6 +1013,8 @@ mod tests {
             .unwrap();
         let text = result.content.first().unwrap().as_text().unwrap();
         assert!(text.text.contains("timed out"));
+        // SPEC R2.5.1: the wait ended, the work did not.
+        assert!(text.text.contains("NOT been cancelled"));
         // One of the two pending ops (gone-1) is no longer active -> "1/2".
         assert!(text.text.contains("1/2"));
         assert!(text.text.contains("run-1"));
@@ -951,7 +1040,7 @@ mod tests {
         service.operation_monitor.add_operation(op).await;
 
         let timeout = service
-            .calculate_intelligent_timeout(&["cargo".to_string()])
+            .calculate_intelligent_timeout(&["cargo".to_string()], 600.0)
             .await;
         assert_eq!(timeout, 900.0);
     }
@@ -973,7 +1062,7 @@ mod tests {
         service.operation_monitor.add_operation(op).await;
 
         let timeout = service
-            .calculate_intelligent_timeout(&["npm".to_string()])
+            .calculate_intelligent_timeout(&["npm".to_string()], 600.0)
             .await;
         assert_eq!(timeout, 600.0);
     }

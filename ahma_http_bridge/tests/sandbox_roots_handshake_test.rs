@@ -27,7 +27,8 @@ mod common;
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use common::{
     SANDBOX_BYPASS_ENV_VARS, SandboxTestEnv, ServerGuard, encode_file_uri, malformed_uris,
-    parse_file_uri, spawn_server_guard_with_deferred_sandbox, write_pwd_tool_config,
+    parse_file_uri, spawn_server_guard_strict_roots, spawn_server_guard_with_deferred_sandbox,
+    write_pwd_tool_config,
 };
 use futures::StreamExt;
 use reqwest::Client;
@@ -56,6 +57,21 @@ async fn start_initialized_session(tools_dir: &Path) -> (ServerGuard, String, Cl
     let server = spawn_server_guard_with_deferred_sandbox(tools_dir)
         .await
         .expect("Failed to start deferred-sandbox server");
+    initialize_against(server).await
+}
+
+/// Same as [`start_initialized_session`] but with **no** explicit fallback scope,
+/// so a client that supplies no usable roots never gets a locked sandbox.
+async fn start_initialized_session_strict_roots(
+    tools_dir: &Path,
+) -> (ServerGuard, String, Client, String) {
+    let server = spawn_server_guard_strict_roots(tools_dir)
+        .await
+        .expect("Failed to start strict-roots server");
+    initialize_against(server).await
+}
+
+async fn initialize_against(server: ServerGuard) -> (ServerGuard, String, Client, String) {
     let base_url = server_base_url(&server);
     let client = common::make_h2_client();
     let session_id = initialize_session(&client, &base_url)
@@ -544,13 +560,22 @@ fn spawn_complete_roots_exchange(
 /// If a client returns an empty roots list, the session should be rejected
 /// because there's no valid sandbox scope to use. This prevents accidental
 /// over-permissive behavior.
+///
+/// The server is started in **strict-roots** mode (no `--sandbox-scope`). With an
+/// explicit fallback scope configured, empty roots is *not* a rejection: the
+/// bridge locks the sandbox from the fallback a few milliseconds later and the
+/// `tools/call` below succeeds. This test used to pass only by beating that lock,
+/// and failed under load once the lock won — reporting whatever the subprocess
+/// answered after per-client tool discovery had replaced the synthetic tool set
+/// ("Tool 'pwd' not found"). Removing the fallback makes the rejection real.
 #[tokio::test]
 async fn test_empty_roots_rejection() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let tools_dir = temp_dir.path().join("tools");
     write_pwd_tool_config(&tools_dir);
 
-    let (_server, base_url, client, session_id) = start_initialized_session(&tools_dir).await;
+    let (_server, base_url, client, session_id) =
+        start_initialized_session_strict_roots(&tools_dir).await;
 
     // Use exchange-only variant: sandbox/configured will never arrive for empty roots,
     // so we must not wait for it.

@@ -1262,6 +1262,7 @@ mod tests {
             tools_dir: None,
             tool_bundles: vec![],
             timeout_secs: 360,
+            await_timeout_secs: 540,
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,

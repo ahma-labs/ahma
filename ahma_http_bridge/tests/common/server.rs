@@ -213,6 +213,13 @@ fn build_server_spec(
     ServerSpec { args, env: vec![] }
 }
 
+/// Remove every `flag <value>` pair from an argument vector.
+fn remove_flag_with_value(args: &mut Vec<String>, flag: &str) {
+    while let Some(pos) = args.iter().position(|a| a == flag) {
+        args.drain(pos..=(pos + 1).min(args.len() - 1));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn should_force_no_sandbox_for_test_server() -> bool {
     use ahma_mcp::sandbox::SandboxError;
@@ -616,6 +623,37 @@ pub async fn spawn_server_guard_with_config_extra_env(
 pub async fn spawn_server_guard_with_deferred_sandbox(
     tools_dir: &Path,
 ) -> Result<ServerGuard, String> {
+    spawn_deferred_sandbox_server(tools_dir, FallbackScope::Workspace).await
+}
+
+/// Whether a deferred-sandbox test server is given an explicit fallback scope.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FallbackScope {
+    /// Pass `--sandbox-scope <workspace>`. A client that returns no roots still
+    /// gets a sandbox, locked from that explicit fallback.
+    Workspace,
+    /// Pass no `--sandbox-scope` at all — the bridge runs in strict-roots mode.
+    /// A client that returns no roots never gets a sandbox, so `tools/call`
+    /// stays gated forever instead of racing an eventual lock.
+    None,
+}
+
+/// Spawn a deferred-sandbox server in **strict-roots** mode (no fallback scope).
+///
+/// Use this for failure-path tests that must observe the sandbox gate: without a
+/// fallback scope, an empty or all-malformed `roots/list` response can never
+/// produce a locked sandbox, so `tools/call` is rejected deterministically.
+/// [`spawn_server_guard_with_deferred_sandbox`] passes `--sandbox-scope`, which
+/// makes the same scenario lock from the fallback a moment later — turning such
+/// a test into a race against the handshake.
+pub async fn spawn_server_guard_strict_roots(tools_dir: &Path) -> Result<ServerGuard, String> {
+    spawn_deferred_sandbox_server(tools_dir, FallbackScope::None).await
+}
+
+async fn spawn_deferred_sandbox_server(
+    tools_dir: &Path,
+    fallback: FallbackScope,
+) -> Result<ServerGuard, String> {
     let binary = resolve_binary_path().map_err(|e| {
         eprintln!("WARNING  {e}");
         e
@@ -624,14 +662,23 @@ pub async fn spawn_server_guard_with_deferred_sandbox(
     let sandbox_scope = workspace.clone(); // deferred — real scope comes from roots/list
     let mut spec = build_server_spec(tools_dir, &sandbox_scope, None);
 
+    if fallback == FallbackScope::None {
+        remove_flag_with_value(&mut spec.args, "--sandbox-scope");
+    }
+
     // Insert --defer-sandbox before the `serve` subcommand.
     if let Some(pos) = spec.args.iter().position(|a| a == "serve") {
         spec.args.insert(pos, "--defer-sandbox".to_string());
     }
 
     eprintln!(
-        "[TestServer] Starting deferred-sandbox server (tools: {})",
-        tools_dir.display()
+        "[TestServer] Starting deferred-sandbox server (tools: {}, fallback scope: {})",
+        tools_dir.display(),
+        if fallback == FallbackScope::None {
+            "none (strict roots)"
+        } else {
+            "workspace"
+        }
     );
 
     let mut cmd = Command::new(&binary);

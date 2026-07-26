@@ -672,6 +672,10 @@ pub struct ToolSettings {
     /// Individual tools can override this via `timeout_seconds` in their JSON definition.
     /// Default: `600`
     pub timeout_secs: u64,
+    /// Default timeout for the `await` tool in seconds.
+    /// Default: `540` (9 minutes)
+    #[serde(default = "default_await_timeout_secs")]
+    pub await_timeout_secs: u64,
     /// Run all tools synchronously.  By default tools are async-first: if a result
     /// arrives within 5 seconds it is returned inline; otherwise an operation ID is
     /// returned and the result is pushed as a notification.
@@ -721,6 +725,7 @@ impl Default for ToolSettings {
     fn default() -> Self {
         Self {
             timeout_secs: 600,
+            await_timeout_secs: 540,
             force_sync: false,
             hot_reload: false,
             skip_probes: false,
@@ -732,6 +737,11 @@ impl Default for ToolSettings {
             mutex_groups: default_mutex_groups(),
         }
     }
+}
+
+/// Default await tool timeout in seconds.
+pub fn default_await_timeout_secs() -> u64 {
+    540
 }
 
 /// Default maximum agent tool-call turns (see [`ToolSettings::max_turns`]).
@@ -1692,6 +1702,12 @@ impl AhmaSettings {
             d.tools.timeout_secs.to_string(),
         );
         w.setting(
+            "Default timeout for the await tool in seconds.",
+            "await_timeout_secs",
+            self.tools.await_timeout_secs.to_string(),
+            d.tools.await_timeout_secs.to_string(),
+        );
+        w.setting(
             "Run all tools synchronously instead of async-first.",
             "force_sync",
             self.tools.force_sync.to_string(),
@@ -2376,6 +2392,7 @@ mod tests {
             },
             tools: ToolSettings {
                 timeout_secs: 123,
+                await_timeout_secs: 456,
                 force_sync: true,
                 hot_reload: true,
                 skip_probes: true,

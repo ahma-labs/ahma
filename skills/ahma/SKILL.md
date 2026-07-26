@@ -168,7 +168,7 @@ run_terminal_command(
 ### `status` — Check async operation progress
 
 ```
-status(operation_id="op_abc123")
+status(id="op_abc123")
 ```
 
 Returns current state: `running`, `complete`, `failed`, `cancelled`, or `timeout`.
@@ -177,16 +177,20 @@ Non-blocking — safe to call repeatedly.
 ### `await` — Wait for an async operation to finish
 
 ```
-await(operation_id="op_abc123", timeout_seconds=60)
+await(id="op_abc123", timeout_seconds=60)
 ```
 
 Blocks until the operation completes or times out. Use sparingly — prefer `status` polling
 when you want to continue other work in parallel.
 
+`timeout_seconds` is optional (default `540`, or `tools.await_timeout_secs` / `--await-timeout`).
+The timeout is **soft**: it ends your wait, it does not cancel the operation. On timeout the
+reply says so — call `await` again with the same `id` to keep waiting, or `cancel` to stop the work.
+
 ### `cancel` — Cancel a running operation
 
 ```
-cancel(operation_id="op_abc123")
+cancel(id="op_abc123")
 ```
 
 Sends cancellation signal. The process is terminated and resources are freed.
@@ -203,15 +207,15 @@ result = cargo_build(subcommand="build")
 # → { "operation_id": "op_abc123", "status": "started" }
 
 # 2. Check progress (non-blocking)
-status(operation_id="op_abc123")
+status(id="op_abc123")
 # → { "status": "running", "output_so_far": "..." }
 
 # 3. Wait for completion when needed
-await(operation_id="op_abc123", timeout_seconds=120)
+await(id="op_abc123", timeout_seconds=120)
 # → { "status": "complete", "exit_code": 0, "output": "..." }
 
 # Or: cancel if taking too long
-cancel(operation_id="op_abc123")
+cancel(id="op_abc123")
 ```
 
 **Force synchronous** for state-modifying commands (e.g., `cargo add`):

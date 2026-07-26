@@ -14,10 +14,10 @@ use crate::shell::cli::SetupArgs;
 const SKILL_CONTENT: &str = include_str!("../../skills/ahma/SKILL.md");
 
 fn prompt_transport() -> &'static str {
-    println!("\nChoose how your AI tools connect to ahma:");
+    println!("\nSelect how MCP clients like your IDE or TUI connect to ahma:");
     println!("  1) stdio  (recommended - private ahma instance per project)");
-    println!("  2) http   (one shared server over TCP)");
-    println!("  3) unix   (one shared server over Unix socket, Unix only)");
+    println!("  2) http   (one shared server over localhost TCP)");
+    println!("  3) unix   (one shared server over localhost Unix socket)");
     print!("  Mode [default 1]: ");
     let _ = io::stdout().flush();
     let mut input = String::new();

@@ -22,8 +22,8 @@ async fn test_generate_input_schema_for_wait() -> Result<()> {
 async fn test_calculate_intelligent_timeout() -> Result<()> {
     let (service, _tmp) = ahma_mcp::test_utils::client::setup_test_environment().await;
 
-    // By default with no ops, it should be 240.0
-    let timeout = service.calculate_intelligent_timeout(&[]).await;
+    // By default with no ops, it should be 600.0
+    let timeout = service.calculate_intelligent_timeout(&[], 600.0).await;
     assert_eq!(timeout, 600.0);
     Ok(())
 }

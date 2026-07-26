@@ -89,6 +89,9 @@ pub struct AppConfig {
     /// `--timeout` CLI flag or `tools.timeout_secs` in settings.toml; individual
     /// tools can override via `timeout_seconds` in their JSON definition.
     pub timeout_secs: u64,
+    /// Default timeout for the `await` tool in seconds. Override with the
+    /// `--await-timeout` CLI flag or `tools.await_timeout_secs` in settings.toml.
+    pub await_timeout_secs: u64,
     /// Run all tools synchronously (AHMA_SYNC=1).
     pub force_sync: bool,
     /// Reload tools from disk when `.ahma/` changes (AHMA_HOT_RELOAD=1).
@@ -215,6 +218,7 @@ impl Default for AppConfig {
             explicit_tools_dir: false,
             tool_bundles: vec![],
             timeout_secs: 600,
+            await_timeout_secs: 540,
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
@@ -1081,6 +1085,10 @@ pub struct Cli {
     /// Individual tools can override this via the timeout_seconds field in their JSON definition.
     #[arg(long = "timeout", value_name = "SECS", global = true)]
     pub timeout: Option<u64>,
+
+    /// Default timeout for the await tool in seconds.
+    #[arg(long = "await-timeout", value_name = "SECS", global = true)]
+    pub await_timeout: Option<u64>,
 
     /// Force all tools to run synchronously.
     /// By default, tools are async-first: if a result arrives within 5 seconds it is
@@ -2459,7 +2467,7 @@ pub fn load_settings(cli: &Cli) -> ahma_common::config::AhmaSettings {
 fn parse_execution_settings(
     cli: &Cli,
     s: &ahma_common::config::AhmaSettings,
-) -> (u64, bool, bool, bool) {
+) -> (u64, u64, bool, bool, bool) {
     // R-CFG1.2: preference-tier env vars are RETIRED — warn and ignore.
     warn_retired_env!("AHMA_TIMEOUT");
     warn_retired_env!("AHMA_SYNC");
@@ -2468,12 +2476,14 @@ fn parse_execution_settings(
 
     // CLI > settings > compiled-in default.
     let timeout_secs = cli.timeout.unwrap_or(s.tools.timeout_secs);
+    let await_timeout_secs = cli.await_timeout.unwrap_or(s.tools.await_timeout_secs);
     let force_sync = cli.sync || s.tools.force_sync;
     let hot_reload_tools = cli.hot_reload || s.tools.hot_reload;
     let skip_availability_probes = cli.skip_probes || s.tools.skip_probes;
 
     (
         timeout_secs,
+        await_timeout_secs,
         force_sync,
         hot_reload_tools,
         skip_availability_probes,
@@ -2744,7 +2754,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     let working_dirs = resolve_working_dirs_cli(cli, &s);
 
     // ── Parse settings sections via modular helper functions ─────────────────
-    let (timeout_secs, force_sync, hot_reload_tools, skip_availability_probes) =
+    let (timeout_secs, await_timeout_secs, force_sync, hot_reload_tools, skip_availability_probes) =
         parse_execution_settings(cli, &s);
 
     let (
@@ -2777,6 +2787,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         explicit_tools_dir,
         tool_bundles,
         timeout_secs,
+        await_timeout_secs,
         force_sync,
         hot_reload_tools,
         skip_availability_probes,
@@ -2983,6 +2994,7 @@ mod tests {
             explicit_tools_dir: false,
             tool_bundles: vec![],
             timeout_secs: 360,
+            await_timeout_secs: 540,
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
@@ -4218,11 +4230,13 @@ mod tests {
         let cli = Cli::parse_from(["ahma", "serve", "stdio"]);
         let mut s = ahma_common::config::AhmaSettings::default();
         s.tools.timeout_secs = 42;
+        s.tools.await_timeout_secs = 24;
         s.tools.force_sync = true;
         s.tools.hot_reload = true;
         s.tools.skip_probes = true;
-        let (timeout, sync, hot, skip) = parse_execution_settings(&cli, &s);
+        let (timeout, await_timeout, sync, hot, skip) = parse_execution_settings(&cli, &s);
         assert_eq!(timeout, 42);
+        assert_eq!(await_timeout, 24);
         assert!(sync && hot && skip);
     }
 
@@ -4233,6 +4247,8 @@ mod tests {
             "ahma",
             "--timeout",
             "120",
+            "--await-timeout",
+            "180",
             "--sync",
             "--hot-reload",
             "--skip-probes",
@@ -4240,8 +4256,9 @@ mod tests {
             "stdio",
         ]);
         let s = ahma_common::config::AhmaSettings::default();
-        let (timeout, sync, hot, skip) = parse_execution_settings(&cli, &s);
+        let (timeout, await_timeout, sync, hot, skip) = parse_execution_settings(&cli, &s);
         assert_eq!(timeout, 120);
+        assert_eq!(await_timeout, 180);
         assert!(sync && hot && skip);
     }
 

@@ -63,6 +63,7 @@ Run `ahma settings init` to generate this file automatically.
 # ── Tool execution ───────────────────────────────────────────────────────────
 # [tools]
 # timeout_secs = 360      # default tool timeout (seconds)
+# await_timeout_secs = 540 # default `await` soft timeout (seconds); does not cancel the operation
 # force_sync   = false    # run all tools synchronously instead of async-first
 # hot_reload   = false    # reload tools from disk on change — INSECURE in production
 # skip_probes  = false    # skip availability probes at startup
