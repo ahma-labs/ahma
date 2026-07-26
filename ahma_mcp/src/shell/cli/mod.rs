@@ -256,7 +256,7 @@ impl Default for AppConfig {
             rate_limit_burst: 10,
             instance_label: "ahma".to_string(),
             idle_timeout_secs: None,
-            max_sessions: 10,
+            max_sessions: 50,
             is_server_child: false,
             settings_origin: SettingsOriginCtx::default(),
         }

@@ -938,6 +938,63 @@ impl SessionManager {
         }
     }
 
+    /// Prune any terminated or timed-out sessions inline.
+    pub async fn prune_stale_sessions(&self) {
+        let mut to_terminate = Vec::new();
+        for entry in self.sessions.iter() {
+            let session_id = entry.key().clone();
+            let session = entry.value();
+
+            if session.is_terminated() {
+                to_terminate.push((session_id, SessionTerminationReason::ProcessCrashed));
+            } else if session.is_handshake_timed_out().is_some() {
+                to_terminate.push((session_id, SessionTerminationReason::Timeout));
+            }
+        }
+
+        for (session_id, reason) in to_terminate {
+            tracing::info!(
+                session_id = %session_id,
+                reason = ?reason,
+                "Inline pruning stale session before session creation"
+            );
+            let _ = self.terminate_session(&session_id, reason).await;
+        }
+    }
+
+    /// Evict the oldest session that has 0 active SSE receivers for at least 5s to accommodate a new session.
+    pub async fn evict_oldest_inactive_session(&self) -> bool {
+        let mut oldest: Option<(String, Instant)> = None;
+        let min_idle_duration = Duration::from_secs(5);
+        for entry in self.sessions.iter() {
+            let session_id = entry.key();
+            let session = entry.value();
+            if session.sse_receivers() == 0 && session.created_at.elapsed() >= min_idle_duration {
+                let created = session.created_at;
+                match oldest {
+                    None => oldest = Some((session_id.clone(), created)),
+                    Some((_, ref old_created)) if created < *old_created => {
+                        oldest = Some((session_id.clone(), created));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some((evict_id, _)) = oldest {
+            tracing::info!(
+                session_id = %evict_id,
+                "Evicting oldest inactive session (0 SSE receivers for >5s) to accommodate new session"
+            );
+            let _ = self
+                .terminate_session(&evict_id, SessionTerminationReason::Timeout)
+                .await;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Initializes a new session and establishes a peer connection for it.
     ///
     /// This initiates the "deferred sandbox" flow:
@@ -953,12 +1010,18 @@ impl SessionManager {
     ///   the `Mcp-Session-Id` header for all subsequent requests.
     /// * `Err(BridgeError)`: If the peer connection could not be established.
     pub async fn create_session(&self) -> Result<String> {
-        let current_count = self.sessions.len();
+        let mut current_count = self.sessions.len();
         if current_count >= self.config.max_sessions {
-            return Err(BridgeError::ServerProcess(format!(
-                "Session limit exceeded (max: {})",
-                self.config.max_sessions
-            )));
+            self.prune_stale_sessions().await;
+            current_count = self.sessions.len();
+            if current_count >= self.config.max_sessions
+                && !self.evict_oldest_inactive_session().await
+            {
+                return Err(BridgeError::ServerProcess(format!(
+                    "Session limit exceeded (max: {})",
+                    self.config.max_sessions
+                )));
+            }
         }
 
         let session_id = Uuid::new_v4().to_string();

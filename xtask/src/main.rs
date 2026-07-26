@@ -648,26 +648,34 @@ fn precise_pin_resolvable(
 /// the crate are present in the tree.
 fn pin_skipped_dependencies(root: &Path, rows: &[Row]) {
     println!("Pinning skipped/unsafe dependencies to current versions in Cargo.lock…");
+    let mut args = vec!["update".to_string(), "--offline".to_string()];
+    let mut count = 0;
     for row in rows {
         if row.status.starts_with("skipped:") {
-            println!(
-                "  Pinning {name} to {version}…",
-                name = row.name,
-                version = row.old_ver
-            );
-            // `name@old --precise old` is a no-op pin that nonetheless
-            // disambiguates when several versions of `name` are in the lock.
-            let _ = std::process::Command::new("cargo")
-                .args([
-                    "update",
-                    "-p",
-                    &format!("{}@{}", row.name, row.old_ver),
-                    "--precise",
-                    &row.old_ver,
-                ])
-                .current_dir(root)
-                .status();
+            args.push("-p".to_string());
+            args.push(format!("{}@{}", row.name, row.old_ver));
+            args.push("--precise".to_string());
+            args.push(row.old_ver.clone());
+            count += 1;
         }
+    }
+    if count == 0 {
+        return;
+    }
+    println!("  Batch-pinning {count} skipped dependencies offline…");
+    let status = std::process::Command::new("cargo")
+        .args(&args)
+        .current_dir(root)
+        .status();
+
+    if status.is_err() || matches!(status.as_ref().map(|s| s.success()), Ok(false)) {
+        // Fallback without --offline if offline fails
+        let mut online_args = args;
+        online_args.remove(1); // remove "--offline"
+        let _ = std::process::Command::new("cargo")
+            .args(&online_args)
+            .current_dir(root)
+            .status();
     }
 }
 
