@@ -140,96 +140,104 @@ fn render_settings_origin(
     out
 }
 
+/// `ahma settings init`: write a defaults file and tell the user where it went.
+fn run_settings_init(force: bool, path: Option<PathBuf>) -> Result<()> {
+    use ahma_common::config::{AhmaSettings, settings_path};
+
+    let target = path
+        .unwrap_or_else(|| settings_path().unwrap_or_else(|| PathBuf::from(".ahma/settings.toml")));
+    AhmaSettings::write_defaults(&target, force)?;
+    println!("Settings file written to: {}", target.display());
+    println!();
+    println!("Edit the file to override defaults.");
+    println!("Run `ahma settings show` to see the effective configuration.");
+    Ok(())
+}
+
+/// Print the plain (non-`--origin`) `settings show` report: rows grouped under
+/// their `[section]` header, plus the settings-file footer.
+///
+/// The `--origin` twin of this renderer is [`render_settings_origin`]; keeping
+/// both as named functions is what stops the two reports from drifting apart.
+fn print_settings_plain(rows: &[SettingRow], file_path: Option<&std::path::Path>) {
+    println!("# Effective Ahma settings");
+    println!(
+        "# Sources: [file] = ~/.ahma/settings.toml  [env] = AHMA_* (deprecated)  [default] = compiled-in"
+    );
+    println!("# Run `ahma settings show --origin` for exact per-key provenance.");
+    println!();
+
+    let mut section = "";
+    for row in rows {
+        let (sec, key) = row.key.split_once('.').unwrap_or(("", row.key));
+        if sec != section {
+            if !section.is_empty() {
+                println!();
+            }
+            println!("[{sec}]");
+            section = sec;
+        }
+        let source = if row.value != row.default {
+            "[file]"
+        } else {
+            "[default]"
+        };
+        println!("{:<45} = {}  # {}", key, row.value, source);
+    }
+
+    let Some(p) = file_path else { return };
+    println!();
+    if p.exists() {
+        println!("# Settings file: {}", p.display());
+    } else {
+        println!("# Settings file not found: {}", p.display());
+        println!("# Run `ahma settings init` to create it.");
+    }
+}
+
+/// `ahma settings show`: resolve the settings actually in effect for this
+/// invocation, then hand the rows to the plain or `--origin` renderer.
+fn run_settings_show(origin: bool, origin_ctx: &SettingsOriginCtx) -> Result<()> {
+    use ahma_common::config::{AhmaSettings, settings_path};
+
+    // Honor --no-settings / --settings-path exactly like server startup does, so
+    // `settings show` reports the configuration actually in effect.
+    let file_path = if origin_ctx.no_settings {
+        None
+    } else {
+        origin_ctx.settings_path.clone().or_else(settings_path)
+    };
+    let s = match &file_path {
+        Some(p) => AhmaSettings::load_from(p),
+        None => AhmaSettings::default(),
+    };
+    let rows = setting_rows(&s, &AhmaSettings::default());
+
+    if !origin {
+        print_settings_plain(&rows, file_path.as_deref());
+        return Ok(());
+    }
+
+    // True provenance (R-CFG5.1): parse the raw file to learn which keys it
+    // explicitly sets, instead of inferring from value diffs.
+    let file_toml: Option<toml::Value> = file_path
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| toml::from_str(&text).ok());
+    print!(
+        "{}",
+        render_settings_origin(&rows, file_path.as_deref(), file_toml.as_ref(), origin_ctx)
+    );
+    Ok(())
+}
+
 pub(crate) fn run_settings_command(
     args: SettingsArgs,
     origin_ctx: &SettingsOriginCtx,
 ) -> Result<()> {
-    use ahma_common::config::{AhmaSettings, settings_path};
-
     match args.command {
-        SettingsCommand::Init { force, path } => {
-            let target = path.unwrap_or_else(|| {
-                settings_path().unwrap_or_else(|| PathBuf::from(".ahma/settings.toml"))
-            });
-            AhmaSettings::write_defaults(&target, force)?;
-            println!("Settings file written to: {}", target.display());
-            println!();
-            println!("Edit the file to override defaults.");
-            println!("Run `ahma settings show` to see the effective configuration.");
-            Ok(())
-        }
-        SettingsCommand::Show { origin } => {
-            // Honor --no-settings / --settings-path exactly like server startup
-            // does, so `settings show` reports the configuration actually in
-            // effect for this invocation.
-            let file_path = if origin_ctx.no_settings {
-                None
-            } else {
-                origin_ctx.settings_path.clone().or_else(settings_path)
-            };
-            let s = match &file_path {
-                Some(p) => AhmaSettings::load_from(p),
-                None => AhmaSettings::default(),
-            };
-            let d = AhmaSettings::default();
-            let rows = setting_rows(&s, &d);
-
-            if origin {
-                // True provenance (R-CFG5.1): parse the raw file to learn which
-                // keys it explicitly sets, instead of inferring from value diffs.
-                let file_toml: Option<toml::Value> = file_path
-                    .as_deref()
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .and_then(|text| toml::from_str(&text).ok());
-                print!(
-                    "{}",
-                    render_settings_origin(
-                        &rows,
-                        file_path.as_deref(),
-                        file_toml.as_ref(),
-                        origin_ctx
-                    )
-                );
-                return Ok(());
-            }
-
-            println!("# Effective Ahma settings");
-            println!(
-                "# Sources: [file] = ~/.ahma/settings.toml  [env] = AHMA_* (deprecated)  [default] = compiled-in"
-            );
-            println!("# Run `ahma settings show --origin` for exact per-key provenance.");
-            println!();
-
-            let mut section = "";
-            for row in &rows {
-                let (sec, key) = row.key.split_once('.').unwrap_or(("", row.key));
-                if sec != section {
-                    if !section.is_empty() {
-                        println!();
-                    }
-                    println!("[{sec}]");
-                    section = sec;
-                }
-                let source = if row.value != row.default {
-                    "[file]"
-                } else {
-                    "[default]"
-                };
-                println!("{:<45} = {}  # {}", key, row.value, source);
-            }
-
-            if let Some(p) = &file_path {
-                println!();
-                if p.exists() {
-                    println!("# Settings file: {}", p.display());
-                } else {
-                    println!("# Settings file not found: {}", p.display());
-                    println!("# Run `ahma settings init` to create it.");
-                }
-            }
-
-            Ok(())
-        }
+        SettingsCommand::Init { force, path } => run_settings_init(force, path),
+        SettingsCommand::Show { origin } => run_settings_show(origin, origin_ctx),
     }
 }
 
@@ -895,27 +903,31 @@ fn revoke_permission(
         return Ok(());
     }
 
-    if apply(&mut settings) {
-        settings
-            .save_to(file)
-            .with_context(|| format!("Failed to write {}", file.display()))?;
-        // Audit the *expanded* subject, so a path's grant and its revoke carry the
-        // same string. An audit log where `~/cache` and `/home/me/cache` are two
-        // different entries cannot answer "what happened to this path?" — which is
-        // the only question anyone opens it to ask.
-        let audited = match kind {
-            GrantKind::FsScope => ahma_common::config::expand_home(std::path::Path::new(subject))
-                .display()
-                .to_string(),
-            _ => subject.to_string(),
-        };
-        audit(AuditAction::Revoke, kind, audited, None);
-        println!("✓ Revoked: {description}");
-        println!();
-        println!("Updated: {}", file.display());
-        if kind == GrantKind::FsScope {
-            println!("Takes effect the next time an ahma server starts.");
-        }
+    // A no-op apply means the grant vanished between preview and write; nothing to
+    // save, audit, or report.
+    if !apply(&mut settings) {
+        return Ok(());
+    }
+
+    settings
+        .save_to(file)
+        .with_context(|| format!("Failed to write {}", file.display()))?;
+    // Audit the *expanded* subject, so a path's grant and its revoke carry the
+    // same string. An audit log where `~/cache` and `/home/me/cache` are two
+    // different entries cannot answer "what happened to this path?" — which is
+    // the only question anyone opens it to ask.
+    let audited = match kind {
+        GrantKind::FsScope => ahma_common::config::expand_home(std::path::Path::new(subject))
+            .display()
+            .to_string(),
+        _ => subject.to_string(),
+    };
+    audit(AuditAction::Revoke, kind, audited, None);
+    println!("✓ Revoked: {description}");
+    println!();
+    println!("Updated: {}", file.display());
+    if kind == GrantKind::FsScope {
+        println!("Takes effect the next time an ahma server starts.");
     }
     Ok(())
 }

@@ -214,20 +214,17 @@ impl ChatHistory {
         }
         let cutoff = len - keep_latest;
 
-        let mut new_entries = VecDeque::with_capacity(len);
-        for (i, entry) in self.entries.drain(..).enumerate() {
-            if i >= cutoff {
-                new_entries.push_back(entry);
-            } else {
-                match entry {
-                    ChatEntry::ToolCall { .. } => {
-                        // Drop old tool calls to save context window space
-                    }
-                    other => new_entries.push_back(other),
-                }
-            }
-        }
-        self.entries = new_entries;
+        // Everything from `cutoff` on is preserved intact; before it, tool calls
+        // are dropped to save context window space.
+        let keep = |(i, entry): &(usize, ChatEntry)| {
+            *i >= cutoff || !matches!(entry, ChatEntry::ToolCall { .. })
+        };
+        self.entries = std::mem::take(&mut self.entries)
+            .into_iter()
+            .enumerate()
+            .filter(keep)
+            .map(|(_, entry)| entry)
+            .collect();
     }
 
     pub fn start_tool_call(&mut self, id: String, name: String, args: String) {
@@ -921,12 +918,17 @@ impl Operation {
     }
 
     pub fn clean_id(&self) -> String {
-        if self.id.starts_with("op_") || self.id.starts_with("op-") {
-            let sep = if self.id.starts_with("op_") { '_' } else { '-' };
-            let parts: Vec<&str> = self.id.split(sep).collect();
-            if parts.len() >= 2 && parts[1].chars().all(|c| c.is_ascii_digit()) {
-                return format!("op{}{}", sep, parts[1]);
-            }
+        // `op_<n>_...` / `op-<n>-...` ids collapse to just the numbered prefix.
+        let sep = match self.id.get(..3) {
+            Some("op_") => Some('_'),
+            Some("op-") => Some('-'),
+            _ => None,
+        };
+        if let Some(sep) = sep
+            && let Some(number) = self.id.split(sep).nth(1)
+            && number.chars().all(|c| c.is_ascii_digit())
+        {
+            return format!("op{sep}{number}");
         }
         self.id[..self.id.len().min(6)].to_string()
     }
@@ -2072,16 +2074,17 @@ fn count_wrapped_lines(line: &str, width: usize) -> usize {
     let mut current_line_len = 0;
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == ' ' {
-            if current_line_len < width {
-                current_line_len += 1;
-            } else {
-                lines += 1;
-                current_line_len = 0;
-            }
-        } else {
+        if c != ' ' {
             let word_len = parse_word_len(c, &mut chars);
             handle_word_fit(&mut current_line_len, &mut lines, word_len, width);
+            continue;
+        }
+        // A space either fits on the current line or wraps it.
+        if current_line_len < width {
+            current_line_len += 1;
+        } else {
+            lines += 1;
+            current_line_len = 0;
         }
     }
     if current_line_len > 0 {
@@ -2414,27 +2417,15 @@ impl AppState {
         if !op.description.is_empty() {
             existing.description = op.description;
         }
-        if op.cwd.is_some() {
-            existing.cwd = op.cwd;
-        }
         if !op.args.is_empty() {
             existing.args = op.args;
         }
-        if op.pid.is_some() {
-            existing.pid = op.pid;
-        }
-        if op.scope.is_some() {
-            existing.scope = op.scope;
-        }
-        if op.result_summary.is_some() {
-            existing.result_summary = op.result_summary;
-        }
-        if op.completed_at.is_some() {
-            existing.completed_at = op.completed_at;
-        }
-        if op.duration_ms.is_some() {
-            existing.duration_ms = op.duration_ms;
-        }
+        Self::prefer_incoming(&mut existing.cwd, op.cwd);
+        Self::prefer_incoming(&mut existing.pid, op.pid);
+        Self::prefer_incoming(&mut existing.scope, op.scope);
+        Self::prefer_incoming(&mut existing.result_summary, op.result_summary);
+        Self::prefer_incoming(&mut existing.completed_at, op.completed_at);
+        Self::prefer_incoming(&mut existing.duration_ms, op.duration_ms);
 
         // Merge stdout tails without duplicating: the poll path re-sends the
         // operation's FULL current tail on every cycle, and the hub path
@@ -2453,6 +2444,14 @@ impl AppState {
 
         // pinned is sticky — once pinned it stays pinned.
         existing.pinned = existing.pinned || op.pinned;
+    }
+
+    /// Overwrite an optional field only when the incoming update supplies a
+    /// value, so a source that leaves the field unset cannot clear it.
+    fn prefer_incoming<T>(existing: &mut Option<T>, incoming: Option<T>) {
+        if incoming.is_some() {
+            *existing = incoming;
+        }
     }
 
     /// Append `new_lines` to `existing`'s stdout tail, evicting from the

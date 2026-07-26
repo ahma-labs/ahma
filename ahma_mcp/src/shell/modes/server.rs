@@ -454,14 +454,11 @@ async fn check_bridge_running(socket_path: Option<&str>, http_url: Option<&str>)
     get_bridge_version(socket_path, http_url).await.is_some()
 }
 
-/// Run in server mode (stdio MCP server).
+/// Ask the running bridge to shut down, then wait (up to 2s) for it to stop
+/// answering health checks so the caller can start a replacement.
 ///
-/// # Arguments
-/// * `config` - Immutable application configuration.
-/// * `sandbox` - Sandbox configuration.
-///
-/// # Errors
-/// Returns an error if the server fails to start or encounters a fatal error.
+/// Best-effort: a refused or unanswered restart request is logged, not fatal —
+/// the caller spawns a fresh bridge either way.
 async fn restart_bridge_server(socket_path_opt: Option<&str>, http_url_opt: Option<&str>) {
     tracing::info!(
         "Client version is newer than running bridge version. Requesting bridge restart..."
@@ -686,12 +683,14 @@ pub(crate) fn split_version_and_build_id(v: &str) -> (&str, Option<&str>) {
 pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
     let mut args = vec!["serve".to_string(), "--server-child".to_string()];
 
-    // Helper closures to reduce push-pair verbosity.
-    let push = |a: &mut Vec<String>, flag: &str| a.push(flag.to_string());
-    let push_val = |a: &mut Vec<String>, flag: &str, val: String| {
-        a.push(flag.to_string());
-        a.push(val);
-    };
+    // Helpers so every forwarded flag stays on a single, auditable line.
+    fn push(args: &mut Vec<String>, flag: &str) {
+        args.push(flag.to_string());
+    }
+    fn push_val(args: &mut Vec<String>, flag: &str, val: impl Into<String>) {
+        args.push(flag.to_string());
+        args.push(val.into());
+    }
 
     // Forward ONLY genuinely explicit sandbox scopes (from --sandbox-scope,
     // --working-dir, or task vault) so the bridge is not locked to a
@@ -699,53 +698,36 @@ pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
     // --sandbox and --tmp are forwarded as boolean flags below so the bridge
     // can derive ~/sandbox and temp access independently for each session.
     for scope in &config.sandbox_scopes {
-        push_val(
-            &mut args,
-            "--sandbox-scope",
-            scope.to_string_lossy().to_string(),
-        );
+        push_val(&mut args, "--sandbox-scope", scope.to_string_lossy());
     }
     for wd in &config.working_dirs {
-        push_val(&mut args, "--working-dir", wd.to_string_lossy().to_string());
+        push_val(&mut args, "--working-dir", wd.to_string_lossy());
     }
 
     if config.explicit_tools_dir
         && let Some(ref tools_dir) = config.tools_dir
     {
-        push_val(
-            &mut args,
-            "--tools-dir",
-            tools_dir.to_string_lossy().to_string(),
-        );
+        push_val(&mut args, "--tools-dir", tools_dir.to_string_lossy());
     }
 
     if let Some(ref task_vault) = config.task_vault {
-        push_val(
-            &mut args,
-            "--task-vault",
-            task_vault.to_string_lossy().to_string(),
-        );
+        push_val(&mut args, "--task-vault", task_vault.to_string_lossy());
     }
 
     for bundle in &config.tool_bundles {
         push_val(&mut args, "--tools", bundle.clone());
     }
 
-    let timeout = config
+    let idle_timeout = config
         .idle_timeout_secs
-        .or(Some(AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS));
-    if let Some(t) = timeout
-        && t > 0
-    {
-        push_val(&mut args, "--idle-timeout", t.to_string());
+        .unwrap_or(AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS);
+    if idle_timeout > 0 {
+        push_val(&mut args, "--idle-timeout", idle_timeout.to_string());
     }
 
     if !config.unix_socket_path.is_empty() {
-        push_val(
-            &mut args,
-            "--unix-socket-path",
-            config.unix_socket_path.clone(),
-        );
+        let socket = config.unix_socket_path.clone();
+        push_val(&mut args, "--unix-socket-path", socket);
     }
 
     // Boolean flags — each enabled only when the config field is set.
@@ -776,25 +758,16 @@ pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
 
     // Numeric flags — forwarded only when non-zero.
     if config.rate_limit_rps > 0 {
-        push_val(
-            &mut args,
-            "--rate-limit-rps",
-            config.rate_limit_rps.to_string(),
-        );
+        let rps = config.rate_limit_rps.to_string();
+        push_val(&mut args, "--rate-limit-rps", rps);
     }
     if config.rate_limit_burst > 0 {
-        push_val(
-            &mut args,
-            "--rate-limit-burst",
-            config.rate_limit_burst.to_string(),
-        );
+        let burst = config.rate_limit_burst.to_string();
+        push_val(&mut args, "--rate-limit-burst", burst);
     }
     if config.handshake_timeout_secs > 0 {
-        push_val(
-            &mut args,
-            "--handshake-timeout",
-            config.handshake_timeout_secs.to_string(),
-        );
+        let handshake = config.handshake_timeout_secs.to_string();
+        push_val(&mut args, "--handshake-timeout", handshake);
     }
 
     // Auth flags.
@@ -802,11 +775,7 @@ pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
         push_val(&mut args, "--require-token", token.clone());
     }
     if let Some(ref path) = config.require_token_path {
-        push_val(
-            &mut args,
-            "--require-token-path",
-            path.to_string_lossy().to_string(),
-        );
+        push_val(&mut args, "--require-token-path", path.to_string_lossy());
     }
 
     if !config.instance_label.is_empty() {

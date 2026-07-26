@@ -1458,31 +1458,29 @@ where
     // rather than lost in the gap between snapshot and live stream.
     let mut rx = hub.broadcast.subscribe();
 
-    // Replay the operations that ran before this subscriber connected, so
-    // the monitor shows all calls — not just ones that start from now on.
-    for msg in hub.replay_events().await {
+    // Replay everything that happened before this subscriber connected — the
+    // operations that already ran, then any still-pending approvals — so the
+    // monitor shows all calls, not just ones that start from now on.
+    let mut backlog = hub.replay_events().await;
+    backlog.extend(
+        hub.pending_approvals
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .map(|pending| DaemonMsg::ApprovalRequested {
+                id: pending.id,
+                tool: pending.tool,
+                args: pending.args,
+            }),
+    );
+    for msg in backlog {
         if let Err(e) = send_msg(writer, &msg).await {
-            debug!("daemon: subscriber replay write failed: {e}");
+            debug!("daemon: subscriber backlog replay write failed: {e}");
             return;
         }
     }
 
-    // Replay pending approvals to the newly connected subscriber.
-    let approvals = {
-        let guard = hub.pending_approvals.lock().await;
-        guard.values().cloned().collect::<Vec<_>>()
-    };
-    for pending in approvals {
-        let msg = DaemonMsg::ApprovalRequested {
-            id: pending.id,
-            tool: pending.tool,
-            args: pending.args,
-        };
-        if let Err(e) = send_msg(writer, &msg).await {
-            debug!("daemon: subscriber replay pending approval write failed: {e}");
-            return;
-        }
-    }
     loop {
         match rx.recv().await {
             Ok(msg) => {

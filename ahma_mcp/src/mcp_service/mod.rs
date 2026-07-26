@@ -164,109 +164,44 @@ pub struct AhmaMcpService {
     pub grant_coordinator: Arc<RwLock<Option<Arc<ahma_common::scope_grant::GrantCoordinator>>>>,
 }
 
+/// Built-ins withheld from [`AhmaMcpService::get_all_available_tools`], the
+/// toolset handed to ahma's own agent loop.
+///
+/// `agent` delegates *to that same loop*, so handing it to the loop would let
+/// the agent recurse into itself. `handle_agent` caps turns within one loop but
+/// nothing caps nesting depth, so the guard has to live here. MCP clients still
+/// get the tool via `list_tools` — the recursion risk is specific to ahma
+/// calling itself.
+const AGENT_LOOP_DENIED_BUILTINS: &[&str] = &["agent"];
+
+/// Project an rmcp [`Tool`] into the `ToolInfo` shape the agent loop consumes.
+fn tool_info_from_tool(tool: Tool) -> crate::mcp_client::ToolInfo {
+    crate::mcp_client::ToolInfo {
+        name: tool.name.to_string(),
+        description: tool.description.map(|d| d.to_string()),
+        input_schema: serde_json::Value::Object(tool.input_schema.as_ref().clone()),
+    }
+}
+
 impl AhmaMcpService {
-    /// Retrieve a list of all locally and externally registered tools in ToolInfo format.
+    /// Every tool available to this session, in `ToolInfo` form: the built-ins
+    /// from [`Self::builtin_tools`], then per-client config tools, then
+    /// external MCP tools.
+    ///
+    /// This is the toolset handed to ahma's own agent loop, so it withholds
+    /// [`AGENT_LOOP_DENIED_BUILTINS`]. Everything else is shared with
+    /// `list_tools` by construction rather than by hand.
     pub async fn get_all_available_tools(&self) -> Vec<crate::mcp_client::ToolInfo> {
-        let mut tools = vec![
-            crate::mcp_client::ToolInfo {
-                name: "await".to_string(),
-                description: Some("Block until a started operation completes and return its final result. Operations notify automatically when they finish, so prefer doing other useful work first; reach for `await` only when the next step truly depends on the result.".to_string()),
-                input_schema: serde_json::Value::Object(self.generate_input_schema_for_wait().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "status".to_string(),
-                description: Some("Return a snapshot of active and completed operations without blocking. Completion is pushed via notifications, so this is for ad-hoc inspection rather than polling.".to_string()),
-                input_schema: serde_json::Value::Object(self.generate_input_schema_for_status().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "run_terminal_command".to_string(),
-                description: Some("Run a shell command inside a kernel-level filesystem sandbox (Landlock on Linux, Seatbelt on macOS, Job Objects on Windows). Returns an operation_id immediately; use `status`, `await`, or `cancel` to manage long-running work. Supports pipes, redirects, environment variables, and full shell syntax. Set `monitor_level` to stream error/warning alerts from stdout or stderr.".to_string()),
-                input_schema: serde_json::Value::Object(self.generate_input_schema_for_run_terminal_command().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "logs_list".to_string(),
-                description: Some("List all log files in the project log directory (`./logs/`). Returns file names, sizes, modification times, and symlink targets. Use this to discover which log files are available before calling logs_read or logs_search.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::log_tools::logs_list_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "logs_approve".to_string(),
-                description: Some("Approve a blocked out-of-scope log symlink target to allow AI read access.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::log_tools::logs_approve_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "logs_read".to_string(),
-                description: Some("Read lines from a project log file with optional pagination. Sensitive values (tokens, passwords, API keys) are redacted by default. Use `raw: true` only when debugging credential issues.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::log_tools::logs_read_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "logs_search".to_string(),
-                description: Some("Search a project log file for lines matching a pattern (case-insensitive substring match by default). Returns matching lines with line numbers. Sensitive values are redacted by default.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::log_tools::logs_search_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "restart".to_string(),
-                description: Some("Force stop and restart the background bridge server, disconnecting all active sessions (including TUI and other IDEs) to apply updates or recover from a bad state.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::restart_tool::restart_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "read_file".to_string(),
-                description: Some("Read UTF-8 text from a scoped file, with optional line slicing.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::harness_tools::read_file_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "list_dir".to_string(),
-                description: Some("List entries in a scoped directory with basic metadata.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::harness_tools::list_dir_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "file_search".to_string(),
-                description: Some("Find files by glob pattern inside the sandbox scope.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::harness_tools::file_search_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "grep_search".to_string(),
-                description: Some("Search file contents by plain text or regex.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::harness_tools::grep_search_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "fetch_webpage".to_string(),
-                description: Some("Fetch and extract readable text from an HTTP/HTTPS webpage.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::harness_tools::fetch_webpage_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "write_file".to_string(),
-                description: Some("Write UTF-8 content to a scoped file (create or overwrite).".to_string()),
-                input_schema: serde_json::Value::Object(handlers::harness_tools::write_file_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "replace_in_file".to_string(),
-                description: Some("Replace exact string occurrences in a scoped UTF-8 file.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::harness_tools::replace_in_file_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "todo_write".to_string(),
-                description: Some("Record or update your task plan as a checklist (pass the full list each time; it replaces the current plan). Use for any multi-step task: list the steps, mark one in_progress, mark finished steps completed.".to_string()),
-                input_schema: serde_json::Value::Object(handlers::todo_tool::todo_write_schema().as_ref().clone()),
-            },
-            crate::mcp_client::ToolInfo {
-                name: "log_monitor".to_string(),
-                description: Some("Start a real-time log monitoring session on a file inside the sandbox. Reads new lines as they are written, runs them through the AI for issue detection, and sends alerts.".to_string()),
-                input_schema: serde_json::Value::Object(
-                    schema::object_input_schema(
-                        {
-                            let mut props = serde_json::Map::new();
-                            props.insert("file_path".to_string(), schema::string_property("Path of the log file to monitor (within sandbox scope)"));
-                            props.insert("detection_prompt".to_string(), schema::string_property("Optional prompt guiding AI issue detection"));
-                            props.insert("llm_base_url".to_string(), schema::string_property("Optional custom LLM base URL"));
-                            props.insert("llm_model".to_string(), schema::string_property("Optional custom LLM model"));
-                            props.insert("llm_api_key".to_string(), schema::string_property("Optional custom LLM API key"));
-                            props
-                        },
-                        &["file_path"],
-                    ).as_ref().clone()
-                ),
-            },
-        ];
+        let mut tools: Vec<crate::mcp_client::ToolInfo> = self
+            .builtin_tools()
+            .into_iter()
+            .filter(|t| {
+                !AGENT_LOOP_DENIED_BUILTINS
+                    .iter()
+                    .any(|denied| t.name == *denied)
+            })
+            .map(tool_info_from_tool)
+            .collect();
 
         {
             let configs_lock = self.configs.read().unwrap();
@@ -274,13 +209,11 @@ impl AhmaMcpService {
                 if !self.is_config_visible_to_client(config) {
                     continue;
                 }
-                for t in self.create_tools_from_config(config) {
-                    tools.push(crate::mcp_client::ToolInfo {
-                        name: t.name.to_string(),
-                        description: t.description.map(|d| d.to_string()),
-                        input_schema: serde_json::Value::Object(t.input_schema.as_ref().clone()),
-                    });
-                }
+                tools.extend(
+                    self.create_tools_from_config(config)
+                        .into_iter()
+                        .map(tool_info_from_tool),
+                );
             }
         }
 
@@ -290,6 +223,153 @@ impl AhmaMcpService {
         }
 
         tools
+    }
+
+    /// The built-in tools every session exposes, before per-client config
+    /// tools and external MCP tools are appended.
+    ///
+    /// Single source of truth for both `list_tools` (what MCP clients see) and
+    /// [`Self::get_all_available_tools`] (what ahma's own agent loop sees).
+    /// Those were two separately maintained literals and they had drifted: the
+    /// agent-facing one was three tools and two descriptions behind.
+    fn builtin_tools(&self) -> Vec<Tool> {
+        vec![
+            // Hard-wired await command - always available
+            Tool::new(
+                "await",
+                "Block until a started operation completes and return its final result. Operations notify automatically when they finish, so prefer doing other useful work first; reach for `await` only when the next step truly depends on the result.",
+                self.generate_input_schema_for_wait(),
+            )
+            .with_title("await"),
+            // Hard-wired status command - always available
+            Tool::new(
+                "status",
+                "Return a snapshot of active and completed operations without blocking. Completion is pushed via notifications, so this is for ad-hoc inspection rather than polling.",
+                self.generate_input_schema_for_status(),
+            )
+            .with_title("status"),
+            // Hard-wired run_terminal_command command - always available
+            Tool::new(
+                "run_terminal_command",
+                "Run a shell command inside a kernel-level filesystem sandbox (Landlock on Linux, Seatbelt on macOS, Job Objects on Windows). Returns an operation_id immediately; use `status`, `await`, or `cancel` to manage long-running work. Supports pipes, redirects, environment variables, and full shell syntax. Set `monitor_level` to stream error/warning alerts from stdout or stderr.",
+                self.generate_input_schema_for_run_terminal_command(),
+            )
+            .with_title("run_terminal_command"),
+            // Hard-wired log inspection tools — always available
+            Tool::new(
+                "logs_list",
+                "List all log files in the project log directory (`./logs/`). Returns file names, sizes, modification times, and symlink targets. Use this to discover which log files are available before calling logs_read or logs_search.",
+                handlers::log_tools::logs_list_schema(),
+            )
+            .with_title("logs_list"),
+            Tool::new(
+                "logs_approve",
+                "Approve a blocked out-of-scope log symlink target to allow AI read access.",
+                handlers::log_tools::logs_approve_schema(),
+            )
+            .with_title("logs_approve"),
+            Tool::new(
+                "logs_read",
+                "Read lines from a project log file with optional pagination. Sensitive values (tokens, passwords, API keys) are redacted by default. Use `raw: true` only when debugging credential issues.",
+                handlers::log_tools::logs_read_schema(),
+            )
+            .with_title("logs_read"),
+            Tool::new(
+                "logs_search",
+                "Search a project log file for lines matching a pattern (case-insensitive substring match by default). Returns matching lines with line numbers. Sensitive values are redacted by default.",
+                handlers::log_tools::logs_search_schema(),
+            )
+            .with_title("logs_search"),
+            Tool::new(
+                "restart",
+                "Force stop and restart the background bridge server, disconnecting all active sessions (including TUI and other IDEs) to apply updates or recover from a bad state.",
+                handlers::restart_tool::restart_schema(),
+            )
+            .with_title("restart"),
+            Tool::new(
+                "cancel",
+                "Cancel a running background operation by `id`, or cancel EVERY in-flight operation with `all: true`. Each cancellation reaps the operation's full process tree (cargo/rustc/sccache) — the clean way to stop wedged work without killing and restarting the server.",
+                handlers::cancel_tool::cancel_schema(),
+            )
+            .with_title("cancel"),
+            Tool::new(
+                "sandbox_grant",
+                "Propose adding an out-of-scope path as a persistent sandbox root in ~/.ahma/settings.toml. Call this when a command fails with a `sandbox_denial` error. WITHOUT `confirm: true` it only PREVIEWS — it returns the full settings-file path, the exact line it would add, and a risk assessment so you can show the human and get approval first. Catastrophic paths (filesystem root, $HOME, credential dirs, system dirs, workspace parents) are REFUSED even with confirmation. On `confirm: true` it writes the grant; run `restart` to apply, then re-run the blocked command.",
+                handlers::sandbox_grant_tool::sandbox_grant_schema(),
+            )
+            .with_title("sandbox_grant"),
+            Tool::new(
+                "read_file",
+                "Read UTF-8 text from a scoped file, with optional line slicing.",
+                handlers::harness_tools::read_file_schema(),
+            )
+            .with_title("read_file"),
+            Tool::new(
+                "list_dir",
+                "List entries in a scoped directory with basic metadata.",
+                handlers::harness_tools::list_dir_schema(),
+            )
+            .with_title("list_dir"),
+            Tool::new(
+                "file_search",
+                "Find files by glob pattern inside the sandbox scope.",
+                handlers::harness_tools::file_search_schema(),
+            )
+            .with_title("file_search"),
+            Tool::new(
+                "grep_search",
+                "Search file contents by plain text or regex.",
+                handlers::harness_tools::grep_search_schema(),
+            )
+            .with_title("grep_search"),
+            Tool::new(
+                "fetch_webpage",
+                "Fetch and extract readable text from an HTTP/HTTPS webpage.",
+                handlers::harness_tools::fetch_webpage_schema(),
+            )
+            .with_title("fetch_webpage"),
+            Tool::new(
+                "write_file",
+                "Write UTF-8 content to a scoped file (create or overwrite).",
+                handlers::harness_tools::write_file_schema(),
+            )
+            .with_title("write_file"),
+            Tool::new(
+                "replace_in_file",
+                "Replace exact string occurrences in a scoped UTF-8 file.",
+                handlers::harness_tools::replace_in_file_schema(),
+            )
+            .with_title("replace_in_file"),
+            Tool::new(
+                "agent",
+                "Delegate a self-contained task to ahma's own agent loop as a sub-agent. ahma runs its full tool-using loop (read/edit files, run commands in the sandbox, search) with the model the user last selected in `ahma tui`, and returns the final answer. Use this to offload a focused sub-task — investigating code, producing a file or report, or answering a question grounded in the workspace — without doing the steps yourself.",
+                handlers::agent_tool::agent_schema(),
+            )
+            .with_title("agent"),
+            Tool::new(
+                "todo_write",
+                "Record or update your task plan as a checklist. Pass the FULL list of steps each time — it replaces the current plan. Use this at the start of any multi-step task, then call it again to mark a step in_progress before you work on it and completed when it's done. Keeps you (and the user) oriented across turns.",
+                handlers::todo_tool::todo_write_schema(),
+            )
+            .with_title("todo_write"),
+            Tool::new(
+                "log_monitor",
+                "Start a real-time log monitoring session on a file inside the sandbox. Reads new lines as they are written, runs them through the AI for issue detection, and sends alerts.",
+                schema::object_input_schema(
+                    {
+                        let mut props = serde_json::Map::new();
+                        props.insert("file_path".to_string(), schema::string_property("Path of the log file to monitor (within sandbox scope)"));
+                        props.insert("detection_prompt".to_string(), schema::string_property("Optional prompt guiding AI issue detection"));
+                        props.insert("llm_base_url".to_string(), schema::string_property("Optional custom LLM base URL"));
+                        props.insert("llm_model".to_string(), schema::string_property("Optional custom LLM model"));
+                        props.insert("llm_api_key".to_string(), schema::string_property("Optional custom LLM API key"));
+                        props
+                    },
+                    &["file_path"],
+                ),
+            )
+            .with_title("log_monitor"),
+        ]
     }
 
     fn task_vault_root(&self) -> Option<PathBuf> {
@@ -1293,143 +1373,7 @@ impl ServerHandler for AhmaMcpService {
             std::sync::atomic::Ordering::Relaxed,
         );
         async move {
-            let mut tools = vec![
-                // Hard-wired await command - always available
-                Tool::new(
-                    "await",
-                    "Block until a started operation completes and return its final result. Operations notify automatically when they finish, so prefer doing other useful work first; reach for `await` only when the next step truly depends on the result.",
-                    self.generate_input_schema_for_wait(),
-                )
-                .with_title("await"),
-                // Hard-wired status command - always available
-                Tool::new(
-                    "status",
-                    "Return a snapshot of active and completed operations without blocking. Completion is pushed via notifications, so this is for ad-hoc inspection rather than polling.",
-                    self.generate_input_schema_for_status(),
-                )
-                .with_title("status"),
-                // Hard-wired run_terminal_command command - always available
-                Tool::new(
-                    "run_terminal_command",
-                    "Run a shell command inside a kernel-level filesystem sandbox (Landlock on Linux, Seatbelt on macOS, Job Objects on Windows). Returns an operation_id immediately; use `status`, `await`, or `cancel` to manage long-running work. Supports pipes, redirects, environment variables, and full shell syntax. Set `monitor_level` to stream error/warning alerts from stdout or stderr.",
-                    self.generate_input_schema_for_run_terminal_command(),
-                )
-                .with_title("run_terminal_command"),
-                // Hard-wired log inspection tools — always available
-                Tool::new(
-                    "logs_list",
-                    "List all log files in the project log directory (`./logs/`). Returns file names, sizes, modification times, and symlink targets. Use this to discover which log files are available before calling logs_read or logs_search.",
-                    handlers::log_tools::logs_list_schema(),
-                )
-                .with_title("logs_list"),
-                Tool::new(
-                    "logs_approve",
-                    "Approve a blocked out-of-scope log symlink target to allow AI read access.",
-                    handlers::log_tools::logs_approve_schema(),
-                )
-                .with_title("logs_approve"),
-                Tool::new(
-                    "logs_read",
-                    "Read lines from a project log file with optional pagination. Sensitive values (tokens, passwords, API keys) are redacted by default. Use `raw: true` only when debugging credential issues.",
-                    handlers::log_tools::logs_read_schema(),
-                )
-                .with_title("logs_read"),
-                Tool::new(
-                    "logs_search",
-                    "Search a project log file for lines matching a pattern (case-insensitive substring match by default). Returns matching lines with line numbers. Sensitive values are redacted by default.",
-                    handlers::log_tools::logs_search_schema(),
-                )
-                .with_title("logs_search"),
-                Tool::new(
-                    "restart",
-                    "Force stop and restart the background bridge server, disconnecting all active sessions (including TUI and other IDEs) to apply updates or recover from a bad state.",
-                    handlers::restart_tool::restart_schema(),
-                )
-                .with_title("restart"),
-                Tool::new(
-                    "cancel",
-                    "Cancel a running background operation by `id`, or cancel EVERY in-flight operation with `all: true`. Each cancellation reaps the operation's full process tree (cargo/rustc/sccache) — the clean way to stop wedged work without killing and restarting the server.",
-                    handlers::cancel_tool::cancel_schema(),
-                )
-                .with_title("cancel"),
-                Tool::new(
-                    "sandbox_grant",
-                    "Propose adding an out-of-scope path as a persistent sandbox root in ~/.ahma/settings.toml. Call this when a command fails with a `sandbox_denial` error. WITHOUT `confirm: true` it only PREVIEWS — it returns the full settings-file path, the exact line it would add, and a risk assessment so you can show the human and get approval first. Catastrophic paths (filesystem root, $HOME, credential dirs, system dirs, workspace parents) are REFUSED even with confirmation. On `confirm: true` it writes the grant; run `restart` to apply, then re-run the blocked command.",
-                    handlers::sandbox_grant_tool::sandbox_grant_schema(),
-                )
-                .with_title("sandbox_grant"),
-                Tool::new(
-                    "read_file",
-                    "Read UTF-8 text from a scoped file, with optional line slicing.",
-                    handlers::harness_tools::read_file_schema(),
-                )
-                .with_title("read_file"),
-                Tool::new(
-                    "list_dir",
-                    "List entries in a scoped directory with basic metadata.",
-                    handlers::harness_tools::list_dir_schema(),
-                )
-                .with_title("list_dir"),
-                Tool::new(
-                    "file_search",
-                    "Find files by glob pattern inside the sandbox scope.",
-                    handlers::harness_tools::file_search_schema(),
-                )
-                .with_title("file_search"),
-                Tool::new(
-                    "grep_search",
-                    "Search file contents by plain text or regex.",
-                    handlers::harness_tools::grep_search_schema(),
-                )
-                .with_title("grep_search"),
-                Tool::new(
-                    "fetch_webpage",
-                    "Fetch and extract readable text from an HTTP/HTTPS webpage.",
-                    handlers::harness_tools::fetch_webpage_schema(),
-                )
-                .with_title("fetch_webpage"),
-                Tool::new(
-                    "write_file",
-                    "Write UTF-8 content to a scoped file (create or overwrite).",
-                    handlers::harness_tools::write_file_schema(),
-                )
-                .with_title("write_file"),
-                Tool::new(
-                    "replace_in_file",
-                    "Replace exact string occurrences in a scoped UTF-8 file.",
-                    handlers::harness_tools::replace_in_file_schema(),
-                )
-                .with_title("replace_in_file"),
-                Tool::new(
-                    "agent",
-                    "Delegate a self-contained task to ahma's own agent loop as a sub-agent. ahma runs its full tool-using loop (read/edit files, run commands in the sandbox, search) with the model the user last selected in `ahma tui`, and returns the final answer. Use this to offload a focused sub-task — investigating code, producing a file or report, or answering a question grounded in the workspace — without doing the steps yourself.",
-                    handlers::agent_tool::agent_schema(),
-                )
-                .with_title("agent"),
-                Tool::new(
-                    "todo_write",
-                    "Record or update your task plan as a checklist. Pass the FULL list of steps each time — it replaces the current plan. Use this at the start of any multi-step task, then call it again to mark a step in_progress before you work on it and completed when it's done. Keeps you (and the user) oriented across turns.",
-                    handlers::todo_tool::todo_write_schema(),
-                )
-                .with_title("todo_write"),
-                Tool::new(
-                    "log_monitor",
-                    "Start a real-time log monitoring session on a file inside the sandbox. Reads new lines as they are written, runs them through the AI for issue detection, and sends alerts.",
-                    schema::object_input_schema(
-                        {
-                            let mut props = serde_json::Map::new();
-                            props.insert("file_path".to_string(), schema::string_property("Path of the log file to monitor (within sandbox scope)"));
-                            props.insert("detection_prompt".to_string(), schema::string_property("Optional prompt guiding AI issue detection"));
-                            props.insert("llm_base_url".to_string(), schema::string_property("Optional custom LLM base URL"));
-                            props.insert("llm_model".to_string(), schema::string_property("Optional custom LLM model"));
-                            props.insert("llm_api_key".to_string(), schema::string_property("Optional custom LLM API key"));
-                            props
-                        },
-                        &["file_path"],
-                    ),
-                )
-                .with_title("log_monitor"),
-            ];
+            let mut tools = self.builtin_tools();
 
             {
                 let configs_lock = self.configs.read().unwrap();
@@ -3618,6 +3562,60 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
+    }
+
+    /// The agent loop's toolset must be the client toolset minus exactly the
+    /// denied built-ins.
+    ///
+    /// Regression: `get_all_available_tools` and `list_tools` used to carry two
+    /// hand-maintained copies of the built-in list. They drifted — the agent-facing
+    /// copy was missing `cancel` and `sandbox_grant`, so ahma's own agent could
+    /// start async operations it had no way to cancel, and could not act on a
+    /// `sandbox_denial`. Both now derive from `builtin_tools`, and this asserts the
+    /// derivation instead of re-listing the names.
+    #[tokio::test]
+    async fn agent_toolset_is_client_toolset_minus_denied_builtins() {
+        let service = make_service().await;
+
+        let client_builtins: Vec<String> = service
+            .builtin_tools()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let agent_tools: Vec<String> = service
+            .get_all_available_tools()
+            .await
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+
+        for name in &client_builtins {
+            let denied = AGENT_LOOP_DENIED_BUILTINS.contains(&name.as_str());
+            assert_eq!(
+                agent_tools.contains(name),
+                !denied,
+                "builtin {name}: denied={denied}, but present in agent toolset={}",
+                agent_tools.contains(name)
+            );
+        }
+
+        // The two tools the drift had silently dropped.
+        for expected in ["cancel", "sandbox_grant"] {
+            assert!(
+                agent_tools.iter().any(|n| n == expected),
+                "agent toolset is missing {expected}"
+            );
+        }
+        // ...and the one that is withheld on purpose, to stop the agent loop
+        // recursing into itself.
+        assert!(
+            !agent_tools.iter().any(|n| n == "agent"),
+            "the agent loop must not be handed the `agent` tool"
+        );
+        assert!(
+            client_builtins.iter().any(|n| n == "agent"),
+            "MCP clients should still see the `agent` tool"
+        );
     }
 
     // ==================== vault audit append helpers ====================

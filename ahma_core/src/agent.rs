@@ -571,22 +571,22 @@ async fn run_streaming_chat(
     use futures::StreamExt;
     let mut first_token = true;
     while let Some(res) = stream.next().await {
-        match res {
-            Ok(token) => {
-                if !token.is_empty() {
-                    if first_token {
-                        info!(provider = %base_url, "chat: first token received");
-                        first_token = false;
-                    }
-                    let _ = tx.send(AgentEvent::Token(token)).await;
-                }
-            }
+        let token = match res {
+            Ok(token) => token,
             Err(e) => {
                 warn!(provider = %base_url, error = %e, "chat: stream error");
                 let _ = tx.send(AgentEvent::Error(e.to_string())).await;
                 return;
             }
+        };
+        if token.is_empty() {
+            continue;
         }
+        if first_token {
+            info!(provider = %base_url, "chat: first token received");
+            first_token = false;
+        }
+        let _ = tx.send(AgentEvent::Token(token)).await;
     }
     info!(provider = %base_url, "chat: stream complete");
     let _ = tx.send(AgentEvent::Done).await;
@@ -727,23 +727,23 @@ async fn dispatch_tool_execution(
     args_value: serde_json::Value,
     cfg: &McpChatConfig,
 ) -> Result<(String, bool), String> {
-    if let Some((server, _tool)) = name.split_once("::") {
-        let conn = cfg.mcp_connections.clone();
-        let conn_has_server = conn.servers.iter().any(|s| s.name == server);
-        if conn_has_server {
-            match conn.call_tool(name, args_value.clone()).await {
-                Ok(pair) => Ok(pair),
-                Err(e) => Err(format!("MCP tool error ({name}): {e}")),
-            }
-        } else if let Some(base_url) = cfg.external_http_servers.get(server) {
-            let base = base_url.clone();
-            spawn_external_tool_call_http(&base, _tool, args_value).await
-        } else {
-            Err(format!("Unknown external MCP server `{server}`"))
-        }
-    } else {
-        spawn_local_tool_call(cfg.clone(), name, args_value).await
+    let Some((server, tool)) = name.split_once("::") else {
+        return spawn_local_tool_call(cfg.clone(), name, args_value).await;
+    };
+
+    let conn = cfg.mcp_connections.clone();
+    if conn.servers.iter().any(|s| s.name == server) {
+        return conn
+            .call_tool(name, args_value)
+            .await
+            .map_err(|e| format!("MCP tool error ({name}): {e}"));
     }
+
+    let Some(base_url) = cfg.external_http_servers.get(server) else {
+        return Err(format!("Unknown external MCP server `{server}`"));
+    };
+    let base = base_url.clone();
+    spawn_external_tool_call_http(&base, tool, args_value).await
 }
 
 /// True when a chat-completion error indicates the model/provider rejected the

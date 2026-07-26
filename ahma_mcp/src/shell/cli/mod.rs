@@ -339,6 +339,12 @@ enum SandboxAvailability {
     /// `sandbox-exec` denied). Rather than hard-failing, ahma defers to that
     /// host — fail-closed, because a blocked nesting attempt is positive proof an
     /// outer sandbox is enforcing — and discloses it loudly.
+    ///
+    /// macOS-only: a denied nesting attempt is the sole proof we accept, and only
+    /// `sandbox-exec` gives it. Landlock and Job Objects nest fine, so the other
+    /// platforms never reach this outcome — gating the variant keeps it from
+    /// reading as dead code there.
+    #[cfg(target_os = "macos")]
     DeferToHost(sandbox::HostSandbox),
 }
 
@@ -421,6 +427,20 @@ fn ensure_task_vault_layout(task_vault_root: &Path) -> Result<PathBuf> {
     })
 }
 
+/// Canonicalize explicitly configured `--sandbox-scope` paths, creating each
+/// directory if missing and dropping duplicates while preserving order.
+fn canonicalize_configured_scopes(configured: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut scopes = Vec::with_capacity(configured.len());
+    for scope in configured {
+        let canonical = ahma_common::config::ensure_sandbox_directory(scope)
+            .with_context(|| format!("Failed to initialize sandbox scope: {:?}", scope))?;
+        if !scopes.contains(&canonical) {
+            scopes.push(canonical);
+        }
+    }
+    Ok(scopes)
+}
+
 fn resolve_sandbox_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     if let Some(task_vault_root) = &cfg.task_vault {
         let workdir = ensure_task_vault_layout(task_vault_root)?;
@@ -441,15 +461,7 @@ fn resolve_sandbox_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     }
 
     if !cfg.sandbox_scopes.is_empty() {
-        let mut scopes = Vec::with_capacity(cfg.sandbox_scopes.len());
-        for scope in &cfg.sandbox_scopes {
-            let canonical = ahma_common::config::ensure_sandbox_directory(scope)
-                .with_context(|| format!("Failed to initialize sandbox scope: {:?}", scope))?;
-            if !scopes.contains(&canonical) {
-                scopes.push(canonical);
-            }
-        }
-        return Ok(Some(scopes));
+        return Ok(Some(canonicalize_configured_scopes(&cfg.sandbox_scopes)?));
     }
 
     // SPEC R5.2.1: the launch CWD is NEVER inferred as a sandbox scope — not via
@@ -501,14 +513,7 @@ fn resolve_deferred_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     // yield to client-provided roots (config_watcher prefers parsed roots), so
     // this stays provisional and does not widen any locked scope.
     if !cfg.sandbox_scopes.is_empty() {
-        let mut scopes = Vec::with_capacity(cfg.sandbox_scopes.len());
-        for scope in &cfg.sandbox_scopes {
-            let canonical = ahma_common::config::ensure_sandbox_directory(scope)
-                .with_context(|| format!("Failed to initialize sandbox scope: {:?}", scope))?;
-            if !scopes.contains(&canonical) {
-                scopes.push(canonical);
-            }
-        }
+        let scopes = canonicalize_configured_scopes(&cfg.sandbox_scopes)?;
         tracing::info!(
             "Deferred sandbox seeded from --sandbox-scope fallback (no client roots required): {:?}",
             scopes
@@ -637,6 +642,34 @@ fn grant_persistent_read_scope(
     }
 }
 
+/// Resolve the persistent secondary sandbox directory requested by `--sandbox`.
+///
+/// Returns `None` when `--sandbox` was not set, when no `sandbox_directory` is
+/// configured, or when the directory could not be created/canonicalized — each
+/// case disclosed in the log rather than failing startup.
+fn resolve_persistent_sandbox_dir(cfg: &AppConfig) -> Option<PathBuf> {
+    if !cfg.use_sandbox_dir {
+        return None;
+    }
+    let Some(dir) = &cfg.sandbox_directory else {
+        tracing::warn!("--sandbox set but no sandbox_directory configured; ignoring");
+        return None;
+    };
+    match ahma_common::config::ensure_sandbox_directory(dir) {
+        Ok(canonical) => {
+            tracing::info!(
+                "Persistent sandbox directory (--sandbox): {}",
+                canonical.display()
+            );
+            Some(canonical)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create sandbox directory {:?}: {}", dir, e);
+            None
+        }
+    }
+}
+
 fn create_sandbox_instance(
     scopes: Option<Vec<PathBuf>>,
     policy: &SandboxPolicy,
@@ -655,28 +688,7 @@ fn create_sandbox_instance(
 
     // When --sandbox is set, canonicalize ~/sandbox and record it as the
     // persistent secondary scope that survives every roots/list update.
-    let sandbox_dir = if cfg.use_sandbox_dir {
-        if let Some(dir) = &cfg.sandbox_directory {
-            match ahma_common::config::ensure_sandbox_directory(dir) {
-                Ok(canonical) => {
-                    tracing::info!(
-                        "Persistent sandbox directory (--sandbox): {}",
-                        canonical.display()
-                    );
-                    Some(canonical)
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to create sandbox directory {:?}: {}", dir, e);
-                    None
-                }
-            }
-        } else {
-            tracing::warn!("--sandbox set but no sandbox_directory configured; ignoring");
-            None
-        }
-    } else {
-        None
-    };
+    let sandbox_dir = resolve_persistent_sandbox_dir(cfg);
 
     // User-granted persistent scopes (e.g. an sccache cache outside the workspace).
     // Folded into the sandbox now (so initial enforcement covers them) and
@@ -2852,17 +2864,23 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn initialize_sandbox(cfg: &AppConfig) -> Result<Option<Arc<sandbox::Sandbox>>> {
-    let mut policy = resolve_sandbox_policy(cfg);
+    let policy = resolve_sandbox_policy(cfg);
 
-    let deferred_host = match check_sandbox_availability(policy.no_sandbox)? {
-        SandboxAvailability::Available => None,
+    // Rebuilding the policy rather than mutating it keeps this compiling warning-free
+    // where `DeferToHost` is cfg'd out — a `mut` binding would then be needless.
+    let (policy, deferred_host) = match check_sandbox_availability(policy.no_sandbox)? {
+        SandboxAvailability::Available => (policy, None),
+        #[cfg(target_os = "macos")]
         SandboxAvailability::DeferToHost(host) => {
             // Cannot nest ahma's own sandbox inside the proven outer sandbox — run
             // in Test mode (no ahma enforcement) and rely on the host. Disclosed
             // loudly by log_sandbox_mode below.
-            policy.no_sandbox = true;
-            policy.mode = sandbox::SandboxMode::Test;
-            Some(host)
+            let policy = SandboxPolicy {
+                no_sandbox: true,
+                mode: sandbox::SandboxMode::Test,
+                ..policy
+            };
+            (policy, Some(host))
         }
     };
 
