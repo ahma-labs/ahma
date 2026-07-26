@@ -454,26 +454,65 @@ async fn check_bridge_running(socket_path: Option<&str>, http_url: Option<&str>)
     get_bridge_version(socket_path, http_url).await.is_some()
 }
 
-/// Ask the running bridge to shut down, then wait (up to 2s) for it to stop
-/// answering health checks so the caller can start a replacement.
+/// How long [`restart_bridge_server`] waits for the old bridge to stop answering
+/// health checks.
+const BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often [`restart_bridge_server`] re-checks while waiting for that stop.
+const BRIDGE_STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Poll `still_running` until it reports the bridge is gone, or until `timeout`
+/// elapses. Returns `true` only when a check actually *observed* the bridge stop;
+/// a timeout returns `false`.
 ///
-/// Best-effort: a refused or unanswered restart request is logged, not fatal —
-/// the caller spawns a fresh bridge either way.
+/// The two outcomes are kept distinguishable on purpose. This wait previously
+/// reported "Old bridge stopped." on both, which logged the one case an operator
+/// needs to see — the old bridge outliving the wait, so a replacement is spawned
+/// while it may still hold the socket or port — as a success.
+async fn wait_for_bridge_to_stop(
+    timeout: Duration,
+    poll_interval: Duration,
+    still_running: impl AsyncFn() -> bool,
+) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if !still_running().await {
+            return true;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+    false
+}
+
+/// Ask the running bridge to shut down, then wait (up to [`BRIDGE_STOP_TIMEOUT`])
+/// for it to stop answering health checks so the caller can start a replacement.
+///
+/// Best-effort: neither a refused restart request nor a bridge that outlives the
+/// wait is fatal — the caller spawns a fresh bridge either way. Both are logged at
+/// `warn` so that a replacement which then fails to bind is explainable.
 async fn restart_bridge_server(socket_path_opt: Option<&str>, http_url_opt: Option<&str>) {
     tracing::info!(
         "Client version is newer than running bridge version. Requesting bridge restart..."
     );
-    if trigger_bridge_restart(socket_path_opt, http_url_opt).await {
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(2) {
-            if !check_bridge_running(socket_path_opt, http_url_opt).await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+    if !trigger_bridge_restart(socket_path_opt, http_url_opt).await {
+        tracing::warn!("Failed to request bridge restart. Attempting to start anyway.");
+        return;
+    }
+
+    let stopped =
+        wait_for_bridge_to_stop(BRIDGE_STOP_TIMEOUT, BRIDGE_STOP_POLL_INTERVAL, async || {
+            check_bridge_running(socket_path_opt, http_url_opt).await
+        })
+        .await;
+
+    if stopped {
         tracing::info!("Old bridge stopped. Starting new bridge...");
     } else {
-        tracing::warn!("Failed to request bridge restart. Attempting to start anyway.");
+        tracing::warn!(
+            timeout_secs = BRIDGE_STOP_TIMEOUT.as_secs(),
+            "Old bridge is still answering health checks after the shutdown wait; starting a \
+             new bridge anyway. If the old process still holds the socket or port, the \
+             replacement may fail to bind."
+        );
     }
 }
 
@@ -2212,6 +2251,55 @@ mod tests {
         assert!(
             result.is_ok(),
             "a child_process server entry must be skipped (only Http is wired), not error: {result:?}"
+        );
+    }
+
+    /// Regression test: a bridge that outlives the shutdown wait must be reported as
+    /// *not stopped*. `restart_bridge_server` used to log "Old bridge stopped." on
+    /// this path too, so the timeout was indistinguishable from a clean stop.
+    #[tokio::test]
+    async fn wait_for_bridge_to_stop_reports_timeout_when_bridge_never_stops() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+
+        let stopped = wait_for_bridge_to_stop(
+            Duration::from_millis(60),
+            Duration::from_millis(10),
+            async || {
+                polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true // still answering health checks, forever
+            },
+        )
+        .await;
+
+        assert!(
+            !stopped,
+            "a bridge still answering after the timeout must report not-stopped"
+        );
+        assert!(
+            polls.load(std::sync::atomic::Ordering::Relaxed) > 1,
+            "the wait must actually poll more than once before giving up"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_bridge_to_stop_reports_success_when_bridge_goes_away() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+
+        let stopped = wait_for_bridge_to_stop(
+            Duration::from_secs(30),
+            Duration::from_millis(1),
+            async || {
+                // Answers twice, then the bridge is gone.
+                polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2
+            },
+        )
+        .await;
+
+        assert!(stopped, "an observed stop must report stopped");
+        assert_eq!(
+            polls.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "the wait must return on the first check that observes the stop"
         );
     }
 }
