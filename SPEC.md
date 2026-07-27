@@ -2210,6 +2210,38 @@ If the symlink does not exist or does not resolve, the check fails.
 developing Ahma**. Do not copy developer-only content (testing rules, cross-platform checklist,
 commit format) into the skill, and do not copy agent usage recipes into AGENTS.md.
 
+### R-SK8 — Running standard skills
+
+Ahma does not only *ship* skills — it can *run* any skill that follows the
+[Agent Skills open standard](https://agentskills.io/specification). Implemented in
+`ahma_common::skills` (discovery/parsing) and the ahma TUI chat dispatch.
+
+- **R-SK8.1 Discovery**: skills are discovered from, in precedence order:
+  `<workspace>/.agents/skills/`, `<workspace>/.claude/skills/`, `~/.agents/skills/`,
+  `~/.claude/skills/`. The first skill found under a given name shadows later roots
+  (workspace beats user-global); roots that resolve to the same directory (symlinks)
+  are scanned once.
+- **R-SK8.2 Validation**: `SKILL.md` frontmatter is validated per the standard —
+  required `name` (1–64 chars; lowercase alphanumerics and hyphens; no
+  leading/trailing/consecutive hyphens; must match the skill directory name) and
+  required non-empty `description` (≤1024 chars). Unknown fields and nested maps
+  (`metadata:` etc.) are tolerated and ignored. Invalid skill directories MUST be
+  disclosed with the reason (in `/skills` output), never silently hidden.
+- **R-SK8.3 User invocation (TUI)**: in the TUI chat, `/<name> [args]` invokes a
+  discovered skill. Built-in commands are matched first, so a built-in always shadows
+  a same-named skill. `/skill <name> [args]` is the explicit form (a missing name is
+  reported, not treated as an unknown command); `/skills` and bare `/skill` list the
+  discovered skills. Discovered skills also appear in the `/` command navigator.
+- **R-SK8.4 Injection**: the chat pane displays the typed command; the LLM receives
+  the full `SKILL.md` instruction body plus the user's arguments — on the invoking
+  turn **and every later turn** of the conversation, so the skill stays in effect.
+  Context-size accounting counts the injected payload, not the short displayed text.
+- **R-SK8.5 `user-invocable` gate**: the `user-invocable` frontmatter extension
+  (R-SK2) gates slash invocation. Absent means `true`, so third-party standard skills
+  (which do not know the field) remain invocable. `user-invocable: false` skills are
+  listed with a marker but cannot be slash-invoked and are not offered in the
+  navigator.
+
 ---
 
 ## 16. Future Work

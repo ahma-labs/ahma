@@ -1195,6 +1195,7 @@ fn push_chat_entry_lines(
     match entry {
         ChatEntry::User {
             text,
+            payload: _,
             started_at,
             duration_ms,
         } => {
@@ -1814,7 +1815,7 @@ fn navigator_list_items(
                 theme.normal()
             };
             let cmd_str = truncate(&cmd.command, desc_col);
-            let desc_str = truncate(cmd.description, inner_width.saturating_sub(desc_col + 2));
+            let desc_str = truncate(&cmd.description, inner_width.saturating_sub(desc_col + 2));
             let desc_style = if selected_row { style } else { theme.dim() };
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {:<width$}", cmd_str, width = desc_col), style),
@@ -2036,7 +2037,9 @@ fn conversation_chars(state: &AppState) -> usize {
         .entries()
         .iter()
         .map(|e| match e {
-            ChatEntry::User { text, .. } => text.len(),
+            // Count what the LLM actually receives: a `/skill` invocation sends
+            // its payload, not the short displayed command.
+            ChatEntry::User { text, payload, .. } => payload.as_deref().unwrap_or(text).len(),
             ChatEntry::Thinking { content, .. } | ChatEntry::Assistant { content, .. } => {
                 content.len()
             }
@@ -3893,6 +3896,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Enter", "Run selected command"),
         ("/help, /?", "Show keyboard reference"),
         ("/run <tool> {json}", "Run tool with JSON args"),
+        ("/skills", "List Agent Skills; run one with /<name> [args]"),
         ("", ""),
         ("COMMAND PALETTE (:)", ""),
         ("Tab", "Next completion"),
@@ -3990,6 +3994,7 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("Enter", "Run selected command"),
         ("/help, /?", "Show keyboard reference"),
         ("/run <tool> {json}", "Run a tool manually with JSON args"),
+        ("/skills", "List Agent Skills; run one with /<name> [args]"),
         ("", ""),
         ("COMMAND PALETTE (:)", ""),
         ("Tab", "Next completion"),

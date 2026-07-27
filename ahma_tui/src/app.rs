@@ -1241,6 +1241,7 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
 
     state.chat.push(ChatEntry::User {
         text,
+        payload: None,
         started_at: Some(std::time::Instant::now()),
         duration_ms: None,
     });
@@ -1250,6 +1251,12 @@ fn submit_chat_input(state: &mut crate::state::AppState) {
     });
     state.chat_scroll = 0;
 
+    send_chat_turn(state, base_url, model);
+}
+
+/// Collect the current conversation and submit it to the daemon LLM loop.
+#[cfg(feature = "tui")]
+fn send_chat_turn(state: &mut crate::state::AppState, base_url: String, model: String) {
     let messages = collect_chat_history(state)
         .into_iter()
         .map(|msg| {
@@ -1461,7 +1468,11 @@ fn collect_chat_history(state: &crate::state::AppState) -> Vec<ahma_llm_monitor:
         .entries()
         .iter()
         .filter_map(|entry| match entry {
-            ChatEntry::User { text, .. } => Some(ChatMessage::user(text.clone())),
+            // A `/skill` invocation displays the typed command but sends the
+            // full skill instructions (SPEC R-SK8): prefer the payload.
+            ChatEntry::User { text, payload, .. } => Some(ChatMessage::user(
+                payload.clone().unwrap_or_else(|| text.clone()),
+            )),
             ChatEntry::Assistant {
                 content,
                 streaming: false,
@@ -1621,8 +1632,9 @@ fn handle_navigator_action(
 #[cfg(feature = "tui")]
 fn open_navigator(state: &mut crate::state::AppState) {
     let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
+    let skills = skill_nav_commands(state);
     state.modal =
-        crate::state::ModalState::Navigator(crate::state::CommandNavigator::opened(&tools));
+        crate::state::ModalState::Navigator(crate::state::CommandNavigator::opened(&tools, skills));
 }
 
 #[cfg(feature = "tui")]
@@ -1961,7 +1973,8 @@ fn handle_chat_input_key(
             if state.chat_input_is_empty() {
                 state.chat_input.insert_str("/run ");
                 let tools: Vec<String> = state.tools_list.iter().map(|t| t.name.clone()).collect();
-                let mut nav = crate::state::CommandNavigator::opened(&tools);
+                let skills = skill_nav_commands(state);
+                let mut nav = crate::state::CommandNavigator::opened(&tools, skills);
                 nav.input = "run ".to_string();
                 nav.refresh_completions(&tools);
                 state.modal = crate::state::ModalState::Navigator(nav);
@@ -2071,14 +2084,190 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
         || handle_run_nav_command(cmd, state)
         || handle_monitor_nav_command(cmd, state)
         || handle_analyze_nav_command(cmd, state)
+        || handle_skills_nav_command(cmd, state)
     {
         return;
     }
 
     push_assistant_message(
         state,
-        format!("Unknown command `{cmd}`. Use /help to see the available commands."),
+        format!(
+            "Unknown command `{cmd}`. Use /help for the built-in commands or /skills for the Agent Skills you can invoke with /<name>."
+        ),
     );
+}
+
+/// `/skills` (and bare `/skill`) lists discovered Agent Skills; `/skill <name>
+/// [args]` or plain `/<name> [args]` invokes one (SPEC R-SK8). Runs after
+/// every built-in handler so built-in commands always shadow same-named
+/// skills.
+#[cfg(feature = "tui")]
+fn handle_skills_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    let (head, rest) = split_first_token(cmd.trim_start_matches('/'));
+
+    match head {
+        "skills" => {
+            list_skills(state);
+            true
+        }
+        "skill" => {
+            // Explicit form: a missing skill is reported, not treated as an
+            // unknown command.
+            let (name, args) = split_first_token(rest);
+            if name.is_empty() {
+                list_skills(state);
+            } else if let Some(skill) = find_user_skill(state, name) {
+                invoke_skill(state, &skill, args, cmd);
+            } else {
+                push_assistant_message(
+                    state,
+                    format!(
+                        "No Agent Skill named `{name}`. Use /skills to list what is available."
+                    ),
+                );
+            }
+            true
+        }
+        name => {
+            // Implicit form `/<name> [args]`: only names that are valid per the
+            // Agent Skills spec and actually resolve to a skill are consumed;
+            // everything else falls through to the unknown-command message.
+            if ahma_common::skills::validate_name(name).is_err() {
+                return false;
+            }
+            let Some(skill) = find_user_skill(state, name) else {
+                return false;
+            };
+            invoke_skill(state, &skill, rest, cmd);
+            true
+        }
+    }
+}
+
+/// Split `s` into its first whitespace-delimited token and the trimmed rest.
+fn split_first_token(s: &str) -> (&str, &str) {
+    let s = s.trim();
+    match s.split_once(char::is_whitespace) {
+        Some((head, rest)) => (head, rest.trim()),
+        None => (s, ""),
+    }
+}
+
+/// Look up a user-invocable skill by name from the standard discovery roots.
+#[cfg(feature = "tui")]
+fn find_user_skill(
+    state: &crate::state::AppState,
+    name: &str,
+) -> Option<ahma_common::skills::Skill> {
+    ahma_common::skills::discover_skills(std::path::Path::new(&state.workspace))
+        .get(name)
+        .filter(|s| s.user_invocable)
+        .cloned()
+}
+
+/// Post the `/skills` listing into the chat, disclosing skipped skill
+/// directories rather than hiding them.
+#[cfg(feature = "tui")]
+fn list_skills(state: &mut crate::state::AppState) {
+    let workspace = std::path::Path::new(&state.workspace);
+    let set = ahma_common::skills::discover_skills(workspace);
+    let mut msg = String::new();
+
+    if set.skills.is_empty() {
+        msg.push_str("No Agent Skills found. Searched:\n");
+        for root in ahma_common::skills::skill_roots(workspace) {
+            msg.push_str(&format!("- {}\n", root.display()));
+        }
+    } else {
+        msg.push_str("Available Agent Skills — invoke with `/<name> [args]`:\n");
+        for s in &set.skills {
+            let note = if s.user_invocable {
+                ""
+            } else {
+                " (not user-invocable)"
+            };
+            msg.push_str(&format!("- **/{}**{note} — {}\n", s.name, s.description));
+        }
+    }
+    for e in &set.invalid {
+        msg.push_str(&format!("\n⚠ Skipped {}: {}", e.path.display(), e.reason));
+    }
+
+    push_assistant_message(state, msg.trim_end().to_string());
+}
+
+/// Inject the skill's SKILL.md instructions as the LLM payload for this turn
+/// while the pane displays the typed command (SPEC R-SK8).
+#[cfg(feature = "tui")]
+fn invoke_skill(
+    state: &mut crate::state::AppState,
+    skill: &ahma_common::skills::Skill,
+    args: &str,
+    typed: &str,
+) {
+    let (base_url, model) = parse_llm_selection(state);
+    if base_url.is_empty() {
+        push_assistant_message(state, "No LLM configured. Use /provider to select one.");
+        return;
+    }
+
+    state.push_log(crate::state::LogEntry {
+        timestamp: chrono::Local::now(),
+        level: crate::state::LogLevel::Info,
+        message: format!(
+            "Skill '{}' loaded from {} ({} lines)",
+            skill.name,
+            skill.path.display(),
+            skill.body.lines().count()
+        ),
+    });
+
+    state.chat.push(crate::state::ChatEntry::User {
+        text: typed.to_string(),
+        payload: Some(compose_skill_prompt(skill, args)),
+        started_at: Some(std::time::Instant::now()),
+        duration_ms: None,
+    });
+    state.chat.push(crate::state::ChatEntry::Assistant {
+        content: String::new(),
+        streaming: true,
+    });
+    state.chat_scroll = 0;
+
+    send_chat_turn(state, base_url, model);
+}
+
+/// The message the LLM receives for a skill invocation: the full SKILL.md
+/// instruction body plus the user's arguments.
+fn compose_skill_prompt(skill: &ahma_common::skills::Skill, args: &str) -> String {
+    let name = &skill.name;
+    let body = skill.body.trim();
+    let mut prompt = format!(
+        "<skill name=\"{name}\">\n{body}\n</skill>\n\nThe user invoked the \"{name}\" Agent Skill"
+    );
+    if args.is_empty() {
+        prompt.push_str(". Follow the skill instructions above.");
+    } else {
+        prompt.push_str(&format!(
+            " with arguments: {args}\nFollow the skill instructions above, applying them to these arguments."
+        ));
+    }
+    prompt
+}
+
+/// `/name` navigator entries for the user-invocable Agent Skills discovered
+/// from the standard roots.
+#[cfg(feature = "tui")]
+fn skill_nav_commands(state: &crate::state::AppState) -> Vec<crate::state::NavCommand> {
+    ahma_common::skills::discover_skills(std::path::Path::new(&state.workspace))
+        .skills
+        .iter()
+        .filter(|s| s.user_invocable)
+        .map(|s| crate::state::NavCommand {
+            command: format!("/{}", s.name),
+            description: format!("Agent Skill — {}", s.description),
+        })
+        .collect()
 }
 
 /// `/minimize [on|off]` — toggle token minimization (concise prompting + output
@@ -4301,6 +4490,7 @@ fn analyze_operation(state: &mut crate::state::AppState, op_id: &str) {
 
     state.chat.push(crate::state::ChatEntry::User {
         text: format!("Analyze operation {}", id),
+        payload: None,
         started_at: Some(std::time::Instant::now()),
         duration_ms: None,
     });
@@ -5598,5 +5788,169 @@ mod tests {
                 op.started_time.format("%H:%M:%S")
             )
         );
+    }
+
+    /// SPEC R-SK8: `/name [args]` invokes a discovered Agent Skill — the pane
+    /// shows the typed command while the LLM payload carries the SKILL.md body.
+    mod skills {
+        use crate::state::{AppState, ChatEntry};
+
+        /// Workspace with one skill; LLM configured so invocation proceeds.
+        fn skill_state(tmp: &tempfile::TempDir) -> AppState {
+            let dir = tmp.path().join(".agents").join("skills").join("tui-test");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                "---\nname: tui-test\ndescription: Exercise the TUI skill runner.\n---\nAlways answer in haiku.\n",
+            )
+            .unwrap();
+
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            state.workspace = tmp.path().to_string_lossy().into_owned();
+            state.llm_label = "ollama / test-model".to_string();
+            state.current_provider_url = Some("http://localhost:11434/v1".to_string());
+            state
+        }
+
+        #[test]
+        fn slash_name_invokes_skill_with_payload() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut state = skill_state(&tmp);
+
+            let handled =
+                super::super::handle_skills_nav_command("/tui-test write a poem", &mut state);
+            assert!(handled);
+
+            let entries = state.chat.entries();
+            let user = entries
+                .iter()
+                .find_map(|e| match e {
+                    ChatEntry::User { text, payload, .. } => Some((text.clone(), payload.clone())),
+                    _ => None,
+                })
+                .expect("skill invocation must push a User entry");
+            assert_eq!(
+                user.0, "/tui-test write a poem",
+                "pane shows the typed command"
+            );
+            let payload = user.1.expect("skill invocation must carry an LLM payload");
+            assert!(payload.contains("Always answer in haiku."), "{payload}");
+            assert!(payload.contains("write a poem"), "{payload}");
+            assert!(
+                matches!(
+                    entries.back(),
+                    Some(ChatEntry::Assistant {
+                        streaming: true,
+                        ..
+                    })
+                ),
+                "a streaming assistant entry must be open"
+            );
+        }
+
+        #[test]
+        fn explicit_skill_form_and_missing_skill_report() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut state = skill_state(&tmp);
+
+            assert!(super::super::handle_skills_nav_command(
+                "/skill tui-test",
+                &mut state
+            ));
+            let has_payload = state.chat.entries().iter().any(|e| {
+                matches!(
+                    e,
+                    ChatEntry::User {
+                        payload: Some(_),
+                        ..
+                    }
+                )
+            });
+            assert!(has_payload, "/skill <name> must invoke like /<name>");
+
+            assert!(super::super::handle_skills_nav_command(
+                "/skill no-such-skill-xyzzy",
+                &mut state
+            ));
+            let last = state.chat.entries().back().cloned();
+            let Some(ChatEntry::Assistant { content, .. }) = last else {
+                panic!("missing-skill report must be an assistant message");
+            };
+            assert!(content.contains("no-such-skill-xyzzy"), "{content}");
+        }
+
+        #[test]
+        fn unknown_or_invalid_names_fall_through() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut state = skill_state(&tmp);
+            assert!(!super::super::handle_skills_nav_command(
+                "/no-such-skill-xyzzy",
+                &mut state
+            ));
+            // Uppercase is invalid per the Agent Skills spec — never a skill.
+            assert!(!super::super::handle_skills_nav_command(
+                "/Bogus", &mut state
+            ));
+        }
+
+        #[test]
+        fn skills_listing_names_workspace_skill() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut state = skill_state(&tmp);
+            assert!(super::super::handle_skills_nav_command(
+                "/skills", &mut state
+            ));
+            let Some(ChatEntry::Assistant { content, .. }) = state.chat.entries().back() else {
+                panic!("listing must be an assistant message");
+            };
+            assert!(content.contains("/tui-test"), "{content}");
+            assert!(
+                content.contains("Exercise the TUI skill runner."),
+                "{content}"
+            );
+        }
+
+        #[test]
+        fn non_user_invocable_skill_is_listed_but_not_invocable() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut state = skill_state(&tmp);
+            let dir = tmp.path().join(".agents").join("skills").join("model-only");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                "---\nname: model-only\ndescription: Not for slash use.\nuser-invocable: false\n---\nBody.\n",
+            )
+            .unwrap();
+
+            assert!(
+                !super::super::handle_skills_nav_command("/model-only", &mut state),
+                "user-invocable: false must not be /name-invocable"
+            );
+            let nav = super::super::skill_nav_commands(&state);
+            assert!(nav.iter().any(|c| c.command == "/tui-test"));
+            assert!(!nav.iter().any(|c| c.command == "/model-only"));
+
+            assert!(super::super::handle_skills_nav_command(
+                "/skills", &mut state
+            ));
+            let Some(ChatEntry::Assistant { content, .. }) = state.chat.entries().back() else {
+                panic!("listing must be an assistant message");
+            };
+            assert!(content.contains("not user-invocable"), "{content}");
+        }
+
+        #[test]
+        fn collect_chat_history_prefers_payload() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut state = skill_state(&tmp);
+            state.chat.push(ChatEntry::User {
+                text: "/tui-test".into(),
+                payload: Some("full instructions".into()),
+                started_at: None,
+                duration_ms: None,
+            });
+            let history = super::super::collect_chat_history(&state);
+            assert_eq!(history.last().unwrap().content, "full instructions");
+        }
     }
 }

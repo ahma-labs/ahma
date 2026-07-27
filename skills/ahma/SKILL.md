@@ -605,6 +605,11 @@ ahma tui
 
 This opens the terminal dashboard for monitoring active operations, viewing logs, and approving gates.
 
+Inside the TUI chat, `/skills` lists Agent Skills discovered from the standard locations
+(`.agents/skills/` and `.claude/skills/` in the workspace and home directory), and
+`/<name> [args]` runs one — the skill's `SKILL.md` instructions are injected into the
+LLM conversation per the [Agent Skills standard](https://agentskills.io/specification).
+
 ---
 
 ## `/ahma update [ref]` — Update the Installed Binary

@@ -67,6 +67,11 @@ pub enum ChatEntry {
     /// A message submitted by the user.
     User {
         text: String,
+        /// When set, this — not `text` — is what the LLM receives for this turn.
+        /// `text` stays what the pane displays. Used by `/skill` invocations
+        /// (SPEC R-SK8): the pane shows the typed command while the model gets
+        /// the full SKILL.md instructions, on this and every later turn.
+        payload: Option<String>,
         started_at: Option<std::time::Instant>,
         duration_ms: Option<u64>,
     },
@@ -263,130 +268,62 @@ pub struct NavCommand {
     /// The full command string, e.g. `/help`.
     pub command: String,
     /// Short description shown in the picker.
-    pub description: &'static str,
+    pub description: String,
 }
 
 /// The full set of built-in `/` commands.
 pub fn builtin_commands() -> Vec<NavCommand> {
-    vec![
-        NavCommand {
-            command: "/help".into(),
-            description: "show keyboard reference",
-        },
-        NavCommand {
-            command: "/?".into(),
-            description: "show keyboard reference (alias)",
-        },
-        NavCommand {
-            command: "/mode chat".into(),
-            description: "switch to chat interface",
-        },
-        NavCommand {
-            command: "/mode monitor".into(),
-            description: "switch to monitor dashboard",
-        },
-        NavCommand {
-            command: "/provider".into(),
-            description: "select LLM provider",
-        },
-        NavCommand {
-            command: "/model".into(),
-            description: "select model for current provider",
-        },
-        NavCommand {
-            command: "/minimize on".into(),
-            description: "enable token minimization (concise prompts, compressed output)",
-        },
-        NavCommand {
-            command: "/minimize off".into(),
-            description: "disable token minimization (default)",
-        },
-        NavCommand {
-            command: "/mcp on".into(),
-            description: "enable ahma as MCP tool server",
-        },
-        NavCommand {
-            command: "/mcp off".into(),
-            description: "disable ahma MCP tool server",
-        },
-        NavCommand {
-            command: "/mcp list".into(),
-            description: "list configured MCP client servers",
-        },
-        NavCommand {
-            command: "/mcp refresh".into(),
-            description: "refresh tools from configured MCP servers",
-        },
-        NavCommand {
-            command: "/mcp add http <url> [name]".into(),
-            description: "add an HTTP MCP server",
-        },
-        NavCommand {
-            command: "/mcp add stdio <cmd> [args] [--name <n>]".into(),
-            description: "add a stdio MCP server",
-        },
-        NavCommand {
-            command: "/mcp remove <name>".into(),
-            description: "remove a configured MCP server",
-        },
-        NavCommand {
-            command: "/run <tool> {json}".into(),
-            description: "invoke an ahma tool directly with optional JSON args",
-        },
-        NavCommand {
-            command: "/tools".into(),
-            description: "list available ahma tools",
-        },
-        NavCommand {
-            command: "/operations".into(),
-            description: "jump to operations panel",
-        },
-        NavCommand {
-            command: "/logs".into(),
-            description: "jump to log panel",
-        },
-        NavCommand {
-            command: "/approve".into(),
-            description: "approve pending gate",
-        },
-        NavCommand {
-            command: "/reject".into(),
-            description: "reject pending gate",
-        },
-        NavCommand {
-            command: "/clear".into(),
-            description: "clear chat & finished windows (logs kept)",
-        },
-        NavCommand {
-            command: "/agent list".into(),
-            description: "list saved agent profiles",
-        },
-        NavCommand {
-            command: "/agent save <name>".into(),
-            description: "save current setup as an agent profile",
-        },
-        NavCommand {
-            command: "/agent load <name>".into(),
-            description: "load an agent profile",
-        },
-        NavCommand {
-            command: "/agent delete <name>".into(),
-            description: "delete an agent profile",
-        },
-        NavCommand {
-            command: "/export markdown".into(),
-            description: "export chat transcript to markdown",
-        },
-        NavCommand {
-            command: "/settings".into(),
-            description: "open settings panel (edit & persist)",
-        },
-        NavCommand {
-            command: "/quit".into(),
-            description: "quit the application",
-        },
+    const CMDS: &[(&str, &str)] = &[
+        ("/help", "show keyboard reference"),
+        ("/?", "show keyboard reference (alias)"),
+        ("/mode chat", "switch to chat interface"),
+        ("/mode monitor", "switch to monitor dashboard"),
+        ("/provider", "select LLM provider"),
+        ("/model", "select model for current provider"),
+        (
+            "/minimize on",
+            "enable token minimization (concise prompts, compressed output)",
+        ),
+        ("/minimize off", "disable token minimization (default)"),
+        ("/mcp on", "enable ahma as MCP tool server"),
+        ("/mcp off", "disable ahma MCP tool server"),
+        ("/mcp list", "list configured MCP client servers"),
+        ("/mcp refresh", "refresh tools from configured MCP servers"),
+        ("/mcp add http <url> [name]", "add an HTTP MCP server"),
+        (
+            "/mcp add stdio <cmd> [args] [--name <n>]",
+            "add a stdio MCP server",
+        ),
+        ("/mcp remove <name>", "remove a configured MCP server"),
+        (
+            "/run <tool> {json}",
+            "invoke an ahma tool directly with optional JSON args",
+        ),
+        ("/tools", "list available ahma tools"),
+        ("/skills", "list Agent Skills invocable with /<name>"),
+        ("/operations", "jump to operations panel"),
+        ("/logs", "jump to log panel"),
+        ("/approve", "approve pending gate"),
+        ("/reject", "reject pending gate"),
+        ("/clear", "clear chat & finished windows (logs kept)"),
+        ("/agent list", "list saved agent profiles"),
+        (
+            "/agent save <name>",
+            "save current setup as an agent profile",
+        ),
+        ("/agent load <name>", "load an agent profile"),
+        ("/agent delete <name>", "delete an agent profile"),
+        ("/export markdown", "export chat transcript to markdown"),
+        ("/settings", "open settings panel (edit & persist)"),
+        ("/quit", "quit the application"),
         // /exit intentionally omitted — still handled, just not advertised
-    ]
+    ];
+    CMDS.iter()
+        .map(|(command, description)| NavCommand {
+            command: (*command).into(),
+            description: (*description).into(),
+        })
+        .collect()
 }
 
 /// State for the `/` command navigator overlay.
@@ -398,25 +335,34 @@ pub struct CommandNavigator {
     pub completions: Vec<NavCommand>,
     /// Index of the highlighted completion.
     pub selected: usize,
+    /// `/name` entries for discovered Agent Skills (SPEC R-SK8), captured when
+    /// the navigator opens so keystroke filtering does not re-scan the disk.
+    pub skill_commands: Vec<NavCommand>,
 }
 
 impl CommandNavigator {
-    /// Build a freshly-opened navigator with completions seeded from `tools`.
+    /// Build a freshly-opened navigator with completions seeded from `tools`
+    /// and discovered Agent Skills.
     /// Visibility is owned by [`ModalState`], not this struct (SPEC R23).
-    pub fn opened(tools: &[String]) -> Self {
-        let mut nav = CommandNavigator::default();
+    pub fn opened(tools: &[String], skills: Vec<NavCommand>) -> Self {
+        let mut nav = CommandNavigator {
+            skill_commands: skills,
+            ..CommandNavigator::default()
+        };
         nav.refresh_completions(tools);
         nav
     }
 
-    /// Rebuild completions from builtins + dynamic `/run <tool>` entries.
+    /// Rebuild completions from builtins + dynamic `/run <tool>` and skill
+    /// entries.
     pub fn refresh_completions(&mut self, tools: &[String]) {
         let mut cmds = builtin_commands();
+        cmds.extend(self.skill_commands.iter().cloned());
         // Add a `/run <tool>` entry for every known ahma tool.
         for t in tools {
             cmds.push(NavCommand {
                 command: format!("/run {t}"),
-                description: "run ahma tool",
+                description: "run ahma tool".into(),
             });
         }
 
@@ -2968,6 +2914,7 @@ mod tests {
         let mut hist = ChatHistory::default();
         hist.push(ChatEntry::User {
             text: "Hello!".into(),
+            payload: None,
             started_at: None,
             duration_ms: None,
         });
@@ -2976,6 +2923,7 @@ mod tests {
         hist.finish_stream();
         hist.push(ChatEntry::User {
             text: "Thanks.".into(),
+            payload: None,
             started_at: None,
             duration_ms: None,
         });
@@ -3152,6 +3100,7 @@ mod tests {
         let mut hist = ChatHistory::default();
         hist.push(ChatEntry::User {
             text: "done turn".into(),
+            payload: None,
             started_at: None,
             duration_ms: None,
         });
@@ -3193,6 +3142,7 @@ mod tests {
 
         s.chat.push(ChatEntry::User {
             text: "hi".into(),
+            payload: None,
             started_at: None,
             duration_ms: None,
         });
@@ -3255,7 +3205,7 @@ mod tests {
         let tools = vec!["cargo_build".to_string()];
 
         // When input is empty, should return all builtins (including /quit, but NOT /q) plus dynamic tools
-        let mut nav = CommandNavigator::opened(&tools);
+        let mut nav = CommandNavigator::opened(&tools, vec![]);
         assert!(nav.completions.iter().any(|c| c.command == "/quit"));
         assert!(!nav.completions.iter().any(|c| c.command == "/q"));
         assert!(
@@ -3306,6 +3256,26 @@ mod tests {
         assert!(nav.completions.iter().any(|c| c.command == "/quit"));
     }
 
+    /// SPEC R-SK8: discovered Agent Skills appear in the `/` navigator and
+    /// survive keystroke-driven refreshes.
+    #[test]
+    fn navigator_includes_skill_commands() {
+        let skills = vec![NavCommand {
+            command: "/my-skill".into(),
+            description: "Agent Skill — does things".into(),
+        }];
+        let mut nav = CommandNavigator::opened(&[], skills);
+        assert!(nav.completions.iter().any(|c| c.command == "/my-skill"));
+
+        nav.input = "my-sk".to_string();
+        nav.refresh_completions(&[]);
+        assert!(nav.completions.iter().any(|c| c.command == "/my-skill"));
+
+        nav.input = "zzz-no-match".to_string();
+        nav.refresh_completions(&[]);
+        assert!(!nav.completions.iter().any(|c| c.command == "/my-skill"));
+    }
+
     /// SPEC R23: at most one user overlay is open at a time. Opening a second
     /// overlay replaces the first; the projection accessors agree with the
     /// active variant and report `None` for every other overlay.
@@ -3321,7 +3291,7 @@ mod tests {
         assert!(s.palette().is_none());
 
         // Opening the navigator replaces help — both are never open at once.
-        s.modal = ModalState::Navigator(CommandNavigator::opened(&[]));
+        s.modal = ModalState::Navigator(CommandNavigator::opened(&[], vec![]));
         assert!(!s.is_help_open());
         assert!(s.navigator().is_some());
         assert!(s.text_entry_modal_open());
