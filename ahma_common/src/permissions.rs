@@ -234,7 +234,7 @@ pub fn records(settings: &AhmaSettings) -> Vec<GrantRecord> {
 // Persisted tool approvals — the `[permissions]` table
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Per-workspace "always allow this tool" grants.
+/// Per-workspace "always allow this tool" grants (SPEC R-PERM.1.1).
 ///
 /// Keyed by **workspace root**, deliberately: trusting `cargo_build` in one
 /// project must not silently trust it in another. The key is the canonicalized
@@ -648,7 +648,8 @@ pub fn migrate_legacy_approvals(settings_file: &Path) -> anyhow::Result<Migratio
 /// rather than propagating failures.
 ///
 /// Called from process startup. A migration failure must never block ahma from
-/// running: the worst case is that the user re-approves a tool once.
+/// running (SPEC R-PERM.2.2): the worst case is that the user re-approves a tool
+/// once.
 pub fn migrate_legacy_approvals_best_effort() {
     let Some(settings_file) = crate::config::settings_path() else {
         return;
@@ -733,8 +734,9 @@ pub fn append_audit_at(path: &Path, entry: &AuditEntry) -> std::io::Result<()> {
 
 /// Append to the real audit log, swallowing (but logging) failures.
 ///
-/// An audit write that fails must not fail the grant it is recording: the grant
-/// itself was already confirmed by a human and is safely in the settings file.
+/// An audit write that fails must not fail the grant it is recording (SPEC
+/// R-PERM.2.2): the grant itself was already confirmed by a human and is safely
+/// in the settings file.
 /// Losing the *record* of it is a lesser harm than losing the *grant*.
 pub fn append_audit(entry: &AuditEntry) {
     let Some(path) = audit_path() else { return };

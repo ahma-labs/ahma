@@ -1,4 +1,4 @@
-//! Session-health event envelopes (issue #485, `docs/session-health-notifications.md`).
+//! Session-health event envelopes (SPEC R8.8; issue #485, `docs/session-health-notifications.md`).
 //!
 //! One internal event type, fanned out over two wire forms:
 //!

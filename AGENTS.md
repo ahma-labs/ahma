@@ -1,616 +1,171 @@
 # AGENTS.md
 
-## About This File
+How to work in this repo. **What** the product does and **why** lives in [SPEC.md](SPEC.md)
+(root) and each crate's own `SPEC.md`. If you need to state a product rule, it goes in a
+SPEC, not here and not only in code.
 
-This file provides AI-specific development guidance for the `ahma` project. For functional requirements and architecture, see [SPEC.md](SPEC.md). These files work together:
+> **A rule that binds one surface binds all of them.** If you write a constraint as a comment
+> in the one file that currently obeys it, the next surface to implement the same thing will
+> not know about it, and it regresses silently. Promote it to the relevant `SPEC.md` and
+> reference the requirement id from the code.
 
-- **SPEC.md**: Single source of truth for **what** the product does and **how** it's architected
-- **AGENTS.md**: Guide for **how** to develop, test, and contribute to the codebase
+## Build, test, verify
 
-**Note for crate-specific workflows**: If you're working in a specific crate directory (e.g., `ahma-http-bridge/`), this AGENTS.md is symlinked and applies workspace-wide. Crate-specific functional requirements are in each crate's `SPEC.md`.
-
-## When to use ahma vs the native terminal
-
-For commands run during this project, prefer ahma's `run_terminal_command` (via `CallMcpTool` on Cursor) when any of these apply:
-
-- the command writes to disk — the kernel-enforced sandbox keeps writes inside the workspace
-- the command runs for more than a few seconds — `run_terminal_command` is async, returns an operation_id, and lets the agent continue other work while it runs
-- the output should be watched for errors mid-run — set `monitor_level` to get pushed alerts
-- multiple independent commands should run concurrently — each gets its own operation_id
-
-For read-only file inspection (read, grep, glob, find, replace-in-file) keep using the IDE's native file tools — they are faster and cheaper than going through MCP.
-
-The downstream effect: `cargo`, `git`, `pytest`, build scripts, formatters, and long log tails go through ahma; file reads and edits stay on native tooling.
-
----
-
-## Setup Commands
-
-### Prerequisites
-- Rust 1.93+ (install via [rustup](https://rustup.rs/))
-- Platform-specific sandbox requirements:
-  - **Linux**: Kernel 5.13+ (Landlock support)
-  - **macOS**: Any modern version (`sandbox-exec` is built-in)
-
-### Initial Setup
-```bash
-# Clone the repository
-git clone https://github.com/paulirotta/ahma.git
-cd ahma
-
-# Build the project
-cargo build
-
-# Run tests (recommended)
-cargo nextest run
-
-# Fallback if nextest not installed
-cargo test
-```
-
-### Development Environment
-```bash
-# Install development tools (optional but recommended)
-cargo install cargo-watch cargo-nextest cargo-llvm-cov
-
-# Watch mode for rapid iteration
-cargo watch -x build
-
-# Run the binary
-./target/debug/ahma --help
-```
-
----
-
-## Build and Test Commands
-
-### Building
-```bash
-# Debug build (fast compilation)
-cargo build
-
-# Release build (optimized)
-cargo build --release
-
-# Build specific crate
-cargo build -p ahma_core
-cargo build -p ahma-http-bridge
-
-# Incubating features are quarantined behind non-default cargo features.
-# The default build excludes vault/cluster/simplify (and the decompose/
-# worker/renewal crates are not in workspace default-members).
-cargo build -p ahma_bin --features cluster   # or: vault, simplify, full
-cargo nextest run -p ahma_vault -p ahma_cluster   # test quarantined crates directly
-```
-
-### Testing
-```bash
-# Run all tests (preferred)
-cargo nextest run
-
-# Run tests for specific crate
-cargo nextest run -p ahma_core
-cargo nextest run -p ahma-http-bridge
-
-# Run specific test
-cargo nextest run test_sandbox_enforcement
-
-# Fallback/Legacy
-cargo test
-
-# Generate coverage report
-cargo llvm-cov --html
-```
-
-### Quality Assurance
-```bash
-# Preferred: run multi-step pipelines via run_terminal_command
-ahma run_terminal_command --working-directory . -- \
-  "cargo fmt --all && cargo clippy --fix --allow-dirty && cargo clippy --fix --allow-dirty --tests && cargo clippy --all-targets && cargo nextest run"
-
-# Individual quality checks (direct)
-cargo fmt --all                    # Format code
-cargo clippy --all-targets         # Lint with auto-fix suggestions
-cargo clippy --fix --allow-dirty   # Auto-fix lints
-```
-
----
-
-## Code Style and Conventions
-
-### Documentation Style
-- **No File Lists**: Do not maintain hardcoded directory trees or file lists in markdown files (like `SPEC.md` or `CLAUDE.md`). AI agents can explore the workspace directly. Hardcoded lists waste context window and become outdated quickly.
-- **Single Source of Truth**: Keep architectural decisions in `SPEC.md` and AI instructions in `AGENTS.md`.
-
-### Rust Style
-- **Formatting**: Use `rustfmt` (enforced by `cargo fmt`)
-- **Linting**: Pass `clippy` with no warnings
-- **Naming**: Follow Rust naming conventions (`snake_case` for functions/variables, `CamelCase` for types)
-- **Documentation**: Public APIs must have doc comments (`///` for items, `//!` for modules)
-
-### Project-Specific Patterns
-
-#### Temporary Python Scripts
-- **Never add or commit Python scripts (`*.py`) to this repository.**
-- Temporary Python scripts may be created and run for one-off local tasks (debugging, data inspection, quick transformations).
-- After use, delete any temporary Python script before finishing work, and ensure no `.py` files are staged or committed.
-- **Tests must never depend on the system `python3` binary or any external Python runtime.** Python is a supported execution target for worker synthesis (`WorkerLanguage::Python`), but the test suite assumes only a Rust toolchain is present. Write Rust-native equivalents; do not rely on a silent graceful skip as a substitute for a real assertion.
-
-#### Error Handling
-- Use `anyhow::Result` for internal error propagation
-- Convert to `rmcp::error::McpError` at the MCP service boundary
-- Include actionable context: `with_context(|| "Failed to X because Y")`
-- Example: "Install with `cargo install cargo-nextest`" in error messages
-
-#### Async/Await
-- **CRITICAL**: Never use `std::fs` or blocking I/O in async functions
-- Use `tokio::fs` and `tokio::io` for all file operations
-- Reserve `tokio::task::spawn_blocking` for:
-  - Third-party libs with only sync APIs
-  - CPU-bound computation (not I/O)
-- Test code is exempt from this rule
-
-#### Logging
-- `error!`: Operation failures affecting user workflows
-- `warn!`: Recoverable issues or deprecated usage
-- `info!`: Normal operation milestones (startup, shutdown, major state changes)
-- `debug!`: Detailed troubleshooting information
-
-#### Stdout Notification Writes (SPEC R5.6.1)
-- **Never use `println!` or `print!` to write protocol data on stdout.** These macros panic on any write error (e.g., broken pipe on Windows = OS error 232).
-- In **stdio server mode** (subprocess spawned by HTTP bridge), stdout is a pipe. The bridge may close it during shutdown, causing broken-pipe errors.
-- **Always use `crate::utils::stdio::emit_stdout_notification`** for all JSON-RPC notifications written to stdout. It classifies errors:
-  - Broken pipe → `debug` log, treated as non-fatal
-  - Other I/O errors → `warn` log, returned to caller
-- **`println!` is acceptable in CLI mode only** (`--list-tools`, single tool execution, validation) where stdout goes to a terminal, not a pipe.
-
----
-
-## Testing Instructions
-
-### Test Pyramid (Read This First)
-
-**Prefer in-memory unit tests over subprocess E2E tests.** This is the single most important rule for keeping CI stable on GitHub's 2-core runners. Every subprocess spawned by a test burns OS scheduler slots; when 20+ tests run in parallel this causes IPC pipe back-pressure and handshake timeouts.
-
-| Layer | When to use | Tools |
-|-------|-------------|-------|
-| **Unit** (default) | Logic, schema generation, config parsing, state machines | Direct API calls, `#[cfg(test)]` |
-| **Integration (in-process)** | MCP protocol logic, tool dispatch, path security, arg parsing, async ops | `create_in_process_mcp_from_dir()` / `create_in_process_mcp_with_scope()` |
-| **E2E (subprocess)** — use sparingly | Binary wiring, CLI flags, cross-binary IPC | `ClientBuilder`, `spawn_http_bridge` |
-
-**Decision rule**: _Can this test be written without forking a process?_ If yes, do it that way. `ClientBuilder` and `spawn_http_bridge` are reserved for tests that specifically verify binary wiring or MCP wire-protocol behavior.
-
-**⚠️ `setup_mcp_service_with_client()` spawns a subprocess** — it is NOT an in-process helper despite the name. It belongs in the E2E row.
-
-Both helpers strictly enforce path validation since `new_test` and validation bypasses have been removed. Tests must ensure that input files and working directories are correctly scoped.
-
-### Test Organization
-Tests are organized into three categories:
-
-1. **Unit Tests**: In-module `#[cfg(test)]` blocks or crate `tests/` directory
-2. **Integration Tests**: Cross-module workflows in workspace `tests/`
-3. **Regression Tests**: Bug fixes must include a test that would have caught the bug
-
-### Test Requirements
-- **Coverage Target**: ≥80% for all crates except:
-  - `ahma_core/src/test_utils.rs` (testing infrastructure)
-  - `ahma-http-bridge/src/main.rs` (binary entry point, tested via CLI integration)
-- **Fast**: Most tests complete in <100ms
-- **Isolated**: Use `tempfile::TempDir` for all file operations (see below)
-- **Deterministic**: Same input always produces same output
-- **Documented**: Test names describe what they verify
-
-### Cross-Platform Test Checklist
-
-All tests run on Linux, macOS, **and Windows** CI. Follow these rules to avoid platform-specific breakage:
-
-- **Never hardcode `/tmp`, `/var/folders`, or `/dev/null`** in tests. Use `test_utils::path_helpers`:
-  - `test_temp_path("name")` — path inside `std::env::temp_dir()` (works on all platforms)
-  - `test_out_of_scope_path()` — guaranteed outside any sandbox scope
-  - `test_blocked_device_path()` — platform device path (`/dev/null` or `NUL`)
-  - `test_abs(&["a","b"])` and `test_root()` — platform-rooted absolute paths
-- **Never hardcode `/bin/sh`, `/bin/bash`, or bash-specific syntax** (e.g. `>&2`, `2>&1`) in shell command strings sent through the tool pipeline. On Windows the shell is `powershell` (PowerShell 5.1+), which uses different redirection syntax.
-- **Prefer `std::env::temp_dir()`** over `/tmp` for any temp-related logic.
-- **Use `Path`/`PathBuf` APIs** instead of string manipulation for path separators — never assume `/` or `\\`.
-- **Avoid `#[cfg(unix)]` gating when cross-platform alternatives exist.** If a test is genuinely Unix-only (e.g. uses `std::os::unix::fs::symlink`), gating is correct. But never gate a test that could be rewritten with cross-platform APIs.
-- **Be aware that `Path::starts_with` is case-sensitive on Windows** even though the filesystem is case-insensitive. Use `dunce::canonicalize` on both sides of comparisons.
-
-### Platform-Aware Timeouts (REQUIRED)
-
-**Never hardcode timeouts.** Windows CI runners are 3-5x slower than Linux/macOS. Use `ahma_common::timeouts`:
-
-```rust
-use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
-
-// Use semantic categories with platform-appropriate defaults
-let timeout = TestTimeouts::get(TimeoutCategory::Handshake);  // 60s base, 240s on Windows
-
-// Scale custom durations by platform multiplier
-let custom = TestTimeouts::scale_secs(5);  // 5s base, 20s on Windows
-
-// Platform-appropriate polling interval
-let interval = TestTimeouts::poll_interval();  // 100ms Unix, 500ms Windows
-
-// Short delay after async operations (e.g., post-SSE exchange)
-sleep(TestTimeouts::short_delay()).await;
-```
-
-Available categories: `ProcessSpawn`, `Handshake`, `ToolCall`, `SandboxReady`, `HttpRequest`, `SseStream`, `HealthCheck`, `Cleanup`, `Quick`. See SPEC.md §10.8 for details.
-
-### Hard Invariants (Do Not “Test Around” These)
-
-#### MCP Streamable HTTP Handshake (HTTP Bridge)
-**E2E HTTP integration tests** MUST mimic real client behavior closely (this rule applies to the E2E subprocess layer; unit and in-process tests are exempt):
-
-1. `initialize` (POST, no session header) → server returns `mcp-session-id`
-2. Open SSE stream (GET `/mcp`, `Accept: text/event-stream`, with `mcp-session-id`) **before** sending `notifications/initialized`
-3. Send `notifications/initialized` (POST with `mcp-session-id`)
-4. Wait for server `roots/list` request over SSE, respond via POST with the same `id`
-5. Only after sandbox is locked, call `tools/call`
-
-If a test client cannot follow this sequence, fix the client/test harness (or the server) rather than weakening assertions.
-
-#### Sandbox Gating Must Be Observable
-`tools/call` before sandbox lock MUST return HTTP 409 with JSON-RPC error code `-32001` ("Sandbox initializing..."). Tests should assert this explicitly where relevant.
-
-#### Dual-Transport Coverage (HTTP Bridge Tool Tests — SPEC.md §R15.5)
-Every test that calls `tools/call` or `tools/list` via the HTTP bridge **must run against BOTH response modes**: `Accept: application/json` (JSON transport) and `Accept: text/event-stream` (SSE transport).
-
-**Pattern** — extract the body into a shared `run_*` function, add `_json` / `_sse` entry points:
-
-```rust
-async fn run_my_tool(mode: TransportMode) {
-    let Some((_server, mcp)) = setup_test_mcp(mode).await else { return; };
-    let result = mcp.call_tool("tool_name", json!({})).await;
-    assert!(result.success, "{:?}", result.error);
-}
-
-#[tokio::test]
-async fn test_my_tool_json() { run_my_tool(TransportMode::Json).await; }
-#[tokio::test]
-async fn test_my_tool_sse()  { run_my_tool(TransportMode::Sse).await; }
-```
-
-**Setup** — use `common::setup_test_mcp(mode)` (in `tests/common/mod.rs`). It spawns a server, completes the full MCP handshake, and returns an `McpTestClient` wired to the requested transport. Do **not** use the old `sse_test_helpers::{ensure_server_available, call_tool}` functions — those are legacy and lack session handling.
-
-**Nextest** — the `.config/nextest.toml` override filters use structural predicates (`binary_id(~ahma_mcp::)`, `package(ahma_http_bridge)`) that automatically cover every test in those packages.  No manual per-file additions are needed.  Only add an override if you add tests to a **new package** that isn't already covered by an existing filter.
-
-**Exemptions** (keep SSE-only, no `_json`/`_sse` split):
-- `sse_streaming_test.rs`, `sse_endpoint_test.rs` — SSE protocol behaviour
-- `handshake_*.rs` — session handshake invariants
-- `sandbox_*.rs` — sandbox gating rules
-
-#### No Print-Only Integration Tests
-Integration tests MUST include assertions on:
-- success/failure (`result.success` or HTTP status)
-- key output/error patterns
-Printing output is allowed, but never sufficient.
-
-### Debug/Trace Evidence (Required For Repros)
-
-#### Always Capture Text Logs
-When reproducing failures (especially cancellations), always capture complete logs via:
-
-```bash
-<command> 2>&1 | tee /tmp/ahma_debug.log
-```
-
-If output is long, use `tail -200 /tmp/ahma_debug.log` to summarize.
-
-#### Reduce Concurrency When Debugging
-Prefer single-test runs for clarity:
-
-RUST_TEST_THREADS=1 cargo nextest run <test_name> --no-capture 2>&1 | tee /tmp/ahma_test.log
-```
-
-For `nextest`, run narrow filters so only one failing test prints logs.
-
-### File Isolation (CRITICAL)
-**ALL tests MUST use temporary directories** to prevent repository pollution:
-
-```rust
-use tempfile::tempdir;
-
-#[test]
-fn test_something() {
-    let temp_dir = tempdir().unwrap();  // Auto-cleanup on drop
-    let test_file = temp_dir.path().join("test.txt");
-    
-    // Create test files within temp_dir.path()
-    std::fs::write(&test_file, "test content").unwrap();
-    
-    // Test your code...
-    
-    // temp_dir is automatically cleaned up when it goes out of scope
-}
-```
-
-**Never** create test files directly in the repository structure. Always use `tempfile::tempdir()` or `tempfile::TempDir::new()`.
-
-### Running Tests
-
-> **Local vs CI parallelism**: plain `cargo nextest run` uses the `default` nextest profile, which runs tests with full CPU parallelism (no `test-threads` cap).  This is intentional — developer machines such as an M4 Ultra have ample resources.  CI uses `cargo nextest run --profile ci` (set in `build.yml`), which caps parallelism to `num-cpus` (= 2 on GitHub Actions runners) and applies `threads-required = 2` to resource-heavy tests, allowing only one such test at a time.  **Never add `--test-threads` or a `test-threads` setting to `[profile.default]` — that would throttle local developer machines unnecessarily.**
-
-```bash
-# Run all tests (full parallelism locally — no throttle)
-cargo nextest run
-
-# Run tests with coverage
-cargo llvm-cov --html
-open target/llvm-cov/html/index.html
-
-# Run specific test file
-cargo nextest run --test sandbox_test
-
-# Run test and show output
-cargo nextest run test_name --no-capture
-```
-
----
-
-## Common Development Tasks
-
-### Adding a New Tool
-1. Create a JSON configuration in `.ahma/yourtool.json`
-2. Follow the MTDF schema (see [SPEC.md Section 3](SPEC.md#3-tool-definition-mtdf-schema))
-3. Test the tool: `ahma tool run yourtool_subcommand --help`
-4. Restart the server to pick up tool changes by default; use `--hot-reload` only while developing tool definitions
-
-### Debugging
-```bash
-# Run with debug logging
-RUST_LOG=debug ahma --log-to-stderr
-
-# Inspect MCP protocol communication
-./scripts/ahma-inspector.sh
-
-# Test single tool in CLI mode
-ahma tool run cargo_build --working-directory . -- --release
-```
-
-### MCP Server Testing
-```bash
-# Start stdio server (used by Cursor/VS Code)
-ahma serve stdio
-
-# Start HTTP bridge server
-ahma serve http --http-port 3000
-
-# List all tools from a server
-ahma tool list -- ./target/debug/ahma --tools-dir .ahma
-ahma tool list --http http://localhost:3000 --format json
-```
-
----
-
-## PR and Commit Guidelines
-
-## Definition of Done (Local Verification)
-
-Before you stop work / hand off / claim “all green”, you MUST run:
-
-1. The normal test suite: `cargo nextest run`
-2. All ignored tests that apply to your platform: `cargo nextest run --workspace --run-ignored all`
-3. **Whenever you touch `Cargo.toml` or `Cargo.lock`**: the full `cargo deny check`
-
-Notes:
-- “Ignored” tests in this repo are typically expensive stress/regression coverage. They are part of the required verification set.
-- If an ignored test cannot be run due to missing prerequisites (e.g., platform-only features) or it is currently broken, you must:
-  - record the reason (and how to reproduce) in your handoff/PR description
-  - and fix it or open/track an issue before considering the work complete
-- **`cargo deny check`, not `cargo deny check advisories`.** The full check also enforces
-  **licences**, bans and sources — and a licence is what actually got through: `zip 8.6`'s
-  default features silently pulled in `bzip2`, whose licence is not on the allow-list, and
-  main went red (#470). A new transitive dependency arrives with a licence you did not choose,
-  so the advisories subset alone proves nothing about it.
-
-### Before Committing
-1. **Run quality pipeline**: `cargo fmt --all && cargo clippy --all-targets && cargo nextest run` must pass
-2. **Format code**: `cargo fmt --all`
-3. **Fix clippy warnings**: `cargo clippy --fix --allow-dirty`
-4. **Run tests**: `cargo nextest run` must pass with ≥80% coverage
-
-Optional local guardrail before pushing:
-- Install hooks: `cp scripts/check-guardrails.sh .git/hooks/pre-push && chmod +x .git/hooks/pre-push`
-- The hook enforces a clean working tree, version consistency across all files, and runs `cargo check --workspace --locked`.
-- This catches "works locally but fails on CI checkout" cases caused by untracked required source files.
-
-To bump the version across all files at once:
-- Run: `cargo xtask bump-version X.Y.Z`
-- This updates `Cargo.toml`, `skills/ahma/SKILL.md`, `scripts/install.sh`, and `scripts/install.ps1` in one step.
-
-Optional but recommended for faster runs:
-- `cargo nextest run` (and for ignored: `cargo nextest run --run-ignored all`)
-
-### Commit Messages
-Follow conventional commits format:
-```
-<type>(<scope>): <subject>
-
-<body>
-
-<footer>
-```
-
-Types: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `chore`
-
-Example:
-```
-feat(sandbox): add nested sandbox detection for Cursor
-
-- Detect when running inside another sandbox (Cursor, VS Code, Docker)
-- Auto-disable internal sandbox with warning
-- Add AHMA_DISABLE_SANDBOX env var for manual override
-
-Closes #123
-```
-
-### PR Title Format
-```
-[<crate>] <description>
-```
-
-Examples:
-- `[ahma_core] Add kernel-level sandboxing via Landlock`
-- `[ahma-http-bridge] Fix session isolation scope derivation`
-
----
-
-## Security Considerations
-
-### Sandbox Scope
-- The sandbox scope **cannot** be changed during a session (security invariant)
-- Never trust user-provided paths without validation via `path_security` module
-- All file operations are restricted to the sandbox scope by the kernel
-
-### Nested Sandboxes (host sandbox present)
-When running inside a host sandbox (Cursor, VS Code, Docker), ahma picks one authoritative sandbox per execution path and always discloses which one is active (SPEC R7):
-- **Terminal hooks** defer to the host: the command runs unchanged in the host sandbox and ahma does NOT re-wrap it (avoids the redundant double-sandbox and the host's build-cache env friction). The hook discloses this loudly. Set `AHMA_PREFER_OWN_SANDBOX=1` to force ahma's own sandbox instead.
-- **MCP server (`run_terminal_command`)** stays authoritative: ahma applies its own sandbox (the host's terminal sandbox does not wrap ahma's own executions). If it cannot, it fails loudly — never silently unsandboxed.
-- `--disable-sandbox` defers to the host explicitly.
-- Honesty limit: detecting a host does not prove its sandbox is enabled; disclosure says so.
-
-### Temp Directory Access (`--tmp`)
-
-The `--tmp` flag (or `AHMA_TMP_ACCESS=1` environment variable) adds the system temp directory to the sandbox scope as an explicit read/write scope. This is useful for testing and dynamic workflows that require temp file access.
-
-**When to use:**
-- Testing workflows that require temp file access
-- Tools that legitimately need temp storage (compilers, build systems)
-- Development environments where temp access is needed
-
-**When NOT to use:**
-- Production deployments handling sensitive data
-- When `--disable-temp-files` provides sufficient security
-
-**Flag interactions:**
-
-| Flag Combination | Behavior |
-|-----------------|----------|
-| (default) | Temp access via implicit platform rules |
-| `--tmp` | Temp dir added as formal scope (explicit) |
-| `--disable-temp-files` | Temp access blocked entirely |
-| `--tmp --disable-temp-files` | `--disable-temp-files` takes precedence (blocked) |
-
-**Security considerations:**
-
-1. **Shared temp directory**: `/tmp` (or equivalent) is shared by all users/processes. Malicious processes could read files written by ahma, write files that ahma might read (symlink attacks), or fill up temp space.
-2. **Symlink attacks**: Mitigated by `dunce::canonicalize` which resolves symlinks before validation.
-3. **Predictable paths**: Tools using predictable temp file names are vulnerable to TOCTOU attacks. Use `mktemp` with random suffixes.
-4. **Cross-session data leakage**: Temp files may persist across sessions. Clean up sensitive temp files after use.
-
-### Windows Platform Development
-
-> **Status**: Runtime (PowerShell shell, path model) is `in-progress`.
-> Job Object sandbox enforcement (`enforce_windows_sandbox`) is **done** and wired into startup.
-> AppContainer spawn isolation is **pending**; do not mark it done until Windows CI proves
-> write attempts outside the sandbox are OS-blocked.
-
-#### Key rules for Windows-targeted changes
-
-- **Never use `#[cfg(unix)]` or `#[cfg(target_family = "unix")]` for tests that have Windows-compatible equivalents.**  
-  If a test is genuinely Unix-only (e.g., because it calls `std::os::unix::fs::symlink`), using `#[cfg(unix)]` without a Windows arm is correct — do not force-write a broken Windows version just to fill the gap.
-- **Root path checks** in `sandbox/scopes.rs` use `is_filesystem_root()` — never compare  
-  directly to `Path::new("/")` because `C:\` and UNC roots have different representations.
-- **Shell invocations** must go through `platform_shell_program()` (in `shell_pool.rs`) — do not hard-code `bash` or `/bin/sh`.  
-  The removed `is_shell_program_invocation()` function caused a double `-c` bug; do not re-introduce it.
-- **Path separators**: always use `std::path::MAIN_SEPARATOR` or `Path`/`PathBuf` APIs.  
-  String-based separator assumptions (`"/"`, `"\\"`) break cross-platform.
-- **`expand_home`**: tilde expansion handles both `~/` and `~\` — test both when modifying.
-- **Temp files**: use `std::env::temp_dir()` (cross-platform) rather than `/tmp`.
-
-#### Windows sandbox implementation checklist
-
-Before marking `Windows Sandbox backend` → `tests-pass` in SPEC.md, all of the following
-must be satisfied (see R6.3 in SPEC.md for the full acceptance criteria):
-
-- [x] `check_windows_sandbox_available()` returns `Ok(())` when the AppContainer API is available — **done**: probes `CreateAppContainerProfile` with invalid name; `E_INVALIDARG` confirms Win8+ API is present
-- [x] `enforce_windows_sandbox(roots)` — **done**: Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` applied at startup; non-fatal if already inside a job
-- [ ] Implement AppContainer spawn isolation in `create_windows_sandboxed_command` — **pending**: attach an AppContainer SID at process spawn and grant only scoped filesystem access
-- [ ] Write outside scope is OS-blocked at kernel level — **pending**: requires AppContainer spawn isolation and Windows CI proof (R6.3.3)
-- [x] `tools/call` before sandbox lock returns HTTP 409 / JSON-RPC `-32001` — covered by `handshake_timeout_test`
-- [x] Filesystem root scopes (`C:\`, UNC) are rejected by `canonicalize_scopes` — **done**: `is_filesystem_root()` handles all Win/Unix root forms
-- [x] All sandbox gating integration tests pass on `windows-latest` CI runner — **done**: Windows bypass removed from `sandbox_env.rs`; `red_team_command_write_escape_blocked` enabled on Windows (R6.3.7)
-
-#### Running against Windows CI locally (cross-check)
-
-If you have a Windows machine or VM, you can validate cross-platform patches by running:
-```powershell
-cargo check --workspace
-cargo clippy --workspace
-cargo nextest run --workspace
-cargo nextest run --workspace -- --ignored
-```
-
-On macOS/Linux you can catch obvious Windows-compile errors without a VM:
-```bash
-cargo check --workspace --target x86_64-pc-windows-msvc  # requires Windows cross toolchain
-```
-
-### Validation
-- All tool configurations are validated against the MTDF JSON schema at startup
-- Invalid configs are rejected with clear error messages
-- `format: "path"` in JSON schema triggers path security validation
-
----
-
-## Tool Usage Patterns
-
-### Async-First Workflow
-**Default**: Tools run asynchronously and return immediately with an `id`. The AI receives a notification when complete.
-
-```json
-{
-  "name": "cargo_build",
-  "description": "Build the project (async). You can continue with other tasks.",
-  "synchronous": false  // or omit (default is async)
-}
-```
-
-### Synchronous Override
-**When to use**: Commands that modify project state (e.g., `cargo add`, `npm install --save`)
-
-```json
-{
-  "name": "cargo_add",
-  "description": "Add a dependency to Cargo.toml (waits for completion)",
-  "synchronous": true  // Force synchronous execution
-}
-```
-
-### CLI Testing Workflow
-For development and debugging, bypass the MCP protocol:
-
-```bash
-# Execute a single tool command
-ahma tool run cargo_build --working-directory . -- --release
-
-# With debug logging
-RUST_LOG=debug ahma --log-to-stderr tool run cargo_test --working-directory .
-```
-
----
-
-## Additional Resources
-
-- **Architecture**: [SPEC.md](SPEC.md)
-- **HTTP Bridge Details**: [docs/session-isolation.md](docs/session-isolation.md)
-- **Development Methodology**: [docs/spec-driven-development.md](docs/spec-driven-development.md)
-- **Coverage Reports**: https://paulirotta.github.io/ahma/html/
-- **MCP Protocol**: https://github.com/mcp-rs/rmcp
-
-## Repo-local Skills
-
-Skills under `.agents/skills/` are repo-local and not distributed with ahma releases.
-
-| Skill | Trigger | Purpose |
-|-------|---------|---------|
-| [.agents/skills/ahmadev/SKILL.md](.agents/skills/ahmadev/SKILL.md) | `/ahmadev` | Safe dep updates, dev workflows |
-
-Use `/ahmadev help` in chat for the full command list.  
-For general ahma tooling (sandbox, livelog, run_terminal_command, etc.) use `/ahma help`.
-
----
-
-**Last Updated**: 2026-03-04
-**For Questions**: Open an issue on GitHub or check existing documentation in `docs/`
+Standard cargo. Package names use **underscores** (`-p ahma_http_bridge`, not `ahma-http-bridge`).
+Prefer `cargo nextest run` over `cargo test`. Rust edition 2024, MSRV in `Cargo.toml`.
+
+Incubating crates are quarantined behind non-default features (`vault`, `cluster`, `simplify`,
+`full`) and are not in `default-members` — test them directly with `-p`.
+
+### Definition of done
+
+Before you claim "all green", run **both**:
+
+1. `cargo nextest run`
+2. `cargo nextest run --workspace --run-ignored all` — ignored tests here are expensive
+   stress/regression coverage, not dead weight; they are part of the required set.
+3. **If you touched `Cargo.toml`/`Cargo.lock`:** the *full* `cargo deny check`.
+   Not `cargo deny check advisories`. The full check also enforces licences, and a licence is
+   what actually broke main (#470): `zip 8.6`'s default features silently pulled in `bzip2`,
+   whose licence is not on the allow-list. A new transitive dep arrives with a licence you did
+   not choose, so the advisories subset proves nothing about it.
+
+If an ignored test can't run (missing platform prerequisite) or is broken, say so in the PR
+with a repro — don't quietly drop it.
+
+### When to route through ahma vs native tools
+
+Use ahma's `run_terminal_command` when the command **writes to disk** (kernel sandbox keeps
+writes in-workspace), **runs more than a few seconds** (async, returns an operation_id so you
+can work meanwhile), needs **mid-run error watching** (`monitor_level`), or when several
+independent commands should run **concurrently**.
+
+Keep read-only inspection (read/grep/glob/find/replace) on native file tools — faster and
+cheaper than a round trip through MCP.
+
+## Testing
+
+### Test pyramid — read this first
+
+**Prefer in-process tests over subprocess E2E.** This is the single most important rule for CI
+stability: GitHub runners have 2 cores, every spawned subprocess burns scheduler slots, and at
+20+ parallel tests this causes IPC pipe back-pressure and handshake timeouts.
+
+| Layer | Use for | Helpers |
+|---|---|---|
+| **Unit** (default) | Logic, schema gen, config parsing, state machines | `#[cfg(test)]` |
+| **Integration (in-process)** | MCP protocol logic, tool dispatch, path security, async ops | `create_in_process_mcp_from_dir()` / `_with_scope()` |
+| **E2E (subprocess)** — sparingly | Binary wiring, CLI flags, cross-binary IPC | `ClientBuilder`, `spawn_http_bridge` |
+
+Decision rule: *can this be written without forking a process?* If yes, do that.
+
+⚠️ **`setup_mcp_service_with_client()` spawns a subprocess** despite the name — it is E2E.
+
+### Rules that break CI when ignored
+
+- **Every test uses `tempfile::tempdir()`.** Never create files in the repo tree.
+- **Never hardcode timeouts.** Windows runners are 3–5× slower. Use
+  `ahma_common::timeouts::{TestTimeouts, TimeoutCategory}` — semantic categories
+  (`Handshake`, `ToolCall`, `SandboxReady`, …), `scale_secs()`, `poll_interval()`.
+- **Never hardcode `/tmp`, `/var/folders`, `/dev/null`.** Use `test_utils::path_helpers`:
+  `test_temp_path`, `test_out_of_scope_path`, `test_blocked_device_path`, `test_abs`, `test_root`.
+- **Never hardcode `/bin/sh`, `/bin/bash`, or bash redirection** (`>&2`, `2>&1`) in command
+  strings sent through the tool pipeline — on Windows the shell is PowerShell.
+- **Never `#[cfg(unix)]` a test that has a cross-platform equivalent.** Gating is correct only
+  when the test genuinely needs a Unix-only API (e.g. `std::os::unix::fs::symlink`).
+- **`Path::starts_with` is case-sensitive on Windows** though the filesystem isn't —
+  `dunce::canonicalize` both sides before comparing.
+- **Spawned test processes must die with the test.** Set `.process_group(0)` and kill with
+  `kill(-pgid)`, never `child.kill()` alone — that signals one PID and orphans grandchildren.
+  A test that SIGKILLed only its direct shell leaked a 100%-CPU busy loop on every single suite
+  run; CI never noticed because runners are discarded. See `kill_process_tree`.
+- **Don't add `test-threads` to `[profile.default]`.** Local runs are meant to use full
+  parallelism; CI throttling belongs in `--profile ci` only.
+
+### Hard invariants — fix the harness, don't weaken the assertion
+
+**MCP Streamable HTTP handshake** (E2E HTTP tests only; unit/in-process exempt), in order:
+`initialize` (no session header) → open SSE stream **before** `notifications/initialized` →
+send `notifications/initialized` → answer the server's `roots/list` over SSE with the same id →
+only then `tools/call`.
+
+**Sandbox gating is observable**: `tools/call` before sandbox lock returns HTTP 409 with
+JSON-RPC `-32001`. Assert it explicitly.
+
+**Dual-transport coverage** (SPEC §R15.5): every HTTP-bridge test calling `tools/call` or
+`tools/list` runs against **both** `application/json` and `text/event-stream`. Extract the body
+into `run_*(mode)` and add `_json`/`_sse` entry points; set up with `common::setup_test_mcp(mode)`
+(not the legacy `sse_test_helpers`). Exempt: `sse_*`, `handshake_*`, `sandbox_*` tests.
+
+**No print-only integration tests.** Printing is fine; asserting on success/failure and key
+output patterns is mandatory.
+
+### Reproducing failures
+
+Capture full logs (`<cmd> 2>&1 | tee …`) and reduce concurrency to a single test
+(`RUST_TEST_THREADS=1 … --no-capture`) — narrow filters so only the failure prints.
+
+## Code conventions that differ from defaults
+
+- **Never `std::fs` or blocking I/O in an async fn** — use `tokio::fs`/`tokio::io`. Reserve
+  `spawn_blocking` for sync-only third-party APIs and CPU-bound work, not I/O. Tests exempt.
+- **Never `println!`/`print!` for protocol data on stdout** (SPEC R5.6.1). They panic on write
+  errors — a broken pipe on Windows is OS error 232, and in stdio server mode stdout *is* a
+  pipe the bridge may close during shutdown. Use `crate::utils::stdio::emit_stdout_notification`,
+  which downgrades broken-pipe to `debug` and returns other I/O errors. `println!` is fine in
+  CLI mode, where stdout is a terminal.
+- **Never commit `*.py`.** Temporary Python for local one-offs is fine — delete it before you
+  finish. **Tests must never depend on `python3`**; Python is a worker-synthesis *target*, but
+  the suite assumes only a Rust toolchain. Write Rust-native equivalents rather than relying on
+  a silent skip that asserts nothing.
+- **Errors**: `anyhow::Result` internally, converted to `rmcp::error::McpError` at the MCP
+  boundary. Give actionable context ("Install with `cargo install cargo-nextest`").
+- **Docs**: don't hardcode directory trees or file lists in markdown — they rot, and agents can
+  read the workspace.
+
+## Security invariants
+
+- **Sandbox scope cannot change during a session.** Validate every user-supplied path through
+  `path_security`; the kernel enforces the scope.
+- **ahma never silently disables enforcement.** Inside a host sandbox (Cursor, VS Code, Docker)
+  it picks one authoritative sandbox per execution path and discloses which, loudly (SPEC R7):
+  terminal hooks **defer to the host** (override with `AHMA_PREFER_OWN_SANDBOX=1`); the **MCP
+  server stays authoritative** because the host does not wrap ahma's own executions, and fails
+  loudly if it cannot sandbox. Detecting a host doesn't prove its sandbox is on — the disclosure
+  says so.
+- **`AHMA_*` configuration env vars are retired and ignored.** Use CLI flags or
+  `~/.ahma/settings.toml`. Still live: `AHMA_HOOKS`, `AHMA_DISABLE_HOOKS`,
+  `AHMA_PREFER_OWN_SANDBOX`.
+- Tool configs are validated against the MTDF schema at startup; `format: "path"` triggers path
+  security validation.
+
+### Windows
+
+Job Object enforcement is done; **AppContainer spawn isolation is still pending**, so
+out-of-scope writes are not yet OS-blocked on Windows — don't mark R6.3 done until Windows CI
+proves it. `red_team_command_write_escape_blocked` is `#[cfg_attr(windows, ignore)]` for exactly
+this reason; remove the ignore only when R6.3.3 lands.
+
+- Root checks use `is_filesystem_root()` — never compare to `Path::new("/")`; `C:\` and UNC
+  roots differ.
+- Shell invocation goes through `platform_shell_program()` (`shell_pool.rs`). Do **not**
+  reintroduce `is_shell_program_invocation()` — it caused a double `-c` bug.
+- Use `MAIN_SEPARATOR`/`Path` APIs, never string separator assumptions.
+- `expand_home` handles both `~/` and `~\` — test both when changing it.
+
+## Commits and PRs
+
+Conventional commits (`feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `chore`). PR titles are
+`[<crate>] <description>`. Squash-merge onto `main`; the squash body is built from your commit
+messages, so write them for the permanent log.
+
+Before committing: `cargo fmt --all && cargo clippy --all-targets && cargo nextest run`.
+Bump versions with `cargo xtask bump-version X.Y.Z` (updates Cargo.toml, Cargo.lock, SKILL.md
+and both install scripts together). Optional local guard:
+`cp scripts/check-guardrails.sh .git/hooks/pre-push && chmod +x .git/hooks/pre-push`.
+
+## Repo-local skills
+
+`.agents/skills/` is repo-local, not shipped with releases (`.claude/skills/` symlinks into it).
+`/ahmadev help` covers dev workflows — land, release, bisect, coverage, dep updates.
+`/ahma help` covers ahma's own tooling — sandbox, livelog, `run_terminal_command`.
