@@ -178,7 +178,10 @@ async fn start_background_server() -> Result<ResolvedConnection> {
     cmd.arg("serve");
     #[cfg(unix)]
     {
-        // Detach from parent process group
+        // Intentionally detached (SPEC R-PROC.3): the background server must
+        // outlive this TUI, so it deliberately does NOT set kill_on_drop, and
+        // process_group(0) is here to keep it alive when the TUI's process group
+        // goes away — not so it can be reaped with us (contrast R-PROC.2).
         cmd.process_group(0);
     }
 

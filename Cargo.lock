@@ -336,6 +336,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures",
+ "libc",
  "ratatui",
  "reqwest 0.13.4",
  "rmcp",

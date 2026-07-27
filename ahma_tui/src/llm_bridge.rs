@@ -355,6 +355,25 @@ pub fn spawn_decompose_task(client: LlmClient, goal: String, tx: Sender<BridgeEv
     });
 }
 
+/// Kill a spawned window command **and its whole process group**.
+///
+/// Window commands are spawned as process-group leaders, so on Unix
+/// `kill(-pgid)` takes down the descendants too. `child.kill()` alone signals
+/// only the direct shell: cancelling a window running `cargo build` would reap
+/// `bash` and leave `cargo`/`rustc` burning CPU with no way for the user to see
+/// or stop them. Same defect class as the leak fixed in #508.
+async fn kill_window_process_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // Negative pid targets the process group led by the child.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    // Idempotent on Unix after the group kill; also reaps the child.
+    let _ = child.kill().await;
+}
+
 pub fn spawn_window_cli_task(
     window_id: usize,
     command_str: String,
@@ -375,6 +394,13 @@ pub fn spawn_window_cli_task(
         cmd.current_dir(&working_dir);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        // This child is *owned* by the window, so it dies with it (SPEC R-PROC.1):
+        // kill_on_drop covers the task being dropped, and the process group lets
+        // an explicit cancel reap the shell's descendants too, instead of
+        // orphaning whatever it started (SPEC R-PROC.2).
+        cmd.kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -420,7 +446,7 @@ pub fn spawn_window_cli_task(
         tokio::select! {
             biased;
             _ = &mut abort_rx => {
-                let _ = child.kill().await;
+                kill_window_process_tree(&mut child).await;
                 let _ = stdout_handle.await;
                 let _ = stderr_handle.await;
                 let _ = tx.send(BridgeEvent::WindowFinished {
@@ -525,4 +551,73 @@ pub fn spawn_window_llm_task(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test (SPEC R-PROC.2): cancelling a window command must reap the
+    /// shell's **descendants**, not just the shell.
+    ///
+    /// `child.kill()` signals one pid, so cancelling a window running
+    /// `bash -c "cargo build"` used to reap `bash` and leave `cargo`/`rustc`
+    /// running — detached from any surface that could show or stop them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_window_reaps_the_grandchild_too() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+
+        let (abort_tx, abort_rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+        // The shell backgrounds a grandchild, records its pid, then waits.
+        spawn_window_cli_task(
+            1,
+            format!("sleep 300 & echo $! > {}; wait", pidfile.display()),
+            dir.path().display().to_string(),
+            abort_rx,
+            tx,
+        );
+
+        let mut gpid = None;
+        for _ in 0..200 {
+            if let Ok(s) = std::fs::read_to_string(&pidfile)
+                && let Ok(p) = s.trim().parse::<i32>()
+            {
+                gpid = Some(p);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let gpid = gpid.expect("grandchild pid file should be written");
+
+        // Signal 0 only probes for existence.
+        assert_eq!(
+            unsafe { libc::kill(gpid, 0) },
+            0,
+            "grandchild should be alive before the cancel"
+        );
+
+        abort_tx.send(()).expect("abort receiver should be live");
+
+        let mut dead = false;
+        for _ in 0..200 {
+            if unsafe { libc::kill(gpid, 0) } != 0 {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        rx.close();
+
+        assert!(
+            dead,
+            "grandchild (pid {gpid}) must be reaped via the process-group kill, \
+             not orphaned to outlive the cancelled window"
+        );
+    }
 }

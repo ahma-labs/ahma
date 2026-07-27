@@ -576,9 +576,11 @@ pub async fn ensure_daemon_running() -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    // Detach from the current process group so the daemon outlives us on Unix.
-    // process_group(0) calls setpgid(0,0) in the child — creates a new process
-    // group so the daemon is not killed when the spawning terminal/IDE exits.
+    // Intentionally detached (SPEC R-PROC.3): this daemon must outlive us, so it
+    // deliberately does NOT set kill_on_drop. `process_group(0)` is used here for
+    // the opposite reason to an owned child (R-PROC.2) — setpgid(0,0) puts the
+    // daemon in its own group so it is *not* killed when the spawning
+    // terminal/IDE exits, rather than so it can be reaped with us.
     #[cfg(unix)]
     {
         cmd.process_group(0);

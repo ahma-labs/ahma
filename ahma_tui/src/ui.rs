@@ -411,15 +411,37 @@ fn draw_operation_detail(
     let [body_a, footer_a] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
-    let lines = operation_detail_lines(op, theme, body_a.width as usize);
-    let max_scroll = lines.len().saturating_sub(body_a.height as usize);
+    // Reserve the scrollbar column *before* wrapping, whether or not the bar is
+    // currently visible — otherwise showing the bar would re-wrap the text,
+    // change the row count, and oscillate (same reasoning as the chat pane).
+    let text_width = (body_a.width as usize).saturating_sub(1).max(1);
+    let lines = operation_detail_lines(op, theme, text_width);
+    // The paragraph wraps, so a scroll offset is measured in *rendered rows*,
+    // not logical lines. Measuring with `lines.len()` left the last wrapped rows
+    // unreachable whenever any line was wider than the pane.
+    let total_rows = total_wrapped_rows(&lines, text_width);
+    let max_scroll = total_rows.saturating_sub(body_a.height as usize);
     state.detail_max_scroll.set(max_scroll);
     let scroll = detail.scroll.min(max_scroll);
 
+    let text_a = Rect {
+        width: body_a.width.saturating_sub(1).max(1),
+        ..body_a
+    };
     let para = Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })
         .scroll((scroll as u16, 0));
-    frame.render_widget(para, body_a);
+    frame.render_widget(para, text_a);
+    // Without this the overlay scrolled silently: no thumb, and no indication
+    // that there was anything below the fold.
+    draw_scrollbar(
+        frame,
+        theme,
+        total_rows,
+        body_a.height as usize,
+        scroll,
+        body_a,
+    );
 
     // Footer: clickable actions on the left, key hints on the right.
     let is_live = matches!(

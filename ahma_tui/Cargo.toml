@@ -46,6 +46,11 @@ tracing.workspace = true
 tui-textarea = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v4"] }
 
+[target.'cfg(unix)'.dependencies]
+# Process-group kill (`kill(-pgid)`) when cancelling a window command, so the
+# shell's descendants are reaped rather than orphaned.
+libc.workspace = true
+
 [dev-dependencies]
 ahma_http_bridge = { path = "../ahma_http_bridge" }
 axum = { version = "0.8", features = ["tokio"] }

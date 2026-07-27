@@ -4373,7 +4373,13 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
         }
         ClickTarget::AnalyzeOperation(op_id) => {
             analyze_operation(state, &op_id);
-            state.focus = crate::state::Focus::OpsDag;
+            // The analysis streams into the chat pane. When Analyze is clicked
+            // from the full-screen detail overlay, that overlay covers chat — so
+            // leaving it up made a working click look like it did nothing. Close
+            // it (a no-op when analysing from the side panel) and focus chat, so
+            // the answer is visible as it arrives.
+            state.close_modal();
+            state.focus = crate::state::Focus::Chat;
         }
         ClickTarget::SelectOperation(op_idx) => {
             state.ops_selected = op_idx;

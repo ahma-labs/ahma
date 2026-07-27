@@ -384,6 +384,7 @@ async fn run_setup_hooks_only_auto(binary_path: &Path) -> Result<()> {
 
     let status = tokio::process::Command::new(binary_path)
         .args(["setup", "--hooks", "--auto"])
+        .kill_on_drop(true) // owned child (SPEC R-PROC.1)
         .status()
         .await
         .with_context(|| {
@@ -409,6 +410,7 @@ async fn run_setup_skills_only_auto(binary_path: &Path) -> Result<()> {
 
     let status = tokio::process::Command::new(binary_path)
         .args(["setup", "--skills", "--auto"])
+        .kill_on_drop(true) // owned child (SPEC R-PROC.1)
         .status()
         .await
         .with_context(|| {
@@ -431,6 +433,7 @@ async fn run_setup_skills_only_auto(binary_path: &Path) -> Result<()> {
 async fn run_setup_interactive(binary_path: &Path) -> Result<()> {
     let status = tokio::process::Command::new(binary_path)
         .arg("setup")
+        .kill_on_drop(true) // owned child (SPEC R-PROC.1)
         .status()
         .await
         .with_context(|| format!("Failed to run {} setup", binary_path.display()))?;

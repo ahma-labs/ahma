@@ -1320,9 +1320,16 @@ These control execution environment but **must not** be passed as CLI arguments:
 
 ### 9.2 Async I/O Hygiene
 
-- **R10.1**: Blocking I/O (`std::fs`) **must not** be used in async functions. Use `tokio::fs` instead.
-- **R10.2**: Test code is exempt (blocking acceptable in `#[tokio::test]`).
-- **R10.3**: **Child Process Leaks**: All `tokio::process::Command` spawns **must** implement `.kill_on_drop(true)`. By default, dropping a tokio child process future (e.g. from a timeout) orphans the process, leaving it running in the background. This has historically caused catastrophic CLI test hangs in CI. Always explicitly enforce `kill_on_drop`.
+> **Note on numbering**: these requirements were previously `R10.1`–`R10.3`, which collided with the unrelated `R10` "Session Isolation" family in §7 (`R10.1`–`R10.8`). One id could not name two requirements, so §9.2's are renamed to the self-describing `R-ASYNC` and `R-PROC` namespaces. Nothing outside this section referenced the old ids.
+
+- **R-ASYNC.1**: Blocking I/O (`std::fs`) **must not** be used in async functions. Use `tokio::fs` instead.
+- **R-ASYNC.2**: Test code is exempt (blocking acceptable in `#[tokio::test]`).
+
+#### R-PROC: Child Process Lifetime
+
+- **R-PROC.1**: **Child process leaks**: Every `tokio::process::Command` spawn of a child the parent **owns must** set `.kill_on_drop(true)`. By default, dropping a tokio child-process future (e.g. from a timeout) orphans the process, leaving it running in the background. This has historically caused catastrophic CLI test hangs in CI. Note that `status()` and `output()` spawn internally, so they are covered by this rule exactly as `spawn()` is.
+- **R-PROC.2**: **Owning a child means owning its descendants.** An owned child **must** additionally be spawned as a process-group leader (`process_group(0)`) and torn down with a group kill (`kill(-pgid)` on Unix, the Job Object on Windows), never with `child.kill()` alone. A signal to a single pid reaps the direct child only: killing the `sh` of `sh -c "cargo build"` leaves `cargo` and `rustc` running, detached from any surface that could show or stop them. `kill_on_drop` does **not** cover this — it too signals only the direct child. This has bitten twice: a test that orphaned a busy loop and leaked a 100%-CPU process on every suite run (#508), and TUI window cancellation, which reaped `bash` and left the build running.
+- **R-PROC.3**: **Deliberately detached daemons are exempt, and must say so.** A spawn whose entire purpose is to *outlive* its parent — the auto-spawned bridge, the daemon hub — **must not** set `kill_on_drop`, and uses `process_group(0)` for the opposite reason (to survive the terminal's process group, not to be reaped with it). Such a spawn **must** carry a comment stating that it is intentionally detached, so the exemption is visibly deliberate and not mistaken for an R-PROC.1 violation.
 
 ### 9.3 Error Handling
 

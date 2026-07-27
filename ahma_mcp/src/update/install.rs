@@ -197,6 +197,7 @@ async fn install_binary(source: &Path, target: &Path) -> Result<()> {
             let result = tokio::process::Command::new("codesign")
                 .args(["--force", "--sign", "-", "--options", "runtime"])
                 .arg(&staged)
+                .kill_on_drop(true) // owned child (SPEC R-PROC.1)
                 .output()
                 .await;
             match result {
@@ -296,6 +297,7 @@ pub async fn read_installed_version(binary: &Path) -> Option<String> {
     }
     let output = tokio::process::Command::new(binary)
         .arg("--version")
+        .kill_on_drop(true) // owned child (SPEC R-PROC.1)
         .output()
         .await
         .ok()?;

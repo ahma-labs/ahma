@@ -77,11 +77,15 @@ pub async fn install_from_git_ref(
     println!("Building ahma from Git branch '{branch}' (this may take several minutes)...");
     println!("  RUSTFLAGS='{rustflags}' {display}");
 
+    // Owned child (SPEC R-PROC.1). `status()` spawns internally, so a Ctrl-C that
+    // drops this future would otherwise leave a multi-minute `cargo build`
+    // running with nothing left to stop it.
     let status = tokio::process::Command::new(&args[0])
         .args(&args[1..])
         .env("RUSTFLAGS", &rustflags)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        .kill_on_drop(true)
         .status()
         .await
         .context("Failed to spawn cargo install")?;

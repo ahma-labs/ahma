@@ -873,6 +873,10 @@ async fn spawn_background_bridge(
         ahma_common::process_guard::child_spawn_depth(),
     );
 
+    // Intentionally detached (SPEC R-PROC.3): the background bridge must outlive
+    // the process that spawned it, so it deliberately does NOT set kill_on_drop.
+    // `process_group(0)` keeps it alive when our own process group goes away —
+    // the opposite purpose it serves for an owned child (R-PROC.2).
     #[cfg(unix)]
     {
         cmd.process_group(0);
