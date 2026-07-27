@@ -93,15 +93,31 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn counts_cpu_burned_by_a_grandchild() {
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
 
         // `sh` (the child) spawns a busy loop (the grandchild) and just waits, so
         // essentially all the CPU is burned one level down.
+        //
+        // `process_group(0)` makes the child a process-group leader — the same flag
+        // `Sandbox::base_command` sets in production — so the cleanup below can
+        // `kill(-pgid)` the whole group. This test used to spawn without it and
+        // SIGKILL only the direct child, which orphaned the busy loop to `launchd`
+        // where it spun at 100% CPU forever with nothing left to reap it. One such
+        // process leaked per test run, so a dev machine accumulated a hot core per
+        // `cargo nextest run` (invisible on CI, whose runners are discarded).
         let mut child = Command::new("sh")
             .arg("-c")
-            .arg("sh -c 'while : ; do : ; done' & sleep 3; kill %1 2>/dev/null")
+            .arg(format!(
+                "sh -c 'while : ; do : ; done' & echo $! > {}; wait",
+                pidfile.display()
+            ))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .process_group(0)
             .spawn()
             .expect("spawn busy-loop child");
 
@@ -110,6 +126,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let second = process_tree_cpu_ms(pid).unwrap_or(0);
 
+        // Negative pid targets the process group, so the grandchild dies with the
+        // shell rather than outliving it.
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
         let _ = child.kill();
         let _ = child.wait();
 
@@ -117,6 +136,29 @@ mod tests {
             second > first,
             "a busy grandchild must register as CPU progress ({first}ms -> {second}ms); \
              without this the watchdog kills silent-but-working builds"
+        );
+
+        // Regression guard: the busy loop must not survive the test. Reading the pid
+        // after the kill is deliberate — the assertion above is what this test is
+        // *for*, and it must not be skipped just because cleanup is being checked.
+        let gpid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("grandchild pid file should be written")
+            .trim()
+            .parse()
+            .expect("grandchild pid should parse");
+        let mut dead = false;
+        for _ in 0..100 {
+            // Signal 0 only probes for existence.
+            if unsafe { libc::kill(gpid, 0) } != 0 {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            dead,
+            "the busy-loop grandchild (pid {gpid}) must be killed via the process-group \
+             kill, not orphaned to spin at 100% CPU forever"
         );
     }
 }
