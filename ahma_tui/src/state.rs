@@ -1123,6 +1123,10 @@ pub enum ClickTarget {
     TreeRow(usize),
     /// Open the full-screen detail view for the operation with this id.
     OpenOperationDetail(String),
+    /// Open the full-screen detail view for one log line. The text is captured
+    /// at draw time because the log is re-derived (and re-filtered) every frame,
+    /// so a row index would not survive until the click is handled.
+    OpenLogLine(String),
 }
 
 // ─── Command palette ──────────────────────────────────────────────────────────
@@ -1194,6 +1198,20 @@ pub enum ModalState {
     LogFiles { selected: usize },
     /// Full-screen drill-in for one operation (Enter or click on it).
     OperationDetail(OperationDetailState),
+    /// Full-screen drill-in for one log line (click on it). The log pane does
+    /// not wrap by default, so a long line is truncated at the pane edge with
+    /// no way to read the rest; this shows it wrapped and scrollable.
+    LogLineDetail(LogLineDetailState),
+}
+
+/// State of the full-screen log-line detail overlay.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogLineDetailState {
+    /// The full text of the line, captured at click time.
+    pub text: String,
+    /// Scroll offset in rendered rows; clamped at draw time via
+    /// [`AppState::detail_max_scroll`].
+    pub scroll: usize,
 }
 
 /// State of the full-screen operation detail overlay.
@@ -2221,6 +2239,13 @@ impl AppState {
     pub fn open_operation_detail(&mut self, op_id: String) {
         self.detail_max_scroll.set(0);
         self.modal = ModalState::OperationDetail(OperationDetailState { op_id, scroll: 0 });
+    }
+
+    /// Open the full-screen detail overlay for one log line, wrapped so the
+    /// whole line is readable rather than truncated at the pane edge.
+    pub fn open_log_line_detail(&mut self, text: String) {
+        self.detail_max_scroll.set(0);
+        self.modal = ModalState::LogLineDetail(LogLineDetailState { text, scroll: 0 });
     }
 
     /// Enter on the selected task-tree row: drill into an operation's

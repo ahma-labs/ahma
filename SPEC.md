@@ -1549,6 +1549,43 @@ correct **at startup**, not only for events that happen afterwards.
     fixes late-attach replay for free: a TUI opened *after* an IDE has been
     working shows what those operations **were**, not what their ids looked like.
 
+- **R24.8 — A pane must not lie about what it is showing.** Every one of the
+  following binds **every** scrollable or size-capped pane — chat history, the
+  log tail, operation windows, and each full-screen overlay — not just the pane
+  where the rule was first noticed. The recurring defect is not a rendering bug
+  but a *disclosure* one: the machinery works and the surface fails to say so.
+  - **R24.8.1 — Scroll position is truthful.** When a pane is scrolled to its
+    last row, its scrollbar thumb **must** be flush with the bottom of the
+    track, and when it is at the first row the thumb **must not** be. A thumb
+    parked short of the end is indistinguishable from "there is more below",
+    which is the single most-reported TUI complaint. Note that
+    `ratatui::ScrollbarState::content_length` counts scroll **positions**
+    (`max_scroll + 1`), not content rows; passing the row count silently
+    produces exactly this lie, and the error shrinks as content grows, so a long
+    log tail looks correct while a short chat pane does not.
+  - **R24.8.2 — Layout budgets what the renderer draws.** The height a pane is
+    allocated **must** be computed from the same line count the renderer will
+    emit, including any header, separator, or footer rows the renderer adds. The
+    two **must** derive from one shared function; when they disagreed, a `!pwd`
+    window was sized for its output alone, rendered two rows taller, and clipped
+    away the answer it existed to report.
+  - **R24.8.3 — Overflow drops the preamble, never the outcome.** When output
+    cannot fit its pane, the **tail** is what survives — the newest lines and the
+    result. Echoes of the command are recoverable from the title or the detail
+    overlay; the result is not.
+  - **R24.8.4 — Truncated content is reachable.** Any pane that clips a line at
+    its edge **must** offer a way to read the whole line — click-to-open into a
+    wrapped, scrollable overlay, or a wrap toggle. Content the user can see the
+    beginning of but can never finish reading is not "displayed".
+  - **R24.8.5 — A control names its own key.** Where a pane's title or footer
+    advertises a toggle state, it **must** name the key that changes it. Listing
+    a state next to an unrelated key ("`[Wrap: Off | …] Press 'l' to switch`",
+    where `l` opens the file switcher and `w` wraps) is worse than listing none.
+  - **R24.8.6 — Identity is the footnote, work is the headline.** A detail pane
+    for an instance answers *what was asked and how it went* first — outcome
+    tallies and recent operation identities (R24.7) — and demotes transport,
+    pid, uuid, and scope to a single dim line for connection debugging.
+
 ---
 
 ## 10. Testing Philosophy

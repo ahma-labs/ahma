@@ -622,8 +622,11 @@ fn handle_navigation_action(
 ) -> bool {
     use crate::keymap::Action;
 
-    // The full-screen operation detail overlay captures navigation while open.
-    if matches!(state.modal, crate::state::ModalState::OperationDetail(_)) {
+    // The full-screen detail overlays capture navigation while open.
+    if matches!(
+        state.modal,
+        crate::state::ModalState::OperationDetail(_) | crate::state::ModalState::LogLineDetail(_)
+    ) {
         return match action {
             Action::Up | Action::Down | Action::Top | Action::Bottom => {
                 scroll_detail_overlay(action, state);
@@ -644,19 +647,25 @@ fn handle_navigation_action(
     true
 }
 
-/// Scroll the operation-detail overlay; the max is computed at draw time.
+/// Scroll whichever full-screen detail overlay is open; the max is computed at
+/// draw time and published through `detail_max_scroll`, which both overlays
+/// share (only one can be open at a time).
 #[cfg(feature = "tui")]
 fn scroll_detail_overlay(action: &crate::keymap::Action, state: &mut crate::state::AppState) {
     use crate::keymap::Action;
+    use crate::state::ModalState;
     let max = state.detail_max_scroll.get();
-    if let crate::state::ModalState::OperationDetail(d) = &mut state.modal {
-        match action {
-            Action::Up => d.scroll = d.scroll.saturating_sub(1),
-            Action::Down => d.scroll = (d.scroll + 1).min(max),
-            Action::Top => d.scroll = 0,
-            Action::Bottom => d.scroll = max,
-            _ => {}
-        }
+    let scroll = match &mut state.modal {
+        ModalState::OperationDetail(d) => &mut d.scroll,
+        ModalState::LogLineDetail(d) => &mut d.scroll,
+        _ => return,
+    };
+    match action {
+        Action::Up => *scroll = scroll.saturating_sub(1),
+        Action::Down => *scroll = (*scroll + 1).min(max),
+        Action::Top => *scroll = 0,
+        Action::Bottom => *scroll = max,
+        _ => {}
     }
 }
 
@@ -1934,7 +1943,11 @@ fn handle_chat_input_key(
     if state.focus != Focus::Chat
         || state.text_entry_modal_open()
         || state.log_filter_active
-        || matches!(state.modal, crate::state::ModalState::OperationDetail(_))
+        || matches!(
+            state.modal,
+            crate::state::ModalState::OperationDetail(_)
+                | crate::state::ModalState::LogLineDetail(_)
+        )
     {
         return false;
     }
@@ -4403,6 +4416,12 @@ fn handle_click_target(target: crate::state::ClickTarget, state: &mut crate::sta
         ClickTarget::OpenOperationDetail(op_id) => {
             state.open_operation_detail(op_id);
         }
+        ClickTarget::OpenLogLine(text) => {
+            // Clicking the log pane also focuses it, so Esc lands the user back
+            // on the pane they were reading rather than somewhere else.
+            state.focus = crate::state::Focus::Log;
+            state.open_log_line_detail(text);
+        }
     }
 }
 
@@ -4528,13 +4547,18 @@ fn handle_mouse_click(col: u16, row: u16, state: &mut crate::state::AppState) {
 
 #[cfg(feature = "tui")]
 fn handle_mouse_scroll(col: u16, row: u16, up: bool, state: &mut crate::state::AppState) {
-    // The operation-detail overlay covers the screen — wheel scrolls it.
+    // A full-screen detail overlay covers the screen — the wheel scrolls it.
     let detail_max = state.detail_max_scroll.get();
-    if let crate::state::ModalState::OperationDetail(d) = &mut state.modal {
-        d.scroll = if up {
-            d.scroll.saturating_sub(1)
+    let overlay_scroll = match &mut state.modal {
+        crate::state::ModalState::OperationDetail(d) => Some(&mut d.scroll),
+        crate::state::ModalState::LogLineDetail(d) => Some(&mut d.scroll),
+        _ => None,
+    };
+    if let Some(scroll) = overlay_scroll {
+        *scroll = if up {
+            scroll.saturating_sub(1)
         } else {
-            (d.scroll + 1).min(detail_max)
+            (*scroll + 1).min(detail_max)
         };
         return;
     }
@@ -4602,14 +4626,19 @@ fn page_size_for_height(height: u16) -> f64 {
 
 #[cfg(feature = "tui")]
 fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
-    // The operation-detail overlay captures paging while open.
+    // A full-screen detail overlay captures paging while open.
     let detail_max = state.detail_max_scroll.get();
-    if let crate::state::ModalState::OperationDetail(d) = &mut state.modal {
+    let overlay_scroll = match &mut state.modal {
+        crate::state::ModalState::OperationDetail(d) => Some(&mut d.scroll),
+        crate::state::ModalState::LogLineDetail(d) => Some(&mut d.scroll),
+        _ => None,
+    };
+    if let Some(scroll) = overlay_scroll {
         let page = 10;
-        d.scroll = if up {
-            d.scroll.saturating_sub(page)
+        *scroll = if up {
+            scroll.saturating_sub(page)
         } else {
-            (d.scroll + page).min(detail_max)
+            (*scroll + page).min(detail_max)
         };
         return;
     }
@@ -5405,6 +5434,60 @@ mod tests {
         assert!(super::handle_mode_nav_command("/mode monitor", &mut state));
         assert_eq!(state.mode, Mode::Monitor);
         assert_eq!(state.focus, Focus::OpsDag);
+    }
+
+    /// Clicking a log row opens that line full-screen, wrapped, so a line wider
+    /// than the pane can actually be read. The click also focuses the log pane,
+    /// so Esc returns the user to what they were reading.
+    #[tokio::test]
+    async fn log_row_click_opens_the_line_overlay() {
+        use crate::state::{AppState, ClickTarget, Focus, ModalState};
+        use ratatui::layout::Rect;
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.focus = Focus::Chat;
+
+        let text = "pid=79950 role=bridge INFO serve_inner: a very long message";
+        state.click_targets.borrow_mut().push((
+            ClickTarget::OpenLogLine(text.into()),
+            Rect::new(0, 4, 60, 1),
+        ));
+
+        super::handle_mouse_click(10, 4, &mut state);
+        match &state.modal {
+            ModalState::LogLineDetail(d) => {
+                assert_eq!(d.text, text);
+                assert_eq!(d.scroll, 0);
+            }
+            other => panic!("expected the log-line overlay, got {other:?}"),
+        }
+        assert_eq!(state.focus, Focus::Log);
+    }
+
+    /// The overlay scroll keys drive whichever overlay is open — the log-line
+    /// one shares `detail_max_scroll` with the operation overlay.
+    #[tokio::test]
+    async fn log_line_overlay_scrolls_and_clamps() {
+        use crate::keymap::Action;
+        use crate::state::{AppState, ModalState};
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.open_log_line_detail("a long line".into());
+        state.detail_max_scroll.set(3);
+
+        let scroll = |s: &crate::state::AppState| match &s.modal {
+            ModalState::LogLineDetail(d) => d.scroll,
+            other => panic!("expected the log-line overlay, got {other:?}"),
+        };
+
+        super::scroll_detail_overlay(&Action::Down, &mut state);
+        assert_eq!(scroll(&state), 1);
+        super::scroll_detail_overlay(&Action::Bottom, &mut state);
+        assert_eq!(scroll(&state), 3);
+        super::scroll_detail_overlay(&Action::Down, &mut state);
+        assert_eq!(scroll(&state), 3, "must clamp at the last row");
+        super::scroll_detail_overlay(&Action::Top, &mut state);
+        assert_eq!(scroll(&state), 0);
+        super::scroll_detail_overlay(&Action::Up, &mut state);
+        assert_eq!(scroll(&state), 0, "must clamp at the first row");
     }
 
     /// Clicking a card's body drills into the operation detail overlay;

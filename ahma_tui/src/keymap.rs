@@ -103,6 +103,7 @@ pub fn map_key(
         ModalState::LogFiles { .. } => return map_log_modal_key(key),
         ModalState::Palette(_) => return map_palette_key(key),
         ModalState::OperationDetail(_) => return map_op_detail_key(key),
+        ModalState::LogLineDetail(_) => return map_log_line_detail_key(key),
         _ => {}
     }
 
@@ -200,6 +201,20 @@ fn map_op_detail_key(key: KeyEvent) -> Action {
         (Char('G'), KM::SHIFT) | (Char('G'), KM::NONE) => Action::Bottom,
         (Char('c'), KM::NONE) => Action::CancelOp,
         _ => Action::Unknown,
+    }
+}
+
+/// Keys for the log-line overlay: the same close/scroll vocabulary as the
+/// operation overlay, minus `c` — there is no operation behind a log line to
+/// cancel, and silently accepting the key would suggest otherwise.
+#[cfg(feature = "tui")]
+fn map_log_line_detail_key(key: KeyEvent) -> Action {
+    use KeyCode::*;
+    use KeyModifiers as KM;
+
+    match (key.code, key.modifiers) {
+        (Char('c'), KM::NONE) => Action::Unknown,
+        _ => map_op_detail_key(key),
     }
 }
 
@@ -350,6 +365,62 @@ mod tests {
             op_id: "op_1".into(),
             scroll: 0,
         })
+    }
+
+    fn log_line_modal() -> ModalState {
+        ModalState::LogLineDetail(crate::state::LogLineDetailState {
+            text: "pid=1 role=bridge INFO something long".into(),
+            scroll: 0,
+        })
+    }
+
+    /// The log-line overlay shares the close/scroll vocabulary of the operation
+    /// overlay, so muscle memory carries over between the two.
+    #[test]
+    fn log_line_detail_close_and_scroll_keys() {
+        for (key, want) in [
+            (kn(KeyCode::Esc), Action::DetailClose),
+            (kn(KeyCode::Char('q')), Action::DetailClose),
+            (kn(KeyCode::Enter), Action::DetailClose),
+            (kn(KeyCode::Char('j')), Action::Down),
+            (kn(KeyCode::Char('k')), Action::Up),
+            (kn(KeyCode::Char('g')), Action::Top),
+            (k(KeyCode::Char('G'), KeyModifiers::SHIFT), Action::Bottom),
+        ] {
+            assert_eq!(
+                map_key(key, Mode::Monitor, Focus::Log, &log_line_modal(), false),
+                want,
+                "key {key:?}"
+            );
+        }
+    }
+
+    /// `c` cancels the operation behind the *operation* overlay. There is no
+    /// operation behind a log line, so the key must do nothing rather than
+    /// silently imply one was cancelled.
+    #[test]
+    fn log_line_detail_does_not_borrow_the_cancel_key() {
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('c')),
+                Mode::Monitor,
+                Focus::Log,
+                &log_line_modal(),
+                false
+            ),
+            Action::Unknown
+        );
+        assert_eq!(
+            map_key(
+                kn(KeyCode::Char('c')),
+                Mode::Monitor,
+                Focus::Log,
+                &op_detail_modal(),
+                false
+            ),
+            Action::CancelOp,
+            "the operation overlay keeps its cancel key"
+        );
     }
 
     // ─── Operation detail overlay dispatch (map_op_detail_key) ──────────────────

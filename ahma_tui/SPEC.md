@@ -18,7 +18,8 @@
 - **Chat Interface**: Connects to the local LLM and streams chat responses, incorporating animated thinking indicators.
 - **Small-Model Context Harness**: When chatting with limited-context local models, per-tool-result output is truncated head+tail with an explicit elision marker, and the conversation is trimmed (system prompt + latest messages preserved, with an injected notice) to fit the model's context. Controlled by `--context-length <tokens>`, `--small-model-harness` / `--no-small-model-harness`, and `--minimize-tokens` / `--no-minimize-tokens`; flags take precedence over (deprecated) env vars and settings.
 - **Approval Gate Prompts**: Intercepts and renders prompts for security checkpoints (e.g. renewal gates, elevation requests).
-- **Log Monitor integration**: Displays real-time tailing of log files and LLM-powered alert notifications.
+- **Log Monitor integration**: Displays real-time tailing of log files and LLM-powered alert notifications. A log line clipped at the pane edge can be clicked to open it wrapped and scrollable (SPEC R24.8.4).
+- **Honest panes (SPEC R24.8)**: Every scrollable or size-capped pane tells the truth about what it is showing — the scrollbar thumb reaches the bottom exactly when the content does, layout budgets the rows the renderer actually draws, overflow keeps the result rather than the command echo, clipped content stays reachable, and each advertised toggle names its own key.
 
 ## 3. Non-Functional Requirements
 

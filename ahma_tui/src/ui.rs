@@ -25,6 +25,15 @@ use crate::theme::Theme;
 /// Called every redraw tick — the only public entry point in this module.
 #[cfg(feature = "tui")]
 pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    // Click targets describe *this* frame's screen and nothing else. They were
+    // only ever cleared when an overlay happened to open, so they accumulated
+    // for the life of the session: the vector grew without bound, every click
+    // cloned it, and — because `handle_mouse_click` takes the first rect that
+    // contains the point — a stale rect from an earlier frame could out-rank the
+    // widget actually drawn there. Reset at the top of the frame that rebuilds
+    // them. (The overlays clear again, to drop the layer they cover.)
+    state.click_targets.borrow_mut().clear();
+
     match state.mode {
         Mode::Chat => draw_chat_layout(frame, state, theme),
         Mode::Monitor => draw_monitor_layout(frame, state, theme),
@@ -45,6 +54,9 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
         }
         crate::state::ModalState::OperationDetail(detail) => {
             draw_operation_detail(frame, state, detail, theme, full)
+        }
+        crate::state::ModalState::LogLineDetail(detail) => {
+            draw_log_line_detail(frame, state, detail, theme, full)
         }
     }
     if state.settings_editor.open {
@@ -74,6 +86,24 @@ struct RenderedWindowLayout {
     keep_open: bool,
 }
 
+/// Whether [`draw_expanded_window`] will prepend a `$ <command>` header and its
+/// separator rule. The layout budget and the renderer must ask the *same*
+/// question (SPEC R24.8.2) — when they disagreed, a window was sized for its
+/// output rows only and then rendered two rows taller, pushing the tail off the
+/// bottom. For a one-line command like `!pwd` that is the entire answer.
+#[cfg(feature = "tui")]
+fn window_has_command_header(w: &crate::state::TuiWindow) -> bool {
+    !w.command.is_empty() && w.command != w.label
+}
+
+/// Logical line count [`draw_expanded_window`] renders inside the borders:
+/// the optional command header (2 rows) plus one row per output line.
+#[cfg(feature = "tui")]
+fn expanded_window_line_count(w: &crate::state::TuiWindow) -> usize {
+    let header = if window_has_command_header(w) { 2 } else { 0 };
+    header + w.content.len()
+}
+
 #[cfg(feature = "tui")]
 fn compute_window_layouts(
     windows: &[crate::state::TuiWindow],
@@ -87,7 +117,8 @@ fn compute_window_layouts(
             let preferred_h = if w.collapsed {
                 1
             } else {
-                (w.content.len() + 2).clamp(3, 8) as u16
+                // +2 for the top/bottom border.
+                (expanded_window_line_count(w) + 2).clamp(3, 8) as u16
             };
             RenderedWindowLayout {
                 orig_idx: i,
@@ -336,7 +367,7 @@ fn draw_expanded_window(
     let mut content_lines: Vec<Line> = Vec::new();
 
     // Command header (shown when non-empty and distinct from the label).
-    if !w.command.is_empty() && w.command != w.label {
+    if window_has_command_header(w) {
         let cmd_display = format!("$ {}", w.command);
         content_lines.push(Line::from(Span::styled(cmd_display, theme.dim())));
         // Separator
@@ -353,7 +384,15 @@ fn draw_expanded_window(
         content_lines.push(Line::from(Span::styled(line.clone(), style)));
     }
 
-    let para = Paragraph::new(content_lines).wrap(Wrap { trim: false });
+    // Anchor to the *end* of the output (SPEC R24.8.3). A window is capped at 8
+    // rows and long or wrapped output overflows it; rendering from the top then
+    // shows the command echo and hides the result, which is the one thing the
+    // window exists to report. The command itself is still in the border title.
+    let scroll = total_wrapped_rows(&content_lines, inner.width as usize)
+        .saturating_sub(inner.height as usize);
+    let para = Paragraph::new(content_lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(para, inner);
 }
 
@@ -482,6 +521,81 @@ fn draw_operation_detail(
         ),
     ];
     frame.render_widget(Paragraph::new(Line::from(spans)), footer_a);
+}
+
+/// Full-screen drill-in for one log line (click on it in the log pane) — the
+/// reachability half of SPEC R24.8.4.
+///
+/// The log pane renders unwrapped by default, so any line wider than the pane
+/// is silently cut at the edge — and the interesting part of a structured log
+/// line (the message) sits *after* the pid/role/timestamp/level preamble, so
+/// what gets cut is exactly what the reader wanted. This shows the line wrapped
+/// and scrollable, reusing the scroll bookkeeping of the operation overlay.
+#[cfg(feature = "tui")]
+fn draw_log_line_detail(
+    frame: &mut Frame,
+    state: &AppState,
+    detail: &crate::state::LogLineDetailState,
+    theme: &Theme,
+    area: Rect,
+) {
+    // The overlay owns the screen — see `draw_operation_detail`.
+    state.click_targets.borrow_mut().clear();
+    state.window_rects.borrow_mut().clear();
+
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(Span::styled(" Log line ", theme.title()))
+        .borders(Borders::ALL)
+        .border_style(theme.border_focused());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 2 {
+        return;
+    }
+
+    let [body_a, footer_a] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    // Reserve the scrollbar column before wrapping, so toggling the bar cannot
+    // re-wrap the text and oscillate the row count.
+    let text_width = (body_a.width as usize).saturating_sub(1).max(1);
+    let lines = vec![Line::from(Span::styled(
+        detail.text.clone(),
+        theme.normal(),
+    ))];
+    let total_rows = total_wrapped_rows(&lines, text_width);
+    let max_scroll = total_rows.saturating_sub(body_a.height as usize);
+    state.detail_max_scroll.set(max_scroll);
+    let scroll = detail.scroll.min(max_scroll);
+
+    let text_a = Rect {
+        width: body_a.width.saturating_sub(1).max(1),
+        ..body_a
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll as u16, 0)),
+        text_a,
+    );
+    draw_scrollbar(
+        frame,
+        theme,
+        total_rows,
+        body_a.height as usize,
+        scroll,
+        body_a,
+    );
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Esc close · j/k scroll · g/G top/bottom",
+            theme.dim(),
+        ))),
+        footer_a,
+    );
 }
 
 /// The scrollable body of the operation detail overlay.
@@ -949,6 +1063,12 @@ fn total_wrapped_rows(lines: &[ratatui::text::Line<'_>], width: usize) -> usize 
 /// when a resize re-wraps the content. The thumb is painted as a solid filled
 /// cell instead of ratatui's default `█` glyph, which renders as dashes under
 /// terminal line-spacing. No bar is drawn when everything already fits.
+///
+/// Scroll position must be truthful (SPEC R24.8.1): `ScrollbarState::content_length`
+/// is the number of **scroll positions**, not content rows, because ratatui places
+/// the thumb at `position / (content_length - 1 + viewport_content_length)` of the
+/// track. Feed it the position count so "scrolled to the end" paints the thumb
+/// flush against the bottom.
 #[cfg(feature = "tui")]
 fn draw_scrollbar(
     frame: &mut Frame,
@@ -969,9 +1089,10 @@ fn draw_scrollbar(
         .thumb_style(theme.scrollbar_thumb())
         .track_symbol(Some(" "))
         .track_style(theme.scrollbar_track());
-    let mut sb_state = ScrollbarState::new(total_len)
+    let positions = total_len - visible_h + 1;
+    let mut sb_state = ScrollbarState::new(positions)
         .viewport_content_length(visible_h)
-        .position(scroll);
+        .position(scroll.min(positions - 1));
     frame.render_stateful_widget(sb, inner, &mut sb_state);
 }
 
@@ -2131,10 +2252,21 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
 
     let rows_to_draw = display_rows.min(rows.len() - scroll);
 
+    // Reserve the scrollbar column when the tree overflows (SPEC R24.8.1). Row
+    // count does not depend on width here — these are list rows, not wrapped
+    // text — so a conditional reservation cannot oscillate, and a tree that
+    // fits keeps its full width.
+    let overflows = rows.len() > display_rows;
+    let row_width = if overflows {
+        inner.width.saturating_sub(1).max(1)
+    } else {
+        inner.width
+    };
+
     for i in 0..rows_to_draw {
         let row_idx = scroll + i;
         let row = &rows[row_idx];
-        let row_area = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+        let row_area = Rect::new(inner.x, inner.y + i as u16, row_width, 1);
         let is_selected = row_idx == selected;
 
         match &row.kind {
@@ -2184,6 +2316,8 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
             ),
         }
     }
+
+    draw_scrollbar(frame, theme, rows.len(), display_rows, scroll, inner);
 }
 
 /// Adjust the tree's scroll offset so the selected row stays within the
@@ -2782,94 +2916,127 @@ fn render_selected_instance_detail(
         return;
     }
 
-    let mut lines = Vec::new();
+    // Lead with the answer, not the identity (SPEC R24.8.6). Selecting an
+    // instance is a question about work — "what did I ask this client to do,
+    // and how did it go?" — so the tally line and the recent operations come
+    // first, and the wiring detail is demoted to a dim footer for the rare
+    // moment someone is debugging the connection itself.
+    let mut lines = vec![instance_tally_line(counts, theme, state.unicode)];
 
-    // Find instance details if not local group
-    let inst_info = if !group_id.is_empty() {
-        state
-            .active_instances
-            .iter()
-            .find(|inst| inst.id == group_id)
-    } else {
-        None
-    };
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Recent operations", theme.title())));
 
-    if let Some(info) = inst_info {
-        lines.push(Line::from(vec![
-            Span::styled("Client   ", theme.dim()),
-            Span::styled(
-                info.client.as_deref().unwrap_or("unknown").to_string(),
-                theme.normal(),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("Label    ", theme.dim()),
-            Span::styled(info.label.to_string(), theme.normal()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("PID      ", theme.dim()),
-            Span::styled(info.pid.to_string(), theme.normal()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("Mode     ", theme.dim()),
-            Span::styled(info.mode.to_string(), theme.normal()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("Scope    ", theme.dim()),
-            Span::styled(info.scope.to_string(), theme.normal()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("UUID     ", theme.dim()),
-            Span::styled(info.id.to_string(), theme.normal()),
-        ]));
+    // Budget: everything above plus the identity footer (blank + 1 line).
+    let used = lines.len() + 2;
+    let op_budget = (inner.height as usize).saturating_sub(used).max(1);
+    let recent = recent_instance_ops(state, group_id, op_budget);
+    if recent.is_empty() {
+        lines.push(Line::from(Span::styled("  nothing run yet", theme.dim())));
     } else {
-        lines.push(Line::from(vec![
-            Span::styled("Type     ", theme.dim()),
-            Span::styled("Local TUI Connection", theme.normal()),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("Label    ", theme.dim()),
-            Span::styled("this terminal (you)", theme.normal()),
-        ]));
-        if !detail.is_empty() {
+        for op in recent {
             lines.push(Line::from(vec![
-                Span::styled("Detail   ", theme.dim()),
-                Span::styled(detail.to_string(), theme.normal()),
+                Span::styled(
+                    format!("  {} ", op.status.glyph(state.unicode)),
+                    theme.op_status_style(&op.status),
+                ),
+                Span::styled(
+                    truncate(&op.display_name(), inner.width.saturating_sub(14) as usize),
+                    theme.normal(),
+                ),
+                Span::styled(format!("  {}", op.elapsed_display()), theme.dim()),
             ]));
         }
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Operation Tallies:",
-        theme.title(),
+        instance_identity_footer(state, group_id, detail),
+        theme.dim(),
     )));
-
-    let (r, q, s, f) = (
-        counts.running,
-        counts.queued,
-        counts.succeeded,
-        counts.failed,
-    );
-    lines.push(Line::from(vec![
-        Span::styled("  Running    ", theme.dim()),
-        Span::styled(r.to_string(), theme.running()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  Queued     ", theme.dim()),
-        Span::styled(q.to_string(), theme.pending()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  Succeeded  ", theme.dim()),
-        Span::styled(s.to_string(), theme.success()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  Failed     ", theme.dim()),
-        Span::styled(f.to_string(), theme.failed()),
-    ]));
 
     let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     frame.render_widget(para, inner);
+}
+
+/// One-line outcome summary for an instance: `2 running · 1 queued · 14 ok · 1 failed`.
+/// Zero-valued terms are dropped so the eye lands on what is actually happening.
+#[cfg(feature = "tui")]
+fn instance_tally_line(
+    counts: &crate::task_tree::GroupCounts,
+    theme: &Theme,
+    unicode: bool,
+) -> Line<'static> {
+    let sep = if unicode { " · " } else { " | " };
+    let terms: [(usize, &str, Style); 4] = [
+        (counts.running, "running", theme.running()),
+        (counts.queued, "queued", theme.pending()),
+        (counts.succeeded, "ok", theme.success()),
+        (counts.failed, "failed", theme.failed()),
+    ];
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (n, label, style) in terms {
+        if n == 0 {
+            continue;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::styled(sep.to_string(), theme.dim()));
+        }
+        spans.push(Span::styled(format!("{n} {label}"), style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(
+            "idle — no operations".to_string(),
+            theme.dim(),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The most recent operations belonging to `group_id`, newest first, capped at
+/// `limit`. An empty `group_id` is the TUI's own local group, whose operations
+/// carry no instance id.
+#[cfg(feature = "tui")]
+fn recent_instance_ops<'a>(
+    state: &'a AppState,
+    group_id: &str,
+    limit: usize,
+) -> Vec<&'a crate::state::Operation> {
+    let mut matching: Vec<&crate::state::Operation> = state
+        .operations
+        .iter()
+        .filter(|op| match op.instance_id.as_deref() {
+            Some(id) => id == group_id,
+            None => group_id.is_empty(),
+        })
+        .collect();
+    // `operations` is append-ordered, so the tail is the newest work.
+    matching.reverse();
+    matching.truncate(limit);
+    matching
+}
+
+/// The connection wiring, on one dim line: transport, pid, and sandbox scope.
+#[cfg(feature = "tui")]
+fn instance_identity_footer(state: &AppState, group_id: &str, detail: &str) -> String {
+    let info = if group_id.is_empty() {
+        None
+    } else {
+        state
+            .active_instances
+            .iter()
+            .find(|inst| inst.id == group_id)
+    };
+    match info {
+        Some(info) => format!(
+            "{} · {} · pid {} · {}",
+            info.client.as_deref().unwrap_or("unknown"),
+            info.mode,
+            info.pid,
+            info.scope
+        ),
+        None if detail.is_empty() => "this terminal (you)".to_string(),
+        None => format!("this terminal (you) · {detail}"),
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -3116,8 +3283,11 @@ fn build_log_title(state: &AppState) -> String {
         String::new()
     };
     let filter_indicator = log_filter_indicator(state);
+    // A control names its own key (SPEC R24.8.5). The old form listed Wrap and
+    // Zoom and then said "Press 'l' to switch", which reads as though `l` drove
+    // them — it opens the file switcher; `w` wraps and `Enter` zooms.
     format!(
-        "{}{}{}[Wrap: {} | Zoom: {} | Press 'l' to switch] ",
+        "{}{}{}[w Wrap:{} | Enter Zoom:{} | l file | click a line to open] ",
         panel, log_title, filter_indicator, wrap_str, zoom_str
     )
 }
@@ -3181,8 +3351,33 @@ fn draw_log(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
         .cloned()
         .collect();
 
+    // One click target per visible row, so a line that is too long for the pane
+    // can be opened and read in full. Registered before the paragraph is drawn
+    // so the rects match exactly what is on screen this frame.
+    register_log_line_click_targets(state, &visible_lines, inner);
+
     frame.render_widget(Paragraph::new(visible_lines), inner);
     draw_scrollbar(frame, theme, display_lines.len(), visible_h, scroll, inner);
+}
+
+/// Register a [`ClickTarget::OpenLogLine`] for each rendered log row, carrying
+/// that row's plain text. Blank rows are skipped — there is nothing to open.
+#[cfg(feature = "tui")]
+fn register_log_line_click_targets(state: &AppState, visible_lines: &[Line<'_>], inner: Rect) {
+    let mut targets = state.click_targets.borrow_mut();
+    for (i, line) in visible_lines.iter().enumerate() {
+        let text: String = line.spans.iter().map(|s| &*s.content).collect();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let rect = Rect {
+            x: inner.x,
+            y: inner.y + i as u16,
+            width: inner.width,
+            height: 1,
+        };
+        targets.push((ClickTarget::OpenLogLine(text), rect));
+    }
 }
 
 #[cfg(feature = "tui")]
@@ -3675,12 +3870,8 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("", ""),
         ("CHAT INPUT PREFIXES", ""),
         (
-            "$ / % / ! <command>",
-            "Run terminal command in sandbox (e.g. $ pwd)",
-        ),
-        (
-            "!! <command>",
-            "Run OUTSIDE sandbox — unrestricted, human-only (e.g. !! make install)",
+            "! <command>",
+            "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
         ),
         ("# <goal>", "Decompose goal using LLM"),
         ("/", "Open navigator (from empty input)"),
@@ -3733,6 +3924,10 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("/", "Start filter (Esc to clear)"),
         ("j / k", "Scroll"),
         ("g / G", "Top / bottom"),
+        ("w", "Toggle line wrap"),
+        ("Enter", "Zoom/restore the pane"),
+        ("l", "Switch log file"),
+        ("Click a line", "Open it full-screen, wrapped"),
     ];
 
     let single_rows: &[(&str, &str)] = &[
@@ -3751,12 +3946,8 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("", ""),
         ("CHAT INPUT PREFIXES", ""),
         (
-            "$ or % or ! <command>",
-            "Run terminal command in sandbox (e.g. $ pwd)",
-        ),
-        (
-            "!! <command>",
-            "Run OUTSIDE sandbox — unrestricted, human-only (e.g. !! make install)",
+            "! <command>",
+            "Run OUTSIDE the sandbox — unrestricted, human-only (e.g. ! pwd)",
         ),
         ("# <goal>", "Decompose goal using LLM (e.g. # run tests)"),
         ("/", "Open command navigator (from empty input)"),
@@ -3784,6 +3975,10 @@ fn draw_help(frame: &mut Frame, theme: &Theme, area: Rect) {
         ("/", "Start filter (Esc to clear)"),
         ("j / k", "Scroll"),
         ("g / G", "Top / bottom"),
+        ("w", "Toggle line wrap"),
+        ("Enter", "Zoom/restore the pane"),
+        ("l", "Switch log file"),
+        ("Click a line", "Open it full-screen, wrapped"),
         ("", ""),
         ("APPROVAL BANNER", ""),
         ("y", "Approve gate"),
@@ -4191,6 +4386,287 @@ mod tests {
         );
     }
 
+    /// The reported symptom: `!pwd` printed nothing visible. The window was
+    /// sized from `content.len()` alone while the renderer also prepended a
+    /// `$ pwd` header and a separator, so the two rows it did not budget for
+    /// pushed the answer and the outcome off the bottom.
+    #[test]
+    fn window_layout_budgets_the_command_header_it_renders() {
+        use crate::state::WindowStatus;
+        let mut w = layout_window(WindowStatus::Finished, 2);
+        w.label = "UNSANDBOXED: pwd in ~/github/ahma".into();
+        w.command = "pwd".into();
+        w.content = vec!["/Users/paul/github/ahma".into(), "Finished in 0.0s".into()];
+
+        assert!(
+            window_has_command_header(&w),
+            "a distinct command must render its header"
+        );
+        assert_eq!(
+            expanded_window_line_count(&w),
+            4,
+            "2 header rows + 2 output rows"
+        );
+
+        let layouts = compute_window_layouts(std::slice::from_ref(&w), 40);
+        let inner_h = layouts[0].height as usize - 2; // borders
+        assert!(
+            inner_h >= expanded_window_line_count(&w),
+            "window sized {inner_h} rows for {} rendered lines — the answer is cut off",
+            expanded_window_line_count(&w)
+        );
+    }
+
+    /// A window with no command header must not be padded for one.
+    #[test]
+    fn window_layout_omits_the_header_budget_when_no_command_is_shown() {
+        use crate::state::WindowStatus;
+        let w = layout_window(WindowStatus::Finished, 2);
+        assert!(!window_has_command_header(&w));
+        assert_eq!(expanded_window_line_count(&w), 2);
+    }
+
+    /// Render a real window and read back the text of each row, so the test
+    /// sees exactly what the user sees.
+    fn render_window_rows(w: &crate::state::TuiWindow, width: u16, height: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                draw_expanded_window(frame, w, area, &theme, theme.normal());
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// End-to-end for the `!pwd` report: the command's actual output must be on
+    /// screen at the height the layout picks for it.
+    #[test]
+    fn expanded_window_shows_the_command_output() {
+        use crate::state::WindowStatus;
+        let mut w = layout_window(WindowStatus::Finished, 0);
+        w.label = "UNSANDBOXED: pwd in ~/github/ahma".into();
+        w.command = "pwd".into();
+        w.content = vec!["/Users/paul/github/ahma".into(), "Finished in 0.0s".into()];
+
+        let h = compute_window_layouts(std::slice::from_ref(&w), 40)[0].height;
+        let rows = render_window_rows(&w, 60, h);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("/Users/paul/github/ahma"),
+            "the command's output must be visible, got:\n{screen}"
+        );
+    }
+
+    /// When output overflows the capped window, the *tail* survives — the last
+    /// lines and the outcome, not the command echo the border already shows.
+    #[test]
+    fn expanded_window_overflow_keeps_the_tail_not_the_head() {
+        use crate::state::WindowStatus;
+        let mut w = layout_window(WindowStatus::Finished, 0);
+        w.label = "UNSANDBOXED: ls in ~/github/ahma".into();
+        w.command = "ls".into();
+        w.content = (0..40).map(|i| format!("entry-{i}")).collect();
+
+        let h = compute_window_layouts(std::slice::from_ref(&w), 40)[0].height;
+        let screen = render_window_rows(&w, 60, h).join("\n");
+        assert!(
+            screen.contains("entry-39"),
+            "the newest output must survive overflow, got:\n{screen}"
+        );
+        assert!(
+            !screen.contains("entry-0\n") && !screen.ends_with("entry-0"),
+            "the oldest output is what should scroll away, got:\n{screen}"
+        );
+    }
+
+    /// Every rendered log row gets a click target carrying its full text, so a
+    /// line truncated at the pane edge can still be opened and read. Blank rows
+    /// are skipped — there is nothing behind them.
+    #[test]
+    fn log_rows_register_click_targets_with_their_full_text() {
+        let state = AppState::new("http://localhost:3000", "HTTP", true);
+        let inner = Rect::new(0, 5, 40, 3);
+        let lines = vec![
+            make_line("pid=1 role=bridge INFO a very long message"),
+            make_line("   "),
+            make_line("pid=1 role=bridge WARN another line"),
+        ];
+        register_log_line_click_targets(&state, &lines, inner);
+
+        let targets = state.click_targets.borrow();
+        assert_eq!(targets.len(), 2, "the blank row must not be clickable");
+        match &targets[0] {
+            (ClickTarget::OpenLogLine(text), rect) => {
+                assert_eq!(text, "pid=1 role=bridge INFO a very long message");
+                assert_eq!((rect.y, rect.height), (5, 1));
+            }
+            other => panic!("expected an OpenLogLine target, got {other:?}"),
+        }
+        match &targets[1] {
+            (ClickTarget::OpenLogLine(text), rect) => {
+                assert_eq!(text, "pid=1 role=bridge WARN another line");
+                assert_eq!(rect.y, 7, "row index must map to its screen row");
+            }
+            other => panic!("expected an OpenLogLine target, got {other:?}"),
+        }
+    }
+
+    /// A tree taller than its pane scrolls silently unless it says so. The
+    /// selected row is kept in view automatically, so without a bar there is no
+    /// cue at all that rows exist above or below.
+    #[test]
+    fn task_tree_shows_a_scrollbar_only_when_it_overflows() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        let thumb_bg = theme.scrollbar_thumb().bg;
+        let track_bg = theme.scrollbar_track().bg;
+
+        // `n` operations under one instance header; the pane shows 8 rows.
+        let render = |n: usize| -> Vec<Option<Color>> {
+            let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+            state.mode = Mode::Monitor;
+            for i in 0..n {
+                let mut op = crate::state::Operation::new(
+                    format!("op_{i}"),
+                    "run_terminal_command",
+                    crate::state::OpStatus::Running,
+                );
+                op.title = Some(format!("cargo test {i}"));
+                state.operations.push(op);
+            }
+            let (w, h) = (60u16, 10u16);
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal
+                .draw(|frame| draw_ops_dag(frame, &state, &theme, Rect::new(0, 0, w, h)))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            // Column w-2 is inside the block border, where the bar renders.
+            (1..h - 1)
+                .map(|y| buf.cell((w - 2, y)).unwrap().bg.into())
+                .collect()
+        };
+
+        let few = render(2);
+        assert!(
+            !few.iter().any(|bg| *bg == thumb_bg || *bg == track_bg),
+            "a tree that fits must not steal a column for a bar, got {few:?}"
+        );
+
+        let many = render(60);
+        assert!(
+            many.contains(&thumb_bg),
+            "an overflowing tree must show its scroll position, got {many:?}"
+        );
+    }
+
+    /// The help screen claimed `$ / % / ! <command>` ran "in sandbox" and that
+    /// `!!` was the escape. Only `!` is handled, and it is the escape — so the
+    /// help told the user a sandbox bypass was sandboxed, and named two
+    /// prefixes that do nothing. Documentation that inverts a security
+    /// polarity is worse than none (SPEC R7: enforcement is never silently
+    /// disabled, and disclosure is loud).
+    #[test]
+    fn help_describes_the_bang_prefix_as_the_sandbox_escape() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        // Both the two-column (>=100 wide) and single-column layouts.
+        for width in [120u16, 70] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 50)).unwrap();
+            terminal
+                .draw(|frame| draw_help(frame, &theme, Rect::new(0, 0, width, 50)))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let screen: String = (0..50)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert!(
+                !screen.contains("in sandbox"),
+                "width {width}: no chat prefix runs in the sandbox, got:\n{screen}"
+            );
+            assert!(
+                !screen.contains("!!"),
+                "width {width}: `!!` is not a prefix the code implements, got:\n{screen}"
+            );
+            assert!(
+                screen.contains("OUTSIDE"),
+                "width {width}: the `!` escape must be disclosed, got:\n{screen}"
+            );
+        }
+    }
+
+    /// Click targets are rebuilt from scratch every frame. They used to be
+    /// cleared only when an overlay opened, so they grew for the whole session
+    /// and a stale rect could win the first-match lookup over the widget
+    /// actually drawn at that point.
+    #[test]
+    fn drawing_a_frame_discards_the_previous_frame_targets() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::new(true);
+        let mut state = AppState::new("http://localhost:3000", "HTTP", true);
+        state.mode = Mode::Monitor;
+
+        // A target left over from an earlier frame, at a rect nothing occupies.
+        state.click_targets.borrow_mut().push((
+            ClickTarget::OpenLogLine("stale".into()),
+            Rect::new(0, 0, 5, 1),
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &state, &theme)).unwrap();
+
+        let targets = state.click_targets.borrow();
+        assert!(
+            !targets
+                .iter()
+                .any(|(t, _)| matches!(t, ClickTarget::OpenLogLine(s) if s == "stale")),
+            "the previous frame's targets must not survive into this one"
+        );
+    }
+
+    /// The instance panel answers "how did it go", so zero-valued tallies are
+    /// noise and are dropped; an instance with no work says so in words.
+    #[test]
+    fn instance_tally_line_drops_zero_terms() {
+        use crate::task_tree::GroupCounts;
+        let theme = Theme::new(true);
+        let text = |l: &Line| -> String { l.spans.iter().map(|s| &*s.content).collect() };
+
+        let busy = GroupCounts {
+            running: 2,
+            queued: 0,
+            succeeded: 14,
+            failed: 1,
+        };
+        let line = text(&instance_tally_line(&busy, &theme, true));
+        assert_eq!(line, "2 running · 14 ok · 1 failed");
+
+        let idle = GroupCounts::default();
+        assert_eq!(
+            text(&instance_tally_line(&idle, &theme, true)),
+            "idle — no operations"
+        );
+    }
+
     #[test]
     fn status_glyphs_distinguish_outcomes() {
         use crate::state::WindowStatus;
@@ -4424,6 +4900,42 @@ mod tests {
                 assert_eq!(*bg, track_bg, "row {i} should be track groove");
             }
         }
+    }
+
+    /// The long-standing complaint: scrolled fully to the end, the thumb stopped
+    /// short of the bottom edge, so the pane looked like it had more below.
+    /// `ScrollbarState::content_length` counts scroll *positions*, not rows;
+    /// feeding it the row count parks the thumb at `total/(total-1+visible)` of
+    /// the track. Checked across shapes because the error shrinks as content
+    /// grows — which is why the log pane looked fine and the chat pane did not.
+    #[test]
+    fn scrollbar_thumb_reaches_the_bottom_at_max_scroll() {
+        let thumb_bg = Theme::new(true).scrollbar_thumb().bg;
+        let height = 10u16;
+        for (total, visible) in [(12usize, 10usize), (15, 10), (40, 10), (400, 10)] {
+            let max_scroll = total - visible;
+            let col = render_scrollbar_column(total, visible, max_scroll, height);
+            let last = col.last().expect("scrollbar column is non-empty");
+            assert_eq!(
+                last.1, thumb_bg,
+                "total={total} visible={visible}: at max scroll the thumb must \
+                 reach the bottom row of the track, got column {col:?}"
+            );
+        }
+    }
+
+    /// The complement: at rest (nothing scrolled) the thumb must NOT touch the
+    /// bottom, or "you are at the end" would be indistinguishable from "you are
+    /// at the start".
+    #[test]
+    fn scrollbar_thumb_leaves_the_bottom_free_at_top_scroll() {
+        let thumb_bg = Theme::new(true).scrollbar_thumb().bg;
+        let col = render_scrollbar_column(40, 10, 0, 10);
+        assert_ne!(
+            col.last().unwrap().1,
+            thumb_bg,
+            "at scroll 0 the bottom of the track must be groove, got {col:?}"
+        );
     }
 
     #[test]
