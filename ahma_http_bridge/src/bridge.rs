@@ -1295,19 +1295,34 @@ async fn try_start_quic_endpoint(tcp_addr: SocketAddr) -> Option<QuicInfo> {
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    /// This bridge process's configured default sandbox scope (from
+    /// `--sandbox-scope` or the `~/sandbox` fallback), if any. `None` when the
+    /// bridge is waiting on client `roots/list` to learn its scope. Callers
+    /// deciding whether to reuse this bridge instead of spawning a new one
+    /// should compare this against the project directory they actually want
+    /// (SPEC R7) rather than assuming a healthy bridge is scoped correctly.
+    /// `#[serde(default)]` so a client talking to a pre-upgrade bridge that
+    /// doesn't send this field still deserializes the response.
+    #[serde(default)]
+    pub default_sandbox_scope: Option<String>,
 }
 
 /// Health check endpoint
-async fn health_check() -> impl IntoResponse {
+async fn health_check(State(state): State<Arc<BridgeState>>) -> impl IntoResponse {
     // Include the compile-time build-id so that same-semver dev rebuilds are
     // detectable: "0.12.5+abc1234" differs from "0.12.5+def5678" even though
     // the semver is identical.
     let version = format!("{}+{}", env!("CARGO_PKG_VERSION"), ahma_common::BUILD_ID);
+    let default_sandbox_scope = state
+        .session_manager
+        .default_scope()
+        .map(|p| p.to_string_lossy().into_owned());
     (
         StatusCode::OK,
         Json(HealthResponse {
             status: "OK".to_string(),
             version,
+            default_sandbox_scope,
         }),
     )
 }
@@ -2415,6 +2430,14 @@ for line in sys.stdin:
             version.starts_with(env!("CARGO_PKG_VERSION")),
             "health version must start with semver: got {version}"
         );
+        // A client deciding whether to reuse this bridge must be able to see
+        // which project it's actually scoped to (SPEC R7).
+        let reported_scope = response_json
+            .get("default_sandbox_scope")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(reported_scope, temp_dir.path().to_string_lossy());
     }
 
     // ── CORS hardening tests ───────────────────────────────────────────

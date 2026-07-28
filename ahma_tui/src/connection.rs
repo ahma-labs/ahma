@@ -437,8 +437,31 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
+/// A running bridge's self-reported version and (if any) the sandbox scope it
+/// is actually configured for. `default_sandbox_scope` lets a caller decide
+/// whether an already-healthy bridge is safe to reuse for a *different*
+/// project, instead of assuming any healthy bridge is scoped correctly
+/// (SPEC R7) — see `handle_existing_candidate`.
+struct BridgeHealth {
+    version: String,
+    default_sandbox_scope: Option<String>,
+}
+
+fn parse_health_body(body: &str) -> Option<BridgeHealth> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let version = parsed.get("version")?.as_str()?.to_string();
+    let default_sandbox_scope = parsed
+        .get("default_sandbox_scope")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Some(BridgeHealth {
+        version,
+        default_sandbox_scope,
+    })
+}
+
 #[cfg(unix)]
-async fn query_uds_health(path: &str) -> Option<String> {
+async fn query_uds_health_full(path: &str) -> Option<BridgeHealth> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let connect = tokio::net::UnixStream::connect(path);
     let mut stream = tokio::time::timeout(Duration::from_millis(200), connect)
@@ -456,11 +479,15 @@ async fn query_uds_health(path: &str) -> Option<String> {
 
     let response_str = std::str::from_utf8(&buf).ok()?;
     let body = response_str.split("\r\n\r\n").nth(1)?;
-    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed.get("version")?.as_str().map(String::from)
+    parse_health_body(body)
 }
 
-async fn query_tcp_health(url: &str) -> Option<String> {
+#[cfg(unix)]
+async fn query_uds_health(path: &str) -> Option<String> {
+    query_uds_health_full(path).await.map(|h| h.version)
+}
+
+async fn query_tcp_health_full(url: &str) -> Option<BridgeHealth> {
     let health_url = format!("{}/health", url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(200))
@@ -468,10 +495,14 @@ async fn query_tcp_health(url: &str) -> Option<String> {
         .unwrap_or_default();
     let resp = client.get(&health_url).send().await.ok()?;
     if resp.status().is_success() {
-        let parsed: serde_json::Value = resp.json().await.ok()?;
-        return parsed.get("version")?.as_str().map(String::from);
+        let body = resp.text().await.ok()?;
+        return parse_health_body(&body);
     }
     None
+}
+
+async fn query_tcp_health(url: &str) -> Option<String> {
+    query_tcp_health_full(url).await.map(|h| h.version)
 }
 
 pub async fn get_candidate_version(candidate: &ResolvedConnection) -> Option<String> {
@@ -479,6 +510,16 @@ pub async fn get_candidate_version(candidate: &ResolvedConnection) -> Option<Str
         ResolvedTransport::Http(url) | ResolvedTransport::Http3(url) => query_tcp_health(url).await,
         #[cfg(unix)]
         ResolvedTransport::UnixSocket(path) => query_uds_health(path).await,
+    }
+}
+
+async fn get_candidate_health(candidate: &ResolvedConnection) -> Option<BridgeHealth> {
+    match &candidate.transport {
+        ResolvedTransport::Http(url) | ResolvedTransport::Http3(url) => {
+            query_tcp_health_full(url).await
+        }
+        #[cfg(unix)]
+        ResolvedTransport::UnixSocket(path) => query_uds_health_full(path).await,
     }
 }
 
@@ -524,11 +565,51 @@ pub async fn trigger_candidate_restart(candidate: &ResolvedConnection) -> bool {
     }
 }
 
+/// True when `bridge_scope` (as self-reported by a running bridge's
+/// `/health`) and `wanted_scope` (the project the caller actually wants)
+/// refer to the same directory. Canonicalizes both sides first so a trailing
+/// slash or a symlinked path doesn't read as a mismatch; falls back to a
+/// literal comparison if canonicalization fails (e.g. the directory doesn't
+/// exist yet). `dunce::canonicalize` (not `std::fs::canonicalize`) so this is
+/// correct on Windows, where `\\?\`-prefixed paths would otherwise never
+/// equal their un-prefixed form.
+fn scope_matches(bridge_scope: &str, wanted_scope: &std::path::Path) -> bool {
+    let bridge_path = std::path::Path::new(bridge_scope);
+    match (
+        dunce::canonicalize(bridge_path),
+        dunce::canonicalize(wanted_scope),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => bridge_path == wanted_scope,
+    }
+}
+
 async fn handle_existing_candidate(
     candidate: &ResolvedConnection,
     client_version: &str,
     bridge_version: String,
+    bridge_default_scope: Option<&str>,
+    wanted_scope: Option<&std::path::Path>,
 ) -> Result<Option<()>> {
+    // A healthy bridge is only safe to reuse if it's actually scoped to the
+    // project we want. Without this check, a stale daemon left running for a
+    // *different* project (or one pinned to the `~/sandbox` fallback because
+    // it was started with `--sandbox` and no explicit `--sandbox-scope`) gets
+    // silently reused: every new session then auto-locks to that wrong
+    // directory instead of the one the user actually opened the TUI in
+    // (SPEC R7 — never disclose sandbox state silently).
+    if let (Some(bridge_scope), Some(wanted)) = (bridge_default_scope, wanted_scope)
+        && !scope_matches(bridge_scope, wanted)
+    {
+        tracing::warn!(
+            bridge_scope,
+            wanted_scope = %wanted.display(),
+            "Found a running bridge, but it is sandboxed to a different project; \
+             spawning a fresh one scoped to this project instead of reusing it."
+        );
+        return Ok(None);
+    }
+
     if bridge_version == client_version {
         return Ok(Some(()));
     }
@@ -633,11 +714,21 @@ fn spawn_server_process(exe: &std::path::Path, args: &[&str]) -> Result<()> {
 /// or `ahma serve http` (on Windows) and polls until healthy.
 pub async fn ensure_server_running(scope_path: Option<&std::path::Path>) -> Result<()> {
     let client_version = env!("CARGO_PKG_VERSION");
+    let path_to_use = match scope_path {
+        Some(p) => Some(p.to_path_buf()),
+        None => std::env::current_dir().ok(),
+    };
     let candidates = default_candidates();
     for candidate in &candidates {
-        if let Some(bridge_version) = get_candidate_version(candidate).await {
-            if let Some(()) =
-                handle_existing_candidate(candidate, client_version, bridge_version).await?
+        if let Some(health) = get_candidate_health(candidate).await {
+            if let Some(()) = handle_existing_candidate(
+                candidate,
+                client_version,
+                health.version,
+                health.default_sandbox_scope.as_deref(),
+                path_to_use.as_deref(),
+            )
+            .await?
             {
                 return Ok(());
             }
@@ -646,10 +737,6 @@ pub async fn ensure_server_running(scope_path: Option<&std::path::Path>) -> Resu
     }
 
     let exe = std::env::current_exe()?;
-    let path_to_use = match scope_path {
-        Some(p) => Some(p.to_path_buf()),
-        None => std::env::current_dir().ok(),
-    };
 
     let mut args = Vec::new();
     args.push("serve".to_string());
@@ -1003,6 +1090,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_tcp_health_full_extracts_default_sandbox_scope() {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "status": "OK",
+                    "version": "1.2.3",
+                    "default_sandbox_scope": "/some/project",
+                }))
+                .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}");
+
+        let health = query_tcp_health_full(&url)
+            .await
+            .expect("health response must parse");
+        assert_eq!(health.version, "1.2.3");
+        assert_eq!(
+            health.default_sandbox_scope.as_deref(),
+            Some("/some/project")
+        );
+        handle.abort();
+    }
+
+    #[test]
+    fn scope_matches_compares_literally_when_uncanonicalizable() {
+        // Neither side exists on disk, so canonicalization fails and the
+        // comparison falls back to a literal path comparison.
+        assert!(scope_matches(
+            "/does/not/exist/a",
+            std::path::Path::new("/does/not/exist/a")
+        ));
+        assert!(!scope_matches(
+            "/does/not/exist/a",
+            std::path::Path::new("/does/not/exist/b")
+        ));
+    }
+
+    #[tokio::test]
     async fn get_candidate_version_http_and_http3() {
         let (url, h) = start_test_http_server(200, Some("7.8.9"), 200, None).await;
 
@@ -1153,7 +1286,7 @@ mod tests {
             display_url: "http://x".to_string(),
             transport: ResolvedTransport::Http("http://x".to_string()),
         };
-        let r = handle_existing_candidate(&c, "1.2.3", "1.2.3".to_string())
+        let r = handle_existing_candidate(&c, "1.2.3", "1.2.3".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1164,13 +1297,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_existing_candidate_scope_mismatch_returns_none_even_if_versions_match() {
+        let c = ResolvedConnection {
+            display_url: "http://x".to_string(),
+            transport: ResolvedTransport::Http("http://x".to_string()),
+        };
+        let wanted = std::path::PathBuf::from("/some/project/a");
+        let r = handle_existing_candidate(
+            &c,
+            "1.2.3",
+            "1.2.3".to_string(),
+            Some("/some/other/project/b"),
+            Some(&wanted),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r, None,
+            "a bridge scoped to a different project must never be silently reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_existing_candidate_scope_match_reuses_candidate() {
+        let c = ResolvedConnection {
+            display_url: "http://x".to_string(),
+            transport: ResolvedTransport::Http("http://x".to_string()),
+        };
+        let wanted = std::path::PathBuf::from("/some/project/a");
+        let r = handle_existing_candidate(
+            &c,
+            "1.2.3",
+            "1.2.3".to_string(),
+            Some("/some/project/a"),
+            Some(&wanted),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, Some(()), "matching scope must still reuse the bridge");
+    }
+
+    #[tokio::test]
     async fn handle_existing_candidate_client_newer_unreachable_returns_none() {
         let dead = unreachable_url().await;
         let c = ResolvedConnection {
             display_url: dead.clone(),
             transport: ResolvedTransport::Http(dead.clone()),
         };
-        let r = handle_existing_candidate(&c, "999.0.0", "0.0.1".to_string())
+        let r = handle_existing_candidate(&c, "999.0.0", "0.0.1".to_string(), None, None)
             .await
             .unwrap();
         assert_eq!(r, None, "client-newer path returns Ok(None)");
@@ -1185,7 +1359,7 @@ mod tests {
             display_url: "http://x".to_string(),
             transport: ResolvedTransport::Http("http://x".to_string()),
         };
-        let r = handle_existing_candidate(&c, "0.0.1", "999.0.0".to_string()).await;
+        let r = handle_existing_candidate(&c, "0.0.1", "999.0.0".to_string(), None, None).await;
         unsafe {
             std::env::remove_var("AHMA_RESTARTED");
         }

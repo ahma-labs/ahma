@@ -916,6 +916,16 @@ impl SessionManager {
         self.config.default_scope.is_none()
     }
 
+    /// The bridge's configured default sandbox scope (from `--sandbox-scope`
+    /// or the `~/sandbox` fallback), if any. Exposed via `/health` (SPEC R7)
+    /// so a client deciding whether to reuse an already-running bridge can
+    /// tell whether it is actually scoped to the project the client wants,
+    /// instead of silently reusing a stale daemon pinned to a different
+    /// (or fallback) directory.
+    pub fn default_scope(&self) -> Option<&std::path::Path> {
+        self.config.default_scope.as_deref()
+    }
+
     /// Auto-lock the sandbox using the configured `default_scope` when no client roots
     /// are expected (or before they arrive). This is a no-op when `default_scope` is
     /// `None` or the sandbox is already locked. The subprocess still controls the

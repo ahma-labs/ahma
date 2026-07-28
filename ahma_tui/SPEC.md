@@ -21,6 +21,7 @@
 - **Log Monitor integration**: Displays real-time tailing of log files and LLM-powered alert notifications. A log line clipped at the pane edge can be clicked to open it wrapped and scrollable (SPEC R24.8.4).
 - **Honest panes (SPEC R24.8)**: Every scrollable or size-capped pane tells the truth about what it is showing — the scrollbar thumb reaches the bottom exactly when the content does, layout budgets the rows the renderer actually draws, overflow keeps the result rather than the command echo, clipped content stays reachable, and each advertised toggle names its own key.
 - **Agent Skills (SPEC §15 R-SK8)**: `/skills` lists skills discovered per the [Agent Skills open standard](https://agentskills.io/specification); `/<name> [args]` (or explicitly `/skill <name> [args]`) runs one — the pane shows the typed command while the LLM receives the full `SKILL.md` instructions on that and every later turn. Discovered skills appear in the `/` command navigator; invalid skill directories are disclosed, not hidden.
+- **Tool-call session reuse (SPEC R25)**: Chat tool calls reuse a single negotiated MCP session rather than performing a full `initialize`/`roots/list` handshake and spawning a fresh bridge subprocess per call. The session id established by a tool call's `get_or_create_session` is fed back into `state.session_id` so every later tool call in the turn — and across turns — reuses it instead of racing the bridge's session limit.
 
 ## 3. Non-Functional Requirements
 

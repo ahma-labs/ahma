@@ -52,6 +52,14 @@ pub enum BridgeEvent {
     Truncated {
         reason: String,
     },
+    /// A tool call just negotiated (or reused) an MCP session. The app stores
+    /// this in `state.session_id` so the *next* tool call's `McpChatConfig`
+    /// carries it and `get_or_create_session` takes its reuse fast-path
+    /// instead of spawning a brand-new bridge subprocess and handshake per
+    /// call (SPEC R25).
+    SessionEstablished {
+        session_id: String,
+    },
 }
 
 pub type McpChatConfig = ahma_core::agent::McpChatConfig;
@@ -270,6 +278,14 @@ pub fn spawn_tool_call_task(
                 return;
             }
         };
+        // Feed the (possibly freshly negotiated) session id back to the app so
+        // the *next* tool call's McpChatConfig carries it and reuses this
+        // session instead of handshaking a brand-new one (SPEC R25).
+        let _ = tx
+            .send(BridgeEvent::SessionEstablished {
+                session_id: session_id.clone(),
+            })
+            .await;
 
         let tool_result = ahma_core::agent::call_mcp_tool_http(
             &client,
@@ -282,12 +298,24 @@ pub fn spawn_tool_call_task(
         let (result, failed) = match tool_result {
             Ok((result, failed)) => (result, failed),
             Err(ref err) if err.contains("HTTP 403") => {
+                // The cached/reused session was rejected — drop it from the
+                // process-wide cache too, or get_or_create_session would just
+                // hand back the same dead id for `fresh_mcp` below.
+                ahma_core::agent::invalidate_cached_session(&url, &mcp.workspace_root);
                 let fresh_mcp = McpChatConfig {
                     session_id: None,
                     ..mcp.clone()
                 };
                 match ahma_core::agent::get_or_create_session(&client, &url, &fresh_mcp).await {
                     Ok(new_sid) => {
+                        // The old session_id was rejected (403); replace it in
+                        // app state so subsequent calls don't keep retrying a
+                        // dead session before falling back here every time.
+                        let _ = tx
+                            .send(BridgeEvent::SessionEstablished {
+                                session_id: new_sid.clone(),
+                            })
+                            .await;
                         match ahma_core::agent::call_mcp_tool_http(
                             &client, &url, &new_sid, &tool, arguments,
                         )

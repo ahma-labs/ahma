@@ -335,6 +335,7 @@ dependencies = [
  "axum",
  "chrono",
  "crossterm",
+ "dunce",
  "futures",
  "libc",
  "ratatui",

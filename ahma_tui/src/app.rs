@@ -3793,6 +3793,9 @@ fn handle_bridge_event(event: crate::llm_bridge::BridgeEvent, state: &mut crate:
         BridgeEvent::RequestApproval { id, tool, args, tx } => {
             request_tool_approval(state, id, tool, args, Some(tx));
         }
+        BridgeEvent::SessionEstablished { session_id } => {
+            state.session_id = Some(session_id);
+        }
     }
 }
 

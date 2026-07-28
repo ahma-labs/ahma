@@ -111,12 +111,29 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
 
     let enable_colored_output = true;
 
-    match &explicit_fallback_scope {
-        Some(scope) => tracing::info!(
+    match (&explicit_fallback_scope, config.use_sandbox_dir) {
+        (Some(scope), false) => tracing::info!(
             "Unix socket bridge mode - explicit fallback sandbox scope: {}",
             scope.display()
         ),
-        None => tracing::info!(
+        // `--sandbox` with no explicit `--sandbox-scope`: every session on
+        // this bridge auto-locks to this fallback directory until its own
+        // roots/list overrides it. Never let this substitution happen
+        // silently (SPEC R7) — a client that reuses an already-running
+        // bridge without checking `/health`'s `default_sandbox_scope` first
+        // would otherwise silently execute against the wrong project.
+        (Some(scope), true) => tracing::warn!(
+            fallback_scope = %scope.display(),
+            "Unix socket bridge mode - no --sandbox-scope given; falling back to the --sandbox \
+             directory ({}) until a client's roots/list overrides it. Pass --sandbox-scope \
+             explicitly if this bridge should be scoped to a specific project.",
+            scope.display()
+        ),
+        (None, true) => tracing::warn!(
+            "Unix socket bridge mode - --sandbox was set but no usable sandbox directory could \
+             be resolved; sessions will rely entirely on client roots/list to lock their scope."
+        ),
+        (None, false) => tracing::info!(
             "Unix socket bridge mode - strict roots mode: no fallback scope configured"
         ),
     }

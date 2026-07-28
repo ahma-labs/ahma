@@ -5,6 +5,7 @@ use ahma_mcp::ActiveAgentSession;
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
@@ -1575,15 +1576,42 @@ async fn respond_to_roots_list(
         .await;
 }
 
+/// Process-wide cache of MCP sessions this process has already negotiated
+/// with a given bridge, keyed by (bridge URL, workspace root). Each
+/// `dispatch_tool_execution` call used to receive its own fresh clone of
+/// `McpChatConfig` with `session_id: None` — the agentic loop's `for turn in
+/// 0..max_turns` (`spawn_agent_task`) and every `join_all`'d tool call within
+/// a turn never wrote a negotiated id back into the shared config, so every
+/// single tool call re-ran the full initialize/SSE/roots handshake and spun
+/// up a brand-new bridge subprocess. That churn exhausted the bridge's
+/// `max_sessions` cap within a normal chat turn. This cache lets any caller
+/// in the process reuse the same session for the same (url, workspace)
+/// instead (SPEC ahma_tui R25).
+static SESSION_CACHE: std::sync::LazyLock<std::sync::Mutex<HashMap<(String, PathBuf), String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Drop a cached session for (url, workspace_root) so the next
+/// `get_or_create_session` call negotiates a fresh one. Call this when a
+/// cached session is discovered to be dead (e.g. an HTTP 403 on `tools/call`)
+/// — otherwise the cache would keep handing out the same rejected id.
+pub fn invalidate_cached_session(url: &str, workspace_root: &std::path::Path) {
+    SESSION_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(url.to_string(), workspace_root.to_path_buf()));
+}
+
 /// Initialize (or reuse) an MCP session against the local bridge for a tool
 /// call. Shared by the core agent loop and the TUI's manual tool-call path.
 ///
 /// When `mcp.session_id` is already set (the TUI's `mcp_source` has negotiated a
-/// sandbox-locked session) it is reused verbatim. Otherwise this performs the
-/// **complete** MCP Streamable-HTTP handshake — `initialize`, open the GET
-/// `/mcp` SSE stream, send `notifications/initialized`, answer the bridge's
-/// `roots/list`, and wait for `notifications/sandbox/configured` — so the new
-/// session reaches `Active` and its `tools/call`s are not rejected with HTTP 409.
+/// sandbox-locked session) it is reused verbatim. Otherwise this reuses this
+/// process's cached session for the same (url, workspace_root) if one exists
+/// (see `SESSION_CACHE`), and only then performs the **complete** MCP
+/// Streamable-HTTP handshake — `initialize`, open the GET `/mcp` SSE stream,
+/// send `notifications/initialized`, answer the bridge's `roots/list`, and
+/// wait for `notifications/sandbox/configured` — so the new session reaches
+/// `Active` and its `tools/call`s are not rejected with HTTP 409.
 /// Skipping the SSE/`roots/list` steps (the previous behaviour) left the session
 /// stuck in `AwaitingRoots`, which is why `ahma tui` chat tool calls returned
 /// "the sandbox is still initializing" indefinitely on startup or after a reset.
@@ -1596,6 +1624,16 @@ pub async fn get_or_create_session(
         && !sid.is_empty()
     {
         return Ok(sid.clone());
+    }
+
+    let cache_key = (url.to_string(), mcp.workspace_root.clone());
+    if let Some(sid) = SESSION_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+        .cloned()
+    {
+        return Ok(sid);
     }
 
     // Step 1: initialize → obtain the session id.
@@ -1685,6 +1723,11 @@ pub async fn get_or_create_session(
             );
         }
     }
+
+    SESSION_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cache_key, sid.clone());
 
     Ok(sid)
 }

@@ -28,6 +28,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 chrono = { workspace = true }
 crossterm = { workspace = true, optional = true }
+dunce.workspace = true
 futures = { workspace = true, optional = true }
 ratatui = { workspace = true, optional = true }
 reqwest = { workspace = true, features = ["json", "rustls", "stream"] }
