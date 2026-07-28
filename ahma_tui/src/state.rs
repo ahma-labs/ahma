@@ -1352,6 +1352,8 @@ pub struct AppState {
     pub active_instances: Vec<ahma_common::daemon_hub::InstanceInfo>,
     /// Available models for the current provider.
     pub available_models: Vec<String>,
+    /// Agent Skills currently active in the chat session (SPEC R-SK8.4).
+    pub active_skills: Vec<ahma_common::skills::Skill>,
     /// Chat scroll offset (lines from bottom = 0 is newest).
     pub chat_scroll: usize,
     /// The single active overlay/modal (navigator, palette, pickers, help,
@@ -1795,6 +1797,7 @@ impl AppState {
             discovered_providers: vec![],
             active_instances: vec![],
             available_models: vec![],
+            active_skills: vec![],
             chat_scroll: 0,
             modal: ModalState::None,
 
@@ -1906,6 +1909,9 @@ impl AppState {
         // Watermark so already-completed operations a source re-pushes are not
         // resurrected as windows (see `window_suppressed_by_clear`).
         self.cleared_at = Some(Instant::now());
+
+        // Clear session active skills.
+        self.active_skills.clear();
 
         // Reset scroll positions to their startup defaults.
         self.chat_scroll = 0;
@@ -3274,6 +3280,22 @@ mod tests {
         nav.input = "zzz-no-match".to_string();
         nav.refresh_completions(&[]);
         assert!(!nav.completions.iter().any(|c| c.command == "/my-skill"));
+    }
+
+    #[test]
+    fn clear_screen_resets_active_skills() {
+        let mut s = AppState::new("http://localhost:3000", "HTTP", true);
+        s.active_skills.push(ahma_common::skills::Skill {
+            name: "test-skill".into(),
+            description: "desc".into(),
+            user_invocable: true,
+            path: std::path::PathBuf::from("/tmp/test-skill/SKILL.md"),
+            body: "body".into(),
+        });
+        assert_eq!(s.active_skills.len(), 1);
+
+        s.clear_screen();
+        assert!(s.active_skills.is_empty());
     }
 
     /// SPEC R23: at most one user overlay is open at a time. Opening a second

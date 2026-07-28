@@ -1362,6 +1362,43 @@ fn format_recent_failures(operations: &[crate::state::Operation]) -> String {
 ///
 /// The context block is intentionally short (<500 tokens) so it does not eat
 /// into the user's context window.
+/// Summary of discovered skills for system prompt awareness.
+#[cfg(feature = "tui")]
+fn format_skills_summary(workspace: &str) -> String {
+    if workspace.is_empty() {
+        return String::new();
+    }
+    let set = ahma_common::skills::discover_skills(std::path::Path::new(workspace));
+    let user_invocable: Vec<_> = set.skills.iter().filter(|s| s.user_invocable).collect();
+    if user_invocable.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Available Agent Skills (invoke with /<name> [args]):\n");
+    for s in user_invocable {
+        out.push_str(&format!("  - /{}: {}\n", s.name, s.description));
+    }
+    out
+}
+
+/// Active Agent Skills context in effect for multi-turn sessions (SPEC R-SK8.4).
+#[cfg(feature = "tui")]
+fn format_active_skills(skills: &[ahma_common::skills::Skill]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nActive Agent Skills in effect:\n");
+    for s in skills {
+        out.push_str(&format!(
+            "<active_skill name=\"{}\" path=\"{}\" directory=\"{}\">\n{}\n</active_skill>\n",
+            s.name,
+            s.path.display(),
+            s.root_dir().display(),
+            s.body.trim()
+        ));
+    }
+    out
+}
+
 /// The pieces of a system prompt, assembled by a [`PromptComposer`]. Keeping
 /// them separate lets a composer decide which to include for token economy.
 #[cfg(feature = "tui")]
@@ -1374,6 +1411,10 @@ struct PromptParts {
     workspace_line: String,
     /// `"Sandbox: …\n"` or empty.
     sandbox_line: String,
+    /// Discovered Agent Skills summary.
+    skills_summary: String,
+    /// Active Agent Skills in effect across turns (SPEC R-SK8.4).
+    active_skills: String,
     /// Recent operations block (token-heavy).
     recent_ops: String,
     /// Recent failures block incl. stdout tails (token-heavy).
@@ -1406,22 +1447,30 @@ struct FullComposer;
 impl PromptComposer for FullComposer {
     fn compose(&self, p: &PromptParts) -> String {
         let ctx = format!(
-            "{}{}{}{}",
-            p.workspace_line, p.sandbox_line, p.recent_ops, p.recent_failures
+            "{}{}{}{}{}{}",
+            p.workspace_line,
+            p.sandbox_line,
+            p.skills_summary,
+            p.active_skills,
+            p.recent_ops,
+            p.recent_failures
         );
         assemble_prompt(&p.profile_prompt, &p.base, &ctx)
     }
 }
 
 /// The lean composer used under `/minimize`: drops the token-heavy recent-ops
-/// and recent-failures blocks, keeping the base, profile, workspace and sandbox.
+/// and recent-failures blocks, keeping the base, profile, workspace, sandbox, and skills.
 #[cfg(feature = "tui")]
 struct MinimalComposer;
 
 #[cfg(feature = "tui")]
 impl PromptComposer for MinimalComposer {
     fn compose(&self, p: &PromptParts) -> String {
-        let ctx = format!("{}{}", p.workspace_line, p.sandbox_line);
+        let ctx = format!(
+            "{}{}{}{}",
+            p.workspace_line, p.sandbox_line, p.skills_summary, p.active_skills
+        );
         assemble_prompt(&p.profile_prompt, &p.base, &ctx)
     }
 }
@@ -1445,6 +1494,8 @@ fn build_system_prompt(state: &crate::state::AppState) -> String {
         } else {
             String::new()
         },
+        skills_summary: format_skills_summary(&state.workspace),
+        active_skills: format_active_skills(&state.active_skills),
         recent_ops: format_recent_ops(&state.operations),
         recent_failures: format_recent_failures(&state.operations),
     };
@@ -2135,6 +2186,20 @@ fn handle_skills_nav_command(cmd: &str, state: &mut crate::state::AppState) -> b
             if ahma_common::skills::validate_name(name).is_err() {
                 return false;
             }
+            let workspace = std::path::Path::new(&state.workspace);
+            let set = ahma_common::skills::discover_skills(workspace);
+            if let Some(err) = set.invalid.iter().find(|e| {
+                e.path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .is_some_and(|n| n == name)
+            }) {
+                push_assistant_message(
+                    state,
+                    format!("Skill `{name}` could not be loaded: {}", err.reason),
+                );
+                return true;
+            }
             let Some(skill) = find_user_skill(state, name) else {
                 return false;
             };
@@ -2211,6 +2276,10 @@ fn invoke_skill(
         return;
     }
 
+    if !state.active_skills.iter().any(|s| s.name == skill.name) {
+        state.active_skills.push(skill.clone());
+    }
+
     state.push_log(crate::state::LogEntry {
         timestamp: chrono::Local::now(),
         level: crate::state::LogLevel::Info,
@@ -2238,12 +2307,14 @@ fn invoke_skill(
 }
 
 /// The message the LLM receives for a skill invocation: the full SKILL.md
-/// instruction body plus the user's arguments.
+/// instruction body plus file path metadata and the user's arguments.
 fn compose_skill_prompt(skill: &ahma_common::skills::Skill, args: &str) -> String {
     let name = &skill.name;
     let body = skill.body.trim();
+    let path = skill.path.display();
+    let dir = skill.root_dir().display();
     let mut prompt = format!(
-        "<skill name=\"{name}\">\n{body}\n</skill>\n\nThe user invoked the \"{name}\" Agent Skill"
+        "<skill name=\"{name}\" path=\"{path}\" directory=\"{dir}\">\n{body}\n</skill>\n\nThe user invoked the \"{name}\" Agent Skill"
     );
     if args.is_empty() {
         prompt.push_str(". Follow the skill instructions above.");
@@ -5071,6 +5142,8 @@ mod tests {
             base: "BASE".to_string(),
             workspace_line: "Workspace: /w\n".to_string(),
             sandbox_line: "Sandbox: on\n".to_string(),
+            skills_summary: "Skills: /demo\n".to_string(),
+            active_skills: "<active_skill name=\"demo\">".to_string(),
             recent_ops: "OPS-HEAVY\n".to_string(),
             recent_failures: "FAILS-HEAVY\n".to_string(),
         };
@@ -5079,12 +5152,16 @@ mod tests {
         let full = FullComposer.compose(&parts);
         assert!(full.contains("OPS-HEAVY") && full.contains("FAILS-HEAVY"));
         assert!(full.contains("Workspace: /w") && full.contains("BASE"));
+        assert!(full.contains("Skills: /demo") && full.contains("<active_skill name=\"demo\">"));
 
         // The minimal composer drops the token-heavy ops/failures, but keeps the
-        // cheap workspace/sandbox lines and the agentic base.
+        // cheap workspace/sandbox lines, skills, and the agentic base.
         let minimal = MinimalComposer.compose(&parts);
         assert!(!minimal.contains("OPS-HEAVY") && !minimal.contains("FAILS-HEAVY"));
         assert!(minimal.contains("Workspace: /w") && minimal.contains("Sandbox: on"));
+        assert!(
+            minimal.contains("Skills: /demo") && minimal.contains("<active_skill name=\"demo\">")
+        );
         assert!(minimal.contains("BASE"));
     }
 

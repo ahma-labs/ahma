@@ -37,6 +37,13 @@ pub struct Skill {
     pub body: String,
 }
 
+impl Skill {
+    /// Parent directory containing the `SKILL.md` file.
+    pub fn root_dir(&self) -> &Path {
+        self.path.parent().unwrap_or(&self.path)
+    }
+}
+
 /// A skill directory that could not be loaded, and why. Surfaced so callers
 /// can disclose the problem instead of silently hiding a broken skill.
 #[derive(Debug, Clone)]
@@ -64,8 +71,8 @@ impl SkillSet {
 }
 
 /// The standard discovery roots for `workspace`, in precedence order:
-/// workspace `.agents/skills`, workspace `.claude/skills`, then the same two
-/// under the user's home directory (where `ahma setup --skills` installs).
+/// workspace `.agents/skills`, workspace `.claude/skills`, then under the user's
+/// home directory (`.agents/skills`, `.claude/skills`, and `XDG_CONFIG_HOME/agents/skills`).
 pub fn skill_roots(workspace: &Path) -> Vec<PathBuf> {
     let mut roots = vec![
         workspace.join(".agents").join("skills"),
@@ -74,6 +81,10 @@ pub fn skill_roots(workspace: &Path) -> Vec<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join(".agents").join("skills"));
         roots.push(home.join(".claude").join("skills"));
+        let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        roots.push(config_dir.join("agents").join("skills"));
     }
     roots
 }
@@ -162,10 +173,14 @@ pub fn load_skill(skill_md: &Path) -> Result<Skill, String> {
         ));
     }
 
-    let user_invocable = match fields.get("user-invocable").map(String::as_str) {
+    let user_invocable = match fields
+        .get("user-invocable")
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
         None => true,
-        Some("true") => true,
-        Some("false") => false,
+        Some("true" | "1" | "yes") => true,
+        Some("false" | "0" | "no") => false,
         Some(other) => {
             return Err(format!(
                 "`user-invocable` must be true or false, got {other}"
@@ -232,32 +247,57 @@ fn parse_frontmatter(content: &str) -> Result<(BTreeMap<String, String>, &str), 
 
 /// Parse the YAML subset used by skill frontmatter: top-level scalar fields,
 /// with support for quoted values and `>` / `|` block scalars (with optional
-/// `-`/`+` chomping indicator). Nested maps are skipped.
+/// `-`/`+` chomping indicator). Nested maps and block lists (`- item`) are handled.
 fn parse_yaml_subset(frontmatter: &str) -> BTreeMap<String, String> {
     let mut fields = BTreeMap::new();
     let mut lines = frontmatter.lines().peekable();
 
     while let Some(line) = lines.next() {
-        // Top-level keys start at column 0; anything indented here is a stray
-        // continuation (nested-map children are consumed below).
-        if line.starts_with(' ') || line.starts_with('\t') || line.trim().is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // Top-level keys start at column 0; anything indented here is a stray continuation.
+        if line.starts_with(' ') || line.starts_with('\t') {
             continue;
         }
         let Some((key, raw_value)) = line.split_once(':') else {
             continue;
         };
         let key = key.trim().to_string();
-        let raw_value = raw_value.trim();
+        let mut raw_value = raw_value.trim();
+
+        // Strip trailing inline comments if not quoted.
+        if !raw_value.starts_with('"')
+            && !raw_value.starts_with('\'')
+            && let Some((val, _comment)) = raw_value.split_once(" #")
+        {
+            raw_value = val.trim();
+        }
 
         let value = match raw_value {
             "" => {
-                // Nested map (e.g. `metadata:`): consume and ignore children.
+                // Check if next lines are indented block list items (`- item`) or nested map
+                let mut list_items = Vec::new();
                 while lines.peek().is_some_and(|l| {
-                    l.starts_with(' ') || l.starts_with('\t') || l.trim().is_empty()
+                    let t = l.trim();
+                    t.starts_with("- ")
+                        || t.starts_with(' ')
+                        || t.starts_with('\t')
+                        || t.is_empty()
+                        || t.starts_with('#')
                 }) {
-                    lines.next();
+                    let next_line = lines.next().unwrap_or_default();
+                    let t = next_line.trim();
+                    if let Some(item) = t.strip_prefix("- ") {
+                        list_items.push(unquote(item.trim()).to_string());
+                    }
                 }
-                continue;
+                if !list_items.is_empty() {
+                    list_items.join(", ")
+                } else {
+                    continue;
+                }
             }
             block
                 if block == ">" || block == "|" || {
@@ -269,12 +309,14 @@ fn parse_yaml_subset(frontmatter: &str) -> BTreeMap<String, String> {
             {
                 let fold = block.starts_with('>');
                 let mut parts: Vec<String> = Vec::new();
-                while lines
-                    .peek()
-                    .is_some_and(|l| l.starts_with(' ') || l.trim().is_empty())
-                {
+                while lines.peek().is_some_and(|l| {
+                    l.starts_with(' ') || l.trim().is_empty() || l.trim().starts_with('#')
+                }) {
                     let l = lines.next().unwrap_or_default();
-                    parts.push(l.trim().to_string());
+                    let t = l.trim();
+                    if !t.starts_with('#') {
+                        parts.push(t.to_string());
+                    }
                 }
                 // Trim trailing blank continuation lines.
                 while parts.last().is_some_and(|p| p.is_empty()) {
@@ -467,5 +509,17 @@ mod tests {
         assert!(skill.user_invocable);
         assert!(skill.description.starts_with("Comprehensive guide."));
         assert!(skill.body.contains("# Ahma"));
+        assert_eq!(skill.root_dir(), tmp.path().join("ahma"));
+    }
+
+    #[test]
+    fn parses_comments_lists_and_boolean_variations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let content = "---\nname: list-demo # inline comment\ndescription: A demo description\nuser-invocable: Yes # capitalized boolean\ntags:\n  - fast\n  - search\n---\nBody\n";
+        let path = write_skill(tmp.path(), "list-demo", content);
+        let skill = load_skill(&path).unwrap();
+        assert_eq!(skill.name, "list-demo");
+        assert!(skill.user_invocable);
+        assert_eq!(skill.description, "A demo description");
     }
 }

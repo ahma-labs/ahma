@@ -893,6 +893,12 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         String::new()
     };
 
+    let active_skills_part = if !state.active_skills.is_empty() {
+        format!(" · skills:{}", state.active_skills.len())
+    } else {
+        String::new()
+    };
+
     let line = Line::from(vec![
         Span::styled(" ahma chat", theme.title()),
         Span::styled(
@@ -903,6 +909,7 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         Span::styled(external_part, theme.dim()),
         Span::styled(sandbox_part, theme.dim()),
         Span::styled(sandbox_status_part, sandbox_style),
+        Span::styled(active_skills_part, theme.normal()),
         health_span,
         Span::styled(" · ", theme.dim()),
         daemon_span,
