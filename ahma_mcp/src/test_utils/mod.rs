@@ -20,6 +20,9 @@ pub mod in_process;
 pub mod mcp_client_trait;
 pub mod path_helpers;
 pub mod project;
+/// An MCP client that records the notifications the server pushed to it —
+/// the only way to assert on `notifications/progress` from the outside.
+pub mod recording_client;
 pub mod stdio;
 
 /// Canonical factory: build a bare [`crate::mcp_service::AhmaMcpService`] scoped

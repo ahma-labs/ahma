@@ -15,6 +15,7 @@ use crate::shell_pool::{ShellPoolConfig, ShellPoolManager};
 use anyhow::Result;
 use rmcp::{
     ServiceExt,
+    handler::client::ClientHandler,
     service::{RoleClient, RoleServer, RunningService},
     transport::async_rw::AsyncRwTransport,
 };
@@ -27,9 +28,15 @@ use std::sync::Arc;
 /// The server handle must remain alive for the duration of the test so that
 /// the background task loop can respond to client requests.  Drop this value
 /// (or let it go out of scope) to cleanly shut down the connection.
-pub struct InProcessMcp {
+///
+/// `C` is the client-side handler. It defaults to `()` — a client that ignores
+/// everything the server pushes — which is what most tests want. Use
+/// [`crate::test_utils::recording_client::RecordingClient`] instead when the
+/// assertion is about what the *client* received (progress notifications) or
+/// about behaviour ahma keys off `clientInfo.name`.
+pub struct InProcessMcp<C: ClientHandler = ()> {
     /// The MCP client – use this to call `list_all_tools`, `call_tool`, etc.
-    pub client: RunningService<RoleClient, ()>,
+    pub client: RunningService<RoleClient, C>,
     /// The inner service implementation on the server side.
     pub service: AhmaMcpService,
     /// Keeps the server background tasks alive.
@@ -115,11 +122,51 @@ pub async fn create_in_process_mcp_with_scope(
     wire_in_process_mcp(configs, sandbox).await
 }
 
+/// Create an in-process pair whose *client* is a custom [`ClientHandler`].
+///
+/// Use this when the assertion is about what the server pushed to the client
+/// (`notifications/progress`) or about behaviour ahma derives from
+/// `clientInfo.name`. `scopes` is passed to the sandbox verbatim: pass an empty
+/// vector to get a server whose scope is not yet settled, which is how the
+/// `tools/call` gate (SPEC R5.1.2) becomes observable.
+///
+/// Unlike the `()`-client constructors this does **not** call
+/// `set_roots_received(true)` when `scopes` is empty — that flag is precisely
+/// what those tests need to be false.
+pub async fn create_in_process_mcp_with_client<C: ClientHandler>(
+    client: C,
+    configs: HashMap<String, ToolConfig>,
+    scopes: Vec<PathBuf>,
+) -> Result<InProcessMcp<C>> {
+    let roots_settled = !scopes.is_empty();
+    // Empty scopes must stay `Strict`: `SandboxMode::Test` reports
+    // `is_ready_for_tool_calls() == true` regardless of scope, which is exactly
+    // the state the gate test needs to be false. With real scopes, mirror the
+    // other constructors and relax for nested sandboxes so commands can run.
+    let mode = if roots_settled && super::client::is_nested_sandbox_environment() {
+        SandboxMode::Test
+    } else {
+        SandboxMode::Strict
+    };
+    let sandbox = Sandbox::new(scopes, mode, false, false, false)?;
+    sandbox.set_roots_received(roots_settled);
+    wire_in_process_mcp_with_client(client, configs, sandbox).await
+}
+
 /// Internal: wire a pre-built `Sandbox` and tool configs into an in-process pair.
 async fn wire_in_process_mcp(
     configs: HashMap<String, ToolConfig>,
     sandbox: Sandbox,
 ) -> Result<InProcessMcp> {
+    wire_in_process_mcp_with_client((), configs, sandbox).await
+}
+
+/// Internal: as [`wire_in_process_mcp`], with a caller-supplied client handler.
+async fn wire_in_process_mcp_with_client<C: ClientHandler>(
+    client_handler: C,
+    configs: HashMap<String, ToolConfig>,
+    sandbox: Sandbox,
+) -> Result<InProcessMcp<C>> {
     let monitor_config = MonitorConfig::with_timeout(std::time::Duration::from_secs(300));
     let operation_monitor = Arc::new(OperationMonitor::new(monitor_config));
     let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
@@ -129,8 +176,13 @@ async fn wire_in_process_mcp(
         Arc::new(sandbox),
     )?);
 
+    // NOTE: `set_roots_received` is the *caller's* decision, made on the sandbox
+    // before it is handed here. It used to be forced to `true` at this point,
+    // which silently made it impossible to build an in-process server whose
+    // scope is not yet settled — and therefore impossible to observe the
+    // `tools/call` gate (SPEC R5.1.2) in-process at all.
     let service = AhmaMcpService::new(
-        adapter.clone(),
+        adapter,
         operation_monitor,
         Arc::new(configs),
         Arc::new(None::<GuidanceConfig>),
@@ -138,11 +190,6 @@ async fn wire_in_process_mcp(
         false, // defer_sandbox
     )
     .await?;
-
-    // Since this is an in-process mock client/server pair for testing,
-    // we mark roots as received so that path validation behaves strictly
-    // and does not dynamically auto-scope to the test runner's environment.
-    adapter.sandbox().set_roots_received(true);
 
     // Wire client and server through an in-memory duplex channel.
     let (client_stream, server_stream) = tokio::io::duplex(65536);
@@ -155,7 +202,7 @@ async fn wire_in_process_mcp(
     // Run both handshakes concurrently; both futures complete once the
     // initialize / initialized exchange is done and both sides are ready.
     let (client_result, server_result) = tokio::join!(
-        ().serve(client_transport),
+        client_handler.serve(client_transport),
         service.clone().serve(server_transport),
     );
 

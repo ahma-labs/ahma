@@ -61,6 +61,18 @@ Decision rule: *can this be written without forking a process?* If yes, do that.
 
 ⚠️ **`setup_mcp_service_with_client()` spawns a subprocess** despite the name — it is E2E.
 
+**Asserting on what the client receives.** For anything ahma *pushes* — `notifications/progress`
+above all — assert on the wire, not on the router's bookkeeping. `test_utils::recording_client::
+RecordingClient` is a real `ClientHandler` that records notifications and answers `roots/list`;
+pass it to `create_in_process_mcp_with_client(client, configs, scopes)`. Its `clientInfo.name` is
+configurable because ahma keys real behaviour off it (`supports_progress`, `request_budget`), and
+passing **empty `scopes`** gives you a server whose sandbox scope never settles — the only way to
+observe the `tools/call` gate in-process.
+
+Progress tokens are the *client's* to mint: rmcp assigns one per request and overwrites anything
+you set, so use `call_tool_observing_token()` to learn the token a request actually carried
+rather than trying to choose it.
+
 ### Rules that break CI when ignored
 
 - **Every test uses `tempfile::tempdir()`.** Never create files in the repo tree.

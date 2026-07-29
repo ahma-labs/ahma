@@ -198,13 +198,11 @@ impl AhmaMcpService {
     ) -> Result<CallToolResult, McpError> {
         let args = params.arguments.unwrap_or_default();
 
-        // Delay tool execution until sandbox is initialized from roots/list.
-        // This is critical in HTTP bridge mode with deferred sandbox initialization.
-        if !self.adapter.sandbox().is_ready_for_tool_calls() {
-            let error_message = "Sandbox initializing from client roots - retry tools/call after roots/list completes".to_string();
-            tracing::warn!("{}", error_message);
-            return Err(common::mcp_internal(error_message));
-        }
+        // No sandbox-readiness check here: `tools/call` dispatch applies it to
+        // every tool, once (SPEC R5.1.2). A copy in this handler is what the
+        // invariant used to be — and being written per-handler is precisely why
+        // the six built-in file tools were added without it. Keeping a
+        // now-unreachable duplicate would advertise the wrong pattern.
 
         // Extract command (required)
         let command = common::require_str(&args, "command", "command parameter is required")?;
