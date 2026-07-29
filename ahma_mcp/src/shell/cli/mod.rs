@@ -1103,9 +1103,11 @@ pub struct Cli {
     pub await_timeout: Option<u64>,
 
     /// Force all tools to run synchronously.
-    /// By default, tools are async-first: if a result arrives within 5 seconds it is
-    /// returned inline; otherwise an operation ID is returned and the result is pushed
-    /// as a notification.
+    /// By default, tools are async-first: ahma waits an adaptive inline window
+    /// (SPEC R2.6.1) and returns the result inline if the command finishes in time;
+    /// otherwise an operation ID is returned and the result is pushed as a
+    /// notification. This flag is a server-operator decision — models never get to
+    /// choose synchronous execution (R2.6.3).
     #[arg(long = "sync", global = true)]
     pub sync: bool,
 

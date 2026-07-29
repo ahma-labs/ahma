@@ -825,6 +825,19 @@ impl OperationMonitor {
         history.values().cloned().collect()
     }
 
+    /// How many operations are running right now, excluding `exclude_id`.
+    ///
+    /// Cheaper than [`Self::get_active_operations`] (no clone) because the only
+    /// question asked is "is the caller already fanning out?" — which is what
+    /// sizes the inline result window (SPEC R2.6.1). The operation being
+    /// started is excluded because it is not something to overlap *with*.
+    pub async fn active_count_excluding(&self, exclude_id: &str) -> usize {
+        let ops = self.operations.read().await;
+        ops.values()
+            .filter(|op| !op.state.is_terminal() && op.id != exclude_id)
+            .count()
+    }
+
     pub async fn get_shutdown_summary(&self) -> ShutdownSummary {
         let operations = self.get_active_operations().await;
         let total_active = operations.len();

@@ -498,6 +498,78 @@ impl AhmaMcpService {
         }
     }
 
+    /// Configure the sandbox from the client's roots **off the session's message
+    /// loop** (SPEC R5.1.2).
+    ///
+    /// The obvious implementation — `configure_sandbox_from_roots(peer).await`
+    /// inside the notification handler — is a trap, because a notification
+    /// handler runs on the same loop that dispatches requests. That handler
+    /// issues a *server→client* `roots/list` and waits for the answer, so for as
+    /// long as the client takes to reply, every request queued behind it is
+    /// stalled. A captured session shows exactly that: a client answered
+    /// `roots/list` 60.003s late, the `tools/list` that had arrived in the same
+    /// millisecond was never dispatched, the bridge's 60s request timeout fired
+    /// first, and that client sat for 44 minutes with no ahma tools at all.
+    ///
+    /// Correctness does not depend on blocking the loop: `tools/call` is gated
+    /// separately on `is_ready_for_tool_calls()` and returns a retry error until
+    /// the scope is committed (SPEC R5.2). That gate is the invariant; blocking
+    /// the loop was only ever its accidental implementation.
+    pub fn spawn_sandbox_configuration(&self, peer: Peer<RoleServer>) {
+        let already_running = self.sandbox_config_in_flight.send_if_modified(|running| {
+            if *running {
+                false
+            } else {
+                *running = true;
+                true
+            }
+        });
+        if !already_running {
+            tracing::debug!("Sandbox configuration already in flight - not starting another");
+            return;
+        }
+
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.configure_sandbox_from_roots(&peer).await;
+            // Releases anything parked in `wait_for_sandbox_configuration`.
+            // `send_replace`, not `send`: `send` fails when no receiver exists,
+            // which is the normal case (nobody is waiting), and would leave the
+            // flag latched at `true` — parking every later tool call for the
+            // full settle budget.
+            service.sandbox_config_in_flight.send_replace(false);
+        });
+    }
+
+    /// Block until an in-flight sandbox configuration settles (SPEC R5.1.2).
+    ///
+    /// This is what lets the configuration run off the message loop without
+    /// weakening the scope invariant. `tools/list` and the other read-only
+    /// requests answer immediately; a `tools/call` waits here so it never
+    /// executes against a scope that is still being decided — the provisional
+    /// pre-`roots/list` scope is a *subset* of the committed one, so acting
+    /// early would deny work that is about to be perfectly legal.
+    ///
+    /// Bounded, because the wait holds an MCP request open: on expiry the caller
+    /// proceeds against the scope committed so far, which is the conservative
+    /// direction (narrower, never wider).
+    pub async fn wait_for_sandbox_configuration(&self, budget: std::time::Duration) {
+        if !*self.sandbox_config_in_flight.borrow() {
+            return;
+        }
+        let mut rx = self.sandbox_config_in_flight.subscribe();
+        if tokio::time::timeout(budget, rx.wait_for(|running| !*running))
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                ?budget,
+                "Sandbox configuration did not settle within the wait budget; \
+                 proceeding against the scope committed so far"
+            );
+        }
+    }
+
     pub async fn configure_sandbox_from_roots(&self, peer: &Peer<RoleServer>) {
         // SPEC R5.1 / R5.1.1 / R5.2.2: the sandbox scope is committed exactly once
         // and is immutable thereafter. A second invocation — e.g. a pure-stdio
@@ -1490,5 +1562,81 @@ mod tests {
         // Give the task a moment to attempt and fail gracefully.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         // If we reach here without a panic the test passes.
+    }
+}
+
+#[cfg(test)]
+mod sandbox_settle_tests {
+    use crate::test_utils::client::setup_test_environment;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn waiting_returns_immediately_when_nothing_is_in_flight() {
+        let (service, _tmp) = setup_test_environment().await;
+        let start = tokio::time::Instant::now();
+        service
+            .wait_for_sandbox_configuration(Duration::from_secs(5))
+            .await;
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "the common case must not pay for the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_waits_for_an_in_flight_configuration() {
+        // SPEC R5.1.2: configuration runs off the message loop, so a tools/call
+        // could otherwise execute against the provisional pre-roots scope — a
+        // subset of the final one, so it would deny work that is about to be
+        // legal. The wait is what keeps the scope invariant true while the
+        // message loop stays free to answer tools/list.
+        let (service, _tmp) = setup_test_environment().await;
+        service.sandbox_config_in_flight.send_replace(true);
+
+        let waiter = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .wait_for_sandbox_configuration(Duration::from_secs(5))
+                    .await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "must still be parked");
+
+        service.sandbox_config_in_flight.send_replace(false);
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("settling must release the waiter")
+            .expect("waiter task");
+    }
+
+    #[tokio::test]
+    async fn the_wait_is_bounded_so_a_stuck_client_cannot_hang_a_tool_call() {
+        // A client that never answers roots/list must not park tool calls
+        // forever; expiry proceeds against the scope committed so far, which is
+        // the conservative (narrower) direction.
+        let (service, _tmp) = setup_test_environment().await;
+        service.sandbox_config_in_flight.send_replace(true);
+
+        let start = tokio::time::Instant::now();
+        service
+            .wait_for_sandbox_configuration(Duration::from_millis(200))
+            .await;
+        assert!(start.elapsed() >= Duration::from_millis(200));
+        assert!(start.elapsed() < Duration::from_secs(2), "must not hang");
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_notifications_starts_only_one_configuration() {
+        // Antigravity sent 69 roots/list_changed notifications in one session;
+        // each must not spawn its own roots/list round-trip.
+        let (service, _tmp) = setup_test_environment().await;
+        service.sandbox_config_in_flight.send_replace(true);
+        assert!(
+            *service.sandbox_config_in_flight.borrow(),
+            "in-flight flag must latch"
+        );
     }
 }

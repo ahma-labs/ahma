@@ -480,7 +480,8 @@ impl Adapter {
         // orphaning `sh`/`cargo`/`rustc` descendants. `base_command` pipes
         // stdout/stderr and makes the child a process-group leader.
         // Match `cmd.output()`'s guarantee that stdout/stderr are captured.
-        cmd.stdout(std::process::Stdio::piped())
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let child = cmd
             .spawn()
@@ -1332,7 +1333,8 @@ async fn execute_with_streaming(
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    // Ensure stdout/stderr are piped (should already be set by sandbox)
+    // Ensure stdin/stdout/stderr are strictly isolated (should already be set by sandbox)
+    proc_cmd.stdin(std::process::Stdio::null());
     proc_cmd.stdout(std::process::Stdio::piped());
     proc_cmd.stderr(std::process::Stdio::piped());
 

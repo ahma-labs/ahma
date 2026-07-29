@@ -69,17 +69,18 @@ async fn test_async_notification_delivery() -> Result<()> {
 
     let result = client.call_tool(call_params).await?;
 
-    // The async tool should return immediately with operation info, or complete inline
+    // Either an operation id (slow path) or the completed result inline — and in
+    // both cases the caller is told what happened. `sleep 1` prints nothing, so
+    // this used to be satisfied by an *empty* text block; that hole is exactly
+    // the bug SPEC R2.6.2 closes, hence no `is_empty()` arm here.
     assert!(!result.content.is_empty());
     if let Some(content) = result.content.first()
         && let Some(text_content) = content.as_text()
     {
-        // Should contain operation ID and status info (if executing async)
-        // Or be empty if it completed inline due to automatic async behavior
+        let text = &text_content.text;
         assert!(
-            text_content.text.contains("id")
-                || text_content.text.contains("started")
-                || text_content.text.is_empty() // Success output for 'sleep 1'
+            text.contains("AHMA ID:") || text.contains("exit 0"),
+            "async call must report either an operation id or the finished outcome, got: {text:?}"
         );
     }
 

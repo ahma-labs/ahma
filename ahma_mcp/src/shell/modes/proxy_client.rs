@@ -458,6 +458,13 @@ where
                 let request_id = val.get("id").filter(|id| !id.is_null()).cloned();
                 handshake.observe_client_to_bridge(&val);
                 let tx_msg = serde_json::from_value(val).unwrap();
+                // No inner retry here: an rmcp transport `send` error means the
+                // worker behind this transport is gone, not that the channel is
+                // momentarily busy (`send` awaits capacity). Re-sending the same
+                // message down the same dead transport only multiplies latency
+                // and inflates the failure count below. Recovery is the
+                // reconnect path, which rebuilds the transport and replays the
+                // handshake.
                 if let Err(e) = client.send(tx_msg).await {
                     // A single forward failure must NOT tear down the whole
                     // multiplexed session. The bridge returns recoverable

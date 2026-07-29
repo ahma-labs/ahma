@@ -83,6 +83,30 @@ use serde_json::Value;
 
 pub(crate) static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// How long a `tools/call` waits for an in-flight sandbox configuration to
+/// settle before proceeding anyway (SPEC R5.1.2).
+///
+/// The `roots/list` round-trip is normally sub-millisecond; this only matters
+/// for a client that answers slowly, and it is capped well under any client's
+/// single-request budget (R2.6.5) so waiting here can never itself be the thing
+/// that times a request out.
+const SANDBOX_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Built-ins that must answer before the sandbox scope is settled (SPEC R5.1.2).
+///
+/// These are the session's own control surface — they touch no workspace path,
+/// and gating them would be self-defeating: `sandbox_grant` is how a scope gets
+/// widened in the first place, and `status`/`await`/`cancel` must remain usable
+/// to observe and stop work whatever the scope is doing. Everything else waits.
+const SANDBOX_EXEMPT_BUILTINS: &[&str] = &[
+    "status",
+    "await",
+    "cancel",
+    "sandbox_grant",
+    "restart",
+    "todo_write",
+];
+
 /// `AhmaMcpService` is the server handler for the MCP service.
 #[derive(Clone)]
 pub struct AhmaMcpService {
@@ -162,6 +186,12 @@ pub struct AhmaMcpService {
     /// (server mode). Read by the keep-alive path to disclose the number of
     /// grants awaiting a human decision in the heartbeat payload (#485).
     pub grant_coordinator: Arc<RwLock<Option<Arc<ahma_common::scope_grant::GrantCoordinator>>>>,
+    /// `true` while a sandbox configuration (the `roots/list` round-trip) is in
+    /// flight (SPEC R5.1.2). Two readers: `spawn_sandbox_configuration` uses it
+    /// to keep a burst of `roots/list_changed` notifications from starting
+    /// concurrent queries, and `guard_sandbox_ready_for_tool_calls` waits on it
+    /// so a `tools/call` never runs against a scope that is still being decided.
+    pub sandbox_config_in_flight: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 /// Built-ins withheld from [`AhmaMcpService::get_all_available_tools`], the
@@ -658,6 +688,7 @@ impl AhmaMcpService {
             guidance,
             force_synchronous,
             defer_sandbox,
+            sandbox_config_in_flight: Arc::new(tokio::sync::watch::Sender::new(false)),
             peer: Arc::new(RwLock::new(None)),
             monitor_rate_limit_seconds: crate::log_monitor::DEFAULT_RATE_LIMIT_SECONDS,
             app_config: Arc::new(RwLock::new(None)),
@@ -1148,9 +1179,12 @@ impl AhmaMcpService {
 
         match job_id {
             Ok(id) => {
-                if let Some(result) =
-                    handlers::common::try_automatic_async_completion(&self.operation_monitor, &id)
-                        .await
+                if let Some(result) = handlers::common::try_automatic_async_completion(
+                    &self.operation_monitor,
+                    &id,
+                    client_type,
+                )
+                .await
                 {
                     return Ok(result);
                 }
@@ -1266,9 +1300,11 @@ impl ServerHandler for AhmaMcpService {
                 return;
             }
 
-            // Run synchronously per R19.3 - sandbox configuration is a lifecycle
-            // operation that should complete before we're "ready"
-            self.configure_sandbox_from_roots(peer).await;
+            // Off the message loop, for the same reason as the
+            // `roots/list_changed` path (SPEC R5.1.2): this queries the client
+            // and waits for its reply, and anything the client pipelined behind
+            // `initialized` would wait with it.
+            self.spawn_sandbox_configuration(peer.clone());
         }
     }
 
@@ -1285,12 +1321,7 @@ impl ServerHandler for AhmaMcpService {
 
             // This notification is sent by the HTTP bridge when SSE connects.
             // It signals that we can now safely call roots/list.
-            let peer = &context.peer;
-
-            // Run synchronously per R19.3 - sandbox configuration must complete
-            // before we can safely process tools/call requests. Initial handshake
-            // timing is not super critical, but correctness is.
-            self.configure_sandbox_from_roots(peer).await;
+            self.spawn_sandbox_configuration(context.peer.clone());
         }
     }
 
@@ -1443,12 +1474,26 @@ impl ServerHandler for AhmaMcpService {
             run_params.meta = params.meta.clone();
             run_params.task = params.task.clone();
 
+            // Every tool call gates on the scope being settled (SPEC R5.1.2) —
+            // here, once, rather than in each handler. The built-in file tools
+            // (`write_file`, `read_file`, `list_dir`, …) validate paths against
+            // the scope, so they need this exactly as much as the configured
+            // tools and `run_terminal_command` did; only those two had it.
+            // `tools/list` deliberately does NOT wait: a client must be able to
+            // discover tools while the scope is still being decided.
+            if !SANDBOX_EXEMPT_BUILTINS.contains(&tool_name.as_ref()) {
+                self.guard_sandbox_ready_for_tool_calls().await?;
+            }
+
             let result = match tool_name.as_ref() {
                 "status" => {
                     self.handle_status(run_params.arguments.unwrap_or_default())
                         .await
                 }
-                "await" => self.handle_await(run_params).await,
+                "await" => {
+                    let caller = handlers::await_tool::AwaitCaller::from_context(&context);
+                    self.handle_await_for_caller(run_params, caller).await
+                }
                 "run_terminal_command" => {
                     self.handle_run_terminal_command(run_params, context).await
                 }
@@ -1629,7 +1674,16 @@ impl AhmaMcpService {
         }
     }
 
-    fn guard_sandbox_ready_for_tool_calls(&self) -> Result<(), McpError> {
+    /// Gate a `tools/call` on the sandbox scope being settled (SPEC R5.1.2, R5.2).
+    ///
+    /// Waits out an in-flight configuration first — scope is decided off the
+    /// message loop, so "not ready yet" is a matter of milliseconds in the
+    /// normal case and this turns what would be a spurious denial into a
+    /// correct execution. Only if no scope exists at all after that does the
+    /// call get the retryable error.
+    async fn guard_sandbox_ready_for_tool_calls(&self) -> Result<(), McpError> {
+        self.wait_for_sandbox_configuration(SANDBOX_SETTLE_WAIT)
+            .await;
         if self.adapter.sandbox().is_ready_for_tool_calls() {
             return Ok(());
         }
@@ -1865,7 +1919,7 @@ impl AhmaMcpService {
         params: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.guard_sandbox_ready_for_tool_calls()?;
+        self.guard_sandbox_ready_for_tool_calls().await?;
 
         if params.name.contains("::")
             && let Some(result) = self.try_dispatch_external_mcp_tool(&params).await
@@ -3415,7 +3469,7 @@ mod tests {
     async fn guard_and_skip_roots_defaults() {
         let service = make_service().await;
         // Strict test adapter has a rooted scope -> ready.
-        assert!(service.guard_sandbox_ready_for_tool_calls().is_ok());
+        assert!(service.guard_sandbox_ready_for_tool_calls().await.is_ok());
         // Not explicit, not test mode -> we still ask the client for roots.
         assert!(!service.should_skip_client_roots_sandbox_setup());
     }

@@ -79,6 +79,57 @@ impl ProgressPushRouter {
         self.targets.write().await.remove(op_id);
     }
 
+    /// Point an operation's progress at the request that is waiting on it *now*,
+    /// returning the target it displaced (SPEC R2.5.3).
+    ///
+    /// A progress token belongs to an in-flight request. The token registered
+    /// when the operation started dies with that `tools/call` — so an `await`
+    /// that then blocks for a minute emitted every "still running" notification
+    /// under a token the client had already retired, and saw no liveness at all
+    /// on the request it was actually waiting on. Callers restore the displaced
+    /// target with [`Self::restore`] when their request completes, so the
+    /// best-effort completion push (R2.2) still lands afterwards.
+    pub async fn redirect(
+        &self,
+        op_id: &str,
+        peer: Peer<RoleServer>,
+        progress_token: ProgressToken,
+        client_type: McpClientType,
+    ) -> Option<PushTarget> {
+        if !client_type.supports_progress() {
+            return None;
+        }
+        self.targets.write().await.insert(
+            op_id.to_string(),
+            PushTarget {
+                peer,
+                progress_token,
+            },
+        )
+    }
+
+    /// Put back a target displaced by [`Self::redirect`]. `None` means the
+    /// operation had no target before, so leave it without one.
+    ///
+    /// If the entry is already gone, the operation reached a terminal event
+    /// while the await was in flight and the forwarder unregistered it — so
+    /// there is nothing left to send progress *for*, and restoring would leak a
+    /// target for a finished operation that nothing will ever clean up.
+    pub async fn restore(&self, op_id: &str, previous: Option<PushTarget>) {
+        let mut targets = self.targets.write().await;
+        if !targets.contains_key(op_id) {
+            return;
+        }
+        match previous {
+            Some(target) => {
+                targets.insert(op_id.to_string(), target);
+            }
+            None => {
+                targets.remove(op_id);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub async fn target_count(&self) -> usize {
         self.targets.read().await.len()
@@ -411,5 +462,116 @@ mod tests {
         assert!(message.contains("Command: cargo"));
         assert!(message.contains("Working Directory: /work"));
         assert!(message.contains("=== FULL OUTPUT ===\nError: boom"));
+    }
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    use crate::client_type::McpClientType;
+    use rmcp::model::NumberOrString;
+
+    fn token(n: i64) -> ProgressToken {
+        ProgressToken(NumberOrString::Number(n))
+    }
+
+    /// A real `Peer<RoleServer>` — rmcp's `Peer::new` is crate-private, so the
+    /// in-process harness is the only way to obtain one.
+    async fn server_peer() -> (
+        Peer<RoleServer>,
+        crate::test_utils::in_process::InProcessMcp,
+    ) {
+        let mcp = crate::test_utils::in_process::create_in_process_mcp_empty()
+            .await
+            .expect("in-process mcp");
+        let peer = mcp._server.peer().clone();
+        (peer, mcp)
+    }
+
+    #[tokio::test]
+    async fn await_redirects_progress_and_gives_the_original_target_back() {
+        // REGRESSION: progress for an operation used to stay pinned to the token
+        // of the `tools/call` that started it. That request is long finished by
+        // the time anyone calls `await`, so the awaiting client saw no liveness
+        // at all on the request it was actually blocked on — 85 seconds of
+        // silence in a captured session, after which the client gave up.
+        let (peer, _mcp) = server_peer().await;
+        let router = ProgressPushRouter::new();
+
+        router
+            .register("op_1", peer.clone(), token(1), McpClientType::ClaudeDesktop)
+            .await;
+
+        let displaced = router
+            .redirect("op_1", peer.clone(), token(2), McpClientType::ClaudeDesktop)
+            .await
+            .expect("the original registration must be handed back");
+        assert_eq!(displaced.progress_token, token(1));
+
+        {
+            let targets = router.targets.read().await;
+            assert_eq!(
+                targets.get("op_1").unwrap().progress_token,
+                token(2),
+                "progress must follow the request that is waiting now"
+            );
+        }
+
+        // When the await returns, the completion push (SPEC R2.2) still has to
+        // land, so the displaced target goes back.
+        router.restore("op_1", Some(displaced)).await;
+        let targets = router.targets.read().await;
+        assert_eq!(targets.get("op_1").unwrap().progress_token, token(1));
+    }
+
+    #[tokio::test]
+    async fn restoring_nothing_leaves_the_operation_unregistered() {
+        // An `await` on an operation nobody registered (no progress token on the
+        // original call) must not leave a dangling target behind.
+        let (peer, _mcp) = server_peer().await;
+        let router = ProgressPushRouter::new();
+
+        let displaced = router
+            .redirect("op_1", peer, token(2), McpClientType::ClaudeDesktop)
+            .await;
+        assert!(displaced.is_none(), "nothing was registered to displace");
+
+        router.restore("op_1", None).await;
+        assert_eq!(router.target_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_operation_that_finished_during_the_await_is_not_resurrected() {
+        // The forwarder unregisters on the terminal event. If that lands while
+        // the await is returning, putting the old target back would leave a
+        // target for a finished operation that nothing will ever remove.
+        let (peer, _mcp) = server_peer().await;
+        let router = ProgressPushRouter::new();
+
+        router
+            .register("op_1", peer.clone(), token(1), McpClientType::ClaudeDesktop)
+            .await;
+        let displaced = router
+            .redirect("op_1", peer, token(2), McpClientType::ClaudeDesktop)
+            .await;
+
+        router.unregister("op_1").await; // terminal event arrives
+        router.restore("op_1", displaced).await;
+
+        assert_eq!(router.target_count().await, 0, "must stay unregistered");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_cannot_handle_progress_is_never_redirected() {
+        let (peer, _mcp) = server_peer().await;
+        let router = ProgressPushRouter::new();
+
+        assert!(
+            router
+                .redirect("op_1", peer, token(2), McpClientType::Cursor)
+                .await
+                .is_none()
+        );
+        assert_eq!(router.target_count().await, 0);
     }
 }

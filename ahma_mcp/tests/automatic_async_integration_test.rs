@@ -1,8 +1,11 @@
 //! Automatic Async Integration Tests
 //!
 //! Tests that verify the "automatic async" feature: when an async operation
-//! completes within `AUTOMATIC_ASYNC_TIMEOUT_SECS` (2 seconds), the result
-//! is returned inline instead of requiring a separate `await` call.
+//! completes within the inline window (SPEC R2.6.1), the result is returned
+//! inline instead of requiring a separate `await` call. The window is adaptive
+//! — `INLINE_WINDOW_IDLE_SECS` when nothing else is running,
+//! `INLINE_WINDOW_BUSY_SECS` when the caller is already fanning out — so these
+//! tests derive their bounds from those constants rather than restating them.
 
 use ahma_mcp::test_utils::client::ClientBuilder;
 use ahma_mcp::utils::logging::init_test_logging;
@@ -108,8 +111,8 @@ async fn test_automatic_async_fast_shell_returns_inline() -> Result<()> {
 // Test: Slow command falls back to async behavior
 // ============================================================================
 
-/// A slow command (sleep 30) should exceed the 5-second automatic async window
-/// and return the traditional async operation ID.
+/// A slow command (sleep 30) should exceed the inline window and return the
+/// traditional async operation ID.
 #[tokio::test]
 async fn test_automatic_async_slow_command_returns_async_id() -> Result<()> {
     init_test_logging();
@@ -152,23 +155,27 @@ async fn test_automatic_async_slow_command_returns_async_id() -> Result<()> {
         .filter_map(|c| c.as_text().map(|t| t.text.clone()))
         .collect();
 
-    // Slow command should return async operation ID after automatic async timeout
+    // Slow command should return async operation ID after the inline window
     assert!(
         all_text.contains("AHMA ID: op_"),
         "Slow command should return async operation ID. Got: {}",
         all_text
     );
 
-    // Should have waited approximately AUTOMATIC_ASYNC_TIMEOUT_SECS (2s) before returning.
-    // We allow a 1s lower bound to tolerate slow CI runners.
+    // Nothing else is running, so this call gets the *idle* window
+    // (SPEC R2.6.1). Bounds are derived from the constant, not restated, so the
+    // test tracks the policy instead of quietly contradicting it. The lower
+    // bound is loose to tolerate slow CI runners.
+    let idle = ahma_mcp::constants::INLINE_WINDOW_IDLE_SECS;
     assert!(
-        duration.as_secs() >= 1,
-        "Should have waited ~2 seconds before returning async ID. Actual: {:.1}s",
+        duration.as_secs() >= idle / 2,
+        "Should have waited about the idle inline window ({idle}s) before returning \
+         an async ID. Actual: {:.1}s",
         duration.as_secs_f64()
     );
     assert!(
-        duration.as_secs() <= 8,
-        "Should not have waited too long. Actual: {:.1}s",
+        duration.as_secs() <= idle + 6,
+        "Should not have waited far past the idle inline window ({idle}s). Actual: {:.1}s",
         duration.as_secs_f64()
     );
 

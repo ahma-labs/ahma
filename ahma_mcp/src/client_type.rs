@@ -34,6 +34,9 @@ pub enum McpClientType {
     LmStudio,
     /// Ollama - handles progress notifications correctly.
     Ollama,
+    /// Google Antigravity - abandons the transport partway through a long
+    /// `tools/call` (see [`McpClientType::request_budget`]).
+    Antigravity,
     /// Unknown client - optimistically assume progress is supported.
     #[default]
     Unknown,
@@ -60,6 +63,8 @@ impl McpClientType {
             McpClientType::LmStudio
         } else if name_lower.contains("ollama") {
             McpClientType::Ollama
+        } else if name_lower.contains("antigravity") {
+            McpClientType::Antigravity
         } else {
             McpClientType::Unknown
         }
@@ -92,7 +97,41 @@ impl McpClientType {
             McpClientType::Zed => "Zed",
             McpClientType::LmStudio => "LM Studio",
             McpClientType::Ollama => "Ollama",
+            McpClientType::Antigravity => "Antigravity",
             McpClientType::Unknown => "Unknown",
+        }
+    }
+
+    /// How long ahma may hold **one** MCP request open for this client before
+    /// the client gives up on it (SPEC R2.6.5).
+    ///
+    /// MCP has no way to discover this, so it is a table keyed on
+    /// `clientInfo.name` with a conservative default. Two behaviours derive
+    /// from it: the ceiling on the inline result window (R2.6.1) and the
+    /// `await` soft timeout (R2.5.1). Get it wrong high and a long call takes
+    /// the session down with it; get it wrong low and the model pays extra
+    /// round-trips. Prefer wrong-low.
+    ///
+    /// Antigravity's 20s is measured, not guessed: in a captured session its
+    /// transport stopped answering server pings partway through an 85-second
+    /// `await`, between 0 and 34 seconds after the request went out — the
+    /// result was written into a dead connection. Clients not on this list get
+    /// the same conservative budget until one is measured for them.
+    pub fn request_budget(&self) -> std::time::Duration {
+        use std::time::Duration;
+        match self {
+            // Purpose-built for long tool calls; ahma's own surfaces likewise.
+            McpClientType::Ahma
+            | McpClientType::ClaudeDesktop
+            | McpClientType::Cursor
+            | McpClientType::VSCode
+            | McpClientType::Zed => Duration::from_secs(300),
+            // Measured, and the reason this table exists.
+            McpClientType::Antigravity => Duration::from_secs(20),
+            // Local-model front-ends and anything unrecognised: assume little.
+            McpClientType::LmStudio | McpClientType::Ollama | McpClientType::Unknown => {
+                Duration::from_secs(20)
+            }
         }
     }
 }
@@ -221,5 +260,58 @@ mod tests {
     #[test]
     fn test_default_is_unknown() {
         assert_eq!(McpClientType::default(), McpClientType::Unknown);
+    }
+
+    #[test]
+    fn antigravity_is_detected_from_its_client_name() {
+        // The name it actually sends, from a captured session.
+        assert_eq!(
+            McpClientType::from_client_name("antigravity-client"),
+            McpClientType::Antigravity
+        );
+        assert_eq!(
+            McpClientType::from_client_name("Antigravity"),
+            McpClientType::Antigravity
+        );
+    }
+
+    #[test]
+    fn unrecognised_clients_get_the_conservative_budget() {
+        // Guessing high costs the session; guessing low costs a round-trip.
+        assert_eq!(
+            McpClientType::Unknown.request_budget(),
+            McpClientType::Antigravity.request_budget(),
+            "an unmeasured client must not be assumed tolerant"
+        );
+    }
+
+    #[test]
+    fn every_budget_is_long_enough_to_be_useful() {
+        use std::time::Duration;
+        for client in [
+            McpClientType::Ahma,
+            McpClientType::Cursor,
+            McpClientType::VSCode,
+            McpClientType::ClaudeDesktop,
+            McpClientType::Zed,
+            McpClientType::LmStudio,
+            McpClientType::Ollama,
+            McpClientType::Antigravity,
+            McpClientType::Unknown,
+        ] {
+            let budget = client.request_budget();
+            assert!(
+                budget >= Duration::from_secs(10),
+                "{} budget {budget:?} is too small for any real command",
+                client.display_name()
+            );
+            // The HTTP bridge guillotines a tools/call at 600s, so a budget
+            // above that would promise something the transport cannot keep.
+            assert!(
+                budget <= Duration::from_secs(600),
+                "{} budget {budget:?} exceeds the bridge's tools/call ceiling",
+                client.display_name()
+            );
+        }
     }
 }

@@ -37,6 +37,14 @@ pub fn boolean_property(description: &str) -> Value {
     })
 }
 
+/// Builds a common integer property schema with a description.
+pub fn integer_property(description: &str) -> Value {
+    json!({
+        "type": "integer",
+        "description": description
+    })
+}
+
 /// Builds a string property schema with `format: path`.
 pub fn path_property(description: &str) -> Value {
     json!({

@@ -62,6 +62,18 @@ pub fn text_result(text: impl Into<String>) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(text.into())])
 }
 
+/// Appends a note to a result's trailing text block, or adds one if the result
+/// carries no text. Used to disclose things the caller should know about the
+/// call itself (e.g. ignored arguments) without disturbing the payload.
+pub fn append_note(mut result: CallToolResult, note: &str) -> CallToolResult {
+    if let Some(ContentBlock::Text(last)) = result.content.last_mut() {
+        last.text.push_str(note);
+        return result;
+    }
+    result.content.push(ContentBlock::text(note.trim_start()));
+    result
+}
+
 /// Builds an internal MCP error with no extra data payload.
 pub fn mcp_internal(message: impl Into<String>) -> McpError {
     McpError::internal_error(message.into(), None)
@@ -154,18 +166,48 @@ pub fn require_str(
     opt_str(args, key).ok_or_else(|| mcp_invalid_params(error_message))
 }
 
-/// Attempts to wait for an async operation to complete within the automatic async
-/// timeout window. If the operation finishes in time, returns a `CallToolResult` with
-/// the output inline. Otherwise returns `None` to signal normal async behavior.
+/// How long this `tools/call` should wait for its operation before handing back
+/// an operation id (SPEC R2.6.1).
+///
+/// Two signals, no magic number:
+///
+/// * **Is anything else running?** If not, the model has nothing to overlap
+///   with and its next move would be `await` anyway, so waiting is free and
+///   buys an inline result. If it is already fanning out, hand the id back fast
+///   so the next command starts now.
+/// * **What will the client tolerate?** The wait holds one MCP request open, so
+///   it can never approach the client's single-request budget (R2.6.5).
+pub async fn inline_window(
+    monitor: &crate::operation_monitor::OperationMonitor,
+    op_id: &str,
+    client_type: crate::client_type::McpClientType,
+) -> std::time::Duration {
+    use crate::constants::{INLINE_WINDOW_BUSY_SECS, INLINE_WINDOW_IDLE_SECS};
+    use std::time::Duration;
+
+    let busy = monitor.active_count_excluding(op_id).await > 0;
+    let wanted = Duration::from_secs(if busy {
+        INLINE_WINDOW_BUSY_SECS
+    } else {
+        INLINE_WINDOW_IDLE_SECS
+    });
+    // Half the budget, never more: the response still has to travel back, and a
+    // window that consumes the client's whole tolerance leaves no margin.
+    wanted.min(client_type.request_budget() / 2)
+}
+
+/// Attempts to wait for an async operation to complete within the inline window.
+/// If the operation finishes in time, returns a `CallToolResult` with the output
+/// inline. Otherwise returns `None` to signal normal async behavior.
 ///
 /// This reduces context chatter for fast commands by eliminating the need for an
 /// extra `await` round-trip.
 pub async fn try_automatic_async_completion(
     monitor: &crate::operation_monitor::OperationMonitor,
     op_id: &str,
+    client_type: crate::client_type::McpClientType,
 ) -> Option<rmcp::model::CallToolResult> {
-    use crate::constants::AUTOMATIC_ASYNC_TIMEOUT_SECS;
-    use std::time::Duration;
+    let window = inline_window(monitor, op_id, client_type).await;
 
     // First check if already completed (race: task finished before we got here)
     if let Some(op) = monitor.check_completion_history_pub(op_id).await {
@@ -185,21 +227,20 @@ pub async fn try_automatic_async_completion(
         Ok(Some(rx)) => rx,
     };
 
-    // Wait up to AUTOMATIC_ASYNC_TIMEOUT_SECS for completion.
+    // Wait out the inline window.
     // The watch channel stores its current value, so if the operation finished
     // between the receiver creation and this await, `wait_for` returns immediately.
     //
     // Note: `watch::Ref` wraps an `RwLockReadGuard` which is not `Send`, so we extract
     // a plain `bool` and drop the guard before any subsequent `await`.
-    let timeout = Duration::from_secs(AUTOMATIC_ASYNC_TIMEOUT_SECS);
-    let timed_out = tokio::time::timeout(timeout, rx.wait_for(|done| *done))
+    let timed_out = tokio::time::timeout(window, rx.wait_for(|done| *done))
         .await
         .is_err();
     if timed_out {
-        // Timeout elapsed — fall back to normal async behavior.
+        // Window elapsed — fall back to normal async behavior.
         tracing::debug!(
-            "Automatic async timeout ({}s) elapsed for {}, returning async ID",
-            AUTOMATIC_ASYNC_TIMEOUT_SECS,
+            "Inline window ({:?}) elapsed for {}, returning async ID",
+            window,
             op_id
         );
         None
@@ -213,30 +254,64 @@ pub async fn try_automatic_async_completion(
 }
 
 /// Formats a completed operation into a `CallToolResult`.
+///
+/// **Always leads with the identity line** (SPEC R2.6.2, R24.7). A silent
+/// success used to return an empty string: `cargo fmt --check` on clean code
+/// produces no stdout, no stderr and exit 0, so the model received
+/// `{"text": ""}` and could not tell "passed" from "the tool is broken". The
+/// exit code and duration existed — they went only to a progress notification,
+/// which is best-effort and which the caller may not even receive. An operation
+/// that finished inline must say so in the result itself.
 fn format_completed_operation(op: &Operation) -> rmcp::model::CallToolResult {
     use crate::operation_monitor::OperationStatus;
 
-    match op.state {
-        OperationStatus::Completed => {
-            let output = extract_output_from_result(&op.result);
-            text_result(output)
-        }
-        OperationStatus::Failed => {
-            let output = extract_output_from_result(&op.result);
-            // Return as success with error content (same as sync path behavior)
-            text_result(format!("Command failed: {}", output))
-        }
-        OperationStatus::Cancelled | OperationStatus::TimedOut => {
-            let reason = op
-                .result
-                .as_ref()
-                .and_then(|v| v.get("reason"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("Operation was cancelled or timed out");
-            text_result(reason.to_string())
-        }
-        _ => text_result("Operation completed"),
+    let body = match op.state {
+        OperationStatus::Cancelled | OperationStatus::TimedOut => op
+            .result
+            .as_ref()
+            .and_then(|v| v.get("reason"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("Operation was cancelled or timed out")
+            .to_string(),
+        _ => extract_output_from_result(&op.result),
+    };
+
+    let body = if body.trim().is_empty() {
+        "(no output)"
+    } else {
+        body.trim_end()
+    };
+    text_result(format!("{}\n{}", identity_line(op), body))
+}
+
+/// The one-line identity for a finished operation, rendered by the shared
+/// renderer every other surface uses (SPEC R24.7) so chat, monitor rows and
+/// tool results name the same operation the same way.
+fn identity_line(op: &Operation) -> String {
+    use ahma_common::op_identity::{OpIdentity, OpOutcome};
+
+    let duration_ms = op
+        .end_time
+        .and_then(|end| end.duration_since(op.start_time).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let exit_code = op
+        .result
+        .as_ref()
+        .and_then(|v| v.get("exit_code"))
+        .and_then(serde_json::Value::as_i64);
+
+    OpIdentity {
+        title: op.title.as_deref().unwrap_or(&op.tool_name),
+        cwd: op.cwd.as_deref(),
+        origin: None,
+        outcome: OpOutcome::Finished {
+            exit_code,
+            status: format!("{:?}", op.state),
+            duration_ms,
+        },
     }
+    .render(false)
 }
 
 fn format_structured_output(stdout_str: &str, stderr_str: &str, exit_code: i64) -> String {

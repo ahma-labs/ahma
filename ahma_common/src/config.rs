@@ -685,9 +685,11 @@ pub struct ToolSettings {
     /// Default: [`DEFAULT_AWAIT_TIMEOUT_SECS`] (9 minutes)
     #[serde(default = "default_await_timeout_secs")]
     pub await_timeout_secs: u64,
-    /// Run all tools synchronously.  By default tools are async-first: if a result
-    /// arrives within 5 seconds it is returned inline; otherwise an operation ID is
-    /// returned and the result is pushed as a notification.
+    /// Run all tools synchronously.  By default tools are async-first: ahma waits
+    /// an adaptive inline window (SPEC R2.6.1) — longer when nothing else is
+    /// running, short when the caller is already fanning out — and returns the
+    /// result inline if it arrives in time; otherwise an operation ID is returned
+    /// and the result is pushed as a notification.
     /// Default: `false`
     pub force_sync: bool,
     /// Watch the tools directory for JSON changes and reload tool definitions at runtime.

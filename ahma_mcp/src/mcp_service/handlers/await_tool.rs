@@ -9,7 +9,85 @@ use std::sync::Arc;
 use tokio::time::{Instant, error::Elapsed};
 use tracing;
 
+/// Who issued this `await`, when that is known.
+///
+/// `await` is also called from the CLI and from tests, where there is no MCP
+/// peer at all — hence `Default`. When a peer *is* present, two things follow
+/// from it: the wait is bounded by what that client tolerates on one request
+/// (SPEC R2.6.5), and progress for the awaited operations is redirected to this
+/// request's token so the caller sees liveness (SPEC R2.5.3).
+#[derive(Default, Clone)]
+pub struct AwaitCaller {
+    pub peer: Option<rmcp::service::Peer<rmcp::service::RoleServer>>,
+    pub progress_token: Option<rmcp::model::ProgressToken>,
+    pub client_type: Option<crate::client_type::McpClientType>,
+}
+
+impl AwaitCaller {
+    /// Build from a live MCP request.
+    pub fn from_context(
+        context: &rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Self {
+        Self {
+            peer: Some(context.peer.clone()),
+            progress_token: context.meta.get_progress_token(),
+            client_type: Some(crate::client_type::McpClientType::from_peer(&context.peer)),
+        }
+    }
+}
+
+/// Holds the progress targets an `await` displaced, and puts them back when the
+/// await returns (SPEC R2.5.3).
+///
+/// Restoration is best-effort and happens on a spawned task, because `Drop`
+/// cannot await — which matches the guarantee level of progress push itself
+/// (R2.2): the store of record is the `OperationMonitor`, never a notification.
+pub struct ProgressRedirect {
+    router: Arc<crate::mcp_service::progress_push::ProgressPushRouter>,
+    saved: Vec<(
+        String,
+        Option<crate::mcp_service::progress_push::PushTarget>,
+    )>,
+}
+
+impl Drop for ProgressRedirect {
+    fn drop(&mut self) {
+        let router = Arc::clone(&self.router);
+        let saved = std::mem::take(&mut self.saved);
+        tokio::spawn(async move {
+            for (op_id, previous) in saved {
+                router.restore(&op_id, previous).await;
+            }
+        });
+    }
+}
+
 impl AhmaMcpService {
+    /// Point the awaited operations' progress at *this* request for as long as
+    /// the returned guard lives (SPEC R2.5.3).
+    async fn redirect_progress(
+        &self,
+        op_ids: &[String],
+        caller: &AwaitCaller,
+    ) -> Option<ProgressRedirect> {
+        let peer = caller.peer.clone()?;
+        let token = caller.progress_token.clone()?;
+        let client_type = caller.client_type?;
+
+        let mut saved = Vec::with_capacity(op_ids.len());
+        for op_id in op_ids {
+            let previous = self
+                .progress_push
+                .redirect(op_id, peer.clone(), token.clone(), client_type)
+                .await;
+            saved.push((op_id.clone(), previous));
+        }
+        Some(ProgressRedirect {
+            router: Arc::clone(&self.progress_push),
+            saved,
+        })
+    }
+
     /// Generates the specific input schema for the `await` tool.
     pub fn generate_input_schema_for_wait(&self) -> Arc<Map<String, Value>> {
         let mut properties = Map::new();
@@ -56,10 +134,47 @@ impl AhmaMcpService {
         })
     }
 
-    /// Handles the 'await' tool call.
+    /// Bound a resolved await timeout by what the calling client tolerates on a
+    /// single request (SPEC R2.5.1, R2.6.5).
+    ///
+    /// Expiry is soft — the operation keeps running and `await` can be called
+    /// again — so clamping costs at most a cheap extra round-trip. Not clamping
+    /// costs the session: a client that abandons the transport at 20s never
+    /// receives the result of a 540s wait, and the operation's output is
+    /// written into a connection nobody is reading. An explicit
+    /// `timeout_seconds` argument is honoured as given; this bounds the
+    /// *default*, which is what models actually use.
+    fn bounded_await_timeout_secs(&self, resolved: f64, caller: &AwaitCaller) -> f64 {
+        let Some(client_type) = caller.client_type else {
+            return resolved;
+        };
+        let budget = client_type.request_budget().as_secs_f64();
+        if resolved <= budget {
+            return resolved;
+        }
+        tracing::debug!(
+            client = client_type.display_name(),
+            resolved,
+            budget,
+            "Clamping await timeout to the client's single-request budget"
+        );
+        budget
+    }
+
+    /// Handles the 'await' tool call with no caller context (CLI, tests).
     pub async fn handle_await(
         &self,
         params: CallToolRequestParams,
+    ) -> Result<CallToolResult, McpError> {
+        self.handle_await_for_caller(params, AwaitCaller::default())
+            .await
+    }
+
+    /// Handles the 'await' tool call.
+    pub async fn handle_await_for_caller(
+        &self,
+        params: CallToolRequestParams,
+        caller: AwaitCaller,
     ) -> Result<CallToolResult, McpError> {
         let args = params.arguments.unwrap_or_default();
 
@@ -69,11 +184,18 @@ impl AhmaMcpService {
 
         // If id is specified, wait for that specific operation
         if let Some(op_id) = id_filter {
+            let timeout_secs = match timeout_override {
+                Some(t) => t as f64,
+                None => self.bounded_await_timeout_secs(
+                    self.resolved_await_timeout_secs(None) as f64,
+                    &caller,
+                ),
+            };
+            let _progress = self
+                .redirect_progress(std::slice::from_ref(&op_id), &caller)
+                .await;
             return self
-                .handle_await_specific_operation(
-                    op_id,
-                    self.resolved_await_timeout_secs(timeout_override),
-                )
+                .handle_await_specific_operation(op_id, timeout_secs as u64)
                 .await;
         }
 
@@ -83,11 +205,13 @@ impl AhmaMcpService {
         let timeout_seconds = match timeout_override {
             Some(t) => t as f64,
             None => {
-                self.calculate_intelligent_timeout(
-                    &tool_filters,
-                    self.resolved_await_timeout_secs(None) as f64,
-                )
-                .await
+                let intelligent = self
+                    .calculate_intelligent_timeout(
+                        &tool_filters,
+                        self.resolved_await_timeout_secs(None) as f64,
+                    )
+                    .await;
+                self.bounded_await_timeout_secs(intelligent, &caller)
             }
         };
         let timeout_duration = std::time::Duration::from_secs(timeout_seconds as u64);
@@ -107,6 +231,9 @@ impl AhmaMcpService {
 
         let wait_start = Instant::now();
         let (warning_task, mut warning_rx) = spawn_progress_warnings(timeout_seconds);
+
+        let pending_ids: Vec<String> = pending_ops.iter().map(|op| op.id.clone()).collect();
+        let _progress = self.redirect_progress(&pending_ids, &caller).await;
 
         let wait_result = self
             .wait_for_pending_operations(timeout_duration, &pending_ops)
@@ -1205,5 +1332,52 @@ mod tests {
         let msg = msg.expect("channel should yield at least one message");
         assert!(msg.contains("complete"));
         assert!(msg.contains("remaining"));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::client_type::McpClientType;
+
+    fn caller(client_type: Option<McpClientType>) -> AwaitCaller {
+        AwaitCaller {
+            peer: None,
+            progress_token: None,
+            client_type,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_default_is_clamped_to_what_the_client_tolerates() {
+        // REGRESSION: the 540s default await outlives clients that abandon the
+        // transport far sooner. In a captured session the operation's result was
+        // written into a connection that had stopped reading ~50s earlier. Since
+        // expiry is soft — "still running, call await again" — clamping costs a
+        // cheap round-trip and saves the session.
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        let budget = McpClientType::Antigravity.request_budget().as_secs_f64();
+
+        let bounded =
+            service.bounded_await_timeout_secs(540.0, &caller(Some(McpClientType::Antigravity)));
+        assert_eq!(bounded, budget);
+    }
+
+    #[tokio::test]
+    async fn a_tolerant_client_keeps_its_long_wait() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        let bounded =
+            service.bounded_await_timeout_secs(120.0, &caller(Some(McpClientType::ClaudeDesktop)));
+        assert_eq!(bounded, 120.0, "no clamp when the client can take it");
+    }
+
+    #[tokio::test]
+    async fn no_client_context_means_no_clamp() {
+        // CLI and tests have no MCP peer, so there is nothing to protect.
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        assert_eq!(
+            service.bounded_await_timeout_secs(540.0, &caller(None)),
+            540.0
+        );
     }
 }

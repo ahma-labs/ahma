@@ -305,3 +305,139 @@ fn test_extract_output_arbitrary_json_fallback() {
         "Fallback should serialize JSON: {out}"
     );
 }
+
+// ─── Inline result: the outcome is always stated (SPEC R2.6.2) ───────────────
+
+/// A completed operation carrying stdout/stderr/exit_code, as the adapter
+/// stores it.
+fn completed_op(id: &str, title: &str, stdout: &str, stderr: &str, exit_code: i64) -> Operation {
+    let mut op = make_op(id, "run_terminal_command", OperationStatus::Completed);
+    op.title = Some(title.to_string());
+    op.end_time = Some(op.start_time + std::time::Duration::from_millis(867));
+    op.result = Some(json!({
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": exit_code,
+    }));
+    op
+}
+
+fn text_of(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect()
+}
+
+#[test]
+fn silent_success_still_reports_the_outcome() {
+    // REGRESSION: `cargo fmt --check` on clean code writes nothing and exits 0.
+    // The inline result used to be the empty string, so the model could not
+    // tell "passed" from "the tool is broken" — and a captured Antigravity
+    // session did exactly that, then invented a `sync` parameter to fix it.
+    let op = completed_op("op_1_cargo_fmt", "cargo fmt --check", "", "", 0);
+    let text = text_of(&format_completed_operation(&op));
+
+    assert!(!text.trim().is_empty(), "result must never be empty");
+    assert!(
+        text.contains("cargo fmt --check"),
+        "must name what ran: {text:?}"
+    );
+    assert!(
+        text.contains("exit 0"),
+        "must state the exit code: {text:?}"
+    );
+    assert!(
+        text.contains("(no output)"),
+        "must say the command was silent rather than say nothing: {text:?}"
+    );
+}
+
+#[test]
+fn successful_output_is_preceded_by_the_identity_line() {
+    let op = completed_op("op_2_echo", "echo hi", "hi\n", "", 0);
+    let text = text_of(&format_completed_operation(&op));
+
+    let (first, rest) = text.split_once('\n').expect("identity line then body");
+    assert!(
+        first.contains("echo hi") && first.contains("exit 0"),
+        "{first:?}"
+    );
+    assert_eq!(rest, "hi", "the command's own output follows verbatim");
+}
+
+#[test]
+fn failure_states_the_nonzero_exit_code() {
+    let op = completed_op("op_3_build", "cargo build", "", "error[E0433]", 1);
+    let text = text_of(&format_completed_operation(&op));
+
+    assert!(
+        text.contains("exit 1"),
+        "must state the exit code: {text:?}"
+    );
+    assert!(text.contains("error[E0433]"), "must keep stderr: {text:?}");
+}
+
+// ─── Ignored-argument disclosure (SPEC R2.6.4) ───────────────────────────────
+
+#[test]
+fn append_note_extends_the_trailing_text_block() {
+    let result = append_note(text_result("payload"), "\n\nNote: something");
+    assert_eq!(text_of(&result), "payload\n\nNote: something");
+}
+
+#[test]
+fn append_note_adds_a_block_when_there_is_no_text() {
+    let empty = rmcp::model::CallToolResult::success(vec![]);
+    let result = append_note(empty, "\n\nNote: something");
+    assert_eq!(text_of(&result), "Note: something");
+}
+
+// ─── Adaptive inline window (SPEC R2.6.1, R2.6.5) ────────────────────────────
+
+use crate::client_type::McpClientType;
+use crate::constants::{INLINE_WINDOW_BUSY_SECS, INLINE_WINDOW_IDLE_SECS};
+use crate::operation_monitor::{MonitorConfig, OperationMonitor};
+use std::time::Duration;
+
+async fn monitor_with_running(ids: &[&str]) -> OperationMonitor {
+    let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(60)));
+    for id in ids {
+        let mut op = make_op(id, "run_terminal_command", OperationStatus::InProgress);
+        op.end_time = None;
+        monitor.add_operation(op).await;
+    }
+    monitor
+}
+
+#[tokio::test]
+async fn idle_session_waits_the_long_window() {
+    // Nothing to overlap with: the model's next move would be `await` anyway,
+    // so waiting is free and may save a whole round-trip.
+    let monitor = monitor_with_running(&["op_1"]).await;
+    let window = inline_window(&monitor, "op_1", McpClientType::ClaudeDesktop).await;
+    assert_eq!(window, Duration::from_secs(INLINE_WINDOW_IDLE_SECS));
+}
+
+#[tokio::test]
+async fn fanning_out_gets_the_short_window() {
+    // Something else is already running, so holding this response delays the
+    // next command in a fan-out. Hand the id back promptly instead.
+    let monitor = monitor_with_running(&["op_1", "op_2"]).await;
+    let window = inline_window(&monitor, "op_2", McpClientType::ClaudeDesktop).await;
+    assert_eq!(window, Duration::from_secs(INLINE_WINDOW_BUSY_SECS));
+}
+
+#[tokio::test]
+async fn a_tight_client_budget_clamps_the_window() {
+    // Antigravity abandons the transport partway through a long request, so the
+    // window can never approach its budget however idle the session is.
+    let monitor = monitor_with_running(&["op_1"]).await;
+    let window = inline_window(&monitor, "op_1", McpClientType::Antigravity).await;
+    assert!(
+        window <= McpClientType::Antigravity.request_budget() / 2,
+        "window {window:?} must leave the client margin to receive the response"
+    );
+    assert!(window >= Duration::from_secs(INLINE_WINDOW_BUSY_SECS));
+}

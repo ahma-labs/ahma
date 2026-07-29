@@ -102,7 +102,8 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
 ```
 
 > [!NOTE]
-> The `~/sandbox` directory is auto-created by ahma on first startup. To use a different directory, change the `--sandbox-scope` path above or set `sandbox_directory` in `~/.ahma/settings.toml`.
+> - The `~/sandbox` directory is auto-created by ahma on first startup. To use a different directory, change the `--sandbox-scope` path above or set `sandbox_directory` in `~/.ahma/settings.toml`.
+> - **You do not need a "sync" flag.** `run_terminal_command` decides for itself: a command that finishes inside the inline window returns its output in the same response, with no `status`/`await` round-trip. Only a command that outlives the window hands back an operation id. The window adapts — longer when nothing else is running, short when you are starting several commands at once — and is capped by what your client tolerates on one open request (SPEC R2.6). Sending `"sync": true` does nothing; the result will say so.
 
 ## 2. HTTP Mode (EXPERIMENTAL)
 

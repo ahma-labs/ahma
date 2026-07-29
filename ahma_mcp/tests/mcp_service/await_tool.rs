@@ -33,14 +33,18 @@ async fn test_handle_await_with_pending_ops() -> Result<()> {
     init_test_logging();
     let client = ClientBuilder::new().build().await?;
 
-    // Start a fast async command so it creates an operation
+    // Start a command that outlives the inline window, so the call hands back an
+    // operation id instead of answering inline (SPEC R2.6.1). Sized from the
+    // constant so the test cannot silently stop testing `await` if the window
+    // changes.
+    let secs = ahma_mcp::constants::INLINE_WINDOW_IDLE_SECS + 2;
     let mut args = Map::new();
     args.insert(
         "command".to_string(),
         json!(if cfg!(windows) {
-            "Start-Sleep -Seconds 6; Write-Output 'done waiting'"
+            format!("Start-Sleep -Seconds {secs}; Write-Output 'done waiting'")
         } else {
-            "sleep 6 && echo 'done waiting'"
+            format!("sleep {secs} && echo 'done waiting'")
         }),
     );
     args.insert("execution_mode".to_string(), json!("Asynchronous"));

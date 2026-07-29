@@ -118,11 +118,80 @@ impl AhmaMcpService {
                 "Run the command attached to a pseudo-terminal (Unix only). Use for tools that require a TTY or change behaviour without one (colours, progress bars, interactive prompts). stdout and stderr are merged.",
             ),
         );
+        properties.insert(
+            "timeout_seconds".to_string(),
+            schema::integer_property(
+                "Kill the command if it is still running after this many seconds. Not a wait: the call still returns as soon as the command finishes, or hands back an operation id if it is slow (SPEC R2.6).",
+            ),
+        );
+        // Deliberately NOT advertised: any parameter that lets the model choose
+        // synchronous execution (SPEC R2.6.3). Blocking a single MCP request for
+        // the length of a `cargo` build exceeds what several clients tolerate,
+        // and models reach for such a flag by default rather than selectively.
+        // The inline/async decision is ahma's (R2.6.1), not the model's.
         schema::object_input_schema(properties, &["command"])
     }
 
-    /// Handles the 'run_terminal_command' built-in tool call.
+    /// Parameters `run_terminal_command` understands. Anything else a client
+    /// sends is ignored — and disclosed in the result (SPEC R2.6.4) so a model
+    /// that invented a parameter learns it did nothing, instead of assuming it
+    /// took effect. `execution_mode` is honoured but unadvertised: it is the
+    /// CLI/test escape hatch, not a knob for models.
+    const KNOWN_ARGS: &'static [&'static str] = &[
+        "command",
+        "working_directory",
+        "monitor_level",
+        "monitor_stream",
+        "session_id",
+        "pty",
+        "timeout_seconds",
+        "execution_mode",
+    ];
+
+    /// Names the client sent that ahma does not act on, in a stable order.
+    fn unknown_args(args: &Map<String, Value>) -> Vec<String> {
+        let mut unknown: Vec<String> = args
+            .keys()
+            .filter(|k| !Self::KNOWN_ARGS.contains(&k.as_str()))
+            .cloned()
+            .collect();
+        unknown.sort();
+        unknown
+    }
+
+    /// The disclosure appended to a result when arguments were ignored.
+    fn unknown_args_notice(unknown: &[String]) -> String {
+        format!(
+            "\n\nNote: ignored unknown argument(s): {}. `run_terminal_command` is \
+             async-first: fast commands return their output inline, slower ones return \
+             an operation id to `await`. There is no caller-selectable synchronous mode.",
+            unknown.join(", ")
+        )
+    }
+
+    /// Handles the 'run_terminal_command' built-in tool call, disclosing any
+    /// arguments it ignored (SPEC R2.6.4).
     pub async fn handle_run_terminal_command(
+        &self,
+        params: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let unknown = Self::unknown_args(params.arguments.as_ref().unwrap_or(&Map::new()));
+        let result = self.dispatch_run_terminal_command(params, context).await?;
+        if unknown.is_empty() {
+            return Ok(result);
+        }
+        tracing::warn!(
+            ignored = ?unknown,
+            "run_terminal_command called with unknown argument(s); ignored and disclosed to the client"
+        );
+        Ok(common::append_note(
+            result,
+            &Self::unknown_args_notice(&unknown),
+        ))
+    }
+
+    async fn dispatch_run_terminal_command(
         &self,
         params: CallToolRequestParams,
         context: RequestContext<RoleServer>,
@@ -196,7 +265,8 @@ impl AhmaMcpService {
             }
         });
 
-        // Determine execution mode
+        // Determine execution mode. `execution_mode` is the CLI/test escape
+        // hatch; models get no say (SPEC R2.6.3).
         let execution_mode = if self.force_synchronous {
             crate::adapter::ExecutionMode::Synchronous
         } else if let Some(mode_str) = common::opt_str(&args, "execution_mode") {
@@ -464,8 +534,12 @@ impl AhmaMcpService {
 
         match started {
             Ok(op_id) => {
-                if let Some(result) =
-                    common::try_automatic_async_completion(&self.operation_monitor, &op_id).await
+                if let Some(result) = common::try_automatic_async_completion(
+                    &self.operation_monitor,
+                    &op_id,
+                    client_type,
+                )
+                .await
                 {
                     return Ok(result);
                 }
@@ -541,9 +615,14 @@ impl AhmaMcpService {
 
         match job_id {
             Ok(id) => {
-                // Automatic async: wait briefly for fast commands to complete
-                if let Some(result) =
-                    common::try_automatic_async_completion(&self.operation_monitor, &id).await
+                // Automatic async: wait out the inline window (SPEC R2.6.1) so
+                // fast commands answer without an `await` round-trip.
+                if let Some(result) = common::try_automatic_async_completion(
+                    &self.operation_monitor,
+                    &id,
+                    client_type,
+                )
+                .await
                 {
                     return Ok(result);
                 }
@@ -923,6 +1002,73 @@ mod tests {
         assert!(
             outcome.is_err(),
             "missing required 'command' must surface an error"
+        );
+    }
+}
+
+#[cfg(test)]
+mod arg_disclosure_tests {
+    use crate::AhmaMcpService;
+    use serde_json::{Map, json};
+
+    fn args(pairs: &[(&str, serde_json::Value)]) -> Map<String, serde_json::Value> {
+        pairs
+            .iter()
+            .cloned()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_advertised_property_is_a_known_argument() {
+        // The schema and the handler must not drift: a property we advertise but
+        // do not list as known would be "disclosed as ignored" on every call.
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        let schema = service.generate_input_schema_for_run_terminal_command();
+        let props = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("schema has properties");
+        for name in props.keys() {
+            assert!(
+                AhmaMcpService::KNOWN_ARGS.contains(&name.as_str()),
+                "advertised property {name:?} is missing from KNOWN_ARGS"
+            );
+        }
+    }
+
+    #[test]
+    fn known_arguments_are_not_reported() {
+        let a = args(&[
+            ("command", json!("ls")),
+            ("working_directory", json!("/tmp")),
+            ("pty", json!(true)),
+            ("timeout_seconds", json!(30)),
+        ]);
+        assert!(AhmaMcpService::unknown_args(&a).is_empty());
+    }
+
+    #[test]
+    fn an_invented_argument_is_reported_in_a_stable_order() {
+        // REGRESSION: a captured session shows Gemini sending `"sync": true`,
+        // which was not in the schema. ahma dropped it silently, so the model had
+        // no way to learn the parameter did nothing — and concluded ahma was
+        // broken rather than that its parameter was imaginary.
+        let a = args(&[
+            ("command", json!("cargo fmt --check")),
+            ("sync", json!(true)),
+            ("blocking", json!(true)),
+        ]);
+        assert_eq!(
+            AhmaMcpService::unknown_args(&a),
+            vec!["blocking".to_string(), "sync".to_string()]
+        );
+
+        let notice = AhmaMcpService::unknown_args_notice(&AhmaMcpService::unknown_args(&a));
+        assert!(notice.contains("sync"), "{notice}");
+        assert!(
+            notice.contains("no caller-selectable synchronous mode"),
+            "the notice must say why, or the model will just try again: {notice}"
         );
     }
 }

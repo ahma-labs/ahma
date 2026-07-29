@@ -36,10 +36,25 @@ for '{id}'. Instead, use 'await' \u{2014} it blocks until complete.\n";
 /// Particularly important for Cargo operations that may hold Cargo.lock.
 pub const SEQUENCE_STEP_DELAY_MS: u64 = 100;
 
-/// Maximum time (in seconds) to wait for an async operation to complete before
-/// returning an async operation ID. If the operation finishes within this window,
-/// its result is returned inline, saving the LLM an extra `await` round-trip.
-pub const AUTOMATIC_ASYNC_TIMEOUT_SECS: u64 = 2;
+/// How long a `tools/call` waits for its operation to finish before handing back
+/// an operation id, **when the session has nothing else running** (SPEC R2.6.1).
+///
+/// The model has nothing to overlap with here: if this call does not return
+/// inline, its next move is `await`, which blocks for at least as long. So the
+/// wait is free wall-clock and buys an inline result — saving a whole LLM turn
+/// and the context that turn would burn. Clamped by the client's single-request
+/// budget ([`McpClientType::request_budget`]).
+///
+/// [`McpClientType::request_budget`]: crate::client_type::McpClientType::request_budget
+pub const INLINE_WINDOW_IDLE_SECS: u64 = 10;
+
+/// The same window **when operations are already in flight** (SPEC R2.6.1).
+///
+/// Now the model is fanning out, and every second spent holding this response is
+/// a second the next command is not yet started. Long enough for genuinely
+/// instant commands (`git status`, `ls`) to still answer inline; short enough
+/// that a fan-out of slow builds starts concurrently without delay.
+pub const INLINE_WINDOW_BUSY_SECS: u64 = 1;
 
 #[cfg(test)]
 mod tests {
@@ -81,19 +96,24 @@ mod tests {
     }
 
     #[test]
-    fn automatic_async_timeout_is_reasonable() {
+    fn inline_windows_are_ordered_and_within_every_client_budget() {
         init_test_logging();
         const _: () = assert!(
-            AUTOMATIC_ASYNC_TIMEOUT_SECS >= 1,
-            "Automatic async timeout too short - won't catch fast commands"
+            INLINE_WINDOW_BUSY_SECS >= 1,
+            "Busy window too short - even instant commands would return an id"
         );
         const _: () = assert!(
-            AUTOMATIC_ASYNC_TIMEOUT_SECS <= 60,
-            "Automatic async timeout too long - defeats purpose of async"
+            INLINE_WINDOW_BUSY_SECS < INLINE_WINDOW_IDLE_SECS,
+            "The busy window must be the shorter one - that is the whole point"
         );
-        assert_eq!(
-            AUTOMATIC_ASYNC_TIMEOUT_SECS, 2,
-            "Automatic async timeout should be 600 seconds (10 minutes) as documented"
+        // The idle window holds a `tools/call` open. It must fit inside the
+        // budget of the least tolerant client we know of, or the request that
+        // was supposed to save a round-trip kills the session instead.
+        let tightest = crate::client_type::McpClientType::Antigravity.request_budget();
+        assert!(
+            std::time::Duration::from_secs(INLINE_WINDOW_IDLE_SECS) < tightest,
+            "idle window {INLINE_WINDOW_IDLE_SECS}s must stay under the tightest \
+             client request budget {tightest:?}"
         );
     }
 }
