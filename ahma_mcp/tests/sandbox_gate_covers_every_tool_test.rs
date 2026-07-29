@@ -16,9 +16,12 @@
 //! particular would be circular, since granting is how a scope gets widened.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ahma_common::timeouts::TestTimeouts;
+use ahma_mcp::shell::cli::AppConfig;
 use ahma_mcp::test_utils::in_process::{
     InProcessMcp, create_in_process_mcp_with_client, create_in_process_mcp_with_scope,
 };
@@ -44,10 +47,6 @@ const EXEMPT: &[&str] = &[
     "todo_write",
 ];
 
-/// Exempt tools with side effects too large to invoke in a test. Their
-/// membership in [`EXEMPT`] is still asserted; only the call is skipped.
-const DO_NOT_INVOKE: &[&str] = &["restart"];
-
 /// Tools that must be gated no matter what else changes. The wire-driven loop
 /// below covers every advertised tool, but these are named explicitly because
 /// they are the ones that were silently ungated: the check lived inside
@@ -71,13 +70,45 @@ fn budget() -> Duration {
 /// An in-process server whose sandbox scope never settles: the client answers
 /// `roots/list` with an empty list, which is exactly what Cursor does in a
 /// window with no workspace folder open.
-async fn server_without_a_settled_scope() -> Result<InProcessMcp<RecordingClient>> {
-    create_in_process_mcp_with_client(
+///
+/// The service's bridge endpoints are repointed at private, unused ones so that
+/// invoking `restart` is safe. `trigger_bridge_restart` already refuses to touch
+/// the *global* endpoints under test isolation, but that guard keys off
+/// `NEXTEST`/`AHMA_TEST_ISOLATION` — absent under a plain `cargo test`, where
+/// the defaults (`/tmp/ahma.sock`, `127.0.0.1:3000`) are exactly the developer's
+/// live server. Overriding the config removes the hazard outright instead of
+/// relying on the environment to be right.
+async fn server_without_a_settled_scope(
+    unreachable_socket: &Path,
+) -> Result<InProcessMcp<RecordingClient>> {
+    let mcp = create_in_process_mcp_with_client(
         RecordingClient::new("cursor"),
         HashMap::new(),
         Vec::new(), // no scope — and the client offers none
     )
-    .await
+    .await?;
+
+    let config = AppConfig {
+        unix_socket_path: unreachable_socket.to_string_lossy().into_owned(),
+        http_host: "127.0.0.1".to_string(),
+        http_port: unused_local_port()?,
+        ..Default::default()
+    };
+    *mcp.service
+        .app_config
+        .write()
+        .expect("app_config lock poisoned") = Some(Arc::new(config));
+
+    Ok(mcp)
+}
+
+/// A TCP port with nothing listening on it: bind to port 0, note what the OS
+/// picked, then release it.
+fn unused_local_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
 }
 
 /// Drive every advertised tool and require the gate to apply to all of them
@@ -91,7 +122,8 @@ async fn server_without_a_settled_scope() -> Result<InProcessMcp<RecordingClient
 #[tokio::test]
 async fn every_advertised_tool_is_gated_unless_it_is_the_control_surface() -> Result<()> {
     init_test_logging();
-    let mcp = server_without_a_settled_scope().await?;
+    let temp = tempfile::tempdir()?;
+    let mcp = server_without_a_settled_scope(&temp.path().join("bridge.sock")).await?;
 
     let tools = tokio::time::timeout(budget(), mcp.client.list_all_tools())
         .await
@@ -115,15 +147,6 @@ async fn every_advertised_tool_is_gated_unless_it_is_the_control_surface() -> Re
     }
 
     for name in &advertised {
-        if DO_NOT_INVOKE.contains(&name.as_str()) {
-            assert!(
-                EXEMPT.contains(&name.as_str()),
-                "`{name}` is skipped only because invoking it is unsafe in a \
-                 test; that is justified only for exempt tools"
-            );
-            continue;
-        }
-
         // Deliberately no arguments: the gate has to run *before* argument
         // validation. If a tool answers with a parameter error instead, the
         // handler was reached — which is the ungated state.
@@ -169,7 +192,8 @@ async fn every_advertised_tool_is_gated_unless_it_is_the_control_surface() -> Re
 #[tokio::test]
 async fn tool_discovery_is_never_gated() -> Result<()> {
     init_test_logging();
-    let mcp = server_without_a_settled_scope().await?;
+    let temp = tempfile::tempdir()?;
+    let mcp = server_without_a_settled_scope(&temp.path().join("bridge.sock")).await?;
 
     let tools = tokio::time::timeout(budget(), mcp.client.list_all_tools())
         .await

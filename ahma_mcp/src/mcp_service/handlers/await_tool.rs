@@ -62,6 +62,44 @@ impl Drop for ProgressRedirect {
     }
 }
 
+/// How long this `await` will wait, and whether the client's single-request
+/// budget cut it short (SPEC R2.6.5).
+///
+/// The clamp used to exist only as a `debug!` line. That is invisible to the
+/// caller, and the caller is the one who has to act on it: a model that asked
+/// for a 540s wait and got 20s of silence has no way to tell a clamp from a
+/// hung operation, and "call `await` again" is the wrong conclusion to have to
+/// guess at. So the reason travels with the timeout and is stated in the
+/// result.
+struct AwaitTimeout {
+    secs: f64,
+    /// `(requested_secs, client)` when the budget shortened the wait.
+    clamped_from: Option<(f64, crate::client_type::McpClientType)>,
+}
+
+impl AwaitTimeout {
+    fn unclamped(secs: f64) -> Self {
+        Self {
+            secs,
+            clamped_from: None,
+        }
+    }
+
+    /// The sentence appended to a timeout result when the wait was shortened.
+    fn note(&self) -> Option<String> {
+        let (requested, client) = self.clamped_from?;
+        Some(format!(
+            "\n\nNote: this wait was capped at {:.0}s rather than {:.0}s because \
+             {} stops waiting on a single request at about that point (SPEC \
+             R2.6.5). The cap is why the wait ended, not a problem with the \
+             operation — it is still running.",
+            self.secs,
+            requested,
+            client.display_name(),
+        ))
+    }
+}
+
 impl AhmaMcpService {
     /// Point the awaited operations' progress at *this* request for as long as
     /// the returned guard lives (SPEC R2.5.3).
@@ -144,13 +182,13 @@ impl AhmaMcpService {
     /// written into a connection nobody is reading. An explicit
     /// `timeout_seconds` argument is honoured as given; this bounds the
     /// *default*, which is what models actually use.
-    fn bounded_await_timeout_secs(&self, resolved: f64, caller: &AwaitCaller) -> f64 {
+    fn bounded_await_timeout_secs(&self, resolved: f64, caller: &AwaitCaller) -> AwaitTimeout {
         let Some(client_type) = caller.client_type else {
-            return resolved;
+            return AwaitTimeout::unclamped(resolved);
         };
         let budget = client_type.request_budget().as_secs_f64();
         if resolved <= budget {
-            return resolved;
+            return AwaitTimeout::unclamped(resolved);
         }
         tracing::debug!(
             client = client_type.display_name(),
@@ -158,7 +196,10 @@ impl AhmaMcpService {
             budget,
             "Clamping await timeout to the client's single-request budget"
         );
-        budget
+        AwaitTimeout {
+            secs: budget,
+            clamped_from: Some((resolved, client_type)),
+        }
     }
 
     /// Handles the 'await' tool call with no caller context (CLI, tests).
@@ -184,8 +225,8 @@ impl AhmaMcpService {
 
         // If id is specified, wait for that specific operation
         if let Some(op_id) = id_filter {
-            let timeout_secs = match timeout_override {
-                Some(t) => t as f64,
+            let bound = match timeout_override {
+                Some(t) => AwaitTimeout::unclamped(t as f64),
                 None => self.bounded_await_timeout_secs(
                     self.resolved_await_timeout_secs(None) as f64,
                     &caller,
@@ -195,15 +236,15 @@ impl AhmaMcpService {
                 .redirect_progress(std::slice::from_ref(&op_id), &caller)
                 .await;
             return self
-                .handle_await_specific_operation(op_id, timeout_secs as u64)
+                .handle_await_specific_operation(op_id, bound.secs as u64, bound.note())
                 .await;
         }
 
         // Original behavior: wait for operations by tool filter. An explicit
         // `timeout_seconds` is honoured as given; otherwise the resolved default is
         // raised to cover the longest-running pending operation.
-        let timeout_seconds = match timeout_override {
-            Some(t) => t as f64,
+        let bound = match timeout_override {
+            Some(t) => AwaitTimeout::unclamped(t as f64),
             None => {
                 let intelligent = self
                     .calculate_intelligent_timeout(
@@ -214,6 +255,8 @@ impl AhmaMcpService {
                 self.bounded_await_timeout_secs(intelligent, &caller)
             }
         };
+        let timeout_seconds = bound.secs;
+        let clamp_note = bound.note();
         let timeout_duration = std::time::Duration::from_secs(timeout_seconds as u64);
 
         let pending_ops = self.pending_operations_for_filters(&tool_filters).await;
@@ -247,7 +290,7 @@ impl AhmaMcpService {
         match wait_result {
             Ok(contents) => Ok(build_completion_result(contents, wait_start)),
             Err(_) => {
-                self.handle_await_timeout(wait_start, timeout_seconds, &pending_ops)
+                self.handle_await_timeout(wait_start, timeout_seconds, &pending_ops, clamp_note)
                     .await
             }
         }
@@ -258,6 +301,7 @@ impl AhmaMcpService {
         wait_start: Instant,
         timeout_seconds: f64,
         pending_ops: &[Operation],
+        clamp_note: Option<String>,
     ) -> Result<CallToolResult, McpError> {
         let elapsed = wait_start.elapsed();
         let still_running: Vec<Operation> = self
@@ -270,14 +314,18 @@ impl AhmaMcpService {
         let completed_during_wait = pending_ops.len() - still_running.len();
         let remediation_steps = self.generate_remediation_suggestions(&still_running).await;
 
-        Ok(common::text_result(format_timeout_error_message(
+        let mut message = format_timeout_error_message(
             elapsed,
             timeout_seconds,
             completed_during_wait,
             pending_ops.len(),
             &still_running,
             &remediation_steps,
-        )))
+        );
+        if let Some(note) = clamp_note {
+            message.push_str(&note);
+        }
+        Ok(common::text_result(message))
     }
 
     /// Calculate intelligent timeout based on operation timeouts and default await timeout
@@ -322,6 +370,7 @@ impl AhmaMcpService {
         &self,
         op_id: String,
         timeout_secs: u64,
+        clamp_note: Option<String>,
     ) -> Result<CallToolResult, McpError> {
         if self.operation_monitor.get_operation(&op_id).await.is_none() {
             return Ok(self.format_already_completed_or_not_found(&op_id).await);
@@ -362,11 +411,12 @@ impl AhmaMcpService {
                 Ok(common::text_result(format!(
                     "Timeout waiting for operation {op_id} after {timeout_secs}s.\n\n\
                     The operation {op_id}{tool} is still running.\n\n\
-                    {}",
+                    {}{}",
                     soft_timeout_notice(
                         SoftTimeoutSubject::One,
                         &format!(" with `id: \"{op_id}\"`")
-                    )
+                    ),
+                    clamp_note.unwrap_or_default()
                 )))
             }
         }
@@ -1229,7 +1279,7 @@ mod tests {
         ];
         let start = Instant::now();
         let result = service
-            .handle_await_timeout(start, 60.0, &pending)
+            .handle_await_timeout(start, 60.0, &pending, None)
             .await
             .unwrap();
         let text = result.content.first().unwrap().as_text().unwrap();
@@ -1360,7 +1410,28 @@ mod budget_tests {
 
         let bounded =
             service.bounded_await_timeout_secs(540.0, &caller(Some(McpClientType::Antigravity)));
-        assert_eq!(bounded, budget);
+        assert_eq!(bounded.secs, budget);
+
+        // The clamp must be legible to the caller, not just to the log. A model
+        // that asked for 540s and got 20s of silence cannot otherwise tell a
+        // clamp from a hung operation.
+        let note = bounded.note().expect("a clamped wait must explain itself");
+        assert!(
+            note.contains("20s"),
+            "the actual wait must be stated: {note}"
+        );
+        assert!(
+            note.contains("540s"),
+            "the requested wait must be stated so the gap is visible: {note}"
+        );
+        assert!(
+            note.contains("Antigravity"),
+            "the client that imposed the cap must be named: {note}"
+        );
+        assert!(
+            note.contains("still running"),
+            "the note must say the operation survived the cap: {note}"
+        );
     }
 
     #[tokio::test]
@@ -1368,16 +1439,109 @@ mod budget_tests {
         let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
         let bounded =
             service.bounded_await_timeout_secs(120.0, &caller(Some(McpClientType::ClaudeDesktop)));
-        assert_eq!(bounded, 120.0, "no clamp when the client can take it");
+        assert_eq!(bounded.secs, 120.0, "no clamp when the client can take it");
+        assert!(
+            bounded.note().is_none(),
+            "an unclamped wait must not explain a clamp that did not happen"
+        );
     }
 
     #[tokio::test]
     async fn no_client_context_means_no_clamp() {
         // CLI and tests have no MCP peer, so there is nothing to protect.
         let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
-        assert_eq!(
-            service.bounded_await_timeout_secs(540.0, &caller(None)),
-            540.0
+        let bounded = service.bounded_await_timeout_secs(540.0, &caller(None));
+        assert_eq!(bounded.secs, 540.0);
+        assert!(bounded.note().is_none());
+    }
+
+    /// An explicit `timeout_seconds` is honoured verbatim (SPEC R2.5.1), so it
+    /// must never produce a clamp note — the caller chose that number.
+    #[tokio::test]
+    async fn an_explicit_timeout_is_never_reported_as_clamped() {
+        let bound = AwaitTimeout::unclamped(5.0);
+        assert_eq!(bound.secs, 5.0);
+        assert!(bound.note().is_none());
+    }
+
+    async fn add_stuck_op(service: &AhmaMcpService, id: &str, tool: &str) {
+        let mut op = Operation::new(id.to_string(), tool.to_string(), String::new(), None);
+        op.state = crate::operation_monitor::OperationStatus::InProgress;
+        service.operation_monitor.add_operation(op).await;
+    }
+
+    /// The clamp reaches the **result**, through the whole `await` path.
+    ///
+    /// The unit tests above prove the note is built correctly; this proves it is
+    /// attached. Those are different failures, and the second one is the one
+    /// that matters — a note that is computed and then dropped leaves the caller
+    /// exactly as uninformed as the `debug!` line it replaced.
+    ///
+    /// `start_paused` because the whole point is a wait long enough to matter:
+    /// the operation never completes and tokio auto-advances the 20s budget, so
+    /// the test costs no wall-clock time. There is no real subprocess here for
+    /// virtual time to desynchronise from.
+    #[tokio::test(start_paused = true)]
+    async fn a_clamped_await_says_so_in_the_result() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_stuck_op(&service, "op_stuck_1", "run_terminal_command").await;
+
+        // No `timeout_seconds`: the default (540s) is what gets clamped, and the
+        // default is what models actually use.
+        let params = CallToolRequestParams::new("await");
+        let result = service
+            .handle_await_for_caller(params, caller(Some(McpClientType::Antigravity)))
+            .await
+            .expect("a soft timeout is a result, never an error");
+
+        let text: String = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect();
+
+        assert!(
+            text.contains("timed out"),
+            "the wait must have expired for the note to apply, got: {text}"
+        );
+        assert!(
+            text.contains("Antigravity"),
+            "the result must name the client whose budget capped the wait \
+             (SPEC R2.6.5) — otherwise the cap is invisible to the caller and \
+             indistinguishable from a hung operation. Got: {text}"
+        );
+        assert!(
+            text.contains("540s"),
+            "the result must state the wait that was asked for, so the gap is \
+             visible. Got: {text}"
+        );
+    }
+
+    /// The complement: a client that can take the long wait gets no note, so the
+    /// disclosure stays meaningful instead of becoming boilerplate.
+    #[tokio::test(start_paused = true)]
+    async fn an_unclamped_await_carries_no_note() {
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        add_stuck_op(&service, "op_stuck_2", "run_terminal_command").await;
+
+        let mut args = serde_json::Map::new();
+        args.insert("timeout_seconds".to_string(), serde_json::json!(5));
+        let params = CallToolRequestParams::new("await").with_arguments(args);
+        let result = service
+            .handle_await_for_caller(params, caller(Some(McpClientType::Antigravity)))
+            .await
+            .expect("a soft timeout is a result, never an error");
+
+        let text: String = result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect();
+        assert!(text.contains("timed out"), "got: {text}");
+        assert!(
+            !text.contains("was capped at"),
+            "an explicit `timeout_seconds` is honoured verbatim, so nothing was \
+             capped and nothing may claim otherwise. Got: {text}"
         );
     }
 }
