@@ -1090,6 +1090,29 @@ fn prepare_unix_socket_path(socket_path: &str) -> Result<()> {
     }
 }
 
+/// Conservative cross-platform ceiling for `sockaddr_un.sun_path`, used only as
+/// a friendly pre-check before `bind()` — not a precise per-OS contract. The
+/// real usable limit is ~103 bytes on macOS and ~107 on Linux; 100 bytes leaves
+/// headroom under both without needing to special-case the running platform.
+#[cfg(unix)]
+const MAX_UNIX_SOCKET_PATH_LEN: usize = 100;
+
+/// Pre-check `socket_path`'s byte length before it reaches `bind()`, so a
+/// too-long path (e.g. a user-supplied `--unix-socket-path` or
+/// `settings.toml` value) fails with an ahma-authored, actionable message
+/// instead of libstd's bare `"path must be shorter than SUN_LEN"`.
+#[cfg(unix)]
+fn check_unix_socket_path_length(socket_path: &str) -> Result<()> {
+    let byte_len = socket_path.len();
+    if byte_len > MAX_UNIX_SOCKET_PATH_LEN {
+        return Err(BridgeError::HttpServer(format!(
+            "Unix socket path '{socket_path}' is {byte_len} bytes, which exceeds the OS limit \
+             (~103 bytes on macOS, ~107 on Linux); use a shorter --unix-socket-path or the default"
+        )));
+    }
+    Ok(())
+}
+
 /// Identity (device, inode) of the socket file this process bound, used to
 /// ensure shutdown removes only a socket it still owns (SPEC R-ISO.3): if
 /// another process has since replaced the path, the file is theirs.
@@ -1115,6 +1138,10 @@ async fn start_bridge_unix(config: BridgeConfig, raw_socket_path: String) -> Res
     } else {
         raw_socket_path.clone()
     };
+
+    // Fail fast with an actionable message rather than surfacing libstd's bare
+    // "path must be shorter than SUN_LEN" from `UnixListener::bind` below.
+    check_unix_socket_path_length(&socket_path)?;
 
     info!("Starting HTTP bridge on Unix socket: {}", raw_socket_path);
     info!("Session isolation: ENABLED (always-on)");
@@ -3133,6 +3160,47 @@ for line in sys.stdin:
             "error must name the live-socket cause, got: {err}"
         );
         assert!(path.exists(), "the live socket file must not be removed");
+    }
+
+    /// A too-long socket path must fail with ahma's actionable message, not
+    /// libstd's bare "path must be shorter than SUN_LEN". The length check
+    /// runs before any filesystem access, so the path need not exist on disk.
+    #[cfg(unix)]
+    #[test]
+    fn check_unix_socket_path_length_rejects_too_long_path() {
+        use ahma_mcp::test_utils::path_helpers::test_abs;
+
+        let long_component = "a".repeat(120);
+        let long_path = test_abs(&[&long_component, "socket.sock"])
+            .to_string_lossy()
+            .into_owned();
+        assert!(long_path.len() > 100, "test path must exceed the limit");
+
+        let err = check_unix_socket_path_length(&long_path)
+            .expect_err("a path over the conservative limit must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds the OS limit"),
+            "error must use ahma's friendly message, got: {msg}"
+        );
+        assert!(
+            !msg.contains("SUN_LEN"),
+            "error must not surface libstd's raw message, got: {msg}"
+        );
+        assert!(
+            msg.contains("--unix-socket-path"),
+            "error must point at the actionable fix, got: {msg}"
+        );
+    }
+
+    /// A short path within the limit must pass the pre-check.
+    #[cfg(unix)]
+    #[test]
+    fn check_unix_socket_path_length_accepts_short_path() {
+        use ahma_mcp::test_utils::path_helpers::test_temp_path;
+
+        let short_path = test_temp_path("ahma-test.sock");
+        assert!(check_unix_socket_path_length(&short_path.to_string_lossy()).is_ok());
     }
 
     /// R-ISO.3 helper: identity is stable for the same file and changes when

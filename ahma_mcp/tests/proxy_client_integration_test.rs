@@ -11,11 +11,15 @@ async fn test_proxy_client_autostart_and_shutdown() {
     let binary = build_binary();
     let workspace = workspace_dir();
 
-    // Create UDS path inside the workspace target directory to satisfy sandbox path limits
+    // Create the UDS path in the OS temp dir, not the workspace tree: this test
+    // passes `--no-sandbox` to the spawned process, so there is no sandbox-scope
+    // reason to keep the socket inside the workspace, and a workspace-rooted path
+    // (e.g. under a deeply nested git worktree at `.claude/worktrees/agent-<hex>/`)
+    // can exceed the OS's `sockaddr_un.sun_path` capacity (~103 bytes on macOS,
+    // ~107 on Linux). `std::env::temp_dir()` stays short regardless of workspace
+    // nesting depth. See `ahma_common::test_isolation` for the same pattern.
     let rand_id = rand::random::<u32>();
-    let socket_path = workspace
-        .join("target")
-        .join(format!("ahma_test_{}.sock", rand_id));
+    let socket_path = std::env::temp_dir().join(format!("ahma_test_{}.sock", rand_id));
     let socket_str = socket_path.to_string_lossy().into_owned();
 
     // Clean up if a stale file exists
@@ -164,10 +168,12 @@ async fn test_frontend_exits_when_handshake_never_arrives() {
     let binary = build_binary();
     let workspace = workspace_dir();
 
+    // Same rationale as above: no sandbox-scope reason to keep the socket inside
+    // the workspace (this test also passes `--no-sandbox`), and the OS temp dir
+    // stays well under the `sockaddr_un.sun_path` length limit regardless of how
+    // deeply nested the workspace checkout is.
     let rand_id = rand::random::<u32>();
-    let socket_path = workspace
-        .join("target")
-        .join(format!("ahma_test_nohs_{}.sock", rand_id));
+    let socket_path = std::env::temp_dir().join(format!("ahma_test_nohs_{}.sock", rand_id));
     let socket_str = socket_path.to_string_lossy().into_owned();
     let _ = std::fs::remove_file(&socket_path);
 

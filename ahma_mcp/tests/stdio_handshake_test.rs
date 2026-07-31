@@ -38,10 +38,15 @@ async fn run_stdio_tools_list_scenario(respond_to_roots: bool) {
         .unwrap()
         .to_path_buf();
 
+    // Create the UDS path in the OS temp dir, not the workspace tree: this test
+    // passes `--no-sandbox` to the spawned process, so there is no sandbox-scope
+    // reason to keep the socket inside the workspace, and a workspace-rooted path
+    // (e.g. under a deeply nested git worktree at `.claude/worktrees/agent-<hex>/`)
+    // can exceed the OS's `sockaddr_un.sun_path` capacity (~103 bytes on macOS,
+    // ~107 on Linux). `std::env::temp_dir()` stays short regardless of workspace
+    // nesting depth. See `ahma_common::test_isolation` for the same pattern.
     let rand_id = rand::random::<u32>();
-    let socket_path = workspace
-        .join("target")
-        .join(format!("ahma_test_handshake_{}.sock", rand_id));
+    let socket_path = std::env::temp_dir().join(format!("ahma_test_handshake_{}.sock", rand_id));
     let _ = std::fs::remove_file(&socket_path);
     let socket_str = socket_path.to_string_lossy().into_owned();
 
