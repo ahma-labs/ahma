@@ -1221,6 +1221,10 @@ impl ServerHandler for AhmaMcpService {
                   (4) multiple commands should run concurrently — each call gets its own operation_id. \
                   Workflow: start operations, do other useful work, then `await` the ids you need — \
                   completion is also pushed via notifications, so avoid polling `status` in a loop. \
+                  Push notifications only arrive over a live, actively-listening connection — if you \
+                  might stop generating before an operation finishes (ending your turn, handing off, \
+                  or exiting), call `await` and let it block rather than counting on a notification to \
+                  resume you; a push sent while you are not listening is not queued or replayed. \
                   Results include a bounded stdout/stderr window plus an `output_file` path holding the \
                   COMPLETE output of the operation; when the inline output is marked truncated, read or \
                   grep that file instead of re-running the command. \

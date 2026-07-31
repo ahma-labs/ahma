@@ -222,6 +222,16 @@ cancel(id="op_abc123")
 - Set `"synchronous": true` in the tool's MTDF JSON, or
 - Start server with `--sync` flag
 
+> **Caveat: the push notification needs you to still be listening.** The completion push in
+> step 3 above rides the same live connection that started the operation — it is not a mailbox,
+> so nothing is queued or replayed for a caller who isn't connected when it arrives. If there is
+> any chance you'll stop generating, hand off, or end your turn before the operation finishes,
+> call `await` and let it block instead of ending your turn to "wait for the notification." This
+> matters most for subagents: unlike a top-level session, a subagent that ends its turn is not
+> automatically woken back up by an MCP push — only an explicit message from whatever
+> orchestrated it can resume the subagent, so a missed notification means the work silently
+> stalls until someone notices.
+
 ---
 
 ## Sandbox — Filesystem Security
