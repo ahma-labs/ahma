@@ -514,7 +514,7 @@ impl AhmaMcpService {
     }
 
     async fn collect_lock_file_suggestions(&self, steps: &mut Vec<String>) {
-        for dir in &["target", "node_modules", ".cargo", "tmp", "temp"] {
+        for dir in &["target", "node_modules", ".cargo", "tmp", "temp", ".git"] {
             scan_dir_for_lock_files(dir, steps).await;
         }
         if tokio::fs::metadata(".").await.is_ok() {
@@ -874,6 +874,48 @@ mod tests {
         let mut steps = Vec::new();
         scan_dir_for_lock_files("nonexistent_dir_12345", &mut steps).await;
         assert!(steps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_for_lock_files_finds_git_index_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("index.lock"), "").unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let mut steps = Vec::new();
+        scan_dir_for_lock_files(".git", &mut steps).await;
+
+        std::env::set_current_dir(&original_cwd).unwrap();
+
+        assert!(!steps.is_empty(), "Should find .git/index.lock");
+        assert!(steps[0].contains(".git/index.lock"));
+    }
+
+    #[tokio::test]
+    async fn test_collect_lock_file_suggestions_scans_git_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(git_dir.join("index.lock"), "").unwrap();
+
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let mut steps = Vec::new();
+        for dir in &["target", "node_modules", ".cargo", "tmp", "temp", ".git"] {
+            scan_dir_for_lock_files(dir, &mut steps).await;
+        }
+
+        std::env::set_current_dir(&original_cwd).unwrap();
+
+        assert!(
+            steps.iter().any(|s| s.contains(".git/index.lock")),
+            "Should suggest removing stale .git/index.lock: {steps:?}"
+        );
     }
 
     #[tokio::test]
