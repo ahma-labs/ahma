@@ -4,6 +4,7 @@ use crate::AhmaMcpService;
 use crate::client_type::McpClientType;
 use crate::mcp_service::progress_push;
 use crate::mcp_service::schema;
+use crate::sandbox::ScopeSource;
 use crate::shell_pool::platform_shell_program;
 use rmcp::{
     model::{CallToolRequestParams, CallToolResult, ErrorData as McpError},
@@ -13,6 +14,66 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing;
+
+/// The directory a `run_terminal_command` call will actually run in, plus — when
+/// the caller did not name one — the disclosure that ahma picked it.
+///
+/// Substituting a working directory is a *scope* decision, and SPEC R5.4 is
+/// explicit that no scope decision may be communicated only via an internal log
+/// line. So the substitution travels back with the result, through the same
+/// note channel the ignored-argument disclosure uses (R2.6.4), instead of being
+/// something only the server log knows.
+#[derive(Debug)]
+struct WorkingDirectory {
+    /// The directory the command runs in.
+    path: String,
+    /// `Some(notice)` when ahma chose [`path`](Self::path) because the call
+    /// omitted `working_directory`; `None` when the caller supplied it.
+    substitution_notice: Option<String>,
+}
+
+impl WorkingDirectory {
+    /// The caller named the directory: nothing to disclose.
+    fn supplied(path: String) -> Self {
+        Self {
+            path,
+            substitution_notice: None,
+        }
+    }
+
+    /// ahma chose the directory. `notice` says which one and why, so a model
+    /// reading only the tool result can tell the choice was not its own.
+    fn substituted(path: String, notice: String) -> Self {
+        Self {
+            path,
+            substitution_notice: Some(notice),
+        }
+    }
+
+    /// Attach the substitution disclosure to a successful result.
+    fn disclose(&self, result: CallToolResult) -> CallToolResult {
+        match &self.substitution_notice {
+            Some(notice) => common::append_note(result, notice),
+            None => result,
+        }
+    }
+
+    /// Attach the substitution disclosure to a *failure*. This is the case the
+    /// incident actually turned on: `fatal: not a git repository` is a plausible
+    /// project error and a wildly implausible one once you know the command ran
+    /// somewhere the caller never named. The error is the only thing the model
+    /// sees, so the directory has to be in it.
+    fn disclose_error(&self, error: McpError) -> McpError {
+        let Some(notice) = &self.substitution_notice else {
+            return error;
+        };
+        McpError {
+            code: error.code,
+            message: format!("{}{}", error.message, notice).into(),
+            data: error.data,
+        }
+    }
+}
 
 impl AhmaMcpService {
     fn command_has_shell_metacharacters(command: &str) -> bool {
@@ -191,6 +252,137 @@ impl AhmaMcpService {
         ))
     }
 
+    /// Provenance of the session's locked scope (SPEC R5.2 precedence, rendered
+    /// per R5.4).
+    ///
+    /// Derived exactly as the `notifications/sandbox/configured` payload derives
+    /// it, so a model comparing the two never sees them disagree. `Elicited` and
+    /// `Pending` are not distinguishable from these flags — both are user-chosen,
+    /// so both land in the branches that keep running rather than the declared
+    /// default that refuses.
+    fn locked_scope_source(&self) -> ScopeSource {
+        let sandbox = self.adapter.sandbox();
+        if sandbox.has_explicit_scopes() {
+            ScopeSource::Explicit
+        } else if sandbox.roots_received() {
+            ScopeSource::RootsList
+        } else {
+            ScopeSource::Default
+        }
+    }
+
+    /// The first writable scope, which is what ahma substitutes when the caller
+    /// names no directory. `None` in test mode, where scope is resolved but never
+    /// enforced and the process CWD is the honest answer.
+    fn substitutable_scope(&self) -> Option<String> {
+        let sandbox = self.adapter.sandbox();
+        if sandbox.is_test_mode() {
+            return None;
+        }
+        sandbox
+            .scopes()
+            .first()
+            .map(|p: &std::path::PathBuf| p.to_string_lossy().to_string())
+    }
+
+    /// Refusal for "no `working_directory`, and the only thing to substitute is
+    /// the *declared default* scope" (SPEC R5.2.3 — `~/sandbox`, the fallback
+    /// used when no client roots arrived and no explicit scope was configured).
+    ///
+    /// Why this one case refuses instead of running: a default scope is a
+    /// directory nobody chose for this task. With the scope at `~/sandbox`,
+    /// commands ran there and answered `fatal: not a git repository` and
+    /// `bash: ./gradlew: No such file or directory`. Those are ordinary *shell*
+    /// errors, so the model debugged the project rather than the directory,
+    /// could not diagnose it, and left ahma for its own unsandboxed terminal.
+    /// A silent wrong-directory success is worse than a loud failure.
+    ///
+    /// The body carries the complete scope through the one canonical renderer
+    /// (R5.4(d): scope-related errors show the scope and its provenance), plus a
+    /// machine-readable `data` payload shaped like the `sandbox_denial` one so a
+    /// client can act on it without parsing prose.
+    fn no_working_directory_error(&self, scope: &str) -> McpError {
+        let source = ScopeSource::Default;
+        let scope_text = self.adapter.sandbox().scope_text(source);
+        let message = format!(
+            "run_terminal_command was called without `working_directory`, and this session's \
+             sandbox scope is the declared default (source: {source}) — a directory nobody \
+             chose for this task. Refusing to run in `{scope}`, because commands that land \
+             there fail with ordinary-looking shell errors (`not a git repository`, \
+             `No such file or directory`) that give no hint the directory was substituted.\n\
+             \n{scope_text}\n\
+             Fix by either: (1) pass an explicit in-scope `working_directory`; or (2) give the \
+             session a real scope — start ahma with `--sandbox-scope <dir>`, set it in \
+             `~/.ahma/settings.toml`, or use a client that reports workspace roots via \
+             `roots/list`.",
+            source = source.as_str(),
+        );
+        let data = serde_json::json!({
+            "kind": "working_directory_required",
+            "reason": "scope_source_is_default",
+            "scope_source": source.as_str(),
+            "substituted_scope": scope,
+            "remediation": "Pass an explicit in-scope `working_directory`, or configure a \
+                            real sandbox scope (`--sandbox-scope <dir>`).",
+        });
+        McpError::invalid_params(message, Some(data))
+    }
+
+    /// Decide where the command runs, and whether that decision was ahma's.
+    ///
+    /// Three outcomes, in order:
+    /// 1. caller named a directory → use it, disclose nothing;
+    /// 2. omitted, and the scope is the declared default → refuse (see
+    ///    [`no_working_directory_error`](Self::no_working_directory_error));
+    /// 3. omitted otherwise → substitute, and say so in the result.
+    fn resolve_shell_working_directory(
+        &self,
+        args: &Map<String, Value>,
+    ) -> Result<WorkingDirectory, McpError> {
+        if let Some(supplied) = common::opt_str(args, "working_directory") {
+            return Ok(WorkingDirectory::supplied(supplied));
+        }
+
+        let source = self.locked_scope_source();
+        let Some(scope) = self.substitutable_scope() else {
+            // No scope to borrow (test mode). `.` is the process CWD — still not
+            // the caller's choice, so it is still disclosed.
+            return Ok(WorkingDirectory::substituted(
+                ".".to_string(),
+                Self::substitution_notice(
+                    ".",
+                    "the server's current directory (no sandbox scope was available)",
+                ),
+            ));
+        };
+
+        if source == ScopeSource::Default {
+            tracing::warn!(
+                scope = %scope,
+                "run_terminal_command called without working_directory while the scope source is \
+                 the declared default; refusing rather than running somewhere nobody chose"
+            );
+            return Err(self.no_working_directory_error(&scope));
+        }
+
+        let why = format!(
+            "this session's locked sandbox scope (source: {})",
+            source.as_str()
+        );
+        let notice = Self::substitution_notice(&scope, &why);
+        Ok(WorkingDirectory::substituted(scope, notice))
+    }
+
+    /// The disclosure appended when ahma chose the working directory.
+    fn substitution_notice(directory: &str, why: &str) -> String {
+        format!(
+            "\n\nNote: no `working_directory` was given, so ahma ran this command in `{directory}` \
+             — {why}. If that is not where the command was meant to run, re-issue it with an \
+             explicit in-scope `working_directory`; do not read the output as if it came from \
+             somewhere else."
+        )
+    }
+
     async fn dispatch_run_terminal_command(
         &self,
         params: CallToolRequestParams,
@@ -207,25 +399,34 @@ impl AhmaMcpService {
         // Extract command (required)
         let command = common::require_str(&args, "command", "command parameter is required")?;
 
-        // Extract working_directory (optional)
-        let working_directory = common::opt_str(&args, "working_directory")
-            .or_else(|| {
-                if self.adapter.sandbox().is_test_mode() {
-                    None
-                } else {
-                    self.adapter
-                        .sandbox()
-                        .scopes()
-                        .first()
-                        .map(|p: &std::path::PathBuf| p.to_string_lossy().to_string())
-                }
-            })
-            .unwrap_or_else(|| ".".to_string());
+        // Where the command runs, and who decided that (SPEC R5.4).
+        let working_directory = self.resolve_shell_working_directory(&args)?;
 
+        match self
+            .run_terminal_command_in(command, args, &working_directory.path, context)
+            .await
+        {
+            Ok(result) => Ok(working_directory.disclose(result)),
+            Err(e) => Err(working_directory.disclose_error(e)),
+        }
+    }
+
+    /// Run the command in an already-decided `working_directory`.
+    ///
+    /// Split from [`dispatch_run_terminal_command`](Self::dispatch_run_terminal_command)
+    /// so every exit path — vault staging, session/PTY, sync, async — flows back
+    /// through one place that can attach the working-directory disclosure.
+    async fn run_terminal_command_in(
+        &self,
+        command: String,
+        args: Map<String, Value>,
+        working_directory: &str,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         let timeout = args.get("timeout_seconds").and_then(|v| v.as_u64());
 
         if let Some(staged) = self
-            .maybe_stage_run_terminal_rm(&command, &working_directory)
+            .maybe_stage_run_terminal_rm(&command, working_directory)
             .await?
         {
             return Ok(staged);
@@ -238,7 +439,7 @@ impl AhmaMcpService {
             return self
                 .execute_shell_special(
                     &command,
-                    &working_directory,
+                    working_directory,
                     timeout,
                     session_id.as_deref(),
                     use_pty,
@@ -292,7 +493,7 @@ impl AhmaMcpService {
             crate::adapter::ExecutionMode::Synchronous => {
                 self.execute_shell_sync(
                     adapter_args,
-                    &working_directory,
+                    working_directory,
                     timeout,
                     &subcommand_config,
                     &context,
@@ -302,7 +503,7 @@ impl AhmaMcpService {
             crate::adapter::ExecutionMode::AsyncResultPush => {
                 self.execute_shell_async(
                     adapter_args,
-                    &working_directory,
+                    working_directory,
                     timeout,
                     &subcommand_config,
                     &context,
@@ -547,9 +748,10 @@ impl AhmaMcpService {
             Err(e) => {
                 self.progress_push.unregister(&id).await;
                 self.emit_vault_tool_complete(&id, false, 0).await;
-                let error_message = format!("Execution failed: {}", e);
-                tracing::error!("{}", error_message);
-                Err(common::mcp_internal(error_message))
+                // Session/PTY starts validate the working directory too, so this
+                // is the same denial the async path can hit — it gets the same
+                // machine-readable payload (logging included).
+                Err(common::async_execution_error(&e))
             }
         }
     }
@@ -634,9 +836,11 @@ impl AhmaMcpService {
                 // arrive to clean up the push registration.
                 self.progress_push.unregister(&id).await;
                 self.emit_vault_tool_complete(&id, false, 0).await;
-                let error_message = format!("Async execution failed: {}", e);
-                tracing::error!("{}", error_message);
-                Err(common::mcp_internal(error_message))
+                // Async is the *default* path, so this is the error agents
+                // actually see: it must carry the same structured
+                // `sandbox_denial` + remediation the sync path carries, or a
+                // scope violation reaches the model as unactionable prose.
+                Err(common::async_execution_error(&e))
             }
         }
     }
@@ -645,14 +849,22 @@ impl AhmaMcpService {
 #[cfg(test)]
 mod tests {
     use crate::AhmaMcpService;
-    use crate::adapter::ExecutionMode;
+    use crate::adapter::{Adapter, ExecutionMode};
+    use crate::mcp_service::GuidanceConfig;
+    use crate::operation_monitor::{MonitorConfig, OperationMonitor};
+    use crate::sandbox::{Sandbox, SandboxMode};
     use crate::shell::cli::AppConfig;
-    use crate::test_utils::in_process::{build_test_service, create_in_process_mcp_empty};
-    use rmcp::model::{CallToolRequestParams, CallToolResult};
-    use serde_json::json;
+    use crate::shell_pool::{ShellPoolConfig, ShellPoolManager};
+    use crate::test_utils::in_process::{
+        build_test_service, create_in_process_mcp_empty, create_in_process_mcp_with_scope,
+    };
+    use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
+    use rmcp::model::{CallToolRequestParams, CallToolResult, ErrorCode};
+    use serde_json::{Map, Value, json};
     use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::Arc;
-    use std::time::Duration;
 
     /// Concatenate all text content of a `CallToolResult` into one String.
     fn result_text(result: &CallToolResult) -> String {
@@ -673,9 +885,12 @@ mod tests {
             .expect("in-process MCP pair must build");
         let params = CallToolRequestParams::new(Cow::Borrowed("run_terminal_command"))
             .with_arguments(args.as_object().unwrap().clone());
-        let out = tokio::time::timeout(Duration::from_secs(30), mcp.client.call_tool(params))
-            .await
-            .expect("call_tool must not time out");
+        let out = tokio::time::timeout(
+            TestTimeouts::get(TimeoutCategory::ToolCall),
+            mcp.client.call_tool(params),
+        )
+        .await
+        .expect("call_tool must not time out");
         let _ = mcp.client.cancel().await;
         out
     }
@@ -990,6 +1205,269 @@ mod tests {
         assert!(
             !text.is_empty(),
             "pty path must return some content (output or AHMA ID), got empty"
+        );
+    }
+
+    // ── working-directory substitution (SPEC R5.2 provenance, R5.4 disclosure) ─
+    //
+    // REGRESSION: with the scope at the declared default `~/sandbox`, a call
+    // that omitted `working_directory` silently ran there and returned
+    // `fatal: not a git repository` / `bash: ./gradlew: No such file or
+    // directory`. Those read as project errors, so the model could not diagnose
+    // the directory and abandoned ahma for its own unsandboxed terminal.
+
+    /// A service whose scope provenance is exactly the flag pair
+    /// `locked_scope_source` reads (explicit / roots-received).
+    ///
+    /// `SandboxMode::Strict` on purpose: `SandboxMode::Test` resolves scope but
+    /// never substitutes it, so it cannot exercise this decision at all.
+    async fn service_with_provenance(
+        scope: &Path,
+        explicit: bool,
+        roots_received: bool,
+    ) -> AhmaMcpService {
+        let sandbox = Sandbox::new(
+            vec![scope.to_path_buf()],
+            SandboxMode::Strict,
+            false,
+            false,
+            false,
+        )
+        .expect("sandbox must build")
+        .with_explicit_scopes(explicit);
+
+        let operation_monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            TestTimeouts::get(TimeoutCategory::ToolCall),
+        )));
+        let shell_pool = Arc::new(ShellPoolManager::new(ShellPoolConfig::default()));
+        let adapter = Arc::new(
+            Adapter::new(
+                Arc::clone(&operation_monitor),
+                shell_pool,
+                Arc::new(sandbox),
+            )
+            .expect("adapter must build"),
+        );
+        let service = AhmaMcpService::new(
+            adapter,
+            operation_monitor,
+            Arc::new(HashMap::new()),
+            Arc::new(None::<GuidanceConfig>),
+            false, // force_synchronous
+            false, // defer_sandbox
+        )
+        .await
+        .expect("service must build");
+        // Must be set *after* construction: `AhmaMcpService::new` clears the flag
+        // so each session renegotiates roots. Setting it on the sandbox first
+        // would be silently undone.
+        service.adapter.sandbox().set_roots_received(roots_received);
+        service
+    }
+
+    /// The scope as the sandbox canonicalized it (macOS rewrites `/var` to
+    /// `/private/var`), which is what the handler substitutes.
+    fn locked_scope(service: &AhmaMcpService) -> String {
+        service
+            .adapter
+            .sandbox()
+            .scopes()
+            .first()
+            .expect("test sandbox has one scope")
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn args_of(value: Value) -> Map<String, Value> {
+        value.as_object().expect("object args").clone()
+    }
+
+    #[tokio::test]
+    async fn supplied_working_directory_is_used_verbatim_and_not_disclosed() {
+        // Even with the provenance that refuses a substitution, an explicitly
+        // supplied directory is honoured untouched and disclosed to nobody.
+        let temp = tempfile::tempdir().unwrap();
+        let service = service_with_provenance(temp.path(), false, false).await;
+        let supplied = temp.path().to_string_lossy().to_string();
+
+        let resolved = service
+            .resolve_shell_working_directory(&args_of(json!({
+                "command": "true",
+                "working_directory": supplied,
+            })))
+            .expect("a supplied working_directory must never be refused");
+
+        assert_eq!(resolved.path, supplied, "supplied path must pass through");
+        assert!(
+            resolved.substitution_notice.is_none(),
+            "nothing was substituted, so nothing may be disclosed"
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_working_directory_with_default_scope_is_refused_actionably() {
+        let temp = tempfile::tempdir().unwrap();
+        // Neither explicit nor roots-derived => the declared default (R5.2.3).
+        let service = service_with_provenance(temp.path(), false, false).await;
+        let scope = locked_scope(&service);
+
+        let err = service
+            .resolve_shell_working_directory(&args_of(json!({"command": "git status"})))
+            .expect_err("a default-provenance substitution must be refused, not run");
+
+        assert_eq!(
+            err.code,
+            ErrorCode::INVALID_PARAMS,
+            "the caller can fix this by passing a parameter: {err:?}"
+        );
+        let message = err.message.to_string();
+        for expected in [
+            "working_directory", // what the call was missing
+            "source: default",   // the provenance that made it unsafe
+            scope.as_str(),      // the directory it would have used
+            "--sandbox-scope",   // how to fix it at the session level
+        ] {
+            assert!(
+                message.contains(expected),
+                "error must name {expected:?}; got: {message}"
+            );
+        }
+        let data = err.data.expect("machine-readable payload");
+        assert_eq!(
+            data.get("kind").and_then(|v| v.as_str()),
+            Some("working_directory_required")
+        );
+        assert_eq!(
+            data.get("scope_source").and_then(|v| v.as_str()),
+            Some("default")
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_working_directory_with_roots_scope_runs_and_marks_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = service_with_provenance(temp.path(), false, true).await;
+        let scope = locked_scope(&service);
+
+        let resolved = service
+            .resolve_shell_working_directory(&args_of(json!({"command": "git status"})))
+            .expect("a client-chosen scope is a legitimate substitution");
+
+        assert_eq!(resolved.path, scope, "must run in the locked scope");
+        let notice = resolved
+            .substitution_notice
+            .expect("a substituted directory must be disclosed (R5.4)");
+        assert!(notice.contains(&scope), "notice must name it: {notice}");
+        assert!(
+            notice.contains("roots/list"),
+            "notice must state the provenance: {notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_working_directory_with_explicit_scope_runs_and_marks_substitution() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = service_with_provenance(temp.path(), true, false).await;
+        let scope = locked_scope(&service);
+
+        let resolved = service
+            .resolve_shell_working_directory(&args_of(json!({"command": "git status"})))
+            .expect("an operator-chosen scope is a legitimate substitution");
+
+        assert_eq!(resolved.path, scope);
+        let notice = resolved
+            .substitution_notice
+            .expect("a substituted directory must be disclosed (R5.4)");
+        assert!(
+            notice.contains("explicit"),
+            "notice must state the provenance: {notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn substitution_notice_reaches_the_client_in_the_result() {
+        // The disclosure is worthless unless the model actually receives it, so
+        // assert on what comes back over the wire, not on the resolver.
+        let result = call_run_terminal(json!({"command": "echo hello_substituted"}))
+            .await
+            .expect("run_terminal_command must return Ok");
+        let text = result_text(&result);
+        assert!(
+            text.contains("no `working_directory` was given"),
+            "an omitted working_directory must be disclosed in the result: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supplied_working_directory_adds_no_notice_over_the_wire() {
+        // The in-process sandbox scope is the process CWD, so this is in scope.
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let result = call_run_terminal(json!({
+            "command": "echo hello_supplied",
+            "working_directory": cwd,
+        }))
+        .await
+        .expect("run_terminal_command must return Ok");
+        let text = result_text(&result);
+        assert!(
+            !text.contains("no `working_directory` was given"),
+            "the caller chose the directory; there is nothing to disclose: {text:?}"
+        );
+    }
+
+    // ── async-path sandbox denials carry actionable data (SPEC R5.4.7) ───────
+
+    #[tokio::test]
+    async fn async_path_scope_denial_carries_remediation_naming_the_grant_command() {
+        // REGRESSION: the async path built its error with `mcp_internal`, whose
+        // `data` is `None`. Async is the *default* for run_terminal_command, so
+        // in practice every scope violation reached the agent as bare prose —
+        // observed on the wire in an Antigravity session. Only the rarely-taken
+        // synchronous path carried the `sandbox_denial` payload.
+        let tools_dir = tempfile::tempdir().unwrap();
+        let scope = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // `create_in_process_mcp_with_scope` is always Strict, so `validate_path`
+        // really runs (SandboxMode::Test would skip it and make this vacuous).
+        let mcp =
+            create_in_process_mcp_with_scope(tools_dir.path(), vec![scope.path().to_path_buf()])
+                .await
+                .expect("in-process MCP pair must build");
+        let params = CallToolRequestParams::new(Cow::Borrowed("run_terminal_command"))
+            .with_arguments(args_of(json!({
+                "command": "echo denied",
+                "working_directory": outside.path().to_string_lossy(),
+            })));
+        let outcome = tokio::time::timeout(
+            TestTimeouts::get(TimeoutCategory::ToolCall),
+            mcp.client.call_tool(params),
+        )
+        .await
+        .expect("call_tool must not time out");
+        let _ = mcp.client.cancel().await;
+
+        let err = match outcome.expect_err("an out-of-scope working directory must fail") {
+            rmcp::ServiceError::McpError(e) => e,
+            other => panic!("expected an MCP error, got: {other:?}"),
+        };
+        let data = err
+            .data
+            .expect("an async scope denial must carry machine-readable data");
+        assert_eq!(
+            data.get("kind").and_then(|v| v.as_str()),
+            Some("sandbox_denial"),
+            "async denials must use the same payload shape as sync: {data}"
+        );
+        let remediation = data
+            .get("remediation")
+            .and_then(|v| v.as_str())
+            .expect("a denial without remediation is not actionable");
+        assert!(
+            remediation.contains("ahma sandbox grant"),
+            "remediation must name the escape hatch concretely: {remediation}"
         );
     }
 

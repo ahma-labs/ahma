@@ -26,9 +26,73 @@ pub(crate) fn is_filesystem_root(path: &Path) -> bool {
     }
 }
 
+/// How broad a candidate scope is relative to the user's home directory.
+///
+/// `AboveHome` is the same class of over-broad scope as a filesystem root:
+/// `/Users`, `/home`, `/Volumes`, `C:\Users` each span every account on the
+/// machine, so locking to one is materially the same risk as locking to `/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HomeBreadth {
+    /// Neither the home directory nor an ancestor of it — acceptable breadth.
+    Contained,
+    /// Exactly the home directory: exposes every dotfile, key and credential.
+    HomeItself,
+    /// A **strict ancestor** of the home directory: spans every user account.
+    AboveHome,
+}
+
+/// Resolve `path` for comparison: real canonicalization when the path exists,
+/// lexical normalization otherwise (a scope that does not exist is rejected
+/// elsewhere; this keeps the classification total).
+fn resolve_for_comparison(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| normalize_path_lexically(path))
+}
+
+/// Classify `candidate` against `home` (SPEC R5.2.4 hard rejections).
+///
+/// The relationship is tested **structurally** — resolve the home directory and
+/// ask whether the candidate contains it — rather than against a denylist of
+/// platform literals, so it stays correct for non-standard home locations
+/// (a relocated macOS home, `/home` automounted from `/mnt/home`, a corporate
+/// network home, `AHMA_TEST_HOME` in tests).
+///
+/// Both sides go through [`resolve_for_comparison`] before comparing, for two
+/// reasons: SPEC R5.7 requires the rejection to hold *after* symlink
+/// resolution, and `Path::starts_with` is case-sensitive on Windows though the
+/// filesystem is not — a raw `C:\users` would otherwise slip past `C:\Users`.
+///
+/// This is a **hard** rejection with no CLI escape hatch, deliberately.
+/// `--sandbox-scope` is carried in client-owned MCP config files written by
+/// `ahma setup`, which is exactly where a naive or hostile setup would put an
+/// over-broad path; a flag or environment variable to bypass this would live in
+/// the same file that the check exists to distrust. Any future escape hatch
+/// belongs in user-owned `~/.ahma/settings.toml` only.
+pub(crate) fn home_breadth(candidate: &Path, home: Option<&Path>) -> HomeBreadth {
+    let Some(home) = home else {
+        return HomeBreadth::Contained;
+    };
+    // An empty candidate has no components, so `starts_with` would match every
+    // home. Empty paths are rejected by their own check, with their own message.
+    if candidate.as_os_str().is_empty() {
+        return HomeBreadth::Contained;
+    }
+
+    let candidate = resolve_for_comparison(candidate);
+    let home = resolve_for_comparison(home);
+
+    if candidate == home {
+        HomeBreadth::HomeItself
+    } else if home.starts_with(&candidate) {
+        HomeBreadth::AboveHome
+    } else {
+        HomeBreadth::Contained
+    }
+}
+
 /// Canonicalize and validate a list of sandbox scopes.
 ///
-/// Rejects filesystem roots and empty paths in Strict mode.
+/// Rejects filesystem roots and empty paths in Strict mode, plus the home
+/// directory and any strict ancestor of it ([`home_breadth`], SPEC R5.2.4).
 /// Falls back to raw paths in Test mode when canonicalization fails.
 ///
 /// For symlink-aware compatibility, this preserves both canonical and absolute
@@ -38,6 +102,23 @@ pub(super) fn canonicalize_scopes(
     scopes: Vec<PathBuf>,
     mode: SandboxMode,
     context: &str,
+) -> Result<Vec<PathBuf>> {
+    canonicalize_scopes_with_home(
+        scopes,
+        mode,
+        context,
+        ahma_common::config::ahma_home_dir().as_deref(),
+    )
+}
+
+/// [`canonicalize_scopes`] with the home directory injected, so the R5.2.4
+/// breadth rejections are testable against a fabricated home instead of the
+/// developer's real one (no process-global env mutation, no writes to `$HOME`).
+fn canonicalize_scopes_with_home(
+    scopes: Vec<PathBuf>,
+    mode: SandboxMode,
+    context: &str,
+    home: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     let cwd = std::env::current_dir().ok();
     let mut canonicalized = Vec::with_capacity(scopes.len() * 2);
@@ -89,6 +170,40 @@ pub(super) fn canonicalize_scopes(
                 std::env::consts::OS,
                 context
             ));
+        }
+
+        // SPEC R5.2.4: the home directory and anything above it are hard
+        // rejections, checked here (post-canonicalization) so a symlinked or
+        // differently-cased spelling cannot walk past it (R5.7).
+        if mode != SandboxMode::Test {
+            match home_breadth(&canonical, home) {
+                HomeBreadth::Contained => {}
+                HomeBreadth::HomeItself => {
+                    return Err(anyhow!(
+                        "Your home directory is not a valid sandbox scope: '{}' exposes every \
+                         dotfile, key and credential under it (resolved from '{}', OS: {}). \
+                         Scope to the project you are working on, or to a container directory \
+                         under your home directory (e.g. ~/github, or ~/github/myproject). {}",
+                        canonical.display(),
+                        scope.display(),
+                        std::env::consts::OS,
+                        context
+                    ));
+                }
+                HomeBreadth::AboveHome => {
+                    return Err(anyhow!(
+                        "'{}' is an ancestor of your home directory and is not a valid sandbox \
+                         scope: it spans every user account on this machine, which is materially \
+                         the same as scoping to the filesystem root (resolved from '{}', OS: {}). \
+                         Scope to the project you are working on, or to a container directory \
+                         under your home directory (e.g. ~/github, or ~/github/myproject). {}",
+                        canonical.display(),
+                        scope.display(),
+                        std::env::consts::OS,
+                        context
+                    ));
+                }
+            }
         }
 
         push_unique(canonical.clone());
@@ -298,6 +413,216 @@ mod tests {
             err.to_string().contains("not a valid sandbox scope"),
             "C:\\ must be rejected as sandbox scope: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // R5.2.4 breadth rejections — home directory and its ancestors
+    //
+    // Every case uses a *fabricated* home under a tempdir, so nothing is
+    // written to the developer's real `$HOME` and no process-global env is
+    // mutated (tests stay parallel-safe).
+    // -----------------------------------------------------------------------
+
+    /// `<tmp>/Users/alice` as home, with `<tmp>/Users` standing in for
+    /// `/Users`, `/home`, `/Volumes` or `C:\Users`.
+    fn fake_home() -> (tempfile::TempDir, PathBuf) {
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path().join("Users").join("alice");
+        std::fs::create_dir_all(&home).unwrap();
+        (td, home)
+    }
+
+    #[test]
+    fn test_home_breadth_flags_strict_ancestor_of_home() {
+        let (td, home) = fake_home();
+        let users = home.parent().unwrap().to_path_buf();
+        assert_eq!(
+            home_breadth(&users, Some(&home)),
+            HomeBreadth::AboveHome,
+            "the directory holding every user account must be flagged"
+        );
+        assert_eq!(
+            home_breadth(td.path(), Some(&home)),
+            HomeBreadth::AboveHome,
+            "a higher ancestor must be flagged too"
+        );
+    }
+
+    #[test]
+    fn test_home_breadth_flags_home_itself() {
+        let (_td, home) = fake_home();
+        assert_eq!(home_breadth(&home, Some(&home)), HomeBreadth::HomeItself);
+    }
+
+    #[test]
+    fn test_home_breadth_flags_filesystem_root() {
+        let (_td, home) = fake_home();
+        // A root is by definition an ancestor of every home on that volume.
+        // Only assert when the fabricated home really lives under this root
+        // (on Windows the temp dir may sit on another drive).
+        let root = test_root();
+        if resolve_for_comparison(&home).starts_with(&root) {
+            assert_eq!(home_breadth(&root, Some(&home)), HomeBreadth::AboveHome);
+        }
+    }
+
+    #[test]
+    fn test_home_breadth_allows_project_and_container_dirs_under_home() {
+        let (_td, home) = fake_home();
+        let project = home.join("myproject");
+        let container = home.join("github");
+        let nested = container.join("ahma");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+
+        for p in [&project, &container, &nested] {
+            assert_eq!(
+                home_breadth(p, Some(&home)),
+                HomeBreadth::Contained,
+                "{} must be an acceptable scope",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn test_home_breadth_without_home_is_contained() {
+        // No resolvable home → this rule simply does not fire; the filesystem
+        // root guard still does.
+        assert_eq!(
+            home_breadth(&test_abs(&["Users"]), None),
+            HomeBreadth::Contained
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_home_breadth_sees_through_symlinked_home() {
+        // R5.7: the rejection must hold after symlink resolution. Needs a
+        // genuinely Unix-only API (std::os::unix::fs::symlink).
+        let td = tempfile::tempdir().unwrap();
+        let real_users = td.path().join("real");
+        let home = real_users.join("alice");
+        std::fs::create_dir_all(&home).unwrap();
+        let link = td.path().join("link");
+        std::os::unix::fs::symlink(&real_users, &link).unwrap();
+
+        // Home is spelled through the symlink; the candidate is the real dir.
+        assert_eq!(
+            home_breadth(&real_users, Some(&link.join("alice"))),
+            HomeBreadth::AboveHome
+        );
+        // And the mirror image: candidate spelled through the symlink.
+        assert_eq!(home_breadth(&link, Some(&home)), HomeBreadth::AboveHome);
+    }
+
+    #[test]
+    fn test_canonicalize_rejects_ancestor_of_home_in_strict_mode() {
+        let (_td, home) = fake_home();
+        let users = home.parent().unwrap().to_path_buf();
+        let err = canonicalize_scopes_with_home(
+            vec![users.clone()],
+            SandboxMode::Strict,
+            "test context",
+            Some(&home),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ancestor of your home directory"),
+            "must say why it is too broad: {msg}"
+        );
+        assert!(
+            msg.contains(&users.display().to_string())
+                || msg.contains(&resolve_for_comparison(&users).display().to_string()),
+            "must name the rejected path: {msg}"
+        );
+        assert!(
+            msg.contains("~/github"),
+            "must point at a workable alternative: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_rejects_home_itself_in_strict_mode() {
+        let (_td, home) = fake_home();
+        let err = canonicalize_scopes_with_home(
+            vec![home.clone()],
+            SandboxMode::Strict,
+            "test context",
+            Some(&home),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("home directory is not a valid sandbox scope"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("~/github"),
+            "must point at a workable alternative: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_still_rejects_root_with_home_known() {
+        let (_td, home) = fake_home();
+        let err = canonicalize_scopes_with_home(
+            vec![test_root()],
+            SandboxMode::Strict,
+            "test context",
+            Some(&home),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid sandbox scope"),
+            "filesystem root must stay rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_accepts_project_and_container_dirs_under_home() {
+        let (_td, home) = fake_home();
+        let project = home.join("myproject");
+        let container = home.join("github");
+        let nested = container.join("ahma");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        for p in [project, container, nested] {
+            let result = canonicalize_scopes_with_home(
+                vec![p.clone()],
+                SandboxMode::Strict,
+                "test context",
+                Some(&home),
+            );
+            assert!(
+                result.is_ok(),
+                "{} must be accepted: {:?}",
+                p.display(),
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonicalize_home_breadth_exempt_in_test_mode() {
+        let (_td, home) = fake_home();
+        let users = home.parent().unwrap().to_path_buf();
+        for candidate in [users, home.clone()] {
+            let result = canonicalize_scopes_with_home(
+                vec![candidate.clone()],
+                SandboxMode::Test,
+                "test context",
+                Some(&home),
+            );
+            assert!(
+                result.is_ok(),
+                "Test mode must not apply the R5.2.4 breadth guard to {}: {:?}",
+                candidate.display(),
+                result
+            );
+        }
     }
 
     #[cfg(windows)]

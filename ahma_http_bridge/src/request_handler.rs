@@ -32,10 +32,25 @@ fn json_response_with_status(status: StatusCode, value: Value) -> Response {
         .unwrap_or_else(|_| (status, "Failed to create response").into_response())
 }
 
+/// Extract the JSON-RPC `id` of the request an error is answering.
+///
+/// Returns JSON `null` when the payload has no `id` (a genuine notification).
+/// JSON-RPC still requires the field to be *present* in that case — omitting it
+/// is what makes an error uncorrelatable, so callers must never skip it.
+fn payload_id(payload: &Value) -> Value {
+    payload.get("id").cloned().unwrap_or(Value::Null)
+}
+
 /// Build a JSON-RPC error object.
-fn json_rpc_error_value(code: i32, message: &str) -> Value {
+///
+/// `id` is the id of the request being answered (`Value::Null` for a
+/// notification, or where the request is not knowable). It is always emitted:
+/// a conforming MCP client matches the error to its pending request by `id`,
+/// and an error without one is silently dropped or looks like a hang.
+fn json_rpc_error_value(id: Value, code: i32, message: &str) -> Value {
     serde_json::json!({
         "jsonrpc": "2.0",
+        "id": id,
         "error": {
             "code": code,
             "message": message
@@ -53,7 +68,7 @@ fn json_rpc_error_value(code: i32, message: &str) -> Value {
 /// operation itself keeps running in the subprocess; the caller can await again
 /// or wait for the completion notification.
 fn request_timeout_response(payload: &Value) -> Response {
-    let id = payload.get("id").cloned().unwrap_or(Value::Null);
+    let id = payload_id(payload);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -80,26 +95,31 @@ fn with_session_header(mut response: Response, session_id: &str) -> Response {
 }
 
 /// Create an error response with the provided status and JSON-RPC code.
-fn error_response_with_status(status: StatusCode, code: i32, message: &str) -> Response {
-    json_response_with_status(status, json_rpc_error_value(code, message))
+///
+/// `id` correlates the error with the request that provoked it — see
+/// [`json_rpc_error_value`]. The HTTP status is unchanged by the id.
+fn error_response_with_status(status: StatusCode, id: Value, code: i32, message: &str) -> Response {
+    json_response_with_status(status, json_rpc_error_value(id, code, message))
 }
 
 /// Create an error response in the appropriate format
-fn error_response(code: i32, message: &str) -> Response {
-    error_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, code, message)
+fn error_response(id: Value, code: i32, message: &str) -> Response {
+    error_response_with_status(StatusCode::INTERNAL_SERVER_ERROR, id, code, message)
 }
 
-fn missing_session_id_response() -> Response {
+fn missing_session_id_response(id: Value) -> Response {
     error_response_with_status(
         StatusCode::BAD_REQUEST,
+        id,
         -32600,
         "Missing Mcp-Session-Id header. Send initialize request first.",
     )
 }
 
-fn session_not_found_response() -> Response {
+fn session_not_found_response(id: Value) -> Response {
     error_response_with_status(
         StatusCode::FORBIDDEN,
+        id,
         -32600,
         "Session not found or terminated",
     )
@@ -183,7 +203,7 @@ async fn handle_routed_sampling_request(
                 "No active IDE session (Cursor, VS Code, etc.) with sampling capability found. \
                  Make sure your IDE is running and connected to ahma."
                     .to_string();
-            return error_response(-32603, &err_msg);
+            return error_response(payload_id(payload), -32603, &err_msg);
         }
     };
 
@@ -213,13 +233,21 @@ async fn handle_routed_sampling_request(
         Ok(s) => s,
         Err(e) => {
             target_session.routed_requests.remove(&routed_id);
-            return error_response(-32603, &format!("Failed to serialize routed payload: {e}"));
+            return error_response(
+                payload_id(payload),
+                -32603,
+                &format!("Failed to serialize routed payload: {e}"),
+            );
         }
     };
 
     if target_session.broadcast(json_str).is_err() {
         target_session.routed_requests.remove(&routed_id);
-        return error_response(-32603, "Target session's SSE channel is closed");
+        return error_response(
+            payload_id(payload),
+            -32603,
+            "Target session's SSE channel is closed",
+        );
     }
 
     let timeout = Duration::from_secs(120);
@@ -244,10 +272,14 @@ async fn handle_routed_sampling_request(
                 with_session_header(json_response(final_response), session_id)
             }
         }
-        Ok(Err(_)) => error_response(-32603, "Routed request sender dropped"),
+        Ok(Err(_)) => error_response(payload_id(payload), -32603, "Routed request sender dropped"),
         Err(_) => {
             target_session.routed_requests.remove(&routed_id);
-            error_response(-32002, "Request timed out on the client side")
+            error_response(
+                payload_id(payload),
+                -32002,
+                "Request timed out on the client side",
+            )
         }
     }
 }
@@ -285,7 +317,7 @@ pub async fn handle_session_isolated_request(
         "Request without session ID for non-initialize method: {:?}",
         method
     );
-    missing_session_id_response()
+    missing_session_id_response(payload_id(&payload))
 }
 
 fn validate_initialize_payload(payload: &Value) -> Option<Response> {
@@ -296,6 +328,7 @@ fn validate_initialize_payload(payload: &Value) -> Option<Response> {
         .is_none()
     {
         Some(error_response(
+            payload_id(payload),
             -32602,
             "Invalid initialize params: missing params.protocolVersion",
         ))
@@ -307,6 +340,7 @@ fn validate_initialize_payload(payload: &Value) -> Option<Response> {
 async fn handle_initialize_error(
     session_manager: &SessionManager,
     session_id: &str,
+    request_id: Value,
     error: crate::error::BridgeError,
 ) -> Response {
     error!(session_id = %session_id, "Failed to send initialize request: {}", error);
@@ -316,7 +350,11 @@ async fn handle_initialize_error(
             crate::session::SessionTerminationReason::ProcessCrashed,
         )
         .await;
-    error_response(-32603, &format!("Failed to initialize session: {}", error))
+    error_response(
+        request_id,
+        -32603,
+        &format!("Failed to initialize session: {}", error),
+    )
 }
 
 async fn register_session_details(
@@ -351,7 +389,7 @@ async fn handle_initialize(session_manager: &Arc<SessionManager>, payload: &Valu
     }
 
     info!("Creating new session for initialize request");
-    let new_session_id = match create_session_or_error(session_manager).await {
+    let new_session_id = match create_session_or_error(session_manager, payload_id(payload)).await {
         Ok(id) => id,
         Err(e) => return e,
     };
@@ -368,7 +406,9 @@ async fn handle_initialize(session_manager: &Arc<SessionManager>, payload: &Valu
         .await
     {
         Ok(response) => with_session_header(json_response(response), &new_session_id),
-        Err(e) => handle_initialize_error(session_manager, &new_session_id, e).await,
+        Err(e) => {
+            handle_initialize_error(session_manager, &new_session_id, payload_id(payload), e).await
+        }
     }
 }
 
@@ -377,6 +417,7 @@ async fn handle_initialize(session_manager: &Arc<SessionManager>, payload: &Valu
 /// Distinguishes session-limit errors (HTTP 429) from other failures (HTTP 500).
 async fn create_session_or_error(
     session_manager: &Arc<SessionManager>,
+    request_id: Value,
 ) -> Result<String, Response> {
     match session_manager.create_session().await {
         Ok(id) => Ok(id),
@@ -385,21 +426,30 @@ async fn create_session_or_error(
             let response = if e.to_string().contains("Session limit exceeded") {
                 error_response_with_status(
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    request_id,
                     -32002,
                     &format!("Failed to create session: {}", e),
                 )
             } else {
-                error_response(-32603, &format!("Failed to create session: {}", e))
+                error_response(
+                    request_id,
+                    -32603,
+                    &format!("Failed to create session: {}", e),
+                )
             };
             Err(response)
         }
     }
 }
 
-fn check_session_exists(session_manager: &SessionManager, session_id: &str) -> Option<Response> {
+fn check_session_exists(
+    session_manager: &SessionManager,
+    session_id: &str,
+    request_id: Value,
+) -> Option<Response> {
     if !session_manager.session_exists(session_id) {
         warn!(session_id = %session_id, "Request for non-existent or terminated session");
-        Some(session_not_found_response())
+        Some(session_not_found_response(request_id))
     } else {
         None
     }
@@ -408,6 +458,7 @@ fn check_session_exists(session_manager: &SessionManager, session_id: &str) -> O
 async fn handle_roots_changed_request(
     session_manager: &SessionManager,
     session_id: &str,
+    request_id: Value,
 ) -> Option<Response> {
     match session_manager.handle_roots_changed(session_id).await {
         // Tolerated no-op: sandbox already locked. Acknowledge with success and
@@ -422,7 +473,7 @@ async fn handle_roots_changed_request(
         Ok(false) => None,
         Err(e) => {
             error!(session_id = %session_id, "Roots change handling failed: {}", e);
-            Some(session_not_found_response())
+            Some(session_not_found_response(request_id))
         }
     }
 }
@@ -434,18 +485,22 @@ async fn handle_existing_session_request(
     method: Option<&str>,
     payload: &Value,
 ) -> Response {
-    if let Some(response) = check_session_exists(session_manager, session_id) {
+    // Every error below answers *this* request, so it carries this id.
+    let request_id = payload_id(payload);
+
+    if let Some(response) = check_session_exists(session_manager, session_id, request_id.clone()) {
         return response;
     }
 
     if method == Some("notifications/roots/list_changed")
-        && let Some(response) = handle_roots_changed_request(session_manager, session_id).await
+        && let Some(response) =
+            handle_roots_changed_request(session_manager, session_id, request_id.clone()).await
     {
         return response;
     }
 
     if method == Some("tools/call")
-        && let Some(response) = check_sandbox_lock(session_manager, session_id)
+        && let Some(response) = check_sandbox_lock(session_manager, session_id, request_id.clone())
     {
         return response;
     }
@@ -461,6 +516,7 @@ async fn handle_existing_session_request(
         session_manager,
         session_id,
         method,
+        request_id,
         is_initialized_notification,
         is_client_response,
     )
@@ -489,6 +545,7 @@ async fn check_initialization_required(
     session_manager: &SessionManager,
     session_id: &str,
     method: Option<&str>,
+    request_id: Value,
     is_initialized_notification: bool,
     is_client_response: bool,
 ) -> Option<Response> {
@@ -501,7 +558,7 @@ async fn check_initialization_required(
         return None;
     }
 
-    wait_for_initialization(&session, session_id, method).await
+    wait_for_initialization(&session, session_id, method, request_id).await
 }
 
 fn is_client_response(method: Option<&str>, payload: &Value) -> bool {
@@ -513,6 +570,7 @@ fn is_client_response(method: Option<&str>, payload: &Value) -> bool {
 fn build_handshake_timeout_response(
     session_manager: &SessionManager,
     session_id: &str,
+    request_id: Value,
     elapsed_secs: u64,
     sse_connected: bool,
     mcp_initialized: bool,
@@ -525,7 +583,7 @@ fn build_handshake_timeout_response(
     );
     error!(session_id = %session_id, "Handshake timeout: SSE={}, initialized={}", sse_connected, mcp_initialized);
     with_session_header(
-        error_response_with_status(StatusCode::GATEWAY_TIMEOUT, -32002, &error_msg),
+        error_response_with_status(StatusCode::GATEWAY_TIMEOUT, request_id, -32002, &error_msg),
         session_id,
     )
 }
@@ -539,7 +597,15 @@ fn get_conflict_message(requires_client_roots: bool) -> &'static str {
 }
 
 /// Checks if the sandbox is locked for `tools/call` requests.
-fn check_sandbox_lock(session_manager: &SessionManager, session_id: &str) -> Option<Response> {
+///
+/// `request_id` is echoed into every error body so the caller can correlate the
+/// refusal with its `tools/call`. HTTP statuses are unaffected — the sandbox
+/// gate's observable contract (409 + JSON-RPC -32001) is a SPEC hard invariant.
+fn check_sandbox_lock(
+    session_manager: &SessionManager,
+    session_id: &str,
+    request_id: Value,
+) -> Option<Response> {
     let session = session_manager.get_session(session_id)?;
 
     match session.current_sandbox_state() {
@@ -548,6 +614,7 @@ fn check_sandbox_lock(session_manager: &SessionManager, session_id: &str) -> Opt
             return Some(with_session_header(
                 error_response_with_status(
                     StatusCode::FORBIDDEN,
+                    request_id,
                     -32000,
                     &format!("Sandbox configuration failed: {}", error),
                 ),
@@ -556,7 +623,12 @@ fn check_sandbox_lock(session_manager: &SessionManager, session_id: &str) -> Opt
         }
         ahma_common::sandbox_state::SandboxState::Terminated => {
             return Some(with_session_header(
-                error_response_with_status(StatusCode::FORBIDDEN, -32000, "Session terminated"),
+                error_response_with_status(
+                    StatusCode::FORBIDDEN,
+                    request_id,
+                    -32000,
+                    "Session terminated",
+                ),
                 session_id,
             ));
         }
@@ -572,6 +644,7 @@ fn check_sandbox_lock(session_manager: &SessionManager, session_id: &str) -> Opt
         return Some(build_handshake_timeout_response(
             session_manager,
             session_id,
+            request_id,
             elapsed_secs,
             sse_connected,
             mcp_initialized,
@@ -581,6 +654,7 @@ fn check_sandbox_lock(session_manager: &SessionManager, session_id: &str) -> Opt
     Some(with_session_header(
         error_response_with_status(
             StatusCode::CONFLICT,
+            request_id,
             -32001,
             get_conflict_message(session_manager.requires_client_roots()),
         ),
@@ -617,6 +691,7 @@ async fn wait_for_initialization(
     session: &crate::session::Session,
     session_id: &str,
     method: Option<&str>,
+    request_id: Value,
 ) -> Option<Response> {
     debug!(
         session_id = %session_id,
@@ -643,6 +718,7 @@ async fn wait_for_initialization(
         return Some(with_session_header(
             error_response_with_status(
                 StatusCode::GATEWAY_TIMEOUT,
+                request_id,
                 -32002,
                 "Timeout waiting for MCP initialization - client must send notifications/initialized first",
             ),
@@ -707,7 +783,11 @@ async fn handle_client_response(
             session_id = %session_id,
             "Failed to forward client response: {}", e
         );
-        return error_response(-32603, &format!("Failed to forward response: {}", e));
+        return error_response(
+            payload_id(payload),
+            -32603,
+            &format!("Failed to forward response: {}", e),
+        );
     }
 
     with_session_header(
@@ -909,7 +989,11 @@ async fn forward_request(
         }
         Err(e) => {
             error!(session_id = %session_id, "Failed to send request: {}", e);
-            error_response(-32603, &format!("Failed to send request: {}", e))
+            error_response(
+                payload_id(payload),
+                -32603,
+                &format!("Failed to send request: {}", e),
+            )
         }
     }
 }
@@ -1027,8 +1111,11 @@ async fn check_sse_request_gating(
     payload: &Value,
     is_initialized_notification: bool,
 ) -> Option<Response> {
+    // Every error below answers *this* request, so it carries this id.
+    let request_id = payload_id(payload);
+
     // Validate session exists
-    if let Some(response) = check_session_exists(session_manager, session_id) {
+    if let Some(response) = check_session_exists(session_manager, session_id, request_id.clone()) {
         return Some(response);
     }
 
@@ -1040,14 +1127,15 @@ async fn check_sse_request_gating(
 
     // Roots changed check
     if method == Some("notifications/roots/list_changed")
-        && let Some(response) = handle_roots_changed_request(session_manager, session_id).await
+        && let Some(response) =
+            handle_roots_changed_request(session_manager, session_id, request_id.clone()).await
     {
         return Some(response);
     }
 
     // Sandbox gating for tools/call
     if method == Some("tools/call")
-        && let Some(response) = check_sandbox_lock(session_manager, session_id)
+        && let Some(response) = check_sandbox_lock(session_manager, session_id, request_id.clone())
     {
         return Some(response);
     }
@@ -1057,6 +1145,7 @@ async fn check_sse_request_gating(
         session_manager,
         session_id,
         method,
+        request_id,
         is_initialized_notification,
         false,
     )
@@ -1092,7 +1181,7 @@ pub async fn handle_session_isolated_request_sse(
     }
 
     let Some(session_id) = session_id else {
-        return missing_session_id_response();
+        return missing_session_id_response(payload_id(&payload));
     };
 
     if method == Some("sampling/createMessage") {
@@ -1155,7 +1244,7 @@ async fn handle_initialize_sse(session_manager: &Arc<SessionManager>, payload: &
         return err_response;
     }
 
-    let new_session_id = match create_session_or_error(session_manager).await {
+    let new_session_id = match create_session_or_error(session_manager, payload_id(payload)).await {
         Ok(id) => id,
         Err(e) => return e,
     };
@@ -1174,7 +1263,9 @@ async fn handle_initialize_sse(session_manager: &Arc<SessionManager>, payload: &
             build_initialize_sse_response(session_manager, &new_session_id, &response),
             &new_session_id,
         ),
-        Err(e) => handle_initialize_error(session_manager, &new_session_id, e).await,
+        Err(e) => {
+            handle_initialize_error(session_manager, &new_session_id, payload_id(payload), e).await
+        }
     }
 }
 
@@ -1207,7 +1298,13 @@ async fn forward_notification_sse(
         }
         Err(e) => {
             error!(session_id = %session_id, "Failed to forward notification: {}", e);
-            error_response(-32603, &format!("Failed to send request: {}", e))
+            // A notification has no id by definition; `payload_id` yields JSON
+            // `null`, which is still emitted so the field is never absent.
+            error_response(
+                payload_id(payload),
+                -32603,
+                &format!("Failed to send request: {}", e),
+            )
         }
     }
 }
@@ -1223,7 +1320,7 @@ async fn forward_request_sse(
 ) -> Response {
     let session = match session_manager.get_session(session_id) {
         Some(s) => s,
-        None => return session_not_found_response(),
+        None => return session_not_found_response(payload_id(payload)),
     };
 
     // Subscribe to broadcast BEFORE sending the request so we don't miss events
@@ -1259,7 +1356,11 @@ async fn forward_request_sse(
         }
         Err(e) => {
             error!(session_id = %session_id, "Failed to send request: {}", e);
-            error_response(-32603, &format!("Failed to send request: {}", e))
+            error_response(
+                payload_id(payload),
+                -32603,
+                &format!("Failed to send request: {}", e),
+            )
         }
     }
 }
@@ -1378,11 +1479,31 @@ mod tests {
     }
 
     #[test]
-    fn json_rpc_error_value_has_code_and_message() {
-        let v = json_rpc_error_value(-32000, "boom");
+    fn json_rpc_error_value_has_id_code_and_message() {
+        let v = json_rpc_error_value(json!(7), -32000, "boom");
         assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], json!(7), "errors must be correlatable by id");
         assert_eq!(v["error"]["code"], -32000);
         assert_eq!(v["error"]["message"], "boom");
+    }
+
+    /// A notification has no id, but the field must still be PRESENT and null —
+    /// an absent `id` is exactly what makes an error impossible to match.
+    #[test]
+    fn json_rpc_error_value_emits_null_id_rather_than_omitting_it() {
+        let v = json_rpc_error_value(Value::Null, -32603, "boom");
+        assert!(
+            v.get("id").is_some(),
+            "the id field must never be omitted: {v}"
+        );
+        assert_eq!(v["id"], Value::Null);
+    }
+
+    #[test]
+    fn payload_id_extracts_or_defaults_to_null() {
+        assert_eq!(payload_id(&json!({"id": 3})), json!(3));
+        assert_eq!(payload_id(&json!({"id": "abc"})), json!("abc"));
+        assert_eq!(payload_id(&json!({"method": "ping"})), Value::Null);
     }
 
     #[test]
@@ -1400,25 +1521,29 @@ mod tests {
 
     #[tokio::test]
     async fn error_response_defaults_to_500() {
-        let resp = error_response(-32603, "internal");
+        let resp = error_response(json!(11), -32603, "internal");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = body_json(resp).await;
+        assert_eq!(body["id"], json!(11));
         assert_eq!(body["error"]["code"], -32603);
         assert_eq!(body["error"]["message"], "internal");
     }
 
     #[tokio::test]
     async fn error_response_with_status_honors_status() {
-        let resp = error_response_with_status(StatusCode::FORBIDDEN, -32000, "nope");
+        let resp = error_response_with_status(StatusCode::FORBIDDEN, json!("x-1"), -32000, "nope");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert_eq!(body_json(resp).await["error"]["code"], -32000);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], json!("x-1"));
+        assert_eq!(body["error"]["code"], -32000);
     }
 
     #[tokio::test]
     async fn missing_session_id_response_is_400() {
-        let resp = missing_session_id_response();
+        let resp = missing_session_id_response(json!(9));
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
+        assert_eq!(body["id"], json!(9));
         assert_eq!(body["error"]["code"], -32600);
         assert!(
             body["error"]["message"]
@@ -1430,9 +1555,10 @@ mod tests {
 
     #[tokio::test]
     async fn session_not_found_response_is_403() {
-        let resp = session_not_found_response();
+        let resp = session_not_found_response(json!(9));
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = body_json(resp).await;
+        assert_eq!(body["id"], json!(9));
         assert_eq!(body["error"]["code"], -32600);
         assert!(
             body["error"]["message"]
@@ -1636,10 +1762,11 @@ mod tests {
     #[tokio::test]
     async fn build_handshake_timeout_response_is_504_with_header() {
         let mgr = manager_with(None, 10, 3600, Arc::new(KeepAlivePeerFactory));
-        let resp = build_handshake_timeout_response(&mgr, "sid-x", 50, false, false);
+        let resp = build_handshake_timeout_response(&mgr, "sid-x", json!(31), 50, false, false);
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(header_session_id(&resp).as_deref(), Some("sid-x"));
         let body = body_json(resp).await;
+        assert_eq!(body["id"], json!(31));
         assert_eq!(body["error"]["code"], -32002);
         assert!(
             body["error"]["message"]
@@ -1654,7 +1781,7 @@ mod tests {
     #[test]
     fn check_session_exists_returns_403_for_unknown() {
         let mgr = keepalive_manager();
-        let resp = check_session_exists(&mgr, "does-not-exist").expect("should be Some");
+        let resp = check_session_exists(&mgr, "does-not-exist", json!(4)).expect("should be Some");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -1662,7 +1789,7 @@ mod tests {
     async fn check_session_exists_none_for_live_session() {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
-        assert!(check_session_exists(&mgr, &id).is_none());
+        assert!(check_session_exists(&mgr, &id, json!(4)).is_none());
     }
 
     // ─── check_sandbox_lock ─────────────────────────────────────────────
@@ -1670,17 +1797,23 @@ mod tests {
     #[test]
     fn check_sandbox_lock_none_for_unknown_session() {
         let mgr = keepalive_manager();
-        assert!(check_sandbox_lock(&mgr, "missing").is_none());
+        assert!(check_sandbox_lock(&mgr, "missing", json!(1)).is_none());
     }
 
     #[tokio::test]
     async fn check_sandbox_lock_conflict_while_awaiting_roots() {
         let mgr = manager_with(None, 10, 3600, Arc::new(KeepAlivePeerFactory));
         let id = mgr.create_session().await.expect("create session");
-        let resp = check_sandbox_lock(&mgr, &id).expect("should be Some");
+        let resp = check_sandbox_lock(&mgr, &id, json!("call-77")).expect("should be Some");
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         assert_eq!(header_session_id(&resp).as_deref(), Some(id.as_str()));
-        assert_eq!(body_json(resp).await["error"]["code"], -32001);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32001);
+        assert_eq!(
+            body["id"],
+            json!("call-77"),
+            "the 409 must be correlatable to the tools/call that provoked it"
+        );
     }
 
     #[tokio::test]
@@ -1688,9 +1821,25 @@ mod tests {
         // handshake_timeout_secs = 0 → immediately timed out.
         let mgr = manager_with(None, 10, 0, Arc::new(KeepAlivePeerFactory));
         let id = mgr.create_session().await.expect("create session");
-        let resp = check_sandbox_lock(&mgr, &id).expect("should be Some");
+        let resp = check_sandbox_lock(&mgr, &id, json!(88)).expect("should be Some");
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(body_json(resp).await["error"]["code"], -32002);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32002);
+        assert_eq!(body["id"], json!(88));
+    }
+
+    #[tokio::test]
+    async fn check_sandbox_lock_403s_carry_the_request_id() {
+        // Failed and Terminated both short-circuit to 403 / -32000; neither may
+        // drop the id.
+        let mgr = keepalive_manager();
+        let failed = mgr.create_session().await.expect("create session");
+        mgr.fail_sandbox(&failed, "scope unresolvable");
+        let resp = check_sandbox_lock(&mgr, &failed, json!("f-1")).expect("should be Some");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32000);
+        assert_eq!(body["id"], json!("f-1"));
     }
 
     // ─── Top-level entry points ─────────────────────────────────────────
@@ -1701,7 +1850,9 @@ mod tests {
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         let resp = handle_session_isolated_request(mgr, HeaderMap::new(), payload).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(body_json(resp).await["error"]["code"], -32600);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32600);
+        assert_eq!(body["id"], json!(1));
     }
 
     #[tokio::test]
@@ -1711,6 +1862,7 @@ mod tests {
         let resp =
             handle_session_isolated_request(mgr, headers_with_session("nope"), payload).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(resp).await["id"], json!(1));
     }
 
     #[tokio::test]
@@ -1719,6 +1871,7 @@ mod tests {
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
         let resp = handle_session_isolated_request_sse(mgr, HeaderMap::new(), payload).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["id"], json!(1));
     }
 
     #[tokio::test]
@@ -1728,6 +1881,25 @@ mod tests {
         let resp =
             handle_session_isolated_request_sse(mgr, headers_with_session("nope"), payload).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(resp).await["id"], json!(1));
+    }
+
+    /// A notification (no `id`) that errors must still carry `"id": null` —
+    /// present, not omitted. `notifications/initialized` to an unknown session
+    /// takes the 403 path with nothing to correlate against.
+    #[tokio::test]
+    async fn isolated_request_notification_error_carries_null_id_not_absent() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        let resp =
+            handle_session_isolated_request(mgr, headers_with_session("nope"), payload).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = body_json(resp).await;
+        assert!(
+            body.get("id").is_some(),
+            "the id field must be present even for a notification: {body}"
+        );
+        assert_eq!(body["id"], Value::Null);
     }
 
     // ─── handle_initialize validation paths ─────────────────────────────
@@ -1755,27 +1927,33 @@ mod tests {
     #[tokio::test]
     async fn create_session_or_error_returns_429_on_limit() {
         let mgr = manager_with(None, 0, 3600, Arc::new(KeepAlivePeerFactory));
-        let err = create_session_or_error(&mgr)
+        let err = create_session_or_error(&mgr, json!(2))
             .await
             .expect_err("should fail");
         assert_eq!(err.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(body_json(err).await["error"]["code"], -32002);
+        let body = body_json(err).await;
+        assert_eq!(body["error"]["code"], -32002);
+        assert_eq!(body["id"], json!(2));
     }
 
     #[tokio::test]
     async fn create_session_or_error_returns_500_on_factory_failure() {
         let mgr = manager_with(None, 10, 3600, Arc::new(FailingPeerFactory));
-        let err = create_session_or_error(&mgr)
+        let err = create_session_or_error(&mgr, json!(2))
             .await
             .expect_err("should fail");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body_json(err).await["error"]["code"], -32603);
+        let body = body_json(err).await;
+        assert_eq!(body["error"]["code"], -32603);
+        assert_eq!(body["id"], json!(2));
     }
 
     #[tokio::test]
     async fn create_session_or_error_ok_returns_id() {
         let mgr = keepalive_manager();
-        let id = create_session_or_error(&mgr).await.expect("should succeed");
+        let id = create_session_or_error(&mgr, json!(2))
+            .await
+            .expect("should succeed");
         assert!(!id.is_empty());
     }
 
@@ -1819,7 +1997,11 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         // AwaitingRoots → Ok(false) → None (proceed with normal handshake).
-        assert!(handle_roots_changed_request(&mgr, &id).await.is_none());
+        assert!(
+            handle_roots_changed_request(&mgr, &id, json!(1))
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1834,7 +2016,7 @@ mod tests {
         let id = mgr.create_session().await.expect("create session");
         // Lock the sandbox via the default scope (empty roots).
         assert!(mgr.lock_sandbox(&id, &[]).await.expect("lock"));
-        let resp = handle_roots_changed_request(&mgr, &id)
+        let resp = handle_roots_changed_request(&mgr, &id, json!(1))
             .await
             .expect("locked → Some(202)");
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
@@ -1844,7 +2026,7 @@ mod tests {
     #[tokio::test]
     async fn roots_changed_request_errors_for_unknown_session() {
         let mgr = keepalive_manager();
-        let resp = handle_roots_changed_request(&mgr, "missing")
+        let resp = handle_roots_changed_request(&mgr, "missing", json!(1))
             .await
             .expect("err → Some(403)");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -2222,6 +2404,7 @@ mod tests {
         let resp = handle_initialize_error(
             &mgr,
             &id,
+            json!(6),
             crate::error::BridgeError::Communication("boom".to_string()),
         )
         .await;
@@ -2491,13 +2674,84 @@ mod tests {
 
     #[tokio::test]
     async fn existing_session_tools_call_blocked_before_sandbox_lock() {
-        // HARD INVARIANT: tools/call before sandbox lock → HTTP 409 / -32001.
+        // HARD INVARIANT: tools/call before sandbox lock → HTTP 409 / -32001,
+        // carrying the id of the tools/call it refuses. Without the id an MCP
+        // client cannot match the refusal to its pending request, so the call
+        // looks like a hang rather than a fixable configuration error.
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}});
         let resp = handle_existing_session_request(&mgr, &id, Some("tools/call"), &payload).await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
-        assert_eq!(body_json(resp).await["error"]["code"], -32001);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32001);
+        assert_eq!(body["id"], json!(1));
+    }
+
+    /// The 409/-32001 gate, exercised end-to-end through the public JSON entry
+    /// point, must echo the request id — including a string id.
+    #[tokio::test]
+    async fn isolated_request_tools_call_before_lock_is_409_32001_with_request_id() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload =
+            json!({"jsonrpc": "2.0", "id": "tc-json", "method": "tools/call", "params": {}});
+        let resp = handle_session_isolated_request(mgr, headers_with_session(&id), payload).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32001);
+        assert_eq!(body["id"], json!("tc-json"));
+    }
+
+    /// SPEC §R15.5 dual-transport: the same gate over `text/event-stream`.
+    #[tokio::test]
+    async fn isolated_sse_request_tools_call_before_lock_is_409_32001_with_request_id() {
+        let mgr = keepalive_manager();
+        let id = mgr.create_session().await.expect("create session");
+        let payload =
+            json!({"jsonrpc": "2.0", "id": "tc-sse", "method": "tools/call", "params": {}});
+        let resp =
+            handle_session_isolated_request_sse(mgr, headers_with_session(&id), payload).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32001);
+        assert_eq!(body["id"], json!("tc-sse"));
+    }
+
+    /// The handshake-timeout path (504 / -32002) must also stay correlatable.
+    /// `handshake_timeout_secs = 0` makes the session immediately timed out.
+    #[tokio::test]
+    async fn isolated_request_handshake_timeout_is_504_32002_with_request_id() {
+        let mgr = manager_with(None, 10, 0, Arc::new(KeepAlivePeerFactory));
+        let id = mgr.create_session().await.expect("create session");
+        let payload =
+            json!({"jsonrpc": "2.0", "id": "hs-json", "method": "tools/call", "params": {}});
+        let resp = handle_session_isolated_request(mgr, headers_with_session(&id), payload).await;
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32002);
+        assert_eq!(body["id"], json!("hs-json"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Handshake timeout")
+        );
+    }
+
+    /// SPEC §R15.5 dual-transport mirror of the handshake-timeout assertion.
+    #[tokio::test]
+    async fn isolated_sse_request_handshake_timeout_is_504_32002_with_request_id() {
+        let mgr = manager_with(None, 10, 0, Arc::new(KeepAlivePeerFactory));
+        let id = mgr.create_session().await.expect("create session");
+        let payload =
+            json!({"jsonrpc": "2.0", "id": "hs-sse", "method": "tools/call", "params": {}});
+        let resp =
+            handle_session_isolated_request_sse(mgr, headers_with_session(&id), payload).await;
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32002);
+        assert_eq!(body["id"], json!("hs-sse"));
     }
 
     #[tokio::test]
@@ -2529,6 +2783,7 @@ mod tests {
                 &mgr,
                 &id,
                 Some("notifications/initialized"),
+                json!(1),
                 true,
                 false
             )
@@ -2542,7 +2797,7 @@ mod tests {
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         assert!(
-            check_initialization_required(&mgr, &id, None, false, true)
+            check_initialization_required(&mgr, &id, None, json!(1), false, true)
                 .await
                 .is_none()
         );
@@ -2552,9 +2807,16 @@ mod tests {
     async fn check_initialization_required_none_for_unknown_session() {
         let mgr = keepalive_manager();
         assert!(
-            check_initialization_required(&mgr, "missing", Some("tools/list"), false, false)
-                .await
-                .is_none()
+            check_initialization_required(
+                &mgr,
+                "missing",
+                Some("tools/list"),
+                json!(1),
+                false,
+                false
+            )
+            .await
+            .is_none()
         );
     }
 
@@ -2568,7 +2830,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            check_initialization_required(&mgr, &id, Some("tools/list"), false, false)
+            check_initialization_required(&mgr, &id, Some("tools/list"), json!(1), false, false)
                 .await
                 .is_none()
         );
@@ -2581,7 +2843,7 @@ mod tests {
         let session = mgr.get_session(&id).unwrap();
         session.mark_mcp_initialized().await.unwrap();
         assert!(
-            wait_for_initialization(&session, &id, Some("tools/list"))
+            wait_for_initialization(&session, &id, Some("tools/list"), json!(1))
                 .await
                 .is_none()
         );
@@ -2672,7 +2934,7 @@ mod tests {
 
     #[tokio::test]
     async fn sse_gating_blocks_tools_call_before_lock() {
-        // HARD INVARIANT mirror for the SSE path.
+        // HARD INVARIANT mirror for the SSE path, id included.
         let mgr = keepalive_manager();
         let id = mgr.create_session().await.expect("create session");
         let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}});
@@ -2680,7 +2942,9 @@ mod tests {
             .await
             .expect("tools/call gated");
         assert_eq!(resp.status(), StatusCode::CONFLICT);
-        assert_eq!(body_json(resp).await["error"]["code"], -32001);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32001);
+        assert_eq!(body["id"], json!(1));
     }
 
     #[tokio::test]

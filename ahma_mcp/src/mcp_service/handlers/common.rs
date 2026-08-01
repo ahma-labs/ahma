@@ -81,17 +81,41 @@ pub fn mcp_internal(message: impl Into<String>) -> McpError {
 
 /// Builds the MCP error for a failed synchronous tool execution.
 ///
+/// See [`denial_aware_error`] for the `sandbox_denial` payload.
+pub fn execution_error(e: &anyhow::Error) -> McpError {
+    denial_aware_error("Synchronous execution failed", e)
+}
+
+/// Builds the MCP error for an async operation that never started.
+///
+/// Same treatment as [`execution_error`], and it matters more here: async is the
+/// *default* execution path for `run_terminal_command`, so this is the error an
+/// agent normally receives. It used to be built with [`mcp_internal`], i.e. with
+/// `data: None` — a scope violation reached the agent as bare prose with no
+/// remediation, and (observed on the wire in an Antigravity session) nothing it
+/// could act on. Only the rarely-taken sync path carried the actionable payload.
+pub fn async_execution_error(e: &anyhow::Error) -> McpError {
+    denial_aware_error("Async execution failed", e)
+}
+
+/// Builds an MCP error that upgrades a sandbox denial into machine-readable
+/// signal.
+///
 /// When the failure is an out-of-sandbox-scope path access, the error's `data`
-/// field carries a machine-readable `sandbox_denial` payload
+/// field carries a `sandbox_denial` payload
 /// (`{kind, path, access, reason, current_scopes, remediation}`) so an AI client
 /// can reason about — and act on — the blocked path instead of parsing the
 /// message text. The `path`/`access` shape mirrors the `ScopeGrantRequest` the
 /// TUI already receives, so both surfaces describe a denial the same way.
 /// Non-sandbox failures get a plain internal error (no `data`).
-pub fn execution_error(e: &anyhow::Error) -> McpError {
+///
+/// `context` prefixes the message so the caller can still tell which execution
+/// path failed; the payload is identical either way, because a denial is a
+/// denial regardless of how the command was going to run.
+fn denial_aware_error(context: &str, e: &anyhow::Error) -> McpError {
     use crate::sandbox::SandboxError;
 
-    let message = format!("Synchronous execution failed: {e}");
+    let message = format!("{context}: {e}");
     tracing::error!("{message}");
 
     if let Some(SandboxError::PathOutsideSandbox { path, scopes }) =

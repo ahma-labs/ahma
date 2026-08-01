@@ -20,6 +20,11 @@ use tokio::sync::mpsc;
 /// to the client and the session is preserved; only a sustained run of failures
 /// — meaning the transport itself is broken, not one request — triggers a
 /// reconnect (or, failing that, exit).
+///
+/// This threshold applies to failures on a *live* endpoint only. A failure that
+/// proves the endpoint itself is gone ([`ForwardFailure::EndpointGone`]) cannot
+/// improve by being retried, so it bypasses the count entirely and recovers on
+/// the first occurrence — see the gone-endpoint branch in `run_transport_proxy`.
 const MAX_CONSECUTIVE_FORWARD_FAILURES: u32 = 3;
 
 /// How many reconnect attempts the proxy makes against a genuinely-dead bridge
@@ -213,10 +218,28 @@ pub type BridgeRespawnFn = Box<
     dyn FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> + Send,
 >;
 
+/// True when a *rendered* failure (Display or Debug) carries the signature of a
+/// gone bridge endpoint — the socket file was unlinked, or nothing is listening
+/// on it. Factored out of [`reconnect_failure_wants_respawn`] so the same
+/// judgement can be applied to a transport `send` error, which is not an
+/// `anyhow::Error` and has no error chain to walk.
+///
+/// Re-dialing a gone endpoint can never succeed on its own; only respawning the
+/// bridge restores service.
+#[cfg(unix)]
+fn error_text_indicates_gone_endpoint(text: &str) -> bool {
+    text.contains("No such file or directory")
+        || text.contains("Connection refused")
+        || text.contains("(os error 2)")
+        || text.contains("(os error 61)")
+        // Debug renderings of a nested io error keep the kind, not the message.
+        || text.contains("kind: NotFound")
+        || text.contains("kind: ConnectionRefused")
+}
+
 /// True when a reconnect failure indicates the bridge endpoint itself is gone
 /// (socket file unlinked, nothing listening) rather than a transient error on
-/// a live endpoint. Re-dialing a gone endpoint can never succeed — only
-/// respawning the bridge restores service.
+/// a live endpoint.
 #[cfg(unix)]
 fn reconnect_failure_wants_respawn(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
@@ -231,11 +254,216 @@ fn reconnect_failure_wants_respawn(err: &anyhow::Error) -> bool {
     }
     // Some transport layers stringify the underlying io error instead of
     // preserving it in the error chain.
-    let text = format!("{err:#}");
-    text.contains("No such file or directory")
-        || text.contains("Connection refused")
-        || text.contains("(os error 2)")
-        || text.contains("(os error 61)")
+    error_text_indicates_gone_endpoint(&format!("{err:#}"))
+}
+
+/// The marker rmcp writes ahead of a folded HTTP response body:
+/// `StreamableHttpError::UnexpectedServerResponse(format!("HTTP {status}: {body}"))`
+/// in `UnixSocketHttpClient::post_message`.
+#[cfg(unix)]
+const HTTP_BODY_MARKER: &str = "HTTP ";
+
+/// Recover the JSON-RPC `error` object the bridge actually sent, from the
+/// rendered form of a transport `send` error.
+///
+/// rmcp folds **every** non-2xx bridge response into a transport error whose
+/// `Display` is `unexpected server response: HTTP <status>: <body>`, where
+/// `<body>` is the bridge's full JSON-RPC error body. Without this recovery the
+/// proxy would throw away every actionable answer the bridge gives — the 409 /
+/// `-32001` "sandbox initializing from client roots" instruction, the 504 /
+/// `-32002` handshake-timeout checklist, 403 / `-32000` sandbox-configuration
+/// failures — and replace them with a generic "retry or await" sentence that
+/// sends the model chasing an operation that never existed.
+///
+/// Returns `None` when the rendered error carries no HTTP body at all (a
+/// genuinely dead socket: ENOENT / ECONNREFUSED), when the body is not JSON, or
+/// when the body has no `error` object the downstream client could decode.
+#[cfg(unix)]
+fn recover_bridge_jsonrpc_error(rendered: &str) -> Option<serde_json::Value> {
+    // Find where the body's JSON *starts* rather than splitting on ':' — the
+    // status line, the JSON structure and the bridge's own message all contain
+    // colons, and the message contains braces and quotes too.
+    let after_marker = rendered.find(HTTP_BODY_MARKER)? + HTTP_BODY_MARKER.len();
+    let body_start = after_marker + rendered[after_marker..].find('{')?;
+    // Parse only the first JSON value: anything a wrapping error appended after
+    // the body is ignored instead of failing the whole parse.
+    let body = serde_json::Deserializer::from_str(&rendered[body_start..])
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
+    let error = body.get("error")?;
+    // Only relay something that is actually a JSON-RPC error object; relaying a
+    // half-formed one would fail to deserialize downstream and the client would
+    // get nothing at all for this request id.
+    let usable = error.get("code").is_some_and(|c| c.is_i64())
+        && error.get("message").is_some_and(|m| m.is_string());
+    usable.then(|| error.clone())
+}
+
+/// What a failed forward to the bridge actually means. Distinguishing these is
+/// the difference between telling the model something true and something
+/// invented, and between recovering now and burning three requests first.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum ForwardFailure {
+    /// The bridge answered — with a non-2xx HTTP status whose body carried a
+    /// JSON-RPC `error`. The endpoint is manifestly alive; relay the error.
+    BridgeError(serde_json::Value),
+    /// Nothing is listening on the bridge endpoint any more (auto-spawned
+    /// bridges unlink their socket and exit after `--idle-timeout`). The
+    /// request never reached the bridge, so it can be resent after a reconnect.
+    EndpointGone,
+    /// Anything else: a transient error on an endpoint that is still there.
+    Transient,
+}
+
+/// Classify a transport `send` error from both its `Display` and `Debug`
+/// renderings. `Display` carries the embedded HTTP body (`Debug` escapes its
+/// quotes, which is why the caller needs a `Display` bound); `Debug` carries
+/// the io `kind` when an intermediate layer dropped the message.
+///
+/// Order matters: a recoverable bridge body proves the endpoint answered, so it
+/// is never mistaken for a gone endpoint even if the bridge's own message
+/// happens to mention a missing file.
+#[cfg(unix)]
+fn classify_forward_failure(display: &str, debug: &str) -> ForwardFailure {
+    if let Some(error) = recover_bridge_jsonrpc_error(display) {
+        return ForwardFailure::BridgeError(error);
+    }
+    if error_text_indicates_gone_endpoint(display) || error_text_indicates_gone_endpoint(debug) {
+        return ForwardFailure::EndpointGone;
+    }
+    ForwardFailure::Transient
+}
+
+/// The message the proxy invents when a forward failed and *nothing* better
+/// could be recovered from it. Deliberately vague, because in that case the
+/// proxy genuinely does not know whether the bridge saw the request.
+#[cfg(unix)]
+const GENERIC_FORWARD_FAILURE_MESSAGE: &str = "Bridge could not service this request; it may \
+                                               still be running. Retry, or await the completion \
+                                               notification.";
+
+/// Answer a single request id downstream after its forward failed: the bridge's
+/// own JSON-RPC error when one could be recovered, otherwise the generic
+/// fallback. Best-effort — a failed relay must not end the session.
+#[cfg(unix)]
+async fn relay_forward_failure_to_client<S>(
+    stdio: &mut S,
+    request_id: serde_json::Value,
+    recovered: Option<serde_json::Value>,
+) where
+    S: Transport<RoleServer>,
+    S::Error: std::fmt::Debug,
+{
+    let error = recovered.unwrap_or_else(|| {
+        serde_json::json!({
+            "code": -32002,
+            "message": GENERIC_FORWARD_FAILURE_MESSAGE,
+        })
+    });
+    let err_val = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": error,
+    });
+    if let Ok(err_msg) = serde_json::from_value::<TxJsonRpcMessage<RoleServer>>(err_val) {
+        let _ = stdio.send(err_msg).await;
+    }
+}
+
+/// True for the messages [`replay_handshake`] resends on a rebuilt connection.
+/// Such a message must never *also* be resent by the gone-endpoint recovery
+/// path: the replay already delivered it, and a second `initialize` on the
+/// fresh session is a protocol error.
+#[cfg(unix)]
+fn message_is_replayed_by_handshake(val: &serde_json::Value) -> bool {
+    matches!(
+        val.get("method").and_then(|m| m.as_str()),
+        Some("initialize") | Some("notifications/initialized")
+    )
+}
+
+/// Rebuild the bridge connection and transparently resend the one request whose
+/// forward failed, replacing `client` with the fresh transport.
+///
+/// Resending is safe and is *not* a duplicate execution: this path only runs
+/// when the failure proved the endpoint was gone, so the request never reached
+/// the bridge at all.
+///
+/// Returns `Ok(true)` when the request was resent, `Ok(false)` when the
+/// reconnect succeeded but the resend did not (the caller must then answer the
+/// request with an error), and `Err` when the reconnect itself failed.
+#[cfg(unix)]
+async fn reconnect_and_resend<C>(
+    client: &mut C,
+    pending: &serde_json::Value,
+    reconnect: &mut dyn FnMut() -> Result<C>,
+    handshake: &CachedHandshake,
+    transport: &str,
+    respawn: Option<&mut BridgeRespawnFn>,
+) -> Result<bool>
+where
+    C: Transport<RoleClient>,
+    C::Error: std::fmt::Debug,
+{
+    let mut fresh = reconnect_with_retries(reconnect, handshake, transport, respawn).await?;
+    // Best-effort: release the dead connection's resources. Bounded so a broken
+    // close() cannot stall the now-healthy session waiting on it.
+    let _ = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
+    let resent = match serde_json::from_value::<TxJsonRpcMessage<RoleClient>>(pending.clone()) {
+        Ok(msg) => match fresh.send(msg).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    transport,
+                    error = ?e,
+                    "Resend on the freshly reconnected bridge failed; \
+                     answering the request with an error instead"
+                );
+                false
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                transport,
+                error = %e,
+                "Pending request no longer deserializes; cannot resend it"
+            );
+            false
+        }
+    };
+    *client = fresh;
+    Ok(resent)
+}
+
+/// Build the `detail` payload for the transparent-reconnect disclosure (#485).
+///
+/// The two cases must not be conflated: when the failed request was resent on
+/// the fresh transport the client has nothing to do, and telling it the request
+/// "was answered with an error and can be retried" would be a lie that invites
+/// a duplicate call.
+#[cfg(unix)]
+fn reconnected_detail(reconnects: u32, cause: &str, in_flight_resent: bool) -> serde_json::Value {
+    let (in_flight_request, message) = if in_flight_resent {
+        (
+            "resent",
+            "ahma bridge session was rebuilt transparently and the in-flight request was \
+             resent on the new connection; no client action is needed",
+        )
+    } else {
+        (
+            "answered_with_error",
+            "ahma bridge session was rebuilt transparently; in-flight requests were \
+             answered with an error and can be retried",
+        )
+    };
+    serde_json::json!({
+        "cause": cause,
+        "reconnects": reconnects,
+        "in_flight_request": in_flight_request,
+        "message": message,
+    })
 }
 
 /// Rebuild the bridge connection (via `reconnect`) and replay the cached
@@ -403,7 +631,11 @@ where
     S: Transport<RoleServer> + Send + 'static,
     C: Transport<RoleClient> + Send + 'static,
     S::Error: std::fmt::Debug + Send,
-    C::Error: std::fmt::Debug + Send,
+    // `Display` (not just `Debug`) is required: rmcp embeds the bridge's JSON
+    // response body in the transport error's `Display`, and `Debug` escapes its
+    // quotes into something no JSON parser will accept. See
+    // `recover_bridge_jsonrpc_error`.
+    C::Error: std::fmt::Debug + std::fmt::Display + Send,
 {
     let mut handshake = CachedHandshake::default();
     // Track whether we ever forwarded a message to the bridge.  Until the client sends
@@ -457,7 +689,9 @@ where
                 let val = serde_json::to_value(msg).unwrap();
                 let request_id = val.get("id").filter(|id| !id.is_null()).cloned();
                 handshake.observe_client_to_bridge(&val);
-                let tx_msg = serde_json::from_value(val).unwrap();
+                // `val` is kept alive past the send: the gone-endpoint recovery
+                // path below resends this exact message on a fresh transport.
+                let tx_msg = serde_json::from_value(val.clone()).unwrap();
                 // No inner retry here: an rmcp transport `send` error means the
                 // worker behind this transport is gone, not that the channel is
                 // momentarily busy (`send` awaits capacity). Re-sending the same
@@ -467,36 +701,100 @@ where
                 // handshake.
                 if let Err(e) = client.send(tx_msg).await {
                     // A single forward failure must NOT tear down the whole
-                    // multiplexed session. The bridge returns recoverable
-                    // conditions (per-request timeout, sandbox-initializing 409)
-                    // as ordinary responses now, but as defense-in-depth we also
-                    // refuse to die on one transport-level send error: relay an
-                    // error for THIS request id back to the client and keep
-                    // serving. Only a sustained run of failures (the transport is
-                    // genuinely dead) exits the proxy.
+                    // multiplexed session. Only the per-request timeout is
+                    // returned by the bridge as an ordinary HTTP 200 response;
+                    // *every other* non-2xx answer — the sandbox-initializing
+                    // 409, the handshake-timeout 504, sandbox-configuration
+                    // 403s — is folded by rmcp into a transport `send` error
+                    // with the bridge's JSON body embedded in its `Display`. So
+                    // classify first: relay the bridge's own error when there is
+                    // one, and keep serving. Only a sustained run of failures
+                    // (the transport is genuinely dead) exits the proxy.
+                    let rendered = format!("{e}");
+                    let rendered_debug = format!("{e:?}");
+                    let failure = classify_forward_failure(&rendered, &rendered_debug);
+
+                    // The bridge auto-spawns with `--idle-timeout`: at zero
+                    // active sessions it unlinks its socket and exits, leaving a
+                    // frontend proxy that outlives it (routine with clients that
+                    // abandon the transport). Those failures cannot improve by
+                    // being retried, so recover on the FIRST one instead of
+                    // answering two requests with errors first — and because the
+                    // request never reached the bridge, resending it on the
+                    // fresh transport is a retry, not a duplicate execution.
+                    //
+                    // Handshake messages are excluded: `replay_handshake` already
+                    // resends those, so a resend would duplicate them.
+                    if failure == ForwardFailure::EndpointGone
+                        && handshake.init_request.is_some()
+                        && !message_is_replayed_by_handshake(&val)
+                    {
+                        tracing::warn!(
+                            transport,
+                            error = %rendered,
+                            "Bridge endpoint is gone; reconnecting immediately and resending \
+                             the request rather than waiting for repeated failures"
+                        );
+                        match reconnect_and_resend(
+                            &mut client,
+                            &val,
+                            reconnect,
+                            &handshake,
+                            transport,
+                            respawn_bridge.as_mut(),
+                        )
+                        .await
+                        {
+                            Ok(resent) => {
+                                // The reconnect handshake just proved the (fresh)
+                                // bridge is alive and responsive.
+                                bridge_responded = true;
+                                reconnects += 1;
+                                if resent {
+                                    consecutive_forward_failures = 0;
+                                    forwarded_any = true;
+                                } else {
+                                    consecutive_forward_failures += 1;
+                                    if let Some(id) = request_id.clone() {
+                                        relay_forward_failure_to_client(&mut stdio, id, None).await;
+                                    }
+                                }
+                                emit_session_event_downstream(
+                                    &mut stdio,
+                                    &mut event_seq,
+                                    ahma_common::session_event::SessionEventKind::Reconnected,
+                                    reconnected_detail(reconnects, "endpoint_gone", resent),
+                                )
+                                .await;
+                                continue;
+                            }
+                            Err(reconnect_err) => {
+                                tracing::warn!(
+                                    transport,
+                                    error = %reconnect_err,
+                                    "Immediate reconnect after a gone bridge endpoint failed; \
+                                     falling back to the failure-count path"
+                                );
+                            }
+                        }
+                    }
+
                     consecutive_forward_failures += 1;
                     tracing::warn!(
                         transport,
-                        error = ?e,
+                        error = %rendered,
                         failures = consecutive_forward_failures,
                         "Failed to forward request to bridge; relaying error to client, session preserved"
                     );
                     if let Some(id) = request_id {
-                        let err_val = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": {
-                                "code": -32002,
-                                "message": "Bridge could not service this request; it may \
-                                            still be running. Retry, or await the completion \
-                                            notification."
-                            }
-                        });
-                        if let Ok(err_msg) =
-                            serde_json::from_value::<TxJsonRpcMessage<RoleServer>>(err_val)
-                        {
-                            let _ = stdio.send(err_msg).await;
-                        }
+                        // Relay the bridge's own actionable error when it sent
+                        // one; the generic fallback is for a dead socket, where
+                        // there is genuinely nothing better to say.
+                        let recovered = match failure {
+                            ForwardFailure::BridgeError(error) => Some(error),
+                            _ => None,
+                        };
+                        relay_forward_failure_to_client(&mut stdio, id, recovered).await;
                     }
                     if consecutive_forward_failures >= MAX_CONSECUTIVE_FORWARD_FAILURES {
                         // Only worth reconnecting once a real handshake has been
@@ -534,19 +832,17 @@ where
                                     reconnects += 1;
                                     // Disclose the rebuild to the client (#485).
                                     // The request that tripped the failure was
-                                    // answered with a -32002 error above; name
-                                    // it so the client can re-issue.
+                                    // answered with an error above; name it so
+                                    // the client can re-issue.
                                     emit_session_event_downstream(
                                         &mut stdio,
                                         &mut event_seq,
                                         ahma_common::session_event::SessionEventKind::Reconnected,
-                                        serde_json::json!({
-                                            "cause": "transport_failure",
-                                            "reconnects": reconnects,
-                                            "message": "ahma bridge session was rebuilt \
-                                                        transparently; in-flight requests were \
-                                                        answered with an error and can be retried",
-                                        }),
+                                        reconnected_detail(
+                                            reconnects,
+                                            "transport_failure",
+                                            false,
+                                        ),
                                     )
                                     .await;
                                     continue;
@@ -1073,13 +1369,30 @@ mod tests {
         Hang(Duration),
     }
 
-    /// Bridge side: fails the first `fail_first_n` sends, then succeeds. Delivers
-    /// any queued `inbound` bridge→client messages once (then `receive` parks
-    /// forever via `pending`, unless `receive_none_after` is set — see below).
-    /// Records how many times `close()` is invoked so tests can assert teardown
-    /// behaviour.
+    /// The default text of a simulated bridge send failure: a transient error
+    /// on a *live* endpoint (no HTTP body, no io "gone" signature), which the
+    /// proxy must handle via the failure-count path.
+    const TRANSIENT_SEND_ERROR: &str = "simulated bridge forward failure";
+
+    /// A send failure that carries the signature of a bridge whose socket was
+    /// unlinked out from under it — what an idle-timed-out bridge produces.
+    const GONE_ENDPOINT_SEND_ERROR: &str = "Client error: No such file or directory (os error 2)";
+
+    /// Bridge side: fails the first `fail_first_n` sends, then succeeds (or,
+    /// with `fail_sends_from`, succeeds first and fails from the Nth send
+    /// onward). Delivers any queued `inbound` bridge→client messages once (then
+    /// `receive` parks forever via `pending`, unless `receive_none_after` is set
+    /// — see below). Records how many times `close()` is invoked so tests can
+    /// assert teardown behaviour.
     struct MockClient {
         fail_first_n: usize,
+        /// 1-indexed send number from which every send fails. `usize::MAX`
+        /// (the default) disables this, leaving `fail_first_n` in charge.
+        fail_sends_from: usize,
+        /// Message of the `io::Error` a failing send returns. Drives the
+        /// proxy's failure classification (transient vs gone endpoint vs a
+        /// recoverable bridge JSON-RPC body).
+        send_error_text: &'static str,
         attempts: Arc<AtomicUsize>,
         inbound: VecDeque<RxJsonRpcMessage<RoleClient>>,
         closed: Arc<AtomicUsize>,
@@ -1103,11 +1416,13 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
             let attempts = self.attempts.clone();
             let fail_first_n = self.fail_first_n;
+            let fail_sends_from = self.fail_sends_from;
+            let send_error_text = self.send_error_text;
             let sent = self.sent.clone();
             async move {
                 let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                if n <= fail_first_n {
-                    Err(std::io::Error::other("simulated bridge forward failure"))
+                if n <= fail_first_n || n >= fail_sends_from {
+                    Err(std::io::Error::other(send_error_text))
                 } else {
                     if let Some(sent) = sent {
                         sent.lock()
@@ -1163,8 +1478,21 @@ mod tests {
         }
 
         fn client(&self, fail_first_n: usize) -> MockClient {
+            self.client_failing_with(fail_first_n, TRANSIENT_SEND_ERROR)
+        }
+
+        /// Like [`Self::client`] but with a chosen send-error text, so tests can
+        /// drive the proxy's failure classification (bridge JSON-RPC body,
+        /// gone endpoint, transient).
+        fn client_failing_with(
+            &self,
+            fail_first_n: usize,
+            send_error_text: &'static str,
+        ) -> MockClient {
             MockClient {
                 fail_first_n,
+                fail_sends_from: usize::MAX,
+                send_error_text,
                 attempts: self.attempts.clone(),
                 inbound: VecDeque::new(),
                 closed: self.closed.clone(),
@@ -1252,6 +1580,8 @@ mod tests {
             let dead_attempts = Arc::new(AtomicUsize::new(0));
             let dead_client = MockClient {
                 fail_first_n: usize::MAX,
+                fail_sends_from: usize::MAX,
+                send_error_text: TRANSIENT_SEND_ERROR,
                 attempts: dead_attempts.clone(),
                 inbound: VecDeque::new(),
                 closed: Arc::new(AtomicUsize::new(0)),
@@ -1269,6 +1599,8 @@ mod tests {
                 reconnect_calls_inner.fetch_add(1, Ordering::SeqCst);
                 Ok(MockClient {
                     fail_first_n: 0,
+                    fail_sends_from: usize::MAX,
+                    send_error_text: TRANSIENT_SEND_ERROR,
                     attempts: fresh_attempts_inner.clone(),
                     inbound: VecDeque::from(vec![bridge_response(0)]),
                     closed: Arc::new(AtomicUsize::new(0)),
@@ -1345,6 +1677,8 @@ mod tests {
             );
             let dead_client = MockClient {
                 fail_first_n: usize::MAX,
+                fail_sends_from: usize::MAX,
+                send_error_text: TRANSIENT_SEND_ERROR,
                 attempts: Arc::new(AtomicUsize::new(0)),
                 inbound: VecDeque::new(),
                 closed: Arc::new(AtomicUsize::new(0)),
@@ -1389,6 +1723,8 @@ mod tests {
             );
             let dead_client = MockClient {
                 fail_first_n: usize::MAX,
+                fail_sends_from: usize::MAX,
+                send_error_text: TRANSIENT_SEND_ERROR,
                 attempts: Arc::new(AtomicUsize::new(0)),
                 inbound: VecDeque::new(),
                 closed: Arc::new(AtomicUsize::new(0)),
@@ -1475,6 +1811,303 @@ mod tests {
         assert!(!reconnect_failure_wants_respawn(&unrelated));
     }
 
+    /// A realistic rmcp rendering of the bridge's sandbox-initializing answer:
+    /// HTTP 409 folded into `StreamableHttpError::UnexpectedServerResponse`.
+    const RENDERED_409_SANDBOX_INITIALIZING: &str = concat!(
+        "unexpected server response: HTTP 409 Conflict: ",
+        r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32001,"message":"#,
+        r#""Sandbox initializing from client roots. This server requires roots/list "#,
+        r#"from client; configure --sandbox-scope for clients without roots support."}}"#,
+    );
+
+    /// The bridge's handshake-timeout answer: HTTP 504, and a message that is
+    /// itself full of colons, digits and punctuation — exactly what a naive
+    /// "split on the first colon" recovery would mangle.
+    const RENDERED_504_HANDSHAKE_TIMEOUT: &str = concat!(
+        "unexpected server response: HTTP 504 Gateway Timeout: ",
+        r#"{"jsonrpc":"2.0","id":9,"error":{"code":-32002,"message":"#,
+        r#""Handshake timed out after 30s: 1) send initialize with no session header; "#,
+        r#"2) open the SSE stream before notifications/initialized; "#,
+        r#"3) answer roots/list over SSE with the same id; 4) only then tools/call"}}"#,
+    );
+
+    #[test]
+    fn recovers_the_bridges_409_sandbox_error_from_the_transport_error() {
+        // REGRESSION: rmcp turns every non-2xx bridge response into a transport
+        // error, so the bridge's own actionable instruction was being replaced
+        // by a generic "retry or await" sentence that sent the model chasing an
+        // operation that never existed.
+        let recovered = recover_bridge_jsonrpc_error(RENDERED_409_SANDBOX_INITIALIZING)
+            .expect("the 409 body must be recoverable");
+        assert_eq!(recovered["code"], serde_json::json!(-32001));
+        assert_eq!(
+            recovered["message"],
+            serde_json::json!(
+                "Sandbox initializing from client roots. This server requires roots/list \
+                 from client; configure --sandbox-scope for clients without roots support."
+            )
+        );
+    }
+
+    #[test]
+    fn recovers_a_body_whose_message_contains_colons_and_digits() {
+        let recovered = recover_bridge_jsonrpc_error(RENDERED_504_HANDSHAKE_TIMEOUT)
+            .expect("the 504 body must be recoverable");
+        assert_eq!(recovered["code"], serde_json::json!(-32002));
+        let message = recovered["message"].as_str().expect("message is a string");
+        assert!(
+            message.starts_with("Handshake timed out after 30s: 1) send initialize"),
+            "remediation checklist truncated: {message}"
+        );
+        assert!(
+            message.ends_with("4) only then tools/call"),
+            "remediation checklist truncated: {message}"
+        );
+    }
+
+    #[test]
+    fn recovers_nothing_from_a_dead_socket_or_a_non_json_body() {
+        // A genuinely dead socket carries no HTTP response at all.
+        assert!(recover_bridge_jsonrpc_error(GONE_ENDPOINT_SEND_ERROR).is_none());
+        assert!(recover_bridge_jsonrpc_error(TRANSIENT_SEND_ERROR).is_none());
+        // An HTTP status with a body that is not JSON.
+        assert!(
+            recover_bridge_jsonrpc_error(
+                "unexpected server response: HTTP 502 Bad Gateway: <html>{oops}</html>"
+            )
+            .is_none()
+        );
+        // Valid JSON, but no `error` object to relay.
+        assert!(
+            recover_bridge_jsonrpc_error(
+                r#"unexpected server response: HTTP 500: {"jsonrpc":"2.0","id":1,"result":{}}"#
+            )
+            .is_none()
+        );
+        // An `error` that a downstream client could not decode as JSON-RPC.
+        assert!(
+            recover_bridge_jsonrpc_error(
+                r#"unexpected server response: HTTP 500: {"error":{"code":"nope"}}"#
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn classification_prefers_a_recovered_body_over_the_gone_endpoint_signature() {
+        // A live bridge can legitimately answer with a message mentioning a
+        // missing file; that must never be mistaken for a gone endpoint, or the
+        // proxy would tear down and rebuild a perfectly healthy connection.
+        let rendered = concat!(
+            "unexpected server response: HTTP 500 Internal Server Error: ",
+            r#"{"error":{"code":-32603,"message":"Failed to send request: "#,
+            r#"No such file or directory (os error 2)"}}"#,
+        );
+        assert!(matches!(
+            classify_forward_failure(rendered, "irrelevant"),
+            ForwardFailure::BridgeError(_)
+        ));
+        assert_eq!(
+            classify_forward_failure(GONE_ENDPOINT_SEND_ERROR, "irrelevant"),
+            ForwardFailure::EndpointGone
+        );
+        assert_eq!(
+            classify_forward_failure(TRANSIENT_SEND_ERROR, "irrelevant"),
+            ForwardFailure::Transient
+        );
+        // The io kind survives only in the Debug rendering when an intermediate
+        // layer dropped the message.
+        assert_eq!(
+            classify_forward_failure("Client error", "Client(Io(Os { code: 2, kind: NotFound }))"),
+            ForwardFailure::EndpointGone
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_error_body_is_relayed_downstream_instead_of_the_generic_message() {
+        // REGRESSION (live incident): the client used to receive only
+        // "Bridge could not service this request; it may still be running.
+        // Retry, or await the completion notification." for a 409 that actually
+        // said how to fix the problem. The agent retried, got nowhere, and
+        // abandoned ahma for its own unsandboxed terminal.
+        let state = TestState::new();
+        let stdio = state.stdio(VecDeque::from(vec![client_request(1), client_request(2)]));
+        let client = state.client_failing_with(1, RENDERED_409_SANDBOX_INITIALIZING);
+        let mut reconnect = || -> Result<MockClient> { Err(anyhow!("no reconnect in this test")) };
+
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
+        assert!(result.is_ok(), "the session must survive the relayed error");
+
+        let sent = state.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "expected one relayed error, got {sent:?}");
+        assert_eq!(
+            sent[0]["id"],
+            serde_json::json!(1),
+            "the bridge's error must be relayed under *this* request's id"
+        );
+        assert_eq!(
+            sent[0]["error"]["code"],
+            serde_json::json!(-32001),
+            "expected the bridge's own code, not the generic -32002: {sent:?}"
+        );
+        let message = sent[0]["error"]["message"]
+            .as_str()
+            .expect("message is a string");
+        assert!(
+            message.contains("Sandbox initializing from client roots")
+                && message.contains("--sandbox-scope"),
+            "the bridge's remediation text must survive verbatim: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gone_endpoint_reconnects_on_the_first_failure_and_resends_the_request() {
+        // REGRESSION: an auto-spawned bridge unlinks its socket and exits after
+        // `--idle-timeout`, so a frontend proxy that outlives it fails to POST
+        // with ENOENT. Re-dialing a gone endpoint can never succeed, so waiting
+        // for MAX_CONSECUTIVE_FORWARD_FAILURES just burns two more requests on
+        // a socket that is not coming back. Recover on the first failure, and
+        // resend the request that never reached the bridge.
+        with_zero_backoff(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let stdio = MockStdio::new(
+                VecDeque::from(vec![
+                    client_initialize(0),
+                    client_request(1),
+                    client_request(2),
+                ]),
+                sent.clone(),
+            );
+
+            let dead_attempts = Arc::new(AtomicUsize::new(0));
+            let dead_client = MockClient {
+                fail_first_n: 0,
+                // `initialize` gets through; the bridge then idles out and the
+                // next forward hits an unlinked socket.
+                fail_sends_from: 2,
+                send_error_text: GONE_ENDPOINT_SEND_ERROR,
+                attempts: dead_attempts.clone(),
+                inbound: VecDeque::new(),
+                closed: Arc::new(AtomicUsize::new(0)),
+                receive_none_after: None,
+                receive_call_count: Arc::new(AtomicUsize::new(0)),
+                close_behavior: CloseBehavior::Ok,
+                sent: None,
+            };
+
+            let fresh_attempts = Arc::new(AtomicUsize::new(0));
+            let fresh_sent = Arc::new(Mutex::new(Vec::new()));
+            let reconnect_calls = Arc::new(AtomicUsize::new(0));
+            let reconnect_calls_inner = reconnect_calls.clone();
+            let fresh_attempts_inner = fresh_attempts.clone();
+            let fresh_sent_inner = fresh_sent.clone();
+            let mut reconnect = move || -> Result<MockClient> {
+                reconnect_calls_inner.fetch_add(1, Ordering::SeqCst);
+                Ok(MockClient {
+                    fail_first_n: 0,
+                    fail_sends_from: usize::MAX,
+                    send_error_text: TRANSIENT_SEND_ERROR,
+                    attempts: fresh_attempts_inner.clone(),
+                    inbound: VecDeque::from(vec![bridge_response(0)]),
+                    closed: Arc::new(AtomicUsize::new(0)),
+                    receive_none_after: None,
+                    receive_call_count: Arc::new(AtomicUsize::new(0)),
+                    close_behavior: CloseBehavior::Ok,
+                    sent: Some(fresh_sent_inner.clone()),
+                })
+            };
+
+            let result =
+                run_transport_proxy(stdio, dead_client, "test", None, &mut reconnect, None).await;
+            assert!(
+                result.is_ok_and(|responded| responded),
+                "the session must resume against the reconnected bridge"
+            );
+            assert_eq!(
+                reconnect_calls.load(Ordering::SeqCst),
+                1,
+                "must reconnect exactly once"
+            );
+            assert_eq!(
+                dead_attempts.load(Ordering::SeqCst),
+                2,
+                "the gone endpoint must be abandoned on the FIRST failure, not the third"
+            );
+
+            // Replayed initialize, the resent request(1), then request(2).
+            let fresh_sent = fresh_sent.lock().unwrap();
+            assert_eq!(fresh_sent.len(), 3, "expected 3 sends, got {fresh_sent:?}");
+            assert_eq!(fresh_sent[0]["method"], serde_json::json!("initialize"));
+            assert_eq!(
+                fresh_sent[1]["id"],
+                serde_json::json!(1),
+                "the failed request must be resent transparently: {fresh_sent:?}"
+            );
+            assert_eq!(fresh_sent[2]["id"], serde_json::json!(2));
+
+            let sent = sent.lock().unwrap();
+            assert_eq!(
+                sent.iter().filter(|m| m.get("error").is_some()).count(),
+                0,
+                "a resent request must NOT also be answered with an error: {sent:?}"
+            );
+            // The reconnect disclosure (#485) must say the request was resent,
+            // not invite the client to retry something already in flight.
+            let events: Vec<_> = sent
+                .iter()
+                .filter(|m| {
+                    m.get("method").and_then(|m| m.as_str())
+                        == Some(ahma_common::session_event::SESSION_EVENT_METHOD)
+                })
+                .collect();
+            assert_eq!(events.len(), 1, "expected 1 session event, got {sent:?}");
+            assert_eq!(events[0]["params"]["kind"], "reconnected");
+            assert_eq!(events[0]["params"]["detail"]["cause"], "endpoint_gone");
+            assert_eq!(events[0]["params"]["detail"]["in_flight_request"], "resent");
+            let message = events[0]["params"]["detail"]["message"]
+                .as_str()
+                .expect("detail message is a string");
+            assert!(
+                message.contains("resent") && !message.contains("can be retried"),
+                "disclosure must not claim the request needs retrying: {message}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn transient_failures_still_wait_for_the_threshold_before_reconnecting() {
+        // The gone-endpoint fast path must not swallow the count-based path:
+        // a transient failure on a *live* endpoint is still tolerated up to
+        // MAX_CONSECUTIVE_FORWARD_FAILURES. (That the third failure does then
+        // reconnect is covered by
+        // `reconnect_after_dead_transport_resumes_session_transparently`.)
+        let state = TestState::new();
+        let stdio = state.stdio(VecDeque::from(vec![
+            client_initialize(0),
+            client_request(1),
+        ]));
+        let client = state.client(usize::MAX);
+        let mut reconnect = || -> Result<MockClient> {
+            panic!("must not reconnect before MAX_CONSECUTIVE_FORWARD_FAILURES on a live endpoint")
+        };
+
+        let result = run_transport_proxy(stdio, client, "test", None, &mut reconnect, None).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            state.attempts.load(Ordering::SeqCst),
+            2,
+            "both messages must be attempted without an early reconnect"
+        );
+        let sent = state.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2, "expected 2 relayed errors, got {sent:?}");
+        assert!(
+            sent.iter()
+                .all(|m| m["error"]["code"] == serde_json::json!(-32002)),
+            "a transient failure has no recoverable body, so the generic error stands: {sent:?}"
+        );
+    }
+
     /// REGRESSION (2026-07-14 live incident): when the bridge endpoint is gone
     /// — its socket was unlinked out from under it — re-dialing can never
     /// succeed. The proxy must invoke the respawn hook and then reconnect to
@@ -1496,6 +2129,8 @@ mod tests {
 
             let dead_client = MockClient {
                 fail_first_n: usize::MAX,
+                fail_sends_from: usize::MAX,
+                send_error_text: TRANSIENT_SEND_ERROR,
                 attempts: Arc::new(AtomicUsize::new(0)),
                 inbound: VecDeque::new(),
                 closed: Arc::new(AtomicUsize::new(0)),
@@ -1522,6 +2157,8 @@ mod tests {
                 }
                 Ok(MockClient {
                     fail_first_n: 0,
+                    fail_sends_from: usize::MAX,
+                    send_error_text: TRANSIENT_SEND_ERROR,
                     attempts: fresh_attempts_inner.clone(),
                     inbound: VecDeque::from(vec![bridge_response(0)]),
                     closed: Arc::new(AtomicUsize::new(0)),
@@ -1590,6 +2227,8 @@ mod tests {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let mut client = MockClient {
             fail_first_n: 0,
+            fail_sends_from: usize::MAX,
+            send_error_text: TRANSIENT_SEND_ERROR,
             attempts: attempts.clone(),
             inbound: VecDeque::from(vec![
                 bridge_response(0),           // answers the replayed initialize
@@ -1635,6 +2274,8 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let mut client = MockClient {
             fail_first_n: 0,
+            fail_sends_from: usize::MAX,
+            send_error_text: TRANSIENT_SEND_ERROR,
             attempts: attempts.clone(),
             inbound: VecDeque::new(),
             closed: Arc::new(AtomicUsize::new(0)),
