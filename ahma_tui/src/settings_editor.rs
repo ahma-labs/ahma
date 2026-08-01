@@ -493,6 +493,14 @@ impl SettingsEditor {
                 default_value: SettingValue::U64(d.monitor_rate_limit_secs),
                 security_tier: false,
             },
+            SettingItem {
+                key: "logging.dir",
+                label: "Log directory",
+                description: "Empty = repo root's logs/; set to keep logs out of the tree",
+                value: SettingValue::String(l.dir.clone()),
+                default_value: SettingValue::String(d.dir.clone()),
+                security_tier: false,
+            },
         ]
     }
 
@@ -667,6 +675,11 @@ impl SettingsEditor {
             2 => {
                 if let SettingValue::U64(v) = value {
                     l.monitor_rate_limit_secs = *v;
+                }
+            }
+            3 => {
+                if let SettingValue::String(v) = value {
+                    l.dir = v.clone();
                 }
             }
             _ => {}
@@ -1098,7 +1111,7 @@ mod tests {
         );
         assert_eq!(
             editor.items_for_category(SettingsCategory::Logging).len(),
-            3
+            4
         );
         assert_eq!(editor.items_for_category(SettingsCategory::Http).len(), 3);
         assert_eq!(editor.items_for_category(SettingsCategory::Auth).len(), 2);
@@ -1237,15 +1250,19 @@ mod tests {
         e.apply_logging(0, &SettingValue::String("stderr".into()));
         e.apply_logging(1, &SettingValue::Bool(true));
         e.apply_logging(2, &SettingValue::U64(15));
+        e.apply_logging(3, &SettingValue::String("~/.ahma/logs".into()));
         let l = &e.settings().logging;
         assert_eq!(l.target, "stderr");
         assert!(l.log_monitor);
         assert_eq!(l.monitor_rate_limit_secs, 15);
+        assert_eq!(l.dir, "~/.ahma/logs");
         // Wrong types ignored.
         e.apply_logging(0, &SettingValue::Bool(true));
         assert_eq!(e.settings().logging.target, "stderr");
         e.apply_logging(2, &SettingValue::Bool(true));
         assert_eq!(e.settings().logging.monitor_rate_limit_secs, 15);
+        e.apply_logging(3, &SettingValue::Bool(true));
+        assert_eq!(e.settings().logging.dir, "~/.ahma/logs");
         // Out-of-range.
         e.apply_logging(7, &SettingValue::U64(1));
     }

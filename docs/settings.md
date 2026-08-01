@@ -80,6 +80,7 @@ Run `ahma settings init` to generate this file automatically.
 # target                  = "file"   # "file" (rolling) or "stderr"
 # log_monitor             = false    # enable live log monitoring via LLM
 # monitor_rate_limit_secs = 60       # min seconds between log-monitor alerts
+# dir                     = ""       # log directory; "" resolves automatically
 
 # ── Progressive disclosure ────────────────────────────────────────────────────
 # [disclosure]
@@ -173,6 +174,7 @@ it to settings.
 | `AHMA_LOG_TARGET` | `[logging] target` |
 | `AHMA_LOG_MONITOR` | `[logging] log_monitor` |
 | `AHMA_MONITOR_RATE_LIMIT` | `[logging] monitor_rate_limit_secs` |
+| `AHMA_LOG_DIR` | `[logging] dir` (or the `--log-dir` flag) |
 | `AHMA_REVEAL_PROFILE` | `[disclosure] reveal_profile` |
 | `AHMA_HANDSHAKE_TIMEOUT` | `[http] handshake_timeout_secs` |
 | `AHMA_DISABLE_QUIC` | `[http] disable_quic` |

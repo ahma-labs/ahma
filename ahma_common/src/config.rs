@@ -1118,6 +1118,13 @@ pub struct LoggingSettings {
     /// storms when a persistent issue triggers repeated pattern matches.
     /// Default: `60`
     pub monitor_rate_limit_secs: u64,
+    /// Directory for ahma's operational logs.  The persistent equivalent of the
+    /// `--log-dir` flag, for keeping logs out of the working tree entirely
+    /// (e.g. `~/.ahma/logs`).  Empty means "resolve automatically": the sandbox
+    /// scope's `logs/` when one is locked, otherwise `logs/` at the enclosing
+    /// repository root.  `~` is expanded.
+    /// Default: `""`
+    pub dir: String,
 }
 
 impl Default for LoggingSettings {
@@ -1126,6 +1133,7 @@ impl Default for LoggingSettings {
             target: "file".to_string(),
             log_monitor: false,
             monitor_rate_limit_secs: 60,
+            dir: String::new(),
         }
     }
 }
@@ -1892,6 +1900,12 @@ impl AhmaSettings {
             self.logging.monitor_rate_limit_secs.to_string(),
             d.logging.monitor_rate_limit_secs.to_string(),
         );
+        w.setting(
+            "Directory for ahma's operational logs (persistent form of --log-dir). Empty resolves automatically: the sandbox scope's logs/, else logs/ at the repository root.",
+            "dir",
+            toml_str(&self.logging.dir),
+            toml_str(&d.logging.dir),
+        );
 
         // ── HTTP server ──────────────────────────────────────────────────────
         w.section("HTTP server (ahma serve http only)", "http");
@@ -2446,6 +2460,7 @@ mod tests {
                 target: "stderr".into(),
                 log_monitor: true,
                 monitor_rate_limit_secs: 7,
+                dir: "/var/log/ahma".into(),
             },
             http: HttpSettings {
                 handshake_timeout_secs: 99,

@@ -566,7 +566,10 @@ A "host sandbox" is an outer kernel sandbox ahma is running inside (Cursor, VS C
 ### R8: Project Logging (`/logs` directory)
 
 - **R8.1**: All ahma and execution logs **must** be placed in the `logs/` directory at the root of the (primary) configured sandbox scope, rather than global user cache directories (`~/.cache`).
+- **R8.1.1**: **One project resolves to one log directory, on every execution path.** Where no scope has been locked yet, the log directory is anchored on the enclosing **repository root**, never on the process's current working directory. This binds the paths that have no `roots/list` of their own — above all the terminal-hook path (R5.5), where each hooked command runs as its own short-lived process whose cwd is the *command's* own directory. Anchoring those on cwd scatters a `logs/` into every subdirectory an agent happens to run a command in, which is both litter and a disclosure hazard: build tooling that scans a tree by convention (an Android `res/`, an asset pipeline) will pick up plaintext logs regardless of `.gitignore`.
+- **R8.1.2**: The resolution order is: `--log-dir` flag → `AHMA_LOG_DIR` (deprecated) → `[logging] dir` in `settings.toml` → primary sandbox scope → repository root (R8.1.1) → a per-project namespaced directory under `~/.ahma/logs`. A directory the user *wrote down* (flag or setting) outranks one ahma *discovered*. The active directory is disclosed at startup (R8.3).
 - **R8.2**: When the project is built or the server initialized, the `logs/` directory is created if it does not exist, and old `.log` files are deleted to wipe previous logs.
+- **R8.3**: ahma **must** disclose the active log directory once at startup, and **must** warn when it writes plaintext operational logs — which include full tool-call transcripts — into a git working tree not already covered by an ignore rule, naming the remedy (`ahma logs gitignore`, or `--log-dir` / `[logging] dir` to move them out of the tree entirely).
 
 ### R9: Safe Live Log Monitoring (`--livelog`)
 

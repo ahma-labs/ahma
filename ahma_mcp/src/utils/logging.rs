@@ -112,14 +112,28 @@ pub fn detect_log_role_from_startup() -> &'static str {
 /// Process-wide log directory override set from the `--log-dir` CLI flag.
 static LOG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
+/// Log directory from `[logging] dir` in `~/.ahma/settings.toml`. Lower
+/// priority than `--log-dir` / `AHMA_LOG_DIR`, higher than the sandbox scope:
+/// the scope is discovered at runtime, whereas this is a choice the user wrote
+/// down, and a written-down choice must not be overridden by a discovery.
+static LOG_DIR_FROM_SETTINGS: OnceLock<PathBuf> = OnceLock::new();
+
 /// Log directory derived from the primary sandbox scope after `roots/list`.
-/// Lower priority than `--log-dir` / `AHMA_LOG_DIR`, higher than CWD fallback.
+/// Lower priority than `--log-dir` / `AHMA_LOG_DIR` / settings, higher than the
+/// workspace-root fallback.
 static LOG_DIR_FROM_SCOPE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Set the log directory from the `--log-dir` CLI flag.
 /// Call once, early in startup, before any logging is initialised.
 pub fn set_log_dir_override(dir: PathBuf) {
     let _ = LOG_DIR_OVERRIDE.set(dir);
+}
+
+/// Set the log directory from `[logging] dir` in settings.toml.
+/// Call once, early in startup (before logging is initialised); has no effect
+/// if `--log-dir` was already set, or if already called.
+pub fn set_log_dir_from_settings(dir: PathBuf) {
+    let _ = LOG_DIR_FROM_SETTINGS.set(dir);
 }
 
 /// Derive the default log directory from the primary sandbox scope.
@@ -136,9 +150,10 @@ pub fn set_log_dir_from_scope(dir: PathBuf) {
 /// Project log directory, checked in priority order:
 /// 1. `--log-dir` CLI flag
 /// 2. `AHMA_LOG_DIR` env var (deprecated)
-/// 3. Primary sandbox scope `<scope>/logs` (set after `roots/list`)
-/// 4. `<cwd>/logs` if writable
-/// 5. `~/.ahma/logs/<project-namespace>` — a per-project subdirectory, not one
+/// 3. `[logging] dir` in `~/.ahma/settings.toml`
+/// 4. Primary sandbox scope `<scope>/logs` (set after `roots/list`)
+/// 5. `<workspace-root>/logs` if writable — see [`log_anchor_dir`]
+/// 6. `~/.ahma/logs/<project-namespace>` — a per-project subdirectory, not one
 ///    shared flat file: the sandbox already enforces per-project isolation on
 ///    disk, and a single shared log would quietly undo that at the
 ///    observability layer (one project's commands/paths/errors readable
@@ -157,6 +172,10 @@ pub fn project_log_dir() -> PathBuf {
         return PathBuf::from(val);
     }
 
+    if let Some(dir) = LOG_DIR_FROM_SETTINGS.get() {
+        return dir.clone();
+    }
+
     if let Some(dir) = LOG_DIR_FROM_SCOPE.get() {
         return dir.clone();
     }
@@ -164,9 +183,10 @@ pub fn project_log_dir() -> PathBuf {
     if let Ok(cwd) = std::env::current_dir()
         && cwd.parent().is_some()
     {
-        let log_dir = cwd.join("logs");
+        let anchor = log_anchor_dir(&cwd);
+        let log_dir = anchor.join("logs");
         let exists_and_writeable = log_dir.exists() && is_writeable(&log_dir);
-        let can_create = !log_dir.exists() && is_writeable(&cwd);
+        let can_create = !log_dir.exists() && is_writeable(&anchor);
         if exists_and_writeable || can_create {
             return log_dir;
         }
@@ -232,6 +252,23 @@ fn find_git_root(start: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The directory `logs/` hangs off when nothing more authoritative (a flag, a
+/// setting, a locked sandbox scope) has named one: the enclosing repository
+/// root if `cwd` is inside one, otherwise `cwd` itself.
+///
+/// Anchoring on the repo root rather than the raw cwd is what makes SPEC R8.1
+/// ("the `logs/` directory at the root of the primary sandbox scope") hold for
+/// every execution path, not just the MCP server. A hooked terminal command
+/// runs as its own short-lived `ahma hooks run-shell` process whose cwd is the
+/// *command's* directory, so a raw-cwd fallback sprayed a fresh `logs/` into
+/// whatever subdirectory each command happened to run in — including, in one
+/// report, an Android `res/`, where the resource compiler picks files up
+/// regardless of `.gitignore`. One project must produce one log directory.
+fn log_anchor_dir(cwd: &Path) -> PathBuf {
+    let canonical = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    find_git_root(&canonical).unwrap_or(canonical)
+}
+
 /// Best-effort check for whether `log_dir` is already covered by some
 /// `.gitignore` between its parent and `repo_root` (inclusive). This is a
 /// heuristic — it matches a bare directory-name line (`logs`, `/logs`,
@@ -287,7 +324,9 @@ pub fn disclose_log_location_once() {
                 "ahma is writing plaintext operational logs — including full tool-call \
                  transcripts — into a directory inside this git repository, and it is not \
                  yet covered by .gitignore. Run `ahma logs gitignore` to add an ignore rule, \
-                 or set --log-dir to a path outside the repo to avoid this entirely."
+                 or keep them out of the tree entirely with --log-dir / `[logging] dir` in \
+                 settings.toml. Note that an ignore rule only hides the logs from git: build \
+                 tooling that scans the tree from disk still sees them."
             );
         }
     });
@@ -696,6 +735,73 @@ mod tests {
         assert_eq!(dir, temp_path_canonical.join("logs"));
 
         let _ = std::env::set_current_dir(prev);
+    }
+
+    /// The hooks regression (SPEC R8.1): each hooked terminal command runs as
+    /// its own process whose cwd is the *command's* directory, so anchoring on
+    /// the raw cwd created a `logs/` in every subdirectory an agent ran a
+    /// command in. One repository must resolve to one log directory.
+    #[test]
+    fn test_project_log_dir_anchors_on_repo_root_not_command_cwd() {
+        let temp = tempdir().unwrap();
+        let repo_root = dunce::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(repo_root.join(".git")).unwrap();
+        let command_cwd = repo_root.join("app").join("src").join("main").join("res");
+        fs::create_dir_all(&command_cwd).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&command_cwd).unwrap();
+        let dir = project_log_dir();
+        let _ = std::env::set_current_dir(prev);
+
+        assert_eq!(dir, repo_root.join("logs"));
+        assert!(
+            !command_cwd.join("logs").exists(),
+            "resolving the log dir must not litter the command's own directory"
+        );
+    }
+
+    /// A directory the user wrote down outranks one ahma discovered: the
+    /// settings key beats the sandbox scope, and therefore also the repo root.
+    /// (Each nextest test is its own process, so the `OnceLock`s start unset.)
+    #[test]
+    fn test_project_log_dir_settings_beats_scope() {
+        set_log_dir_from_settings(PathBuf::from("/settings/logs"));
+        set_log_dir_from_scope(PathBuf::from("/scope/logs"));
+
+        assert_eq!(project_log_dir(), PathBuf::from("/settings/logs"));
+    }
+
+    #[test]
+    fn test_log_anchor_dir_finds_repo_root_from_nested_dir() {
+        let temp = tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let nested = root.join("a").join("b");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(log_anchor_dir(&nested), root);
+    }
+
+    /// A git worktree or submodule has `.git` as a *file*, not a directory —
+    /// `find_git_root` tests for existence, so both anchor correctly.
+    #[test]
+    fn test_log_anchor_dir_handles_git_file_worktree() {
+        let temp = tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        fs::write(root.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
+        let nested = root.join("crates").join("thing");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(log_anchor_dir(&nested), root);
+    }
+
+    #[test]
+    fn test_log_anchor_dir_outside_repo_is_the_dir_itself() {
+        let temp = tempdir().unwrap();
+        let dir = dunce::canonicalize(temp.path()).unwrap();
+
+        assert_eq!(log_anchor_dir(&dir), dir);
     }
 
     #[test]

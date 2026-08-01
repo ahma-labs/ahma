@@ -1212,9 +1212,10 @@ pub struct Cli {
     #[arg(long = "log-to-stderr", global = true)]
     pub log_to_stderr: bool,
 
-    /// Directory for rolling log files.
-    /// Defaults to `<cwd>/logs`, falling back to `~/.ahma/logs`.
-    /// Replaces the deprecated AHMA_LOG_DIR environment variable.
+    /// Directory for rolling log files. Defaults to the sandbox scope's
+    /// `logs/`, else `logs/` at the enclosing repository root, falling back to
+    /// `~/.ahma/logs`. Set `[logging] dir` in settings.toml to make a choice
+    /// persistent. Replaces the deprecated AHMA_LOG_DIR environment variable.
     #[arg(long = "log-dir", value_name = "PATH", global = true)]
     pub log_dir: Option<PathBuf>,
 
@@ -1685,7 +1686,8 @@ pub struct LogsArgs {
 
 /// Subcommands for `ahma logs` — manage where ahma writes its operational
 /// logs. The active directory follows a priority order (`--log-dir` flag,
-/// `AHMA_LOG_DIR`, sandbox scope, `<cwd>/logs`, then a per-project directory
+/// `AHMA_LOG_DIR`, `[logging] dir` in settings.toml, sandbox scope,
+/// `logs/` at the enclosing repository root, then a per-project directory
 /// under `~/.ahma/logs`); ahma discloses which one is active at startup.
 #[derive(Subcommand, Debug, Clone)]
 pub enum LogsCommand {
@@ -2746,6 +2748,16 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
 
     // Load user settings (priority layer 2: below CLI flags, above env vars)
     let s = load_settings(cli);
+
+    // `[logging] dir` — applied here, before main() initialises logging, so the
+    // file appender opens on the configured directory rather than a resolved
+    // one. `--log-dir` still wins (see `project_log_dir`).
+    let settings_log_dir = s.logging.dir.trim();
+    if !settings_log_dir.is_empty() {
+        crate::utils::logging::set_log_dir_from_settings(expand_tilde(PathBuf::from(
+            settings_log_dir,
+        )));
+    }
 
     // Install the tool-subprocess secret-env passthrough allowlist from
     // `[sandbox] env_allow`. Everything not on this list that looks like a
