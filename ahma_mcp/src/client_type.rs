@@ -109,36 +109,38 @@ impl McpClientType {
     }
 
     /// How long ahma may hold **one** MCP request open for this client before
-    /// the client gives up on it (SPEC R2.6.5).
+    /// assuming it has given up, when there is no better signal available
+    /// (SPEC R2.6.5, R2.6.5.3).
     ///
-    /// MCP has no way to discover this, so it is a table keyed on
-    /// `clientInfo.name` with a conservative default. Two behaviours derive
-    /// from it: the ceiling on the inline result window (R2.6.1) and the
-    /// `await` soft timeout (R2.5.1). Get it wrong high and a long call takes
-    /// the session down with it; get it wrong low and the model pays extra
-    /// round-trips. Prefer wrong-low.
+    /// This is deliberately no longer a per-`clientInfo.name` guess. It used to
+    /// be: Antigravity got 20s from one measured incident (its transport
+    /// stopped answering server pings partway through an 85-second `await`,
+    /// between 0 and 34 seconds after the request went out — the result was
+    /// written into a dead connection), everyone else got 300s on the
+    /// optimistic assumption that a named, recognized product is well-behaved.
+    /// That was always a proxy for the thing that actually matters — is the
+    /// connection *right now* still alive — and a proxy keyed on product name
+    /// is exactly as reliable as the guess that produced it: wrong for any
+    /// client whose name doesn't match, silently, forever.
     ///
-    /// Antigravity's 20s is measured, not guessed: in a captured session its
-    /// transport stopped answering server pings partway through an 85-second
-    /// `await`, between 0 and 34 seconds after the request went out — the
-    /// result was written into a dead connection. Clients not on this list get
-    /// the same conservative budget until one is measured for them.
+    /// The real answer is [`AhmaMcpService::push_channel_open`]: when a live
+    /// push channel is confirmed, `await` verifies liveness directly with
+    /// periodic pings instead of guessing a deadline for it up front (SPEC
+    /// R2.6.5.3), and this budget is not consulted at all. This value is only
+    /// the fallback for the narrow window before that confirmation arrives, or
+    /// for a session that never opens one (a configured default sandbox scope
+    /// lets a client skip it entirely, by design) — every client gets the same
+    /// conservative number there, because guessing which *product* deserves
+    /// more trust was never the right question once a real liveness signal
+    /// exists. An operator who knows a specific deployment's fallback window
+    /// can actually tolerate longer overrides it via
+    /// `tools.request_budget_override_secs` / `--request-budget-secs` (SPEC
+    /// R2.6.5.2) rather than ahma guessing on their behalf.
+    ///
+    /// [`AhmaMcpService::push_channel_open`]: crate::mcp_service::AhmaMcpService::push_channel_open
     pub fn request_budget(&self) -> std::time::Duration {
-        use std::time::Duration;
-        match self {
-            // Purpose-built for long tool calls; ahma's own surfaces likewise.
-            McpClientType::Ahma
-            | McpClientType::ClaudeDesktop
-            | McpClientType::Cursor
-            | McpClientType::VSCode
-            | McpClientType::Zed => Duration::from_secs(300),
-            // Measured, and the reason this table exists.
-            McpClientType::Antigravity => Duration::from_secs(20),
-            // Local-model front-ends and anything unrecognised: assume little.
-            McpClientType::LmStudio | McpClientType::Ollama | McpClientType::Unknown => {
-                Duration::from_secs(20)
-            }
-        }
+        const FALLBACK_REQUEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+        FALLBACK_REQUEST_BUDGET
     }
 
     /// How long ahma may leave an `elicitation/create` prompt open for this
@@ -401,13 +403,32 @@ mod tests {
     }
 
     #[test]
-    fn unrecognised_clients_get_the_conservative_budget() {
-        // Guessing high costs the session; guessing low costs a round-trip.
-        assert_eq!(
-            McpClientType::Unknown.request_budget(),
-            McpClientType::Antigravity.request_budget(),
-            "an unmeasured client must not be assumed tolerant"
-        );
+    fn every_client_shares_the_same_fallback_request_budget() {
+        // SPEC R2.6.5: request_budget() is only the fallback for the window
+        // before a live push channel is confirmed (or a session that never
+        // opens one) — a real liveness probe (SPEC R2.6.5.3) is the actual
+        // answer once one exists. Guessing which *product* deserves more trust
+        // in that fallback window was never the right question, so every
+        // client — recognized or not — gets the identical conservative number.
+        let expected = McpClientType::Unknown.request_budget();
+        for client in [
+            McpClientType::Ahma,
+            McpClientType::Cursor,
+            McpClientType::VSCode,
+            McpClientType::ClaudeDesktop,
+            McpClientType::Zed,
+            McpClientType::LmStudio,
+            McpClientType::Ollama,
+            McpClientType::Antigravity,
+            McpClientType::Unknown,
+        ] {
+            assert_eq!(
+                client.request_budget(),
+                expected,
+                "{} must share the uniform fallback budget",
+                client.display_name()
+            );
+        }
     }
 
     #[test]

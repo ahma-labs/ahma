@@ -22,7 +22,7 @@ pub struct AwaitCaller {
     pub progress_token: Option<rmcp::model::ProgressToken>,
     pub client_type: Option<crate::client_type::McpClientType>,
     /// Whether the bridge (if any) has confirmed a live push channel to the
-    /// real client (SPEC R2.6.5.2's liveness-probe redesign). `from_context`
+    /// real client (SPEC R2.6.5.3's liveness-probe redesign). `from_context`
     /// cannot fill this in — it has no `AhmaMcpService` to ask — so the caller
     /// must set it from `AhmaMcpService::push_channel_open()` after
     /// construction. Defaults to `false`, the safe assumption.
@@ -110,7 +110,7 @@ impl AwaitTimeout {
 }
 
 /// How often a live-probed wait checks the client is still there, and how long
-/// a single probe is allowed to take before it's presumed dead (SPEC R2.6.5.2).
+/// a single probe is allowed to take before it's presumed dead (SPEC R2.6.5.3).
 /// The probe itself is still a guessed constant — just a much smaller one,
 /// repeated, instead of a single large guess about the whole wait up front.
 const LIVENESS_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
@@ -120,7 +120,7 @@ const LIVENESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// `probe_timeout`. Any response counts as alive; a timed-out or failed send
 /// means presumed dead. This rides the same JSON-RPC connection a
 /// `notifications/ahma/pushChannelChanged`-confirmed session already has a live
-/// path for (SPEC R2.6.5.2) — callers must check `AwaitCaller::push_channel_open`
+/// path for (SPEC R2.6.5.3) — callers must check `AwaitCaller::push_channel_open`
 /// before relying on this, since without it there is nowhere for the ping to go.
 async fn probe_client_liveness(
     peer: &rmcp::service::Peer<rmcp::service::RoleServer>,
@@ -145,9 +145,9 @@ async fn probe_client_liveness(
 /// early — as a timeout, since the caller-facing outcome is the same soft
 /// "still running" message either way — the moment a probe fails, rather than
 /// only ever bailing at a single fixed guessed duration regardless of whether
-/// the connection is actually still healthy (SPEC R2.6.5.2). When
+/// the connection is actually still healthy (SPEC R2.6.5.3). When
 /// `probe_peer` is `None` this is a plain bounded wait, identical to the
-/// pre-R2.6.5.2 behavior.
+/// pre-R2.6.5.3 behavior.
 ///
 /// `probe_interval`/`probe_timeout` are parameters rather than baked-in
 /// constants so tests can exercise the loop's logic (deadline math, probe
@@ -186,7 +186,7 @@ where
                 }
                 if !probe_client_liveness(peer, probe_timeout).await {
                     tracing::debug!(
-                        "Liveness probe failed mid-await; treating client as unresponsive (SPEC R2.6.5.2)"
+                        "Liveness probe failed mid-await; treating client as unresponsive (SPEC R2.6.5.3)"
                     );
                     return Err(());
                 }
@@ -267,11 +267,12 @@ impl AhmaMcpService {
         })
     }
 
-    /// The client's single-request budget (SPEC R2.6.5), unless overridden via
+    /// The fallback single-request budget (SPEC R2.6.5), unless overridden via
     /// the `--request-budget-secs` flag / `tools.request_budget_override_secs`
-    /// setting. The override applies uniformly — it does not distinguish which
-    /// client asked — since it exists precisely for the case where the
-    /// built-in per-`clientInfo.name` guess is wrong for the operator's setup.
+    /// setting. Only consulted when there is no confirmed live push channel to
+    /// verify liveness directly (SPEC R2.6.5.3) — `client_type` is accepted for
+    /// call-site symmetry with that check, not because the fallback still
+    /// varies by client identity; it no longer does (SPEC R2.6.5).
     pub(crate) fn effective_request_budget(
         &self,
         client_type: crate::client_type::McpClientType,
@@ -287,8 +288,9 @@ impl AhmaMcpService {
         }
     }
 
-    /// Bound a resolved await timeout by what the calling client tolerates on a
-    /// single request (SPEC R2.5.1, R2.6.5).
+    /// Bound a resolved await timeout by the fallback single-request budget
+    /// (SPEC R2.5.1, R2.6.5) — only when there is no confirmed live push
+    /// channel to verify liveness directly instead (SPEC R2.6.5.3).
     ///
     /// Expiry is soft — the operation keeps running and `await` can be called
     /// again — so clamping costs at most a cheap extra round-trip. Not clamping
@@ -298,8 +300,8 @@ impl AhmaMcpService {
     /// `timeout_seconds` argument is honoured as given; this bounds the
     /// *default*, which is what models actually use.
     ///
-    /// SPEC R2.6.5.2: when the caller has a confirmed live push channel, this
-    /// guessed clamp is unnecessary — `wait_with_optional_probe` verifies
+    /// SPEC R2.6.5.3: when the caller has a confirmed live push channel, this
+    /// fallback clamp is unnecessary — `wait_with_optional_probe` verifies
     /// liveness directly instead, so the full resolved timeout is used and no
     /// clamp note is needed.
     fn bounded_await_timeout_secs(&self, resolved: f64, caller: &AwaitCaller) -> AwaitTimeout {
@@ -317,7 +319,7 @@ impl AhmaMcpService {
             client = client_type.display_name(),
             resolved,
             budget,
-            "Clamping await timeout to the client's single-request budget"
+            "Clamping await timeout to the fallback single-request budget"
         );
         AwaitTimeout {
             secs: budget,
@@ -346,7 +348,7 @@ impl AhmaMcpService {
         let tool_filters = common::parse_tool_filters(&args);
         let timeout_override = args.get("timeout_seconds").and_then(|v| v.as_u64());
 
-        // SPEC R2.6.5.2: only probeable when the bridge has confirmed a live
+        // SPEC R2.6.5.3: only probeable when the bridge has confirmed a live
         // push channel exists to actually deliver a server-initiated ping on.
         let probe_peer = if caller.push_channel_open {
             caller.peer.as_ref()
@@ -1620,11 +1622,15 @@ mod budget_tests {
     }
 
     #[tokio::test]
-    async fn a_tolerant_client_keeps_its_long_wait() {
+    async fn a_wait_within_the_fallback_budget_is_never_clamped() {
+        // SPEC R2.6.5: the fallback budget is uniform now — there is no
+        // "tolerant client" tier to test separately. Any resolved wait at or
+        // under the fallback stays unclamped, for every client identity.
         let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        let budget = McpClientType::ClaudeDesktop.request_budget().as_secs_f64();
         let bounded =
-            service.bounded_await_timeout_secs(120.0, &caller(Some(McpClientType::ClaudeDesktop)));
-        assert_eq!(bounded.secs, 120.0, "no clamp when the client can take it");
+            service.bounded_await_timeout_secs(budget, &caller(Some(McpClientType::ClaudeDesktop)));
+        assert_eq!(bounded.secs, budget, "no clamp when already within budget");
         assert!(
             bounded.note().is_none(),
             "an unclamped wait must not explain a clamp that did not happen"
@@ -1633,25 +1639,32 @@ mod budget_tests {
 
     #[tokio::test]
     async fn an_override_replaces_the_guess_for_every_client() {
-        // SPEC R2.6.5.2: a wrong guess (or an unrecognized client stuck on the
-        // conservative default) must be correctable without a code change.
+        // SPEC R2.6.5.2: a wrong default (the conservative fallback is wrong
+        // for a given deployment) must be correctable without a code change.
         let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
         service.set_app_config(Arc::new(crate::shell::cli::AppConfig {
             request_budget_override_secs: Some(7),
             ..Default::default()
         }));
 
-        // Antigravity would normally be clamped to 20s; the override wins.
+        // Antigravity would normally be clamped to the 20s fallback; the
+        // override wins instead.
         let bounded =
             service.bounded_await_timeout_secs(30.0, &caller(Some(McpClientType::Antigravity)));
         assert_eq!(bounded.secs, 7.0);
 
-        // A client that would normally NOT be clamped (well within 300s) is now
-        // clamped too — the override applies uniformly, it does not special-case
-        // who asked.
+        // The override applies to every client identity uniformly, including
+        // ones that would not otherwise be clamped at all — a wait of 5s is
+        // under the 20s fallback (would be unclamped by default) but the
+        // operator's 7s override does not apply here since 5 < 7 anyway, so
+        // assert the boundary explicitly: even a wait *within* the default
+        // fallback still respects an override that happens to be smaller.
         let bounded =
-            service.bounded_await_timeout_secs(30.0, &caller(Some(McpClientType::ClaudeDesktop)));
-        assert_eq!(bounded.secs, 7.0);
+            service.bounded_await_timeout_secs(10.0, &caller(Some(McpClientType::ClaudeDesktop)));
+        assert_eq!(
+            bounded.secs, 7.0,
+            "override must clamp even a wait the default fallback (20s) would not have"
+        );
     }
 
     #[tokio::test]
@@ -1763,7 +1776,7 @@ mod liveness_probe_tests {
     async fn no_probe_peer_is_a_plain_bounded_wait() {
         // Backward compatibility: `probe_peer: None` (no live channel confirmed,
         // or CLI/tests with no MCP peer at all) must behave exactly like the
-        // pre-R2.6.5.2 `tokio::time::timeout` — no probing attempted.
+        // pre-R2.6.5.3 `tokio::time::timeout` — no probing attempted.
         let start = Instant::now();
         let result = wait_with_optional_probe(
             std::time::Duration::from_millis(50),

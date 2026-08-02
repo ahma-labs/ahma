@@ -685,13 +685,13 @@ pub struct ToolSettings {
     /// Default: [`DEFAULT_AWAIT_TIMEOUT_SECS`] (9 minutes)
     #[serde(default = "default_await_timeout_secs")]
     pub await_timeout_secs: u64,
-    /// Override for the per-client single-request budget (SPEC R2.6.5): how long
-    /// ahma may hold one MCP request open before assuming this client has stopped
-    /// listening. Unset means "trust the built-in per-`clientInfo.name` guess".
-    /// Set this when that guess is wrong for your environment — e.g. a client
-    /// ahma doesn't recognize (and so conservatively budgets at 20s) that you
-    /// know tolerates long-running `await` calls just fine.
-    /// Default: `None` (use the built-in table)
+    /// Override for the fallback single-request budget (SPEC R2.6.5): how long
+    /// ahma may hold one MCP request open before assuming the client has
+    /// stopped listening, when there is no confirmed live push channel to
+    /// verify that directly (SPEC R2.6.5.3). Unset means "trust the built-in
+    /// conservative default (20s)". Set this when a deployment's actual
+    /// fallback-window tolerance is known to differ.
+    /// Default: `None` (use the built-in default)
     pub request_budget_override_secs: Option<u64>,
     /// Run all tools synchronously.  By default tools are async-first: ahma waits
     /// an adaptive inline window (SPEC R2.6.1) — longer when nothing else is
@@ -1753,10 +1753,11 @@ impl AhmaSettings {
             d.tools.await_timeout_secs.to_string(),
         );
         w.setting(
-            "Override the per-client single-request budget (SPEC R2.6.5) in \
+            "Override the fallback single-request budget (SPEC R2.6.5) in \
              seconds — how long ahma may hold one MCP request open before \
-             assuming the client stopped listening. 0 = unset, use the \
-             built-in per-client guess.",
+             assuming the client stopped listening, when there is no \
+             confirmed live channel to verify that directly. 0 = unset, use \
+             the built-in default.",
             "request_budget_override_secs",
             toml_opt_u64(self.tools.request_budget_override_secs),
             toml_opt_u64(d.tools.request_budget_override_secs),

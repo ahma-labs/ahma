@@ -92,10 +92,12 @@ pub struct AppConfig {
     /// Default timeout for the `await` tool in seconds. Override with the
     /// `--await-timeout` CLI flag or `tools.await_timeout_secs` in settings.toml.
     pub await_timeout_secs: u64,
-    /// Override for the SPEC R2.6.5 per-client single-request budget. `None`
-    /// means trust the built-in per-`clientInfo.name` guess. Override with the
-    /// `--request-budget-secs` CLI flag or `tools.request_budget_override_secs`
-    /// in settings.toml when that guess is wrong for your environment.
+    /// Override for the SPEC R2.6.5 fallback single-request budget — used
+    /// only when there is no confirmed live push channel to verify liveness
+    /// directly (SPEC R2.6.5.3). `None` means trust the built-in conservative
+    /// default. Override with the `--request-budget-secs` CLI flag or
+    /// `tools.request_budget_override_secs` in settings.toml when a
+    /// deployment's actual tolerance is known to differ.
     pub request_budget_override_secs: Option<u64>,
     /// Run all tools synchronously (AHMA_SYNC=1).
     pub force_sync: bool,
@@ -1137,10 +1139,11 @@ pub struct Cli {
     #[arg(long = "await-timeout", value_name = "SECS", global = true)]
     pub await_timeout: Option<u64>,
 
-    /// Override the per-client single-request budget (SPEC R2.6.5): how long
-    /// ahma may hold one MCP request open before assuming a client this
-    /// unrecognized/unmeasured has stopped listening. Use when the built-in
-    /// guess is wrong for your MCP client.
+    /// Override the fallback single-request budget (SPEC R2.6.5): how long
+    /// ahma may hold one MCP request open before assuming the client has
+    /// stopped listening, when there is no confirmed live push channel to
+    /// verify that directly (SPEC R2.6.5.3). Use when a deployment's actual
+    /// fallback-window tolerance is known to differ from the built-in default.
     #[arg(long = "request-budget-secs", value_name = "SECS", global = true)]
     pub request_budget_secs: Option<u64>,
 

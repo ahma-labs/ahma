@@ -107,13 +107,14 @@ mod tests {
             "The busy window must be the shorter one - that is the whole point"
         );
         // The idle window holds a `tools/call` open. It must fit inside the
-        // budget of the least tolerant client we know of, or the request that
-        // was supposed to save a round-trip kills the session instead.
-        let tightest = crate::client_type::McpClientType::Antigravity.request_budget();
+        // fallback request budget (SPEC R2.6.5) every client shares, or the
+        // request that was supposed to save a round-trip kills the session
+        // instead.
+        let fallback_budget = crate::client_type::McpClientType::Unknown.request_budget();
         assert!(
-            std::time::Duration::from_secs(INLINE_WINDOW_IDLE_SECS) < tightest,
-            "idle window {INLINE_WINDOW_IDLE_SECS}s must stay under the tightest \
-             client request budget {tightest:?}"
+            std::time::Duration::from_secs(INLINE_WINDOW_IDLE_SECS) < fallback_budget,
+            "idle window {INLINE_WINDOW_IDLE_SECS}s must stay under the fallback \
+             request budget {fallback_budget:?}"
         );
     }
 }
