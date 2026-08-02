@@ -1691,11 +1691,33 @@ impl AhmaMcpService {
         if self.adapter.sandbox().is_ready_for_tool_calls() {
             return Ok(());
         }
-        let error_message =
-            "Sandbox initializing from client roots - retry tools/call after roots/list completes"
-                .to_string();
+        // R5.2.3: with no scope to be had, refuse *with the remediation*. The old
+        // message said only "retry after roots/list completes", which is a lie to
+        // the client that most needs this error — one that already answered
+        // `roots/list` with `{"roots": []}` (R5.2.7) and will never send another.
+        // It waits, retries, and eventually leaves for an unsandboxed terminal.
+        let error_message = "ahma has no sandbox scope, so it will not run anything yet. \
+             If your editor is still opening a workspace this resolves by itself in a moment — \
+             retry once. If your client reports no workspace roots (Antigravity and LM Studio \
+             answer `roots/list` with an empty list), it never will, and one of these is \
+             needed: open a workspace folder in the client; or set `[sandbox] container_root = \
+             \"~/github\"` in ~/.ahma/settings.toml, naming the directory that holds your \
+             projects; or start ahma with `--sandbox-scope <project-dir>`. ahma does not pick \
+             a directory for you — running in one nobody chose is what this refusal exists to \
+             prevent."
+            .to_string();
         tracing::warn!("{}", error_message);
-        Err(handlers::common::mcp_internal(error_message))
+        Err(McpError::new(
+            rmcp::model::ErrorCode(-32001),
+            error_message,
+            Some(serde_json::json!({
+                "kind": "sandbox_scope_missing",
+                "roots_received": self.adapter.sandbox().roots_received(),
+                "remediation": "Open a workspace folder in the client, set `[sandbox] \
+                                container_root` in ~/.ahma/settings.toml, or start ahma with \
+                                `--sandbox-scope <project-dir>`.",
+            })),
+        ))
     }
 
     fn parse_llm_provider(

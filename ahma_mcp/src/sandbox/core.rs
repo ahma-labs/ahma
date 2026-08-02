@@ -189,6 +189,38 @@ fn is_in_temp_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve `path` for scope comparison: real canonicalization when it exists,
+/// lexical normalization otherwise, so `..` cannot walk out of a scope on a path
+/// that has not been created yet.
+fn resolve_for_scope_compare(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| scopes::normalize_path_lexically(path))
+}
+
+/// Whether `candidate` is `container` or lies under it, compared after
+/// resolution (SPEC R5.7: scope decisions hold after symlink resolution; and
+/// `Path::starts_with` is case-sensitive on Windows though the filesystem is
+/// not, so a raw `C:\users\...` would otherwise miss a canonical `C:\Users\...`).
+fn resolves_within(candidate: &Path, container: &Path) -> bool {
+    resolve_for_scope_compare(candidate).starts_with(resolve_for_scope_compare(container))
+}
+
+/// The name of the immediate child of `container` that `requested` lives in, or
+/// `None` when `requested` is the container itself or lies outside it.
+///
+/// A *name* rather than a full path because the caller has to apply it to every
+/// spelling of the container that is in scope, not just the canonical one.
+///
+/// The container itself deliberately selects nothing: a caller naming the
+/// container has not chosen a project, which is exactly the case R5.2.8 makes
+/// the command surfaces refuse outright.
+fn container_child_name(container: &Path, requested: &Path) -> Option<std::ffi::OsString> {
+    let container = resolve_for_scope_compare(container);
+    let requested = resolve_for_scope_compare(requested);
+
+    let relative = requested.strip_prefix(&container).ok()?;
+    Some(relative.components().next()?.as_os_str().to_os_string())
+}
+
 fn canonicalize_with_fallback(full_path: &Path) -> PathBuf {
     // Only use the parent-canonicalize shortcut when the last component is a
     // real name (not `..`).  If `file_name()` returns `None` the path ends in
@@ -254,6 +286,47 @@ pub struct Sandbox {
     /// ordering that the commit decision must not be reordered past the scopes
     /// write (SPEC R5.1 / R5.1.1 / R5.2.2).
     pub(super) scope_lock: super::scope_lock::ScopeLock,
+    /// The user's `[sandbox] container_root`, when it is what this session's
+    /// scope was derived from (SPEC R5.2.3). `None` for every other scope
+    /// source — an explicit scope and a client-reported root are already the
+    /// project, so there is nothing to narrow.
+    ///
+    /// Its presence is what arms [`narrow_container_to`](Self::narrow_container_to).
+    pub(super) container_root: Option<PathBuf>,
+    /// `Some` once the container has been narrowed, holding the child that won.
+    /// Narrowing happens at most once per session: the second call is a no-op,
+    /// so a later tool call naming a *different* project cannot re-point the
+    /// writable scope (R5.1.1 — one commit, never re-derived).
+    pub(super) narrowed_to: std::sync::RwLock<Option<PathBuf>>,
+}
+
+/// What [`Sandbox::narrow_container_to`] did, when it did something.
+///
+/// Returned rather than logged because narrowing is a scope decision, and SPEC
+/// R5.4 forbids communicating one only through an internal log line — the caller
+/// is expected to put this in front of the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerNarrowing {
+    /// The container that was granted, now read-only.
+    pub container: PathBuf,
+    /// The single immediate child that is now the writable scope.
+    pub child: PathBuf,
+}
+
+impl ContainerNarrowing {
+    /// The disclosure to append to the tool result that triggered the narrowing.
+    pub fn notice(&self) -> String {
+        format!(
+            "\n\nNote: this session's writable sandbox scope has been narrowed to `{child}` \
+             for the rest of the session. It started as your configured container root \
+             `{container}`, which spans every project under it; the first tool call naming a \
+             path selected the project. The rest of the container stays readable but is no \
+             longer writable, and this choice cannot be changed without restarting — a later \
+             call naming a different project will be denied, not re-scoped.",
+            child = self.child.display(),
+            container = self.container.display(),
+        )
+    }
 }
 
 impl Clone for Sandbox {
@@ -272,6 +345,8 @@ impl Clone for Sandbox {
             package_cache_write: self.package_cache_write,
             egress_proxy_addr: std::sync::RwLock::new(*self.egress_proxy_addr.read().unwrap()),
             scope_lock: self.scope_lock.clone(),
+            container_root: self.container_root.clone(),
+            narrowed_to: std::sync::RwLock::new(self.narrowed_to.read().unwrap().clone()),
         }
     }
 }
@@ -291,6 +366,8 @@ impl std::fmt::Debug for Sandbox {
             .field("livelog", &self.livelog)
             .field("package_cache_write", &self.package_cache_write)
             .field("scope_lock", &self.scope_lock)
+            .field("container_root", &self.container_root)
+            .field("narrowed_to", &self.narrowed_to.read().unwrap())
             .finish()
     }
 }
@@ -331,6 +408,8 @@ impl Sandbox {
             package_cache_write: true,
             egress_proxy_addr: std::sync::RwLock::new(None),
             scope_lock: super::scope_lock::ScopeLock::new(true),
+            container_root: None,
+            narrowed_to: std::sync::RwLock::new(None),
         })
     }
 
@@ -501,6 +580,104 @@ impl Sandbox {
     /// are user-chosen, so both arrive here as [`ScopeSource::Explicit`], which
     /// is the branch that keeps running rather than the declared default that
     /// refuses. Callers holding richer provenance should render that instead.
+    /// Record that this session's scope came from the user's container root
+    /// (SPEC R5.2.3), arming auto-narrowing (R5.2.6).
+    ///
+    /// `root` must already be canonicalized and must be one of the live scopes;
+    /// callers get it from the same resolution that seeded the scope.
+    #[must_use]
+    pub fn with_container_root(mut self, root: Option<PathBuf>) -> Self {
+        self.container_root = root;
+        self
+    }
+
+    /// The container root this session's scope was derived from, if any.
+    pub fn container_root(&self) -> Option<&PathBuf> {
+        self.container_root.as_ref()
+    }
+
+    /// The child the container was narrowed to, once it has been.
+    pub fn narrowed_to(&self) -> Option<PathBuf> {
+        self.narrowed_to.read().unwrap().clone()
+    }
+
+    /// Narrow a container-root scope to the one project subtree `requested`
+    /// lives in (SPEC R5.2.6). Returns `Some` only on the call that actually
+    /// narrows, so the caller can disclose it exactly once.
+    ///
+    /// **Why a derived path is allowed to decide this.** `requested` comes from
+    /// tool-call input and is therefore attacker-influenceable, which R5.2.1
+    /// otherwise forbids as a scope signal. It is safe here because it can only
+    /// ever *narrow*: the container is a directory the user already authorized,
+    /// and every candidate this function accepts is a subtree of it. A derived
+    /// signal still may not establish or widen a scope — only choose within one
+    /// already granted.
+    ///
+    /// **Why narrowing matters at all.** A container that matches how people
+    /// actually work (`~/github`) spans every repository they own. Left whole, an
+    /// injected prompt could drop a `.git/hooks/post-checkout` into an unrelated
+    /// project — persistence, not merely data loss. Narrowing bounds that to one
+    /// project while leaving the rest of the container readable, which is what
+    /// keeps cross-project reference lookups working.
+    ///
+    /// Returns `None` — deliberately, not an error — when there is nothing to do:
+    /// no container root, already narrowed, or `requested` is outside the
+    /// container. The last case is not this function's to reject; it is an
+    /// ordinary out-of-scope path and [`validate_path`](Self::validate_path)
+    /// gives it the error message it deserves.
+    pub fn narrow_container_to(&self, requested: &Path) -> Option<ContainerNarrowing> {
+        let container = self.container_root.clone()?;
+        // Cheap pre-check outside the write lock; re-checked under it below.
+        if self.narrowed_to.read().unwrap().is_some() {
+            return None;
+        }
+
+        let child_name = container_child_name(&container, requested)?;
+        let child = container.join(&child_name);
+
+        let mut narrowed = self.narrowed_to.write().unwrap();
+        // Two concurrent first tool calls both pass the pre-check; the one that
+        // gets here second must not re-point the scope (R5.1.1).
+        if narrowed.is_some() {
+            return None;
+        }
+
+        {
+            let mut scopes = self.scopes.write().unwrap();
+            // `canonicalize_scopes` deliberately keeps both the canonical path
+            // and its pre-symlink alias (`/private/var/...` and `/var/...` on
+            // macOS) so either spelling validates. Narrowing has to replace
+            // *every* spelling of the container with the same spelling of the
+            // child, or the alias would silently keep the whole container
+            // writable. Anything else in the set — persistent grants, scratch,
+            // `--tmp` — is not part of the container and survives untouched.
+            let (container_aliases, mut kept): (Vec<PathBuf>, Vec<PathBuf>) = scopes
+                .drain(..)
+                .partition(|s| resolves_within(s, &container));
+            let mut narrowed_scopes: Vec<PathBuf> = container_aliases
+                .into_iter()
+                .map(|alias| alias.join(&child_name))
+                .collect();
+            narrowed_scopes.append(&mut kept);
+            *scopes = narrowed_scopes;
+        }
+        {
+            let mut reads = self.read_scopes.write().unwrap();
+            if !reads.contains(&container) {
+                reads.push(container.clone());
+            }
+        }
+        *narrowed = Some(child.clone());
+
+        tracing::info!(
+            container = %container.display(),
+            child = %child.display(),
+            "Narrowed the container-root scope to the project subtree in use (SPEC R5.2.6); \
+             the remainder of the container is now read-only"
+        );
+        Some(ContainerNarrowing { container, child })
+    }
+
     pub fn scope_source(&self) -> ScopeSource {
         if self.has_explicit_scopes() {
             ScopeSource::Explicit

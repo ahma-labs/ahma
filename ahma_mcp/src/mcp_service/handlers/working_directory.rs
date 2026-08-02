@@ -15,7 +15,7 @@
 //! surface binds all of them" convention exists to prevent.
 
 use super::common;
-use crate::sandbox::{Sandbox, ScopeSource};
+use crate::sandbox::{ContainerNarrowing, Sandbox, ScopeSource};
 use rmcp::model::{CallToolResult, ErrorData as McpError};
 use serde_json::{Map, Value};
 
@@ -28,6 +28,9 @@ pub struct WorkingDirectory {
     /// `Some(notice)` when ahma chose [`path`](Self::path) because the call
     /// omitted `working_directory`; `None` when the caller supplied it.
     substitution_notice: Option<String>,
+    /// `Some` when this call was the one that narrowed a container-root scope
+    /// (SPEC R5.2.6). Also a scope decision, so it is disclosed the same way.
+    narrowing: Option<ContainerNarrowing>,
 }
 
 impl WorkingDirectory {
@@ -36,6 +39,7 @@ impl WorkingDirectory {
         Self {
             path,
             substitution_notice: None,
+            narrowing: None,
         }
     }
 
@@ -45,15 +49,31 @@ impl WorkingDirectory {
         Self {
             path,
             substitution_notice: Some(notice),
+            narrowing: None,
         }
     }
 
-    /// Attach the substitution disclosure to a successful result.
+    /// Record that resolving this directory also narrowed the session's scope.
+    fn with_narrowing(mut self, narrowing: Option<ContainerNarrowing>) -> Self {
+        self.narrowing = narrowing;
+        self
+    }
+
+    /// Every scope decision this resolution made, in the order the reader needs
+    /// them: where the command ran, then what that did to the sandbox.
+    fn notices(&self) -> Vec<String> {
+        self.substitution_notice
+            .iter()
+            .cloned()
+            .chain(self.narrowing.iter().map(ContainerNarrowing::notice))
+            .collect()
+    }
+
+    /// Attach the scope disclosures to a successful result.
     pub fn disclose(&self, result: CallToolResult) -> CallToolResult {
-        match &self.substitution_notice {
-            Some(notice) => common::append_note(result, notice),
-            None => result,
-        }
+        self.notices()
+            .iter()
+            .fold(result, |acc, notice| common::append_note(acc, notice))
     }
 
     /// Attach the substitution disclosure to a *failure*. This is the case the
@@ -62,12 +82,13 @@ impl WorkingDirectory {
     /// somewhere the caller never named. The error is the only thing the model
     /// sees, so the directory has to be in it.
     pub fn disclose_error(&self, error: McpError) -> McpError {
-        let Some(notice) = &self.substitution_notice else {
+        let notices = self.notices();
+        if notices.is_empty() {
             return error;
-        };
+        }
         McpError {
             code: error.code,
-            message: format!("{}{}", error.message, notice).into(),
+            message: format!("{}{}", error.message, notices.concat()).into(),
             data: error.data,
         }
     }
@@ -82,6 +103,12 @@ impl WorkingDirectory {
     #[cfg(test)]
     pub(crate) fn substitution_notice(&self) -> Option<&str> {
         self.substitution_notice.as_deref()
+    }
+
+    /// The narrowing this resolution performed, if any.
+    #[cfg(test)]
+    pub(crate) fn narrowing(&self) -> Option<&ContainerNarrowing> {
+        self.narrowing.as_ref()
     }
 }
 
@@ -98,7 +125,11 @@ pub fn resolve(
     args: &Map<String, Value>,
 ) -> Result<WorkingDirectory, McpError> {
     if let Some(supplied) = common::opt_str(args, "working_directory") {
-        return Ok(WorkingDirectory::supplied(supplied));
+        // R5.2.6: the working directory is the signal that selects which subtree
+        // of a container root becomes writable. Narrowing before the command runs
+        // is what makes the choice binding on this very call, not the next one.
+        let narrowing = sandbox.narrow_container_to(std::path::Path::new(&supplied));
+        return Ok(WorkingDirectory::supplied(supplied).with_narrowing(narrowing));
     }
 
     let source = sandbox.scope_source();
@@ -244,6 +275,151 @@ mod tests {
         let sb = default_scope_sandbox(scope);
         sb.set_roots_received(true);
         sb
+    }
+
+    /// A sandbox scoped to a container root holding two sibling projects, armed
+    /// for auto-narrowing (SPEC R5.2.6).
+    fn container_sandbox(container: &std::path::Path) -> Sandbox {
+        std::fs::create_dir_all(container.join("proj-a")).unwrap();
+        std::fs::create_dir_all(container.join("proj-b")).unwrap();
+        let canonical = dunce::canonicalize(container).unwrap();
+        default_scope_sandbox(container).with_container_root(Some(canonical))
+    }
+
+    /// The narrowing signal comes from the supplied `working_directory`, and the
+    /// call that provides it is the one that gets told (R5.4).
+    #[test]
+    fn supplied_directory_narrows_the_container_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = container_sandbox(dir.path());
+        let project = dunce::canonicalize(dir.path()).unwrap().join("proj-a");
+
+        let wd = resolve(
+            &sb,
+            "cargo",
+            &args_with_dir(&project.join("src").to_string_lossy()),
+        )
+        .unwrap();
+
+        let narrowing = wd.narrowing().expect("first path-bearing call narrows");
+        assert_eq!(narrowing.child, project, "narrows to the immediate child");
+        assert_eq!(sb.narrowed_to(), Some(project.clone()));
+        let writable = sb.scopes().to_vec();
+        assert!(
+            writable.contains(&project),
+            "the chosen project must be writable: {writable:?}"
+        );
+        // Every spelling the sandbox keeps (macOS keeps the `/var` alias beside
+        // the canonical `/private/var`) must point at the child, not the container.
+        assert!(
+            writable
+                .iter()
+                .all(|s| s.file_name() == project.file_name()),
+            "the container itself must no longer be writable: {writable:?}"
+        );
+        assert!(
+            sb.read_scopes()
+                .contains(&dunce::canonicalize(dir.path()).unwrap()),
+            "the rest of the container stays readable: {:?}",
+            sb.read_scopes()
+        );
+
+        let text = wd.disclose(common::text_result("ok"));
+        let ContentBlock::Text(block) = text.content.last().unwrap() else {
+            panic!("expected text content");
+        };
+        assert!(block.text.contains("narrowed"), "{}", block.text);
+        assert!(block.text.contains("proj-a"), "{}", block.text);
+    }
+
+    /// Narrowing happens once. A later call naming a sibling project must not
+    /// re-point the writable scope — R5.1.1 allows exactly one commit, and a
+    /// second narrowing driven by tool input would be a scope change mid-session.
+    #[test]
+    fn second_call_naming_a_sibling_does_not_re_narrow() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = container_sandbox(dir.path());
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        let first = resolve(
+            &sb,
+            "cargo",
+            &args_with_dir(&root.join("proj-a").to_string_lossy()),
+        )
+        .unwrap();
+        assert!(first.narrowing().is_some());
+
+        let second = resolve(
+            &sb,
+            "cargo",
+            &args_with_dir(&root.join("proj-b").to_string_lossy()),
+        )
+        .unwrap();
+        assert!(
+            second.narrowing().is_none(),
+            "a session narrows at most once"
+        );
+        let writable = sb.scopes().to_vec();
+        assert!(writable.contains(&root.join("proj-a")));
+        assert!(
+            !writable.iter().any(|s| s.ends_with("proj-b")),
+            "the sibling must never become writable: {writable:?}"
+        );
+    }
+
+    /// The container itself is not a project. Naming it selects nothing, so
+    /// nothing narrows — and R5.2.8's refusal covers the omitted-directory case.
+    #[test]
+    fn naming_the_container_itself_narrows_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = container_sandbox(dir.path());
+        let root = dunce::canonicalize(dir.path()).unwrap();
+
+        let wd = resolve(&sb, "cargo", &args_with_dir(&root.to_string_lossy())).unwrap();
+        assert!(wd.narrowing().is_none());
+        assert_eq!(sb.narrowed_to(), None);
+    }
+
+    /// A path outside the container is not this code's to reject: it narrows
+    /// nothing and leaves the scope alone, so `validate_path` still produces the
+    /// out-of-scope error with the message it deserves.
+    #[test]
+    fn a_path_outside_the_container_narrows_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let sb = container_sandbox(dir.path());
+        let before = sb.scopes().to_vec();
+
+        let wd = resolve(
+            &sb,
+            "cargo",
+            &args_with_dir(&elsewhere.path().to_string_lossy()),
+        )
+        .unwrap();
+
+        assert!(wd.narrowing().is_none());
+        assert_eq!(sb.scopes().to_vec(), before, "scope must be untouched");
+    }
+
+    /// Narrowing is armed only for a container-root scope. A client-reported or
+    /// operator-chosen scope is already the project, and shrinking it would take
+    /// away something the user actually asked for.
+    #[test]
+    fn a_roots_scope_is_never_narrowed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        let sb = roots_sandbox(dir.path());
+        let before = sb.scopes().to_vec();
+
+        let wd = resolve(
+            &sb,
+            "cargo",
+            &args_with_dir(&dir.path().join("sub").to_string_lossy()),
+        )
+        .unwrap();
+
+        assert!(wd.narrowing().is_none());
+        assert_eq!(sb.scopes().to_vec(), before);
     }
 
     #[test]

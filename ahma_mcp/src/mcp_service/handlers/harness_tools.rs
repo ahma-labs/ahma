@@ -164,10 +164,14 @@ impl AhmaMcpService {
         let peer = self.peer.read().unwrap().clone();
         let elicited: Option<WebApprovalDecision> = match peer {
             None => None,
+            // SPEC R5.3.1 binds *every* elicitation, not just the scope one: wait
+            // no longer than this client leaves a dialog up, or the client cancels
+            // the prompt out from under us and we learn nothing from a deadline it
+            // never disclosed.
             Some(peer) => match peer
                 .elicit_with_timeout::<WebApprovalForm>(
                     prompt_message(domain, url),
-                    Some(std::time::Duration::from_secs(120)),
+                    Some(crate::client_type::McpClientType::from_peer(&peer).elicitation_budget()),
                 )
                 .await
             {
@@ -364,13 +368,14 @@ impl AhmaMcpService {
             return Err(mcp_internal(err_msg));
         }
 
+        let narrowing = self.narrow_container_for(path_ref);
         let scopes = self.adapter.sandbox().scopes().to_vec();
         self.file_ops_provider
             .write_file(&scopes, path_ref, content)
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
 
-        Ok(text_result("File written"))
+        Ok(disclose_narrowing(text_result("File written"), narrowing))
     }
 
     pub async fn handle_replace_in_file(
@@ -390,6 +395,7 @@ impl AhmaMcpService {
             .and_then(Value::as_str)
             .ok_or_else(|| mcp_invalid_params("'new_str' is required"))?;
 
+        let narrowing = self.narrow_container_for(Path::new(path));
         let scopes = self.adapter.sandbox().scopes().to_vec();
         let replaced = self
             .file_ops_provider
@@ -397,7 +403,33 @@ impl AhmaMcpService {
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
 
-        Ok(text_result(format!("Replaced {replaced} occurrence(s)")))
+        Ok(disclose_narrowing(
+            text_result(format!("Replaced {replaced} occurrence(s)")),
+            narrowing,
+        ))
+    }
+
+    /// Select the container subtree this write is for, before the write happens
+    /// (SPEC R5.2.6).
+    ///
+    /// The *write* tools carry this and the read tools do not, deliberately.
+    /// Narrowing exists to bound where the AI can write; reads across the whole
+    /// container stay allowed, and letting a read pick the project would let an
+    /// incidental lookup spend the one narrowing the session gets.
+    fn narrow_container_for(&self, path: &Path) -> Option<crate::sandbox::ContainerNarrowing> {
+        self.adapter.sandbox().narrow_container_to(path)
+    }
+}
+
+/// Append the scope-narrowing disclosure to a result (SPEC R5.4: a scope
+/// decision is never communicated only through a log line).
+fn disclose_narrowing(
+    result: CallToolResult,
+    narrowing: Option<crate::sandbox::ContainerNarrowing>,
+) -> CallToolResult {
+    match narrowing {
+        Some(n) => super::common::append_note(result, &n.notice()),
+        None => result,
     }
 }
 

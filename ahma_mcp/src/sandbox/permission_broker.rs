@@ -22,13 +22,19 @@
 //! 3. **Nobody** — fail closed, loudly, with a command the user can paste. This
 //!    rung always exists, which is what makes the whole ladder safe to rely on.
 //!
-//! ## Demotion: a broken surface, not a "no"
+//! ## Demotion: a broken surface, not a "no" and not a silence
 //!
-//! An elicitation that **times out or errors** demotes the harness for the rest of
-//! the session — one strike — and later questions skip to rung 2. A **decline does
-//! not**: a decline is a working surface saying no, and treating it as a fault
-//! would teach the system to abandon a perfectly good surface the moment a user
-//! exercises it. That distinction is the whole of [`ElicitOutcome`].
+//! Only an elicitation that **errors** — the transport broke, or the answer would
+//! not parse — demotes the harness for the rest of the session (one strike), after
+//! which questions skip to rung 2.
+//!
+//! Two things deliberately do *not* demote. A **decline** is a working surface
+//! saying no, and punishing it would teach the system to abandon a perfectly good
+//! surface the moment a user exercises it. A **dismissal** — the MCP `cancel`
+//! action, or our own wait expiring — is nobody's decision at all: clients cancel
+//! on their own undisclosed deadlines with no human involved, so it is neither
+//! consent nor evidence of a fault. Those three-way distinctions are the whole of
+//! [`ElicitOutcome`].
 //!
 //! ## What the broker will not do
 //!
@@ -54,8 +60,9 @@ use super::grant_channel::{ScopeGrantNotifier, runtime_denial_remediation_cli};
 
 /// What happened when we asked the harness (rung 1).
 ///
-/// The three variants exist to separate "the user said no" from "we could not
-/// ask" — a distinction that decides whether the surface is still trustworthy.
+/// The variants exist to separate "the user said no" from "nobody answered" from
+/// "we could not ask" — distinctions that decide whether a decision was made and
+/// whether the surface is still trustworthy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ElicitOutcome {
     /// The human answered. A decline is an *answer*: it resolves the question and
@@ -65,9 +72,20 @@ pub enum ElicitOutcome {
     /// advertised the `elicitation` capability. Not a fault, so no demotion; we
     /// simply move down the ladder.
     Unavailable,
-    /// The ask *failed*: it timed out, was cancelled, or the transport broke. This
-    /// is the only outcome that demotes the harness, because it is the only one
-    /// that tells us the surface does not work.
+    /// The prompt closed without an answer: the MCP `cancel` action, an accept
+    /// carrying no content, or ahma's own wait expiring.
+    ///
+    /// This is **not** a denial and **not** a fault (SPEC R5.3.1). `cancel` means
+    /// "dismissed without an explicit choice", and a client produces it on its
+    /// *own* undisclosed deadline with no human involved — Antigravity was
+    /// measured cancelling at 60.005s. Recording that as a user's "no" would
+    /// invent consent-shaped data out of a timeout; recording it as a fault
+    /// would demote a perfectly working surface because a user walked away.
+    /// So: no demotion, no decision, fall through the ladder (R5.3.2).
+    Dismissed(String),
+    /// The ask *failed*: the transport broke, or the response could not be
+    /// parsed. This is the only outcome that demotes the harness, because it is
+    /// the only one that tells us the surface does not work.
     Failed(String),
 }
 
@@ -87,7 +105,8 @@ enum HarnessState {
     Untried,
     /// It answered at least once — it works.
     Proven,
-    /// It timed out or errored. Skip it for the rest of the session (one strike).
+    /// It errored — broken transport, unparseable answer. Skip it for the rest of
+    /// the session (one strike). A decline or a dismissal never lands here.
     Demoted,
 }
 
@@ -194,6 +213,19 @@ impl PermissionBroker {
                             "The MCP client could not be asked for permission ({why}); it will \
                              not be asked again this session. Falling back to the ahma TUI, or \
                              to a failed operation with instructions."
+                        );
+                    }
+                    ElicitOutcome::Dismissed(why) => {
+                        // Neither an answer nor a fault (R5.3.1). The surface
+                        // stays trusted — a client that cancels on its own
+                        // deadline, or a user who walked away, has not proved it
+                        // broken — and nothing is recorded as a decision, so the
+                        // next question for this path is still asked (R5.4.7
+                        // binds *decided* outcomes only).
+                        tracing::warn!(
+                            path = %req.path.display(),
+                            "The permission prompt closed without an answer ({why}). This is not \
+                             a denial: asking elsewhere, and the client will be asked again."
                         );
                     }
                     ElicitOutcome::Unavailable => {
@@ -384,16 +416,12 @@ impl ScopeGrantNotifier for PermissionBroker {
 #[derive(Debug)]
 pub struct PeerElicitationSurface {
     peer: Arc<RwLock<Option<rmcp::service::Peer<rmcp::service::RoleServer>>>>,
-    timeout: std::time::Duration,
 }
 
 impl PeerElicitationSurface {
     /// Wrap the service's peer slot as an asking surface.
     pub fn new(peer: Arc<RwLock<Option<rmcp::service::Peer<rmcp::service::RoleServer>>>>) -> Self {
-        Self {
-            peer,
-            timeout: std::time::Duration::from_secs(120),
-        }
+        Self { peer }
     }
 }
 
@@ -418,15 +446,21 @@ impl ElicitationSurface for PeerElicitationSurface {
             return ElicitOutcome::Unavailable;
         };
 
+        // SPEC R5.3.1: bound the wait by *this* client's patience, so ahma is the
+        // one that resolves the prompt. A flat 120s here is what let Antigravity
+        // cancel at 60.005s and get the harness demoted for a deadline it never
+        // disclosed.
+        let timeout = crate::client_type::McpClientType::from_peer(&peer).elicitation_budget();
+
         let message = prompt_text(req);
         match peer
-            .elicit_with_timeout::<GrantForm>(message, Some(self.timeout))
+            .elicit_with_timeout::<GrantForm>(message, Some(timeout))
             .await
         {
             Ok(Some(form)) => ElicitOutcome::Answered(parse_decision(&form.decision)),
-            // Accepted with no content, or an explicit decline — both are the human
-            // saying no. An answer, not a fault: the surface stays trusted.
-            Ok(None) | Err(rmcp::service::ElicitationError::UserDeclined) => {
+            // An explicit decline is the human saying no. An answer, not a fault:
+            // the surface stays trusted.
+            Err(rmcp::service::ElicitationError::UserDeclined) => {
                 ElicitOutcome::Answered(GrantDecision::Deny)
             }
             // The client cannot elicit at all. Nothing to demote — there was never
@@ -434,7 +468,21 @@ impl ElicitationSurface for PeerElicitationSurface {
             Err(rmcp::service::ElicitationError::CapabilityNotSupported) => {
                 ElicitOutcome::Unavailable
             }
-            // Timed out, cancelled, or the transport broke: the surface is unusable.
+            // Dismissed rather than decided (R5.3.1). `cancel` is what a client
+            // sends when *it* gives up, with no human involved, so it is neither
+            // consent nor a denial; an accept with no content is an answer we
+            // cannot read, which is not consent either; and our own wait expiring
+            // means a human was slow, not that the surface is broken.
+            Ok(None)
+            | Err(rmcp::service::ElicitationError::UserCancelled)
+            | Err(rmcp::service::ElicitationError::NoContent) => {
+                ElicitOutcome::Dismissed("cancelled or dismissed without a choice".to_string())
+            }
+            Err(rmcp::service::ElicitationError::Service(
+                rmcp::service::ServiceError::Timeout { timeout },
+            )) => ElicitOutcome::Dismissed(format!("no answer within {timeout:?}")),
+            // The transport broke, or the answer would not parse: the surface is
+            // genuinely unusable, which is the one case that demotes it.
             Err(e) => ElicitOutcome::Failed(e.to_string()),
         }
     }
@@ -664,9 +712,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_timeout_demotes_the_harness_and_the_question_falls_to_the_tui() {
+    async fn a_broken_surface_demotes_the_harness_and_the_question_falls_to_the_tui() {
         let h = ScriptedHarness::new(vec![
-            ElicitOutcome::Failed("timed out".into()),
+            ElicitOutcome::Failed("transport closed".into()),
             ElicitOutcome::Answered(GrantDecision::GrantRw),
         ]);
         let (broker, mut rx) = broker_with(Some(h.clone()), true);
@@ -685,12 +733,45 @@ mod tests {
         assert_eq!(
             h.asks(),
             1,
-            "one strike: a harness that timed out is not retried this session"
+            "one strike: a harness whose transport broke is not retried this session"
         );
         let second = rx
             .try_recv()
             .expect("the second question also goes to the TUI");
         assert_eq!(second.path, PathBuf::from("/opt/two"));
+    }
+
+    /// SPEC R5.3.1: a `cancel` is not a user's answer and not a broken surface.
+    ///
+    /// REGRESSION: clients cancel on their *own* undisclosed deadline —
+    /// Antigravity was measured at 60.005s against ahma's flat 120s wait — so
+    /// treating a cancel as a fault demoted a working surface for a timeout no
+    /// human was party to, and treating it as a denial would have invented
+    /// consent-shaped data out of nothing.
+    #[tokio::test]
+    async fn a_dismissal_neither_decides_nor_demotes() {
+        let h = ScriptedHarness::new(vec![
+            ElicitOutcome::Dismissed("cancelled".into()),
+            ElicitOutcome::Answered(GrantDecision::GrantRw),
+        ]);
+        let (broker, mut rx) = broker_with(Some(h.clone()), true);
+        let rx = rx.as_mut().unwrap();
+
+        violate(&broker, "/opt/one").await;
+        assert_eq!(h.asks(), 1);
+        assert_eq!(
+            rx.try_recv().expect("falls through to the TUI").path,
+            PathBuf::from("/opt/one"),
+            "a dismissal must reach the out-of-band path (R5.3.2)"
+        );
+
+        // The surface is still trusted: a second question is still put to it.
+        violate(&broker, "/opt/two").await;
+        assert_eq!(h.asks(), 2, "a dismissal must not demote a working harness");
+        assert!(
+            rx.try_recv().is_err(),
+            "the second question was answered at the harness, not forwarded"
+        );
     }
 
     #[tokio::test]

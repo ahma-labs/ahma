@@ -134,11 +134,83 @@ impl McpClientType {
             }
         }
     }
+
+    /// How long ahma may leave an `elicitation/create` prompt open for this
+    /// client before the client cancels it out from under us (SPEC R5.3.1).
+    ///
+    /// Separate from [`request_budget`](Self::request_budget) because the two
+    /// deadlines are unrelated: a tool call is bounded by how long the client
+    /// will wait on a *response*, while an elicitation is bounded by how long it
+    /// will leave a *dialog* up. A human needs far longer to read a path and
+    /// choose than a `tools/call` is allowed to take, so reusing the request
+    /// budget here would give an answering user seconds and guarantee timeouts.
+    ///
+    /// Antigravity's 60s is measured: in a captured session it cancelled an
+    /// `elicitation/create` at 60.005s while ahma's broker was still waiting on
+    /// its own flat 120s. The client resolved the prompt, ahma recorded a
+    /// failure, and the harness was demoted for the rest of the session over a
+    /// deadline it had never disclosed. Each budget below is therefore set
+    /// **strictly under** the client's own, so ahma is the one that resolves the
+    /// prompt.
+    pub fn elicitation_budget(&self) -> std::time::Duration {
+        use std::time::Duration;
+        match self {
+            // No observed client-side cancellation; a human gets two minutes.
+            McpClientType::Ahma
+            | McpClientType::ClaudeDesktop
+            | McpClientType::Cursor
+            | McpClientType::VSCode
+            | McpClientType::Zed => Duration::from_secs(120),
+            // Measured cancelling at 60.005s — stay comfortably inside it.
+            McpClientType::Antigravity => Duration::from_secs(45),
+            // Unmeasured: assume the shortest deadline we have seen anywhere.
+            McpClientType::LmStudio | McpClientType::Ollama | McpClientType::Unknown => {
+                Duration::from_secs(45)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC R5.3.1: the elicitation wait must be strictly under the client's own
+    /// undisclosed deadline. Antigravity's is measured at 60.005s; anything at or
+    /// above it lets the client resolve the prompt out from under ahma, which is
+    /// the failure that demoted a working surface for the rest of the session.
+    #[test]
+    fn elicitation_budgets_stay_under_the_measured_client_deadline() {
+        const ANTIGRAVITY_MEASURED_CANCEL: std::time::Duration =
+            std::time::Duration::from_millis(60_005);
+
+        for client in [
+            McpClientType::Antigravity,
+            McpClientType::LmStudio,
+            McpClientType::Ollama,
+            McpClientType::Unknown,
+        ] {
+            let budget = client.elicitation_budget();
+            assert!(
+                budget < ANTIGRAVITY_MEASURED_CANCEL,
+                "{client:?} waits {budget:?}, which is not under the only client \
+                 deadline we have actually measured"
+            );
+        }
+    }
+
+    /// The two budgets are deliberately independent: an elicitation is bounded by
+    /// how long a client leaves a *dialog* up, a tool call by how long it waits
+    /// for a *response*. Reusing the request budget would give an answering human
+    /// Antigravity's 20 seconds and guarantee timeouts.
+    #[test]
+    fn elicitation_budget_is_not_the_request_budget() {
+        assert!(
+            McpClientType::Antigravity.elicitation_budget()
+                > McpClientType::Antigravity.request_budget(),
+            "a human needs longer to answer a prompt than a tool call may take"
+        );
+    }
 
     #[test]
     fn test_ahma_detection() {

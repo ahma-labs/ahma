@@ -61,7 +61,11 @@ const MUST_BE_GATED: &[&str] = &[
     "grep_search",
 ];
 
-const GATE_MESSAGE: &str = "Sandbox initializing";
+/// A stable fragment of the gate refusal. Matched as prose because the gate is
+/// reached through `CallToolResult`/`ErrorData`, where the structured `data`
+/// payload is not what `to_string()` renders. The refusal itself is asserted in
+/// full — code and payload — by the unit tests in `mcp_service`.
+const GATE_MESSAGE: &str = "ahma has no sandbox scope";
 
 fn budget() -> Duration {
     TestTimeouts::scale_secs(30)
@@ -180,6 +184,42 @@ async fn every_advertised_tool_is_gated_unless_it_is_the_control_surface() -> Re
                 }
             );
         }
+    }
+
+    let _ = mcp.client.cancel().await;
+    Ok(())
+}
+
+/// The refusal has to be *actionable*, not just present (SPEC R5.2.3).
+///
+/// REGRESSION: it used to say only "retry tools/call after roots/list completes",
+/// which is a lie told to the client that most needs it — one that already
+/// answered `roots/list` with an empty list and will never send another. It
+/// retries, gets the same line, and eventually abandons ahma for an unsandboxed
+/// terminal, which is exactly what happened.
+#[tokio::test]
+async fn the_gate_refusal_names_the_remediation() -> Result<()> {
+    init_test_logging();
+    let temp = tempfile::tempdir()?;
+    let mcp = server_without_a_settled_scope(&temp.path().join("bridge.sock")).await?;
+
+    let params =
+        CallToolRequestParams::new("run_terminal_command".to_string()).with_arguments(Map::new());
+    let error = tokio::time::timeout(budget(), mcp.client.call_tool(params))
+        .await
+        .expect("the gate must answer, not hang")
+        .expect_err("an unsettled scope must refuse");
+
+    let rendered = error.to_string();
+    for expected in [
+        "container_root",   // the setting that fixes it for a roots-empty client
+        "--sandbox-scope",  // the per-session alternative
+        "workspace folder", // the fix when the client simply has none open yet
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "the refusal must name {expected:?}; got: {rendered}"
+        );
     }
 
     let _ = mcp.client.cancel().await;

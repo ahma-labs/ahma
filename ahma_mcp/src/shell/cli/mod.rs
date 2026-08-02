@@ -703,9 +703,20 @@ fn create_sandbox_instance(
     let explicit_scopes =
         cfg.task_vault.is_some() || !cfg.sandbox_scopes.is_empty() || !cfg.working_dirs.is_empty();
 
-    // When --sandbox is set, canonicalize ~/sandbox and record it as the
-    // persistent secondary scope that survives every roots/list update.
-    let sandbox_dir = resolve_persistent_scratch_dir(cfg);
+    // When --scratch is set, canonicalize the configured scratch directory and
+    // record it as the persistent secondary scope that survives every roots/list
+    // update.
+    let scratch_dir = resolve_persistent_scratch_dir(cfg);
+
+    // SPEC R5.2.6: a scope that came from the container root is armed for
+    // auto-narrowing. Only when it is *actually* the source — an explicit scope
+    // or a client-reported root is already the project, so there is nothing to
+    // narrow, and marking one would wrongly shrink a scope the user chose.
+    let container_root = (!explicit_scopes)
+        .then_some(cfg.container_root.as_ref())
+        .flatten()
+        .and_then(|root| ahma_common::config::ensure_sandbox_directory(root).ok())
+        .filter(|root| scopes.contains(root));
 
     // User-granted persistent scopes (e.g. an sccache cache outside the workspace).
     // Folded into the sandbox now (so initial enforcement covers them) and
@@ -722,7 +733,8 @@ fn create_sandbox_instance(
     )
     .context("Failed to initialize sandbox")?
     .with_explicit_scopes(explicit_scopes)
-    .with_scratch_dir(sandbox_dir)
+    .with_container_root(container_root)
+    .with_scratch_dir(scratch_dir)
     .with_persistent_scopes(persistent_write_scopes, persistent_read_scopes)
     .with_package_cache_write(cfg.package_cache_write);
 

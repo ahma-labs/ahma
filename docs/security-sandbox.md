@@ -24,14 +24,24 @@ The sandbox scope is the root directory boundary for all filesystem operations:
 
 There is **no** sixth source and no invented directory. With none of the five available, ahma refuses tool calls and says how to fix it — it does not pick somewhere to run. (It used to: `sandbox_directory` defaulted to an auto-created `~/sandbox`, so a client reporting no roots silently locked there and every command failed with an ordinary-looking shell error such as `fatal: not a git repository`.)
 
-The container root is the directory that holds the projects you work on. ahma never locks it whole: the writable scope narrows to the single immediate child the session actually touches, and the rest of the container stays read-only, so an injected prompt cannot write into an unrelated repository. It is deliberately settable **only** in your own `~/.ahma/settings.toml` — never in a client-owned `mcp.json`, which is precisely where an over-broad path would be planted.
+### Container root and auto-narrowing
+
+The container root is the directory that holds the projects you work on. It is deliberately settable **only** in your own `~/.ahma/settings.toml` — never in a client-owned `mcp.json`, which is precisely where an over-broad path would be planted.
 
 ```toml
 [sandbox]
 container_root = "~/github"     # no default; unset means "refuse rather than guess"
 ```
 
-**Security invariant**: Once the sandbox scope is set, it cannot be changed for the lifetime of the server process. Any attempt to change it after lock terminates the session.
+ahma never locks the container whole. The first tool call that names a path — a command's `working_directory`, or the target of `write_file`/`replace_in_file` — selects the project, and the writable scope narrows to that one immediate child for the rest of the session. The rest of the container stays **readable but not writable**, so cross-project lookups keep working while an injected prompt cannot drop a `.git/hooks/post-checkout` into an unrelated repository. That is persistence, not merely data loss, which is why the container is not left whole.
+
+Consequences worth knowing:
+
+- **A command with no `working_directory` is refused, not guessed.** The container spans every project, so there is nothing safe to substitute — and the working directory is also the signal that selects what to narrow to.
+- **Narrowing happens once.** A later call naming a sibling project is denied rather than re-scoped. To reach a second project, restart, or grant it explicitly with `ahma sandbox grant <path>`.
+- **Reads never narrow.** Only write-capable surfaces select the project, so an incidental lookup cannot spend the session's one narrowing.
+
+**Security invariant**: Once the sandbox scope is set, it cannot be *widened* for the lifetime of the server process. Any attempt to change it after lock is rejected at the single commit point. Auto-narrowing is the one sanctioned exception in the other direction, and only ever within a container the user already authorized.
 
 ## Platform-Specific Enforcement
 
