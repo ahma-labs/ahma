@@ -685,6 +685,14 @@ pub struct ToolSettings {
     /// Default: [`DEFAULT_AWAIT_TIMEOUT_SECS`] (9 minutes)
     #[serde(default = "default_await_timeout_secs")]
     pub await_timeout_secs: u64,
+    /// Override for the per-client single-request budget (SPEC R2.6.5): how long
+    /// ahma may hold one MCP request open before assuming this client has stopped
+    /// listening. Unset means "trust the built-in per-`clientInfo.name` guess".
+    /// Set this when that guess is wrong for your environment — e.g. a client
+    /// ahma doesn't recognize (and so conservatively budgets at 20s) that you
+    /// know tolerates long-running `await` calls just fine.
+    /// Default: `None` (use the built-in table)
+    pub request_budget_override_secs: Option<u64>,
     /// Run all tools synchronously.  By default tools are async-first: ahma waits
     /// an adaptive inline window (SPEC R2.6.1) — longer when nothing else is
     /// running, short when the caller is already fanning out — and returns the
@@ -737,6 +745,7 @@ impl Default for ToolSettings {
         Self {
             timeout_secs: 600,
             await_timeout_secs: default_await_timeout_secs(),
+            request_budget_override_secs: None,
             force_sync: false,
             hot_reload: false,
             skip_probes: false,
@@ -1744,6 +1753,15 @@ impl AhmaSettings {
             d.tools.await_timeout_secs.to_string(),
         );
         w.setting(
+            "Override the per-client single-request budget (SPEC R2.6.5) in \
+             seconds — how long ahma may hold one MCP request open before \
+             assuming the client stopped listening. 0 = unset, use the \
+             built-in per-client guess.",
+            "request_budget_override_secs",
+            toml_opt_u64(self.tools.request_budget_override_secs),
+            toml_opt_u64(d.tools.request_budget_override_secs),
+        );
+        w.setting(
             "Run all tools synchronously instead of async-first.",
             "force_sync",
             self.tools.force_sync.to_string(),
@@ -2134,6 +2152,12 @@ fn toml_opt_path(o: &Option<PathBuf>) -> String {
     }
 }
 
+/// Render an optional integer; `None` is shown as `0`, an out-of-range sentinel
+/// for a "seconds" field, so an unset value reads as an obvious placeholder.
+fn toml_opt_u64(o: Option<u64>) -> String {
+    o.map(|v| v.to_string()).unwrap_or_else(|| "0".to_string())
+}
+
 /// Render a list of strings as an inline TOML array.
 fn toml_str_list(v: &[String]) -> String {
     let items: Vec<String> = v.iter().map(|s| toml_str(s)).collect();
@@ -2442,6 +2466,7 @@ mod tests {
             tools: ToolSettings {
                 timeout_secs: 123,
                 await_timeout_secs: 456,
+                request_budget_override_secs: Some(120),
                 force_sync: true,
                 hot_reload: true,
                 skip_probes: true,

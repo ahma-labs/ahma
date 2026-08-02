@@ -200,11 +200,14 @@ pub fn require_str(
 ///   buys an inline result. If it is already fanning out, hand the id back fast
 ///   so the next command starts now.
 /// * **What will the client tolerate?** The wait holds one MCP request open, so
-///   it can never approach the client's single-request budget (R2.6.5).
+///   it can never approach the client's single-request budget (R2.6.5). Pass
+///   the caller's already-resolved effective budget (built-in guess, or the
+///   `tools.request_budget_override_secs` override when set) — this function
+///   does not re-derive it from a client type.
 pub async fn inline_window(
     monitor: &crate::operation_monitor::OperationMonitor,
     op_id: &str,
-    client_type: crate::client_type::McpClientType,
+    budget: std::time::Duration,
 ) -> std::time::Duration {
     use crate::constants::{INLINE_WINDOW_BUSY_SECS, INLINE_WINDOW_IDLE_SECS};
     use std::time::Duration;
@@ -217,7 +220,7 @@ pub async fn inline_window(
     });
     // Half the budget, never more: the response still has to travel back, and a
     // window that consumes the client's whole tolerance leaves no margin.
-    wanted.min(client_type.request_budget() / 2)
+    wanted.min(budget / 2)
 }
 
 /// Attempts to wait for an async operation to complete within the inline window.
@@ -226,12 +229,15 @@ pub async fn inline_window(
 ///
 /// This reduces context chatter for fast commands by eliminating the need for an
 /// extra `await` round-trip.
+///
+/// `budget` is the caller's already-resolved effective single-request budget
+/// (see [`inline_window`]).
 pub async fn try_automatic_async_completion(
     monitor: &crate::operation_monitor::OperationMonitor,
     op_id: &str,
-    client_type: crate::client_type::McpClientType,
+    budget: std::time::Duration,
 ) -> Option<rmcp::model::CallToolResult> {
-    let window = inline_window(monitor, op_id, client_type).await;
+    let window = inline_window(monitor, op_id, budget).await;
 
     // First check if already completed (race: task finished before we got here)
     if let Some(op) = monitor.check_completion_history_pub(op_id).await {

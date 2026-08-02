@@ -1182,7 +1182,7 @@ impl AhmaMcpService {
                 if let Some(result) = handlers::common::try_automatic_async_completion(
                     &self.operation_monitor,
                     &id,
-                    client_type,
+                    self.effective_request_budget(client_type),
                 )
                 .await
                 {

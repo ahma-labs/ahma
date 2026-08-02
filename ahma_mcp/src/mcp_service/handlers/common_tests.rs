@@ -416,7 +416,12 @@ async fn idle_session_waits_the_long_window() {
     // Nothing to overlap with: the model's next move would be `await` anyway,
     // so waiting is free and may save a whole round-trip.
     let monitor = monitor_with_running(&["op_1"]).await;
-    let window = inline_window(&monitor, "op_1", McpClientType::ClaudeDesktop).await;
+    let window = inline_window(
+        &monitor,
+        "op_1",
+        McpClientType::ClaudeDesktop.request_budget(),
+    )
+    .await;
     assert_eq!(window, Duration::from_secs(INLINE_WINDOW_IDLE_SECS));
 }
 
@@ -425,7 +430,12 @@ async fn fanning_out_gets_the_short_window() {
     // Something else is already running, so holding this response delays the
     // next command in a fan-out. Hand the id back promptly instead.
     let monitor = monitor_with_running(&["op_1", "op_2"]).await;
-    let window = inline_window(&monitor, "op_2", McpClientType::ClaudeDesktop).await;
+    let window = inline_window(
+        &monitor,
+        "op_2",
+        McpClientType::ClaudeDesktop.request_budget(),
+    )
+    .await;
     assert_eq!(window, Duration::from_secs(INLINE_WINDOW_BUSY_SECS));
 }
 
@@ -434,10 +444,25 @@ async fn a_tight_client_budget_clamps_the_window() {
     // Antigravity abandons the transport partway through a long request, so the
     // window can never approach its budget however idle the session is.
     let monitor = monitor_with_running(&["op_1"]).await;
-    let window = inline_window(&monitor, "op_1", McpClientType::Antigravity).await;
+    let budget = McpClientType::Antigravity.request_budget();
+    let window = inline_window(&monitor, "op_1", budget).await;
     assert!(
-        window <= McpClientType::Antigravity.request_budget() / 2,
+        window <= budget / 2,
         "window {window:?} must leave the client margin to receive the response"
     );
     assert!(window >= Duration::from_secs(INLINE_WINDOW_BUSY_SECS));
+}
+
+#[tokio::test]
+async fn an_override_budget_clamps_the_window_regardless_of_client() {
+    // An operator-set override applies uniformly — the window derives it the
+    // same way whether the effective budget came from the built-in table or
+    // from `tools.request_budget_override_secs`.
+    let monitor = monitor_with_running(&["op_1"]).await;
+    let budget = Duration::from_secs(6);
+    let window = inline_window(&monitor, "op_1", budget).await;
+    assert!(
+        window <= budget / 2,
+        "window {window:?} must leave the overridden client margin to receive the response"
+    );
 }

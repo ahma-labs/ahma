@@ -172,6 +172,26 @@ impl AhmaMcpService {
         })
     }
 
+    /// The client's single-request budget (SPEC R2.6.5), unless overridden via
+    /// the `--request-budget-secs` flag / `tools.request_budget_override_secs`
+    /// setting. The override applies uniformly — it does not distinguish which
+    /// client asked — since it exists precisely for the case where the
+    /// built-in per-`clientInfo.name` guess is wrong for the operator's setup.
+    pub(crate) fn effective_request_budget(
+        &self,
+        client_type: crate::client_type::McpClientType,
+    ) -> std::time::Duration {
+        let override_secs = self
+            .app_config
+            .read()
+            .ok()
+            .and_then(|cfg| cfg.as_ref().and_then(|c| c.request_budget_override_secs));
+        match override_secs {
+            Some(secs) => std::time::Duration::from_secs(secs),
+            None => client_type.request_budget(),
+        }
+    }
+
     /// Bound a resolved await timeout by what the calling client tolerates on a
     /// single request (SPEC R2.5.1, R2.6.5).
     ///
@@ -186,7 +206,7 @@ impl AhmaMcpService {
         let Some(client_type) = caller.client_type else {
             return AwaitTimeout::unclamped(resolved);
         };
-        let budget = client_type.request_budget().as_secs_f64();
+        let budget = self.effective_request_budget(client_type).as_secs_f64();
         if resolved <= budget {
             return AwaitTimeout::unclamped(resolved);
         }
@@ -1486,6 +1506,29 @@ mod budget_tests {
             bounded.note().is_none(),
             "an unclamped wait must not explain a clamp that did not happen"
         );
+    }
+
+    #[tokio::test]
+    async fn an_override_replaces_the_guess_for_every_client() {
+        // SPEC R2.6.5.2: a wrong guess (or an unrecognized client stuck on the
+        // conservative default) must be correctable without a code change.
+        let (service, _tmp) = crate::test_utils::client::setup_test_environment().await;
+        service.set_app_config(Arc::new(crate::shell::cli::AppConfig {
+            request_budget_override_secs: Some(7),
+            ..Default::default()
+        }));
+
+        // Antigravity would normally be clamped to 20s; the override wins.
+        let bounded =
+            service.bounded_await_timeout_secs(30.0, &caller(Some(McpClientType::Antigravity)));
+        assert_eq!(bounded.secs, 7.0);
+
+        // A client that would normally NOT be clamped (well within 300s) is now
+        // clamped too — the override applies uniformly, it does not special-case
+        // who asked.
+        let bounded =
+            service.bounded_await_timeout_secs(30.0, &caller(Some(McpClientType::ClaudeDesktop)));
+        assert_eq!(bounded.secs, 7.0);
     }
 
     #[tokio::test]

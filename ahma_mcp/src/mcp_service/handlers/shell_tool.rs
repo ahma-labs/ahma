@@ -546,7 +546,7 @@ impl AhmaMcpService {
                 if let Some(result) = common::try_automatic_async_completion(
                     &self.operation_monitor,
                     &op_id,
-                    client_type,
+                    self.effective_request_budget(client_type),
                 )
                 .await
                 {
@@ -630,7 +630,7 @@ impl AhmaMcpService {
                 if let Some(result) = common::try_automatic_async_completion(
                     &self.operation_monitor,
                     &id,
-                    client_type,
+                    self.effective_request_budget(client_type),
                 )
                 .await
                 {

@@ -74,9 +74,15 @@ impl McpClientType {
     ///
     /// Returns `Unknown` if no client info is available.
     pub fn from_peer(peer: &Peer<RoleServer>) -> Self {
-        peer.peer_info()
-            .map(|info| Self::from_client_name(&info.client_info.name))
-            .unwrap_or(McpClientType::Unknown)
+        let name = peer.peer_info().map(|info| info.client_info.name.clone());
+        let detected = name
+            .as_deref()
+            .map(Self::from_client_name)
+            .unwrap_or(McpClientType::Unknown);
+        if detected == McpClientType::Unknown {
+            warn_once_unrecognized_client(name.as_deref().unwrap_or("<no client info>"));
+        }
+        detected
     }
 
     /// Whether this client correctly handles MCP progress notifications.
@@ -171,9 +177,56 @@ impl McpClientType {
     }
 }
 
+/// Warn, once per distinct unrecognized `clientInfo.name` per process, that a
+/// session fell back to the conservative `Unknown` request budget (SPEC
+/// R2.6.5). Without this, a client whose self-reported name stops matching
+/// any known pattern (a rename, a proxy that rewrites it, a new product)
+/// silently drops to a 20s budget with no visible signal anywhere — exactly
+/// the kind of degradation a caller only discovers by way of a confusing,
+/// truncated `await`. `tools.request_budget_override_secs` is the fix once
+/// this is noticed.
+///
+/// Returns whether this call actually emitted the warning (i.e. `name` was
+/// not already seen this process), so the dedup itself is unit-testable
+/// without a tracing subscriber.
+fn warn_once_unrecognized_client(name: &str) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut warned = warned.lock().unwrap_or_else(|e| e.into_inner());
+    let first_time = warned.insert(name.to_string());
+    if first_time {
+        tracing::warn!(
+            client_name = name,
+            "Unrecognized MCP client — falling back to the conservative 20s single-request \
+             budget (SPEC R2.6.5). If this client can actually hold a request open longer, \
+             set tools.request_budget_override_secs in settings.toml (or --request-budget-secs)."
+        );
+    }
+    first_time
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC R2.6.5.2: the degradation to the conservative default must be
+    /// visible, but not spammed — one warning per distinct unrecognized name.
+    #[test]
+    fn unrecognized_client_warns_once_per_distinct_name_not_per_call() {
+        assert!(
+            warn_once_unrecognized_client("totally-novel-client-a"),
+            "first sighting of a name must warn"
+        );
+        assert!(
+            !warn_once_unrecognized_client("totally-novel-client-a"),
+            "repeat sightings of the same name must not warn again"
+        );
+        assert!(
+            warn_once_unrecognized_client("totally-novel-client-b"),
+            "a different unrecognized name is a distinct degradation and must warn"
+        );
+    }
 
     /// SPEC R5.3.1: the elicitation wait must be strictly under the client's own
     /// undisclosed deadline. Antigravity's is measured at 60.005s; anything at or

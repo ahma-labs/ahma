@@ -92,6 +92,11 @@ pub struct AppConfig {
     /// Default timeout for the `await` tool in seconds. Override with the
     /// `--await-timeout` CLI flag or `tools.await_timeout_secs` in settings.toml.
     pub await_timeout_secs: u64,
+    /// Override for the SPEC R2.6.5 per-client single-request budget. `None`
+    /// means trust the built-in per-`clientInfo.name` guess. Override with the
+    /// `--request-budget-secs` CLI flag or `tools.request_budget_override_secs`
+    /// in settings.toml when that guess is wrong for your environment.
+    pub request_budget_override_secs: Option<u64>,
     /// Run all tools synchronously (AHMA_SYNC=1).
     pub force_sync: bool,
     /// Reload tools from disk when `.ahma/` changes (AHMA_HOT_RELOAD=1).
@@ -224,6 +229,7 @@ impl Default for AppConfig {
             tool_bundles: vec![],
             timeout_secs: 600,
             await_timeout_secs: ahma_common::config::default_await_timeout_secs(),
+            request_budget_override_secs: None,
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
@@ -1130,6 +1136,13 @@ pub struct Cli {
     /// Default timeout for the await tool in seconds.
     #[arg(long = "await-timeout", value_name = "SECS", global = true)]
     pub await_timeout: Option<u64>,
+
+    /// Override the per-client single-request budget (SPEC R2.6.5): how long
+    /// ahma may hold one MCP request open before assuming a client this
+    /// unrecognized/unmeasured has stopped listening. Use when the built-in
+    /// guess is wrong for your MCP client.
+    #[arg(long = "request-budget-secs", value_name = "SECS", global = true)]
+    pub request_budget_secs: Option<u64>,
 
     /// Force all tools to run synchronously.
     /// By default, tools are async-first: ahma waits an adaptive inline window
@@ -2516,6 +2529,7 @@ pub fn load_settings(cli: &Cli) -> ahma_common::config::AhmaSettings {
 struct ExecutionSettings {
     timeout_secs: u64,
     await_timeout_secs: u64,
+    request_budget_override_secs: Option<u64>,
     force_sync: bool,
     hot_reload_tools: bool,
     skip_availability_probes: bool,
@@ -2532,6 +2546,9 @@ fn parse_execution_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) ->
     ExecutionSettings {
         timeout_secs: cli.timeout.unwrap_or(s.tools.timeout_secs),
         await_timeout_secs: cli.await_timeout.unwrap_or(s.tools.await_timeout_secs),
+        request_budget_override_secs: cli
+            .request_budget_secs
+            .or(s.tools.request_budget_override_secs),
         force_sync: cli.sync || s.tools.force_sync,
         hot_reload_tools: cli.hot_reload || s.tools.hot_reload,
         skip_availability_probes: cli.skip_probes || s.tools.skip_probes,
@@ -2845,6 +2862,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         tool_bundles,
         timeout_secs: exec.timeout_secs,
         await_timeout_secs: exec.await_timeout_secs,
+        request_budget_override_secs: exec.request_budget_override_secs,
         force_sync: exec.force_sync,
         hot_reload_tools: exec.hot_reload_tools,
         skip_availability_probes: exec.skip_availability_probes,
@@ -3059,6 +3077,7 @@ mod tests {
             tool_bundles: vec![],
             timeout_secs: 360,
             await_timeout_secs: 540,
+            request_budget_override_secs: None,
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
