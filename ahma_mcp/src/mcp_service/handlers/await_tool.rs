@@ -6,7 +6,7 @@ use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorData
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tokio::time::{Instant, error::Elapsed};
+use tokio::time::Instant;
 use tracing;
 
 /// Who issued this `await`, when that is known.
@@ -21,10 +21,18 @@ pub struct AwaitCaller {
     pub peer: Option<rmcp::service::Peer<rmcp::service::RoleServer>>,
     pub progress_token: Option<rmcp::model::ProgressToken>,
     pub client_type: Option<crate::client_type::McpClientType>,
+    /// Whether the bridge (if any) has confirmed a live push channel to the
+    /// real client (SPEC R2.6.5.2's liveness-probe redesign). `from_context`
+    /// cannot fill this in — it has no `AhmaMcpService` to ask — so the caller
+    /// must set it from `AhmaMcpService::push_channel_open()` after
+    /// construction. Defaults to `false`, the safe assumption.
+    pub push_channel_open: bool,
 }
 
 impl AwaitCaller {
-    /// Build from a live MCP request.
+    /// Build from a live MCP request. `push_channel_open` is left at its
+    /// default (`false`); set it explicitly from
+    /// `AhmaMcpService::push_channel_open()` if a live-probe wait is wanted.
     pub fn from_context(
         context: &rmcp::service::RequestContext<rmcp::service::RoleServer>,
     ) -> Self {
@@ -32,6 +40,7 @@ impl AwaitCaller {
             peer: Some(context.peer.clone()),
             progress_token: context.meta.get_progress_token(),
             client_type: Some(crate::client_type::McpClientType::from_peer(&context.peer)),
+            push_channel_open: false,
         }
     }
 }
@@ -97,6 +106,92 @@ impl AwaitTimeout {
             requested,
             client.display_name(),
         ))
+    }
+}
+
+/// How often a live-probed wait checks the client is still there, and how long
+/// a single probe is allowed to take before it's presumed dead (SPEC R2.6.5.2).
+/// The probe itself is still a guessed constant — just a much smaller one,
+/// repeated, instead of a single large guess about the whole wait up front.
+const LIVENESS_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+const LIVENESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Sends a bare MCP `ping` and waits for the client to answer it, bounded by
+/// `probe_timeout`. Any response counts as alive; a timed-out or failed send
+/// means presumed dead. This rides the same JSON-RPC connection a
+/// `notifications/ahma/pushChannelChanged`-confirmed session already has a live
+/// path for (SPEC R2.6.5.2) — callers must check `AwaitCaller::push_channel_open`
+/// before relying on this, since without it there is nowhere for the ping to go.
+async fn probe_client_liveness(
+    peer: &rmcp::service::Peer<rmcp::service::RoleServer>,
+    probe_timeout: std::time::Duration,
+) -> bool {
+    use rmcp::model::{PingRequest, ServerRequest};
+    use rmcp::service::PeerRequestOptions;
+
+    let request = ServerRequest::PingRequest(PingRequest::default());
+    match peer
+        .send_request_with_option(request, PeerRequestOptions::with_timeout(probe_timeout))
+        .await
+    {
+        Ok(handle) => handle.await_response().await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// Waits for `fut` up to `total_timeout`. When `probe_peer` is `Some`,
+/// periodically (every `probe_interval`, each probe bounded by
+/// `probe_timeout`) probes the client's liveness while waiting and returns
+/// early — as a timeout, since the caller-facing outcome is the same soft
+/// "still running" message either way — the moment a probe fails, rather than
+/// only ever bailing at a single fixed guessed duration regardless of whether
+/// the connection is actually still healthy (SPEC R2.6.5.2). When
+/// `probe_peer` is `None` this is a plain bounded wait, identical to the
+/// pre-R2.6.5.2 behavior.
+///
+/// `probe_interval`/`probe_timeout` are parameters rather than baked-in
+/// constants so tests can exercise the loop's logic (deadline math, probe
+/// dispatch, early-exit on probe failure) in milliseconds instead of the real
+/// [`LIVENESS_PROBE_INTERVAL`]. Production call sites pass the real constants.
+async fn wait_with_optional_probe<F, T>(
+    total_timeout: std::time::Duration,
+    probe_peer: Option<&rmcp::service::Peer<rmcp::service::RoleServer>>,
+    probe_interval: std::time::Duration,
+    probe_timeout: std::time::Duration,
+    fut: F,
+) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(peer) = probe_peer else {
+        return tokio::time::timeout(total_timeout, fut)
+            .await
+            .map_err(|_| ());
+    };
+
+    let deadline = tokio::time::Instant::now() + total_timeout;
+    tokio::pin!(fut);
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(());
+        }
+        let slice = (deadline - now).min(probe_interval);
+        match tokio::time::timeout(slice, &mut fut).await {
+            Ok(value) => return Ok(value),
+            Err(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                if !probe_client_liveness(peer, probe_timeout).await {
+                    tracing::debug!(
+                        "Liveness probe failed mid-await; treating client as unresponsive (SPEC R2.6.5.2)"
+                    );
+                    return Err(());
+                }
+            }
+        }
     }
 }
 
@@ -202,7 +297,15 @@ impl AhmaMcpService {
     /// written into a connection nobody is reading. An explicit
     /// `timeout_seconds` argument is honoured as given; this bounds the
     /// *default*, which is what models actually use.
+    ///
+    /// SPEC R2.6.5.2: when the caller has a confirmed live push channel, this
+    /// guessed clamp is unnecessary — `wait_with_optional_probe` verifies
+    /// liveness directly instead, so the full resolved timeout is used and no
+    /// clamp note is needed.
     fn bounded_await_timeout_secs(&self, resolved: f64, caller: &AwaitCaller) -> AwaitTimeout {
+        if caller.push_channel_open && caller.peer.is_some() {
+            return AwaitTimeout::unclamped(resolved);
+        }
         let Some(client_type) = caller.client_type else {
             return AwaitTimeout::unclamped(resolved);
         };
@@ -243,6 +346,14 @@ impl AhmaMcpService {
         let tool_filters = common::parse_tool_filters(&args);
         let timeout_override = args.get("timeout_seconds").and_then(|v| v.as_u64());
 
+        // SPEC R2.6.5.2: only probeable when the bridge has confirmed a live
+        // push channel exists to actually deliver a server-initiated ping on.
+        let probe_peer = if caller.push_channel_open {
+            caller.peer.as_ref()
+        } else {
+            None
+        };
+
         // If id is specified, wait for that specific operation
         if let Some(op_id) = id_filter {
             let bound = match timeout_override {
@@ -256,7 +367,7 @@ impl AhmaMcpService {
                 .redirect_progress(std::slice::from_ref(&op_id), &caller)
                 .await;
             return self
-                .handle_await_specific_operation(op_id, bound.secs as u64, bound.note())
+                .handle_await_specific_operation(op_id, bound.secs as u64, bound.note(), probe_peer)
                 .await;
         }
 
@@ -299,7 +410,7 @@ impl AhmaMcpService {
         let _progress = self.redirect_progress(&pending_ids, &caller).await;
 
         let wait_result = self
-            .wait_for_pending_operations(timeout_duration, &pending_ops)
+            .wait_for_pending_operations(timeout_duration, &pending_ops, probe_peer)
             .await;
 
         warning_task.abort();
@@ -391,6 +502,7 @@ impl AhmaMcpService {
         op_id: String,
         timeout_secs: u64,
         clamp_note: Option<String>,
+        probe_peer: Option<&rmcp::service::Peer<rmcp::service::RoleServer>>,
     ) -> Result<CallToolResult, McpError> {
         if self.operation_monitor.get_operation(&op_id).await.is_none() {
             return Ok(self.format_already_completed_or_not_found(&op_id).await);
@@ -404,8 +516,11 @@ impl AhmaMcpService {
         // own 300s cap would otherwise fire first for any configured await timeout
         // above it (the 540s default included) and surface as `Ok(None)` — reporting
         // a still-running operation as "completed but no result available".
-        let wait_result = tokio::time::timeout(
+        let wait_result = wait_with_optional_probe(
             timeout_duration,
+            probe_peer,
+            LIVENESS_PROBE_INTERVAL,
+            LIVENESS_PROBE_TIMEOUT,
             self.operation_monitor
                 .wait_for_operation_bounded(&op_id, None),
         )
@@ -472,26 +587,33 @@ impl AhmaMcpService {
         &self,
         timeout_duration: std::time::Duration,
         pending_ops: &[Operation],
-    ) -> Result<Vec<ContentBlock>, Elapsed> {
-        tokio::time::timeout(timeout_duration, async {
-            // `None` bound — see `handle_await_specific_operation`. Here the inner cap
-            // was worse than a misreport: a `None` return is dropped by `.flatten()`
-            // below, so past 300s a still-running operation silently vanished from an
-            // otherwise successful result.
-            let futures: Vec<_> = pending_ops
-                .iter()
-                .map(|op| {
-                    self.operation_monitor
-                        .wait_for_operation_bounded(&op.id, None)
-                })
-                .collect();
-            let completed: Vec<Operation> = futures::future::join_all(futures)
-                .await
-                .into_iter()
-                .flatten()
-                .collect();
-            common::serialize_operations_to_content(&completed)
-        })
+        probe_peer: Option<&rmcp::service::Peer<rmcp::service::RoleServer>>,
+    ) -> Result<Vec<ContentBlock>, ()> {
+        wait_with_optional_probe(
+            timeout_duration,
+            probe_peer,
+            LIVENESS_PROBE_INTERVAL,
+            LIVENESS_PROBE_TIMEOUT,
+            async {
+                // `None` bound — see `handle_await_specific_operation`. Here the inner cap
+                // was worse than a misreport: a `None` return is dropped by `.flatten()`
+                // below, so past 300s a still-running operation silently vanished from an
+                // otherwise successful result.
+                let futures: Vec<_> = pending_ops
+                    .iter()
+                    .map(|op| {
+                        self.operation_monitor
+                            .wait_for_operation_bounded(&op.id, None)
+                    })
+                    .collect();
+                let completed: Vec<Operation> = futures::future::join_all(futures)
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                common::serialize_operations_to_content(&completed)
+            },
+        )
         .await
     }
 
@@ -1457,6 +1579,7 @@ mod budget_tests {
             peer: None,
             progress_token: None,
             client_type,
+            push_channel_open: false,
         }
     }
 
@@ -1627,6 +1750,126 @@ mod budget_tests {
             !text.contains("was capped at"),
             "an explicit `timeout_seconds` is honoured verbatim, so nothing was \
              capped and nothing may claim otherwise. Got: {text}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod liveness_probe_tests {
+    use super::*;
+    use crate::test_utils::in_process::create_in_process_mcp_empty;
+
+    #[tokio::test]
+    async fn no_probe_peer_is_a_plain_bounded_wait() {
+        // Backward compatibility: `probe_peer: None` (no live channel confirmed,
+        // or CLI/tests with no MCP peer at all) must behave exactly like the
+        // pre-R2.6.5.2 `tokio::time::timeout` — no probing attempted.
+        let start = Instant::now();
+        let result = wait_with_optional_probe(
+            std::time::Duration::from_millis(50),
+            None,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(10),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert!(result.is_err(), "a never-resolving future must time out");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(300),
+            "must bail at the requested timeout, not hang: {:?}",
+            start.elapsed()
+        );
+
+        let fast = wait_with_optional_probe(
+            std::time::Duration::from_secs(5),
+            None,
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(10),
+            async { 42 },
+        )
+        .await;
+        assert_eq!(fast, Ok(42));
+    }
+
+    #[tokio::test]
+    async fn a_live_peer_survives_multiple_probe_intervals_to_reach_completion() {
+        // The core new behavior: a wait that would previously have been capped
+        // at a guessed budget now runs the full requested duration, verifying
+        // liveness along the way instead of assuming death at a fixed point.
+        // Every probe here succeeds (rmcp's default ClientHandler::ping always
+        // answers `Ok(())`), so this must reach the future's own completion,
+        // not time out and not bail early on a phantom probe failure.
+        let mcp = create_in_process_mcp_empty()
+            .await
+            .expect("in-process pair");
+        let peer = mcp._server.peer();
+
+        let start = Instant::now();
+        let result = wait_with_optional_probe(
+            std::time::Duration::from_secs(2),
+            Some(peer),
+            std::time::Duration::from_millis(40),
+            std::time::Duration::from_millis(200),
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+                "done"
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Ok("done"),
+            "must reach real completion, not bail out on a live connection"
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(180),
+            "must not return before the future actually resolved: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "must not run anywhere near the 2s deadline when the future \
+             resolved quickly: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_peer_ends_the_wait_early_without_reaching_the_deadline() {
+        // The other half of the redesign: detect death, don't guess a fixed
+        // deadline for it. Closing the client mid-wait must be caught by the
+        // very next probe and end the wait well before the (generously long)
+        // total_timeout — proving the mechanism reacts to the connection's
+        // actual state instead of always running to a static number.
+        let mut mcp = create_in_process_mcp_empty()
+            .await
+            .expect("in-process pair");
+        let peer = mcp._server.peer().clone();
+
+        mcp.client
+            .close()
+            .await
+            .expect("closing the client side must not itself error");
+
+        let start = Instant::now();
+        let result = wait_with_optional_probe(
+            std::time::Duration::from_secs(30),
+            Some(&peer),
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(200),
+            std::future::pending::<()>(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a probe against a closed connection must fail, not hang forever"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "must bail out on the first failed probe, nowhere near the 30s \
+             deadline: {:?}",
+            start.elapsed()
         );
     }
 }

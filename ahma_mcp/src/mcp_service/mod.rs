@@ -1536,7 +1536,8 @@ impl ServerHandler for AhmaMcpService {
                         .await
                 }
                 "await" => {
-                    let caller = handlers::await_tool::AwaitCaller::from_context(&context);
+                    let mut caller = handlers::await_tool::AwaitCaller::from_context(&context);
+                    caller.push_channel_open = self.push_channel_open();
                     self.handle_await_for_caller(run_params, caller).await
                 }
                 "run_terminal_command" => {
