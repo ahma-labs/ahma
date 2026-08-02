@@ -147,6 +147,17 @@ pub struct AhmaMcpService {
     pub last_received_signal: Arc<std::sync::atomic::AtomicU64>,
     /// True if the connected peer is an Ahma node.
     pub is_ahma_peer: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the bridge has told this subprocess it currently has a live
+    /// push channel to the real client (an open SSE stream). Defaults to
+    /// `false` — the safe assumption for direct stdio (no bridge in front)
+    /// and for any session that never opens one (e.g. a configured default
+    /// sandbox scope, which lets a client skip SSE entirely). A future
+    /// liveness probe (SPEC R2.6.5 redesign) must not attempt a
+    /// server-initiated request mid-`await` unless this is `true` — a
+    /// subprocess-initiated message with no SSE subscriber is silently
+    /// dropped by the bridge, so probing without this signal would
+    /// misreport a healthy client as unresponsive.
+    pub push_channel_open: Arc<std::sync::atomic::AtomicBool>,
     /// Token minimization and output optimizer context.
     pub output_optimizer: Arc<tokio::sync::Mutex<crate::output_optimizer::OutputOptimizer>>,
     /// Safety harness guard context.
@@ -214,6 +225,35 @@ fn tool_info_from_tool(tool: Tool) -> crate::mcp_client::ToolInfo {
 }
 
 impl AhmaMcpService {
+    /// Whether the bridge in front of this subprocess (if any) currently has
+    /// a live push channel open to the real client. See the
+    /// [`push_channel_open`](Self::push_channel_open) field docs for why a
+    /// future liveness probe must check this before attempting a
+    /// server-initiated request mid-`await`.
+    pub(crate) fn push_channel_open(&self) -> bool {
+        self.push_channel_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The pure dispatch logic behind [`ServerHandler::on_custom_notification`],
+    /// factored out so it is testable without constructing a real
+    /// `NotificationContext` (its `Peer` cannot be built outside rmcp itself).
+    fn apply_custom_notification(&self, method: &str, params: Option<&serde_json::Value>) {
+        if method == "notifications/ahma/heartbeat" {
+            self.last_received_signal.store(
+                ahma_common::keepalive::current_timestamp_ms(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        } else if method == "notifications/ahma/pushChannelChanged" {
+            let connected = params
+                .and_then(|p| p.get("connected"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            self.push_channel_open
+                .store(connected, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Every tool available to this session, in `ToolInfo` form: the built-ins
     /// from [`Self::builtin_tools`], then per-client config tools, then
     /// external MCP tools.
@@ -706,6 +746,7 @@ impl AhmaMcpService {
                 ahma_common::keepalive::current_timestamp_ms(),
             )),
             is_ahma_peer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            push_channel_open: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             output_optimizer: Arc::new(tokio::sync::Mutex::new(
                 crate::output_optimizer::OutputOptimizer::new(false, None),
             )),
@@ -1598,12 +1639,7 @@ impl ServerHandler for AhmaMcpService {
         notification: rmcp::model::CustomNotification,
         _context: NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
-        if notification.method == "notifications/ahma/heartbeat" {
-            self.last_received_signal.store(
-                ahma_common::keepalive::current_timestamp_ms(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
+        self.apply_custom_notification(&notification.method, notification.params.as_ref());
         std::future::ready(())
     }
 }
@@ -4205,6 +4241,57 @@ mod tests {
             ..Default::default()
         };
         assert!(service.send_enhanced_heartbeat(payload).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn push_channel_open_defaults_false_and_reflects_the_stored_flag() {
+        // The safe default: a subprocess that never hears from the bridge (direct
+        // stdio, or a session that never opens SSE) must assume there is no live
+        // push channel — see the field doc on `AhmaMcpService::push_channel_open`.
+        let service = make_service().await;
+        assert!(!service.push_channel_open());
+
+        service
+            .push_channel_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(service.push_channel_open());
+
+        service
+            .push_channel_open
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!service.push_channel_open());
+    }
+
+    #[tokio::test]
+    async fn on_custom_notification_push_channel_changed_updates_the_flag() {
+        // Exercises the actual dispatch path a bridge notification arrives
+        // through (minus the NotificationContext, which cannot be constructed
+        // outside rmcp) — proves the method-name match and the
+        // `params.connected` extraction are wired correctly end to end.
+        let service = make_service().await;
+        assert!(!service.push_channel_open());
+
+        service.apply_custom_notification(
+            "notifications/ahma/pushChannelChanged",
+            Some(&json!({"connected": true})),
+        );
+        assert!(service.push_channel_open());
+
+        service.apply_custom_notification(
+            "notifications/ahma/pushChannelChanged",
+            Some(&json!({"connected": false})),
+        );
+        assert!(!service.push_channel_open());
+
+        // Missing/malformed params must not panic, and must not flip the flag.
+        service
+            .push_channel_open
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        service.apply_custom_notification("notifications/ahma/pushChannelChanged", None);
+        assert!(
+            !service.push_channel_open(),
+            "missing params must fall back to the safe default (false), same as unset"
+        );
     }
 
     #[tokio::test]

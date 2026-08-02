@@ -1563,6 +1563,17 @@ async fn handle_sse_stream(State(state): State<Arc<BridgeState>>, headers: Heade
         }
     }
 
+    // Tell the subprocess it now has a live push channel — unconditionally
+    // (unlike `mark_sse_connected`'s handshake transition, which only fires
+    // once), so a reconnect after a dropped stream re-signals it too. A
+    // failed send just leaves the subprocess at its conservative default;
+    // there is no live channel yet to un-signal a stale disconnect, since a
+    // permanent disconnect instead terminates the whole session (and its
+    // subprocess) via `CleanupStream::drop` below.
+    if let Err(e) = session.send_push_channel_changed(true).await {
+        warn!(session_id = %session_id, "Failed to notify subprocess of live push channel: {}", e);
+    }
+
     // Build replay stream from history (if Last-Event-Id was provided)
     let replay_events = last_event_id
         .map(|id| {

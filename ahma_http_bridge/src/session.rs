@@ -515,6 +515,26 @@ impl Session {
         info!(session_id = %self.id, sse_receivers = sse_receivers, "Sent roots/list_changed to subprocess; waiting for roots/list response via broadcast");
         Ok(())
     }
+
+    /// Tell the subprocess whether it currently has a live push channel to the
+    /// real client (an open `GET /mcp` SSE stream) — the signal a future
+    /// liveness probe needs before attempting a server-initiated request
+    /// mid-`await`, since a subprocess-initiated message with no SSE
+    /// subscriber is silently dropped (see `dispatch_subprocess_line`).
+    ///
+    /// Best-effort: the subprocess defaults to "no live channel" (the safe,
+    /// conservative assumption) until the first `true` arrives, so a failure
+    /// to deliver this notification only means the subprocess stays
+    /// conservative — it never causes it to wrongly assume a channel exists.
+    pub async fn send_push_channel_changed(&self, connected: bool) -> Result<()> {
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/ahma/pushChannelChanged",
+            "params": { "connected": connected }
+        });
+        self.send_to_subprocess(&notification, "Failed to send pushChannelChanged")
+            .await
+    }
 }
 
 /// Configuration for the `SessionManager`.
@@ -1745,6 +1765,26 @@ mod session_logic_tests {
         let sent = rx.try_recv().expect("roots/list_changed must be sent");
         let v: Value = serde_json::from_str(&sent).unwrap();
         assert_eq!(v["method"], "notifications/roots/list_changed");
+    }
+
+    #[tokio::test]
+    async fn send_push_channel_changed_notifies_the_subprocess() {
+        let (session, mut rx) = make_test_session();
+
+        session.send_push_channel_changed(true).await.unwrap();
+        let sent = rx
+            .try_recv()
+            .expect("pushChannelChanged(true) must be sent");
+        let v: Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(v["method"], "notifications/ahma/pushChannelChanged");
+        assert_eq!(v["params"]["connected"], true);
+
+        session.send_push_channel_changed(false).await.unwrap();
+        let sent = rx
+            .try_recv()
+            .expect("pushChannelChanged(false) must be sent");
+        let v: Value = serde_json::from_str(&sent).unwrap();
+        assert_eq!(v["params"]["connected"], false);
     }
 
     #[tokio::test]
