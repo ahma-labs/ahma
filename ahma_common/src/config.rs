@@ -875,24 +875,44 @@ pub struct SandboxSettings {
     /// Default: `true`
     #[serde(default = "default_true")]
     pub package_cache_write: bool,
-    /// Default scratch directory for sandbox scope fallback.
+    /// The directory that contains the projects you work on — e.g. `~/github`
+    /// (SPEC R5.2.3, scope source 4).
     ///
-    /// When no explicit `--sandbox-scope` is provided, no `scopes` are defined in
-    /// settings, and the current working directory is a filesystem root (e.g., MCP
-    /// clients like Antigravity that don't send `roots/list`), ahma uses this
-    /// directory as the sandbox scope.  It is auto-created if it does not exist.
+    /// Used only when the client reports no usable workspace roots and no
+    /// explicit `--sandbox-scope` is configured. It is **not** locked as the
+    /// writable scope in its entirety: the writable set narrows to the one
+    /// project subtree the session actually touches, and the rest of the
+    /// container stays read-only (R5.2.6).
     ///
-    /// Set to `None` to disable the auto-fallback (ahma will error instead).
-    /// Default: `"~/sandbox"`
-    #[serde(default = "default_sandbox_directory")]
-    pub sandbox_directory: Option<PathBuf>,
-    /// Add the `sandbox_directory` (default `~/sandbox`) as a persistent secondary
-    /// scope that survives `roots/list` updates.  Equivalent to the `--sandbox` CLI flag.
-    /// This is the recommended default for most MCP server deployments; it gives the AI
-    /// a well-known scratch space that is always writable regardless of which workspace
-    /// is open.
+    /// This setting is deliberately **user-owned only**: it lives here and
+    /// nowhere else. `--sandbox-scope` is carried in the client-owned
+    /// `mcp_config.json` that `ahma setup` writes and anyone configuring the
+    /// client can edit — precisely where an over-broad path would be planted —
+    /// so a container root must not be settable from there.
+    ///
+    /// There is no default. With nothing configured and no usable roots, ahma
+    /// refuses tool calls with remediation rather than inventing a directory.
+    /// Default: `None`
+    pub container_root: Option<PathBuf>,
+    /// Optional scratch directory kept writable across `roots/list` updates,
+    /// giving the AI a stable workspace-independent place to put throwaway
+    /// files. Enabled by `--scratch`.
+    ///
+    /// There is no default. This used to default to `~/sandbox` and also serve
+    /// as the scope fallback, which is how a session ended up locked to a
+    /// directory nobody chose: commands ran in `~/sandbox` and reported
+    /// `fatal: not a git repository`, and the model read that as a project
+    /// error. Scope fallback is now [`container_root`](Self::container_root)'s
+    /// job, and scratch space is opt-in with an explicit path.
+    /// Default: `None`
+    #[serde(alias = "sandbox_directory")]
+    pub scratch_directory: Option<PathBuf>,
+    /// Add [`scratch_directory`](Self::scratch_directory) as a persistent
+    /// secondary scope that survives `roots/list` updates. Equivalent to the
+    /// `--scratch` CLI flag. Has no effect unless a scratch directory is set.
     /// Default: `false`
-    pub use_sandbox_directory: bool,
+    #[serde(alias = "use_sandbox_directory")]
+    pub use_scratch_directory: bool,
     /// Machine-local external directories granted to the sandbox scope that
     /// **survive `roots/list` replacement** — the persistence backing the
     /// `ahma sandbox grant` flow (e.g. an sccache cache outside the workspace).
@@ -1043,8 +1063,9 @@ impl Default for SandboxSettings {
             scopes: Vec::new(),
             working_dirs: Vec::new(),
             package_cache_write: true,
-            sandbox_directory: default_sandbox_directory(),
-            use_sandbox_directory: false,
+            container_root: None,
+            scratch_directory: None,
+            use_scratch_directory: false,
             persistent_scopes: Vec::new(),
             env_allow: Vec::new(),
             allow_keychain: true,
@@ -1053,10 +1074,6 @@ impl Default for SandboxSettings {
             profiles: default_sandbox_profiles(),
         }
     }
-}
-
-fn default_sandbox_directory() -> Option<PathBuf> {
-    Some(PathBuf::from("~/sandbox"))
 }
 
 /// Expand `~` or `~/…` to the user's home directory.
@@ -1832,16 +1849,23 @@ impl AhmaSettings {
             d.sandbox.package_cache_write.to_string(),
         );
         w.setting(
-            "Default scratch directory, auto-created when needed.",
-            "sandbox_directory",
-            toml_opt_path(&self.sandbox.sandbox_directory),
-            toml_opt_path(&d.sandbox.sandbox_directory),
+            "Directory holding your projects (e.g. ~/github); scope fallback when \
+             the client reports no roots. Narrowed to the project in use.",
+            "container_root",
+            toml_opt_path(&self.sandbox.container_root),
+            toml_opt_path(&d.sandbox.container_root),
         );
         w.setting(
-            "Add sandbox_directory as a persistent secondary scope (--sandbox).",
-            "use_sandbox_directory",
-            self.sandbox.use_sandbox_directory.to_string(),
-            d.sandbox.use_sandbox_directory.to_string(),
+            "Optional scratch directory, auto-created when needed.",
+            "scratch_directory",
+            toml_opt_path(&self.sandbox.scratch_directory),
+            toml_opt_path(&d.sandbox.scratch_directory),
+        );
+        w.setting(
+            "Add scratch_directory as a persistent secondary scope (--scratch).",
+            "use_scratch_directory",
+            self.sandbox.use_scratch_directory.to_string(),
+            d.sandbox.use_scratch_directory.to_string(),
         );
         w.setting(
             "External dirs surviving roots/list (manage via `ahma sandbox grant`).",
@@ -2441,8 +2465,9 @@ mod tests {
                 scopes: vec![PathBuf::from("/a"), PathBuf::from("/b")],
                 working_dirs: vec![PathBuf::from("/work")],
                 package_cache_write: false,
-                sandbox_directory: Some(PathBuf::from("/scratch")),
-                use_sandbox_directory: true,
+                container_root: Some(PathBuf::from("/projects")),
+                scratch_directory: Some(PathBuf::from("/scratch")),
+                use_scratch_directory: true,
                 persistent_scopes: vec![PersistentScope {
                     path: PathBuf::from("~/Library/Caches/x.sccache"),
                     access: ScopeAccess::Ro,

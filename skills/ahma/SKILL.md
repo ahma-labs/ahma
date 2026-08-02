@@ -50,7 +50,7 @@ who opens the project gets Ahma configured automatically (prompted to trust once
     "ahma": {
       "type": "stdio",
       "command": "ahma",
-      "args": ["serve", "stdio", "--tools", "git,fileutils", "--sandbox", "--log-monitor"]
+      "args": ["serve", "stdio", "--tools", "git,fileutils", "--log-monitor"]
     }
   }
 }
@@ -87,7 +87,7 @@ are auto-approved (no confirmation dialogs). Pairs well with Ahma's kernel sandb
     "ahma": {
       "type": "stdio",
       "command": "ahma",
-      "args": ["serve", "stdio", "--tools", "git,fileutils", "--sandbox"],
+      "args": ["serve", "stdio", "--tools", "git,fileutils"],
       "sandboxEnabled": true,
       "sandbox": {
         "filesystem": { "allowWrite": ["${workspaceFolder}"] }
@@ -245,7 +245,7 @@ Ahma enforces **kernel-level** filesystem boundaries set once at startup.
 
 ### Temp Directory
 ```json
-"args": ["serve", "stdio", "--sandbox"]
+"args": ["serve", "stdio", "--tmp"]
 ```
 Adds `/tmp` (or `%TEMP%` on Windows) to the scope. Required for compilers, build tools.
 
@@ -443,7 +443,8 @@ Hot-reload while authoring (dev only): `ahma serve stdio --hot-reload`
 | `--hot-reload` / `tools.hot_reload` | off | Reload tool JSON on file change (dev only) |
 | `--no-sandbox` / `sandbox.disable` | off | Disable kernel sandbox (UNSAFE) |
 | `--sandbox-scope` / `sandbox.scopes` | cwd | Sandbox scope paths |
-| `--sandbox` / `sandbox.use_sandbox_directory` | off | Add ~/sandbox as persistent secondary scope |
+| `sandbox.container_root` | unset | Directory holding your projects (e.g. `~/github`); scope fallback when the client reports no roots, narrowed to the project in use |
+| `--scratch` / `sandbox.use_scratch_directory` | off | Add `sandbox.scratch_directory` as a persistent secondary scope (no-op unless that path is set) |
 | `--tmp` / `sandbox.tmp_access` | off | Add temp dir to sandbox scope (opt-in) |
 | `--disable-temp-files` / `sandbox.disable_temp` | off | Block all temp dir access |
 | `--no-package-cache-write` | off | Disable cargo cache writes (strictest isolation) |
@@ -520,7 +521,9 @@ android_logcat(...)   # if defined in .ahma/android-logcat.json
 **Timeout**: Increase via `--timeout 600` in mcp.json args, or set `tools.timeout_secs = 600` in `~/.ahma/settings.toml`.
 
 **Permission denied / sandbox error**: The file is outside the sandbox scope.
-Check `--sandbox-scope` CLI flag or add `--sandbox` to include ~/sandbox as a persistent scratch space, or `--tmp` if temp file access is needed.
+Check the `--sandbox-scope` CLI flag, or set `[sandbox] container_root` in `~/.ahma/settings.toml` to the directory that holds your projects, or `--tmp` if temp file access is needed.
+
+**"was called without `working_directory`" / "sandbox scope is your container root"**: the session's scope is your container root, which spans every project — ahma refuses to guess which one this task is about. Pass `working_directory` naming the project subdirectory; that also tells ahma which subtree to narrow the writable scope to.
 
 > **Cargo dependency errors**: If `cargo add` or `cargo update` fail with permission errors, do **not** add `--sandbox-scope ~/.cargo` to your `mcp.json` — that grants write to the entire cargo home including binaries and credentials.  Instead, the built-in `package_cache_write` feature (on by default) handles this correctly, granting write only to `registry/`, `git/`, and the cargo lock files.  If you previously had `--sandbox-scope ~/.cargo` in your config, remove it — it is no longer needed.
 

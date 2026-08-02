@@ -3,7 +3,7 @@
     "ahma": {
       "type": "stdio",
       "command": "ahma",
-      "args": ["serve", "stdio", "--tools", "rust,git,fileutils,github", "--sandbox", "--log-monitor"]
+      "args": ["serve", "stdio", "--tools", "rust,git,fileutils,github", "--log-monitor"]
     },
     "ahma-http": {
       "type": "http",

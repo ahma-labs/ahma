@@ -39,11 +39,11 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
             dunce::canonicalize(&config.sandbox_scopes[0])
                 .unwrap_or_else(|_| config.sandbox_scopes[0].clone()),
         )
-    } else if config.use_sandbox_dir {
+    } else if config.use_scratch_dir {
         // When --sandbox is set (but no explicit --sandbox-scope), use ~/sandbox as the
         // fallback scope for clients that don't send roots/list (e.g. Antigravity).
         config
-            .sandbox_directory
+            .scratch_directory
             .as_ref()
             .and_then(|dir| ahma_common::config::ensure_sandbox_directory(dir).ok())
     } else {
@@ -57,7 +57,7 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
     if config.no_sandbox {
         server_args.push("--no-sandbox".to_string());
     }
-    if config.use_sandbox_dir {
+    if config.use_scratch_dir {
         server_args.push("--sandbox".to_string());
     }
     if config.tmp_access {
@@ -111,7 +111,7 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
 
     let enable_colored_output = true;
 
-    match (&explicit_fallback_scope, config.use_sandbox_dir) {
+    match (&explicit_fallback_scope, config.use_scratch_dir) {
         (Some(scope), false) => tracing::info!(
             "Unix socket bridge mode - explicit fallback sandbox scope: {}",
             scope.display()

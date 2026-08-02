@@ -18,15 +18,17 @@ The sandbox scope is the root directory boundary for all filesystem operations:
 - **HTTP mode**: Set once when the server starts. Configure via:
   1. `--sandbox-scope <path>` CLI flag (highest priority)
   2. `scopes = [...]` in `~/.ahma/settings.toml`
-  3. MCP client `roots/list` (when `--defer-sandbox` is used)
-  4. Current working directory (when not filesystem root)
-  5. Default `sandbox_directory` from settings (auto-created `~/sandbox`)
+  3. MCP client `roots/list` (an **empty** answer is not a workspace and falls through)
+  4. A user elicitation answer
+  5. `container_root` from settings, narrowed to the project in use
 
-The default `sandbox_directory` (`~/sandbox`) is auto-created on first use. This ensures that MCP clients that don't send `roots/list` (e.g., Antigravity) have a working sandbox scope without manual configuration. Configure it in `~/.ahma/settings.toml`:
+There is **no** sixth source and no invented directory. With none of the five available, ahma refuses tool calls and says how to fix it — it does not pick somewhere to run. (It used to: `sandbox_directory` defaulted to an auto-created `~/sandbox`, so a client reporting no roots silently locked there and every command failed with an ordinary-looking shell error such as `fatal: not a git repository`.)
+
+The container root is the directory that holds the projects you work on. ahma never locks it whole: the writable scope narrows to the single immediate child the session actually touches, and the rest of the container stays read-only, so an injected prompt cannot write into an unrelated repository. It is deliberately settable **only** in your own `~/.ahma/settings.toml` — never in a client-owned `mcp.json`, which is precisely where an over-broad path would be planted.
 
 ```toml
 [sandbox]
-sandbox_directory = "~/sandbox"  # default; set to "" to disable
+container_root = "~/github"     # no default; unset means "refuse rather than guess"
 ```
 
 **Security invariant**: Once the sandbox scope is set, it cannot be changed for the lifetime of the server process. Any attempt to change it after lock terminates the session.

@@ -1202,7 +1202,7 @@ async fn run_shell(args: HooksRunShellArgs, cfg: AppConfig) -> Result<()> {
         // to the default `~/sandbox`, so every real project command is rejected as
         // "outside the sandbox root" and the hook blocks it (fail-closed, R5.5.3).
         sandbox_scopes: vec![PathBuf::from(&payload.cwd)],
-        use_sandbox_dir: false,
+        use_scratch_dir: false,
         ..cfg
     };
 

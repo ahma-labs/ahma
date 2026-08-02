@@ -157,7 +157,7 @@ fn test_update_scopes_preserves_sandbox_dir() {
         false,
     )
     .unwrap()
-    .with_sandbox_dir(Some(sandbox_dir.clone()));
+    .with_scratch_dir(Some(sandbox_dir.clone()));
 
     // Simulate roots/list arriving with a real workspace root.
     sandbox.update_scopes(vec![workspace.clone()]).unwrap();
@@ -291,7 +291,7 @@ fn test_update_scopes_preserves_sandbox_dir_and_tmp() {
         true, // tmp_access = true
     )
     .unwrap()
-    .with_sandbox_dir(Some(sandbox_dir.clone()));
+    .with_scratch_dir(Some(sandbox_dir.clone()));
 
     sandbox.update_scopes(vec![workspace.clone()]).unwrap();
 
@@ -313,7 +313,7 @@ fn test_update_scopes_preserves_sandbox_dir_and_tmp() {
     );
 }
 
-/// with_sandbox_dir / sandbox_dir accessor roundtrip.
+/// with_scratch_dir / sandbox_dir accessor roundtrip.
 #[test]
 fn test_sandbox_dir_accessor() {
     let tmp = tempdir().unwrap();
@@ -321,11 +321,11 @@ fn test_sandbox_dir_accessor() {
 
     let sandbox = Sandbox::new(vec![dir.clone()], SandboxMode::Test, false, false, false)
         .unwrap()
-        .with_sandbox_dir(Some(dir.clone()));
+        .with_scratch_dir(Some(dir.clone()));
 
-    assert_eq!(sandbox.sandbox_dir(), Some(&dir));
+    assert_eq!(sandbox.scratch_dir(), Some(&dir));
 
     let sandbox_no_dir =
         Sandbox::new(vec![dir.clone()], SandboxMode::Test, false, false, false).unwrap();
-    assert_eq!(sandbox_no_dir.sandbox_dir(), None);
+    assert_eq!(sandbox_no_dir.scratch_dir(), None);
 }

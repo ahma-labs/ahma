@@ -1021,7 +1021,7 @@ mod tests {
 
     // ── working-directory substitution (SPEC R5.2 provenance, R5.4 disclosure) ─
     //
-    // REGRESSION: with the scope at the declared default `~/sandbox`, a call
+    // REGRESSION: with the scope at the invented default `~/sandbox`, a call
     // that omitted `working_directory` silently ran there and returned
     // `fatal: not a git repository` / `bash: ./gradlew: No such file or
     // directory`. Those read as project errors, so the model could not diagnose
@@ -1131,14 +1131,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omitted_working_directory_with_default_scope_is_refused_actionably() {
+    async fn omitted_working_directory_with_container_scope_is_refused_actionably() {
         let temp = tempfile::tempdir().unwrap();
-        // Neither explicit nor roots-derived => the declared default (R5.2.3).
+        // Neither explicit nor roots-derived => the user's container root (R5.2.3).
         let service = service_with_provenance(temp.path(), false, false).await;
         let scope = locked_scope(&service);
 
         let err = resolve_for(&service, json!({"command": "git status"}))
-            .expect_err("a default-provenance substitution must be refused, not run");
+            .expect_err("a container-provenance substitution must be refused, not run");
 
         assert_eq!(
             err.code,
@@ -1148,7 +1148,7 @@ mod tests {
         let message = err.message.to_string();
         for expected in [
             "working_directory", // what the call was missing
-            "source: default",   // the provenance that made it unsafe
+            "source: container", // the provenance that made it unsafe
             scope.as_str(),      // the directory it would have used
             "--sandbox-scope",   // how to fix it at the session level
         ] {
@@ -1164,7 +1164,7 @@ mod tests {
         );
         assert_eq!(
             data.get("scope_source").and_then(|v| v.as_str()),
-            Some("default")
+            Some("container")
         );
     }
 

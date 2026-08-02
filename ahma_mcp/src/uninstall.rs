@@ -755,17 +755,19 @@ fn purge_ahma_dir(dry_run: bool) -> Result<()> {
     let home = ahma_common::config::ahma_home_dir()
         .ok_or_else(|| anyhow!("Could not resolve home directory"))?;
     let ahma_dir = home.join(".ahma");
-    // The Antigravity setup creates ~/sandbox for the stdio MCP entry.
-    let sandbox_dir = home.join("sandbox");
+    // Legacy: `ahma setup` used to pre-create ~/sandbox and point roots-less
+    // clients at it. It no longer does (SPEC R5.2.3 — ahma must not invent a
+    // scope), but uninstall still cleans up what older versions left behind.
+    let legacy_sandbox_dir = home.join("sandbox");
 
     if dry_run {
         if ahma_dir.exists() {
             println!("[dry-run] Would remove {}", ahma_dir.display());
         }
-        if sandbox_dir.exists() {
+        if legacy_sandbox_dir.exists() {
             println!(
-                "[dry-run] Would remove {} (Antigravity sandbox directory)",
-                sandbox_dir.display()
+                "[dry-run] Would remove {} (legacy sandbox directory)",
+                legacy_sandbox_dir.display()
             );
         }
         return Ok(());
@@ -777,17 +779,17 @@ fn purge_ahma_dir(dry_run: bool) -> Result<()> {
         println!("✓ Removed {}", ahma_dir.display());
     }
 
-    remove_sandbox_dir_if_empty(&sandbox_dir);
+    remove_legacy_sandbox_dir_if_empty(&legacy_sandbox_dir);
 
     Ok(())
 }
 
-/// Remove the Antigravity `~/sandbox` directory, but only if it is empty.
+/// Remove the legacy `~/sandbox` directory, but only if it is empty.
 ///
-/// Only removes the sandbox dir if it appears to have been created by ahma setup
+/// Only removes it if it appears to have been created by an older `ahma setup`
 /// (i.e. is empty). We do NOT forcibly delete a non-empty user directory named
 /// "sandbox".
-fn remove_sandbox_dir_if_empty(sandbox_dir: &Path) {
+fn remove_legacy_sandbox_dir_if_empty(sandbox_dir: &Path) {
     if !sandbox_dir.exists() {
         return;
     }
@@ -797,7 +799,7 @@ fn remove_sandbox_dir_if_empty(sandbox_dir: &Path) {
     if entries.is_empty() {
         let _ = std::fs::remove_dir(sandbox_dir);
         println!(
-            "✓ Removed empty Antigravity sandbox dir {}",
+            "✓ Removed empty legacy sandbox dir {}",
             sandbox_dir.display()
         );
     } else {

@@ -644,7 +644,7 @@ mod tests {
         let entry = serde_json::json!({
             "type": "stdio",
             "command": "ahma",
-            "args": ["serve", "stdio", "--tools", "simplify", "--sandbox", "--log-monitor"],
+            "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"],
         });
         assert!(
             ide_entry_to_server("Ahma", &entry).is_none(),

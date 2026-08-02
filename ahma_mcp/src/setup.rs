@@ -476,45 +476,32 @@ fn build_mcp_servers_entry(transport: &str) -> serde_json::Value {
     json!({
         "type": "stdio",
         "command": "ahma",
-        "args": [
-            "serve",
-            "stdio",
-            "--tools",
-            "simplify",
-            "--sandbox",
-            "--log-monitor"
-        ]
+        "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
     })
 }
 
-fn build_scoped_servers_entry(transport: &str, home: &Path) -> serde_json::Value {
+/// The stdio entry for clients whose config file omits the `"type"` field
+/// (Antigravity, LM Studio).
+///
+/// It used to also pre-create `~/sandbox` and pin these clients to it with
+/// `--sandbox-scope`, on the belief that they never send `roots/list`. Both
+/// halves were wrong. Antigravity *does* answer `roots/list` — with an empty
+/// array (R5.2.7) — and, more importantly, SPEC R5.2.3/R5.4.2 forbid `ahma
+/// setup` injecting a scope the user did not choose: this file is client-owned,
+/// so a scope written here is exactly the over-broad path the container-root
+/// rules exist to distrust. The observed cost of the old behaviour was a session
+/// silently locked to `~/sandbox`, where every command failed with an
+/// ordinary-looking shell error.
+///
+/// A roots-empty client now reaches its scope through elicitation (R5.3.1) or
+/// the user's own `[sandbox] container_root` (R5.2.3).
+fn build_scoped_servers_entry(transport: &str, _home: &Path) -> serde_json::Value {
     if let Some(url) = mcp_shared_transport_url(transport) {
         return json!({ "url": url });
     }
-    // Some clients (Antigravity, LM Studio) don't send MCP roots/list, so we must
-    // specify a sandbox scope explicitly.  Use the canonical path (not ~/sandbox)
-    // because MCP clients launch processes without shell tilde expansion, and the
-    // sandbox directory must exist for canonicalization.
-    let sandbox_dir = home.join("sandbox");
-    if let Err(e) = std::fs::create_dir_all(&sandbox_dir) {
-        tracing::warn!(
-            "Could not pre-create sandbox directory {}: {e}",
-            sandbox_dir.display()
-        );
-    }
-    let scope_str = sandbox_dir.to_string_lossy().to_string();
     json!({
         "command": "ahma",
-        "args": [
-            "serve",
-            "stdio",
-            "--tools",
-            "simplify",
-            "--sandbox",
-            "--log-monitor",
-            "--sandbox-scope",
-            scope_str
-        ]
+        "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
     })
 }
 
@@ -547,14 +534,7 @@ fn build_claude_desktop_mcp_entry(transport: &str, _home: &Path) -> serde_json::
     }
     json!({
         "command": "ahma",
-        "args": [
-            "serve",
-            "stdio",
-            "--tools",
-            "simplify",
-            "--sandbox",
-            "--log-monitor"
-        ]
+        "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
     })
 }
 
@@ -681,7 +661,6 @@ fn build_codex_toml_value(transport: &str) -> toml::Value {
                 toml::Value::String("stdio".to_string()),
                 toml::Value::String("--tools".to_string()),
                 toml::Value::String("simplify".to_string()),
-                toml::Value::String("--sandbox".to_string()),
                 toml::Value::String("--log-monitor".to_string()),
             ];
             table.insert("args".to_string(), toml::Value::Array(args));
@@ -1000,39 +979,23 @@ mod tests {
     }
 
     #[test]
-    fn test_antigravity_servers_entry_uses_canonical_path_and_creates_dir() {
+    fn test_antigravity_servers_entry_injects_no_scope_and_creates_nothing() {
+        // REGRESSION (SPEC R5.2.3 / R5.4.2): this entry used to pre-create
+        // `~/sandbox` and pin Antigravity to it with `--sandbox-scope`. That
+        // silently locked the session to a directory the user never chose, and
+        // every command run there failed with an ordinary-looking shell error.
         let tmp = tempdir().unwrap();
         let fake_home = tmp.path();
         let entry = build_scoped_servers_entry("stdio", fake_home);
 
-        // The sandbox scope must be a canonical path, not ~/sandbox.
         let args = entry["args"].as_array().expect("args must be an array");
-        let scope_idx = args
-            .iter()
-            .position(|a| a.as_str() == Some("--sandbox-scope"))
-            .expect("must contain --sandbox-scope");
-        let scope_value = args[scope_idx + 1].as_str().unwrap();
-
-        // Must NOT start with ~
         assert!(
-            !scope_value.starts_with('~'),
-            "sandbox scope must be canonical, not tilde: {scope_value}"
+            !args.iter().any(|a| a.as_str() == Some("--sandbox-scope")),
+            "setup must not inject a scope into a client-owned config: {args:?}"
         );
-        // Must be under the fake home
-        let home_str = fake_home.to_string_lossy().to_string();
         assert!(
-            scope_value.starts_with(&home_str),
-            "scope must be under home dir: {scope_value}"
-        );
-        // Must end with /sandbox
-        assert!(
-            scope_value.ends_with("/sandbox") || scope_value.ends_with("\\sandbox"),
-            "scope must end with /sandbox: {scope_value}"
-        );
-        // The directory must have been created
-        assert!(
-            fake_home.join("sandbox").exists(),
-            "sandbox directory must be pre-created by setup"
+            !fake_home.join("sandbox").exists(),
+            "setup must not pre-create ~/sandbox"
         );
     }
 
@@ -1082,55 +1045,60 @@ mod tests {
         assert_eq!(default_all_selection(5), "all");
     }
 
-    // ─── Default install args use --sandbox, not --tmp ────────────────────────
+    // ─── Generated configs never carry --tmp or an injected scope ────────────
+    //
+    // SPEC R5.4.2: these files are *client-owned* — anyone configuring the client
+    // can edit them — so `ahma setup` must not write a sandbox scope into one.
+    // It used to write `--sandbox-scope ~/sandbox` for Antigravity and LM Studio,
+    // which pinned those sessions to a directory the user never chose.
 
-    #[test]
-    fn test_default_mcp_entry_uses_sandbox_not_tmp() {
-        let entry = build_mcp_servers_entry("stdio");
+    /// Assert a generated stdio entry carries neither the temp-dir downgrade nor
+    /// a scope ahma chose on the user's behalf.
+    fn assert_no_tmp_and_no_injected_scope(entry: &serde_json::Value, who: &str) {
         let args = entry["args"].as_array().expect("args must be array");
-        let has_sandbox = args.iter().any(|a| a.as_str() == Some("--sandbox"));
-        let has_tmp = args.iter().any(|a| a.as_str() == Some("--tmp"));
         assert!(
-            has_sandbox,
-            "default stdio entry must include --sandbox: {args:?}"
+            !args.iter().any(|a| a.as_str() == Some("--tmp")),
+            "{who} entry must NOT include --tmp (R5.4.2): {args:?}"
         );
         assert!(
-            !has_tmp,
-            "default stdio entry must NOT include --tmp: {args:?}"
+            !args.iter().any(|a| a.as_str() == Some("--sandbox-scope")),
+            "{who} entry must NOT inject a sandbox scope (R5.2.3/R5.4.2): {args:?}"
         );
     }
 
     #[test]
-    fn test_claude_desktop_entry_uses_sandbox_not_tmp() {
+    fn test_default_mcp_entry_has_no_tmp_or_injected_scope() {
+        assert_no_tmp_and_no_injected_scope(&build_mcp_servers_entry("stdio"), "default stdio");
+    }
+
+    #[test]
+    fn test_claude_desktop_entry_has_no_tmp_or_injected_scope() {
         let tmp = tempdir().unwrap();
         let entry = build_claude_desktop_mcp_entry("stdio", tmp.path());
-        let args = entry["args"].as_array().expect("args must be array");
-        let has_sandbox = args.iter().any(|a| a.as_str() == Some("--sandbox"));
-        let has_tmp = args.iter().any(|a| a.as_str() == Some("--tmp"));
-        assert!(
-            has_sandbox,
-            "Claude Desktop entry must include --sandbox: {args:?}"
-        );
-        assert!(
-            !has_tmp,
-            "Claude Desktop entry must NOT include --tmp: {args:?}"
-        );
+        assert_no_tmp_and_no_injected_scope(&entry, "Claude Desktop");
     }
 
     #[test]
-    fn test_antigravity_entry_uses_sandbox_not_tmp() {
+    fn test_antigravity_entry_has_no_tmp_or_injected_scope() {
         let tmp = tempdir().unwrap();
         let entry = build_scoped_servers_entry("stdio", tmp.path());
-        let args = entry["args"].as_array().expect("args must be array");
-        let has_sandbox = args.iter().any(|a| a.as_str() == Some("--sandbox"));
-        let has_tmp = args.iter().any(|a| a.as_str() == Some("--tmp"));
+        assert_no_tmp_and_no_injected_scope(&entry, "Antigravity");
+    }
+
+    /// `ahma setup` must not create `~/sandbox` (or any other directory) as a
+    /// side effect of building the Antigravity/LM Studio entry.
+    #[test]
+    fn test_scoped_entry_creates_no_directory() {
+        let tmp = tempdir().unwrap();
+        let _ = build_scoped_servers_entry("stdio", tmp.path());
+        let created: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
         assert!(
-            has_sandbox,
-            "Antigravity entry must include --sandbox: {args:?}"
-        );
-        assert!(
-            !has_tmp,
-            "Antigravity entry must NOT include --tmp: {args:?}"
+            created.is_empty(),
+            "setup must not pre-create any directory under home: {created:?}"
         );
     }
 
@@ -1275,7 +1243,11 @@ mod tests {
         assert_eq!(t.get("command").unwrap().as_str(), Some("ahma"));
         let args = t.get("args").unwrap().as_array().unwrap();
         assert_eq!(args[0].as_str(), Some("serve"));
-        assert!(args.iter().any(|a| a.as_str() == Some("--sandbox")));
+        assert!(args.iter().any(|a| a.as_str() == Some("--log-monitor")));
+        assert!(
+            !args.iter().any(|a| a.as_str() == Some("--sandbox-scope")),
+            "setup must not inject a scope into a client-owned config: {args:?}"
+        );
     }
 
     // ─── merge_mcp_json edge cases ────────────────────────────────────────────
@@ -1628,9 +1600,15 @@ mod tests {
         assert_eq!(name, Some("Antigravity"));
         let path = home.join(".gemini").join("config").join("mcp_config.json");
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-        // Scoped entry has a --sandbox-scope arg (and no "type" field).
-        let args = parsed["mcpServers"]["Ahma"]["args"].as_array().unwrap();
-        assert!(args.iter().any(|a| a == "--sandbox-scope"));
+        // The scoped entry differs from the default one only by omitting the
+        // "type" field — it carries no scope of its own (R5.2.3 / R5.4.2).
+        let ahma = &parsed["mcpServers"]["Ahma"];
+        assert!(
+            ahma.get("type").is_none(),
+            "Antigravity entry must omit the type field: {ahma}"
+        );
+        let args = ahma["args"].as_array().unwrap();
+        assert!(!args.iter().any(|a| a == "--sandbox-scope"));
         Ok(())
     }
 

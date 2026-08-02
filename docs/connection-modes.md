@@ -32,7 +32,7 @@ ahma serve stdio
         "Ahma": {
             "type": "stdio",
             "command": "ahma",
-            "args": ["serve", "stdio", "--scratch", "--log-monitor"]
+            "args": ["serve", "stdio", "--log-monitor"]
         }
     }
 }
@@ -59,7 +59,7 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
         "Ahma": {
             "type": "stdio",
             "command": "ahma",
-            "args": ["serve", "stdio", "--scratch", "--log-monitor"]
+            "args": ["serve", "stdio", "--log-monitor"]
         }
     }
 }
@@ -73,36 +73,33 @@ Alternatively, in a terminal run `ahma serve http` for visibility of all actions
         "Ahma": {
             "type": "stdio",
             "command": "ahma",
-            "args": ["serve", "stdio", "--scratch", "--log-monitor"]
+            "args": ["serve", "stdio", "--log-monitor"]
         }
     }
 }
 ```
 
-**Antigravity** (uses `--sandbox-scope` since Antigravity doesn't send `roots/list`):
+**Antigravity / LM Studio** (same entry, minus the `"type"` field these clients do not accept):
 
 ```json
 {
   "mcpServers": {
     "Ahma": {
       "command": "ahma",
-      "args": [
-        "serve",
-        "stdio",
-        "--tools",
-        "simplify",
-        "--scratch",
-        "--log-monitor",
-        "--sandbox-scope",
-        "~/sandbox"
-      ]
+      "args": ["serve", "stdio", "--tools", "simplify", "--log-monitor"]
     }
   }
 }
 ```
 
 > [!NOTE]
-> - The `~/sandbox` directory is auto-created by ahma on first startup. To use a different directory, change the `--sandbox-scope` path above or set `sandbox_directory` in `~/.ahma/settings.toml`.
+> - **Antigravity answers `roots/list` — with an empty array.** It is roots-*empty*, not roots-*less* (an earlier revision of this document said otherwise; the correction is recorded in SPEC R5.4.2 with the wire evidence). An empty answer is not a workspace, so ahma falls through to the next scope source rather than treating it as one.
+> - **`ahma setup` writes no sandbox scope into this file.** It is client-owned — anyone configuring the client can edit it — so a scope written here is exactly the over-broad path that ahma is meant to distrust. Point ahma at the directory that holds your projects instead, in your own `~/.ahma/settings.toml`:
+>   ```toml
+>   [sandbox]
+>   container_root = "~/github"
+>   ```
+>   ahma narrows the writable scope from there to the one project you are actually working in, keeping the rest of the container readable but not writable.
 > - **You do not need a "sync" flag.** `run_terminal_command` decides for itself: a command that finishes inside the inline window returns its output in the same response, with no `status`/`await` round-trip. Only a command that outlives the window hands back an operation id. The window adapts — longer when nothing else is running, short when you are starting several commands at once — and is capped by what your client tolerates on one open request (SPEC R2.6). Sending `"sync": true` does nothing; the result will say so.
 
 ## 2. HTTP Mode (EXPERIMENTAL)
@@ -220,9 +217,11 @@ Ahma treats an empty `roots/list` response as "client has no workspace roots yet
 1. **Open a workspace folder** — in Cursor: `File → Open Folder...` — so that Cursor advertises the folder as a workspace root in its next `roots/list` response.
 2. **Configure an explicit scope** — pass `--sandbox-scope /path/to/your/project` in your `mcp.json` `args` list:
    ```json
-   "args": ["serve", "stdio", "--scratch", "--log-monitor", "--sandbox-scope", "/path/to/project"]
+   "args": ["serve", "stdio", "--log-monitor", "--sandbox-scope", "/path/to/project"]
    ```
-3. **Use `--scratch`** — starts ahma with a fixed `~/sandbox` scratch scope that never changes, suitable for clients that never provide roots. (`--sandbox` still works as a deprecated alias.)
+3. **Set a container root** — put `container_root = "~/github"` under `[sandbox]` in `~/.ahma/settings.toml`, naming the directory that holds your projects. ahma uses it only when the client reports no usable roots, and narrows the writable scope to the single project subtree in use.
+
+`--scratch` (deprecated alias `--sandbox`) is *not* a resolution: it adds an auxiliary scratch directory alongside the real workspace scope, and does nothing unless you also set `[sandbox] scratch_directory`. It used to default to `~/sandbox` and double as the scope fallback, which is how sessions ended up silently locked to a directory nobody chose.
 
 ## 3. Unix Socket Mode
 

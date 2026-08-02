@@ -20,7 +20,7 @@ use super::types::{SandboxMode, ScopesGuard};
 /// Exceptions are keyed by workspace root:
 ///
 /// ```json
-/// { "/Users/you/sandbox/ahma": ["/abs/target/one", "/abs/target/two"] }
+/// { "/Users/you/github/ahma": ["/abs/target/one", "/abs/target/two"] }
 /// ```
 fn log_exceptions_path() -> Option<PathBuf> {
     // Honors `AHMA_CONFIG_DIR` (tests / relocation), else the platform config dir.
@@ -214,10 +214,10 @@ pub struct Sandbox {
     pub(super) no_temp_files: bool,
     /// When true, the canonical temp directory is preserved across scope updates.
     pub(super) tmp_access: bool,
-    /// When set, this directory (typically `~/sandbox`) is preserved across every
+    /// When set, this user-configured scratch directory is preserved across every
     /// `update_scopes` call so that `roots/list` replacements produce
     /// `roots ∪ {sandbox_dir}` rather than discarding the secondary scope.
-    pub(super) sandbox_dir: Option<PathBuf>,
+    pub(super) scratch_dir: Option<PathBuf>,
     /// User-granted external directories (writable) that survive `roots/list`
     /// replacement, just like [`sandbox_dir`](Self::sandbox_dir). These come from
     /// `[sandbox].persistent_scopes` with `access = "rw"` (e.g. an sccache cache
@@ -264,7 +264,7 @@ impl Clone for Sandbox {
             mode: self.mode,
             no_temp_files: self.no_temp_files,
             tmp_access: self.tmp_access,
-            sandbox_dir: self.sandbox_dir.clone(),
+            scratch_dir: self.scratch_dir.clone(),
             persistent_write_scopes: self.persistent_write_scopes.clone(),
             persistent_read_scopes: self.persistent_read_scopes.clone(),
             explicit_scopes: self.explicit_scopes,
@@ -284,7 +284,7 @@ impl std::fmt::Debug for Sandbox {
             .field("mode", &self.mode)
             .field("no_temp_files", &self.no_temp_files)
             .field("tmp_access", &self.tmp_access)
-            .field("sandbox_dir", &self.sandbox_dir)
+            .field("scratch_dir", &self.scratch_dir)
             .field("persistent_write_scopes", &self.persistent_write_scopes)
             .field("persistent_read_scopes", &self.persistent_read_scopes)
             .field("explicit_scopes", &self.explicit_scopes)
@@ -323,7 +323,7 @@ impl Sandbox {
             mode,
             no_temp_files,
             tmp_access,
-            sandbox_dir: None,
+            scratch_dir: None,
             persistent_write_scopes: Vec::new(),
             persistent_read_scopes: Vec::new(),
             explicit_scopes: false,
@@ -371,18 +371,18 @@ impl Sandbox {
         self.explicit_scopes
     }
 
-    /// Set a persistent secondary scope directory (typically `~/sandbox`) that is
+    /// Set a persistent secondary scratch scope (`[sandbox] scratch_directory`) that is
     /// re-appended after every `update_scopes` call so it survives `roots/list`
     /// replacements.  The path must already be canonicalized by the caller.
     #[must_use]
-    pub fn with_sandbox_dir(mut self, dir: Option<PathBuf>) -> Self {
-        self.sandbox_dir = dir;
+    pub fn with_scratch_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.scratch_dir = dir;
         self
     }
 
-    /// Return the persistent secondary scope directory, if one was configured.
-    pub fn sandbox_dir(&self) -> Option<&PathBuf> {
-        self.sandbox_dir.as_ref()
+    /// Return the persistent secondary scratch directory, if one was configured.
+    pub fn scratch_dir(&self) -> Option<&PathBuf> {
+        self.scratch_dir.as_ref()
     }
 
     /// Register user-granted persistent scopes (from `[sandbox].persistent_scopes`).
@@ -426,8 +426,8 @@ impl Sandbox {
             "Client must provide valid workspace roots.",
         )?;
 
-        // Re-append ~/sandbox so roots/list replacements don't discard it.
-        if let Some(ref dir) = self.sandbox_dir
+        // Re-append the scratch dir so roots/list replacements don't discard it.
+        if let Some(ref dir) = self.scratch_dir
             && !canonicalized.contains(dir)
         {
             tracing::info!(
@@ -507,7 +507,7 @@ impl Sandbox {
         } else if self.roots_received() {
             ScopeSource::RootsList
         } else {
-            ScopeSource::Default
+            ScopeSource::Container
         }
     }
 
@@ -896,9 +896,9 @@ mod scope_view_tests {
             false,
         )
         .unwrap();
-        let text = sb.scope_text(ScopeSource::Default);
+        let text = sb.scope_text(ScopeSource::Container);
         assert!(
-            text.contains("source: default"),
+            text.contains("source: container"),
             "missing source line:\n{text}"
         );
         assert!(text.contains("Sandbox:"), "missing header:\n{text}");

@@ -19,8 +19,16 @@ pub enum ScopeSource {
     RootsList,
     /// A user answered a downgrade elicitation.
     Elicited,
-    /// Fell back to the declared default `~/sandbox` (no roots, no explicit).
-    Default,
+    /// Derived from the user's `[sandbox] container_root` — the directory that
+    /// holds their projects — because the client reported no usable roots and no
+    /// explicit scope was configured (SPEC R5.2.3). Always subject to
+    /// auto-narrowing (R5.2.6).
+    ///
+    /// This replaced a `Default` variant that meant "fell back to `~/sandbox`", a
+    /// directory ahma invented rather than the user choosing. R5.2.3 now forbids
+    /// inventing one at all, so there is no longer any such thing as a default
+    /// scope — only a container the user named.
+    Container,
     /// Established by the TUI with no live IDE session; applied to the next
     /// attaching session (SPEC R5.3.6).
     Pending,
@@ -34,7 +42,7 @@ impl ScopeSource {
             ScopeSource::Explicit => "explicit",
             ScopeSource::RootsList => "roots/list",
             ScopeSource::Elicited => "elicited",
-            ScopeSource::Default => "default",
+            ScopeSource::Container => "container",
             ScopeSource::Pending => "pending",
         }
     }
@@ -282,7 +290,7 @@ mod tests {
             read_scopes: &reads,
             tmp_access: true,
             enforced: true,
-            source: ScopeSource::Default,
+            source: ScopeSource::Container,
         };
         let text = view.render_text();
         assert!(
@@ -295,7 +303,7 @@ mod tests {
             "should show tmp ON:\n{text}"
         );
         assert!(
-            text.contains("default"),
+            text.contains("container"),
             "should show source attribution:\n{text}"
         );
     }
@@ -389,7 +397,7 @@ mod tests {
         assert_eq!(ScopeSource::Explicit.as_str(), "explicit");
         assert_eq!(ScopeSource::RootsList.as_str(), "roots/list");
         assert_eq!(ScopeSource::Elicited.as_str(), "elicited");
-        assert_eq!(ScopeSource::Default.as_str(), "default");
+        assert_eq!(ScopeSource::Container.as_str(), "container");
         assert_eq!(ScopeSource::Pending.as_str(), "pending");
     }
 

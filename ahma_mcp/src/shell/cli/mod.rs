@@ -122,13 +122,18 @@ pub struct AppConfig {
     pub defer_sandbox: bool,
     /// Working directories seeded when defer mode lacks client roots.
     pub working_dirs: Vec<PathBuf>,
-    /// Default scratch directory for sandbox scope fallback.
-    /// Auto-created if it does not exist.  Used when no explicit scopes are
-    /// provided and the cwd is a filesystem root.
-    pub sandbox_directory: Option<PathBuf>,
-    /// Add the sandbox_directory (~/sandbox by default) as a persistent secondary
-    /// scope that survives roots/list updates.  Set by --scratch (deprecated alias: --sandbox).
-    pub use_sandbox_dir: bool,
+    /// The user's project container (`[sandbox] container_root`, e.g. `~/github`).
+    /// Scope source 4 (SPEC R5.2.3): used only when the client reports no usable
+    /// roots and no explicit scope was configured. Never defaulted — with nothing
+    /// configured ahma refuses tool calls rather than inventing a directory.
+    pub container_root: Option<PathBuf>,
+    /// Optional scratch directory kept writable across roots/list updates.
+    /// Auto-created if it does not exist. Set by `--scratch` (deprecated alias:
+    /// `--sandbox`); has no effect unless a path is configured.
+    pub scratch_directory: Option<PathBuf>,
+    /// Add the scratch_directory as a persistent secondary scope that survives
+    /// roots/list updates. Set by --scratch (deprecated alias: --sandbox).
+    pub use_scratch_dir: bool,
     /// Add system temp dir to sandbox scopes (AHMA_TMP_ACCESS=1).
     pub tmp_access: bool,
     /// Block writes to temp directories (AHMA_DISABLE_TEMP=1).
@@ -232,8 +237,9 @@ impl Default for AppConfig {
             sandbox_scopes: vec![],
             defer_sandbox: false,
             working_dirs: vec![],
-            sandbox_directory: Some(PathBuf::from("~/sandbox")),
-            use_sandbox_dir: false,
+            container_root: None,
+            scratch_directory: None,
+            use_scratch_dir: false,
             tmp_access: false,
             no_temp_files: false,
             log_monitor: false,
@@ -468,28 +474,33 @@ fn resolve_sandbox_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     // project-marker files, not as a "provisional" root. A spoofable, ambient
     // signal must not decide what the AI may write to. With no explicit scope
     // (handled above) the scope source is, in order: the client's roots/list, a
-    // user elicitation answer, or the declared default `~/sandbox` (R5.2).
+    // user elicitation answer, or the user's container root (R5.2).
     //
     // Here at startup we have not yet talked to the client, so we seed the
-    // declared default when one is configured (the common case — `--sandbox` and
-    // the built-in `sandbox_directory` default both provide it), otherwise an
-    // empty provisional scope so the server awaits roots/list. Either way the
-    // result is shown with its provenance (R5.4); nothing is silent.
-    if let Some(sandbox_dir) = &cfg.sandbox_directory {
-        let canonical = ahma_common::config::ensure_sandbox_directory(sandbox_dir)
-            .context("Failed to initialize default sandbox directory")?;
+    // container root when the user configured one, otherwise an empty provisional
+    // scope so the server awaits roots/list. Either way the result is shown with
+    // its provenance (R5.4); nothing is silent.
+    if let Some(container_root) = &cfg.container_root {
+        let canonical = ahma_common::config::ensure_sandbox_directory(container_root)
+            .context("Failed to initialize [sandbox] container_root")?;
         tracing::info!(
-            "No explicit scope; using default sandbox directory (SPEC R5.2.3): {}",
+            "No explicit scope; falling back to the configured container root (SPEC R5.2.3): {}",
             canonical.display()
         );
         return Ok(Some(vec![canonical]));
     }
 
+    // R5.2.3 is explicit that ahma must not invent a directory here. It used to:
+    // `sandbox_directory` defaulted to `~/sandbox`, so a client that reported no
+    // roots silently locked to a folder nobody chose, and every command ran there
+    // and failed with ordinary-looking shell errors. Refusing loudly is the fix,
+    // so this message has to carry the whole remediation.
     tracing::warn!(
-        "No explicit scope and no sandbox_directory configured; awaiting client roots/list. \
-         Tool calls return HTTP 409 until roots arrive. For clients that do not send roots \
-         (e.g. Antigravity, LM Studio), add --sandbox-scope <path> or configure \
-         [sandbox] sandbox_directory in ~/.ahma/settings.toml (default ~/sandbox)."
+        "No explicit scope and no [sandbox] container_root configured; awaiting client \
+         roots/list. Tool calls are refused until a scope is established. For clients that \
+         report no workspace roots (e.g. Antigravity, LM Studio), either pass \
+         --sandbox-scope <project-dir>, or set `[sandbox] container_root = \"~/github\"` in \
+         ~/.ahma/settings.toml to point ahma at the directory that holds your projects."
     );
     Ok(Some(Vec::new()))
 }
@@ -642,29 +653,35 @@ fn grant_persistent_read_scope(
     }
 }
 
-/// Resolve the persistent secondary sandbox directory requested by `--sandbox`.
+/// Resolve the persistent secondary scratch directory requested by `--scratch`.
 ///
-/// Returns `None` when `--sandbox` was not set, when no `sandbox_directory` is
+/// Returns `None` when `--scratch` was not set, when no `scratch_directory` is
 /// configured, or when the directory could not be created/canonicalized — each
 /// case disclosed in the log rather than failing startup.
-fn resolve_persistent_sandbox_dir(cfg: &AppConfig) -> Option<PathBuf> {
-    if !cfg.use_sandbox_dir {
+fn resolve_persistent_scratch_dir(cfg: &AppConfig) -> Option<PathBuf> {
+    if !cfg.use_scratch_dir {
         return None;
     }
-    let Some(dir) = &cfg.sandbox_directory else {
-        tracing::warn!("--sandbox set but no sandbox_directory configured; ignoring");
+    let Some(dir) = &cfg.scratch_directory else {
+        // No longer defaulted to `~/sandbox`: scratch space is opt-in with an
+        // explicit path, so `--scratch` alone is a no-op that says so.
+        tracing::warn!(
+            "--scratch set but no [sandbox] scratch_directory configured; ignoring. \
+             Set `[sandbox] scratch_directory = \"<path>\"` in ~/.ahma/settings.toml to \
+             give the AI a stable workspace-independent scratch space."
+        );
         return None;
     };
     match ahma_common::config::ensure_sandbox_directory(dir) {
         Ok(canonical) => {
             tracing::info!(
-                "Persistent sandbox directory (--sandbox): {}",
+                "Persistent scratch directory (--scratch): {}",
                 canonical.display()
             );
             Some(canonical)
         }
         Err(e) => {
-            tracing::warn!("Failed to create sandbox directory {:?}: {}", dir, e);
+            tracing::warn!("Failed to create scratch directory {:?}: {}", dir, e);
             None
         }
     }
@@ -688,7 +705,7 @@ fn create_sandbox_instance(
 
     // When --sandbox is set, canonicalize ~/sandbox and record it as the
     // persistent secondary scope that survives every roots/list update.
-    let sandbox_dir = resolve_persistent_sandbox_dir(cfg);
+    let sandbox_dir = resolve_persistent_scratch_dir(cfg);
 
     // User-granted persistent scopes (e.g. an sccache cache outside the workspace).
     // Folded into the sandbox now (so initial enforcement covers them) and
@@ -705,7 +722,7 @@ fn create_sandbox_instance(
     )
     .context("Failed to initialize sandbox")?
     .with_explicit_scopes(explicit_scopes)
-    .with_sandbox_dir(sandbox_dir)
+    .with_scratch_dir(sandbox_dir)
     .with_persistent_scopes(persistent_write_scopes, persistent_read_scopes)
     .with_package_cache_write(cfg.package_cache_write);
 
@@ -1535,7 +1552,7 @@ pub fn settings_origin_ctx(cli: &Cli) -> SettingsOriginCtx {
         flag(cli.defer_sandbox, "sandbox.defer");
         flag(cli.tmp, "sandbox.tmp_access");
         flag(cli.no_temp_files, "sandbox.disable_temp");
-        flag(cli.use_scratch, "sandbox.use_sandbox_directory");
+        flag(cli.use_scratch, "sandbox.use_scratch_directory");
         flag(cli.log_monitor, "logging.log_monitor");
         flag(cli.disable_quic, "http.disable_quic");
         flag(cli.disable_http1_1, "http.disable_http1_1");
@@ -2525,7 +2542,7 @@ fn parse_sandbox_settings(
     warn_retired_security_env!("AHMA_TMP_ACCESS");
     let tmp_access = cli.tmp || s.sandbox.tmp_access;
 
-    let use_sandbox_dir = cli.use_scratch || s.sandbox.use_sandbox_directory;
+    let use_scratch_dir = cli.use_scratch || s.sandbox.use_scratch_directory;
 
     // Security-tier: AHMA_DISABLE_TEMP retired — warn and ignore.
     warn_retired_security_env!("AHMA_DISABLE_TEMP");
@@ -2547,7 +2564,7 @@ fn parse_sandbox_settings(
         no_sandbox,
         defer_sandbox,
         tmp_access,
-        use_sandbox_dir,
+        use_scratch_dir,
         no_temp_files,
         log_monitor,
         monitor_rate_limit_secs,
@@ -2789,7 +2806,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         no_sandbox,
         defer_sandbox,
         tmp_access,
-        use_sandbox_dir,
+        use_scratch_dir,
         no_temp_files,
         log_monitor,
         monitor_rate_limit_secs,
@@ -2829,8 +2846,9 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         sandbox_scopes,
         defer_sandbox,
         working_dirs,
-        sandbox_directory: s.sandbox.sandbox_directory.clone(),
-        use_sandbox_dir,
+        container_root: s.sandbox.container_root.clone(),
+        scratch_directory: s.sandbox.scratch_directory.clone(),
+        use_scratch_dir,
         tmp_access,
         no_temp_files,
         log_monitor,
@@ -3042,8 +3060,9 @@ mod tests {
             sandbox_scopes: vec![],
             defer_sandbox: false,
             working_dirs: vec![],
-            sandbox_directory: None,
-            use_sandbox_dir: false,
+            container_root: None,
+            scratch_directory: None,
+            use_scratch_dir: false,
             tmp_access: false,
             no_temp_files: false,
             log_monitor: false,
@@ -3775,7 +3794,7 @@ mod tests {
         unsafe { std::env::remove_var("AHMA_TEST_CFG_FLAG") };
     }
 
-    // ─── --scratch flag (deprecated alias: --sandbox) / use_sandbox_dir ───────
+    // ─── --scratch flag (deprecated alias: --sandbox) / use_scratch_dir ──────
 
     /// --scratch CLI flag is parsed to use_scratch on Cli and threads into AppConfig.
     #[test]
@@ -3795,16 +3814,16 @@ mod tests {
         );
     }
 
-    /// When CWD is inside the temp dir, resolve_sandbox_scopes falls back to
-    /// sandbox_directory rather than locking to temp.
+    /// When CWD is inside the temp dir, resolve_sandbox_scopes falls back to the
+    /// configured container root rather than locking to temp (SPEC R5.2.3/R5.2.5).
     #[test]
-    fn test_resolve_sandbox_scopes_cwd_in_temp_uses_sandbox_directory() {
+    fn test_resolve_sandbox_scopes_cwd_in_temp_uses_container_root() {
         init_test();
         let sandbox_dir_tmp = tempdir().unwrap();
         let cfg = AppConfig {
             no_sandbox: true,
             sandbox_scopes: vec![],
-            sandbox_directory: Some(sandbox_dir_tmp.path().to_path_buf()),
+            container_root: Some(sandbox_dir_tmp.path().to_path_buf()),
             ..make_cfg()
         };
 
@@ -3822,19 +3841,20 @@ mod tests {
         assert_eq!(
             scopes,
             vec![expected_dir],
-            "When CWD is in temp, must use sandbox_directory, not temp: {scopes:?}"
+            "When CWD is in temp, must use container_root, not temp: {scopes:?}"
         );
     }
 
-    /// When CWD is inside temp and no sandbox_directory is set, resolve_sandbox_scopes
-    /// returns empty (waiting for roots/list) rather than locking to temp.
+    /// With no container root configured, resolve_sandbox_scopes returns empty
+    /// (awaiting roots/list) rather than locking to temp or inventing a directory.
     #[test]
-    fn test_resolve_sandbox_scopes_cwd_in_temp_no_sandbox_dir_returns_empty() {
+    fn test_resolve_sandbox_scopes_cwd_in_temp_no_container_root_returns_empty() {
         init_test();
         let cfg = AppConfig {
             no_sandbox: true,
             sandbox_scopes: vec![],
-            sandbox_directory: None,
+            container_root: None,
+            scratch_directory: None,
             ..make_cfg()
         };
 
@@ -3848,12 +3868,12 @@ mod tests {
         let scopes = scopes_result.unwrap().expect("must return Some");
         assert!(
             scopes.is_empty(),
-            "CWD-in-temp with no sandbox_directory must return empty: {scopes:?}"
+            "CWD-in-temp with no container_root must return empty: {scopes:?}"
         );
     }
 
     /// build_background_bridge_args does NOT include sandbox_scopes as --sandbox-scope
-    /// when they are empty, and DOES forward --sandbox when use_sandbox_dir is set.
+    /// when they are empty, and DOES forward --scratch when use_scratch_dir is set.
     #[test]
     fn test_build_background_bridge_args_forwards_sandbox_flag_not_resolved_scopes() {
         init_test();
@@ -3861,8 +3881,8 @@ mod tests {
         let cfg = AppConfig {
             no_sandbox: true,
             sandbox_scopes: vec![], // no explicit scopes
-            use_sandbox_dir: true,
-            sandbox_directory: Some(tmp.path().to_path_buf()),
+            use_scratch_dir: true,
+            scratch_directory: Some(tmp.path().to_path_buf()),
             ..make_cfg()
         };
 
@@ -3879,7 +3899,7 @@ mod tests {
     }
 
     /// build_background_bridge_args forwards explicit --sandbox-scope values but
-    /// not the --sandbox flag when use_sandbox_dir is false.
+    /// not the --sandbox flag when use_scratch_dir is false.
     #[test]
     fn test_build_background_bridge_args_forwards_explicit_scope_only() {
         init_test();
@@ -3888,7 +3908,7 @@ mod tests {
         let cfg = AppConfig {
             no_sandbox: true,
             sandbox_scopes: vec![scope.clone()],
-            use_sandbox_dir: false,
+            use_scratch_dir: false,
             ..make_cfg()
         };
 
@@ -3904,7 +3924,7 @@ mod tests {
         );
         assert!(
             !args.contains(&"--scratch".to_string()),
-            "--scratch must not appear when use_sandbox_dir is false: {args:?}"
+            "--scratch must not appear when use_scratch_dir is false: {args:?}"
         );
     }
 
@@ -3914,13 +3934,13 @@ mod tests {
     fn resolve_sandbox_scopes_ignores_cwd_and_markers() {
         // SPEC R5.2.1: the launch CWD must never become a sandbox scope by
         // inference — with or without project-marker files. With no explicit
-        // scope configured, resolution must fall to the declared default
-        // sandbox_directory (R5.2.3), NOT the current working directory — even
-        // though the test process CWD (the crate dir) contains a Cargo.toml
-        // marker that the old `is_plausible_workspace` heuristic would accept.
+        // scope configured, resolution must fall to the user's container root
+        // (R5.2.3), NOT the current working directory — even though the test
+        // process CWD (the crate dir) contains a Cargo.toml marker that the old
+        // `is_plausible_workspace` heuristic would accept.
         let tmp = tempdir().unwrap();
         let mut cfg = make_cfg();
-        cfg.sandbox_directory = Some(tmp.path().to_path_buf());
+        cfg.container_root = Some(tmp.path().to_path_buf());
 
         let scopes = resolve_sandbox_scopes(&cfg).unwrap().unwrap();
 
@@ -3928,7 +3948,7 @@ mod tests {
         assert_eq!(
             scopes,
             vec![expected],
-            "scope must be the default sandbox_directory, not the CWD"
+            "scope must be the configured container_root, not the CWD"
         );
         let cwd = dunce::canonicalize(std::env::current_dir().unwrap()).unwrap();
         assert!(
@@ -3940,10 +3960,11 @@ mod tests {
     #[test]
     fn resolve_sandbox_scopes_no_default_awaits_roots() {
         // SPEC R5.2.3 / R5.2: with neither an explicit scope nor a configured
-        // sandbox_directory, resolution yields an empty provisional scope so
-        // the server awaits the client's roots/list — never the CWD.
+        // container root, resolution yields an empty provisional scope so the
+        // server awaits the client's roots/list — never the CWD, and never an
+        // invented directory.
         let mut cfg = make_cfg();
-        cfg.sandbox_directory = None;
+        cfg.container_root = None;
         let scopes = resolve_sandbox_scopes(&cfg).unwrap().unwrap();
         assert!(
             scopes.is_empty(),
@@ -4307,7 +4328,7 @@ mod tests {
         s.sandbox.disable = true;
         s.sandbox.defer = true;
         s.sandbox.tmp_access = true;
-        s.sandbox.use_sandbox_directory = true;
+        s.sandbox.use_scratch_directory = true;
         s.sandbox.disable_temp = true;
         s.logging.log_monitor = true;
         s.logging.monitor_rate_limit_secs = 30;

@@ -785,7 +785,7 @@ pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
     if config.defer_sandbox {
         push(&mut args, "--defer-sandbox");
     }
-    if config.use_sandbox_dir {
+    if config.use_scratch_dir {
         push(&mut args, "--scratch");
     }
     if config.tmp_access {
@@ -1264,8 +1264,9 @@ mod tests {
             restrict_network: false,
             network_allow: vec![],
             sandbox_scopes: vec![],
-            use_sandbox_dir: false,
-            sandbox_directory: Some(std::path::PathBuf::from("~/sandbox")),
+            use_scratch_dir: false,
+            container_root: None,
+            scratch_directory: None,
             tmp_access: false,
             defer_sandbox: false,
             working_dirs: vec![],
@@ -1316,8 +1317,8 @@ mod tests {
     fn test_bridge_args_sandbox_flag_no_scope_forwarded() {
         let tmp = tempdir().unwrap();
         let cfg = AppConfig {
-            use_sandbox_dir: true,
-            sandbox_directory: Some(tmp.path().to_path_buf()),
+            use_scratch_dir: true,
+            scratch_directory: Some(tmp.path().to_path_buf()),
             ..base_cfg()
         };
 
@@ -1340,7 +1341,7 @@ mod tests {
         let scope = tmp.path().to_path_buf();
         let cfg = AppConfig {
             sandbox_scopes: vec![scope.clone()],
-            use_sandbox_dir: false,
+            use_scratch_dir: false,
             ..base_cfg()
         };
 
@@ -1356,7 +1357,7 @@ mod tests {
         );
         assert!(
             !args.contains(&"--scratch".to_string()),
-            "--scratch must not appear when use_sandbox_dir is false: {args:?}"
+            "--scratch must not appear when use_scratch_dir is false: {args:?}"
         );
     }
 
@@ -1367,8 +1368,8 @@ mod tests {
         let scope = tmp.path().to_path_buf();
         let cfg = AppConfig {
             sandbox_scopes: vec![scope.clone()],
-            use_sandbox_dir: true,
-            sandbox_directory: Some(tmp.path().to_path_buf()),
+            use_scratch_dir: true,
+            scratch_directory: Some(tmp.path().to_path_buf()),
             ..base_cfg()
         };
 
@@ -1862,7 +1863,7 @@ mod tests {
             force_sync: true,
             hot_reload_tools: true,
             defer_sandbox: true,
-            use_sandbox_dir: true,
+            use_scratch_dir: true,
             tmp_access: true,
             no_temp_files: true,
             ..base_cfg()

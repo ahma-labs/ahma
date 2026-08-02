@@ -60,10 +60,11 @@ fn setting_rows(
     row!("sandbox.tmp_access", sandbox.tmp_access);
     row!("sandbox.disable_temp", sandbox.disable_temp);
     row!("sandbox.defer", sandbox.defer);
-    row!("sandbox.sandbox_directory", sandbox.sandbox_directory);
+    row!("sandbox.container_root", sandbox.container_root);
+    row!("sandbox.scratch_directory", sandbox.scratch_directory);
     row!(
-        "sandbox.use_sandbox_directory",
-        sandbox.use_sandbox_directory
+        "sandbox.use_scratch_directory",
+        sandbox.use_scratch_directory
     );
     row!("logging.target", logging.target);
     row!("logging.log_monitor", logging.log_monitor);

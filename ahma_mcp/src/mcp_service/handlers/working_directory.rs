@@ -89,7 +89,7 @@ impl WorkingDirectory {
 ///
 /// Three outcomes, in order:
 /// 1. caller named a directory → use it, disclose nothing;
-/// 2. omitted, and the scope is the declared default → refuse (see
+/// 2. omitted, and the scope came from the container root → refuse (see
 ///    [`no_working_directory_error`]);
 /// 3. omitted otherwise → substitute, and say so in the result.
 pub fn resolve(
@@ -114,12 +114,12 @@ pub fn resolve(
         ));
     };
 
-    if source == ScopeSource::Default {
+    if source == ScopeSource::Container {
         tracing::warn!(
             tool = %tool,
             scope = %scope,
-            "tool called without working_directory while the scope source is the declared \
-             default; refusing rather than running somewhere nobody chose"
+            "tool called without working_directory while the scope is the user's container \
+             root; refusing rather than running in a directory that spans every project"
         );
         return Err(no_working_directory_error(sandbox, tool, &scope));
     }
@@ -158,45 +158,51 @@ fn substitution_notice(directory: &str, why: &str) -> String {
 }
 
 /// Refusal for "no `working_directory`, and the only thing to substitute is the
-/// *declared default* scope" (SPEC R5.2.3 — the fallback used when no client
-/// roots arrived and no explicit scope was configured).
+/// **container root**" (SPEC R5.2.3 / R5.2.8).
 ///
-/// Why this one case refuses instead of running: a default scope is a directory
-/// nobody chose for this task. With the scope at `~/sandbox`, commands ran there
-/// and answered `fatal: not a git repository` and `bash: ./gradlew: No such file
-/// or directory`. Those are ordinary *shell* errors, so the model debugged the
-/// project rather than the directory, could not diagnose it, and left ahma for
-/// its own unsandboxed terminal. A silent wrong-directory success is worse than
-/// a loud failure.
+/// Two reasons this one case refuses instead of running.
+///
+/// It is a directory nobody chose *for this task*: a container spans every
+/// project the user owns. When the scope was `~/sandbox`, commands ran there and
+/// answered `fatal: not a git repository` and `bash: ./gradlew: No such file or
+/// directory` — ordinary *shell* errors, so the model debugged the project
+/// rather than the directory, could not diagnose it, and left ahma for its own
+/// unsandboxed terminal. A silent wrong-directory success is worse than a loud
+/// failure.
+///
+/// It is also the missing input to auto-narrowing (R5.2.6): the working
+/// directory is the signal that selects which subtree of the container becomes
+/// writable, so a call that omits it leaves the server nothing to narrow on.
 ///
 /// The body carries the complete scope through the one canonical renderer
 /// (R5.4(d): scope-related errors show the scope and its provenance), plus a
 /// machine-readable `data` payload shaped like the `sandbox_denial` one so a
 /// client can act on it without parsing prose.
 fn no_working_directory_error(sandbox: &Sandbox, tool: &str, scope: &str) -> McpError {
-    let source = ScopeSource::Default;
+    let source = ScopeSource::Container;
     let scope_text = sandbox.scope_text(source);
     let message = format!(
         "`{tool}` was called without `working_directory`, and this session's sandbox scope is \
-         the declared default (source: {source}) — a directory nobody chose for this task. \
-         Refusing to run in `{scope}`, because commands that land there fail with \
-         ordinary-looking shell errors (`not a git repository`, `No such file or directory`) \
-         that give no hint the directory was substituted.\n\
+         your container root (source: {source}) — the directory that holds *all* your \
+         projects, not the one this task is about. Refusing to run in `{scope}`, because \
+         commands that land there fail with ordinary-looking shell errors (`not a git \
+         repository`, `No such file or directory`) that give no hint the directory was \
+         substituted.\n\
          \n{scope_text}\n\
-         Fix by either: (1) pass an explicit in-scope `working_directory`; or (2) give the \
-         session a real scope — start ahma with `--sandbox-scope <dir>`, set it in \
-         `~/.ahma/settings.toml`, or use a client that reports workspace roots via \
-         `roots/list`.",
+         Fix by passing an explicit in-scope `working_directory` — the project subdirectory \
+         this task is about. That also tells ahma which subtree to narrow the writable scope \
+         to. Alternatively, give the session a scope of its own with `--sandbox-scope <dir>`, \
+         or use a client that reports workspace roots via `roots/list`.",
         source = source.as_str(),
     );
     let data = serde_json::json!({
         "kind": "working_directory_required",
-        "reason": "scope_source_is_default",
+        "reason": "scope_source_is_container",
         "tool": tool,
         "scope_source": source.as_str(),
         "substituted_scope": scope,
-        "remediation": "Pass an explicit in-scope `working_directory`, or configure a \
-                        real sandbox scope (`--sandbox-scope <dir>`).",
+        "remediation": "Pass an explicit in-scope `working_directory` naming the project \
+                        subdirectory, or configure a session scope (`--sandbox-scope <dir>`).",
     });
     McpError::invalid_params(message, Some(data))
 }
@@ -214,7 +220,7 @@ mod tests {
     }
 
     /// An enforcing sandbox scoped to `scope` with no provenance recorded, i.e.
-    /// [`ScopeSource::Default`].
+    /// [`ScopeSource::Container`].
     ///
     /// `set_roots_received(false)` is not redundant: a fresh `Sandbox` starts
     /// with the flag set, and a live session only clears it during
@@ -275,11 +281,11 @@ mod tests {
         assert!(err.message.contains("no `working_directory` was given"));
     }
 
-    /// The MTDF surface must refuse on a default scope exactly as the shell
+    /// The MTDF surface must refuse on a container scope exactly as the shell
     /// surface does — R5.2.8 binds every surface, and this test is what stops
     /// the two from drifting apart again.
     #[test]
-    fn default_scope_refuses_and_names_the_tool() {
+    fn container_scope_refuses_and_names_the_tool() {
         let dir = tempfile::tempdir().unwrap();
         let sb = default_scope_sandbox(dir.path());
         let err = resolve(&sb, "cargo", &Map::new()).unwrap_err();
@@ -292,15 +298,15 @@ mod tests {
         );
         let data = err.data.expect("refusal carries an actionable payload");
         assert_eq!(data["kind"], "working_directory_required");
-        assert_eq!(data["reason"], "scope_source_is_default");
+        assert_eq!(data["reason"], "scope_source_is_container");
         assert_eq!(data["tool"], "cargo");
-        assert_eq!(data["scope_source"], "default");
+        assert_eq!(data["scope_source"], "container");
     }
 
-    /// A default scope only refuses when the caller named nothing: an explicit
+    /// A container scope only refuses when the caller named nothing: an explicit
     /// directory is always honoured (and separately validated by path security).
     #[test]
-    fn default_scope_with_explicit_directory_still_runs() {
+    fn container_scope_with_explicit_directory_still_runs() {
         let dir = tempfile::tempdir().unwrap();
         let sb = default_scope_sandbox(dir.path());
         let wd = resolve(&sb, "cargo", &args_with_dir("/chosen")).unwrap();
