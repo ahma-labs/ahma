@@ -755,13 +755,7 @@ impl AhmaMcpService {
         // SPEC R5.4: the configured notification carries the complete scope and
         // its provenance so the client can show it without a separate query.
         let sandbox = self.adapter.sandbox();
-        let source = if sandbox.has_explicit_scopes() {
-            crate::sandbox::ScopeSource::Explicit
-        } else if sandbox.roots_received() {
-            crate::sandbox::ScopeSource::RootsList
-        } else {
-            crate::sandbox::ScopeSource::Default
-        };
+        let source = sandbox.scope_source();
         let scope_json = sandbox.scope_json(source);
         tracing::info!("Sandbox configured:\n{}", sandbox.scope_text(source));
         emit_sandbox_notification_via_peer_with_scope(

@@ -488,6 +488,29 @@ impl Sandbox {
         self.scope_lock.roots_received()
     }
 
+    /// Provenance of this session's locked scope (SPEC R5.2 precedence, rendered
+    /// per R5.4).
+    ///
+    /// One derivation, on the type that owns the flags, so no two surfaces can
+    /// disagree about *why* the scope is what it is. It used to be open-coded in
+    /// both the `notifications/sandbox/configured` emitter and the shell handler
+    /// that refuses to substitute a default scope — a model comparing the
+    /// notification against an error body would have seen the drift first.
+    ///
+    /// `Elicited` and `Pending` are not distinguishable from these flags: both
+    /// are user-chosen, so both arrive here as [`ScopeSource::Explicit`], which
+    /// is the branch that keeps running rather than the declared default that
+    /// refuses. Callers holding richer provenance should render that instead.
+    pub fn scope_source(&self) -> ScopeSource {
+        if self.has_explicit_scopes() {
+            ScopeSource::Explicit
+        } else if self.roots_received() {
+            ScopeSource::RootsList
+        } else {
+            ScopeSource::Default
+        }
+    }
+
     /// The current observable state of the sandbox scope lock (SPEC R23).
     pub fn lock_state(&self) -> super::scope_lock::ScopeLockState {
         self.scope_lock.state()

@@ -2084,50 +2084,40 @@ impl AhmaMcpService {
         }
 
         let base_command = command_parts.join(" ");
-        let working_directory = self.resolve_working_directory(&arguments);
+        // Where the command runs, and who decided that (SPEC R5.2.8 / R5.4).
+        // Shared with `run_terminal_command`: substituting a directory is a scope
+        // decision, and the rule binds every surface that runs a command — this
+        // one used to substitute silently while the shell handler disclosed.
+        let working_directory =
+            handlers::working_directory::resolve(self.adapter.sandbox(), &tool_name, &arguments)?;
 
         if let Some(staged_result) = self
-            .maybe_stage_configured_delete(&base_command, &working_directory, &arguments)
+            .maybe_stage_configured_delete(&base_command, &working_directory.path, &arguments)
             .await?
         {
-            return Ok(staged_result);
+            return Ok(working_directory.disclose(staged_result));
         }
 
         let timeout = arguments.get("timeout_seconds").and_then(|v| v.as_u64());
         let execution_mode = self.determine_execution_mode(subcommand_config, &config, &arguments);
 
-        self.execute_subcommand_command(
-            &tool_name,
-            &base_command,
-            &working_directory,
-            arguments,
-            timeout,
-            subcommand_config,
-            &config,
-            context,
-            execution_mode,
-        )
-        .await
-    }
-
-    /// Picks the working directory for a tool call: explicit argument first,
-    /// then the first sandbox scope (skipped in test mode), then ".".
-    fn resolve_working_directory(
-        &self,
-        arguments: &serde_json::Map<String, serde_json::Value>,
-    ) -> String {
-        if let Some(path) = arguments.get("working_directory").and_then(|v| v.as_str()) {
-            return path.to_string();
+        match self
+            .execute_subcommand_command(
+                &tool_name,
+                &base_command,
+                &working_directory.path,
+                arguments,
+                timeout,
+                subcommand_config,
+                &config,
+                context,
+                execution_mode,
+            )
+            .await
+        {
+            Ok(result) => Ok(working_directory.disclose(result)),
+            Err(e) => Err(working_directory.disclose_error(e)),
         }
-        if self.adapter.sandbox().is_test_mode() {
-            return ".".to_string();
-        }
-        self.adapter
-            .sandbox()
-            .scopes()
-            .first()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string())
     }
 
     async fn handle_livelog_call(
@@ -3447,26 +3437,30 @@ mod tests {
 
     // ==================== working directory / sandbox guards ====================
 
+    /// The MTDF surface resolves its working directory through the same shared
+    /// path as `run_terminal_command` (SPEC R5.2.8), so an omitted directory is
+    /// disclosed rather than silently substituted.
     #[tokio::test]
     async fn resolve_working_directory_explicit_and_scope() {
         let service = make_service().await;
+        let sandbox = service.adapter.sandbox();
 
         let explicit = obj(json!({"working_directory": "/explicit/path"}));
-        assert_eq!(
-            service.resolve_working_directory(&explicit),
-            "/explicit/path"
-        );
+        let wd = handlers::working_directory::resolve(sandbox, "cargo", &explicit).unwrap();
+        assert_eq!(wd.path, "/explicit/path");
 
-        // No arg -> first sandbox scope (strict test adapter has one rooted scope).
-        let wd = service.resolve_working_directory(&serde_json::Map::new());
-        let scope = service
-            .adapter
-            .sandbox()
+        // No arg + a client-reported scope -> substitute the first scope, and say so.
+        sandbox.set_roots_received(true);
+        let wd = handlers::working_directory::resolve(sandbox, "cargo", &serde_json::Map::new())
+            .unwrap();
+        let scope = sandbox
             .scopes()
             .first()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap();
-        assert_eq!(wd, scope);
+        assert_eq!(wd.path, scope);
+        let disclosed = wd.disclose(handlers::common::text_result("out"));
+        assert!(first_text(&disclosed).contains("no `working_directory` was given"));
     }
 
     #[tokio::test]
