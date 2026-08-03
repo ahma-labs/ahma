@@ -36,9 +36,11 @@ with a repro — don't quietly drop it.
 ### Target Directory & Cache Management
 
 The workspace profile is configured (`[profile.dev]` and `[profile.test]`) to strip dependency
-debug symbols (`debug = 0`, `opt-level = 2` for `package."*"`) while preserving fast line-table
-debug info (`debug = 1`) for workspace code. To keep `target/` bloat bounded during long development
-sessions:
+debug symbols (`debug = 0` for `package."*"`) while preserving fast line-table debug info
+(`debug = 1`) for workspace code. Deliberately does **not** raise dependency `opt-level`: that
+trades a real, repeated compile-time cost (no benefit on CI's fresh, non-incremental builds) for
+a runtime speedup only local dev sessions actually reuse — it once pushed the Windows CI job over
+its 40-minute budget. To keep `target/` bloat bounded during long development sessions:
 
 * Run `cargo xtask clean-stale` (or `cargo xtask clean-stale --max-age-days 3`) to prune stale
   incremental compilation sessions. It only touches `target/*/incremental/` — cargo bumps a
