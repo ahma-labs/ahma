@@ -31,6 +31,10 @@ fn main() {
             let remaining: Vec<String> = args.collect();
             safe_update(&remaining);
         }
+        Some("clean-stale") => {
+            let remaining: Vec<String> = args.collect();
+            clean_stale(&remaining);
+        }
         Some(cmd) => {
             eprintln!("Unknown xtask command: {cmd}");
             eprintln!("Available commands:");
@@ -44,6 +48,8 @@ fn main() {
             eprintln!(
                 "                             Upgrade deps that are ≥14 days old and advisory-clean"
             );
+            eprintln!("  clean-stale [--dry-run] [--max-age-days N]");
+            eprintln!("                             Prune target/ artifacts older than N days");
             process::exit(1);
         }
         None => {
@@ -58,6 +64,8 @@ fn main() {
             eprintln!(
                 "                             Upgrade deps that are ≥14 days old and advisory-clean"
             );
+            eprintln!("  clean-stale [--dry-run] [--max-age-days N]");
+            eprintln!("                             Prune target/ artifacts older than N days");
             process::exit(1);
         }
     }
@@ -828,6 +836,161 @@ fn candidate_row(
         status: status.into(),
         note: None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// clean-stale — prune target/ artifacts untouched for >= N days
+// ---------------------------------------------------------------------------
+
+/// Clean stale target artifacts (orphaned binaries, old incremental session data, build dirs older than max_age_days).
+fn clean_stale(args: &[String]) {
+    let mut dry_run = false;
+    let mut max_age_days: u64 = 3;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dry-run" => dry_run = true,
+            "--max-age-days" => {
+                i += 1;
+                max_age_days = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("ERROR: --max-age-days requires a numeric argument");
+                    process::exit(1);
+                });
+            }
+            "--help" | "-h" => {
+                println!("cargo xtask clean-stale [options]");
+                println!();
+                println!(
+                    "Clean stale build artifacts from target/ directory without destroying active caches."
+                );
+                println!();
+                println!("Options:");
+                println!(
+                    "  --dry-run             Print artifacts that would be removed without deleting"
+                );
+                println!(
+                    "  --max-age-days <N>    Remove artifacts untouched for ≥ N days (default: 3)"
+                );
+                println!("  -h, --help            Show this help message");
+                process::exit(0);
+            }
+            other => {
+                eprintln!("Unknown flag: {other}");
+                eprintln!("Run `cargo xtask clean-stale --help` for usage.");
+                process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    let root = workspace_root();
+    let target_dir = root.join("target");
+    if !target_dir.exists() {
+        println!("No target directory found at {}", target_dir.display());
+        return;
+    }
+
+    println!("=== cargo xtask clean-stale ===");
+    if dry_run {
+        println!("(dry-run — no files will be deleted)");
+    }
+    println!("Pruning target artifacts modified > {max_age_days} days ago…");
+
+    let now = std::time::SystemTime::now();
+    let cutoff = now
+        .checked_sub(std::time::Duration::from_secs(max_age_days * 86400))
+        .unwrap_or(now);
+
+    let mut removed_count = 0usize;
+    let mut bytes_reclaimed = 0u64;
+
+    // Only `incremental/` is safe to prune by mtime: cargo regenerates it transparently and its
+    // age directly reflects staleness (old rustc/session data that will never be reused).
+    // `deps/` and `build/` are NOT safe to age-prune the same way — cargo only bumps a
+    // dependency artifact's mtime when it recompiles it, so a stable, rarely-rebuilt dependency
+    // can be "old" while still being exactly what the current build links against. Deleting it
+    // forces a pointless, expensive relink on the next build, working against the whole point of
+    // this command.
+    let profiles = ["debug", "release"];
+    for profile in &profiles {
+        let incr_dir = target_dir.join(profile).join("incremental");
+        if incr_dir.exists() {
+            prune_directory(
+                &incr_dir,
+                cutoff,
+                dry_run,
+                &mut removed_count,
+                &mut bytes_reclaimed,
+            );
+        }
+    }
+
+    let reclaimed_mb = bytes_reclaimed as f64 / (1024.0 * 1024.0);
+    if dry_run {
+        println!(
+            "Dry run complete: would remove {removed_count} files/directories ({reclaimed_mb:.2} MB)."
+        );
+    } else {
+        println!(
+            "Clean complete: removed {removed_count} stale files/directories ({reclaimed_mb:.2} MB reclaimed)."
+        );
+    }
+}
+
+fn prune_directory(
+    dir: &Path,
+    cutoff: std::time::SystemTime,
+    dry_run: bool,
+    removed_count: &mut usize,
+    bytes_reclaimed: &mut u64,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let metadata = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if modified < cutoff {
+            let size = dir_or_file_size(&path, &metadata);
+            *bytes_reclaimed += size;
+            *removed_count += 1;
+
+            if dry_run {
+                println!("  [dry-run] Would remove: {}", path.display());
+            } else if metadata.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+fn dir_or_file_size(path: &Path, metadata: &fs::Metadata) -> u64 {
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if metadata.is_dir() {
+        let mut total = 0u64;
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if let Ok(m) = entry.metadata() {
+                    total += dir_or_file_size(&entry.path(), &m);
+                }
+            }
+        }
+        return total;
+    }
+    0
 }
 
 fn evaluate_one_candidate(

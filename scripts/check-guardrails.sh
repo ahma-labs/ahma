@@ -12,9 +12,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$PROJECT_ROOT"
+cd "$(git rev-parse --show-toplevel)"
 
 PHASE="push"
 ALLOW_DIRTY=0
@@ -30,8 +28,10 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     *)
-      echo "Unknown argument: $1"
-      exit 2
+      # Installed as .git/hooks/pre-push, git invokes us with positional
+      # <remote-name> <remote-url> (plus ref updates on stdin) — ignore
+      # anything that isn't one of our own flags rather than rejecting it.
+      shift
       ;;
   esac
 done
@@ -180,5 +180,9 @@ if ! grep -q 'failure-output = "immediate"' .config/nextest.toml; then
 fi
 echo "OK Nextest diagnostics config looks good"
 
+echo "=== Guardrail: target directory stale cache auto-clean ==="
+cargo xtask clean-stale --max-age-days 3
+
 echo ""
 echo "OK All guardrails passed for phase: $PHASE"
+

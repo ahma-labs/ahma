@@ -33,6 +33,20 @@ Before you claim "all green", run **both**:
 If an ignored test can't run (missing platform prerequisite) or is broken, say so in the PR
 with a repro — don't quietly drop it.
 
+### Target Directory & Cache Management
+
+The workspace profile is configured (`[profile.dev]` and `[profile.test]`) to strip dependency
+debug symbols (`debug = 0`, `opt-level = 2` for `package."*"`) while preserving fast line-table
+debug info (`debug = 1`) for workspace code. To keep `target/` bloat bounded during long development
+sessions:
+
+* Run `cargo xtask clean-stale` (or `cargo xtask clean-stale --max-age-days 3`) to prune stale
+  incremental compilation sessions. It only touches `target/*/incremental/` — cargo bumps a
+  dependency artifact's mtime only when it recompiles it, so age-pruning `deps/`/`build/` would
+  evict rarely-rebuilt but still-valid caches and force pointless relinks; `incremental/` is the
+  one directory where age genuinely means staleness.
+* Use `cargo xtask clean-stale --dry-run` to preview artifacts before deletion.
+
 ### When to route through ahma vs native tools
 
 Use ahma's `run_terminal_command` when the command **writes to disk** (kernel sandbox keeps

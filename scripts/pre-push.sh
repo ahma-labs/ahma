@@ -6,10 +6,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-cd "$PROJECT_ROOT"
+cd "$(git rev-parse --show-toplevel)"
 
 echo "Running pre-push checks..."
 
@@ -51,4 +48,8 @@ echo "OK Version strings consistent (v${CARGO_VER})"
 echo "=== Running cargo check --workspace --locked ==="
 cargo check --workspace --locked
 
+echo "=== Auto-cleaning target directory stale cache ==="
+cargo xtask clean-stale --max-age-days 3
+
 echo "OK Pre-push checks passed"
+
