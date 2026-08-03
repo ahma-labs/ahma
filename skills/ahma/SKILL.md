@@ -232,6 +232,15 @@ cancel(id="op_abc123")
 > orchestrated it can resume the subagent, so a missed notification means the work silently
 > stalls until someone notices.
 
+> **Before declaring a task done, confirm every operation you started actually finished.**
+> A soft `await` timeout is not completion — it explicitly says the work is "still running,"
+> and no timeout mechanism (however accurate) protects you from summarizing success while an
+> operation is genuinely mid-flight, because efficiency and correctness are different problems.
+> Before your final summary, `status` (or `await`) every `operation_id` you spawned this turn
+> and confirm each reached a terminal state (`Completed`/`Failed`/`Cancelled`), not `InProgress`.
+> This has bitten real sessions: a compiler error that only surfaced after a truncated `await`
+> got missed because the agent read "still running" as good enough and moved on.
+
 ---
 
 ## Sandbox — Filesystem Security

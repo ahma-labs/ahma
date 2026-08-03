@@ -99,6 +99,11 @@ pub struct AppConfig {
     /// `tools.request_budget_override_secs` in settings.toml when a
     /// deployment's actual tolerance is known to differ.
     pub request_budget_override_secs: Option<u64>,
+    /// Send progress notifications to Cursor despite its client-side logging
+    /// quirk (`McpClientType::supports_progress`). Override with the
+    /// `--force-progress-notifications` CLI flag or
+    /// `tools.force_progress_notifications` in settings.toml.
+    pub force_progress_notifications: bool,
     /// Run all tools synchronously (AHMA_SYNC=1).
     pub force_sync: bool,
     /// Reload tools from disk when `.ahma/` changes (AHMA_HOT_RELOAD=1).
@@ -232,6 +237,7 @@ impl Default for AppConfig {
             timeout_secs: 600,
             await_timeout_secs: ahma_common::config::default_await_timeout_secs(),
             request_budget_override_secs: None,
+            force_progress_notifications: false,
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,
@@ -1146,6 +1152,12 @@ pub struct Cli {
     /// fallback-window tolerance is known to differ from the built-in default.
     #[arg(long = "request-budget-secs", value_name = "SECS", global = true)]
     pub request_budget_secs: Option<u64>,
+
+    /// Send progress notifications to Cursor despite its client-side logging
+    /// quirk (asserted, not measured — see `McpClientType::supports_progress`).
+    /// Use once a Cursor version has fixed the issue.
+    #[arg(long = "force-progress-notifications", global = true)]
+    pub force_progress_notifications: bool,
 
     /// Force all tools to run synchronously.
     /// By default, tools are async-first: ahma waits an adaptive inline window
@@ -2533,6 +2545,7 @@ struct ExecutionSettings {
     timeout_secs: u64,
     await_timeout_secs: u64,
     request_budget_override_secs: Option<u64>,
+    force_progress_notifications: bool,
     force_sync: bool,
     hot_reload_tools: bool,
     skip_availability_probes: bool,
@@ -2552,6 +2565,8 @@ fn parse_execution_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) ->
         request_budget_override_secs: cli
             .request_budget_secs
             .or(s.tools.request_budget_override_secs),
+        force_progress_notifications: cli.force_progress_notifications
+            || s.tools.force_progress_notifications,
         force_sync: cli.sync || s.tools.force_sync,
         hot_reload_tools: cli.hot_reload || s.tools.hot_reload,
         skip_availability_probes: cli.skip_probes || s.tools.skip_probes,
@@ -2866,6 +2881,7 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         timeout_secs: exec.timeout_secs,
         await_timeout_secs: exec.await_timeout_secs,
         request_budget_override_secs: exec.request_budget_override_secs,
+        force_progress_notifications: exec.force_progress_notifications,
         force_sync: exec.force_sync,
         hot_reload_tools: exec.hot_reload_tools,
         skip_availability_probes: exec.skip_availability_probes,
@@ -3081,6 +3097,7 @@ mod tests {
             timeout_secs: 360,
             await_timeout_secs: 540,
             request_budget_override_secs: None,
+            force_progress_notifications: false,
             force_sync: false,
             hot_reload_tools: false,
             skip_availability_probes: false,

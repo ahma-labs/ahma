@@ -693,6 +693,13 @@ pub struct ToolSettings {
     /// fallback-window tolerance is known to differ.
     /// Default: `None` (use the built-in default)
     pub request_budget_override_secs: Option<u64>,
+    /// Send progress notifications to Cursor even though it is known to log a
+    /// client-side error for them (asserted, not measured — see
+    /// `McpClientType::supports_progress`). ahma suppresses them for Cursor by
+    /// default; set this when a Cursor version has fixed the issue and you
+    /// want progress notifications back.
+    /// Default: `false`
+    pub force_progress_notifications: bool,
     /// Run all tools synchronously.  By default tools are async-first: ahma waits
     /// an adaptive inline window (SPEC R2.6.1) — longer when nothing else is
     /// running, short when the caller is already fanning out — and returns the
@@ -746,6 +753,7 @@ impl Default for ToolSettings {
             timeout_secs: 600,
             await_timeout_secs: default_await_timeout_secs(),
             request_budget_override_secs: None,
+            force_progress_notifications: false,
             force_sync: false,
             hot_reload: false,
             skip_probes: false,
@@ -1763,6 +1771,13 @@ impl AhmaSettings {
             toml_opt_u64(d.tools.request_budget_override_secs),
         );
         w.setting(
+            "Send progress notifications to Cursor despite its client-side \
+             logging quirk (unmeasured, unlike other client-specific behavior).",
+            "force_progress_notifications",
+            self.tools.force_progress_notifications.to_string(),
+            d.tools.force_progress_notifications.to_string(),
+        );
+        w.setting(
             "Run all tools synchronously instead of async-first.",
             "force_sync",
             self.tools.force_sync.to_string(),
@@ -2468,6 +2483,7 @@ mod tests {
                 timeout_secs: 123,
                 await_timeout_secs: 456,
                 request_budget_override_secs: Some(120),
+                force_progress_notifications: true,
                 force_sync: true,
                 hot_reload: true,
                 skip_probes: true,

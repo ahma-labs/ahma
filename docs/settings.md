@@ -65,6 +65,7 @@ Run `ahma settings init` to generate this file automatically.
 # timeout_secs = 360      # default tool timeout (seconds)
 # await_timeout_secs = 540 # default `await` soft timeout (seconds); does not cancel the operation
 # request_budget_override_secs = 0 # override the fallback single-request budget (SPEC R2.6.5); 0 = unset, use the built-in default
+# force_progress_notifications = false # send progress to Cursor despite its client-side logging quirk
 # force_sync   = false    # run all tools synchronously instead of async-first
 # hot_reload   = false    # reload tools from disk on change — INSECURE in production
 # skip_probes  = false    # skip availability probes at startup

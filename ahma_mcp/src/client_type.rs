@@ -6,9 +6,12 @@
 //!
 //! ## Known Client Issues
 //!
-//! - **Cursor**: Logs errors for progress notifications with unknown tokens, even when
-//!   the server correctly uses the client-provided `progressToken`. To avoid noisy
-//!   error logs in Cursor, we skip sending progress notifications entirely for this client.
+//! - **Cursor**: Believed to log errors for progress notifications with unknown
+//!   tokens, even when the server correctly uses the client-provided
+//!   `progressToken` — asserted, not measured (see
+//!   [`McpClientType::supports_progress`] for why it can't be). To avoid noisy
+//!   error logs in Cursor, ahma skips sending progress notifications for this
+//!   client by default; `tools.force_progress_notifications` overrides it.
 //!
 //! - **VSCode/Copilot**: Handles progress notifications correctly.
 //!
@@ -87,8 +90,18 @@ impl McpClientType {
 
     /// Whether this client correctly handles MCP progress notifications.
     ///
-    /// Returns `false` for Cursor (which logs errors for valid progress tokens),
-    /// and `true` for all other clients (optimistic default).
+    /// Returns `false` for Cursor, `true` for all other clients (optimistic
+    /// default). Unlike [`request_budget`](Self::request_budget) and
+    /// [`elicitation_budget`](Self::elicitation_budget) — both set from a
+    /// captured session with a timestamped, reproducible measurement — the
+    /// Cursor claim ("logs errors for valid progress tokens") has no such
+    /// evidence attached anywhere in this codebase's history: it is asserted,
+    /// not measured, and MCP notifications are one-way (no response, no ack),
+    /// so ahma has no way to observe the failure it's working around even if
+    /// it wanted to. It may also be stale — nothing has re-verified it since
+    /// it was added. `tools.force_progress_notifications` /
+    /// `--force-progress-notifications` let an operator override this
+    /// suppression once a given Cursor version is known to have fixed it.
     pub fn supports_progress(&self) -> bool {
         !matches!(self, McpClientType::Cursor)
     }

@@ -206,12 +206,13 @@ impl AhmaMcpService {
         let peer = caller.peer.clone()?;
         let token = caller.progress_token.clone()?;
         let client_type = caller.client_type?;
+        let progress_enabled = self.effective_supports_progress(client_type);
 
         let mut saved = Vec::with_capacity(op_ids.len());
         for op_id in op_ids {
             let previous = self
                 .progress_push
-                .redirect(op_id, peer.clone(), token.clone(), client_type)
+                .redirect(op_id, peer.clone(), token.clone(), progress_enabled)
                 .await;
             saved.push((op_id.clone(), previous));
         }

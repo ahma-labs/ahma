@@ -235,6 +235,30 @@ impl AhmaMcpService {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The raw `tools.force_progress_notifications` / `--force-progress-notifications`
+    /// override, before combining it with any client's default heuristic. Free
+    /// functions that can't reach `self` (e.g. `sequence::handle_sequence_tool`)
+    /// take this resolved bool as a parameter instead of computing it themselves.
+    pub(crate) fn force_progress_notifications_override(&self) -> bool {
+        self.app_config
+            .read()
+            .ok()
+            .and_then(|cfg| cfg.as_ref().map(|c| c.force_progress_notifications))
+            .unwrap_or(false)
+    }
+
+    /// Whether progress notifications should be sent to this client: the
+    /// operator's `tools.force_progress_notifications` /
+    /// `--force-progress-notifications` override if set, otherwise
+    /// `client_type.supports_progress()`'s default heuristic (which
+    /// suppresses them for Cursor — an asserted, not measured, client quirk).
+    pub(crate) fn effective_supports_progress(
+        &self,
+        client_type: crate::client_type::McpClientType,
+    ) -> bool {
+        self.force_progress_notifications_override() || client_type.supports_progress()
+    }
+
     /// The pure dispatch logic behind [`ServerHandler::on_custom_notification`],
     /// factored out so it is testable without constructing a real
     /// `NotificationContext` (its `Peer` cannot be built outside rmcp itself).
@@ -1101,7 +1125,8 @@ impl AhmaMcpService {
 
         // Sync operations never enter the OperationMonitor, so the event
         // forwarder cannot see them — push start/final progress directly.
-        let push_enabled = progress_token.is_some() && client_type.supports_progress();
+        let push_enabled =
+            progress_token.is_some() && self.effective_supports_progress(client_type);
         if let Some(token) = progress_token.clone()
             && push_enabled
         {
@@ -1181,8 +1206,9 @@ impl AhmaMcpService {
             .await;
 
         if let Some(token) = progress_token {
+            let progress_enabled = self.effective_supports_progress(client_type);
             self.progress_push
-                .register(&id, peer, token, client_type)
+                .register(&id, peer, token, client_type, progress_enabled)
                 .await;
         }
 
@@ -1266,6 +1292,9 @@ impl ServerHandler for AhmaMcpService {
                   might stop generating before an operation finishes (ending your turn, handing off, \
                   or exiting), call `await` and let it block rather than counting on a notification to \
                   resume you; a push sent while you are not listening is not queued or replayed. \
+                  A soft `await` timeout is not completion — before declaring a task done, `status` \
+                  or `await` every operation_id you started and confirm each reached a terminal state, \
+                  not \"still running\". \
                   Results include a bounded stdout/stderr window plus an `output_file` path holding the \
                   COMPLETE output of the operation; when the inline output is marked truncated, read or \
                   grep that file instead of re-running the command. \
@@ -1303,7 +1332,7 @@ impl ServerHandler for AhmaMcpService {
             tracing::info!(
                 "Detected MCP client type: {} (progress notifications: {})",
                 client_type.display_name(),
-                if client_type.supports_progress() {
+                if self.effective_supports_progress(client_type) {
                     "enabled"
                 } else {
                     "disabled"
@@ -1855,8 +1884,15 @@ impl AhmaMcpService {
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
         if let Some(token) = progress_token {
+            let progress_enabled = self.effective_supports_progress(client_type);
             self.progress_push
-                .register(&op_id, context.peer.clone(), token, client_type)
+                .register(
+                    &op_id,
+                    context.peer.clone(),
+                    token,
+                    client_type,
+                    progress_enabled,
+                )
                 .await;
         }
 
@@ -1962,6 +1998,7 @@ impl AhmaMcpService {
                 &config,
                 params,
                 context,
+                self.force_progress_notifications_override(),
             )
             .await;
         }
@@ -2138,6 +2175,7 @@ impl AhmaMcpService {
                 subcommand_config,
                 params,
                 context,
+                self.force_progress_notifications_override(),
             )
             .await;
         }
@@ -2190,8 +2228,15 @@ impl AhmaMcpService {
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
         if let Some(token) = progress_token {
+            let progress_enabled = self.effective_supports_progress(client_type);
             self.progress_push
-                .register(&op_id, context.peer.clone(), token, client_type)
+                .register(
+                    &op_id,
+                    context.peer.clone(),
+                    token,
+                    client_type,
+                    progress_enabled,
+                )
                 .await;
         }
         match handlers::livelog_tool::handle_livelog_start(
@@ -4242,6 +4287,31 @@ mod tests {
             ..Default::default()
         };
         assert!(service.send_enhanced_heartbeat(payload).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn effective_supports_progress_defaults_to_the_client_heuristic() {
+        // SPEC R2.2.1: with no override set, the resolved answer must match
+        // McpClientType::supports_progress() exactly — Cursor suppressed,
+        // everyone else enabled.
+        let service = make_service().await;
+        assert!(!service.effective_supports_progress(crate::client_type::McpClientType::Cursor));
+        assert!(service.effective_supports_progress(crate::client_type::McpClientType::VSCode));
+    }
+
+    #[tokio::test]
+    async fn force_progress_notifications_overrides_the_cursor_suppression() {
+        // SPEC R2.2.1: an operator who knows a given Cursor version fixed the
+        // client-side logging issue can turn progress back on for it.
+        let service = make_service().await;
+        service.set_app_config(Arc::new(crate::shell::cli::AppConfig {
+            force_progress_notifications: true,
+            ..Default::default()
+        }));
+        assert!(service.effective_supports_progress(crate::client_type::McpClientType::Cursor));
+        // The override is uniform — it does not stop applying to clients that
+        // were already enabled.
+        assert!(service.effective_supports_progress(crate::client_type::McpClientType::VSCode));
     }
 
     #[tokio::test]

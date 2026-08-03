@@ -104,13 +104,21 @@ async fn register_progress_target(
     progress_push: &ProgressPushRouter,
     context: &RequestContext<RoleServer>,
     id: &str,
+    force_progress_notifications: bool,
 ) {
     let Some(progress_token) = context.meta.get_progress_token() else {
         return;
     };
     let client_type = McpClientType::from_peer(&context.peer);
+    let progress_enabled = force_progress_notifications || client_type.supports_progress();
     progress_push
-        .register(id, context.peer.clone(), progress_token, client_type)
+        .register(
+            id,
+            context.peer.clone(),
+            progress_token,
+            client_type,
+            progress_enabled,
+        )
         .await;
 }
 
@@ -131,6 +139,7 @@ pub async fn handle_sequence_tool(
     config: &ToolConfig,
     params: CallToolRequestParams,
     context: RequestContext<RoleServer>,
+    force_progress_notifications: bool,
 ) -> Result<CallToolResult, McpError> {
     let sequence = config.sequence.as_ref().unwrap(); // Safe due to prior check
     let step_delay_ms = config.step_delay_ms.unwrap_or(SEQUENCE_STEP_DELAY_MS);
@@ -156,6 +165,7 @@ pub async fn handle_sequence_tool(
             context,
             sequence,
             step_delay_ms,
+            force_progress_notifications,
         )
         .await
     }
@@ -267,6 +277,7 @@ async fn handle_sequence_tool_async(
     context: RequestContext<RoleServer>,
     sequence: &[SequenceStep],
     step_delay_ms: u64,
+    force_progress_notifications: bool,
 ) -> Result<CallToolResult, McpError> {
     let mut final_result = CallToolResult::success(vec![]);
     let kind = SequenceKind::TopLevel;
@@ -292,7 +303,7 @@ async fn handle_sequence_tool_async(
             find_step_subcommand(&step_tool_config, &step.subcommand, &step.tool)?;
 
         let id = next_id(&step.tool, Some(&step.subcommand));
-        register_progress_target(progress_push, &context, &id).await;
+        register_progress_target(progress_push, &context, &id, force_progress_notifications).await;
 
         let step_result = adapter
             .execute_async_in_dir_with_options(
@@ -334,6 +345,7 @@ async fn handle_sequence_tool_async(
 }
 
 /// Handles execution of subcommand sequences - subcommands that invoke multiple cargo commands in order.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_subcommand_sequence(
     adapter: &Adapter,
     progress_push: &ProgressPushRouter,
@@ -341,6 +353,7 @@ pub async fn handle_subcommand_sequence(
     subcommand_config: &SubcommandConfig,
     params: CallToolRequestParams,
     context: RequestContext<RoleServer>,
+    force_progress_notifications: bool,
 ) -> Result<CallToolResult, McpError> {
     let sequence = subcommand_config.sequence.as_ref().unwrap(); // Safe due to prior check
     let step_delay_ms = subcommand_config
@@ -366,7 +379,7 @@ pub async fn handle_subcommand_sequence(
             )?;
 
         let id = next_id(&config.name, Some(&step.subcommand));
-        register_progress_target(progress_push, &context, &id).await;
+        register_progress_target(progress_push, &context, &id, force_progress_notifications).await;
 
         let step_result = adapter
             .execute_async_in_dir_with_options(

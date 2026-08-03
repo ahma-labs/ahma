@@ -50,16 +50,21 @@ impl ProgressPushRouter {
 
     /// Register the client destination for an operation.
     ///
-    /// No-op when the client does not handle progress notifications —
-    /// matching the legacy `McpCallbackSender` behaviour.
+    /// No-op when `progress_enabled` is `false` — matching the legacy
+    /// `McpCallbackSender` behaviour. The caller resolves this (normally
+    /// `AhmaMcpService::effective_supports_progress`, which layers the
+    /// operator's `force_progress_notifications` override over
+    /// `client_type`'s default) rather than this router deciding on its own,
+    /// since only the caller has access to that override.
     pub async fn register(
         &self,
         op_id: &str,
         peer: Peer<RoleServer>,
         progress_token: ProgressToken,
         client_type: McpClientType,
+        progress_enabled: bool,
     ) {
-        if !client_type.supports_progress() {
+        if !progress_enabled {
             tracing::trace!(
                 "Skipping progress registration for {} client",
                 client_type.display_name()
@@ -94,9 +99,9 @@ impl ProgressPushRouter {
         op_id: &str,
         peer: Peer<RoleServer>,
         progress_token: ProgressToken,
-        client_type: McpClientType,
+        progress_enabled: bool,
     ) -> Option<PushTarget> {
-        if !client_type.supports_progress() {
+        if !progress_enabled {
             return None;
         }
         self.targets.write().await.insert(
@@ -499,11 +504,17 @@ mod redirect_tests {
         let router = ProgressPushRouter::new();
 
         router
-            .register("op_1", peer.clone(), token(1), McpClientType::ClaudeDesktop)
+            .register(
+                "op_1",
+                peer.clone(),
+                token(1),
+                McpClientType::ClaudeDesktop,
+                true,
+            )
             .await;
 
         let displaced = router
-            .redirect("op_1", peer.clone(), token(2), McpClientType::ClaudeDesktop)
+            .redirect("op_1", peer.clone(), token(2), true)
             .await
             .expect("the original registration must be handed back");
         assert_eq!(displaced.progress_token, token(1));
@@ -531,9 +542,7 @@ mod redirect_tests {
         let (peer, _mcp) = server_peer().await;
         let router = ProgressPushRouter::new();
 
-        let displaced = router
-            .redirect("op_1", peer, token(2), McpClientType::ClaudeDesktop)
-            .await;
+        let displaced = router.redirect("op_1", peer, token(2), true).await;
         assert!(displaced.is_none(), "nothing was registered to displace");
 
         router.restore("op_1", None).await;
@@ -549,11 +558,15 @@ mod redirect_tests {
         let router = ProgressPushRouter::new();
 
         router
-            .register("op_1", peer.clone(), token(1), McpClientType::ClaudeDesktop)
+            .register(
+                "op_1",
+                peer.clone(),
+                token(1),
+                McpClientType::ClaudeDesktop,
+                true,
+            )
             .await;
-        let displaced = router
-            .redirect("op_1", peer, token(2), McpClientType::ClaudeDesktop)
-            .await;
+        let displaced = router.redirect("op_1", peer, token(2), true).await;
 
         router.unregister("op_1").await; // terminal event arrives
         router.restore("op_1", displaced).await;
@@ -562,13 +575,17 @@ mod redirect_tests {
     }
 
     #[tokio::test]
-    async fn a_client_that_cannot_handle_progress_is_never_redirected() {
+    async fn a_disabled_caller_is_never_redirected() {
+        // The router itself no longer decides who handles progress — the
+        // caller resolves `progress_enabled` (normally
+        // `AhmaMcpService::effective_supports_progress`, e.g. `false` for
+        // Cursor by default) and passes the answer in.
         let (peer, _mcp) = server_peer().await;
         let router = ProgressPushRouter::new();
 
         assert!(
             router
-                .redirect("op_1", peer, token(2), McpClientType::Cursor)
+                .redirect("op_1", peer, token(2), false)
                 .await
                 .is_none()
         );

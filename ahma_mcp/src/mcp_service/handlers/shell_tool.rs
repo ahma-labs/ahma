@@ -414,7 +414,8 @@ impl AhmaMcpService {
 
         // Sync operations never enter the OperationMonitor, so the event
         // forwarder cannot see them — push start/final progress directly.
-        let push_enabled = progress_token.is_some() && client_type.supports_progress();
+        let push_enabled =
+            progress_token.is_some() && self.effective_supports_progress(client_type);
         if let Some(token) = progress_token.clone()
             && push_enabled
         {
@@ -505,8 +506,15 @@ impl AhmaMcpService {
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
         if let Some(token) = progress_token {
+            let progress_enabled = self.effective_supports_progress(client_type);
             self.progress_push
-                .register(&id, context.peer.clone(), token, client_type)
+                .register(
+                    &id,
+                    context.peer.clone(),
+                    token,
+                    client_type,
+                    progress_enabled,
+                )
                 .await;
         }
 
@@ -602,8 +610,15 @@ impl AhmaMcpService {
         let progress_token = context.meta.get_progress_token();
         let client_type = McpClientType::from_peer(&context.peer);
         if let Some(token) = progress_token {
+            let progress_enabled = self.effective_supports_progress(client_type);
             self.progress_push
-                .register(&id, context.peer.clone(), token, client_type)
+                .register(
+                    &id,
+                    context.peer.clone(),
+                    token,
+                    client_type,
+                    progress_enabled,
+                )
                 .await;
         }
 
