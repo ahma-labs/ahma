@@ -22,7 +22,10 @@
 //! # Example — lifecycle test with NullPeerFactory
 //!
 //! ```rust,no_run
-//! use ahma_http_bridge::session::{SessionManager, SessionManagerConfig};
+//! use ahma_http_bridge::session::{
+//!     DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TOOL_CALL_TIMEOUT_SECS, SessionManager,
+//!     SessionManagerConfig,
+//! };
 //! use ahma_mcp::test_utils::bridge_peer::NullPeerFactory;
 //! use std::sync::Arc;
 //!
@@ -34,6 +37,8 @@
 //!     default_scope: None,
 //!     enable_colored_output: false,
 //!     handshake_timeout_secs: 5,
+//!     request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+//!     tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
 //!     max_sessions: 10,
 //!     peer_factory: Some(Arc::new(NullPeerFactory)),
 //! };

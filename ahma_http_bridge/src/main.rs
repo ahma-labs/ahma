@@ -49,6 +49,16 @@ struct Args {
     #[arg(long, default_value = "45")]
     handshake_timeout_secs: u64,
 
+    /// Default timeout in seconds for bridge → subprocess request/response
+    /// calls (used for everything except `tools/call`).
+    #[arg(long, default_value = "60")]
+    request_timeout_secs: u64,
+
+    /// Default timeout in seconds for `tools/call` requests, unless the
+    /// caller's `timeout_seconds` argument overrides it.
+    #[arg(long, default_value = "60")]
+    tool_call_timeout_secs: u64,
+
     /// OTLP endpoint for distributed tracing export.
     /// Providing this flag enables tracing. Equivalent to OTEL_EXPORTER_OTLP_ENDPOINT.
     #[arg(long, global = true)]
@@ -132,6 +142,8 @@ async fn main() -> anyhow::Result<()> {
         enable_colored_output,
         default_sandbox_scope: args.default_sandbox_scope,
         handshake_timeout_secs: args.handshake_timeout_secs,
+        request_timeout_secs: args.request_timeout_secs,
+        tool_call_timeout_secs: args.tool_call_timeout_secs,
         enable_quic: true,
         disable_http1_1: args.disable_http1_1,
         listener_kind: ahma_http_bridge::ListenerKind::Tcp(args.bind_addr),

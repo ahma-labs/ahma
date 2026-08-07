@@ -295,7 +295,10 @@ async fn test_get_sse_events_include_event_id() {
 /// Verify that GET SSE with Last-Event-Id replays missed events.
 #[tokio::test]
 async fn test_get_sse_last_event_id_replay() {
-    use ahma_http_bridge::{DEFAULT_HANDSHAKE_TIMEOUT_SECS, SessionManager, SessionManagerConfig};
+    use ahma_http_bridge::{
+        DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS,
+        DEFAULT_TOOL_CALL_TIMEOUT_SECS, SessionManager, SessionManagerConfig,
+    };
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -334,6 +337,8 @@ for line in sys.stdin:
         default_scope: Some(temp_dir.path().to_path_buf()),
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 100,
         peer_factory: None,
     }));

@@ -8,9 +8,11 @@
 //!
 //! These tests improve session.rs coverage from ~47% to higher.
 
-use ahma_http_bridge::DEFAULT_HANDSHAKE_TIMEOUT_SECS;
 use ahma_http_bridge::session::{
     HandshakeState, McpRoot, SessionManager, SessionManagerConfig, SessionTerminationReason,
+};
+use ahma_http_bridge::{
+    DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TOOL_CALL_TIMEOUT_SECS,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +26,8 @@ fn create_test_session_manager(default_scope: Option<PathBuf>) -> Arc<SessionMan
         default_scope,
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
         peer_factory: None,
     };
@@ -699,6 +703,8 @@ async fn test_session_sweeper_cleanup() {
         default_scope: Some(temp.path().to_path_buf()),
         enable_colored_output: false,
         handshake_timeout_secs: 1, // 1 second timeout
+        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
         peer_factory: None,
     };

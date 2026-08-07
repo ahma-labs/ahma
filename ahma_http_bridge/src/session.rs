@@ -130,21 +130,13 @@ pub struct McpRoot {
 /// Default handshake timeout in seconds.
 pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 45;
 
-/// Get the request timeout in seconds for bridge → subprocess calls.
-pub fn request_timeout_secs() -> u64 {
-    std::env::var("AHMA_HTTP_BRIDGE_REQUEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60)
-}
+/// Default request timeout in seconds for bridge → subprocess calls
+/// (see [`SessionManagerConfig::request_timeout_secs`]).
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 
-/// Get the tools/call request timeout in seconds.
-pub fn tool_call_timeout_secs() -> u64 {
-    std::env::var("AHMA_HTTP_BRIDGE_TOOL_CALL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60)
-}
+/// Default `tools/call` request timeout in seconds
+/// (see [`SessionManagerConfig::tool_call_timeout_secs`]).
+pub const DEFAULT_TOOL_CALL_TIMEOUT_SECS: u64 = 60;
 
 /// Session termination reason
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,6 +566,14 @@ pub struct SessionManagerConfig {
     /// within this time, tool calls will return a timeout error.
     /// Defaults to 45 seconds if not specified.
     pub handshake_timeout_secs: u64,
+    /// Default timeout in seconds for bridge → subprocess request/response calls
+    /// (used for everything except `tools/call`, which has its own budget —
+    /// see `tool_call_timeout_secs`). Defaults to 60 seconds.
+    pub request_timeout_secs: u64,
+    /// Default timeout in seconds for `tools/call` requests, unless the
+    /// caller's `timeout_seconds` argument overrides it (still capped at
+    /// `BRIDGE_TOOL_CALL_CEILING_SECS`). Defaults to 60 seconds.
+    pub tool_call_timeout_secs: u64,
     /// Maximum concurrent sessions allowed.
     pub max_sessions: usize,
 
@@ -599,6 +599,8 @@ impl std::fmt::Debug for SessionManagerConfig {
             .field("default_scope", &self.default_scope)
             .field("enable_colored_output", &self.enable_colored_output)
             .field("handshake_timeout_secs", &self.handshake_timeout_secs)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("tool_call_timeout_secs", &self.tool_call_timeout_secs)
             .field("max_sessions", &self.max_sessions)
             .field(
                 "peer_factory",
@@ -715,13 +717,14 @@ fn fail_pending_requests(
 async fn await_response(
     response_rx: Option<oneshot::Receiver<Value>>,
     timeout: Option<Duration>,
+    default_timeout: Duration,
     id_opt: &Option<String>,
     pending: &DashMap<String, oneshot::Sender<Value>>,
 ) -> Result<Value> {
     let Some(rx) = response_rx else {
         return Ok(serde_json::json!({"jsonrpc": "2.0", "result": null}));
     };
-    let wait_timeout = timeout.unwrap_or_else(|| Duration::from_secs(request_timeout_secs()));
+    let wait_timeout = timeout.unwrap_or(default_timeout);
     match tokio::time::timeout(wait_timeout, rx).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) => Err(BridgeError::Communication(
@@ -940,6 +943,18 @@ impl SessionManager {
     /// Returns true when this server requires client roots to complete sandbox lock.
     pub fn requires_client_roots(&self) -> bool {
         self.config.default_scope.is_none()
+    }
+
+    /// The configured request timeout in seconds for bridge → subprocess calls
+    /// (see [`SessionManagerConfig::request_timeout_secs`]).
+    pub fn request_timeout_secs(&self) -> u64 {
+        self.config.request_timeout_secs
+    }
+
+    /// The configured default `tools/call` timeout in seconds
+    /// (see [`SessionManagerConfig::tool_call_timeout_secs`]).
+    pub fn tool_call_timeout_secs(&self) -> u64 {
+        self.config.tool_call_timeout_secs
     }
 
     /// The bridge's configured default sandbox scope (from `--sandbox-scope`
@@ -1267,7 +1282,14 @@ impl SessionManager {
             return Err(err);
         }
 
-        await_response(response_rx, timeout, &id_opt, &session.pending_requests).await
+        await_response(
+            response_rx,
+            timeout,
+            Duration::from_secs(self.request_timeout_secs()),
+            &id_opt,
+            &session.pending_requests,
+        )
+        .await
     }
 
     /// Lock sandbox scope for a session (called when observing first roots/list response).
@@ -2341,7 +2363,9 @@ mod session_logic_tests {
     #[tokio::test]
     async fn await_response_none_rx_returns_null_result() {
         let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
-        let res = await_response(None, None, &None, &pending).await.unwrap();
+        let res = await_response(None, None, Duration::from_secs(60), &None, &pending)
+            .await
+            .unwrap();
         assert_eq!(res["result"], Value::Null);
     }
 
@@ -2354,6 +2378,7 @@ mod session_logic_tests {
         let res = await_response(
             Some(rx),
             Some(Duration::from_secs(1)),
+            Duration::from_secs(60),
             &Some("1".to_string()),
             &pending,
         )
@@ -2367,9 +2392,15 @@ mod session_logic_tests {
         let pending: DashMap<String, oneshot::Sender<Value>> = DashMap::new();
         let (tx, rx) = oneshot::channel::<Value>();
         drop(tx); // sender dropped → recv yields Err
-        let err = await_response(Some(rx), Some(Duration::from_secs(1)), &None, &pending)
-            .await
-            .unwrap_err();
+        let err = await_response(
+            Some(rx),
+            Some(Duration::from_secs(1)),
+            Duration::from_secs(60),
+            &None,
+            &pending,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("Response channel closed"));
     }
 
@@ -2383,6 +2414,7 @@ mod session_logic_tests {
         let err = await_response(
             Some(rx),
             Some(Duration::from_millis(20)),
+            Duration::from_secs(60),
             &Some(id.clone()),
             &pending,
         )
@@ -2400,50 +2432,10 @@ mod session_logic_tests {
         drop(tx);
     }
 
-    // ── timeout env helpers ──────────────────────────────────────────────────
-
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-
-    #[test]
-    fn request_timeout_secs_defaults_and_overrides() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let key = "AHMA_HTTP_BRIDGE_REQUEST_TIMEOUT_SECS";
-        let prev = std::env::var(key).ok();
-
-        unsafe { std::env::remove_var(key) };
-        assert_eq!(request_timeout_secs(), 60);
-
-        unsafe { std::env::set_var(key, "123") };
-        assert_eq!(request_timeout_secs(), 123);
-
-        // Invalid value falls back to default.
-        unsafe { std::env::set_var(key, "not-a-number") };
-        assert_eq!(request_timeout_secs(), 60);
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
-
-    #[test]
-    fn tool_call_timeout_secs_defaults_and_overrides() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let key = "AHMA_HTTP_BRIDGE_TOOL_CALL_TIMEOUT_SECS";
-        let prev = std::env::var(key).ok();
-
-        unsafe { std::env::remove_var(key) };
-        assert_eq!(tool_call_timeout_secs(), 60);
-
-        unsafe { std::env::set_var(key, "5") };
-        assert_eq!(tool_call_timeout_secs(), 5);
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
-        }
-    }
+    // request_timeout_secs()/tool_call_timeout_secs() are now plain
+    // SessionManagerConfig fields (SPEC R-CFG1.2: AHMA_* env vars are
+    // retired) — see SessionManagerConfig's own construction tests for
+    // coverage of the default/override values.
 
     // ── SessionManager: config-only / in-memory peer logic ───────────────────
 
@@ -2489,6 +2481,8 @@ mod session_logic_tests {
             default_scope,
             enable_colored_output: false,
             handshake_timeout_secs: 45,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions,
             peer_factory: Some(Arc::new(DuplexPeerFactory::new())),
         }
@@ -2613,6 +2607,8 @@ mod session_logic_tests {
             default_scope: None,
             enable_colored_output: false,
             handshake_timeout_secs: 45,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 8,
             peer_factory: Some(factory.clone()),
         };
@@ -2867,6 +2863,8 @@ mod session_logic_tests {
             default_scope: None,
             enable_colored_output: false,
             handshake_timeout_secs: 45,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 1,
             peer_factory: None,
         };

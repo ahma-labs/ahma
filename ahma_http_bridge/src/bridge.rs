@@ -26,7 +26,10 @@
 //! shuts down the associated subprocess to conserve system resources.
 
 use crate::error::{BridgeError, Result};
-use crate::session::{DEFAULT_HANDSHAKE_TIMEOUT_SECS, SessionManager, SessionManagerConfig};
+use crate::session::{
+    DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TOOL_CALL_TIMEOUT_SECS,
+    SessionManager, SessionManagerConfig,
+};
 use arc_swap::ArcSwapOption;
 use axum::{
     Json, Router,
@@ -115,6 +118,14 @@ pub struct BridgeConfig {
     /// within this time, tool calls will return a timeout error.
     /// Defaults to 45 seconds.
     pub handshake_timeout_secs: u64,
+
+    /// Default timeout in seconds for bridge → subprocess request/response
+    /// calls (used for everything except `tools/call`). Defaults to 60 seconds.
+    pub request_timeout_secs: u64,
+
+    /// Default timeout in seconds for `tools/call` requests, unless the
+    /// caller's `timeout_seconds` argument overrides it. Defaults to 60 seconds.
+    pub tool_call_timeout_secs: u64,
 
     /// If `true`, attempt to start an HTTP/3 (QUIC) endpoint alongside HTTP/2.
     /// The QUIC endpoint uses a self-signed certificate. Defaults to `true`.
@@ -219,6 +230,8 @@ impl Default for BridgeConfig {
             enable_colored_output: false,
             default_sandbox_scope: None,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             enable_quic: true,
             disable_http1_1: false,
             listener_kind: ListenerKind::Tcp(bind_addr),
@@ -245,6 +258,8 @@ impl std::fmt::Debug for BridgeConfig {
             .field("enable_colored_output", &self.enable_colored_output)
             .field("default_sandbox_scope", &self.default_sandbox_scope)
             .field("handshake_timeout_secs", &self.handshake_timeout_secs)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("tool_call_timeout_secs", &self.tool_call_timeout_secs)
             .field("enable_quic", &self.enable_quic)
             .field("disable_http1_1", &self.disable_http1_1)
             .field("listener_kind", &self.listener_kind)
@@ -280,6 +295,8 @@ impl Clone for BridgeConfig {
             enable_colored_output: self.enable_colored_output,
             default_sandbox_scope: self.default_sandbox_scope.clone(),
             handshake_timeout_secs: self.handshake_timeout_secs,
+            request_timeout_secs: self.request_timeout_secs,
+            tool_call_timeout_secs: self.tool_call_timeout_secs,
             enable_quic: self.enable_quic,
             disable_http1_1: self.disable_http1_1,
             listener_kind: self.listener_kind.clone(),
@@ -335,6 +352,8 @@ impl BridgeConfig {
             enable_colored_output: false,
             default_sandbox_scope: None,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             enable_quic: false, // no QUIC needed for in-process tests
             disable_http1_1: false,
             listener_kind: ListenerKind::Tcp(bind_addr),
@@ -746,6 +765,8 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
         default_scope: config.default_sandbox_scope.clone(),
         enable_colored_output: config.enable_colored_output,
         handshake_timeout_secs: config.handshake_timeout_secs,
+        request_timeout_secs: config.request_timeout_secs,
+        tool_call_timeout_secs: config.tool_call_timeout_secs,
         max_sessions: config.max_sessions,
         // Forward the injected PeerFactory (P5 in-process test harness support).
         // When `Some`, sessions use an in-memory MCP service rather than
@@ -1824,6 +1845,8 @@ mod tests {
             enable_colored_output: false,
             default_sandbox_scope: Some(std::env::temp_dir()),
             handshake_timeout_secs: 10,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             enable_quic: false,
             disable_http1_1: false,
             listener_kind: ListenerKind::Tcp("0.0.0.0:8080".parse().unwrap()),
@@ -1959,6 +1982,8 @@ for line in sys.stdin:
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 50,
             peer_factory: None,
         }));
@@ -2210,6 +2235,8 @@ for line in sys.stdin:
             default_scope,
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 50,
             peer_factory: None,
         }))
@@ -2440,6 +2467,8 @@ for line in sys.stdin:
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 50,
             peer_factory: None,
         }));
@@ -2541,6 +2570,8 @@ for line in sys.stdin:
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 50,
             peer_factory: None,
         }));
@@ -2585,6 +2616,8 @@ for line in sys.stdin:
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 50,
             peer_factory: None,
         }));
@@ -2627,6 +2660,8 @@ for line in sys.stdin:
                 default_scope: Some(temp_dir.path().to_path_buf()),
                 enable_colored_output: false,
                 handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+                tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
                 max_sessions: 50,
                 peer_factory: None,
             })),
@@ -2827,6 +2862,8 @@ for line in sys.stdin:
                 default_scope: Some(temp_dir.path().to_path_buf()),
                 enable_colored_output: false,
                 handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+                tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
                 max_sessions: 50,
                 peer_factory: None,
             })),
@@ -3101,6 +3138,8 @@ for line in sys.stdin:
             default_scope: Some(temp_dir.path().to_path_buf()),
             enable_colored_output: false,
             handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 10,
             peer_factory: None,
         };

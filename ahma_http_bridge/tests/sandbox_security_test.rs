@@ -9,8 +9,10 @@
 //! challenging in unit tests. These tests focus on the configuration and
 //! state management aspects.
 
-use ahma_http_bridge::DEFAULT_HANDSHAKE_TIMEOUT_SECS;
 use ahma_http_bridge::session::{McpRoot, SessionManager, SessionManagerConfig};
+use ahma_http_bridge::{
+    DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TOOL_CALL_TIMEOUT_SECS,
+};
 use ahma_mcp::test_utils::path_helpers::{test_abs, test_temp_path};
 use std::path::PathBuf;
 
@@ -31,6 +33,8 @@ fn test_no_temp_files_flag_in_server_args() {
         default_scope: Some(test_temp_path("test")),
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
         peer_factory: None,
     };
@@ -85,6 +89,8 @@ fn test_session_manager_config_default_scope() {
         default_scope: Some(default_scope.clone()),
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
         peer_factory: None,
     };
@@ -105,6 +111,8 @@ async fn test_session_isolation_creates_separate_sessions() {
         default_scope: Some(test_temp_path("isolation_test")),
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
         peer_factory: None,
     };
@@ -143,6 +151,8 @@ async fn test_sandbox_lock_immutability() {
         default_scope: Some(test_temp_path("lock_test")),
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
         peer_factory: None,
     };
@@ -239,6 +249,8 @@ async fn test_multi_root_workspace_sandbox() {
         default_scope: Some(test_temp_path("multi_root_test")),
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
         peer_factory: None,
     };
@@ -301,6 +313,8 @@ async fn test_empty_roots_rejected() {
         default_scope: None,
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
         peer_factory: None,
     };
@@ -335,6 +349,8 @@ async fn test_empty_roots_use_explicit_fallback_scope() {
         default_scope: Some(fallback_scope.clone()),
         enable_colored_output: false,
         handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
         peer_factory: None,
     };

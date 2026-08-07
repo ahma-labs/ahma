@@ -148,6 +148,8 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         enable_colored_output,
         default_sandbox_scope: explicit_fallback_scope,
         handshake_timeout_secs: config.handshake_timeout_secs,
+        request_timeout_secs: ahma_http_bridge::session::DEFAULT_REQUEST_TIMEOUT_SECS,
+        tool_call_timeout_secs: ahma_http_bridge::session::DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         // QUIC is UDP-based and incompatible with Unix sockets.
         enable_quic: false,
         disable_http1_1: false,

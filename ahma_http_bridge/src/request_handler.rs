@@ -1,5 +1,5 @@
 use crate::error::BridgeError;
-use crate::session::{McpRoot, SessionManager, request_timeout_secs, tool_call_timeout_secs};
+use crate::session::{McpRoot, SessionManager};
 use ahma_common::timeouts::BRIDGE_TOOL_CALL_CEILING_SECS;
 use axum::{
     body::Body,
@@ -402,7 +402,7 @@ async fn handle_initialize(session_manager: &Arc<SessionManager>, payload: &Valu
         .send_request(
             &new_session_id,
             payload,
-            Some(Duration::from_secs(request_timeout_secs())),
+            Some(Duration::from_secs(session_manager.request_timeout_secs())),
         )
         .await
     {
@@ -960,9 +960,9 @@ async fn forward_request(
     is_initialized_notification: bool,
 ) -> Response {
     let request_timeout = if method == Some("tools/call") {
-        calculate_tool_timeout(payload)
+        calculate_tool_timeout(payload, session_manager.tool_call_timeout_secs())
     } else {
-        Duration::from_secs(request_timeout_secs())
+        Duration::from_secs(session_manager.request_timeout_secs())
     };
 
     match session_manager
@@ -1011,7 +1011,7 @@ async fn forward_request(
 /// The +60s margin covers scheduling/IO slack.
 const AWAIT_TOOL_BRIDGE_TIMEOUT_SECS: u64 = BRIDGE_TOOL_CALL_CEILING_SECS + 60;
 
-fn calculate_tool_timeout(payload: &Value) -> Duration {
+fn calculate_tool_timeout(payload: &Value, default_secs: u64) -> Duration {
     let tool_name = payload
         .get("params")
         .and_then(|p| p.get("name"))
@@ -1029,7 +1029,6 @@ fn calculate_tool_timeout(payload: &Value) -> Duration {
         .and_then(|a| a.get("timeout_seconds"))
         .and_then(|v| v.as_u64());
 
-    let default_secs = tool_call_timeout_secs();
     let effective_secs = arg_timeout_secs
         .map(|v| v.min(BRIDGE_TOOL_CALL_CEILING_SECS))
         .unwrap_or(default_secs);
@@ -1257,7 +1256,7 @@ async fn handle_initialize_sse(session_manager: &Arc<SessionManager>, payload: &
         .send_request(
             &new_session_id,
             payload,
-            Some(Duration::from_secs(request_timeout_secs())),
+            Some(Duration::from_secs(session_manager.request_timeout_secs())),
         )
         .await
     {
@@ -1287,7 +1286,7 @@ async fn forward_notification_sse(
     payload: &Value,
     is_initialized_notification: bool,
 ) -> Response {
-    let request_timeout = Duration::from_secs(request_timeout_secs());
+    let request_timeout = Duration::from_secs(session_manager.request_timeout_secs());
 
     match session_manager
         .send_request(session_id, payload, Some(request_timeout))
@@ -1329,9 +1328,9 @@ async fn forward_request_sse(
     let rx = session.subscribe();
 
     let request_timeout = if method == Some("tools/call") {
-        calculate_tool_timeout(payload)
+        calculate_tool_timeout(payload, session_manager.tool_call_timeout_secs())
     } else {
-        Duration::from_secs(request_timeout_secs())
+        Duration::from_secs(session_manager.request_timeout_secs())
     };
 
     // Send the request to the subprocess
@@ -1419,6 +1418,8 @@ mod tests {
             default_scope,
             enable_colored_output: false,
             handshake_timeout_secs,
+            request_timeout_secs: crate::session::DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: crate::session::DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions,
             peer_factory: Some(factory),
         }))
@@ -1694,26 +1695,32 @@ mod tests {
     #[test]
     fn calculate_tool_timeout_uses_argument_value() {
         let payload = json!({"params": {"arguments": {"timeout_seconds": 30}}});
-        assert_eq!(calculate_tool_timeout(&payload), Duration::from_secs(30));
+        assert_eq!(
+            calculate_tool_timeout(&payload, 60),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
     fn calculate_tool_timeout_caps_at_600() {
         let payload = json!({"params": {"arguments": {"timeout_seconds": 9999}}});
-        assert_eq!(calculate_tool_timeout(&payload), Duration::from_secs(600));
+        assert_eq!(
+            calculate_tool_timeout(&payload, 60),
+            Duration::from_secs(600)
+        );
     }
 
     #[test]
     fn calculate_tool_timeout_defaults_without_arguments() {
         let payload = json!({"params": {"arguments": {}}});
         assert_eq!(
-            calculate_tool_timeout(&payload),
-            Duration::from_secs(tool_call_timeout_secs())
+            calculate_tool_timeout(&payload, 60),
+            Duration::from_secs(60)
         );
         let no_params = json!({"method": "tools/call"});
         assert_eq!(
-            calculate_tool_timeout(&no_params),
-            Duration::from_secs(tool_call_timeout_secs())
+            calculate_tool_timeout(&no_params, 60),
+            Duration::from_secs(60)
         );
     }
 
@@ -1725,7 +1732,7 @@ mod tests {
         // guillotining the call.
         let payload = json!({"params": {"name": "await", "arguments": {}}});
         assert_eq!(
-            calculate_tool_timeout(&payload),
+            calculate_tool_timeout(&payload, 60),
             Duration::from_secs(AWAIT_TOOL_BRIDGE_TIMEOUT_SECS)
         );
         const {
@@ -1737,7 +1744,7 @@ mod tests {
         // The extended budget applies regardless of any client-sent timeout arg.
         let with_arg = json!({"params": {"name": "await", "arguments": {"timeout_seconds": 5}}});
         assert_eq!(
-            calculate_tool_timeout(&with_arg),
+            calculate_tool_timeout(&with_arg, 60),
             Duration::from_secs(AWAIT_TOOL_BRIDGE_TIMEOUT_SECS)
         );
     }
