@@ -361,9 +361,7 @@ pub async fn handle_subcommand_sequence(
         .or(config.step_delay_ms)
         .unwrap_or(SEQUENCE_STEP_DELAY_MS);
     let mut final_result = CallToolResult::success(vec![]);
-    let kind = SequenceKind::Subcommand {
-        base_config: config,
-    };
+    let kind = SequenceKind::Subcommand;
 
     for (index, step) in sequence.iter().enumerate() {
         let (step_config, command_parts) =
@@ -425,7 +423,7 @@ pub async fn handle_subcommand_sequence(
 pub fn format_step_started_message(kind: &SequenceKind, step: &SequenceStep, id: &str) -> String {
     let (step_name, prefix) = match kind {
         SequenceKind::TopLevel => (&step.tool, "Sequence step"),
-        SequenceKind::Subcommand { .. } => (&step.subcommand, "Subcommand sequence step"),
+        SequenceKind::Subcommand => (&step.subcommand, "Subcommand sequence step"),
     };
     let hint = crate::tool_hints::preview(id, step_name);
     match step.description.as_deref() {
@@ -447,7 +445,7 @@ pub fn format_step_started_message(kind: &SequenceKind, step: &SequenceStep, id:
 pub fn format_step_skipped_message(kind: &SequenceKind, step: &SequenceStep) -> String {
     let (step_name, prefix) = match kind {
         SequenceKind::TopLevel => (&step.tool, "Sequence step"),
-        SequenceKind::Subcommand { .. } => (&step.subcommand, "Subcommand sequence step"),
+        SequenceKind::Subcommand => (&step.subcommand, "Subcommand sequence step"),
     };
     match step.description.as_deref() {
         Some(desc) if !desc.is_empty() => {
@@ -578,10 +576,7 @@ mod tests {
     #[test]
     fn test_format_step_started_message_subcommand_with_description() {
         let step = make_test_sequence_step("cargo", "clippy", Some("Run linter"));
-        let dummy_config = make_dummy_tool_config();
-        let kind = SequenceKind::Subcommand {
-            base_config: &dummy_config,
-        };
+        let kind = SequenceKind::Subcommand;
         let message = format_step_started_message(&kind, &step, "op_sub_test_001");
 
         assert!(message.contains("clippy"));
@@ -617,10 +612,7 @@ mod tests {
     #[test]
     fn test_format_step_skipped_message_subcommand() {
         let step = make_test_sequence_step("cargo", "nextest_run", Some("Run tests"));
-        let dummy_config = make_dummy_tool_config();
-        let kind = SequenceKind::Subcommand {
-            base_config: &dummy_config,
-        };
+        let kind = SequenceKind::Subcommand;
         let message = format_step_skipped_message(&kind, &step);
 
         assert!(message.contains("nextest_run"));
@@ -827,10 +819,7 @@ mod tests {
     #[test]
     fn test_format_step_skipped_message_subcommand_without_description() {
         let step = make_test_sequence_step("cargo", "clippy", None);
-        let dummy_config = make_dummy_tool_config();
-        let kind = SequenceKind::Subcommand {
-            base_config: &dummy_config,
-        };
+        let kind = SequenceKind::Subcommand;
         let message = format_step_skipped_message(&kind, &step);
         assert!(message.contains("clippy"));
         assert!(message.contains("skipped"));

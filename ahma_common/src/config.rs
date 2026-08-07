@@ -1466,6 +1466,47 @@ impl AhmaSettings {
         }
     }
 
+    /// Async variant of [`load`](Self::load): reads the settings file via
+    /// `tokio::fs` so request-path callers (per-call policy reloads) never
+    /// block a runtime worker on disk I/O. Same **runtime-safe** semantics as
+    /// [`load_from`](Self::load_from) — unreadable or unparsable files degrade
+    /// to compiled-in defaults with a log line, mirroring
+    /// [`load_from_result`](Self::load_from_result)'s `NotFound` /
+    /// `PermissionDenied` handling (see that method for why `PermissionDenied`
+    /// is expected inside the ahma sandbox).
+    pub async fn load_async() -> Self {
+        let Some(path) = settings_path() else {
+            debug!("Could not determine home directory; using default AhmaSettings");
+            return Self::default();
+        };
+        match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => Self::parse(&contents).unwrap_or_else(|e| {
+                warn!(
+                    "failed to parse settings file {}: {e}; using default AhmaSettings",
+                    path.display()
+                );
+                Self::default()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                warn!(
+                    "settings file {} is not readable ({e}); this is expected when running \
+                     inside the ahma sandbox, which denies ~/.ahma by design (SPEC R5.4.8). \
+                     Using compiled-in defaults.",
+                    path.display()
+                );
+                Self::default()
+            }
+            Err(e) => {
+                warn!(
+                    "failed to read {}: {e}; using default AhmaSettings",
+                    path.display()
+                );
+                Self::default()
+            }
+        }
+    }
+
     /// Load from an explicit path — useful for tests and alternate locations.
     ///
     /// This is the **runtime-safe** loader: a parse error is logged and the

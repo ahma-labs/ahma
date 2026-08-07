@@ -236,7 +236,7 @@ impl WorkerRegistry {
 
     /// Load static peers from `~/.ahma/cluster/peers.json` if it exists.
     pub fn load_static_peers(&self) -> Result<usize> {
-        let Some(home) = dirs::home_dir() else {
+        let Some(home) = ahma_common::config::ahma_home_dir() else {
             return Ok(0);
         };
         self.load_static_peers_from(&home)
@@ -417,12 +417,10 @@ fn mdns_info_to_peer(info: &ResolvedService) -> Option<PeerInfo> {
 
 /// Return a suitable mDNS hostname for this machine (e.g. `mymac.local.`).
 ///
-/// Reads `HOSTNAME` (Unix) or `COMPUTERNAME` (Windows) environment variables;
-/// falls back to `"ahma-worker"` if neither is set.
+/// The base name comes from [`ahma_common::hostname::hostname`], the shared
+/// machine-identity chain (`HOSTNAME` → `COMPUTERNAME` → `"ahma-worker"`).
 fn hostname_string() -> String {
-    let base = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "ahma-worker".to_owned());
+    let base = ahma_common::hostname::hostname();
     if base.ends_with('.') {
         base
     } else if base.contains('.') {
@@ -819,8 +817,8 @@ mod tests {
 
     #[test]
     fn load_static_peers_from_default_home_does_not_error() {
-        // Exercises `load_static_peers()` (lines 238-243), which resolves the real
-        // home directory via `dirs::home_dir()` rather than a test-controlled path.
+        // Exercises `load_static_peers()`, which resolves the home directory via
+        // `ahma_common::config::ahma_home_dir()` rather than a test-controlled path.
         // We only assert it doesn't error — the actual peer count depends on whether
         // this machine happens to have `~/.ahma/cluster/peers.json`.
         let reg = WorkerRegistry::new(60);

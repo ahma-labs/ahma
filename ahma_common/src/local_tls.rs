@@ -54,7 +54,7 @@ pub struct LocalTlsCerts {
 impl LocalTlsConfig {
     /// Default TLS directory: `~/.ahma/tls`.
     pub fn default_dir() -> PathBuf {
-        dirs::home_dir()
+        crate::config::ahma_home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".ahma")
             .join("tls")

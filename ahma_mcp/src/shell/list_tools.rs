@@ -163,12 +163,14 @@ pub fn parse_mcp_config(path: &PathBuf, server_name: Option<&str>) -> Result<Leg
 /// tool configs authored on one platform work correctly on the other.
 /// Bare `~` without a following separator is left unchanged.
 pub fn expand_home(path: &str) -> String {
-    // Accept `~/` (Unix) or `~\` (Windows) — but NOT bare `~` alone.
-    let is_tilde_prefix = path.starts_with("~/") || path.starts_with("~\\");
-    if is_tilde_prefix && let Some(home) = dirs::home_dir() {
-        return path.replacen("~", home.to_str().unwrap_or("~"), 1);
+    // Bare `~` alone is deliberately NOT expanded here (unlike the shared
+    // helper): these values are commands/args, so a lone `~` passes through.
+    if path == "~" {
+        return path.to_string();
     }
-    path.to_string()
+    ahma_common::config::expand_home(std::path::Path::new(path))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// List tools from mcp.json configuration
@@ -289,40 +291,6 @@ pub async fn list_tools_http(url: &str) -> Result<ToolListResult> {
         server_info: server_info_output,
         tools,
     })
-}
-
-#[allow(dead_code)]
-/// Extract parameter definitions from a JSON schema object.
-///
-/// # Arguments
-/// * `schema` - JSON schema value with `properties` and `required` entries.
-///
-/// # Returns
-/// A list of `ParameterOutput` entries suitable for display.
-pub fn extract_parameters_from_json(schema: &serde_json::Value) -> Vec<ParameterOutput> {
-    let mut params = Vec::new();
-
-    if let Some(properties) = schema["properties"].as_object() {
-        let required_fields: Vec<&str> = schema["required"]
-            .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-
-        for (name, prop) in properties {
-            let param_type = prop["type"].as_str().unwrap_or("string").to_string();
-            let description = prop["description"].as_str().map(|s| s.to_string());
-            let required = required_fields.contains(&name.as_str());
-
-            params.push(ParameterOutput {
-                name: name.clone(),
-                param_type,
-                required,
-                description,
-            });
-        }
-    }
-
-    params
 }
 
 fn convert_tool_to_output(tool: Tool) -> ToolOutput {
@@ -639,91 +607,6 @@ mod tests {
             assert!(!command.starts_with("~/"));
             assert!(!args[0].starts_with("~/"));
         }
-    }
-
-    #[test]
-    fn test_extract_parameters_from_json() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "The name"
-                },
-                "count": {
-                    "type": "integer"
-                }
-            },
-            "required": ["name"]
-        });
-
-        let params = extract_parameters_from_json(&schema);
-
-        assert_eq!(params.len(), 2);
-
-        let name_param = params.iter().find(|p| p.name == "name").unwrap();
-        assert_eq!(name_param.param_type, "string");
-        assert!(name_param.required);
-        assert_eq!(name_param.description, Some("The name".to_string()));
-
-        let count_param = params.iter().find(|p| p.name == "count").unwrap();
-        assert_eq!(count_param.param_type, "integer");
-        assert!(!count_param.required);
-    }
-
-    #[test]
-    fn test_extract_parameters_empty_schema() {
-        let schema = serde_json::json!({});
-        let params = extract_parameters_from_json(&schema);
-        assert!(params.is_empty());
-    }
-
-    #[test]
-    fn test_extract_parameters_no_properties() {
-        let schema = serde_json::json!({
-            "type": "object"
-        });
-        let params = extract_parameters_from_json(&schema);
-        assert!(params.is_empty());
-    }
-
-    #[test]
-    fn test_extract_parameters_no_required_array() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "field1": {"type": "string"}
-            }
-        });
-        let params = extract_parameters_from_json(&schema);
-        assert_eq!(params.len(), 1);
-        assert!(!params[0].required);
-    }
-
-    #[test]
-    fn test_extract_parameters_missing_type_defaults_to_string() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "untyped_field": {}
-            }
-        });
-        let params = extract_parameters_from_json(&schema);
-        assert_eq!(params.len(), 1);
-        assert_eq!(params[0].param_type, "string");
-    }
-
-    #[test]
-    fn test_extract_parameters_no_description() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "no_desc": {"type": "boolean"}
-            }
-        });
-        let params = extract_parameters_from_json(&schema);
-        assert_eq!(params.len(), 1);
-        assert!(params[0].description.is_none());
     }
 
     #[test]

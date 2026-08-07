@@ -5,10 +5,9 @@
 //! recorded (allowed, denied, or passed through), so there is a forensic trail
 //! of what the agent reached out to.
 
-use std::io::Write;
-
 use ahma_common::web_policy::WebDecision;
 use serde::Serialize;
+use tokio::io::AsyncWriteExt;
 
 /// What the caller should do with a request after consulting the policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,22 +74,23 @@ pub fn record(
 /// Append `record` as one JSON line to `<log_dir>/web_egress.jsonl`. Best-effort
 /// (R-WEB.9.3): any error is logged at debug and swallowed so it never blocks or
 /// fails the request.
-pub fn append(record: &WebAuditRecord) {
+pub async fn append(record: &WebAuditRecord) {
     let Ok(line) = serde_json::to_string(record) else {
         return;
     };
     let path = crate::utils::logging::project_log_dir().join("web_egress.jsonl");
-    let write = || -> std::io::Result<()> {
+    let write = async {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        let mut f = std::fs::OpenOptions::new()
+        let mut f = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)?;
-        writeln!(f, "{line}")
+            .open(&path)
+            .await?;
+        f.write_all(format!("{line}\n").as_bytes()).await
     };
-    if let Err(e) = write() {
+    if let Err(e) = write.await {
         tracing::debug!("web audit append failed ({}): {e}", path.display());
     }
 }

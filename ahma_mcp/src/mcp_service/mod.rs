@@ -44,7 +44,6 @@ pub mod schema;
 mod sequence;
 mod subcommand;
 mod types;
-mod utils;
 
 pub use types::{
     ActiveAgentSession, ExtensionToolHandler, GuidanceConfig, LegacyGuidanceConfig, META_PARAMS,
@@ -2737,109 +2736,6 @@ mod tests {
         let result = service.handle_cancel(args).await.expect("cancel");
         let text = first_text(&result);
         assert!(text.contains("timed out"));
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn parse_file_uri_to_path_accepts_localhost_and_decodes() {
-        let p = AhmaMcpService::parse_file_uri_to_path(
-            "file://localhost/Users/test/My%20Project/file.txt?x=1#frag",
-        )
-        .expect("path");
-        assert_eq!(p.to_string_lossy(), "/Users/test/My Project/file.txt");
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn parse_file_uri_to_path_rejects_non_file_scheme_and_relative() {
-        assert!(AhmaMcpService::parse_file_uri_to_path("http://example.com/a").is_none());
-        assert!(AhmaMcpService::parse_file_uri_to_path("file://not-abs").is_none());
-        assert!(AhmaMcpService::parse_file_uri_to_path("file://localhostnotabs").is_none());
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn parse_file_uri_to_path_accepts_absolute_without_localhost() {
-        let p = AhmaMcpService::parse_file_uri_to_path("file:///home/user/file.txt").expect("path");
-        assert_eq!(p.to_string_lossy(), "/home/user/file.txt");
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn parse_file_uri_to_path_strips_query_only() {
-        let p =
-            AhmaMcpService::parse_file_uri_to_path("file:///path/to/file?query=1").expect("path");
-        assert_eq!(p.to_string_lossy(), "/path/to/file");
-    }
-
-    #[test]
-    #[cfg(not(target_os = "windows"))]
-    fn parse_file_uri_to_path_strips_fragment_only() {
-        let p =
-            AhmaMcpService::parse_file_uri_to_path("file:///path/to/file#section").expect("path");
-        assert_eq!(p.to_string_lossy(), "/path/to/file");
-    }
-
-    // ── parse_file_uri_to_path (Windows equivalents) ────────────────────────
-    // Windows uses drive-letter URIs (file:///C:/...) instead of Unix absolute paths.
-
-    #[test]
-    #[cfg(target_os = "windows")]
-    fn parse_file_uri_to_path_accepts_absolute_without_localhost() {
-        let p =
-            AhmaMcpService::parse_file_uri_to_path("file:///C:/home/user/file.txt").expect("path");
-        assert_eq!(p.to_string_lossy(), "C:/home/user/file.txt");
-    }
-
-    #[test]
-    #[cfg(target_os = "windows")]
-    fn parse_file_uri_to_path_accepts_localhost_and_decodes() {
-        let p = AhmaMcpService::parse_file_uri_to_path(
-            "file://localhost/C:/Users/test/My%20Project/file.txt?x=1#frag",
-        )
-        .expect("path");
-        assert_eq!(p.to_string_lossy(), "C:/Users/test/My Project/file.txt");
-    }
-
-    #[test]
-    fn percent_decode_utf8_rejects_invalid_hex() {
-        assert!(AhmaMcpService::percent_decode_utf8("/a%ZZ").is_none());
-        assert!(AhmaMcpService::percent_decode_utf8("/a%2").is_none());
-    }
-
-    #[test]
-    fn percent_decode_utf8_decodes_space() {
-        let decoded = AhmaMcpService::percent_decode_utf8("/path%20to%20file").expect("decode");
-        assert_eq!(decoded, "/path to file");
-    }
-
-    #[test]
-    fn percent_decode_utf8_preserves_plain_text() {
-        let decoded = AhmaMcpService::percent_decode_utf8("/path/to/file").expect("decode");
-        assert_eq!(decoded, "/path/to/file");
-    }
-
-    #[test]
-    fn percent_decode_utf8_uppercase_hex() {
-        let decoded = AhmaMcpService::percent_decode_utf8("path%2Ffile").expect("decode");
-        assert_eq!(decoded, "path/file");
-    }
-
-    #[test]
-    fn percent_decode_utf8_truncated_percent_at_end() {
-        assert!(AhmaMcpService::percent_decode_utf8("/path%").is_none());
-    }
-
-    #[test]
-    fn percent_decode_utf8_invalid_utf8_returns_none() {
-        // %FF decodes to byte 0xFF which is invalid as standalone UTF-8
-        assert!(AhmaMcpService::percent_decode_utf8("%FF").is_none());
-    }
-
-    #[test]
-    fn percent_decode_utf8_empty_string() {
-        let decoded = AhmaMcpService::percent_decode_utf8("").expect("decode");
-        assert_eq!(decoded, "");
     }
 
     #[tokio::test]

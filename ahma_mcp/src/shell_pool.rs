@@ -28,7 +28,11 @@ use std::time::Duration;
 /// platforms we use `bash`.
 ///
 /// Also used by `mcp_service` handlers to build progress descriptions.
-pub(crate) fn platform_shell_program() -> &'static str {
+///
+/// This is the cross-crate chokepoint for shell selection (see AGENTS.md):
+/// every surface that spawns a platform shell — including `ahma_tui` — must
+/// take the program name from here rather than hardcoding it.
+pub fn platform_shell_program() -> &'static str {
     #[cfg(target_os = "windows")]
     {
         "powershell"

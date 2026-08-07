@@ -76,7 +76,16 @@ impl FileOpsProvider for DefaultFileOpsProvider {
         base_dir: &Path,
         pattern: &str,
     ) -> Result<Vec<String>> {
-        ahma_harness_tools::file_search(scopes, base_dir, pattern)
+        // The underlying search is a synchronous filesystem walk; run it on
+        // the blocking pool so a workspace-wide walk never stalls a tokio
+        // worker thread.
+        let scopes = scopes.to_vec();
+        let base_dir = base_dir.to_path_buf();
+        let pattern = pattern.to_string();
+        tokio::task::spawn_blocking(move || {
+            ahma_harness_tools::file_search(&scopes, &base_dir, &pattern)
+        })
+        .await?
     }
 
     async fn grep_search(
@@ -88,14 +97,22 @@ impl FileOpsProvider for DefaultFileOpsProvider {
         include_pattern: Option<&str>,
         max_results: Option<usize>,
     ) -> Result<Vec<GrepMatch>> {
-        ahma_harness_tools::grep_search(
-            scopes,
-            base_dir,
-            query,
-            is_regex,
-            include_pattern,
-            max_results,
-        )
+        // Synchronous WalkDir + per-file reads; keep it off the async workers.
+        let scopes = scopes.to_vec();
+        let base_dir = base_dir.to_path_buf();
+        let query = query.to_string();
+        let include_pattern = include_pattern.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            ahma_harness_tools::grep_search(
+                &scopes,
+                &base_dir,
+                &query,
+                is_regex,
+                include_pattern.as_deref(),
+                max_results,
+            )
+        })
+        .await?
     }
 }
 

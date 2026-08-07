@@ -299,22 +299,6 @@ impl AppConfig {
     }
 }
 
-fn expand_tilde(path: PathBuf) -> PathBuf {
-    let path_str = path.to_string_lossy();
-    if path_str == "~"
-        && let Some(home) = dirs::home_dir()
-    {
-        return home;
-    } else if (path_str.starts_with("~/") || path_str.starts_with("~\\"))
-        && let Some(home) = dirs::home_dir()
-    {
-        let mut expanded = home;
-        expanded.push(&path_str[2..]);
-        return expanded;
-    }
-    path
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Sandbox policy helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -637,7 +621,7 @@ fn grant_persistent_write_scope(
         }
         Err(e) => tracing::warn!(
             "Skipping persistent scope {}: could not create/canonicalize ({e})",
-            expand_tilde(scope.path.clone()).display()
+            ahma_common::config::expand_home(&scope.path).display()
         ),
     }
 }
@@ -648,7 +632,7 @@ fn grant_persistent_read_scope(
     scope: &ahma_common::config::PersistentScope,
     read: &mut Vec<PathBuf>,
 ) {
-    let raw = expand_tilde(scope.path.clone());
+    let raw = ahma_common::config::expand_home(&scope.path);
     match dunce::canonicalize(&raw) {
         Ok(canonical) => {
             if !read.contains(&canonical) {
@@ -2696,13 +2680,13 @@ fn resolve_sandbox_scopes_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) 
     if !cli.sandbox_scopes.is_empty() {
         cli.sandbox_scopes
             .iter()
-            .map(|p| expand_tilde(p.clone()))
+            .map(|p| ahma_common::config::expand_home(p))
             .collect()
     } else {
         s.sandbox
             .scopes
             .iter()
-            .map(|p| expand_tilde(p.clone()))
+            .map(|p| ahma_common::config::expand_home(p))
             .collect()
     }
 }
@@ -2713,13 +2697,13 @@ fn resolve_working_dirs_cli(cli: &Cli, s: &ahma_common::config::AhmaSettings) ->
     if !cli.working_dirs.is_empty() {
         cli.working_dirs
             .iter()
-            .map(|p| expand_tilde(p.clone()))
+            .map(|p| ahma_common::config::expand_home(p))
             .collect()
     } else {
         s.sandbox
             .working_dirs
             .iter()
-            .map(|p| expand_tilde(p.clone()))
+            .map(|p| ahma_common::config::expand_home(p))
             .collect()
     }
 }
@@ -2818,9 +2802,9 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     // one. `--log-dir` still wins (see `project_log_dir`).
     let settings_log_dir = s.logging.dir.trim();
     if !settings_log_dir.is_empty() {
-        crate::utils::logging::set_log_dir_from_settings(expand_tilde(PathBuf::from(
-            settings_log_dir,
-        )));
+        crate::utils::logging::set_log_dir_from_settings(ahma_common::config::expand_home(
+            Path::new(settings_log_dir),
+        ));
     }
 
     // Install the tool-subprocess secret-env passthrough allowlist from
@@ -2924,9 +2908,14 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
             // Security-tier: AHMA_TASK_VAULT retired — warn and ignore.
             warn_retired_security_env!("AHMA_TASK_VAULT");
             cli.task_vault
-                .clone()
-                .map(expand_tilde)
-                .or_else(|| s.sandbox.task_vault.clone().map(expand_tilde))
+                .as_deref()
+                .map(ahma_common::config::expand_home)
+                .or_else(|| {
+                    s.sandbox
+                        .task_vault
+                        .as_deref()
+                        .map(ahma_common::config::expand_home)
+                })
         },
         require_token,
         require_token_path,
@@ -4040,42 +4029,46 @@ mod tests {
         assert_eq!(build_id, None);
     }
 
-    // ─── expand_tilde ────────────────────────────────────────────────────────
+    // ─── expand_home (shared tilde expansion used by the CLI paths) ──────────
 
     #[test]
-    fn test_expand_tilde_bare_tilde_is_home() {
+    fn test_expand_home_bare_tilde_is_home() {
         let home = dirs::home_dir().expect("home dir resolvable in test env");
-        let expanded = expand_tilde(PathBuf::from("~"));
+        let expanded = ahma_common::config::expand_home(Path::new("~"));
         assert_eq!(expanded, home, "bare ~ must expand to the home directory");
     }
 
     #[test]
-    fn test_expand_tilde_with_slash_subpath() {
+    fn test_expand_home_with_slash_subpath() {
         let home = dirs::home_dir().expect("home dir resolvable in test env");
-        let expanded = expand_tilde(PathBuf::from("~/projects/foo"));
+        let expanded = ahma_common::config::expand_home(Path::new("~/projects/foo"));
         assert_eq!(expanded, home.join("projects/foo"));
     }
 
     #[test]
-    fn test_expand_tilde_with_backslash_subpath() {
+    fn test_expand_home_with_backslash_subpath() {
         // The `~\sub` branch is matched by a literal backslash and is pure string
         // logic, so it behaves identically on every platform.
         let home = dirs::home_dir().expect("home dir resolvable in test env");
-        let expanded = expand_tilde(PathBuf::from("~\\sub"));
+        let expanded = ahma_common::config::expand_home(Path::new("~\\sub"));
         assert_eq!(expanded, home.join("sub"));
     }
 
     #[test]
-    fn test_expand_tilde_non_tilde_path_unchanged() {
+    fn test_expand_home_non_tilde_path_unchanged() {
         let p = PathBuf::from("/absolute/no/tilde");
-        assert_eq!(expand_tilde(p.clone()), p, "absolute paths pass through");
+        assert_eq!(
+            ahma_common::config::expand_home(&p),
+            p,
+            "absolute paths pass through"
+        );
     }
 
     #[test]
-    fn test_expand_tilde_tilde_user_not_expanded() {
+    fn test_expand_home_tilde_user_not_expanded() {
         // `~user` (no separator) is NOT a home reference and must pass through.
         let p = PathBuf::from("~someuser/dir");
-        assert_eq!(expand_tilde(p.clone()), p);
+        assert_eq!(ahma_common::config::expand_home(&p), p);
     }
 
     // ─── resolve_persistent_scopes ───────────────────────────────────────────

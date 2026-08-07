@@ -283,7 +283,7 @@ impl AhmaMcpService {
             use crate::egress::web_audit::{self, FetchAction};
             use ahma_common::web_policy::{WebDecision, WebPolicy, url_coordinates};
 
-            let settings = ahma_common::config::AhmaSettings::load();
+            let settings = ahma_common::config::AhmaSettings::load_async().await;
             let (policy, errors) = WebPolicy::from_settings(&settings.web);
             for e in errors {
                 tracing::warn!("ignoring invalid [web] pattern: {e}");
@@ -299,7 +299,8 @@ impl AhmaMcpService {
                 &domain,
                 &decision,
                 ts,
-            ));
+            ))
+            .await;
             // An unknown domain (strict `deny` mode) is offered to the human via an
             // interactive prompt; every other decision maps straight to an action.
             let action = match &decision {

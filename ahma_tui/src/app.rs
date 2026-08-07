@@ -177,6 +177,13 @@ async fn run_ratatui(
     // ── Event loop ───────────────────────────────────────────────────────────
     let mut event_stream = EventStream::new();
 
+    // Upper bound on how many queued source/bridge events one loop iteration
+    // drains before drawing. Batching turns a firehose of per-line output
+    // events (e.g. a chatty build) into one draw per pass instead of one full
+    // widget-tree rebuild per event, while the bound keeps input and tick
+    // handling responsive during a flood.
+    const MAX_EVENT_DRAIN_PER_PASS: usize = 256;
+
     let loop_result: Result<()> = async {
         loop {
             tokio::select! {
@@ -283,6 +290,22 @@ async fn run_ratatui(
                     }
                     update_scroll_animations(&mut state);
                 }
+            }
+
+            // Drain the ready backlog from the event channels before drawing,
+            // so bursts of events cost one draw rather than one draw each.
+            let mut drained = 0usize;
+            while drained < MAX_EVENT_DRAIN_PER_PASS
+                && let Ok(src_event) = mcp_rx.try_recv()
+            {
+                handle_source_event(src_event, &mut state);
+                drained += 1;
+            }
+            while drained < MAX_EVENT_DRAIN_PER_PASS
+                && let Ok(bridge_event) = bridge_rx.try_recv()
+            {
+                handle_bridge_event(bridge_event, &mut state);
+                drained += 1;
             }
 
             terminal.draw(|f| ui::draw(f, &state, &theme))?;

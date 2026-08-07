@@ -257,7 +257,8 @@ fn dispatch_vault(
             Ok(())
         }
         VaultCommand::List => {
-            let home = dirs::home_dir().context("Cannot determine home directory")?;
+            let home =
+                ahma_common::config::ahma_home_dir().context("Cannot determine home directory")?;
             let tasks_dir = home.join(".ahma").join("tasks");
             if !tasks_dir.exists() {
                 println!("No vaults found ({})", tasks_dir.display());
@@ -437,7 +438,7 @@ async fn dispatch_llm(args: ahma_mcp::shell::LlmArgs) -> Result<()> {
 /// Path to the static peers file.
 #[cfg(feature = "cluster")]
 fn peers_path() -> Result<std::path::PathBuf> {
-    dirs::home_dir()
+    ahma_common::config::ahma_home_dir()
         .context("Cannot determine home directory for ~/.ahma/cluster/peers.json")
         .map(|h| h.join(".ahma").join("cluster").join("peers.json"))
 }
@@ -649,11 +650,7 @@ async fn dispatch_cluster(
         }
 
         ClusterCommand::Announce(ann_args) => {
-            let id = ann_args.id.unwrap_or_else(|| {
-                std::env::var("HOSTNAME")
-                    .or_else(|_| std::env::var("COMPUTERNAME"))
-                    .unwrap_or_else(|_| "ahma-worker".to_owned())
-            });
+            let id = ann_args.id.unwrap_or_else(ahma_common::hostname::hostname);
             let models: Vec<String> = ann_args
                 .models
                 .into_iter()
@@ -680,8 +677,8 @@ fn dispatch_cert(cmd: ahma_mcp::shell::CertCommand) -> Result<()> {
     match cmd {
         CertCommand::Init { out_dir } => {
             let out_path = if out_dir.starts_with('~') {
-                let home =
-                    dirs::home_dir().context("Cannot determine home directory for cert init")?;
+                let home = ahma_common::config::ahma_home_dir()
+                    .context("Cannot determine home directory for cert init")?;
                 home.join(&out_dir[2..])
             } else {
                 std::path::PathBuf::from(&out_dir)

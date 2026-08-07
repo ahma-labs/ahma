@@ -144,7 +144,8 @@ impl TaskVault {
     }
 
     fn vault_base_dir() -> Result<PathBuf> {
-        let home = dirs::home_dir().context("Cannot determine home directory for vault storage")?;
+        let home = ahma_common::config::ahma_home_dir()
+            .context("Cannot determine home directory for vault storage")?;
         let base = home.join(".ahma").join("tasks");
         std::fs::create_dir_all(&base)
             .with_context(|| format!("Failed to create vault base dir: {}", base.display()))?;

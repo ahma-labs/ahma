@@ -1,5 +1,6 @@
 use crate::error::BridgeError;
 use crate::session::{McpRoot, SessionManager, request_timeout_secs, tool_call_timeout_secs};
+use ahma_common::timeouts::BRIDGE_TOOL_CALL_CEILING_SECS;
 use axum::{
     body::Body,
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -1000,14 +1001,15 @@ async fn forward_request(
 
 /// Bridge wait budget for the `await` meta-tool.
 ///
-/// `await` blocks in-process for up to its own ceiling — `DEFAULT_AWAIT_TIMEOUT`
-/// in `ahma_mcp::mcp_service::handlers::await_tool` (600s), capped by the same
-/// 600s ceiling that `calculate_tool_timeout` applies to operations — and then
-/// returns a graceful "still running" result. The bridge must grant it a
-/// strictly larger budget so the in-process path fires first; otherwise the
-/// bridge guillotines the call and (before the recoverable-timeout fix) tore the
-/// whole MCP session down. The +60s margin covers scheduling/IO slack.
-const AWAIT_TOOL_BRIDGE_TIMEOUT_SECS: u64 = 660;
+/// `await` blocks in-process for up to its own ceiling — the configurable await
+/// timeout (default `ahma_common::config::DEFAULT_AWAIT_TIMEOUT_SECS` = 540s),
+/// capped by the same [`BRIDGE_TOOL_CALL_CEILING_SECS`] that
+/// `calculate_tool_timeout` applies to operations — and then returns a graceful
+/// "still running" result. The bridge must grant it a strictly larger budget so
+/// the in-process path fires first; otherwise the bridge guillotines the call
+/// and (before the recoverable-timeout fix) tore the whole MCP session down.
+/// The +60s margin covers scheduling/IO slack.
+const AWAIT_TOOL_BRIDGE_TIMEOUT_SECS: u64 = BRIDGE_TOOL_CALL_CEILING_SECS + 60;
 
 fn calculate_tool_timeout(payload: &Value) -> Duration {
     let tool_name = payload
@@ -1029,7 +1031,7 @@ fn calculate_tool_timeout(payload: &Value) -> Duration {
 
     let default_secs = tool_call_timeout_secs();
     let effective_secs = arg_timeout_secs
-        .map(|v| v.min(600)) // Cap at 10 minutes
+        .map(|v| v.min(BRIDGE_TOOL_CALL_CEILING_SECS))
         .unwrap_or(default_secs);
 
     Duration::from_secs(effective_secs)

@@ -501,7 +501,7 @@ pub fn default_socket_path() -> PathBuf {
             return dir.join("daemon.sock");
         }
         // Fall back to ~/.ahma/daemon.sock (macOS + Linux without XDG).
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = crate::config::ahma_home_dir() {
             let dir = home.join(".ahma");
             let _ = std::fs::create_dir_all(&dir);
             return dir.join("daemon.sock");

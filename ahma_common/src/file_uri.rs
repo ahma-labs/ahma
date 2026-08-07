@@ -264,6 +264,11 @@ mod tests {
         assert_eq!(percent_decode_utf8("a%2Fb"), Some("a/b".into()));
     }
 
+    #[test]
+    fn decode_empty_string() {
+        assert_eq!(percent_decode_utf8(""), Some("".into()));
+    }
+
     // ── parse_file_uri_to_path (Unix) ───────────────────────────────────────
 
     #[test]
@@ -299,6 +304,21 @@ mod tests {
     fn uri_relative_rejected() {
         // file://relative/path — no leading slash after stripping authority
         assert_eq!(parse_file_uri_to_path("file://relative/path"), None);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn uri_localhost_prefix_host_rejected() {
+        // A host that merely starts with "localhost" is not the localhost form.
+        assert_eq!(parse_file_uri_to_path("file://localhostnotabs"), None);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn uri_localhost_decodes_and_strips_query_fragment() {
+        let p =
+            parse_file_uri_to_path("file://localhost/Users/test/My%20Project/file.txt?x=1#frag");
+        assert_eq!(p, Some(PathBuf::from("/Users/test/My Project/file.txt")));
     }
 
     #[test]

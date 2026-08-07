@@ -410,15 +410,16 @@ pub fn spawn_window_cli_task(
     tx: Sender<BridgeEvent>,
 ) {
     tokio::spawn(async move {
-        let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = tokio::process::Command::new("powershell");
-            c.arg("-NoProfile").arg("-Command").arg(&command_str);
-            c
+        // Shell selection goes through the cross-crate chokepoint
+        // (`platform_shell_program`, see AGENTS.md); only the one-shot flags
+        // are chosen here.
+        let shell = ahma_mcp::shell_pool::platform_shell_program();
+        let mut cmd = tokio::process::Command::new(shell);
+        if cfg!(target_os = "windows") {
+            cmd.arg("-NoProfile").arg("-Command").arg(&command_str);
         } else {
-            let mut c = tokio::process::Command::new("bash");
-            c.arg("-c").arg(&command_str);
-            c
-        };
+            cmd.arg("-c").arg(&command_str);
+        }
         cmd.current_dir(&working_dir);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());

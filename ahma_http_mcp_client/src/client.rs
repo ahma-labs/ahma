@@ -62,7 +62,6 @@ pub struct HttpMcpTransport {
     mcp_url: Url,
 
     auth_state: Arc<StateMachine<AuthState>>,
-    #[allow(dead_code)] // Will be used for token refresh
     oauth_client: Option<ConfiguredOAuthClient>,
     receiver: Arc<Mutex<mpsc::Receiver<RxJsonRpcMessage<RoleClient>>>>,
     sender: mpsc::Sender<RxJsonRpcMessage<RoleClient>>,
@@ -160,7 +159,6 @@ impl HttpMcpTransport {
     ///    and save it locally.
     ///
     /// If no OAuth2 client is configured, this returns an error if no token is present.
-    #[allow(dead_code)] // Will be used when HTTP client is integrated
     pub async fn ensure_authenticated(&self) -> Result<()> {
         loop {
             enum Action {
@@ -220,7 +218,6 @@ impl HttpMcpTransport {
         }
     }
 
-    #[allow(dead_code)] // Will be used when HTTP client is integrated
     async fn perform_oauth_flow(
         &self,
         oauth_client: &ConfiguredOAuthClient,
@@ -289,7 +286,6 @@ impl HttpMcpTransport {
         Ok(stored_token)
     }
 
-    #[allow(dead_code)] // Will be used when HTTP client is integrated
     async fn listen_for_callback_async(&self) -> Result<(String, CsrfToken)> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
         info!("Listening on http://127.0.0.1:8080 for OAuth callback.");
@@ -459,7 +455,7 @@ fn token_file_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os(TOKEN_PATH_ENV) {
         return Ok(PathBuf::from(path));
     }
-    let home = dirs::home_dir()
+    let home = ahma_common::config::ahma_home_dir()
         .ok_or_else(|| McpHttpError::Custom("Could not determine home directory".to_string()))?;
     Ok(home.join(".ahma").join(TOKEN_FILE_NAME))
 }
@@ -545,7 +541,7 @@ mod tests {
 
         let path = token_file_path().unwrap();
         assert!(path.ends_with(TOKEN_FILE_NAME));
-        assert!(path.starts_with(dirs::home_dir().unwrap().join(".ahma")));
+        assert!(path.starts_with(ahma_common::config::ahma_home_dir().unwrap().join(".ahma")));
     }
 
     #[test]

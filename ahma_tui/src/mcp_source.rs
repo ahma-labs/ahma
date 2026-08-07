@@ -231,13 +231,7 @@ async fn mcp_source_task(
                         // 5-second SSE-drop grace period, allowing the auto-spawned bridge to
                         // idle-exit promptly once no client is connected.
                         if let Some(ref session) = mcp_state {
-                            let mcp_url = format!("{request_base_url}/mcp");
-                            let _ = client
-                                .delete(&mcp_url)
-                                .header("mcp-session-id", session.id())
-                                .timeout(Duration::from_secs(2))
-                                .send()
-                                .await;
+                            delete_mcp_session(&client, &request_base_url, session.id()).await;
                         }
                         break;
                     }
@@ -303,17 +297,10 @@ async fn mcp_source_task(
                         Err(e) => {
                             send(&tx, SourceEvent::SandboxStatus { status: "FAILED".to_string() }).await;
                             init_fail_count = init_fail_count.saturating_add(1);
-                            // Exponential backoff capped at 60 s: 1 → 3 → 8 → 20 → 60
-                            let backoff_secs: u64 = match init_fail_count {
-                                1 => 1,
-                                2 => 3,
-                                3 => 8,
-                                4 => 20,
-                                _ => 60,
-                            };
-                            debug!("MCP init failed (attempt {init_fail_count}, retry in {backoff_secs}s): {e:#}");
+                            let backoff = backoff_secs(init_fail_count);
+                            debug!("MCP init failed (attempt {init_fail_count}, retry in {backoff}s): {e:#}");
                             next_init_attempt = tokio::time::Instant::now()
-                                + tokio::time::Duration::from_secs(backoff_secs);
+                                + tokio::time::Duration::from_secs(backoff);
                         }
                     }
                 }
@@ -346,26 +333,13 @@ async fn mcp_source_task(
                             // while it stays alive server-side, and repeated hiccups can pile
                             // up enough orphaned sessions to blow through the server's
                             // concurrent-session cap.
-                            let mcp_url = format!("{request_base_url}/mcp");
-                            let _ = client
-                                .delete(&mcp_url)
-                                .header("mcp-session-id", session.id())
-                                .timeout(Duration::from_secs(2))
-                                .send()
-                                .await;
+                            delete_mcp_session(&client, &request_base_url, session.id()).await;
                             mcp_state = None;
                             // Same backoff as init failures — a run of status hiccups
                             // must not re-init every 3-10s and keep growing the pile.
                             init_fail_count = init_fail_count.saturating_add(1);
-                            let backoff_secs: u64 = match init_fail_count {
-                                1 => 1,
-                                2 => 3,
-                                3 => 8,
-                                4 => 20,
-                                _ => 60,
-                            };
                             next_init_attempt = tokio::time::Instant::now()
-                                + tokio::time::Duration::from_secs(backoff_secs);
+                                + tokio::time::Duration::from_secs(backoff_secs(init_fail_count));
                             // Clear the session id in the UI so it doesn't use the dead id for tool calls.
                             send(&tx, SourceEvent::SessionId { id: String::new() }).await;
                         }
@@ -812,27 +786,90 @@ async fn run_sse_listener(
 
 // ─── Tool calls ───────────────────────────────────────────────────────────────
 
-async fn call_tools_list(
+/// POST one JSON-RPC request to the bridge's `/mcp` endpoint with the shared
+/// session headers, returning the raw HTTP response for the caller to inspect.
+async fn post_json_rpc(
     client: &reqwest::Client,
     base_url: &str,
     session: &McpSession,
-) -> Result<Vec<crate::mcp_connections::ToolInfo>> {
+    method: &str,
+    params: Value,
+) -> Result<reqwest::Response> {
     let url = format!("{base_url}/mcp");
     let req_id = session.next_req_id();
     let body = json!({
         "jsonrpc": "2.0",
         "id": req_id,
-        "method": "tools/list",
-        "params": {}
+        "method": method,
+        "params": params
     });
 
-    let resp = client
+    Ok(client
         .post(&url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json")
         .header("mcp-session-id", &session.id)
         .json(&body)
         .send()
+        .await?)
+}
+
+/// Invoke an MCP tool via `tools/call`, decode the JSON-RPC response, and turn
+/// a JSON-RPC `error` object into an `Err` tagged with the tool name.
+async fn call_tool_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    session: &McpSession,
+    tool: &str,
+    args: Value,
+) -> Result<Value> {
+    let params = json!({ "name": tool, "arguments": args });
+    let resp = post_json_rpc(client, base_url, session, "tools/call", params)
+        .await?
+        .json::<Value>()
+        .await?;
+
+    if let Some(err) = resp.get("error") {
+        let err_msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        return Err(anyhow::anyhow!("{tool} error: {err_msg}"));
+    }
+
+    Ok(resp)
+}
+
+/// Best-effort `DELETE /mcp` so the bridge frees the session immediately
+/// instead of waiting for its idle/SSE-drop grace period.
+async fn delete_mcp_session(client: &reqwest::Client, base_url: &str, session_id: &str) {
+    let mcp_url = format!("{base_url}/mcp");
+    let _ = client
+        .delete(&mcp_url)
+        .header("mcp-session-id", session_id)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await;
+}
+
+/// Exponential backoff after consecutive MCP session failures, capped at 60 s:
+/// 1 → 3 → 8 → 20 → 60.
+fn backoff_secs(fail_count: u32) -> u64 {
+    match fail_count {
+        1 => 1,
+        2 => 3,
+        3 => 8,
+        4 => 20,
+        _ => 60,
+    }
+}
+
+async fn call_tools_list(
+    client: &reqwest::Client,
+    base_url: &str,
+    session: &McpSession,
+) -> Result<Vec<crate::mcp_connections::ToolInfo>> {
+    let resp = post_json_rpc(client, base_url, session, "tools/list", json!({}))
         .await?
         .json::<Value>()
         .await?;
@@ -894,23 +931,8 @@ async fn call_status(
     base_url: &str,
     session: &McpSession,
 ) -> Result<StatusPoll> {
-    let url = format!("{base_url}/mcp");
-    let req_id = session.next_req_id();
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": "tools/call",
-        "params": { "name": "status", "arguments": {} }
-    });
-
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("mcp-session-id", &session.id)
-        .json(&body)
-        .send()
-        .await?;
+    let params = json!({ "name": "status", "arguments": {} });
+    let resp = post_json_rpc(client, base_url, session, "tools/call", params).await?;
 
     if resp.status() == reqwest::StatusCode::CONFLICT {
         // Transient: sandbox still locking. Keep the session and retry.
@@ -919,7 +941,7 @@ async fn call_status(
 
     if !resp.status().is_success() {
         let s = resp.status();
-        return Err(status_call_error(&url, s));
+        return Err(status_call_error(&format!("{base_url}/mcp"), s));
     }
 
     let val = resp.json::<Value>().await?;
@@ -1082,36 +1104,7 @@ async fn call_logs_list(
     base_url: &str,
     session: &McpSession,
 ) -> Result<Vec<LogFileInfo>> {
-    let url = format!("{base_url}/mcp");
-    let req_id = session.next_req_id();
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": "tools/call",
-        "params": {
-            "name": "logs_list",
-            "arguments": {}
-        }
-    });
-
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("mcp-session-id", &session.id)
-        .json(&body)
-        .send()
-        .await?
-        .json::<Value>()
-        .await?;
-
-    if let Some(err) = resp.get("error") {
-        let err_msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error");
-        return Err(anyhow::anyhow!("logs_list error: {err_msg}"));
-    }
+    let resp = call_tool_json(client, base_url, session, "logs_list", json!({})).await?;
 
     let content_text = resp
         .pointer("/result/content/0/text")
@@ -1130,40 +1123,12 @@ async fn call_logs_read(
     offset: usize,
     limit: usize,
 ) -> Result<String> {
-    let url = format!("{base_url}/mcp");
-    let req_id = session.next_req_id();
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": "tools/call",
-        "params": {
-            "name": "logs_read",
-            "arguments": {
-                "file": file_name,
-                "offset": offset,
-                "limit": limit
-            }
-        }
+    let args = json!({
+        "file": file_name,
+        "offset": offset,
+        "limit": limit
     });
-
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .header("mcp-session-id", &session.id)
-        .json(&body)
-        .send()
-        .await?
-        .json::<Value>()
-        .await?;
-
-    if let Some(err) = resp.get("error") {
-        let err_msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error");
-        return Err(anyhow::anyhow!("logs_read error: {err_msg}"));
-    }
+    let resp = call_tool_json(client, base_url, session, "logs_read", args).await?;
 
     let text = resp
         .pointer("/result/content/0/text")

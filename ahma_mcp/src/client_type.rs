@@ -464,10 +464,11 @@ mod tests {
                 "{} budget {budget:?} is too small for any real command",
                 client.display_name()
             );
-            // The HTTP bridge guillotines a tools/call at 600s, so a budget
-            // above that would promise something the transport cannot keep.
+            // The HTTP bridge guillotines a tools/call at its ceiling, so a
+            // budget above that would promise something the transport cannot
+            // keep.
             assert!(
-                budget <= Duration::from_secs(600),
+                budget <= Duration::from_secs(ahma_common::timeouts::BRIDGE_TOOL_CALL_CEILING_SECS),
                 "{} budget {budget:?} exceeds the bridge's tools/call ceiling",
                 client.display_name()
             );

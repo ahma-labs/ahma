@@ -9,7 +9,7 @@ use ahma_common::event_dispatcher::{EventDispatcher, OperationEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -122,9 +122,11 @@ pub struct Operation {
     /// Not serialised — only meaningful for live operations held in OperationMonitor.
     #[serde(skip, default = "default_completion_watch")]
     pub completion_watch: Arc<watch::Sender<bool>>,
-    /// Tail of stdout/stderr lines for this operation (max 100)
+    /// Tail of stdout/stderr lines for this operation (max 100).
+    /// A `VecDeque` so evicting the oldest line is O(1); serializes as a JSON
+    /// array exactly like a `Vec`.
     #[serde(default)]
-    pub stdout_tail: Vec<String>,
+    pub stdout_tail: VecDeque<String>,
     /// Any warnings/errors detected for this operation
     #[serde(default)]
     pub alerts: Vec<String>,
@@ -167,7 +169,7 @@ impl Operation {
             timeout_duration: None,
             cancellation_token: CancellationToken::new(),
             completion_watch: Arc::new(watch::channel(false).0),
-            stdout_tail: Vec::new(),
+            stdout_tail: VecDeque::new(),
             alerts: Vec::new(),
             output_file: None,
             last_activity: SystemTime::now(),
@@ -198,7 +200,7 @@ impl Operation {
             timeout_duration: timeout,
             cancellation_token: CancellationToken::new(),
             completion_watch: Arc::new(watch::channel(false).0),
-            stdout_tail: Vec::new(),
+            stdout_tail: VecDeque::new(),
             alerts: Vec::new(),
             output_file: None,
             last_activity: SystemTime::now(),
@@ -354,7 +356,6 @@ fn log_progress_warnings(progress_percent: u8, remaining_secs: i64, warnings_sen
 pub struct OperationMonitor {
     operations: Arc<RwLock<HashMap<String, Operation>>>,
     completion_history: Arc<RwLock<HashMap<String, Operation>>>,
-    #[allow(dead_code)]
     config: MonitorConfig,
     /// Unified event stream (SPEC R15).  The monitor is the single emitter of
     /// operation lifecycle events: `Started` on insert, `OutputLine`/`Alert`
@@ -422,9 +423,9 @@ impl OperationMonitor {
         let mut ops = self.operations.write().await;
         if let Some(op) = ops.get_mut(id) {
             if op.stdout_tail.len() >= 100 {
-                op.stdout_tail.remove(0);
+                op.stdout_tail.pop_front();
             }
-            op.stdout_tail.push(line.clone());
+            op.stdout_tail.push_back(line.clone());
             // Output is proof of life: reset the idle-output watchdog clock.
             op.last_activity = SystemTime::now();
         } else {

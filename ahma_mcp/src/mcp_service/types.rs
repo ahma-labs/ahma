@@ -65,12 +65,11 @@ use crate::config::ToolConfig;
 /// Used by the unified sequence execution logic to handle differences in
 /// tool/config lookup and message formatting.
 #[derive(Clone)]
-pub enum SequenceKind<'a> {
+pub enum SequenceKind {
     /// Top-level sequence: each step specifies a different tool (e.g., `test_sequence`)
     TopLevel,
     /// Subcommand sequence: all steps use the same base tool config (e.g., `cargo qualitycheck`)
-    #[allow(dead_code)] // base_config reserved for future use
-    Subcommand { base_config: &'a ToolConfig },
+    Subcommand,
 }
 
 /// Represents the structure of the guidance JSON file.

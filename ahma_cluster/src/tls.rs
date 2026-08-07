@@ -51,9 +51,7 @@ pub fn generate_self_signed_cluster_certs(out_dir: &Path) -> Result<()> {
 
     // Leaf key + certificate signed by the CA
     let leaf_key = KeyPair::generate().context("Failed to generate leaf key pair")?;
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "ahma-worker".to_owned());
+    let hostname = ahma_common::hostname::hostname();
 
     let mut leaf_params = CertificateParams::default();
     leaf_params.subject_alt_names.push(SanType::DnsName(

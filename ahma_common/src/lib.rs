@@ -49,6 +49,7 @@ pub mod event_dispatcher;
 pub mod file_uri;
 pub mod fs_lock;
 pub mod hook_consent;
+pub mod hostname;
 pub mod keepalive;
 pub mod local_tls;
 pub mod net_approval;

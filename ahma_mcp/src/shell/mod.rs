@@ -22,8 +22,8 @@ pub mod resolution;
 // Re-export commonly used types
 pub use list_tools::{
     McpConfig, OutputFormat, ParameterOutput, ServerConfig, ServerInfoOutput, ToolListResult,
-    ToolOutput, expand_home, extract_parameters_from_json, list_tools_from_config, list_tools_http,
-    list_tools_stdio_with_env, parse_mcp_config, print_json_output, print_text_output,
+    ToolOutput, expand_home, list_tools_from_config, list_tools_http, list_tools_stdio_with_env,
+    parse_mcp_config, print_json_output, print_text_output,
 };
 
 pub use cli::{

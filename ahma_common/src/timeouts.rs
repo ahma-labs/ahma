@@ -178,6 +178,19 @@ pub const WINDOWS_CI_MULTIPLIER: u64 = 4;
 /// Both spawn sites reference this constant so they always agree on the default.
 pub const AUTO_SPAWNED_BRIDGE_IDLE_TIMEOUT_SECS: u64 = 10;
 
+/// Hard ceiling (seconds) the HTTP bridge applies to a single `tools/call`.
+///
+/// The relationship this constant pins down: the in-process `await` tool bounds
+/// itself by the configurable await timeout (default
+/// [`crate::config::DEFAULT_AWAIT_TIMEOUT_SECS`] = 540s) and returns a graceful
+/// "still running" result, and a caller-supplied `timeout_seconds` is capped at
+/// this ceiling — so the bridge's own budget for the `await` call must sit
+/// *strictly above* it (ceiling + margin) for the graceful in-process path to
+/// fire before the bridge guillotines the HTTP request. Client request budgets
+/// must not exceed it either: a budget above the ceiling promises something the
+/// transport cannot keep.
+pub const BRIDGE_TOOL_CALL_CEILING_SECS: u64 = 600;
+
 /// Deadline (seconds) for the IDE-facing `ahma serve stdio` frontend to observe
 /// the client's MCP handshake (the first stdin message, i.e. `initialize`).
 ///

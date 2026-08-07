@@ -249,6 +249,9 @@ pub fn grep_search(
         .map(|p| glob::Pattern::new(p).with_context(|| format!("Invalid includePattern: {p}")))
         .transpose()?;
 
+    // Lowercased once here rather than per line scanned.
+    let query_lower = query.to_lowercase();
+
     let mut matches = Vec::new();
 
     for entry in WalkDir::new(&safe_base).into_iter().flatten() {
@@ -273,7 +276,7 @@ pub fn grep_search(
             let hit = if let Some(r) = &regex {
                 r.is_match(line)
             } else {
-                line.to_lowercase().contains(&query.to_lowercase())
+                line.to_lowercase().contains(&query_lower)
             };
 
             if hit {

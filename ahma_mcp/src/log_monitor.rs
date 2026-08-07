@@ -34,6 +34,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::OnceLock;
@@ -99,19 +100,47 @@ fn redaction_rules() -> &'static Vec<(Regex, &'static str)> {
     })
 }
 
-/// Redact common secret/token patterns from a single output line.
-pub fn redact_sensitive_line(line: &str) -> String {
-    let mut redacted = line.to_owned();
+/// Prefilter over all redaction rules: one combined scan decides whether a
+/// line needs redaction at all, so the common clean line costs a single
+/// `RegexSet` pass and zero allocations.
+fn redaction_prefilter() -> &'static RegexSet {
+    static SET: OnceLock<RegexSet> = OnceLock::new();
+    SET.get_or_init(|| {
+        RegexSet::new(
+            redaction_rules()
+                .iter()
+                .map(|(pattern, _)| pattern.as_str()),
+        )
+        .expect("redaction prefilter set must compile")
+    })
+}
+
+/// Cow-returning core of [`redact_sensitive_line`]: borrows the input when no
+/// rule matches, and only allocates when a replacement actually fires.
+fn redact_line_cow(line: &str) -> Cow<'_, str> {
+    if !redaction_prefilter().is_match(line) {
+        return Cow::Borrowed(line);
+    }
+    // Something matched: run every rule in order (a rule's replacement text can
+    // interact with later rules), allocating only when a rule rewrites.
+    let mut redacted = Cow::Borrowed(line);
     for (pattern, replacement) in redaction_rules() {
-        redacted = pattern.replace_all(&redacted, *replacement).into_owned();
+        if let Cow::Owned(rewritten) = pattern.replace_all(&redacted, *replacement) {
+            redacted = Cow::Owned(rewritten);
+        }
     }
     redacted
+}
+
+/// Redact common secret/token patterns from a single output line.
+pub fn redact_sensitive_line(line: &str) -> String {
+    redact_line_cow(line).into_owned()
 }
 
 /// Redact common secret/token patterns from multi-line output.
 pub fn redact_sensitive_text(text: &str) -> String {
     text.split('\n')
-        .map(redact_sensitive_line)
+        .map(redact_line_cow)
         .collect::<Vec<_>>()
         .join("\n")
 }

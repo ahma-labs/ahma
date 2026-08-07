@@ -172,6 +172,9 @@ pub struct Session {
     broadcast_tx: broadcast::Sender<(u64, String)>,
     /// Whether the session has been terminated
     terminated: AtomicBool,
+    /// Wakes the I/O task's termination branch when `terminated` flips to true,
+    /// so it does not have to poll the flag.
+    terminated_notify: Notify,
     /// Termination reason (if terminated)
     termination_reason: Mutex<Option<SessionTerminationReason>>,
     /// Async cleanup hook invoked on explicit session termination.
@@ -237,9 +240,12 @@ impl Session {
         self.terminated.load(Ordering::SeqCst)
     }
 
-    /// Set the terminated status of the session. Primarily for testing.
+    /// Set the terminated status of the session.
     pub fn set_terminated(&self, terminated: bool) {
         self.terminated.store(terminated, Ordering::SeqCst);
+        if terminated {
+            self.terminated_notify.notify_waiters();
+        }
     }
 
     /// Check if the sandbox is fully configured and active.
@@ -1095,6 +1101,7 @@ impl SessionManager {
             pending_requests: pending_requests.clone(),
             broadcast_tx: broadcast_tx.clone(),
             terminated: AtomicBool::new(false),
+            terminated_notify: Notify::new(),
             termination_reason: Mutex::new(None),
             peer_shutdown: Mutex::new(shutdown_fn),
             exit_cause: Mutex::new(exit_cause),
@@ -1384,7 +1391,7 @@ impl SessionManager {
                 "Terminating session"
             );
 
-            session.terminated.store(true, Ordering::SeqCst);
+            session.set_terminated(true);
             *session.termination_reason.lock().await = Some(reason);
 
             // Answer in-flight requests FIRST.
@@ -1562,10 +1569,16 @@ impl SessionManager {
                     }
                 }
 
-                // Check for termination
+                // Wake on termination. The `Notified` future is created before
+                // the flag check so a `notify_waiters` racing this branch is
+                // observed by the subsequent await rather than missed.
                 _ = async {
-                    while !session.terminated.load(Ordering::SeqCst) {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    loop {
+                        let notified = session.terminated_notify.notified();
+                        if session.terminated.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        notified.await;
                     }
                 } => {
                     info!(session_id = %session.id, "Session terminated, stopping I/O handler");
@@ -1575,7 +1588,7 @@ impl SessionManager {
         }
 
         // Mark session as terminated if not already
-        session.terminated.store(true, Ordering::SeqCst);
+        session.set_terminated(true);
 
         // Send explicit error responses to all pending requests before clearing.
         // This prevents "Response channel closed" errors that manifest as cryptic
@@ -1707,6 +1720,7 @@ mod session_logic_tests {
             pending_requests: Arc::new(DashMap::new()),
             broadcast_tx,
             terminated: AtomicBool::new(false),
+            terminated_notify: Notify::new(),
             termination_reason: Mutex::new(None),
             peer_shutdown: Mutex::new(None),
             exit_cause: Mutex::new(None),
