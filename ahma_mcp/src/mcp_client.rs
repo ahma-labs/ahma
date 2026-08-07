@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::harness_target::{McpConfigFormat, PLATFORMS};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpServerKind {
@@ -339,55 +341,25 @@ fn config_path(cwd: &Path) -> PathBuf {
     cwd.join(".ahma").join("mcp-clients.toml")
 }
 
+/// Collect MCP servers already configured in the user's AI harnesses.
+///
+/// Driven by the same [`PLATFORMS`] table setup writes to and uninstall removes
+/// from, so a harness added there is discovered here for free. Codex is skipped:
+/// its config is TOML, and this reader only understands the JSON shape.
 pub fn discover_ide_servers() -> Vec<McpServerConfig> {
     let mut results = Vec::new();
 
-    let home = match home_dir() {
-        Some(h) => h,
-        None => return results,
+    let Some(home) = ahma_common::config::ahma_home_dir() else {
+        return results;
     };
 
-    let cursor_path = home.join(".cursor").join("mcp.json");
-    parse_ide_mcp_json(&cursor_path, &mut results);
-
-    #[cfg(target_os = "macos")]
-    {
-        let vscode_path = home
-            .join("Library")
-            .join("Application Support")
-            .join("Code")
-            .join("User")
-            .join("mcp.json");
-        parse_ide_mcp_json(&vscode_path, &mut results);
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let vscode_path = home
-            .join(".config")
-            .join("Code")
-            .join("User")
-            .join("mcp.json");
-        parse_ide_mcp_json(&vscode_path, &mut results);
-    }
-
-    #[cfg(windows)]
-    {
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            let vscode_path = std::path::PathBuf::from(appdata)
-                .join("Code")
-                .join("User")
-                .join("mcp.json");
-            parse_ide_mcp_json(&vscode_path, &mut results);
+    for platform in PLATFORMS.iter().copied() {
+        if let Some((path, McpConfigFormat::Json(_))) = platform.mcp_config(&home) {
+            parse_ide_mcp_json(&path, &mut results);
         }
     }
 
     results
-}
-
-fn home_dir() -> Option<PathBuf> {
-    #[allow(deprecated)]
-    std::env::home_dir()
 }
 
 fn parse_ide_mcp_json(path: &Path, out: &mut Vec<McpServerConfig>) {
@@ -792,6 +764,7 @@ mod tests {
         _lock: MutexGuard<'static, ()>,
         prev_home: Option<std::ffi::OsString>,
         prev_userprofile: Option<std::ffi::OsString>,
+        prev_ahma_test_home: Option<std::ffi::OsString>,
     }
 
     impl HomeGuard {
@@ -799,15 +772,20 @@ mod tests {
             let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             let prev_home = std::env::var_os("HOME");
             let prev_userprofile = std::env::var_os("USERPROFILE");
+            let prev_ahma_test_home = std::env::var_os("AHMA_TEST_HOME");
             // SAFETY: env mutation is serialized by ENV_MUTEX held in `lock`.
             unsafe {
                 std::env::set_var("HOME", path);
                 std::env::set_var("USERPROFILE", path);
+                // `dirs::home_dir()` ignores HOME/USERPROFILE on Windows, so the
+                // explicit override is the only seam that redirects it there.
+                std::env::set_var("AHMA_TEST_HOME", path);
             }
             Self {
                 _lock: lock,
                 prev_home,
                 prev_userprofile,
+                prev_ahma_test_home,
             }
         }
     }
@@ -823,6 +801,10 @@ mod tests {
                 match &self.prev_userprofile {
                     Some(v) => std::env::set_var("USERPROFILE", v),
                     None => std::env::remove_var("USERPROFILE"),
+                }
+                match &self.prev_ahma_test_home {
+                    Some(v) => std::env::set_var("AHMA_TEST_HOME", v),
+                    None => std::env::remove_var("AHMA_TEST_HOME"),
                 }
             }
         }

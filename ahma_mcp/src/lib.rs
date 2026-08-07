@@ -126,6 +126,9 @@ pub mod daemon_reporter;
 /// File operations provider.
 pub mod file_ops;
 /// External terminal hook management for supported AI tools.
+/// The AI harnesses ahma can configure, and the facts that describe each.
+pub mod harness_target;
+
 pub mod hooks;
 /// Live log monitoring pipeline (LLM-powered issue detection).
 pub mod livelog;

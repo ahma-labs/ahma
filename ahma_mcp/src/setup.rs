@@ -7,7 +7,8 @@ use serde_json::json;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use crate::hooks::{HookPlatform, HookScope, HooksInstallArgs};
+use crate::harness_target::{McpConfigFormat, PLATFORMS, Platform};
+use crate::hooks::{HookScope, HooksInstallArgs};
 use crate::shell::cli::SetupArgs;
 
 /// The embedded skill content to install globally.
@@ -63,126 +64,43 @@ impl SetupAction {
     }
 }
 
-/// An AI tool the wizard can target. Listed in alphabetical order (by label)
-/// for uniform, simple presentation. Not every platform supports every action:
-/// GitHub Copilot has no MCP config target here; VS Code, Claude Desktop, and
-/// LM Studio are configured via MCP only (no terminal hook wrapper).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Platform {
-    Antigravity,
-    ClaudeCode,
-    ClaudeDesktop,
-    Codex,
-    Cursor,
-    Copilot,
-    LmStudio,
-    VsCode,
-}
+/// Apply MCP server configuration for one platform. Returns the display name on
+/// success, or `None` if the platform has no MCP config target.
+///
+/// Where the config lives and how it is encoded are facts about the harness and
+/// live on [`Platform`]; this function only decides *which entry* to write, which
+/// is genuinely setup's business.
+fn configure_mcp(
+    platform: Platform,
+    transport: &str,
+    servers_entry: &serde_json::Value,
+    scoped_servers_entry: &serde_json::Value,
+    home: &Path,
+) -> Result<Option<&'static str>> {
+    let Some((path, format)) = platform.mcp_config(home) else {
+        return Ok(None);
+    };
 
-const PLATFORMS: &[Platform] = &[
-    Platform::Antigravity,
-    Platform::ClaudeCode,
-    Platform::ClaudeDesktop,
-    Platform::Codex,
-    Platform::Cursor,
-    Platform::Copilot,
-    Platform::LmStudio,
-    Platform::VsCode,
-];
-
-impl Platform {
-    fn label(self) -> &'static str {
-        match self {
-            Platform::Antigravity => "Antigravity",
-            Platform::ClaudeCode => "Claude Code",
-            Platform::ClaudeDesktop => "Claude Desktop",
-            Platform::Codex => "Codex",
-            Platform::Cursor => "Cursor",
-            Platform::Copilot => "GitHub Copilot CLI",
-            Platform::LmStudio => "LM Studio",
-            Platform::VsCode => "VS Code (GitHub Copilot Chat)",
+    match format {
+        McpConfigFormat::Toml => {
+            merge_codex_toml(&path, build_codex_toml_value(transport))?;
+        }
+        McpConfigFormat::Json(servers_key) => {
+            let entry = if platform == Platform::ClaudeDesktop {
+                // Claude Desktop's entry omits the `"type"` wrapper field.
+                build_claude_desktop_mcp_entry(transport, home)
+            } else if platform.sends_roots_list() {
+                servers_entry.clone()
+            } else {
+                // No roots/list means ahma cannot discover the workspace, so the
+                // entry has to carry the scope explicitly.
+                scoped_servers_entry.clone()
+            };
+            merge_mcp_json(&path, servers_key, entry)?;
         }
     }
 
-    fn supports_mcp(self) -> bool {
-        !matches!(self, Platform::Copilot)
-    }
-
-    fn supports_hooks(self) -> bool {
-        !matches!(
-            self,
-            Platform::VsCode | Platform::ClaudeDesktop | Platform::LmStudio
-        )
-    }
-
-    fn hook_platform(self) -> Option<HookPlatform> {
-        match self {
-            Platform::Antigravity => Some(HookPlatform::Antigravity),
-            Platform::ClaudeCode => Some(HookPlatform::Claude),
-            Platform::ClaudeDesktop => None,
-            Platform::Codex => Some(HookPlatform::Codex),
-            Platform::Cursor => Some(HookPlatform::Cursor),
-            Platform::Copilot => Some(HookPlatform::Copilot),
-            Platform::LmStudio => None,
-            Platform::VsCode => None,
-        }
-    }
-
-    /// Apply MCP server configuration for this platform. Returns the display
-    /// name on success, or `None` if there was nothing to configure.
-    fn configure_mcp(
-        self,
-        transport: &str,
-        servers_entry: &serde_json::Value,
-        scoped_servers_entry: &serde_json::Value,
-        home: &Path,
-    ) -> Result<Option<&'static str>> {
-        match self {
-            Platform::VsCode => {
-                if let Some(path) = vscode_mcp_path() {
-                    merge_mcp_json(&path, "servers", servers_entry.clone())?;
-                    return Ok(Some("VS Code (GitHub Copilot Chat)"));
-                }
-            }
-            Platform::ClaudeCode => {
-                let path = home.join(".claude.json");
-                merge_mcp_json(&path, "mcpServers", servers_entry.clone())?;
-                return Ok(Some("Claude Code"));
-            }
-            Platform::ClaudeDesktop => {
-                if let Some(path) = claude_desktop_config_path() {
-                    let entry = build_claude_desktop_mcp_entry(transport, home);
-                    merge_mcp_json(&path, "mcpServers", entry)?;
-                    return Ok(Some("Claude Desktop"));
-                }
-            }
-            Platform::Cursor => {
-                let path = home.join(".cursor").join("mcp.json");
-                merge_mcp_json(&path, "mcpServers", servers_entry.clone())?;
-                return Ok(Some("Cursor"));
-            }
-            Platform::Antigravity => {
-                let path = home.join(".gemini").join("config").join("mcp_config.json");
-                merge_mcp_json(&path, "mcpServers", scoped_servers_entry.clone())?;
-                return Ok(Some("Antigravity"));
-            }
-            Platform::LmStudio => {
-                // LM Studio reads MCP servers from ~/.lmstudio/mcp.json. Like
-                // Antigravity it does not send roots/list, so use the scoped entry.
-                let path = home.join(".lmstudio").join("mcp.json");
-                merge_mcp_json(&path, "mcpServers", scoped_servers_entry.clone())?;
-                return Ok(Some("LM Studio"));
-            }
-            Platform::Codex => {
-                let path = home.join(".codex").join("config.toml");
-                let toml_val = build_codex_toml_value(transport);
-                merge_codex_toml(&path, toml_val)?;
-                return Ok(Some("Codex CLI"));
-            }
-            Platform::Copilot => {}
-        }
-        Ok(None)
-    }
+    Ok(Some(platform.mcp_display_name()))
 }
 
 async fn execute_actions(
@@ -505,22 +423,6 @@ fn build_scoped_servers_entry(transport: &str, _home: &Path) -> serde_json::Valu
     })
 }
 
-fn claude_desktop_config_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    #[cfg(target_os = "macos")]
-    {
-        Some(home.join("Library/Application Support/Claude/claude_desktop_config.json"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Some(home.join("AppData/Roaming/Claude/claude_desktop_config.json"))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        Some(home.join(".config/Claude/claude_desktop_config.json"))
-    }
-}
-
 /// Build the MCP entry for Claude Desktop.
 ///
 /// Claude Desktop's `claude_desktop_config.json` uses `mcpServers` with the
@@ -558,28 +460,13 @@ fn print_mcp_restart_hints(interactive: bool, configured: &[&str], transport: &s
     println!();
 }
 
-fn vscode_mcp_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    #[cfg(target_os = "macos")]
-    {
-        Some(home.join("Library/Application Support/Code/User/mcp.json"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Some(home.join("AppData/Roaming/Code/User/mcp.json"))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        Some(home.join(".config/Code/User/mcp.json"))
-    }
-}
-
 async fn setup_mcp_config(
     platforms: &[Platform],
     transport: &str,
     interactive: bool,
 ) -> Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve home directory"))?;
+    let home = ahma_common::config::ahma_home_dir()
+        .ok_or_else(|| anyhow!("Could not resolve home directory"))?;
 
     let servers_entry = build_mcp_servers_entry(transport);
     let scoped_servers_entry = build_scoped_servers_entry(transport, &home);
@@ -587,9 +474,13 @@ async fn setup_mcp_config(
     let mut configured = Vec::new();
 
     for platform in platforms.iter().copied().filter(|p| p.supports_mcp()) {
-        if let Some(name) =
-            platform.configure_mcp(transport, &servers_entry, &scoped_servers_entry, &home)?
-        {
+        if let Some(name) = configure_mcp(
+            platform,
+            transport,
+            &servers_entry,
+            &scoped_servers_entry,
+            &home,
+        )? {
             configured.push(name);
         }
     }
@@ -1478,11 +1369,14 @@ mod tests {
         assert!(parse_separated_list("foo bar", 5).is_empty());
     }
 
-    // ─── claude_desktop_config_path / vscode_mcp_path ─────────────────────────
+    // ─── platform-specific config locations ───────────────────────────────────
 
     #[test]
     fn test_claude_desktop_config_path_points_at_claude() {
-        let p = claude_desktop_config_path().expect("home dir resolvable in test env");
+        let home = Path::new("/home/tester");
+        let (p, _) = Platform::ClaudeDesktop
+            .mcp_config(home)
+            .expect("Claude Desktop has an MCP config target");
         let s = p.to_string_lossy();
         assert!(s.contains("Claude"), "path should mention Claude: {s}");
         assert!(s.ends_with("claude_desktop_config.json"));
@@ -1490,10 +1384,14 @@ mod tests {
 
     #[test]
     fn test_vscode_mcp_path_points_at_code_mcp_json() {
-        let p = vscode_mcp_path().expect("home dir resolvable in test env");
+        let home = Path::new("/home/tester");
+        let (p, format) = Platform::VsCode
+            .mcp_config(home)
+            .expect("VS Code has an MCP config target");
         let s = p.to_string_lossy();
         assert!(s.contains("Code"), "path should mention Code: {s}");
         assert!(s.ends_with("mcp.json"));
+        assert_eq!(format, McpConfigFormat::Json("servers"));
     }
 
     // ─── SetupAction methods ──────────────────────────────────────────────────
@@ -1568,7 +1466,7 @@ mod tests {
         let home = tmp.path();
         let servers = build_mcp_servers_entry("stdio");
         let scoped = build_scoped_servers_entry("stdio", home);
-        let name = Platform::ClaudeCode.configure_mcp("stdio", &servers, &scoped, home)?;
+        let name = configure_mcp(Platform::ClaudeCode, "stdio", &servers, &scoped, home)?;
         assert_eq!(name, Some("Claude Code"));
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json"))?)?;
@@ -1582,7 +1480,7 @@ mod tests {
         let home = tmp.path();
         let servers = build_mcp_servers_entry("stdio");
         let scoped = build_scoped_servers_entry("stdio", home);
-        let name = Platform::Cursor.configure_mcp("stdio", &servers, &scoped, home)?;
+        let name = configure_mcp(Platform::Cursor, "stdio", &servers, &scoped, home)?;
         assert_eq!(name, Some("Cursor"));
         let path = home.join(".cursor").join("mcp.json");
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
@@ -1596,7 +1494,7 @@ mod tests {
         let home = tmp.path();
         let servers = build_mcp_servers_entry("stdio");
         let scoped = build_scoped_servers_entry("stdio", home);
-        let name = Platform::Antigravity.configure_mcp("stdio", &servers, &scoped, home)?;
+        let name = configure_mcp(Platform::Antigravity, "stdio", &servers, &scoped, home)?;
         assert_eq!(name, Some("Antigravity"));
         let path = home.join(".gemini").join("config").join("mcp_config.json");
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
@@ -1618,7 +1516,7 @@ mod tests {
         let home = tmp.path();
         let servers = build_mcp_servers_entry("stdio");
         let scoped = build_scoped_servers_entry("stdio", home);
-        let name = Platform::LmStudio.configure_mcp("stdio", &servers, &scoped, home)?;
+        let name = configure_mcp(Platform::LmStudio, "stdio", &servers, &scoped, home)?;
         assert_eq!(name, Some("LM Studio"));
         let path = home.join(".lmstudio").join("mcp.json");
         assert!(path.exists());
@@ -1631,7 +1529,7 @@ mod tests {
         let home = tmp.path();
         let servers = build_mcp_servers_entry("http");
         let scoped = build_scoped_servers_entry("http", home);
-        let name = Platform::Codex.configure_mcp("http", &servers, &scoped, home)?;
+        let name = configure_mcp(Platform::Codex, "http", &servers, &scoped, home)?;
         assert_eq!(name, Some("Codex CLI"));
         let path = home.join(".codex").join("config.toml");
         let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(path)?)?;
@@ -1648,7 +1546,7 @@ mod tests {
         let home = tmp.path();
         let servers = build_mcp_servers_entry("stdio");
         let scoped = build_scoped_servers_entry("stdio", home);
-        let name = Platform::Copilot.configure_mcp("stdio", &servers, &scoped, home)?;
+        let name = configure_mcp(Platform::Copilot, "stdio", &servers, &scoped, home)?;
         assert_eq!(name, None);
         Ok(())
     }

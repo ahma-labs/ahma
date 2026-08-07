@@ -22,6 +22,7 @@ use serde_json::Value;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use crate::harness_target::{McpConfigFormat, PLATFORMS, Platform};
 use crate::hooks::{HookPlatform, HookScope, HooksUninstallArgs};
 use crate::shell::cli::UninstallArgs;
 
@@ -55,82 +56,6 @@ impl UninstallAction {
 
     fn is_platform_specific(self) -> bool {
         matches!(self, UninstallAction::Mcp | UninstallAction::Hooks)
-    }
-}
-
-/// A platform that setup can target (mirrors `setup.rs`).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Platform {
-    Antigravity,
-    ClaudeCode,
-    ClaudeDesktop,
-    Codex,
-    Cursor,
-    Copilot,
-    LmStudio,
-    VsCode,
-}
-
-const PLATFORMS: &[Platform] = &[
-    Platform::Antigravity,
-    Platform::ClaudeCode,
-    Platform::ClaudeDesktop,
-    Platform::Codex,
-    Platform::Cursor,
-    Platform::Copilot,
-    Platform::LmStudio,
-    Platform::VsCode,
-];
-
-impl Platform {
-    fn label(self) -> &'static str {
-        match self {
-            Platform::Antigravity => "Antigravity",
-            Platform::ClaudeCode => "Claude Code",
-            Platform::ClaudeDesktop => "Claude Desktop",
-            Platform::Codex => "Codex",
-            Platform::Cursor => "Cursor",
-            Platform::Copilot => "GitHub Copilot CLI",
-            Platform::LmStudio => "LM Studio",
-            Platform::VsCode => "VS Code (GitHub Copilot Chat)",
-        }
-    }
-
-    fn cli_name(self) -> &'static str {
-        match self {
-            Platform::Antigravity => "antigravity",
-            Platform::ClaudeCode => "claude",
-            Platform::ClaudeDesktop => "claude-desktop",
-            Platform::Codex => "codex",
-            Platform::Cursor => "cursor",
-            Platform::Copilot => "copilot",
-            Platform::LmStudio => "lmstudio",
-            Platform::VsCode => "vscode",
-        }
-    }
-
-    fn supports_mcp(self) -> bool {
-        !matches!(self, Platform::Copilot)
-    }
-
-    fn supports_hooks(self) -> bool {
-        !matches!(
-            self,
-            Platform::VsCode | Platform::ClaudeDesktop | Platform::LmStudio
-        )
-    }
-
-    fn hook_platform(self) -> Option<HookPlatform> {
-        match self {
-            Platform::Antigravity => Some(HookPlatform::Antigravity),
-            Platform::ClaudeCode => Some(HookPlatform::Claude),
-            Platform::ClaudeDesktop => None,
-            Platform::Codex => Some(HookPlatform::Codex),
-            Platform::Cursor => Some(HookPlatform::Cursor),
-            Platform::Copilot => Some(HookPlatform::Copilot),
-            Platform::LmStudio => None,
-            Platform::VsCode => None,
-        }
     }
 }
 
@@ -332,57 +257,23 @@ fn remove_platform_mcp(
     home: &Path,
     dry_run: bool,
 ) -> Result<Option<&'static str>> {
-    let name = match platform {
-        Platform::VsCode => {
-            if let Some(path) = vscode_mcp_path() {
-                remove_mcp_entry(&path, "servers", dry_run)
-                    .with_context(|| format!("VS Code MCP config at {}", path.display()))?;
-                Some("VS Code (GitHub Copilot Chat)")
-            } else {
-                None
-            }
-        }
-        Platform::ClaudeCode => {
-            let path = home.join(".claude.json");
-            remove_mcp_entry(&path, "mcpServers", dry_run)
-                .context("Claude Code MCP config (~/.claude.json)")?;
-            Some("Claude Code")
-        }
-        Platform::ClaudeDesktop => {
-            if let Some(path) = claude_desktop_config_path() {
-                remove_mcp_entry(&path, "mcpServers", dry_run)
-                    .with_context(|| format!("Claude Desktop config at {}", path.display()))?;
-                Some("Claude Desktop")
-            } else {
-                None
-            }
-        }
-        Platform::Cursor => {
-            let path = home.join(".cursor").join("mcp.json");
-            remove_mcp_entry(&path, "mcpServers", dry_run)
-                .context("Cursor MCP config (~/.cursor/mcp.json)")?;
-            Some("Cursor")
-        }
-        Platform::Antigravity => {
-            let path = home.join(".gemini").join("config").join("mcp_config.json");
-            remove_mcp_entry(&path, "mcpServers", dry_run)
-                .with_context(|| format!("Antigravity MCP config at {}", path.display()))?;
-            Some("Antigravity")
-        }
-        Platform::LmStudio => {
-            let path = home.join(".lmstudio").join("mcp.json");
-            remove_mcp_entry(&path, "mcpServers", dry_run)
-                .with_context(|| format!("LM Studio MCP config at {}", path.display()))?;
-            Some("LM Studio")
-        }
-        Platform::Codex => {
-            let path = home.join(".codex").join("config.toml");
-            remove_codex_mcp(&path, dry_run).context("Codex config (~/.codex/config.toml)")?;
-            Some("Codex CLI")
-        }
-        Platform::Copilot => None,
+    let Some((path, format)) = platform.mcp_config(home) else {
+        return Ok(None);
     };
-    Ok(name)
+
+    match format {
+        McpConfigFormat::Toml => remove_codex_mcp(&path, dry_run),
+        McpConfigFormat::Json(servers_key) => remove_mcp_entry(&path, servers_key, dry_run),
+    }
+    .with_context(|| {
+        format!(
+            "{} MCP config at {}",
+            platform.mcp_display_name(),
+            path.display()
+        )
+    })?;
+
+    Ok(Some(platform.mcp_display_name()))
 }
 
 /// Remove the `"Ahma"` key from `config[servers_key]` in a JSON MCP config file.
@@ -909,38 +800,6 @@ fn parse_separated_list(input: &str, max_val: usize) -> Vec<usize> {
 }
 
 // ── Platform path helpers (mirrors setup.rs) ──────────────────────────────────
-
-fn vscode_mcp_path() -> Option<PathBuf> {
-    let home = ahma_common::config::ahma_home_dir()?;
-    #[cfg(target_os = "macos")]
-    {
-        Some(home.join("Library/Application Support/Code/User/mcp.json"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Some(home.join("AppData/Roaming/Code/User/mcp.json"))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        Some(home.join(".config/Code/User/mcp.json"))
-    }
-}
-
-fn claude_desktop_config_path() -> Option<PathBuf> {
-    let home = ahma_common::config::ahma_home_dir()?;
-    #[cfg(target_os = "macos")]
-    {
-        Some(home.join("Library/Application Support/Claude/claude_desktop_config.json"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Some(home.join("AppData/Roaming/Claude/claude_desktop_config.json"))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        Some(home.join(".config/Claude/claude_desktop_config.json"))
-    }
-}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
