@@ -429,130 +429,22 @@ fn parse_status_2xx(response: &[u8]) -> bool {
     false
 }
 
-fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = v.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    Some((major, minor, patch))
-}
-
-/// A running bridge's self-reported version and (if any) the sandbox scope it
-/// is actually configured for. `default_sandbox_scope` lets a caller decide
-/// whether an already-healthy bridge is safe to reuse for a *different*
-/// project, instead of assuming any healthy bridge is scoped correctly
-/// (SPEC R7) — see `handle_existing_candidate`.
-struct BridgeHealth {
-    version: String,
-    default_sandbox_scope: Option<String>,
-}
-
-fn parse_health_body(body: &str) -> Option<BridgeHealth> {
-    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    let version = parsed.get("version")?.as_str()?.to_string();
-    let default_sandbox_scope = parsed
-        .get("default_sandbox_scope")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    Some(BridgeHealth {
-        version,
-        default_sandbox_scope,
-    })
-}
-
+use ahma_mcp::shell::modes::server::{
+    BridgeHealth, parse_version, query_tcp_health, trigger_tcp_restart,
+};
 #[cfg(unix)]
-async fn query_uds_health_full(path: &str) -> Option<BridgeHealth> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let connect = tokio::net::UnixStream::connect(path);
-    let mut stream = tokio::time::timeout(Duration::from_millis(200), connect)
-        .await
-        .ok()?
-        .ok()?;
-
-    let request = b"GET /health HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    if stream.write_all(request).await.is_err() {
-        return None;
-    }
-
-    let mut buf = Vec::with_capacity(512);
-    let _ = tokio::time::timeout(Duration::from_millis(200), stream.read_to_end(&mut buf)).await;
-
-    let response_str = std::str::from_utf8(&buf).ok()?;
-    let body = response_str.split("\r\n\r\n").nth(1)?;
-    parse_health_body(body)
-}
-
-#[cfg(unix)]
-async fn query_uds_health(path: &str) -> Option<String> {
-    query_uds_health_full(path).await.map(|h| h.version)
-}
-
-async fn query_tcp_health_full(url: &str) -> Option<BridgeHealth> {
-    let health_url = format!("{}/health", url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(200))
-        .build()
-        .unwrap_or_default();
-    let resp = client.get(&health_url).send().await.ok()?;
-    if resp.status().is_success() {
-        let body = resp.text().await.ok()?;
-        return parse_health_body(&body);
-    }
-    None
-}
-
-async fn query_tcp_health(url: &str) -> Option<String> {
-    query_tcp_health_full(url).await.map(|h| h.version)
-}
+use ahma_mcp::shell::modes::server::{query_uds_health, trigger_uds_restart};
 
 pub async fn get_candidate_version(candidate: &ResolvedConnection) -> Option<String> {
+    get_candidate_health(candidate).await.map(|h| h.version)
+}
+
+async fn get_candidate_health(candidate: &ResolvedConnection) -> Option<BridgeHealth> {
     match &candidate.transport {
         ResolvedTransport::Http(url) | ResolvedTransport::Http3(url) => query_tcp_health(url).await,
         #[cfg(unix)]
         ResolvedTransport::UnixSocket(path) => query_uds_health(path).await,
     }
-}
-
-async fn get_candidate_health(candidate: &ResolvedConnection) -> Option<BridgeHealth> {
-    match &candidate.transport {
-        ResolvedTransport::Http(url) | ResolvedTransport::Http3(url) => {
-            query_tcp_health_full(url).await
-        }
-        #[cfg(unix)]
-        ResolvedTransport::UnixSocket(path) => query_uds_health_full(path).await,
-    }
-}
-
-#[cfg(unix)]
-async fn trigger_uds_restart(path: &str) -> bool {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let connect = tokio::net::UnixStream::connect(path);
-    let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_millis(200), connect).await else {
-        return false;
-    };
-
-    let request = b"POST /restart HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-    if stream.write_all(request).await.is_err() {
-        return false;
-    }
-
-    let mut buf = Vec::with_capacity(512);
-    let _ = tokio::time::timeout(Duration::from_millis(200), stream.read_to_end(&mut buf)).await;
-
-    let response_str = std::str::from_utf8(&buf).unwrap_or("");
-    response_str.starts_with("HTTP/1.") && response_str.contains(" 200 ")
-}
-
-async fn trigger_tcp_restart(url: &str) -> bool {
-    let restart_url = format!("{}/restart", url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(200))
-        .build()
-        .unwrap_or_default();
-    if let Ok(resp) = client.post(&restart_url).send().await {
-        return resp.status().is_success();
-    }
-    false
 }
 
 pub async fn trigger_candidate_restart(candidate: &ResolvedConnection) -> bool {
@@ -1073,7 +965,10 @@ mod tests {
     #[tokio::test]
     async fn query_tcp_health_variants() {
         let (url, h) = start_test_http_server(200, Some("4.5.6"), 200, None).await;
-        assert_eq!(query_tcp_health(&url).await.as_deref(), Some("4.5.6"));
+        assert_eq!(
+            query_tcp_health(&url).await.map(|health| health.version),
+            Some("4.5.6".to_string())
+        );
         h.abort();
 
         let (url_nv, h2) = start_test_http_server(200, None, 200, None).await;
@@ -1109,7 +1004,7 @@ mod tests {
         });
         let url = format!("http://{addr}");
 
-        let health = query_tcp_health_full(&url)
+        let health = query_tcp_health(&url)
             .await
             .expect("health response must parse");
         assert_eq!(health.version, "1.2.3");
@@ -1393,7 +1288,7 @@ mod tests {
 
         let v = query_uds_health(&sock).await;
         server.abort();
-        assert_eq!(v.as_deref(), Some("2.0.0"));
+        assert_eq!(v.map(|health| health.version), Some("2.0.0".to_string()));
 
         let missing = tmp.path().join("nope.sock").to_string_lossy().into_owned();
         assert!(query_uds_health(&missing).await.is_none());

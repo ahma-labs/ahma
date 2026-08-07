@@ -301,7 +301,12 @@ async fn run_shutdown_handler(
 ///
 /// # Errors
 /// Returns an error if the server fails to start or encounters a fatal error.
-fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
+// The functions below are the cross-crate chokepoint for bridge
+// liveness/version/restart checks (see AGENTS.md): every surface that needs
+// to know whether a bridge is up, what version it reports, or must ask it to
+// restart — including `ahma_tui` — calls through here rather than
+// reimplementing the raw HTTP/1.0-over-`UnixStream` and `reqwest` probes.
+pub fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     let mut parts = v.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
@@ -309,8 +314,32 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
+/// A running bridge's self-reported version and (if any) the sandbox scope it
+/// is actually configured for. `default_sandbox_scope` lets a caller decide
+/// whether an already-healthy bridge is safe to reuse for a *different*
+/// project, instead of assuming any healthy bridge is scoped correctly
+/// (SPEC R7).
+#[derive(Debug, PartialEq, Eq)]
+pub struct BridgeHealth {
+    pub version: String,
+    pub default_sandbox_scope: Option<String>,
+}
+
+fn parse_health_body(body: &str) -> Option<BridgeHealth> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let version = parsed.get("version")?.as_str()?.to_string();
+    let default_sandbox_scope = parsed
+        .get("default_sandbox_scope")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Some(BridgeHealth {
+        version,
+        default_sandbox_scope,
+    })
+}
+
 #[cfg(unix)]
-async fn query_uds_health(path: &str) -> Option<String> {
+pub async fn query_uds_health(path: &str) -> Option<BridgeHealth> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let connect = tokio::net::UnixStream::connect(path);
     let mut stream = tokio::time::timeout(Duration::from_millis(200), connect)
@@ -328,11 +357,10 @@ async fn query_uds_health(path: &str) -> Option<String> {
 
     let response_str = std::str::from_utf8(&buf).ok()?;
     let body = response_str.split("\r\n\r\n").nth(1)?;
-    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed.get("version")?.as_str().map(String::from)
+    parse_health_body(body)
 }
 
-async fn query_tcp_health(url: &str) -> Option<String> {
+pub async fn query_tcp_health(url: &str) -> Option<BridgeHealth> {
     let health_url = format!("{}/health", url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(200))
@@ -340,9 +368,30 @@ async fn query_tcp_health(url: &str) -> Option<String> {
         .unwrap_or_default();
     let resp = client.get(&health_url).send().await.ok()?;
     if resp.status().is_success() {
-        let parsed: serde_json::Value = resp.json().await.ok()?;
-        return parsed.get("version")?.as_str().map(String::from);
+        let body = resp.text().await.ok()?;
+        return parse_health_body(&body);
     }
+    None
+}
+
+/// Query the bridge's `/health` endpoint, preferring the Unix socket over TCP.
+pub async fn query_bridge_health(
+    socket_path: Option<&str>,
+    http_url: Option<&str>,
+) -> Option<BridgeHealth> {
+    #[cfg(unix)]
+    if let Some(path) = socket_path
+        && let Some(health) = query_uds_health(path).await
+    {
+        return Some(health);
+    }
+    if let Some(url) = http_url
+        && let Some(health) = query_tcp_health(url).await
+    {
+        return Some(health);
+    }
+    #[cfg(not(unix))]
+    let _ = socket_path;
     None
 }
 
@@ -350,24 +399,13 @@ pub async fn get_bridge_version(
     socket_path: Option<&str>,
     http_url: Option<&str>,
 ) -> Option<String> {
-    #[cfg(unix)]
-    if let Some(path) = socket_path
-        && let Some(ver) = query_uds_health(path).await
-    {
-        return Some(ver);
-    }
-    if let Some(url) = http_url
-        && let Some(ver) = query_tcp_health(url).await
-    {
-        return Some(ver);
-    }
-    #[cfg(not(unix))]
-    let _ = socket_path;
-    None
+    query_bridge_health(socket_path, http_url)
+        .await
+        .map(|h| h.version)
 }
 
 #[cfg(unix)]
-async fn trigger_uds_restart(path: &str) -> bool {
+pub async fn trigger_uds_restart(path: &str) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let connect = tokio::net::UnixStream::connect(path);
     let Ok(Ok(mut stream)) = tokio::time::timeout(Duration::from_millis(200), connect).await else {
@@ -386,7 +424,7 @@ async fn trigger_uds_restart(path: &str) -> bool {
     response_str.starts_with("HTTP/1.") && response_str.contains(" 200 ")
 }
 
-async fn trigger_tcp_restart(url: &str) -> bool {
+pub async fn trigger_tcp_restart(url: &str) -> bool {
     let restart_url = format!("{}/restart", url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(200))
