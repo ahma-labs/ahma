@@ -295,10 +295,7 @@ async fn test_get_sse_events_include_event_id() {
 /// Verify that GET SSE with Last-Event-Id replays missed events.
 #[tokio::test]
 async fn test_get_sse_last_event_id_replay() {
-    use ahma_http_bridge::{
-        DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS,
-        DEFAULT_TOOL_CALL_TIMEOUT_SECS, SessionManager, SessionManagerConfig,
-    };
+    use ahma_http_bridge::{SessionManager, SessionManagerConfig};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -335,12 +332,8 @@ for line in sys.stdin:
         server_command: if cfg!(windows) { "python" } else { "python3" }.to_string(),
         server_args: vec![script_path.to_string_lossy().to_string()],
         default_scope: Some(temp_dir.path().to_path_buf()),
-        enable_colored_output: false,
-        handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 100,
-        peer_factory: None,
+        ..Default::default()
     }));
 
     let session_id = sm.create_session().await.expect("create session");

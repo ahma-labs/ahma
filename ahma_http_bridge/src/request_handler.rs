@@ -1414,14 +1414,11 @@ mod tests {
     ) -> Arc<SessionManager> {
         Arc::new(SessionManager::new(SessionManagerConfig {
             server_command: String::new(),
-            server_args: vec![],
             default_scope,
-            enable_colored_output: false,
             handshake_timeout_secs,
-            request_timeout_secs: crate::session::DEFAULT_REQUEST_TIMEOUT_SECS,
-            tool_call_timeout_secs: crate::session::DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions,
             peer_factory: Some(factory),
+            ..Default::default()
         }))
     }
 

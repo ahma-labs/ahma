@@ -10,9 +10,6 @@
 //! state management aspects.
 
 use ahma_http_bridge::session::{McpRoot, SessionManager, SessionManagerConfig};
-use ahma_http_bridge::{
-    DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TOOL_CALL_TIMEOUT_SECS,
-};
 use ahma_mcp::test_utils::path_helpers::{test_abs, test_temp_path};
 use std::path::PathBuf;
 
@@ -31,12 +28,8 @@ fn test_no_temp_files_flag_in_server_args() {
         server_command: "ahma_mcp".to_string(),
         server_args: server_args.clone(),
         default_scope: Some(test_temp_path("test")),
-        enable_colored_output: false,
-        handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
-        peer_factory: None,
+        ..Default::default()
     };
 
     assert!(
@@ -85,14 +78,9 @@ fn test_session_manager_config_default_scope() {
 
     let config = SessionManagerConfig {
         server_command: "ahma_mcp".to_string(),
-        server_args: vec![],
         default_scope: Some(default_scope.clone()),
-        enable_colored_output: false,
-        handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
-        peer_factory: None,
+        ..Default::default()
     };
 
     assert_eq!(
@@ -109,12 +97,8 @@ async fn test_session_isolation_creates_separate_sessions() {
         server_command: "echo".to_string(), // Use echo as safe subprocess
         server_args: vec!["test".to_string()],
         default_scope: Some(test_temp_path("isolation_test")),
-        enable_colored_output: false,
-        handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
-        peer_factory: None,
+        ..Default::default()
     };
 
     let manager = SessionManager::new(config);
@@ -147,14 +131,9 @@ async fn test_session_isolation_creates_separate_sessions() {
 async fn test_sandbox_lock_immutability() {
     let config = SessionManagerConfig {
         server_command: "echo".to_string(),
-        server_args: vec![],
         default_scope: Some(test_temp_path("lock_test")),
-        enable_colored_output: false,
-        handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
-        peer_factory: None,
+        ..Default::default()
     };
 
     let manager = SessionManager::new(config);
@@ -245,14 +224,9 @@ fn test_sandbox_scope_validation_logic() {
 async fn test_multi_root_workspace_sandbox() {
     let config = SessionManagerConfig {
         server_command: "echo".to_string(),
-        server_args: vec![],
         default_scope: Some(test_temp_path("multi_root_test")),
-        enable_colored_output: false,
-        handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
-        peer_factory: None,
+        ..Default::default()
     };
 
     let manager = SessionManager::new(config);
@@ -309,14 +283,9 @@ async fn test_multi_root_workspace_sandbox() {
 async fn test_empty_roots_rejected() {
     let config = SessionManagerConfig {
         server_command: "echo".to_string(),
-        server_args: vec![],
         default_scope: None,
-        enable_colored_output: false,
-        handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
-        peer_factory: None,
+        ..Default::default()
     };
 
     let manager = SessionManager::new(config);
@@ -345,14 +314,9 @@ async fn test_empty_roots_use_explicit_fallback_scope() {
 
     let config = SessionManagerConfig {
         server_command: "echo".to_string(),
-        server_args: vec![],
         default_scope: Some(fallback_scope.clone()),
-        enable_colored_output: false,
-        handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 10,
-        peer_factory: None,
+        ..Default::default()
     };
 
     let manager = SessionManager::new(config);

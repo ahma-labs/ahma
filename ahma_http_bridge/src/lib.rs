@@ -84,8 +84,9 @@ pub use bridge::{BridgeConfig, ListenerKind, start_bridge};
 pub use error::{BridgeError, Result};
 pub use peer::{PeerFactory, PeerShutdownFn, PeerStreams, SubprocessPeerFactory};
 pub use session::{
-    DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TOOL_CALL_TIMEOUT_SECS,
-    McpRoot, Session, SessionManager, SessionManagerConfig, SessionTerminationReason,
+    DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_MAX_SESSIONS, DEFAULT_REQUEST_TIMEOUT_SECS,
+    DEFAULT_TOOL_CALL_TIMEOUT_SECS, McpRoot, Session, SessionManager, SessionManagerConfig,
+    SessionTerminationReason,
 };
 
 /// Request handler for HTTP bridge.

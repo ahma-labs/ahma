@@ -138,6 +138,10 @@ pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 /// (see [`SessionManagerConfig::tool_call_timeout_secs`]).
 pub const DEFAULT_TOOL_CALL_TIMEOUT_SECS: u64 = 60;
 
+/// Default cap on concurrent sessions
+/// (see [`SessionManagerConfig::max_sessions`]).
+pub const DEFAULT_MAX_SESSIONS: usize = 100;
+
 /// Session termination reason
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionTerminationReason {
@@ -589,6 +593,28 @@ pub struct SessionManagerConfig {
     ///
     /// [`PeerStreams`]: crate::peer::PeerStreams
     pub peer_factory: Option<Arc<dyn PeerFactory>>,
+}
+
+impl Default for SessionManagerConfig {
+    /// Production defaults: a subprocess-backed manager (`peer_factory: None`)
+    /// running `ahma` with no arguments, no fallback scope (so clients must
+    /// supply roots), and the `DEFAULT_*` timeouts and session cap.
+    ///
+    /// Construction sites should set only the fields they actually care about
+    /// and fill the rest with `..Default::default()`.
+    fn default() -> Self {
+        Self {
+            server_command: "ahma".to_string(),
+            server_args: vec![],
+            default_scope: None,
+            enable_colored_output: false,
+            handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
+            max_sessions: DEFAULT_MAX_SESSIONS,
+            peer_factory: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for SessionManagerConfig {
@@ -2477,14 +2503,10 @@ mod session_logic_tests {
     fn test_config(default_scope: Option<PathBuf>, max_sessions: usize) -> SessionManagerConfig {
         SessionManagerConfig {
             server_command: "unused".to_string(),
-            server_args: vec![],
             default_scope,
-            enable_colored_output: false,
-            handshake_timeout_secs: 45,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions,
             peer_factory: Some(Arc::new(DuplexPeerFactory::new())),
+            ..Default::default()
         }
     }
 
@@ -2603,14 +2625,9 @@ mod session_logic_tests {
         });
         let config = SessionManagerConfig {
             server_command: "unused".to_string(),
-            server_args: vec![],
-            default_scope: None,
-            enable_colored_output: false,
-            handshake_timeout_secs: 45,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 8,
             peer_factory: Some(factory.clone()),
+            ..Default::default()
         };
         let mgr = SessionManager::new(config);
         let id = mgr.create_session().await.unwrap();
@@ -2859,14 +2876,8 @@ mod session_logic_tests {
 
         let without = SessionManagerConfig {
             server_command: "x".to_string(),
-            server_args: vec![],
-            default_scope: None,
-            enable_colored_output: false,
-            handshake_timeout_secs: 45,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 1,
-            peer_factory: None,
+            ..Default::default()
         };
         let dbg_none = format!("{without:?}");
         assert!(dbg_none.contains("peer_factory: \"None\""));

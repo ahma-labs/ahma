@@ -27,8 +27,8 @@
 
 use crate::error::{BridgeError, Result};
 use crate::session::{
-    DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TOOL_CALL_TIMEOUT_SECS,
-    SessionManager, SessionManagerConfig,
+    DEFAULT_HANDSHAKE_TIMEOUT_SECS, DEFAULT_MAX_SESSIONS, DEFAULT_REQUEST_TIMEOUT_SECS,
+    DEFAULT_TOOL_CALL_TIMEOUT_SECS, SessionManager, SessionManagerConfig,
 };
 use arc_swap::ArcSwapOption;
 use axum::{
@@ -241,7 +241,7 @@ impl Default for BridgeConfig {
             rate_limit_burst: 10,
             active_sessions: None,
             idle_timeout_secs: None,
-            max_sessions: 100,
+            max_sessions: DEFAULT_MAX_SESSIONS,
             cluster_shared_key: None,
             peer_factory: None,
             bound_port_tx: None,
@@ -347,26 +347,12 @@ impl BridgeConfig {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         Self {
             bind_addr,
+            // Ignored: `peer_factory` being `Some` bypasses subprocess spawning.
             server_command: String::new(),
-            server_args: vec![],
-            enable_colored_output: false,
-            default_sandbox_scope: None,
-            handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             enable_quic: false, // no QUIC needed for in-process tests
-            disable_http1_1: false,
             listener_kind: ListenerKind::Tcp(bind_addr),
-            require_token: None,
-            require_token_path: None,
-            rate_limit_rps: 0,
-            rate_limit_burst: 10,
-            active_sessions: None,
-            idle_timeout_secs: None,
-            max_sessions: 100,
-            cluster_shared_key: None,
             peer_factory: Some(factory),
-            bound_port_tx: None,
+            ..Default::default()
         }
     }
 
@@ -1980,12 +1966,8 @@ for line in sys.stdin:
             server_command: python_cmd().to_string(),
             server_args: vec![script_path.to_string_lossy().to_string()],
             default_scope: Some(temp_dir.path().to_path_buf()),
-            enable_colored_output: false,
-            handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 50,
-            peer_factory: None,
+            ..Default::default()
         }));
 
         let state = create_state_with_session_manager(Arc::clone(&session_manager));
@@ -2233,12 +2215,8 @@ for line in sys.stdin:
             server_command: python_cmd().to_string(),
             server_args: vec![script.to_string_lossy().to_string()],
             default_scope,
-            enable_colored_output: false,
-            handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 50,
-            peer_factory: None,
+            ..Default::default()
         }))
     }
 
@@ -2465,12 +2443,8 @@ for line in sys.stdin:
             server_command: python_cmd().to_string(),
             server_args: vec![script_path.to_string_lossy().to_string()],
             default_scope: Some(temp_dir.path().to_path_buf()),
-            enable_colored_output: false,
-            handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 50,
-            peer_factory: None,
+            ..Default::default()
         }));
         let state = create_state_with_session_manager(session_manager);
         let app = create_app(state);
@@ -2568,12 +2542,8 @@ for line in sys.stdin:
             server_command: python_cmd().to_string(),
             server_args: vec![script_path.to_string_lossy().to_string()],
             default_scope: Some(temp_dir.path().to_path_buf()),
-            enable_colored_output: false,
-            handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 50,
-            peer_factory: None,
+            ..Default::default()
         }));
 
         let session_id = session_manager
@@ -2614,12 +2584,8 @@ for line in sys.stdin:
             server_command: python_cmd().to_string(),
             server_args: vec![script_path.to_string_lossy().to_string()],
             default_scope: Some(temp_dir.path().to_path_buf()),
-            enable_colored_output: false,
-            handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 50,
-            peer_factory: None,
+            ..Default::default()
         }));
 
         let state = create_state_with_session_manager(session_manager);
@@ -2656,14 +2622,9 @@ for line in sys.stdin:
         let state = Arc::new(BridgeState {
             session_manager: Arc::new(SessionManager::new(SessionManagerConfig {
                 server_command: "echo".to_string(),
-                server_args: vec![],
                 default_scope: Some(temp_dir.path().to_path_buf()),
-                enable_colored_output: false,
-                handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-                tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
                 max_sessions: 50,
-                peer_factory: None,
+                ..Default::default()
             })),
             require_token: ArcSwapOption::new(token.map(|s| Arc::new(s.to_owned()))),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
@@ -2858,14 +2819,9 @@ for line in sys.stdin:
         let state = Arc::new(BridgeState {
             session_manager: Arc::new(SessionManager::new(SessionManagerConfig {
                 server_command: "echo".to_string(),
-                server_args: vec![],
                 default_scope: Some(temp_dir.path().to_path_buf()),
-                enable_colored_output: false,
-                handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-                tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
                 max_sessions: 50,
-                peer_factory: None,
+                ..Default::default()
             })),
             require_token: ArcSwapOption::new(None),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
@@ -3134,14 +3090,9 @@ for line in sys.stdin:
 
         let session_config = SessionManagerConfig {
             server_command: "echo".to_string(),
-            server_args: vec![],
             default_scope: Some(temp_dir.path().to_path_buf()),
-            enable_colored_output: false,
-            handshake_timeout_secs: DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-            tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
             max_sessions: 10,
-            peer_factory: None,
+            ..Default::default()
         };
         let mut session_manager = SessionManager::new(session_config);
         // Inject the counter the same way `build_bridge_state` does.

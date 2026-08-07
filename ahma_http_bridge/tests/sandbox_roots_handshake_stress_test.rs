@@ -1,6 +1,5 @@
 use ahma_http_bridge::session::{
-    DEFAULT_REQUEST_TIMEOUT_SECS, DEFAULT_TOOL_CALL_TIMEOUT_SECS, HandshakeState, SessionManager,
-    SessionManagerConfig, SessionTerminationReason,
+    HandshakeState, SessionManager, SessionManagerConfig, SessionTerminationReason,
 };
 
 use ahma_common::timeouts::TestTimeouts;
@@ -12,14 +11,10 @@ async fn test_handshake_state_machine_transitions() {
     // Setup session manager with mock components
     let config = SessionManagerConfig {
         server_command: "true".to_string(), // No-op command
-        server_args: vec![],
         default_scope: Some(std::path::PathBuf::from(".")),
-        enable_colored_output: false,
         handshake_timeout_secs: 5,
-        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 100,
-        peer_factory: None,
+        ..Default::default()
     };
     let session_manager = SessionManager::new(config);
     let session_id = session_manager
@@ -62,12 +57,9 @@ async fn test_handshake_state_machine_race_condition_stress() {
         server_command: "sh".to_string(), // Use sh to ignore extra args
         server_args: vec!["-c".to_string(), "sleep 10".to_string()],
         default_scope: Some(std::path::PathBuf::from(".")),
-        enable_colored_output: false,
         handshake_timeout_secs: 5,
-        request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
-        tool_call_timeout_secs: DEFAULT_TOOL_CALL_TIMEOUT_SECS,
         max_sessions: 100,
-        peer_factory: None,
+        ..Default::default()
     };
     let session_manager = Arc::new(SessionManager::new(config));
 
