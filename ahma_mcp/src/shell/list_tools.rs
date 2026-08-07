@@ -402,11 +402,14 @@ mod tests {
         assert_eq!(expand_home("/absolute/path"), "/absolute/path");
         assert_eq!(expand_home("relative/path"), "relative/path");
 
-        // Home path should expand (if home dir exists)
+        // Home path should expand (if home dir exists). The shared helper joins
+        // with `PathBuf::push`, so the tail separator is the platform's own —
+        // `\` on Windows, `/` elsewhere. Asserting a literal `/` here is the
+        // separator assumption AGENTS.md forbids, and it broke Windows CI.
         if dirs::home_dir().is_some() {
             let expanded = expand_home("~/test");
             assert!(!expanded.starts_with("~/"));
-            assert!(expanded.ends_with("/test"));
+            assert!(expanded.ends_with(&format!("{}test", std::path::MAIN_SEPARATOR)));
         }
     }
 
@@ -422,7 +425,9 @@ mod tests {
         if dirs::home_dir().is_some() {
             let expanded = expand_home("~\\test");
             assert!(!expanded.starts_with("~\\"));
-            assert!(expanded.ends_with("\\test") || expanded.ends_with("/test"));
+            // Same platform-separator tail as `~/test`: the helper accepts either
+            // prefix and normalises both onto `MAIN_SEPARATOR`.
+            assert!(expanded.ends_with(&format!("{}test", std::path::MAIN_SEPARATOR)));
         }
     }
 
