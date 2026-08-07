@@ -29,6 +29,13 @@ use tracing;
 /// per-operation watch channel plus `completion_history`.
 const EVENT_STREAM_CAPACITY: usize = 1024;
 
+/// Cap on `completion_history` size: once this many terminal operations have
+/// accumulated, the oldest is evicted on each new completion. Mirrors the
+/// bound already applied to `Operation::stdout_tail` (see
+/// `append_output_line`) — without one, a long-lived server session
+/// accumulates one entry per operation for the life of the process.
+const MAX_COMPLETION_HISTORY: usize = 1000;
+
 /// Default bound for [`OperationMonitor::wait_for_operation`].
 ///
 /// This is a backstop for callers with no deadline of their own. It is deliberately
@@ -356,6 +363,9 @@ fn log_progress_warnings(progress_percent: u8, remaining_secs: i64, warnings_sen
 pub struct OperationMonitor {
     operations: Arc<RwLock<HashMap<String, Operation>>>,
     completion_history: Arc<RwLock<HashMap<String, Operation>>>,
+    /// Insertion order of `completion_history` entries, so the oldest can be
+    /// evicted in O(1) once [`MAX_COMPLETION_HISTORY`] is exceeded.
+    completion_order: Arc<RwLock<VecDeque<String>>>,
     config: MonitorConfig,
     /// Unified event stream (SPEC R15).  The monitor is the single emitter of
     /// operation lifecycle events: `Started` on insert, `OutputLine`/`Alert`
@@ -370,6 +380,7 @@ impl OperationMonitor {
         Self {
             operations: Arc::new(RwLock::new(HashMap::new())),
             completion_history: Arc::new(RwLock::new(HashMap::new())),
+            completion_order: Arc::new(RwLock::new(VecDeque::new())),
             config,
             events: EventDispatcher::new(EVENT_STREAM_CAPACITY),
         }
@@ -664,10 +675,21 @@ impl OperationMonitor {
     ///
     /// Ordering invariant (SPEC R15.3): history write → watch signal → event
     /// emission, so any consumer woken by either channel observes final state.
+    ///
+    /// Also evicts the oldest history entry once [`MAX_COMPLETION_HISTORY`] is
+    /// exceeded, so a long-lived server session doesn't grow this map forever.
     async fn move_to_history_and_notify(&self, id: &str, operation: Option<Operation>) {
         let Some(op) = operation else { return };
         let mut history = self.completion_history.write().await;
         history.insert(id.to_string(), op.clone());
+        let mut order = self.completion_order.write().await;
+        order.push_back(id.to_string());
+        if order.len() > MAX_COMPLETION_HISTORY
+            && let Some(oldest) = order.pop_front()
+        {
+            history.remove(&oldest);
+        }
+        drop(order);
         drop(history);
         // Signal completion.  Ignore errors: a SendError means no subscribers,
         // which is fine — the result is already in completion_history.
@@ -1173,6 +1195,43 @@ mod tests {
         // 6. Verify it IS in the completion history map
         let history = monitor.completion_history.read().await;
         assert!(history.contains_key(&op_id));
+    }
+
+    /// `completion_history` must not grow without bound: once
+    /// `MAX_COMPLETION_HISTORY` terminal operations have accumulated, each new
+    /// completion evicts the oldest entry rather than growing the map forever.
+    #[tokio::test]
+    async fn completion_history_evicts_oldest_beyond_the_cap() {
+        let monitor = OperationMonitor::new(MonitorConfig::with_timeout(Duration::from_secs(30)));
+
+        for i in 0..MAX_COMPLETION_HISTORY + 5 {
+            let op_id = format!("op_{i}");
+            let op = Operation::new(
+                op_id.clone(),
+                "test_tool".to_string(),
+                "test".to_string(),
+                None,
+            );
+            monitor.add_operation(op).await;
+            monitor
+                .update_status(&op_id, OperationStatus::Completed, None)
+                .await;
+        }
+
+        let history = monitor.completion_history.read().await;
+        assert_eq!(
+            history.len(),
+            MAX_COMPLETION_HISTORY,
+            "history must be capped at MAX_COMPLETION_HISTORY, not grow unbounded"
+        );
+        assert!(
+            !history.contains_key("op_0"),
+            "the oldest entries must have been evicted"
+        );
+        assert!(
+            history.contains_key(&format!("op_{}", MAX_COMPLETION_HISTORY + 4)),
+            "the most recent entry must still be present"
+        );
     }
 
     /// The default bound must not outlive a caller's own, longer deadline.
