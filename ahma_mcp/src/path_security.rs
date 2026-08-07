@@ -8,8 +8,9 @@
 //! Callers must validate any user-provided paths before file access. This module
 //! is a defense-in-depth layer in addition to kernel sandboxing.
 
+use crate::sandbox::normalize_path_lexically;
 use anyhow::{Result, anyhow};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Canonicalize `path` using `dunce::canonicalize` to prevent symlink escapes.
 ///
@@ -56,10 +57,10 @@ pub async fn validate_path(path: &Path, root: &Path) -> Result<PathBuf> {
                 } else {
                     // If even the parent cannot be canonicalized, fall back to lexical normalization.
                     // This should be rare and is primarily for deeply-nested create flows.
-                    normalize_path(&path_to_check)
+                    normalize_path_lexically(&path_to_check)
                 }
             } else {
-                normalize_path(&path_to_check)
+                normalize_path_lexically(&path_to_check)
             }
         }
     };
@@ -75,34 +76,9 @@ pub async fn validate_path(path: &Path, root: &Path) -> Result<PathBuf> {
     }
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
-    // Collect and resolve components in a fully cross-platform way.
-    // Using Vec<Component> + collect() lets Rust handle Prefix/RootDir correctly
-    // on both Windows (drive letters, UNC) and Unix.
-    let mut out: Vec<std::path::Component> = Vec::new();
-
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // Only pop a Normal segment; never remove a root/prefix.
-                if matches!(out.last(), Some(Component::Normal(_))) {
-                    out.pop();
-                }
-            }
-            c => out.push(c),
-        }
-    }
-
-    // Reconstruct a PathBuf from the resolved components.
-    // This correctly handles Unix `/`, Windows `C:\`, and UNC `\\server\share`.
-    out.iter().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::path_helpers::{test_abs, test_root};
     use tempfile::TempDir;
     use tokio::fs;
 
@@ -180,65 +156,7 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_normalize_path_removes_dot() {
-        let path = test_abs(&["a", ".", "b", ".", "c"]);
-        let normalized = normalize_path(&path);
-        assert_eq!(normalized, test_abs(&["a", "b", "c"]));
-    }
-
-    #[test]
-    fn test_normalize_path_removes_dotdot() {
-        let path = test_abs(&["a", "b", "..", "c"]);
-        let normalized = normalize_path(&path);
-        assert_eq!(normalized, test_abs(&["a", "c"]));
-    }
-
-    #[test]
-    fn test_normalize_path_multiple_dotdots() {
-        let path = test_abs(&["a", "b", "c", "..", "..", "d"]);
-        let normalized = normalize_path(&path);
-        assert_eq!(normalized, test_abs(&["a", "d"]));
-    }
-
-    #[test]
-    fn test_normalize_path_root_reset() {
-        // A plain absolute path should be returned unchanged.
-        let path = test_abs(&["a", "b"]);
-        let normalized = normalize_path(&path);
-        assert_eq!(normalized, test_abs(&["a", "b"]));
-    }
-
-    #[test]
-    fn test_normalize_path_empty_after_dotdot() {
-        let path = test_abs(&["a", "..", ".."]);
-        let normalized = normalize_path(&path);
-        // Should result in just root — the RootDir sentinel is never popped.
-        assert_eq!(normalized, test_root());
-    }
-
-    #[test]
-    fn test_normalize_path_many_dotdots_cannot_escape_root() {
-        // No matter how many `..` are chained, we must not go above the root.
-        let path = test_abs(&[
-            "a", "b", "c", "..", "..", "..", "..", "..", "..", "..", "..",
-        ]);
-        let normalized = normalize_path(&path);
-        assert_eq!(normalized, test_root());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn test_normalize_path_windows_drive() {
-        let normalized = normalize_path(Path::new("C:\\Users\\test\\.\\..\\docs"));
-        assert_eq!(normalized, PathBuf::from("C:\\Users\\docs"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn test_normalize_path_windows_dotdot_cannot_escape_drive_root() {
-        let normalized = normalize_path(Path::new("C:\\a\\..\\..\\..\\escape"));
-        // `..` cannot pop RootDir or Prefix, so we end up at C:\ + Normal("escape")
-        assert_eq!(normalized, PathBuf::from("C:\\escape"));
-    }
+    // normalize_path's own dot/dotdot behavior is covered by
+    // sandbox::scopes's test suite for normalize_path_lexically, which this
+    // module now calls directly rather than keeping a duplicate.
 }

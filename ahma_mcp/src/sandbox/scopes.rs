@@ -44,7 +44,10 @@ pub(crate) enum HomeBreadth {
 /// Resolve `path` for comparison: real canonicalization when the path exists,
 /// lexical normalization otherwise (a scope that does not exist is rejected
 /// elsewhere; this keeps the classification total).
-fn resolve_for_comparison(path: &Path) -> PathBuf {
+///
+/// `pub(crate)` so `sandbox::core` shares this instead of keeping its own copy
+/// (the two were previously byte-identical private functions).
+pub(crate) fn resolve_for_comparison(path: &Path) -> PathBuf {
     dunce::canonicalize(path).unwrap_or_else(|_| normalize_path_lexically(path))
 }
 

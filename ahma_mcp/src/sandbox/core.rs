@@ -189,19 +189,12 @@ fn is_in_temp_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve `path` for scope comparison: real canonicalization when it exists,
-/// lexical normalization otherwise, so `..` cannot walk out of a scope on a path
-/// that has not been created yet.
-fn resolve_for_scope_compare(path: &Path) -> PathBuf {
-    dunce::canonicalize(path).unwrap_or_else(|_| scopes::normalize_path_lexically(path))
-}
-
 /// Whether `candidate` is `container` or lies under it, compared after
 /// resolution (SPEC R5.7: scope decisions hold after symlink resolution; and
 /// `Path::starts_with` is case-sensitive on Windows though the filesystem is
 /// not, so a raw `C:\users\...` would otherwise miss a canonical `C:\Users\...`).
 fn resolves_within(candidate: &Path, container: &Path) -> bool {
-    resolve_for_scope_compare(candidate).starts_with(resolve_for_scope_compare(container))
+    scopes::resolve_for_comparison(candidate).starts_with(scopes::resolve_for_comparison(container))
 }
 
 /// The name of the immediate child of `container` that `requested` lives in, or
@@ -214,8 +207,8 @@ fn resolves_within(candidate: &Path, container: &Path) -> bool {
 /// container has not chosen a project, which is exactly the case R5.2.8 makes
 /// the command surfaces refuse outright.
 fn container_child_name(container: &Path, requested: &Path) -> Option<std::ffi::OsString> {
-    let container = resolve_for_scope_compare(container);
-    let requested = resolve_for_scope_compare(requested);
+    let container = scopes::resolve_for_comparison(container);
+    let requested = scopes::resolve_for_comparison(requested);
 
     let relative = requested.strip_prefix(&container).ok()?;
     Some(relative.components().next()?.as_os_str().to_os_string())
