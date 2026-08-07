@@ -75,7 +75,7 @@ use crate::{
     client_type::McpClientType,
     config::ToolConfig,
     file_ops::{DefaultFileOpsProvider, DefaultWebPageFetcher, FileOpsProvider, WebPageFetcher},
-    llm_service::{DefaultLlmCompletionService, LlmCompletionService},
+    llm_service::DefaultLlmCompletionService,
     operation_monitor::{Operation, OperationStatus},
 };
 use serde_json::Value;
@@ -140,8 +140,8 @@ pub struct AhmaMcpService {
     pub file_ops_provider: Arc<dyn FileOpsProvider>,
     /// Custom web page fetcher.
     pub web_page_fetcher: Arc<dyn WebPageFetcher>,
-    /// Custom LLM completion service.
-    pub llm_service: Arc<dyn LlmCompletionService>,
+    /// LLM completion service used by the livelog pipeline.
+    pub llm_service: Arc<DefaultLlmCompletionService>,
     /// Last received timestamp for keep-alive optimization.
     pub last_received_signal: Arc<std::sync::atomic::AtomicU64>,
     /// True if the connected peer is an Ahma node.
@@ -855,12 +855,6 @@ impl AhmaMcpService {
         tx: tokio::sync::mpsc::UnboundedSender<ahma_common::web_approval::WebApprovalRequest>,
     ) {
         *self.web_approval_tx.lock().unwrap() = Some(tx);
-    }
-
-    /// Sets a custom LLM completion service.
-    pub fn with_llm_service(mut self, service: Arc<dyn LlmCompletionService>) -> Self {
-        self.llm_service = service;
-        self
     }
 
     /// Store the AppConfig that constructed this service so runtime events

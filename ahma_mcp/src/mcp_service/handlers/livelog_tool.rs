@@ -38,7 +38,7 @@ pub async fn handle_livelog_start(
     params: &Map<String, Value>,
     monitor: Arc<OperationMonitor>,
     sandbox: Arc<Sandbox>,
-    llm_service: Arc<dyn crate::llm_service::LlmCompletionService>,
+    llm_service: Arc<crate::llm_service::DefaultLlmCompletionService>,
 ) -> Result<String> {
     let livelog = config.livelog.as_ref().ok_or_else(|| {
         anyhow::anyhow!(

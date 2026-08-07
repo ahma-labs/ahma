@@ -221,7 +221,7 @@ pub use adapter::executor::{CommandExecutor, DefaultCommandExecutor};
 pub use file_ops::{
     DefaultFileOpsProvider, DefaultWebPageFetcher, FileOpsProvider, WebPageFetcher,
 };
-pub use llm_service::{DefaultLlmCompletionService, LlmCompletionService};
+pub use llm_service::DefaultLlmCompletionService;
 pub use mcp_client::{
     McpClientHandler, McpConnectionManager, McpServerConfig, McpServerKind, ToolInfo,
 };

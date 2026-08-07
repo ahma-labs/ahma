@@ -78,7 +78,7 @@ pub async fn run_livelog_pipeline(
     working_dir: &std::path::Path,
     cancellation_token: CancellationToken,
     monitor: Arc<OperationMonitor>,
-    llm_service: Arc<dyn crate::llm_service::LlmCompletionService>,
+    llm_service: Arc<crate::llm_service::DefaultLlmCompletionService>,
 ) {
     let provider = match config.llm_provider.resolve() {
         Ok(p) => p,
@@ -275,7 +275,7 @@ pub async fn run_livelog_pipeline(
 
 /// Immutable per-pipeline configuration threaded into [`maybe_analyze`].
 struct AnalysisCtx<'a> {
-    llm_service: &'a dyn crate::llm_service::LlmCompletionService,
+    llm_service: &'a crate::llm_service::DefaultLlmCompletionService,
     base_url: String,
     model: String,
     api_key: Option<String>,
@@ -450,7 +450,7 @@ pub async fn run_file_monitor_pipeline(
     llm_provider: LlmProviderConfig,
     cancellation_token: CancellationToken,
     monitor: Arc<OperationMonitor>,
-    llm_service: Arc<dyn crate::llm_service::LlmCompletionService>,
+    llm_service: Arc<crate::llm_service::DefaultLlmCompletionService>,
 ) {
     let provider = match llm_provider.resolve() {
         Ok(p) => p,

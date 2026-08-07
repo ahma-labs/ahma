@@ -1,25 +1,19 @@
 use anyhow::Result;
 use std::time::Duration;
 
-#[async_trait::async_trait]
-pub trait LlmCompletionService: Send + Sync + std::fmt::Debug {
-    async fn detect_issues(
-        &self,
-        base_url: &str,
-        model: &str,
-        api_key: Option<String>,
-        prompt: &str,
-        text: &str,
-        timeout: Duration,
-    ) -> Result<Option<String>>;
-}
-
+/// The livelog pipeline's LLM issue-detection call.
+///
+/// This was previously a trait (`LlmCompletionService`) with exactly one
+/// implementation and no test double — every test exercised this same
+/// concrete type and mocked at the HTTP layer via `wiremock` instead of
+/// swapping the trait impl. Collapsed to a concrete type to drop the
+/// `dyn`-dispatch/`async_trait` boxing overhead the indirection bought
+/// nothing for.
 #[derive(Debug, Clone, Default)]
 pub struct DefaultLlmCompletionService;
 
-#[async_trait::async_trait]
-impl LlmCompletionService for DefaultLlmCompletionService {
-    async fn detect_issues(
+impl DefaultLlmCompletionService {
+    pub async fn detect_issues(
         &self,
         base_url: &str,
         model: &str,
