@@ -1882,29 +1882,79 @@ fn provider_is_url(provider: &str) -> bool {
 /// addressed purely by URL. URL-shaped values are treated as a direct base URL
 /// so local models remain usable without a named config entry. When no provider
 /// is supplied, the first configured provider is used.
+/// Everything needed to build an [`LlmClient`], resolved from a provider name,
+/// a bare URL, or the configured default provider.
+///
+/// This deliberately carries `kind` alongside `num_ctx`. Both are declared in
+/// `~/.ahma/config.toml` and both were previously dropped on the way to the
+/// client — `num_ctx` made proactive compaction inert, and `kind` let the
+/// URL heuristic override an explicit `kind = "anthropic"` (issue #484).
+struct LlmConnection {
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+    num_ctx: Option<u32>,
+    /// Explicit wire format from config. `None` means no entry claimed this
+    /// URL, so [`LlmClient::new`]'s host heuristic should decide.
+    kind: Option<ahma_common::config::ProviderKind>,
+}
+
+impl LlmConnection {
+    fn from_resolved(
+        resolved: ahma_common::config::ResolvedProvider,
+        model_override: Option<String>,
+    ) -> Self {
+        Self {
+            base_url: resolved.base_url,
+            model: model_override.unwrap_or(resolved.default_model),
+            api_key: resolved.api_key,
+            num_ctx: resolved.num_ctx,
+            kind: Some(resolved.kind),
+        }
+    }
+
+    /// Build the client, honoring an explicit `kind` when config declared one
+    /// and otherwise leaving `LlmClient::new`'s host heuristic in charge.
+    fn into_client(self) -> LlmClient {
+        let client = LlmClient::new(self.base_url, self.model, self.api_key);
+        let client = match self.kind {
+            Some(ahma_common::config::ProviderKind::Anthropic) => {
+                client.with_flavor(ahma_llm_monitor::ApiFlavor::Anthropic)
+            }
+            Some(ahma_common::config::ProviderKind::OpenAi) => {
+                client.with_flavor(ahma_llm_monitor::ApiFlavor::OpenAi)
+            }
+            None => client,
+        };
+        client.with_num_ctx(self.num_ctx)
+    }
+}
+
 fn resolve_llm_connection(
     provider: Option<String>,
     model: Option<String>,
-) -> Result<(String, String, Option<String>, Option<u32>), String> {
+) -> Result<LlmConnection, String> {
     if let Some(p_name) = provider {
         if provider_is_url(&p_name) {
-            // The TUI persists the selected provider by URL, so a configured
-            // provider's declared context window must still be recovered here
-            // (issue #484 — a lost `num_ctx` silently disables compaction).
-            let num_ctx = ahma_common::config::AhmaConfig::load().num_ctx_for_base_url(&p_name);
-            return Ok((p_name, model.unwrap_or_default(), None, num_ctx));
+            // The TUI persists the selected provider by URL, so everything the
+            // matching config entry declares must still be recovered here
+            // (issue #484 — a lost `num_ctx` silently disables compaction, and
+            // a lost `kind` sends the wrong wire format to a proxied provider).
+            let config = ahma_common::config::AhmaConfig::load();
+            let entry = config.provider_for_base_url(&p_name);
+            return Ok(LlmConnection {
+                base_url: p_name,
+                model: model.unwrap_or_default(),
+                api_key: None,
+                num_ctx: entry.and_then(|e| e.num_ctx),
+                kind: entry.map(|e| e.kind),
+            });
         }
         let config = ahma_common::config::AhmaConfig::load();
         let resolved = config
             .resolve_provider(&p_name)
             .map_err(|e| format!("Failed to resolve provider '{}': {e}", p_name))?;
-        let resolved_model = model.unwrap_or(resolved.default_model);
-        return Ok((
-            resolved.base_url,
-            resolved_model,
-            resolved.api_key,
-            resolved.num_ctx,
-        ));
+        return Ok(LlmConnection::from_resolved(resolved, model));
     }
 
     let config = ahma_common::config::AhmaConfig::load();
@@ -1917,13 +1967,7 @@ fn resolve_llm_connection(
             first_provider.name
         )
     })?;
-    let resolved_model = model.unwrap_or(resolved.default_model);
-    Ok((
-        resolved.base_url,
-        resolved_model,
-        resolved.api_key,
-        resolved.num_ctx,
-    ))
+    Ok(LlmConnection::from_resolved(resolved, model))
 }
 
 /// A PromptRunner implementation that executes the agent loop inside ahma_core.
@@ -2075,8 +2119,9 @@ async fn build_agent_run_context(
     let service = ahma_mcp::get_active_service()
         .ok_or_else(|| "No active AhmaMcpService found in this process".to_string())?;
 
-    let (base_url, model_name, api_key, num_ctx) = resolve_llm_connection(provider, model)?;
-    let client = LlmClient::new(base_url, model_name, api_key).with_num_ctx(num_ctx);
+    let conn = resolve_llm_connection(provider, model)?;
+    let num_ctx = conn.num_ctx;
+    let client = conn.into_client();
 
     let available_tools = service.get_all_available_tools().await;
 
@@ -3479,24 +3524,80 @@ mod tests {
 
     #[test]
     fn resolve_llm_connection_url_provider_bypasses_config() {
-        let (base, model, key, _num_ctx) = resolve_llm_connection(
+        let conn = resolve_llm_connection(
             Some("http://localhost:1234/v1".to_string()),
             Some("my-model".to_string()),
         )
         .expect("URL provider resolves without config");
-        assert_eq!(base, "http://localhost:1234/v1");
-        assert_eq!(model, "my-model");
-        assert!(key.is_none());
+        assert_eq!(conn.base_url, "http://localhost:1234/v1");
+        assert_eq!(conn.model, "my-model");
+        assert!(conn.api_key.is_none());
     }
 
     #[test]
     fn resolve_llm_connection_url_provider_uses_empty_default_model() {
-        let (base, model, key, _num_ctx) =
-            resolve_llm_connection(Some("unix:///run/ahma.sock".to_string()), None)
-                .expect("unix URL provider resolves");
-        assert_eq!(base, "unix:///run/ahma.sock");
-        assert_eq!(model, "", "missing model defaults to empty string");
-        assert!(key.is_none());
+        let conn = resolve_llm_connection(Some("unix:///run/ahma.sock".to_string()), None)
+            .expect("unix URL provider resolves");
+        assert_eq!(conn.base_url, "unix:///run/ahma.sock");
+        assert_eq!(conn.model, "", "missing model defaults to empty string");
+        assert!(conn.api_key.is_none());
+    }
+
+    /// Regression for issue #484: an explicit `kind` from config must reach the
+    /// client. `LlmClient::new`'s heuristic keys off the Anthropic *host*, so a
+    /// `kind = "anthropic"` provider behind a proxy URL was silently built as
+    /// an OpenAI client and spoke the wrong wire format.
+    #[test]
+    fn explicit_provider_kind_overrides_the_url_flavor_heuristic() {
+        use ahma_common::config::ProviderKind;
+
+        let proxied = LlmConnection {
+            base_url: "https://llm-gateway.internal/v1".to_string(),
+            model: "claude-opus-4-8".to_string(),
+            api_key: Some("k".to_string()),
+            num_ctx: None,
+            kind: Some(ProviderKind::Anthropic),
+        };
+        assert_eq!(
+            proxied.into_client().flavor(),
+            ahma_llm_monitor::ApiFlavor::Anthropic,
+            "configured kind must win over the host heuristic"
+        );
+
+        // No matching config entry → the heuristic stays in charge.
+        let unknown = LlmConnection {
+            base_url: "https://llm-gateway.internal/v1".to_string(),
+            model: "m".to_string(),
+            api_key: None,
+            num_ctx: None,
+            kind: None,
+        };
+        assert_eq!(
+            unknown.into_client().flavor(),
+            ahma_llm_monitor::ApiFlavor::OpenAi
+        );
+    }
+
+    /// The context window must survive client construction alongside `kind` —
+    /// `with_flavor` runs after `LlmClient::new`, so applying it in the wrong
+    /// order would clobber `num_ctx` and re-break compaction (issue #484).
+    #[test]
+    fn provider_kind_and_num_ctx_both_reach_the_client() {
+        use ahma_common::config::ProviderKind;
+
+        let conn = LlmConnection {
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "ornith:35b".to_string(),
+            api_key: None,
+            num_ctx: Some(16_384),
+            kind: Some(ProviderKind::OpenAi),
+        };
+        let client = conn.into_client();
+        assert_eq!(client.flavor(), ahma_llm_monitor::ApiFlavor::OpenAi);
+        assert!(
+            client.sends_num_ctx(),
+            "num_ctx must survive the with_flavor call"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -1129,7 +1129,6 @@ fn maybe_decompose_goal(
 ) -> bool {
     use crate::llm_bridge::spawn_decompose_task;
     use crate::state::{LogEntry, LogLevel};
-    use ahma_llm_monitor::client::LlmClient;
 
     if let Some(stripped_goal) = text.strip_prefix('#') {
         let goal = stripped_goal.trim().to_string();
@@ -1145,8 +1144,7 @@ fn maybe_decompose_goal(
             level: LogLevel::Info,
             message: format!("Decomposing goal: {}", goal),
         });
-        let client = LlmClient::new(base_url.to_string(), model.to_string(), None)
-            .with_num_ctx(provider_num_ctx(base_url));
+        let client = crate::llm_bridge::build_configured_client(base_url, model);
         if let Some(tx) = &state.bridge_tx {
             spawn_decompose_task(client, goal, tx.clone());
         }
@@ -4429,8 +4427,7 @@ fn start_window_execution(win_id: usize, state: &mut crate::state::AppState) {
             } else {
                 None
             };
-            let num_ctx = provider_num_ctx(&base_url);
-            spawn_window_llm_task(win_id, base_url, model, num_ctx, command, mcp, abort_rx, tx);
+            spawn_window_llm_task(win_id, base_url, model, command, mcp, abort_rx, tx);
         }
     }
 }

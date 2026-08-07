@@ -516,19 +516,39 @@ impl AhmaConfig {
         entry.resolve()
     }
 
-    /// The declared context window (`num_ctx`) of the provider whose base URL
-    /// matches `base_url`, ignoring a trailing-slash difference.
+    /// The configured provider whose `base_url` matches `base_url`, ignoring a
+    /// trailing-slash difference.
     ///
-    /// Providers are often addressed by URL rather than name (the TUI persists
-    /// the selected provider's URL; auto-discovered local servers only have a
-    /// URL), and the context window must remain discoverable on those paths so
-    /// proactive compaction has a denominator (issue #484).
-    pub fn num_ctx_for_base_url(&self, base_url: &str) -> Option<u32> {
+    /// Providers are often addressed by URL rather than name — the TUI persists
+    /// the selected provider's URL, and auto-discovered local servers only ever
+    /// have a URL. Everything the entry declares (`num_ctx`, `kind`) must stay
+    /// recoverable on those paths, or config the user wrote is silently
+    /// discarded (issue #484).
+    pub fn provider_for_base_url(&self, base_url: &str) -> Option<&ProviderEntry> {
         let want = base_url.trim_end_matches('/');
         self.providers
             .iter()
             .find(|p| p.base_url.trim_end_matches('/') == want)
-            .and_then(|p| p.num_ctx)
+    }
+
+    /// The declared context window (`num_ctx`) of the provider whose base URL
+    /// matches `base_url`. Needed so proactive compaction has a denominator on
+    /// URL-addressed paths (issue #484).
+    pub fn num_ctx_for_base_url(&self, base_url: &str) -> Option<u32> {
+        self.provider_for_base_url(base_url).and_then(|p| p.num_ctx)
+    }
+
+    /// The declared wire-format `kind` of the provider whose base URL matches
+    /// `base_url`.
+    ///
+    /// `None` means no entry claims this URL, and the caller should fall back
+    /// to [`LlmClient::new`]'s host-based heuristic. An explicit `kind` is the
+    /// only thing that gets an `anthropic` provider behind a proxy URL talking
+    /// the right wire format, since the heuristic keys off the Anthropic host.
+    ///
+    /// [`LlmClient::new`]: https://docs.rs/ahma_llm_monitor
+    pub fn kind_for_base_url(&self, base_url: &str) -> Option<ProviderKind> {
+        self.provider_for_base_url(base_url).map(|p| p.kind)
     }
 }
 
@@ -2374,6 +2394,56 @@ fn atomic_write_toml(path: &Path, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for issue #484: a provider addressed by URL must still yield
+    /// its declared `kind`, not just its `num_ctx`. Losing `kind` let
+    /// `LlmClient::new`'s host heuristic build an OpenAI client for a provider
+    /// the user explicitly declared `anthropic`.
+    #[test]
+    fn base_url_lookup_recovers_both_kind_and_num_ctx() {
+        let cfg = AhmaConfig {
+            providers: vec![
+                ProviderEntry {
+                    name: "proxied-anthropic".into(),
+                    kind: ProviderKind::Anthropic,
+                    base_url: "https://llm-gateway.internal/v1/".into(),
+                    default_model: "claude-opus-4-8".into(),
+                    api_key: None,
+                    num_ctx: Some(16_384),
+                },
+                ProviderEntry {
+                    name: "ollama-local".into(),
+                    kind: ProviderKind::OpenAi,
+                    base_url: "http://localhost:11434/v1".into(),
+                    default_model: "m".into(),
+                    api_key: None,
+                    num_ctx: None,
+                },
+            ],
+            ..AhmaConfig::default()
+        };
+
+        // Trailing-slash difference must not hide the entry, for either field.
+        assert_eq!(
+            cfg.kind_for_base_url("https://llm-gateway.internal/v1"),
+            Some(ProviderKind::Anthropic),
+            "an explicit kind must survive URL addressing"
+        );
+        assert_eq!(
+            cfg.num_ctx_for_base_url("https://llm-gateway.internal/v1"),
+            Some(16_384)
+        );
+
+        assert_eq!(
+            cfg.kind_for_base_url("http://localhost:11434/v1"),
+            Some(ProviderKind::OpenAi)
+        );
+        assert_eq!(cfg.num_ctx_for_base_url("http://localhost:11434/v1"), None);
+
+        // Unclaimed URL → no opinion, so the caller's heuristic stays in charge.
+        assert_eq!(cfg.kind_for_base_url("http://elsewhere/v1"), None);
+        assert!(cfg.provider_for_base_url("http://elsewhere/v1").is_none());
+    }
 
     #[test]
     fn add_provider_persists_and_rejects_duplicates() {

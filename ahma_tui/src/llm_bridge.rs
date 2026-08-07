@@ -4,6 +4,32 @@ use ahma_llm_monitor::client::LlmClient;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
+/// Build an [`LlmClient`] for `base_url`, honoring everything the matching
+/// `~/.ahma/config.toml` entry declares.
+///
+/// The TUI addresses providers by URL, so a client built straight from
+/// [`LlmClient::new`] silently discards the entry's `kind` and `num_ctx`: the
+/// lost `num_ctx` makes proactive compaction inert (no denominator), and the
+/// lost `kind` lets the host heuristic override an explicit `kind =
+/// "anthropic"`, sending OpenAI-shaped requests to a proxied Anthropic
+/// provider. Issue #484.
+///
+/// When no entry claims this URL, the heuristic is left in charge — that is
+/// the correct behavior for ad-hoc and auto-discovered endpoints.
+pub fn build_configured_client(base_url: impl Into<String>, model: impl Into<String>) -> LlmClient {
+    use ahma_common::config::ProviderKind;
+
+    let base_url = base_url.into();
+    let config = ahma_common::config::AhmaConfig::load();
+    let client = LlmClient::new(base_url.clone(), model.into(), None);
+    let client = match config.kind_for_base_url(&base_url) {
+        Some(ProviderKind::Anthropic) => client.with_flavor(ahma_llm_monitor::ApiFlavor::Anthropic),
+        Some(ProviderKind::OpenAi) => client.with_flavor(ahma_llm_monitor::ApiFlavor::OpenAi),
+        None => client,
+    };
+    client.with_num_ctx(config.num_ctx_for_base_url(&base_url))
+}
+
 pub enum BridgeEvent {
     Token(String),
     /// Reasoning / "thinking" fragment, rendered in lower contrast.
@@ -500,14 +526,13 @@ pub fn spawn_window_llm_task(
     window_id: usize,
     base_url: String,
     model: String,
-    num_ctx: Option<u32>,
     instructions: String,
     mcp: Option<McpChatConfig>,
     mut abort_rx: tokio::sync::oneshot::Receiver<()>,
     tx: Sender<BridgeEvent>,
 ) {
     tokio::spawn(async move {
-        let client = LlmClient::new(base_url, model, None).with_num_ctx(num_ctx);
+        let client = build_configured_client(base_url, model);
         let system_msg = "You are a reasoning agent performing a subtask. Follow the instructions carefully and output the results.";
         let messages = vec![ChatMessage::user(instructions)];
 
