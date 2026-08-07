@@ -883,8 +883,7 @@ async fn spawn_background_bridge(
     }
     #[cfg(windows)]
     {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.creation_flags(crate::shell_pool::CREATE_NO_WINDOW);
     }
 
     let (stdout_path, stderr_path) = match prepare_bridge_capture_files() {

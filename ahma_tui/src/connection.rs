@@ -701,8 +701,7 @@ fn spawn_server_process(exe: &std::path::Path, args: &[&str]) -> Result<()> {
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            cmd.creation_flags(ahma_mcp::shell_pool::CREATE_NO_WINDOW);
         }
         cmd.spawn()?;
     }

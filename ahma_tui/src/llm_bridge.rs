@@ -383,25 +383,6 @@ pub fn spawn_decompose_task(client: LlmClient, goal: String, tx: Sender<BridgeEv
     });
 }
 
-/// Kill a spawned window command **and its whole process group**.
-///
-/// Window commands are spawned as process-group leaders, so on Unix
-/// `kill(-pgid)` takes down the descendants too. `child.kill()` alone signals
-/// only the direct shell: cancelling a window running `cargo build` would reap
-/// `bash` and leave `cargo`/`rustc` burning CPU with no way for the user to see
-/// or stop them. Same defect class as the leak fixed in #508.
-async fn kill_window_process_tree(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        // Negative pid targets the process group led by the child.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-    }
-    // Idempotent on Unix after the group kill; also reaps the child.
-    let _ = child.kill().await;
-}
-
 pub fn spawn_window_cli_task(
     window_id: usize,
     command_str: String,
@@ -475,7 +456,7 @@ pub fn spawn_window_cli_task(
         tokio::select! {
             biased;
             _ = &mut abort_rx => {
-                kill_window_process_tree(&mut child).await;
+                let _ = ahma_mcp::shell_pool::kill_process_tree(&mut child).await;
                 let _ = stdout_handle.await;
                 let _ = stderr_handle.await;
                 let _ = tx.send(BridgeEvent::WindowFinished {
