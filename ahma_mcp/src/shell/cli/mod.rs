@@ -392,41 +392,18 @@ fn canonicalize_paths(paths: &[PathBuf], context: &str) -> Result<Vec<PathBuf>> 
 }
 
 fn ensure_task_vault_layout(task_vault_root: &Path) -> Result<PathBuf> {
-    let workdir = task_vault_root.join("workdir");
-    let inputs = task_vault_root.join("inputs");
-    let outputs = task_vault_root.join("outputs");
-    let trash = task_vault_root.join("trash");
-    let audit_log = task_vault_root.join("audit.jsonl");
-
-    std::fs::create_dir_all(&inputs).with_context(|| {
-        format!(
-            "Failed to create task vault inputs dir: {}",
-            inputs.display()
-        )
-    })?;
-    std::fs::create_dir_all(&workdir)
-        .with_context(|| format!("Failed to create task vault workdir: {}", workdir.display()))?;
-    std::fs::create_dir_all(&outputs).with_context(|| {
-        format!(
-            "Failed to create task vault outputs dir: {}",
-            outputs.display()
-        )
-    })?;
-    std::fs::create_dir_all(&trash)
-        .with_context(|| format!("Failed to create task vault trash dir: {}", trash.display()))?;
-    if !audit_log.exists() {
-        std::fs::write(&audit_log, b"").with_context(|| {
+    let vault =
+        crate::vault::TaskVault::create_at(task_vault_root.to_path_buf()).with_context(|| {
             format!(
-                "Failed to initialize task vault audit log: {}",
-                audit_log.display()
+                "Failed to create task vault at {}",
+                task_vault_root.display()
             )
         })?;
-    }
 
-    dunce::canonicalize(&workdir).with_context(|| {
+    dunce::canonicalize(&vault.workdir).with_context(|| {
         format!(
             "Failed to canonicalize task vault workdir: {}",
-            workdir.display()
+            vault.workdir.display()
         )
     })
 }

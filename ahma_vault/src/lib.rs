@@ -1,5 +1,16 @@
 //! # ahma_vault — Task Vault primitives
 //!
+//! **Deliberately forked from `ahma_mcp::vault`**, not an accidental
+//! duplicate: this crate's core (`TaskVault`, `audit`, `trash`) started as a
+//! copy of `ahma_mcp/src/vault/{mod,audit,trash}.rs`, split out so `ahma_mcp`
+//! itself could stay MIT OR Apache-2.0 while this crate carries the
+//! AGPL-3.0-or-later `egress` addition. `ahma_mcp` cannot depend on this
+//! crate (see the licensing note in `ahma_mcp/src/lib.rs`), and `ahma_mcp`'s
+//! copy additionally carries an `rm_interceptor` module this crate does not
+//! have. Keep the two copies' core logic in sync by hand until/unless the
+//! shared pieces are extracted into a third, license-neutral crate both can
+//! depend on.
+//!
 //! A Task Vault is a per-question isolated working directory that enforces the
 //! "dedicated folder per task" security principle by construction.  Every vault
 //! gets its own kernel-sandbox scope, two-phase trash, and append-only audit log.
