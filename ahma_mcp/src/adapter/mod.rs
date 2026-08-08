@@ -38,7 +38,12 @@
 //! - **Resource RAII**: The adapter manages temporary files created for complex
 //!   multi-line arguments, ensuring they are automatically cleaned up even if
 //!   an operation times out or is cancelled.
+//! - **Auditability**: every execution path writes a `tool_call` to the
+//!   append-only [`audit`] log *before* spawning, and exactly one matching
+//!   `tool_complete` on every terminal path. Output tells you what a command
+//!   printed; the audit log is what tells you that it happened.
 
+pub mod audit;
 pub mod executor;
 pub mod mutex_groups;
 mod preparer;
@@ -99,6 +104,25 @@ fn cpu_probe_threshold(idle_limit: Option<Duration>) -> Option<Duration> {
     // A third of the budget leaves room for at least two samples (a rise needs
     // two) before the watchdog is entitled to fire.
     idle_limit.map(|limit| (limit / 3).min(CPU_LIVENESS_PROBE_AFTER))
+}
+
+/// Result of one prepared synchronous run: what the caller gets back, plus the
+/// two facts the audit log needs (how it ended, and with which exit code).
+struct SyncRun {
+    outcome: audit::Outcome,
+    exit_code: Option<i32>,
+    result: Result<String, anyhow::Error>,
+}
+
+impl SyncRun {
+    /// A run that never produced an exit status (spawn or sandbox-wrap failure).
+    fn failed(err: anyhow::Error) -> Self {
+        Self {
+            outcome: audit::Outcome::Failed,
+            exit_code: None,
+            result: Err(err),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -326,6 +350,17 @@ impl Adapter {
         {
             Ok(p) => Ok(p),
             Err(e) => {
+                // A scope rejection is a security decision, so it gets the same
+                // durable record a runtime denial does — otherwise the two halves
+                // of the same story (refused up front vs refused by the kernel)
+                // land in different places and only one survives the session.
+                audit::record_sandbox_denial(
+                    None,
+                    std::path::Path::new(working_dir),
+                    "working_directory",
+                    tool,
+                )
+                .await;
                 sandbox::grant_channel::notify_pre_exec(
                     self.scope_grant_notifier.as_ref(),
                     &e,
@@ -457,6 +492,58 @@ impl Adapter {
             args_vec
         );
 
+        // Provenance before execution (SPEC R-HANDOFF / audit): the synchronous
+        // path has no operation id of its own, so mint one purely so the
+        // `tool_call` and its `tool_complete` can be correlated in the log.
+        let op_id = generate_id(command, command);
+        let safe_wd_str = safe_wd.to_string_lossy().into_owned();
+        audit::record_tool_call(
+            &op_id,
+            command,
+            args.as_ref(),
+            &safe_wd_str,
+            &program,
+            &args_vec,
+        )
+        .await;
+
+        let start_time = Instant::now();
+        let run = self
+            .run_sync_prepared(
+                command,
+                &op_id,
+                &program,
+                &args_vec,
+                &safe_wd,
+                timeout_seconds,
+            )
+            .await;
+        audit::record_tool_complete(
+            &op_id,
+            run.outcome,
+            start_time.elapsed().as_millis() as u64,
+            run.exit_code,
+        )
+        .await;
+        run.result
+    }
+
+    /// Spawn, wait for, and interpret one prepared synchronous command.
+    ///
+    /// Split out of [`Self::execute_sync_in_dir`] so that every terminal path —
+    /// spawn failure, timeout, non-zero exit, sandbox denial — funnels through a
+    /// single return value the caller can turn into exactly one `tool_complete`
+    /// audit event.  Recording completion at each `return` instead would be one
+    /// forgotten branch away from a `tool_call` that never closes.
+    async fn run_sync_prepared(
+        &self,
+        command: &str,
+        op_id: &str,
+        program: &str,
+        args_vec: &[String],
+        safe_wd: &std::path::Path,
+        timeout_seconds: Option<u64>,
+    ) -> SyncRun {
         let timeout = timeout_seconds
             .map(Duration::from_secs)
             .unwrap_or_else(|| self.shell_pool.config().command_timeout);
@@ -466,13 +553,16 @@ impl Adapter {
         // the caller has NOT already added the -c flag via a subcommand config.
         // For bash/powershell the preparer already embeds -c/-Command; always
         // use create_command so the sandbox wrapper is applied without double-wrapping.
-        let mut cmd = build_sandboxed_command(
+        let mut cmd = match build_sandboxed_command(
             self.command_executor.as_ref(),
             &self.sandbox,
-            &program,
-            &args_vec,
-            &safe_wd,
-        )?;
+            program,
+            args_vec,
+            safe_wd,
+        ) {
+            Ok(cmd) => cmd,
+            Err(e) => return SyncRun::failed(e),
+        };
 
         // Spawn manually (rather than `cmd.output()`) so a timeout can take down
         // the whole process group — `cmd.output()` drops the future on timeout,
@@ -483,9 +573,12 @@ impl Adapter {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("Command execution failed: {}", e))?;
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
+            }
+        };
         // Capture the pid before `wait_with_output` consumes `child`.
         #[cfg(unix)]
         let child_pid = child.id();
@@ -501,12 +594,18 @@ impl Adapter {
                         libc::kill(-(pid as i32), libc::SIGKILL);
                     }
                 }
-                return Err(anyhow::anyhow!(
-                    "Operation timed out (exceeded timeout limit): {} seconds",
-                    timeout.as_secs()
-                ));
+                return SyncRun {
+                    outcome: audit::Outcome::TimedOut,
+                    exit_code: None,
+                    result: Err(anyhow::anyhow!(
+                        "Operation timed out (exceeded timeout limit): {} seconds",
+                        timeout.as_secs()
+                    )),
+                };
             }
-            Ok(Err(e)) => return Err(anyhow::anyhow!("Command execution failed: {}", e)),
+            Ok(Err(e)) => {
+                return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
+            }
             Ok(Ok(output)) => output,
         };
 
@@ -515,6 +614,7 @@ impl Adapter {
         // an out-of-scope path it references.
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let exit_code = output.status.code();
         let result = interpret_sync_command_output(output);
         if result.is_err() {
             sandbox::grant_channel::notify_stderr_denial(
@@ -532,17 +632,33 @@ impl Adapter {
             if let Some(hit) = sandbox::scan_denial_streams(&stderr, &stdout)
                 && !self.sandbox.is_path_in_scope(&hit.path)
             {
+                // Same payload, durable copy: the structured error reaches the
+                // agent now, the audit line survives the session (SPEC R5.4.7).
+                audit::record_sandbox_denial(Some(op_id), &hit.path, hit.access.label(), command)
+                    .await;
                 let details = result.err().map(|e| e.to_string()).unwrap_or_default();
-                return Err(sandbox::SandboxError::RuntimeDenial {
-                    path: hit.path,
-                    access: hit.access,
-                    scopes: self.sandbox.scopes().to_vec(),
-                    details,
-                }
-                .into());
+                return SyncRun {
+                    outcome: audit::Outcome::Failed,
+                    exit_code,
+                    result: Err(sandbox::SandboxError::RuntimeDenial {
+                        path: hit.path,
+                        access: hit.access,
+                        scopes: self.sandbox.scopes().to_vec(),
+                        details,
+                    }
+                    .into()),
+                };
             }
         }
-        result
+        SyncRun {
+            outcome: if result.is_ok() {
+                audit::Outcome::Completed
+            } else {
+                audit::Outcome::Failed
+            },
+            exit_code,
+            result,
+        }
     }
 
     /// Synchronously executes a command with optional retry logic for transient errors.
@@ -693,6 +809,20 @@ impl Adapter {
         operation.output_file = Some(spill::operation_spill_path(&op_id));
         self.monitor.add_operation(operation).await;
 
+        // Durable provenance, written *before* the task is spawned. Doing it here
+        // rather than inside the task is the point: nothing between this line and
+        // the process exiting — a panic, a SIGKILL, a hang, a machine losing
+        // power — can leave the log without a record of what was asked for.
+        audit::record_tool_call(
+            &op_id,
+            tool_name,
+            args.as_ref(),
+            &safe_wd_str,
+            &program_with_subcommand,
+            &args_vec,
+        )
+        .await;
+
         let monitor = self.monitor.clone();
         let shell_pool = self.shell_pool.clone();
         let sandbox = self.sandbox.clone(); // Clone ARC to pass to task
@@ -762,6 +892,17 @@ impl Adapter {
         operation.output_file = Some(spill::operation_spill_path(&op_id));
         self.monitor.add_operation(operation).await;
 
+        let audit_argv = [command_str.to_string()];
+        audit::record_tool_call(
+            &op_id,
+            tool_name,
+            None,
+            &safe_wd.to_string_lossy(),
+            "[pty]",
+            &audit_argv,
+        )
+        .await;
+
         let cancellation_token = match self.monitor.get_operation(&op_id).await {
             Some(op) => op.cancellation_token.clone(),
             None => anyhow::bail!("operation {op_id} vanished before start"),
@@ -780,7 +921,8 @@ impl Adapter {
         let op_id_task = op_id.clone();
 
         let handle = tokio::spawn(async move {
-            pty_exec::run_pty_operation(
+            let started = Instant::now();
+            let (outcome, exit_code) = pty_exec::run_pty_operation(
                 &sandbox,
                 &command_str,
                 &safe_wd,
@@ -788,6 +930,13 @@ impl Adapter {
                 &cancellation_token,
                 &op_id_task,
                 &monitor,
+            )
+            .await;
+            audit::record_tool_complete(
+                &op_id_task,
+                outcome,
+                started.elapsed().as_millis() as u64,
+                exit_code,
             )
             .await;
             task_handles.lock().await.remove(&op_id_task);
@@ -828,6 +977,17 @@ impl Adapter {
         operation.output_file = Some(spill::operation_spill_path(&op_id));
         self.monitor.add_operation(operation).await;
 
+        let audit_argv = [command_str.to_string()];
+        audit::record_tool_call(
+            &op_id,
+            tool_name,
+            None,
+            &safe_wd.to_string_lossy(),
+            &format!("[session {session_id}]"),
+            &audit_argv,
+        )
+        .await;
+
         let cancellation_token = match self.monitor.get_operation(&op_id).await {
             Some(op) => op.cancellation_token.clone(),
             None => anyhow::bail!("operation {op_id} vanished before start"),
@@ -848,7 +1008,8 @@ impl Adapter {
         let op_id_task = op_id.clone();
 
         let handle = tokio::spawn(async move {
-            run_session_operation(
+            let started = Instant::now();
+            let (outcome, exit_code) = run_session_operation(
                 &sessions,
                 &sandbox,
                 &session_id,
@@ -858,6 +1019,13 @@ impl Adapter {
                 &cancellation_token,
                 &op_id_task,
                 &monitor,
+            )
+            .await;
+            audit::record_tool_complete(
+                &op_id_task,
+                outcome,
+                started.elapsed().as_millis() as u64,
+                exit_code,
             )
             .await;
             task_handles.lock().await.remove(&op_id_task);
@@ -970,10 +1138,27 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         scope_grant_notifier,
     } = ctx;
 
+    // Timed from the moment the task starts, so queueing behind a command mutex
+    // group is visible in the audit record rather than silently excluded.
+    let task_start = Instant::now();
+    let audit_complete = |outcome: audit::Outcome, exit_code: Option<i32>| {
+        let op_id = op_id.clone();
+        async move {
+            audit::record_tool_complete(
+                &op_id,
+                outcome,
+                task_start.elapsed().as_millis() as u64,
+                exit_code,
+            )
+            .await;
+        }
+    };
+
     let cancellation_token = match monitor.get_operation(&op_id).await {
         Some(operation) => operation.cancellation_token.clone(),
         None => {
             tracing::error!("Could not find operation {} for cancellation token", op_id);
+            audit_complete(audit::Outcome::Failed, None).await;
             return;
         }
     };
@@ -990,6 +1175,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     if cancellation_token.is_cancelled() {
         tracing::info!("Operation {} was cancelled before execution started", op_id);
         handle_cancellation(&monitor, &op_id).await;
+        audit_complete(audit::Outcome::Cancelled, None).await;
         return;
     }
 
@@ -1019,6 +1205,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
                      Try again after it completes."
                 );
                 fail_operation_with_error(&monitor, &op_id, err).await;
+                audit_complete(audit::Outcome::TimedOut, None).await;
                 task_handles.lock().await.remove(&op_id);
                 return;
             }
@@ -1045,6 +1232,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         Err(e) => {
             let err_msg = format!("Failed to create sandboxed command: {}", e);
             fail_operation_with_error(&monitor, &op_id, err_msg).await;
+            audit_complete(audit::Outcome::Failed, None).await;
             task_handles.lock().await.remove(&op_id);
             return;
         }
@@ -1059,7 +1247,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
     // appends to the tail buffer and emits `OutputLine` on the unified event
     // stream — so the TUI and hub subscribers see output as it is produced.
     // Log-monitor alerting only runs when a config was provided.
-    execute_with_streaming(
+    let (outcome, exit_code) = execute_with_streaming(
         &mut proc_cmd,
         timeout_ms,
         log_monitor_config,
@@ -1073,6 +1261,7 @@ async fn run_async_operation(ctx: AsyncOperationRun) {
         &command,
     )
     .await;
+    audit_complete(outcome, exit_code).await;
 
     task_handles.lock().await.remove(&op_id);
 }
@@ -1138,7 +1327,7 @@ async fn run_session_operation(
     cancellation_token: &tokio_util::sync::CancellationToken,
     op_id: &str,
     monitor: &Arc<OperationMonitor>,
-) {
+) -> (audit::Outcome, Option<i32>) {
     let mut spill_writer = spill::SpillWriter::create(op_id).await;
     let mut collected = BoundedLineCollector::default();
 
@@ -1180,7 +1369,7 @@ async fn run_session_operation(
                         Some(Value::String("Operation was cancelled".to_string())),
                     )
                     .await;
-                return;
+                return (audit::Outcome::Cancelled, None);
             }
 
             line = line_rx.recv() => {
@@ -1227,6 +1416,12 @@ async fn run_session_operation(
             monitor
                 .update_status(op_id, status, Some(final_output))
                 .await;
+            let outcome = if exit_code == 0 {
+                audit::Outcome::Completed
+            } else {
+                audit::Outcome::Failed
+            };
+            (outcome, Some(exit_code))
         }
         Err(e) => {
             let timed_out = e.to_string().contains("timed out");
@@ -1238,6 +1433,12 @@ async fn run_session_operation(
             monitor
                 .update_status(op_id, status, Some(Value::String(e.to_string())))
                 .await;
+            let outcome = if timed_out {
+                audit::Outcome::TimedOut
+            } else {
+                audit::Outcome::Failed
+            };
+            (outcome, None)
         }
     }
 }
@@ -1269,6 +1470,10 @@ async fn cancel_operation_timed_out(
 /// stream).  When `monitor_config` is `Some`, each line is additionally fed
 /// through a `LogMonitor` which checks for error/warning patterns and emits
 /// `Alert` events.
+///
+/// Returns how the operation ended and, where one exists, its exit code — the
+/// caller turns that into the single `tool_complete` audit event that pairs with
+/// the `tool_call` written before the task was spawned.
 #[allow(clippy::too_many_arguments)]
 async fn execute_with_streaming(
     proc_cmd: &mut tokio::process::Command,
@@ -1282,7 +1487,7 @@ async fn execute_with_streaming(
     sandbox: &Arc<sandbox::Sandbox>,
     scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
     tool: &str,
-) {
+) -> (audit::Outcome, Option<i32>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     // Ensure stdin/stdout/stderr are strictly isolated (should already be set by sandbox)
@@ -1295,7 +1500,7 @@ async fn execute_with_streaming(
         Err(e) => {
             fail_operation_with_error(op_monitor, op_id, format!("Failed to spawn process: {}", e))
                 .await;
-            return;
+            return (audit::Outcome::Failed, None);
         }
     };
 
@@ -1348,7 +1553,7 @@ async fn execute_with_streaming(
                 }
                 spill.finish().await;
                 handle_cancellation(op_monitor, op_id).await;
-                return;
+                return (audit::Outcome::Cancelled, None);
             }
 
             // Timeout
@@ -1360,7 +1565,7 @@ async fn execute_with_streaming(
                 spill.finish().await;
                 let duration_ms = start_time.elapsed().as_millis() as u64;
                 cancel_operation_timed_out(op_monitor, op_id, duration_ms).await;
-                return;
+                return (audit::Outcome::TimedOut, None);
             }
 
             _ = still_running_interval.tick() => {
@@ -1448,7 +1653,7 @@ async fn execute_with_streaming(
         scope_grant_notifier,
         tool,
     )
-    .await;
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1518,7 +1723,7 @@ async fn finalize_streaming_operation(
     sandbox: &Arc<sandbox::Sandbox>,
     scope_grant_notifier: Option<&Arc<dyn sandbox::ScopeGrantNotifier>>,
     tool: &str,
-) {
+) -> (audit::Outcome, Option<i32>) {
     let exit_status = child.wait().await;
     let duration_ms = start_time.elapsed().as_millis() as u64;
     tracing::debug!("Operation {} process exited after {}ms", op_id, duration_ms);
@@ -1552,6 +1757,9 @@ async fn finalize_streaming_operation(
         if let Some(hit) = sandbox::scan_denial_streams(&stderr_str, &stdout_str)
             && !sandbox.is_path_in_scope(&hit.path)
         {
+            // The alert below is transient; this line is the durable copy of the
+            // same structured denial (SPEC R5.4.7).
+            audit::record_sandbox_denial(Some(op_id), &hit.path, hit.access.label(), tool).await;
             let remediation =
                 sandbox::grant_channel::runtime_denial_remediation(&hit.path, hit.access);
             tracing::warn!(
@@ -1616,6 +1824,13 @@ async fn finalize_streaming_operation(
     op_monitor
         .update_status(op_id, status, Some(final_output))
         .await;
+
+    let outcome = if success {
+        audit::Outcome::Completed
+    } else {
+        audit::Outcome::Failed
+    };
+    (outcome, exit_status.as_ref().ok().and_then(|s| s.code()))
 }
 
 /// Handle cancellation of an operation — shared logic for both execution paths.

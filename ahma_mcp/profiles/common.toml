@@ -9,3 +9,8 @@ deny_write = []
 [[rules]]
 path = "${XDG_CACHE_HOME:-~/.cache}"
 access = "rx"
+
+# No `[[hosts]]`. A cache directory is not an ecosystem and reaches nothing of
+# its own; every host belongs to the toolchain that fetches it. Inventing an
+# entry here would grant it to everyone who left `common` enabled, which is
+# everyone.

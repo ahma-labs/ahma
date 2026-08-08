@@ -10,3 +10,18 @@ access = "rx"
 [[rules]]
 path = "~/.npm"
 access = "rx"
+
+# Hostnames this toolchain must reach when `--restrict-network` is on. See the
+# rust profile for the rationale; these widen nothing unless restriction is on.
+
+[[hosts]]
+host = "registry.npmjs.org"
+reason = "the npm registry — both metadata and package tarballs (dist.tarball URLs point here)"
+
+[[hosts]]
+host = "registry.yarnpkg.com"
+reason = "yarn classic's registry alias; a lockfile written by yarn resolves against this name"
+
+[[hosts]]
+host = "nodejs.org"
+reason = "runtime tarballs for `nvm install` (nvm's default NVM_NODEJS_ORG_MIRROR is nodejs.org/dist)"

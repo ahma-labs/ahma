@@ -87,7 +87,43 @@ async fn maybe_start_egress_proxy(
     if !config.restrict_network {
         return None;
     }
-    let allowlist = crate::egress::EgressAllowlist::from_str(&config.network_allow.join("\n"));
+    // Windows AppContainer and the egress proxy cannot both be in effect
+    // (SPEC R6.3.3.1a). An AppContainer blocks loopback unless the container is
+    // registered with `CheckNetIsolation LoopbackExempt`, and this proxy binds
+    // 127.0.0.1 — so a sandboxed child cannot reach it.
+    //
+    // Starting the proxy anyway would be the worst of both outcomes rather than a
+    // partial one: a tool that honors HTTP_PROXY fails every request (it cannot
+    // connect to the proxy at all), while a tool that ignores HTTP_PROXY reaches
+    // the internet completely unrestricted through the container's internet-client
+    // capability. The restriction would be broken *and* unenforced, and the
+    // interactive-approval path (R-WEB.16.8) could never fire to explain why.
+    //
+    // Non-fatal, matching the proxy-start failure below: the server still runs. What
+    // it must never do is let the operator believe egress is gated when it is not.
+    if cfg!(target_os = "windows") {
+        tracing::error!(
+            "--restrict-network is NOT in effect this session. On Windows every command is \
+             launched into an AppContainer (SPEC R6.3.3), which blocks loopback — so the egress \
+             proxy would be unreachable by the very subprocesses it exists to gate, and network \
+             egress would be unrestricted for any tool that opens its own socket. Pick one: run \
+             without --restrict-network (AppContainer filesystem isolation stays), or disable the \
+             sandbox with --disable-sandbox to get proxy-based egress gating without it."
+        );
+        return None;
+    }
+    // The reachable set is the *union* of what the operator asked for and what
+    // each enabled sandbox profile declares its toolchain needs — never one
+    // replacing the other. Without the profile half, turning restriction on broke
+    // `cargo build` on the first command, which is why almost nobody did.
+    // See `egress::host_grants` for why the default nonetheless stays opt-in.
+    let grants = crate::egress::EgressGrants::compute(crate::egress::EgressGrantSources {
+        operator_allow: &config.network_allow,
+        enabled_profiles: &config.sandbox_profiles,
+        profile_hosts: config.network_profile_hosts,
+        deny_profile_hosts: &config.network_deny_profile_hosts,
+    });
+    let allowlist = grants.allowlist();
     let proxy = match crate::egress::EgressProxy::start(crate::egress::EgressProxyConfig {
         allowlist,
         net_approval,
@@ -111,20 +147,35 @@ async fn maybe_start_egress_proxy(
     // egress except this proxy address, so a subprocess that ignores HTTP_PROXY
     // still cannot reach the network directly. No-op on other platforms.
     sandbox.set_egress_proxy_addr(Some(proxy.local_addr));
-    if config.network_allow.is_empty() {
+    if grants.is_empty() {
         tracing::warn!(
-            "NETWORK EGRESS RESTRICTED (--restrict-network): [network] allow is EMPTY, so ALL \
+            "NETWORK EGRESS RESTRICTED (--restrict-network): nothing is reachable, so ALL \
              subprocess network egress is denied. Add domains to [network] allow in \
-             ~/.ahma/settings.toml. {enforcement}",
+             ~/.ahma/settings.toml, or re-enable sandbox profiles (`[sandbox] profiles`, \
+             `[network] profile_hosts`) to let each toolchain contribute its own. \
+             {enforcement}",
             enforcement = network_enforcement_note(),
         );
     } else {
+        // Every host names the grant behind it (R-PERM.5.2). A merged anonymous
+        // list would tell an operator *that* `proxy.golang.org` is reachable but
+        // not that one line in their settings file removes it — a grant whose
+        // origin is invisible cannot be refused.
+        let opt_out = match grants.contributing_profiles().as_slice() {
+            [] => String::new(),
+            profiles => format!(
+                " Profile-contributed hosts come from: {}; drop them with \
+                 `[network] deny_profile_hosts` (keeps the toolchain's file access) or all of \
+                 them with `[network] profile_hosts = false`.",
+                profiles.join(", ")
+            ),
+        };
         tracing::warn!(
             "NETWORK EGRESS RESTRICTED (--restrict-network): sandboxed subprocesses are routed \
-             through a guarded proxy at {addr}; reachable domains: {allow:?}. Private/loopback/\
-             cloud-metadata targets are refused. {enforcement}",
+             through a guarded proxy at {addr}. Private/loopback/cloud-metadata targets are \
+             refused. Reachable hosts, and who granted each:\n{disclosure}\n{enforcement}{opt_out}",
             addr = proxy.local_addr,
-            allow = config.network_allow,
+            disclosure = grants.disclosure(),
             enforcement = network_enforcement_note(),
         );
     }
@@ -817,9 +868,6 @@ pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
     if config.force_sync {
         push(&mut args, "--sync");
     }
-    if config.hot_reload_tools {
-        push(&mut args, "--hot-reload");
-    }
     if config.defer_sandbox {
         push(&mut args, "--defer-sandbox");
     }
@@ -1184,16 +1232,6 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         );
     }
 
-    // Hot-reload is opt-in because runtime writes can change tool behavior mid-session.
-    if config.hot_reload_tools {
-        match config.tools_dir.clone() {
-            Some(tools_dir) => service_handler.start_config_watcher(tools_dir, config.clone()),
-            None => tracing::warn!(
-                "--hot-reload is set but no tools directory is configured; hot-reload is disabled"
-            ),
-        }
-    }
-
     let sandbox_scopes = sandbox
         .scopes()
         .iter()
@@ -1300,6 +1338,13 @@ mod tests {
             no_sandbox: true,
             restrict_network: false,
             network_allow: vec![],
+            // Profile hosts off by default in these tests: each case states the
+            // exact reachable set it means to exercise, and a test that silently
+            // inherited the shipped toolchain hosts would stop testing its own
+            // input. `profile_hosts_seed_the_allowlist` opts back in explicitly.
+            network_profile_hosts: false,
+            network_deny_profile_hosts: vec![],
+            sandbox_profiles: vec![],
             sandbox_scopes: vec![],
             use_scratch_dir: false,
             container_root: None,
@@ -1316,7 +1361,6 @@ mod tests {
             request_budget_override_secs: None,
             force_progress_notifications: false,
             force_sync: false,
-            hot_reload_tools: false,
             skip_availability_probes: false,
             no_temp_files: false,
             log_monitor: false,
@@ -1881,7 +1925,6 @@ mod tests {
             "--no-sandbox",
             "--skip-probes",
             "--sync",
-            "--hot-reload",
             "--defer-sandbox",
             "--scratch",
             "--tmp",
@@ -1900,7 +1943,6 @@ mod tests {
             no_sandbox: true,
             skip_availability_probes: true,
             force_sync: true,
-            hot_reload_tools: true,
             defer_sandbox: true,
             use_scratch_dir: true,
             tmp_access: true,
@@ -1912,7 +1954,6 @@ mod tests {
             "--no-sandbox",
             "--skip-probes",
             "--sync",
-            "--hot-reload",
             "--defer-sandbox",
             "--scratch",
             "--tmp",
@@ -2226,6 +2267,96 @@ mod tests {
         let proxy =
             proxy.expect("restrict_network=true with a non-empty allowlist must start the proxy");
         assert!(proxy.local_addr.port() != 0);
+        assert!(proxy.allows("example.com"));
+        assert!(proxy.allows("api.example.org"));
+        assert!(!proxy.allows("elsewhere.example"));
+    }
+
+    #[tokio::test]
+    async fn profile_hosts_seed_the_allowlist() {
+        // The wiring test for the whole feature: `--restrict-network` with *no*
+        // hand-written `[network] allow` must still let cargo, npm and go reach
+        // their registries, because the enabled sandbox profiles said so. Before
+        // this, the same configuration denied everything, and the first command
+        // an operator ran after enabling restriction failed — which is why
+        // essentially nobody enabled it.
+        let tmp = tempdir().unwrap();
+        let sb = make_test_sandbox(tmp.path());
+        let cfg = AppConfig {
+            restrict_network: true,
+            network_allow: vec![],
+            network_profile_hosts: true,
+            sandbox_profiles: crate::sandbox::profiles::default_profile_names(),
+            ..base_cfg()
+        };
+
+        let proxy = maybe_start_egress_proxy(&cfg, &sb, test_net_approval())
+            .await
+            .expect("restriction on must start the proxy");
+        for host in ["index.crates.io", "registry.npmjs.org", "proxy.golang.org"] {
+            assert!(
+                proxy.allows(host),
+                "{host} must be reachable from the shipped profiles alone"
+            );
+        }
+        assert!(
+            !proxy.allows("evil.example"),
+            "seeding the allowlist must not widen it to everything"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_allow_composes_with_profile_hosts_at_the_proxy() {
+        // Guards the natural-but-wrong implementation: "if the operator wrote an
+        // allowlist, use theirs". That would break every toolchain the moment an
+        // operator added one internal host of their own.
+        let tmp = tempdir().unwrap();
+        let sb = make_test_sandbox(tmp.path());
+        let cfg = AppConfig {
+            restrict_network: true,
+            network_allow: vec!["artifacts.internal.example".to_string()],
+            network_profile_hosts: true,
+            sandbox_profiles: vec!["rust".to_string()],
+            ..base_cfg()
+        };
+
+        let proxy = maybe_start_egress_proxy(&cfg, &sb, test_net_approval())
+            .await
+            .expect("restriction on must start the proxy");
+        assert!(
+            proxy.allows("artifacts.internal.example"),
+            "operator's host"
+        );
+        assert!(proxy.allows("index.crates.io"), "…and the rust profile's");
+        assert!(
+            !proxy.allows("registry.npmjs.org"),
+            "…but only the profiles that are enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn withholding_profile_hosts_leaves_the_operators_own_list_intact() {
+        // `[network] profile_hosts = false` is a hardening knob, not a kill
+        // switch: it must not take the operator's own entries down with it.
+        let tmp = tempdir().unwrap();
+        let sb = make_test_sandbox(tmp.path());
+        let cfg = AppConfig {
+            restrict_network: true,
+            network_allow: vec!["artifacts.internal.example".to_string()],
+            network_profile_hosts: false,
+            sandbox_profiles: crate::sandbox::profiles::default_profile_names(),
+            ..base_cfg()
+        };
+
+        let proxy = maybe_start_egress_proxy(&cfg, &sb, test_net_approval())
+            .await
+            .expect("restriction on must start the proxy");
+        assert!(proxy.allows("artifacts.internal.example"));
+        assert!(!proxy.allows("index.crates.io"));
+        assert_eq!(
+            proxy.allowlist_entries(),
+            vec!["artifacts.internal.example"]
+        );
     }
 
     // ------------------------------------------------------------------

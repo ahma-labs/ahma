@@ -14,10 +14,12 @@ and then asks you — once, clearly, with the option to remember your answer.
 
 Every permission you grant lives in **`~/.ahma/settings.toml`**, and that
 directory is the one place the sandbox *never* includes. A sandboxed command
-cannot read it and cannot write it. So no matter what a command does — no matter
-how thoroughly it is compromised or how confused an AI agent gets — **it cannot
-grant itself anything**. Only you can, and only after seeing the exact line that
-would be written.
+cannot write it — kernel-enforced on Linux and macOS — and cannot read it either
+(on macOS via the credential denylist, since reads there are not scoped; see
+[Limitations](#limitations-stated-plainly)). So no matter what a command does — no
+matter how thoroughly it is compromised or how confused an AI agent gets — **it
+cannot grant itself anything**. Only you can, and only after seeing the exact line
+that would be written.
 
 ```bash
 ahma permissions list                      # everything ahma has been granted
@@ -118,15 +120,32 @@ Note what the `rust` profile deliberately does **not** do: it never makes
 Granting all of `~/.cargo` would be simpler and would hand a sandboxed command
 your crates.io token and write access to every binary on your PATH.
 
-## A limitation, stated plainly
+## Limitations, stated plainly
 
-**On macOS, ahma scopes writes but not reads.** Apple's sandbox cannot reliably
-match read paths under APFS firmlinks, so ahma grants blanket read access rather
-than pretend to a protection it doesn't have. Writes are still kernel-enforced.
+**On macOS, ahma scopes writes but not reads** (SPEC R6.2.2). Apple's sandbox
+cannot reliably match read paths under APFS firmlinks, so ahma grants blanket read
+access rather than pretend to a protection it doesn't have. Writes are still
+kernel-enforced. What keeps your secrets out of reach there is a **denylist** of
+credential paths and key material (SPEC R6.2.3) — and a denylist is a weaker thing
+than a scope: a scope denies everything it doesn't name, a denylist denies only
+what it does. Anything nobody thought to enumerate is readable.
 
 Practically: on macOS, treat anything *you* can read as readable by a sandboxed
-command. Linux (Landlock) scopes both. ahma shows this in `ahma status` and in the
-TUI scope panel rather than burying it here.
+command unless it is on that list. Linux (Landlock) scopes both directions
+properly (SPEC R6.1.6). **On Windows, neither** — a Job Object bounds process
+lifetime, not filesystem paths, and AppContainer is not wired up yet (SPEC
+R6.3.9). ahma shows all of this in `ahma status` and in the TUI scope panel rather
+than burying it here.
+
+**Some paths inside your workspace are not writable, and the protection is not
+uniform.** Files that something outside the sandbox later executes by convention —
+git hook directories, ahma's own `.ahma/` tool definitions, container daemon
+sockets — are denied outright; editor and harness configuration is allowed but
+disclosed loudly when written. That deny tier is kernel-enforced on macOS,
+**application-layer only on Linux** (so a shell command through
+`run_terminal_command` can still write those paths), and unenforced on Windows.
+See [`docs/security-sandbox.md`](security-sandbox.md#writable-but-not-everything-trust-handoff)
+and SPEC R-HANDOFF.
 
 ## Command reference
 

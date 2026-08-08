@@ -127,7 +127,7 @@ The unifying design decisions (each is a phase below):
 
 - `~/.config/ahma/` is written by nothing; `grep -rn "config_dir\|approvals.json"` shows only migration code.
 - One file (`settings.toml`) holds all `always` grants of all kinds; one CLI manages them; every write previewed.
-- Docs: fix `docs/security-sandbox.md:188` (says `~/.config/ahma/settings.toml`; code uses `~/.ahma/settings.toml`) and stale env-var references in `ahma_mcp/src/lib.rs:82` and `shell/cli/mod.rs:478`.
+- Docs: fix `docs/security-sandbox.md` where it said `~/.config/ahma/settings.toml` (code uses `~/.ahma/settings.toml`) and the stale env-var references in `ahma_mcp/src/lib.rs` and `shell/cli/mod.rs`.
 
 ---
 
@@ -172,10 +172,10 @@ The unifying design decisions (each is a phase below):
 **Goal**: remove every hard-coded toolchain path from the sandbox backends; ship equivalent *profiles* as data folded through the same grant pipeline; disclose what can't be expressed.
 
 **Current state (verified anchors)**:
-- macOS `ahma_mcp/src/sandbox/seatbelt.rs`: `get_macos_user_tool_rules` (:191-207) hard-codes `[".cargo", ".rustup"]`; `get_macos_temp_rules` (:244); `get_macos_system_rules` (:181-189) emits a blanket `(allow file-read*)` — an APFS firmlink/cryptex workaround, i.e. **all reads are open on macOS**.
-- Linux `ahma_mcp/src/sandbox/landlock.rs`: `add_landlock_home_tool_rules` (:233) hard-codes `[".cargo", ".rustup", ".nvm", ".npm", ".go", ".cache"]`; system rules (:208); temp (:302).
-- Package-cache carve-out `ahma_mcp/src/sandbox/pkg_cache.rs` (:46-62): cargo registry/git writable, `bin/`+`config.toml`+`credentials.toml` never (:16-20); npm/pip/go stubs (:84).
-- Credential-read denylist `ahma_mcp/src/sandbox/credential_reads.rs:48-56` (macOS-only today).
+- macOS `ahma_mcp/src/sandbox/seatbelt.rs`: `get_macos_user_tool_rules` hard-codes `[".cargo", ".rustup"]`; `get_macos_temp_rules`; `get_macos_system_rules` emits a blanket `(allow file-read*)` — an APFS firmlink/cryptex workaround, i.e. **all reads are open on macOS** (now stated as SPEC R6.2.2, with the compensating denylist as R6.2.3).
+- Linux `ahma_mcp/src/sandbox/landlock.rs`: `add_landlock_home_tool_rules` hard-codes `[".cargo", ".rustup", ".nvm", ".npm", ".go", ".cache"]`, plus system and temp rules.
+- Package-cache carve-out (then `ahma_mcp/src/sandbox/pkg_cache.rs`, since folded into the shipped `rust` profile): cargo registry/git writable, `bin/`+`config.toml`+`credentials.toml` never; npm/pip/go stubs. The cross-project consequence of that `rw` grant is SPEC R-HANDOFF.8.
+- Credential-read denylist `ahma_mcp/src/sandbox/credential_reads.rs` (macOS-only, because it exists only to compensate for R6.2.2).
 
 ### Steps
 
@@ -197,7 +197,7 @@ The unifying design decisions (each is a phase below):
 2. **Fold-in path**: profiles resolve to `GrantRecord { granted_by: "builtin-profile(rust)" }` entries merged into the effective scope at the same point `resolve_persistent_scopes` (`shell/cli/mod.rs:569`) merges user grants. Backends (`seatbelt.rs`, `landlock.rs`) then consume *only* the resolved scope list — delete `get_macos_user_tool_rules`, `add_landlock_home_tool_rules`, and migrate `pkg_cache.rs` logic into the `rust` profile (keep `pre_create_package_cache_paths` behavior as a profile attribute, e.g. `precreate = true`).
 3. **Configurability**: `[sandbox] profiles = ["rust", "node"]` in `settings.toml`; default = all builtin profiles enabled (**opt-out first** — preserves current behavior while making it visible and disableable). `ahma permissions list` shows profile entries with provenance; `ahma permissions profiles list|enable|disable` manages them.
 4. **Suggest-on-denial** (stretch, may split to follow-up PR): when a denial path matches a *disabled or unshipped* profile pattern (e.g. `~/.gradle/caches`), the broker's question offers "enable the `<name>` profile" as an alternative to a one-off grant.
-5. **Disclosure of the undeniable**: the macOS blanket read-allow cannot be a profile. Add a persistent disclosure line to every scope display (TUI scope panel, `--list-tools`/startup banner, `status` tool output): `macOS: writes kernel-scoped; reads unrestricted (platform limitation)`. This applies R7.5's honesty principle to ahma's own backend. Do not bury it in docs only.
+5. **Disclosure of the undeniable**: the macOS blanket read-allow cannot be a profile. Add a persistent disclosure line to every scope display (TUI scope panel, `--list-tools`/startup banner, `status` tool output): `macOS: writes kernel-scoped; reads unrestricted (platform limitation)`. This applies R7.5's honesty principle to ahma's own backend. Do not bury it in docs only. (Now specified as SPEC R-PERM.5.1.)
 6. **System dirs stay code**: `/usr`, `/bin`, `/etc` read-only rules and device-path denials are platform invariants, not app exceptions — they remain in the backends. The test for "is this a crutch?" is *app-specific*, not *platform-specific*.
 
 ### Tests
@@ -318,9 +318,9 @@ The unifying design decisions (each is a phase below):
 | Grant tool (two-gate, elicitation) | `ahma_mcp/src/mcp_service/handlers/sandbox_grant_tool.rs` | `handle_sandbox_grant` :109, `classify_grant_risk` :307, `preview_text` :497 |
 | Denial detection | `ahma_mcp/src/mcp_service/handlers/common.rs` | :79 pre-exec, :112 runtime |
 | Notifier rungs | `ahma_mcp/src/sandbox/grant_channel.rs` | `ScopeGrantNotifier` :128, `HubGrantNotifier` :182, `grant_dir_for` :37 |
-| macOS crutches | `ahma_mcp/src/sandbox/seatbelt.rs` | :181-207, :244 |
-| Linux crutches | `ahma_mcp/src/sandbox/landlock.rs` | :208, :233, :302 |
-| Package cache carve-out | `ahma_mcp/src/sandbox/pkg_cache.rs` | :16-20, :46-62 |
+| macOS crutches | `ahma_mcp/src/sandbox/seatbelt.rs` | `get_macos_system_rules`, `get_macos_user_tool_rules`, `get_macos_temp_rules` |
+| Linux crutches | `ahma_mcp/src/sandbox/landlock.rs` | `add_landlock_system_rules`, `add_landlock_home_tool_rules`, temp rules |
+| Package cache carve-out | `ahma_mcp/src/sandbox/profiles.rs` (was `pkg_cache.rs`) | shipped `rust` profile |
 | Hooks decisions / wrapper | `ahma_mcp/src/hooks/mod.rs` | :37, :1125, :1146 (fail-open), :1386, :1575 |
 | Hooks setup filter | `ahma_mcp/src/setup.rs` | :263-277 |
 | Hub wire format | `ahma_common/src/daemon_hub.rs` | `OpStarted` :122, `OpFinished` :137, history :604-731 |

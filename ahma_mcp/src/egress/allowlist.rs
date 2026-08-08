@@ -1,13 +1,12 @@
-//! Per-vault domain allowlist for the egress proxy.
+//! The domain allowlist the egress proxy forwards on.
 //!
-//! The allowlist is stored as a plain-text file (`egress.allowlist`) inside
-//! the vault directory.  Each non-empty, non-comment line is a domain pattern.
+//! Two producers feed the same list:
 //!
-//! ## Matching rules
+//! * the operator's `[network] allow` (and a per-vault `egress.allowlist` file), and
+//! * the hosts contributed by enabled sandbox profiles ([`super::host_grants`]).
 //!
-//! - Exact domain: `api.openai.com` matches only `api.openai.com`.
-//! - Subdomain wildcard: `*.openai.com` matches any direct subdomain of `openai.com`.
-//! - All traffic (dangerous): `*` matches everything — use only for development.
+//! Both are parsed and matched by [`HostPattern`] — see that module for the exact
+//! matching semantics. This type is the set; the pattern type is the decision.
 //!
 //! ## File format
 //!
@@ -18,10 +17,18 @@
 //! api.openai.com
 //! *.anthropic.com
 //! ```
+//!
+//! A line that is not a well-formed host pattern is **dropped with a warning**,
+//! not coerced. Reading `https://crates.io` as the exact host `https://crates.io`
+//! would produce a rule that never fires while looking like it works, and a
+//! silently-inert allowlist entry is how an operator ends up believing egress is
+//! permitted when it is not — or the reverse.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+
+use super::host_pattern::HostPattern;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // EgressAllowlist
@@ -34,23 +41,23 @@ use anyhow::{Context, Result};
 /// to prevent information leakage about the allowlist contents).
 #[derive(Debug, Clone, Default)]
 pub struct EgressAllowlist {
-    patterns: Vec<AllowPattern>,
-}
-
-#[derive(Debug, Clone)]
-enum AllowPattern {
-    /// Matches exactly the given domain (case-insensitive).
-    Exact(String),
-    /// Matches `*.suffix` — any single-level subdomain of `suffix`.
-    Wildcard(String),
-    /// Matches everything.
-    Any,
+    patterns: Vec<HostPattern>,
 }
 
 impl EgressAllowlist {
     /// Create an empty (deny-all) allowlist.
     pub fn deny_all() -> Self {
         Self::default()
+    }
+
+    /// Build from already-parsed patterns — the path the profile-host union takes
+    /// ([`super::host_grants::EgressGrants::allowlist`]), where the strings were
+    /// validated at their source and re-parsing them would be a second chance to
+    /// disagree with the first.
+    pub fn from_patterns(patterns: impl IntoIterator<Item = HostPattern>) -> Self {
+        Self {
+            patterns: patterns.into_iter().collect(),
+        }
     }
 
     /// Load an allowlist from a file.
@@ -66,7 +73,7 @@ impl EgressAllowlist {
         Ok(Self::from_str(&contents))
     }
 
-    /// Parse allowlist from a string (used for tests and in-memory configs).
+    /// Parse an allowlist from newline-separated patterns.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         let mut patterns = vec![];
@@ -75,12 +82,12 @@ impl EgressAllowlist {
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            if trimmed == "*" {
-                patterns.push(AllowPattern::Any);
-            } else if let Some(suffix) = trimmed.strip_prefix("*.") {
-                patterns.push(AllowPattern::Wildcard(suffix.to_ascii_lowercase()));
-            } else {
-                patterns.push(AllowPattern::Exact(trimmed.to_ascii_lowercase()));
+            match HostPattern::parse(trimmed) {
+                Ok(p) => patterns.push(p),
+                Err(e) => tracing::warn!(
+                    "ignoring egress allowlist entry '{trimmed}': {e}. It grants nothing; \
+                     fix or remove it."
+                ),
             }
         }
         Self { patterns }
@@ -100,56 +107,29 @@ impl EgressAllowlist {
 
     /// Return `true` if `domain` is permitted by this allowlist.
     pub fn allows(&self, domain: &str) -> bool {
-        let lower = domain.to_ascii_lowercase();
-        for pattern in &self.patterns {
-            match pattern {
-                AllowPattern::Any => return true,
-                AllowPattern::Exact(d) => {
-                    if lower == *d {
-                        return true;
-                    }
-                }
-                AllowPattern::Wildcard(suffix) => {
-                    // *.example.com matches ONLY direct single-level subdomains:
-                    //   api.example.com  → YES (prefix "api", no dots)
-                    //   deep.api.example.com → NO  (prefix "deep.api", contains a dot)
-                    //   example.com → NO (no prefix at all)
-                    if let Some(rest) = lower.strip_suffix(suffix.as_str())
-                        && let Some(label) = rest.strip_suffix('.')
-                        && !label.is_empty()
-                        && !label.contains('.')
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        self.patterns.iter().any(|p| p.matches(domain))
     }
 
-    /// Add a domain pattern to this allowlist.
+    /// Add a domain pattern. A malformed pattern is refused with a warning rather
+    /// than stored as an entry that can never match.
     pub fn add(&mut self, pattern: &str) {
-        let trimmed = pattern.trim();
-        if trimmed == "*" {
-            self.patterns.push(AllowPattern::Any);
-        } else if let Some(suffix) = trimmed.strip_prefix("*.") {
-            self.patterns
-                .push(AllowPattern::Wildcard(suffix.to_ascii_lowercase()));
-        } else {
-            self.patterns
-                .push(AllowPattern::Exact(trimmed.to_ascii_lowercase()));
+        match HostPattern::parse(pattern) {
+            Ok(p) => self.patterns.push(p),
+            Err(e) => tracing::warn!("ignoring egress allowlist entry '{pattern}': {e}"),
         }
+    }
+
+    /// The patterns in this list, in canonical text form.
+    pub fn entries(&self) -> Vec<String> {
+        self.patterns.iter().map(HostPattern::as_str).collect()
     }
 
     /// Render to the file format.
     fn to_file_string(&self) -> String {
         let mut out = String::from("# ahma egress allowlist\n# One domain pattern per line.\n\n");
         for p in &self.patterns {
-            match p {
-                AllowPattern::Any => out.push_str("*\n"),
-                AllowPattern::Exact(d) => out.push_str(&format!("{d}\n")),
-                AllowPattern::Wildcard(s) => out.push_str(&format!("*.{s}\n")),
-            }
+            out.push_str(&p.as_str());
+            out.push('\n');
         }
         out
     }
@@ -199,6 +179,10 @@ mod tests {
             !list.allows("deep.api.openai.com"),
             "two levels not matched"
         );
+        assert!(
+            !list.allows("evilopenai.com"),
+            "no label boundary, no match — see host_pattern for the full case"
+        );
     }
 
     #[test]
@@ -212,6 +196,20 @@ mod tests {
         let list = al("# comment\n\napi.openai.com\n# another comment\n");
         assert!(list.allows("api.openai.com"));
         assert!(!list.allows("other.com"));
+    }
+
+    #[test]
+    fn a_malformed_entry_is_dropped_not_coerced() {
+        // A URL pasted into the allowlist must not become an exact host that can
+        // never match: the operator would read the file, see their domain, and
+        // conclude egress works.
+        let list = al("https://crates.io\ncrates.io\n");
+        assert_eq!(
+            list.entries(),
+            vec!["crates.io"],
+            "only the well-formed entry survives"
+        );
+        assert!(list.allows("crates.io"));
     }
 
     #[test]

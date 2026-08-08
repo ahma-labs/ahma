@@ -36,6 +36,15 @@
 //! | `api.openai.com` | User opts task into OpenAI |
 //! | `generativelanguage.googleapis.com` | User opts task into Gemini |
 //!
+//! ## Where the server's allowlist comes from
+//!
+//! For `--restrict-network` (the MCP server path, as opposed to a vault's own
+//! file) the allowlist is the union computed by [`host_grants::EgressGrants`]:
+//! the operator's `[network] allow` plus the hostnames each **enabled sandbox
+//! profile** declares for its toolchain. Read that module first — it explains why
+//! restriction stayed unused without it, and why the default is still off.
+//! [`host_pattern::HostPattern`] is the single matcher both paths share.
+//!
 //! ## Environment variables injected into sandboxed subprocesses
 //!
 //! ```text
@@ -45,10 +54,14 @@
 //! ```
 
 pub mod allowlist;
+pub mod host_grants;
+pub mod host_pattern;
 pub mod net_prompt;
 pub mod proxy;
 pub mod web_audit;
 pub mod web_prompt;
 
 pub use allowlist::EgressAllowlist;
+pub use host_grants::{EgressGrantSources, EgressGrants, GrantSource, HostGrant};
+pub use host_pattern::HostPattern;
 pub use proxy::{EgressProxy, EgressProxyConfig, NetApprovalContext};

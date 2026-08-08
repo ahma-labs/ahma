@@ -88,10 +88,19 @@
 //! | `AHMA_TMP_ACCESS` | `--tmp` |
 //! | `AHMA_DISABLE_TEMP` | `--disable-temp-files` |
 //! | `AHMA_TOOLS_DIR` | `--tools-dir <PATH>` |
-//! | `AHMA_TIMEOUT` / `AHMA_SYNC` / `AHMA_HOT_RELOAD` / `AHMA_SKIP_PROBES` | `--timeout <SECS>` / `--sync` / `--hot-reload` / `--skip-probes` |
+//! | `AHMA_TIMEOUT` / `AHMA_SYNC` / `AHMA_SKIP_PROBES` | `--timeout <SECS>` / `--sync` / `--skip-probes` |
+//! | `AHMA_HOT_RELOAD` | none — tool hot-reload was removed; use the `restart` tool |
 //! | `AHMA_LOG_TARGET` | `--log-to-stderr` or `[logging] target` in settings.toml |
 //! | `AHMA_LOG_MONITOR` / `AHMA_MONITOR_RATE_LIMIT` | `--log-monitor` / `--monitor-rate-limit <SECS>` |
 //! | `AHMA_DISABLE_QUIC` / `AHMA_DISABLE_HTTP1_1` / `AHMA_HANDSHAKE_TIMEOUT` | CLI flags & settings keys |
+//! | `AHMA_UNIX_SOCKET` | `--unix-socket-path` or `[http] unix_socket_path` in settings.toml |
+//! | `AHMA_MINIMIZE_TOKENS` / `AHMA_SMALL_MODEL_HARNESS` | `--minimize-tokens` / `--small-model-harness`, or the matching `[tools]` settings keys |
+//! | `AHMA_INSTALL_DIR` | `--install-dir` on `ahma update` |
+//!
+//! Retirement is a **product** rule, not a per-binary one: a variable that is
+//! ignored by `ahma` is ignored by `ahma-tui` and by every subcommand of either.
+//! [`warn_retired_env`] is the single place that verdict is spelled out, so a
+//! second surface cannot quietly keep honoring what the first one dropped.
 //!
 //! Platform/ecosystem-standard variables such as `RUST_LOG` remain honored
 //! (R-CFG1.3 allowlist), and internal parent→child plumbing variables are
@@ -230,6 +239,15 @@ pub use mcp_service::{
     ActiveAgentSession, ExtensionToolHandler, PromptRunner, get_global_prompt_runner,
     register_global_extension_handler, register_global_prompt_runner,
 };
+
+/// Warn that a **retired** `AHMA_*` configuration variable is set, then ignore it
+/// (SPEC R-CFG1.2/R-CFG1.2.1).
+///
+/// Re-exported, **not** redefined. The verdict lives in `ahma_common` so that
+/// `ahma_common` itself (`local_tls`) can reach it: a second copy here would be
+/// the very drift R-CFG1.2.1 forbids, one crate-graph layer down. See
+/// [`ahma_common::config::warn_retired_env`] for why there is only one.
+pub use ahma_common::config::warn_retired_env;
 
 static ACTIVE_SERVICE: std::sync::OnceLock<std::sync::Arc<AhmaMcpService>> =
     std::sync::OnceLock::new();

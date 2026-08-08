@@ -73,9 +73,6 @@ pub async fn run_http_bridge_mode(config: AppConfig) -> Result<()> {
     if config.no_temp_files {
         server_args.push("--disable-temp-files".to_string());
     }
-    if config.hot_reload_tools {
-        server_args.push("--hot-reload".to_string());
-    }
     if config.skip_availability_probes {
         server_args.push("--skip-probes".to_string());
     }

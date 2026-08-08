@@ -1,6 +1,157 @@
+use crate::sandbox::exec_config::{
+    ExecConfigClass, classify, escape_hatch, needs_git_dir_resolution, resolve_git_dirs_async,
+};
 use ahma_harness_tools::{DirEntryInfo, GrepMatch, WebFetchResult};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
+
+/// Guard a write against the auto-executing-configuration classes in
+/// [`crate::sandbox::exec_config`].
+///
+/// * [`ExecConfigClass::DenyWrite`] → `Err` with an actionable message naming the
+///   file, why it is refused, and — for the two rules that have an operator
+///   opt-in — the exact flag and settings key that permit it
+///   ([`crate::sandbox::exec_config::escape_hatch`]). A denial with no stated way
+///   out is what makes people switch the sandbox off wholesale, which is far
+///   worse than a narrow, disclosed opt-in.
+/// * [`ExecConfigClass::Disclose`] → `Ok(Some(`[`ExecConfigDisclosure`]`))`. The
+///   write proceeds; the caller **must** surface `notice` in the tool result, and
+///   the impl that lands the bytes records the durable half in the execution
+///   audit log (see [`record_trust_handoff_write`]).
+/// * anything else → `Ok(None)`.
+///
+/// # Enforcement asymmetry — stated, not papered over (SPEC R7)
+///
+/// ahma never silently disables enforcement, so the uneven story here is written
+/// down rather than implied:
+///
+/// * **macOS**: the `DenyWrite` *subpath* set (git hooks under every resolved git
+///   dir, `<workspace>/.ahma`) is **kernel-enforced** by Seatbelt, emitted as the
+///   last filesystem word in the profile. This check is a better error message in
+///   front of a real wall.
+/// * **Linux**: Landlock ABI V1 is additive-allow. There is no way to carve a deny
+///   hole inside an already-allowed subpath, so the `DenyWrite` set is enforced
+///   **only at this application layer** and is bypassable by any command run
+///   through `run_terminal_command`. That is a real gap, not a rounding error.
+/// * **Windows**: AppContainer spawn isolation is still pending (SPEC R6.3), so
+///   the same application-layer-only caveat applies.
+/// * **Everywhere**: the venv-shaped rule (`pyvenv.cfg`, `*/bin/python*`) is
+///   application-layer only on *all* platforms by choice — a kernel deny on
+///   `*/bin/python*` would break a legitimate `python -m venv`, and the attack
+///   this defends against is the agent authoring the fake interpreter directly
+///   through a write tool.
+///
+/// `Disclose` is application-layer everywhere by definition: it is a warning, and
+/// warnings cannot be emitted by a kernel policy.
+pub async fn exec_config_write_guard(
+    scopes: &[PathBuf],
+    path: &Path,
+) -> Result<Option<ExecConfigDisclosure>> {
+    let root = workspace_root_for(scopes, path);
+
+    // Cheap pass first: every rule except the git-directory ones is pure
+    // lexical, so an ordinary source-file write costs zero syscalls.
+    let mut hit = classify(path, &root, &[]);
+    if hit.is_none() && needs_git_dir_resolution(path) {
+        let git_dirs = resolve_git_dirs_async(&root).await;
+        hit = classify(path, &root, &git_dirs);
+    }
+
+    let Some((class, reason)) = hit else {
+        return Ok(None);
+    };
+    let shown = display_path(path, &root);
+    match class {
+        ExecConfigClass::DenyWrite => {
+            let way_out = escape_hatch(reason).map(str::to_string).unwrap_or_else(|| {
+                "There is no flag for this one — nothing legitimate writes it. If \
+                 this is genuinely what you want, create the file yourself outside \
+                 the agent session"
+                    .to_string()
+            });
+            bail!(
+                "Refusing to write {shown}: {reason}. ahma blocks this class of write \
+                 because it hands execution to a component outside the sandbox. {way_out}."
+            )
+        }
+        ExecConfigClass::Disclose => Ok(Some(ExecConfigDisclosure {
+            notice: format!(
+                "\n\n⚠ wrote {shown} — {reason}. Review it before your next \
+                 editor/git operation."
+            ),
+            path: shown,
+            trigger: reason.to_string(),
+        })),
+    }
+}
+
+/// A `Disclose`-tier write: allowed, but the caller owes the user a warning *and*
+/// the audit log a durable record.
+///
+/// The two halves are deliberately separate. `notice` is the transient half — it
+/// goes in the tool result and scrolls away with the conversation. `path` and
+/// `trigger` are the durable half, written to the execution audit log by
+/// [`record_trust_handoff_write`]. Trust-handoff attacks execute *later*, long
+/// after the transcript that carried the warning is gone (SPEC R-HANDOFF), so a
+/// warning nobody can go back and find is not a control.
+#[derive(Debug, Clone)]
+pub struct ExecConfigDisclosure {
+    /// Warning line to append to the tool result.
+    pub notice: String,
+    /// Workspace-relative spelling of the file that was written.
+    pub path: String,
+    /// What will execute it, and on which trigger.
+    pub trigger: String,
+}
+
+impl ExecConfigDisclosure {
+    /// The warning line, consuming the disclosure.
+    pub fn into_notice(self) -> String {
+        self.notice
+    }
+}
+
+/// Record a landed `Disclose`-tier write in the execution audit log.
+///
+/// Called *after* the bytes reach disk, never before: a refused or failed write
+/// is not a trust handoff, and an audit log that reports handoffs that did not
+/// happen is as useless as one that misses the ones that did.
+pub async fn record_trust_handoff_write(
+    disclosure: Option<&ExecConfigDisclosure>,
+    tool_name: &str,
+) {
+    if let Some(d) = disclosure {
+        crate::adapter::audit::record_trust_handoff(&d.path, &d.trigger, tool_name).await;
+    }
+}
+
+/// Pick the workspace root to classify against: the longest scope that contains
+/// `path`, falling back to the first scope, then to the path's own parent.
+///
+/// Longest-match matters when scopes nest (a container plus a project inside it):
+/// classifying `<container>/<project>/.vscode/tasks.json` against the container
+/// would still match, but `<project>/.ahma` must be judged relative to the
+/// project, not the container.
+fn workspace_root_for(scopes: &[PathBuf], path: &Path) -> PathBuf {
+    scopes
+        .iter()
+        .filter(|s| path.starts_with(s))
+        .max_by_key(|s| s.components().count())
+        .or_else(|| scopes.first())
+        .cloned()
+        .or_else(|| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Workspace-relative spelling for messages, so the warning reads
+/// `.vscode/tasks.json` rather than a 90-character absolute path. Falls back to
+/// the path as given when it is not under the root.
+fn display_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
 
 #[async_trait::async_trait]
 pub trait FileOpsProvider: Send + Sync {
@@ -56,8 +207,21 @@ impl FileOpsProvider for DefaultFileOpsProvider {
         ahma_harness_tools::list_dir(scopes, path).await
     }
 
+    /// Writes through the exec-config guard (see [`exec_config_write_guard`]).
+    ///
+    /// The guard also runs in the MCP handler, which is where the `Disclose`
+    /// warning reaches the caller. It runs *here* as well because this is the
+    /// impl that actually touches the disk: a `DenyWrite` refusal must not
+    /// depend on which caller happened to reach the provider.
+    ///
+    /// The audit record is written *here* rather than in the handler for the same
+    /// reason, plus one more: it is emitted after the bytes land, so the log never
+    /// claims a handoff that a failed write did not actually create.
     async fn write_file(&self, scopes: &[PathBuf], path: &Path, content: &str) -> Result<()> {
-        ahma_harness_tools::write_file(scopes, path, content).await
+        let disclosure = exec_config_write_guard(scopes, path).await?;
+        ahma_harness_tools::write_file(scopes, path, content).await?;
+        record_trust_handoff_write(disclosure.as_ref(), "write_file").await;
+        Ok(())
     }
 
     async fn replace_in_file(
@@ -67,7 +231,10 @@ impl FileOpsProvider for DefaultFileOpsProvider {
         old_str: &str,
         new_str: &str,
     ) -> Result<usize> {
-        ahma_harness_tools::replace_in_file(scopes, path, old_str, new_str).await
+        let disclosure = exec_config_write_guard(scopes, path).await?;
+        let replaced = ahma_harness_tools::replace_in_file(scopes, path, old_str, new_str).await?;
+        record_trust_handoff_write(disclosure.as_ref(), "replace_in_file").await;
+        Ok(replaced)
     }
 
     async fn file_search(
@@ -372,6 +539,188 @@ mod tests {
 
         let result = provider.read_file(&scopes, &target, None, None).await;
         assert!(result.is_err(), "out-of-scope read must be rejected");
+    }
+
+    #[tokio::test]
+    async fn ordinary_writes_are_not_flagged() {
+        let (_dir, base) = scope_dir();
+        let scopes = vec![base.clone()];
+        assert!(
+            exec_config_write_guard(&scopes, &base.join("src/main.rs"))
+                .await
+                .expect("plain source write must be allowed")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_a_git_hook_is_refused_with_an_actionable_message() {
+        let (_dir, base) = scope_dir();
+        let scopes = vec![base.clone()];
+        tokio::fs::create_dir_all(base.join(".git/hooks"))
+            .await
+            .unwrap();
+
+        let err = exec_config_write_guard(&scopes, &base.join(".git/hooks/post-checkout"))
+            .await
+            .expect_err("git hook write must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("post-checkout"), "must name the file: {msg}");
+        assert!(
+            msg.contains("git operation"),
+            "must say why it is refused: {msg}"
+        );
+        // The single most important part of the message: how to permit it. A
+        // denial that leaves the reader guessing is what makes people reach for
+        // `--no-sandbox` instead.
+        assert!(
+            msg.contains("--allow-git-hooks"),
+            "must name the CLI flag: {msg}"
+        );
+        assert!(
+            msg.contains("allow_git_hooks = true"),
+            "must name the settings key: {msg}"
+        );
+    }
+
+    /// End-to-end through the real provider: the refusal must happen *before* the
+    /// bytes land, not after.
+    #[tokio::test]
+    async fn provider_refuses_a_git_hook_and_writes_nothing() {
+        let (_dir, base) = scope_dir();
+        let scopes = vec![base.clone()];
+        tokio::fs::create_dir_all(base.join(".git/hooks"))
+            .await
+            .unwrap();
+        let hook = base.join(".git/hooks/pre-commit");
+
+        let result = DefaultFileOpsProvider
+            .write_file(&scopes, &hook, "exfiltrate\n")
+            .await;
+        assert!(result.is_err(), "provider must refuse the hook write");
+        assert!(!hook.exists(), "no bytes may reach disk on a refusal");
+    }
+
+    #[tokio::test]
+    async fn ahma_tool_config_write_is_refused() {
+        let (_dir, base) = scope_dir();
+        let scopes = vec![base.clone()];
+        let err = exec_config_write_guard(&scopes, &base.join(".ahma/tools/evil.json"))
+            .await
+            .expect_err(".ahma writes must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("MTDF"), "{msg}");
+        assert!(
+            msg.contains("--allow-project-tool-config"),
+            "must name the CLI flag: {msg}"
+        );
+        assert!(
+            msg.contains("allow_project_tool_config = true"),
+            "must name the settings key: {msg}"
+        );
+    }
+
+    /// A denial with no operator opt-in must say so plainly rather than dangle a
+    /// flag that does not exist.
+    #[tokio::test]
+    async fn a_refusal_without_an_opt_in_says_there_is_no_flag() {
+        let (_dir, base) = scope_dir();
+        let scopes = vec![base.clone()];
+        let err = exec_config_write_guard(&scopes, &base.join("venv/bin/python"))
+            .await
+            .expect_err("fake interpreter must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("no flag for this one"), "{msg}");
+        assert!(!msg.contains("--allow-"), "must not invent a flag: {msg}");
+    }
+
+    #[tokio::test]
+    async fn fake_python_interpreter_write_is_refused() {
+        let (_dir, base) = scope_dir();
+        let scopes = vec![base.clone()];
+        for rel in ["venv/bin/python3", "pyvenv.cfg"] {
+            assert!(
+                exec_config_write_guard(&scopes, &base.join(rel))
+                    .await
+                    .is_err(),
+                "{rel} must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vscode_tasks_write_succeeds_but_discloses() {
+        let (_dir, base) = scope_dir();
+        let scopes = vec![base.clone()];
+        let target = base.join(".vscode/tasks.json");
+
+        let disclosure = exec_config_write_guard(&scopes, &target)
+            .await
+            .expect("disclose must not block the write")
+            .expect("a warning must be produced");
+        let notice = &disclosure.notice;
+        assert!(notice.contains('⚠'), "warning must be visible: {notice}");
+        assert!(
+            notice.contains(".vscode") && notice.contains("tasks.json"),
+            "warning must name the file: {notice}"
+        );
+        assert!(
+            notice.contains("folderOpen"),
+            "warning must say what auto-executes: {notice}"
+        );
+        // The structured half the audit log records must carry the same two facts
+        // the warning does — the file, and what will execute it.
+        assert!(
+            disclosure.path.contains("tasks.json"),
+            "audit path: {}",
+            disclosure.path
+        );
+        assert!(
+            disclosure.trigger.contains("folderOpen"),
+            "audit trigger: {}",
+            disclosure.trigger
+        );
+
+        // …and the write really does go through (the underlying writer requires
+        // an existing parent, which is orthogonal to this guard).
+        tokio::fs::create_dir_all(base.join(".vscode"))
+            .await
+            .unwrap();
+        DefaultFileOpsProvider
+            .write_file(&scopes, &target, "{}")
+            .await
+            .expect("a disclosed write must still succeed");
+        assert!(target.exists());
+    }
+
+    #[tokio::test]
+    async fn git_config_write_is_disclosed_not_blocked() {
+        let (_dir, base) = scope_dir();
+        let scopes = vec![base.clone()];
+        tokio::fs::create_dir_all(base.join(".git")).await.unwrap();
+
+        let disclosure = exec_config_write_guard(&scopes, &base.join(".git/config"))
+            .await
+            .expect("`git config user.email` must keep working")
+            .expect("but it must warn");
+        assert!(
+            disclosure.notice.contains("core.hooksPath"),
+            "{}",
+            disclosure.notice
+        );
+    }
+
+    #[test]
+    fn workspace_root_prefers_the_longest_containing_scope() {
+        use crate::test_utils::path_helpers::test_abs;
+        let container = test_abs(&["container"]);
+        let project = test_abs(&["container", "project"]);
+        let target = project.join(".ahma/x.json");
+        let root = workspace_root_for(&[container, project.clone()], &target);
+        assert_eq!(
+            root, project,
+            "a nested project's .ahma must be judged against the project"
+        );
     }
 
     #[test]

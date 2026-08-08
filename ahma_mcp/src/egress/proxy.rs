@@ -103,6 +103,14 @@ impl Default for NetApprovalContext {
 pub struct EgressProxy {
     /// The local address the proxy is bound to.
     pub local_addr: SocketAddr,
+    /// The allowlist actually installed in the accept loop.
+    ///
+    /// Kept on the handle so the effective policy is *observable* rather than
+    /// swallowed by `start`. The seam between "which hosts did we decide on" and
+    /// "which hosts is the running proxy enforcing" is exactly where a wiring
+    /// mistake hides — a caller that built the right union and passed the wrong
+    /// variable would still start a proxy on a real port and look healthy.
+    allowlist: Arc<EgressAllowlist>,
     /// Background task handle (aborted on drop).
     _task: tokio::task::JoinHandle<()>,
 }
@@ -119,14 +127,29 @@ impl EgressProxy {
         let allowlist = Arc::new(cfg.allowlist);
         let block_private = cfg.block_private;
         let net_approval = cfg.net_approval;
-        let task = tokio::spawn(async move {
-            accept_loop(listener, allowlist, block_private, net_approval).await;
+        let task = tokio::spawn({
+            let allowlist = Arc::clone(&allowlist);
+            async move {
+                accept_loop(listener, allowlist, block_private, net_approval).await;
+            }
         });
 
         Ok(Self {
             local_addr,
+            allowlist,
             _task: task,
         })
+    }
+
+    /// Whether the running proxy would forward a connection to `host` on the
+    /// strength of its static allowlist alone (before interactive approval).
+    pub fn allows(&self, host: &str) -> bool {
+        self.allowlist.allows(host)
+    }
+
+    /// The allowlist entries the running proxy is enforcing, in canonical form.
+    pub fn allowlist_entries(&self) -> Vec<String> {
+        self.allowlist.entries()
     }
 
     /// Return the `HTTP_PROXY` URL for this proxy.

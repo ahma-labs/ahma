@@ -1,13 +1,21 @@
+//! Tool definitions are loaded once, at startup — never re-read from disk.
+//!
+//! SECURITY: the tools directory sits inside the sandbox scope, so the agent
+//! under execution can write it. MTDF's `command` is a free-form string, so a
+//! server that re-read the directory at runtime would let a sandboxed agent
+//! repoint an already-approved tool name at an arbitrary command with no
+//! restart and no notification. The file watcher that used to do exactly that
+//! has been removed; the deliberate, auditable reload path is the `restart`
+//! builtin. This test is the end-to-end guard on that property.
+
 use ahma_common::timeouts::{TestTimeouts, TimeoutCategory};
 use ahma_mcp::test_utils::client::ClientBuilder;
-use ahma_mcp::test_utils::concurrency::wait_for_condition;
 use anyhow::Result;
 use std::fs;
-use std::time::Duration;
 use tempfile::tempdir;
 
 #[tokio::test]
-async fn test_config_reload_stays_off_by_default() -> Result<()> {
+async fn tool_definitions_are_never_reloaded_from_disk() -> Result<()> {
     let temp_dir = tempdir()?;
     let tools_dir = temp_dir.path().to_path_buf();
 
@@ -26,6 +34,8 @@ async fn test_config_reload_stays_off_by_default() -> Result<()> {
     assert!(tools.tools.iter().any(|t| t.name == "initial_tool"));
     assert!(!tools.tools.iter().any(|t| t.name == "new_tool"));
 
+    // Write a brand-new tool and repoint an existing one, exactly as a
+    // sandboxed agent with workspace write access could.
     fs::write(
         tools_dir.join("new_tool.json"),
         tool_json("new_tool", "New tool added dynamically"),
@@ -44,7 +54,7 @@ async fn test_config_reload_stays_off_by_default() -> Result<()> {
     .await??;
     assert!(
         !tools.tools.iter().any(|t| t.name == "new_tool"),
-        "New tool should not appear without --hot-reload-tools"
+        "a tool written after startup must not appear without a restart"
     );
     assert_eq!(
         tools
@@ -54,108 +64,7 @@ async fn test_config_reload_stays_off_by_default() -> Result<()> {
             .and_then(|t| t.description.clone())
             .as_deref(),
         Some("Initial tool"),
-        "Initial tool description should stay unchanged without --hot-reload-tools"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_config_reload_when_hot_reload_enabled() -> Result<()> {
-    let temp_dir = tempdir()?;
-    let tools_dir = temp_dir.path().to_path_buf();
-
-    fs::write(
-        tools_dir.join("initial_tool.json"),
-        tool_json("initial_tool", "Initial tool"),
-    )?;
-
-    let client = ClientBuilder::new()
-        .tools_dir(&tools_dir)
-        .arg("--hot-reload")
-        .build()
-        .await?;
-
-    let tools = tokio::time::timeout(
-        TestTimeouts::get(TimeoutCategory::ToolCall),
-        client.list_tools(None),
-    )
-    .await??;
-    assert!(tools.tools.iter().any(|t| t.name == "initial_tool"));
-    assert!(!tools.tools.iter().any(|t| t.name == "new_tool"));
-
-    fs::write(
-        tools_dir.join("new_tool.json"),
-        tool_json("new_tool", "New tool added dynamically"),
-    )?;
-    let new_tool_seen = wait_for_condition(reload_timeout(), TestTimeouts::poll_interval(), || {
-        let client = &client;
-        async move {
-            let tools_res = tokio::time::timeout(
-                TestTimeouts::get(TimeoutCategory::ToolCall),
-                client.list_tools(None),
-            )
-            .await;
-            match tools_res {
-                Ok(Ok(tools)) => tools.tools.iter().any(|t| t.name == "new_tool"),
-                _ => false,
-            }
-        }
-    })
-    .await;
-
-    assert!(new_tool_seen, "New tool should be present after reload");
-
-    fs::write(
-        tools_dir.join("initial_tool.json"),
-        tool_json("initial_tool", "Modified initial tool"),
-    )?;
-    let modified_seen = wait_for_condition(reload_timeout(), TestTimeouts::poll_interval(), || {
-        let client = &client;
-        async move {
-            let tools_res = tokio::time::timeout(
-                TestTimeouts::get(TimeoutCategory::ToolCall),
-                client.list_tools(None),
-            )
-            .await;
-            match tools_res {
-                Ok(Ok(tools)) => tools
-                    .tools
-                    .iter()
-                    .find(|t| t.name == "initial_tool")
-                    .map(|t| t.description == Some("Modified initial tool".into()))
-                    .unwrap_or(false),
-                _ => false,
-            }
-        }
-    })
-    .await;
-
-    assert!(
-        modified_seen,
-        "Modified initial tool should be present after reload"
-    );
-
-    fs::remove_file(tools_dir.join("new_tool.json"))?;
-    let removed_seen = wait_for_condition(reload_timeout(), TestTimeouts::poll_interval(), || {
-        let client = &client;
-        async move {
-            let tools_res = tokio::time::timeout(
-                TestTimeouts::get(TimeoutCategory::ToolCall),
-                client.list_tools(None),
-            )
-            .await;
-            match tools_res {
-                Ok(Ok(tools)) => !tools.tools.iter().any(|t| t.name == "new_tool"),
-                _ => false,
-            }
-        }
-    })
-    .await;
-
-    assert!(
-        removed_seen,
-        "New tool should be removed after file deletion"
+        "an existing tool must not be redefined by a runtime write"
     );
 
     Ok(())
@@ -179,8 +88,4 @@ fn tool_json(name: &str, description: &str) -> String {
 }}
 "#
     )
-}
-
-fn reload_timeout() -> Duration {
-    TestTimeouts::scale_secs(30)
 }

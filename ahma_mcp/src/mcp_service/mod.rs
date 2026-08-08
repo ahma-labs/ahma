@@ -37,9 +37,12 @@
 //! background tasks and executing arbitrary logic within the sandbox.
 
 pub mod bundle_registry;
-mod config_watcher;
 pub mod handlers;
 pub mod progress_push;
+/// Sandbox configuration from client roots + the one-shot tool-config loads that
+/// hang off it. (Formerly `config_watcher`; the tools-directory file watcher was
+/// removed — see the module docs.)
+mod sandbox_config;
 pub mod schema;
 mod sequence;
 mod subcommand;

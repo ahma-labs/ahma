@@ -18,6 +18,16 @@ use ahma_mcp::utils::logging::{
 };
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Windows AppContainer launcher re-entry. Must come before *anything* else,
+    // and specifically before clap: `ahma.exe` re-executes itself to spawn each
+    // sandboxed command inside an AppContainer (the only way to attach
+    // `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` on stable Rust — see
+    // `ahma_mcp::sandbox::windows`), and the reserved marker argument it uses is
+    // deliberately not a subcommand, so clap would reject it. A no-op on every
+    // other platform and for every ordinary invocation; when it does fire it
+    // never returns, exiting with the sandboxed program's exit code.
+    ahma_mcp::sandbox::appcontainer_launcher_hook();
+
     // Parse via `try_parse` (not `Cli::parse`) so a malformed `ahma hooks exec …`
     // invocation never lets clap dump its top-level usage banner. An editor that
     // runs the hook treats the hook's stdout + exit code as the decision, so a
@@ -46,13 +56,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Settings-first log target: cli --log-to-stderr > settings.toml [logging.target] > AHMA_LOG_TARGET (deprecated) > "file"
+    // Settings-first log target: cli --log-to-stderr > settings.toml [logging.target] > "file".
+    // `AHMA_LOG_TARGET` is RETIRED (R-CFG1.2) and already ignored here — but it said so
+    // in its own words rather than through the one function that states the verdict
+    // (R-CFG1.2.1). Two spellings of the same rule is how surfaces drift apart.
     let settings_for_log = load_settings(&cli);
-    if std::env::var_os("AHMA_LOG_TARGET").is_some() {
-        tracing::warn!(
-            "Deprecated: the AHMA_LOG_TARGET environment variable is set. Use --log-to-stderr CLI flag or [logging.target] in settings.toml instead."
-        );
-    }
+    ahma_mcp::warn_retired_env("AHMA_LOG_TARGET");
     let log_to_stderr = cli.log_to_stderr || settings_for_log.log_to_stderr();
 
     set_log_role(detect_log_role_from_startup());

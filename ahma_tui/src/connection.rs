@@ -2,8 +2,9 @@
 //!
 //! Default behaviour when `--connect` is not supplied:
 //!
-//! * **Unix** — try the local Unix domain socket (default `/tmp/ahma.sock`, or
-//!   `AHMA_UNIX_SOCKET` env var) first, then fall back to `http://localhost:3000`.
+//! * **Unix** — try the local Unix domain socket (`[http] unix_socket_path` in
+//!   `~/.ahma/settings.toml`, default `/tmp/ahma.sock`) first, then fall back to
+//!   `http://localhost:3000`.
 //! * **Windows / non-Unix** — go straight to `http://localhost:3000`.
 //!
 //! After a successful TCP/HTTP probe the server's `Alt-Svc` response header is
@@ -234,9 +235,25 @@ fn default_candidates() -> Vec<ResolvedConnection> {
     candidates
 }
 
+/// The Unix socket the TUI probes when `--connect` is not given.
+///
+/// Resolved from `[http] unix_socket_path` in `~/.ahma/settings.toml`, falling back to
+/// the machine-global default — the same two sources `ahma serve` resolves through
+/// `AppConfig.unix_socket_path`, so both ends of the connection agree on the path.
+///
+/// `AHMA_UNIX_SOCKET` is **retired** (R-CFG1.2) and is warn-and-ignored, not read.
+/// `ahma_mcp` retired it; a client binary that kept honoring it would mean one variable
+/// with two meanings in two binaries of the same product, and "which socket does the
+/// control-plane UI attach to" is not something ambient environment should decide.
+/// Use `--connect unix://<path>` for a one-off, or the settings key to make it stick.
 #[cfg(unix)]
-fn unix_socket_default_path() -> String {
-    std::env::var("AHMA_UNIX_SOCKET").unwrap_or_else(|_| "/tmp/ahma.sock".to_string())
+pub fn unix_socket_default_path() -> String {
+    ahma_mcp::warn_retired_env("AHMA_UNIX_SOCKET");
+    ahma_common::config::AhmaSettings::load()
+        .http
+        .unix_socket_path
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| ahma_mcp::shell::modes::server::GLOBAL_SOCKET_PATH.to_string())
 }
 
 /// Parse a user-supplied `--connect` value into a `ResolvedConnection`.

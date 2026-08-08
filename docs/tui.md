@@ -103,7 +103,7 @@ Press Ctrl-C to exit.
 
 `ahma tui` automatically picks the best available transport in order:
 
-1. **Unix socket** (`/tmp/ahma.sock` or `$AHMA_UNIX_SOCKET`) — lowest latency, local only.
+1. **Unix socket** (`/tmp/ahma.sock`, or `[http] unix_socket_path` in `~/.ahma/settings.toml`) — lowest latency, local only. `$AHMA_UNIX_SOCKET` is retired (R-CFG1.2) and ignored by the TUI as it is by `ahma serve`.
 2. **HTTP/3 (QUIC)** — when the server advertises `Alt-Svc: h3=…` _and_ local TLS material exists at `~/.ahma/tls/`. See [TLS provisioning](#tls-provisioning-for-quic) below.
 3. **HTTP/1.1 / HTTP/2** — plain TCP, always available as a fallback.
 
@@ -119,11 +119,11 @@ ahma tui --connect http://localhost:8080
 ahma tui --connect unix:///run/ahma/mcp.sock
 ```
 
-Set `AHMA_DISABLE_QUIC=1` to prevent the HTTP/3 upgrade even when the server advertises it.
+Start the server with `--disable-quic` (or set `[http] disable_quic = true` in `~/.ahma/settings.toml`) to prevent the HTTP/3 upgrade even when it would otherwise be advertised. `AHMA_DISABLE_QUIC` is retired and ignored.
 
 ## TLS provisioning for QUIC
 
-HTTP/3 transport requires TLS. `ahma` manages a persistent self-signed certificate at `~/.ahma/tls/` (override with `$AHMA_TLS_DIR`):
+HTTP/3 transport requires TLS. `ahma` manages a persistent self-signed certificate at `~/.ahma/tls/` (override with the `--tls-dir` flag; `AHMA_TLS_DIR` is retired and ignored):
 
 ```bash
 # Generate certificate on first use (safe to re-run — idempotent)

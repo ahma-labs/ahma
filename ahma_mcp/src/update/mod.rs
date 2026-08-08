@@ -75,7 +75,11 @@ pub struct UpdateArgs {
     #[arg(value_name = "REF")]
     pub reference: Option<String>,
 
-    /// Install directory (default: ~/.local/bin, or AHMA_INSTALL_DIR)
+    /// Install directory (default: ~/.local/bin).
+    ///
+    /// Replaces the retired `AHMA_INSTALL_DIR` environment variable (R-CFG1.2):
+    /// where a binary is installed *from* and *to* is exactly the kind of decision
+    /// that must not come from ambient process state.
     #[arg(long)]
     pub install_dir: Option<PathBuf>,
 
@@ -97,7 +101,7 @@ pub struct UpdateArgs {
     pub insecure_skip_verify: bool,
 
     /// Prefer musl builds on Linux (static binaries, glibc-free).
-    /// Replaces the deprecated AHMA_PREFER_MUSL environment variable.
+    /// Replaces the retired `AHMA_PREFER_MUSL` environment variable (R-CFG1.2).
     #[arg(long)]
     pub prefer_musl: bool,
 }
@@ -108,6 +112,29 @@ struct UpdateOutcome {
     binary_changed: bool,
     /// `Some(true)` = attestation verified, `Some(false)` = verification skipped, `None` = git install (no attestation).
     attestation_verified: Option<bool>,
+}
+
+/// Resolve the directory the `ahma` binary is installed into (and removed from).
+///
+/// The single resolution shared by `ahma update` and `ahma uninstall`, so the two
+/// halves of the same lifecycle can never disagree about where the binary lives.
+///
+/// `AHMA_INSTALL_DIR` is **retired** (R-CFG1.2) and is warn-and-ignored here rather
+/// than read. "Which directory does a downloaded binary get written into, and which
+/// binary does uninstall delete" is the most consequential thing an `AHMA_*` variable
+/// still decided: it is ambient state an agent's environment can carry into a step
+/// that runs *outside* the sandbox, which is the trust-handoff shape of R-HANDOFF.1.
+/// `--install-dir` on `ahma update` is the replacement.
+///
+/// The bootstrap installers (`scripts/install.sh`, `scripts/install.ps1`) still read
+/// `AHMA_INSTALL_DIR`, and legitimately so: they run before any `ahma` binary exists,
+/// so there is no CLI to pass a flag to and no settings file to read.
+pub(crate) fn resolve_install_dir(explicit: Option<&Path>) -> Result<PathBuf> {
+    crate::warn_retired_env("AHMA_INSTALL_DIR");
+    match explicit {
+        Some(dir) => Ok(dir.to_path_buf()),
+        None => default_install_dir(),
+    }
 }
 
 /// Entry point for `ahma update`.
@@ -129,11 +156,7 @@ pub async fn run(args: UpdateArgs, cfg: &crate::shell::cli::AppConfig) -> Result
             .await;
     }
 
-    let install_dir = args
-        .install_dir
-        .clone()
-        .or_else(|| std::env::var("AHMA_INSTALL_DIR").ok().map(PathBuf::from))
-        .unwrap_or_else(|| default_install_dir().expect("home directory"));
+    let install_dir = resolve_install_dir(args.install_dir.as_deref())?;
 
     if args.prefer_musl {
         platform::set_prefer_musl_override();
@@ -182,14 +205,15 @@ async fn run_release_update(
     install_dir: &Path,
     mode: &UpdateMode,
 ) -> Result<UpdateOutcome> {
-    // Security-tier: AHMA_INSECURE_SKIP_VERIFY and AHMA_INSECURE_SKIP_SIGNATURE are retired.
-    // Use the --insecure-skip-verify CLI flag instead (R-CFG2.3).
-    if std::env::var_os("AHMA_INSECURE_SKIP_VERIFY").is_some()
-        || std::env::var_os("AHMA_INSECURE_SKIP_SIGNATURE").is_some()
-    {
+    // Security-tier and retired (R-CFG2.3), stated through the one function that
+    // states it (R-CFG1.2.1). Turning off signature or certificate verification is
+    // the last decision that should be reachable from an inherited environment.
+    let skip_verify_env = crate::warn_retired_env("AHMA_INSECURE_SKIP_VERIFY");
+    let skip_signature_env = crate::warn_retired_env("AHMA_INSECURE_SKIP_SIGNATURE");
+    if skip_verify_env || skip_signature_env {
         tracing::warn!(
-            "AHMA_INSECURE_SKIP_VERIFY / AHMA_INSECURE_SKIP_SIGNATURE are retired and IGNORED. \
-             Use --insecure-skip-verify on the command line (R-CFG2.3)."
+            "Verification stays ON. Pass --insecure-skip-verify on the command line if you \
+             really mean to disable it (R-CFG2.3)."
         );
     }
     let insecure_skip_verify = args.insecure_skip_verify;
@@ -1066,21 +1090,80 @@ mod tests {
         );
     }
 
+    /// R-CFG1.2: `AHMA_INSTALL_DIR` is retired. With no `--install-dir`, the resolved
+    /// directory must be the compiled-in default even when the variable points somewhere
+    /// else — the value is reported as "set" (so it can be warned about) but never used.
+    #[test]
+    fn install_dir_ignores_retired_env_var() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("AHMA_INSTALL_DIR");
+        // SAFETY: guarded by ENV_MUTEX; nextest isolates each test binary.
+        unsafe { std::env::set_var("AHMA_INSTALL_DIR", temp_dir.path()) };
+
+        let resolved = resolve_install_dir(None);
+        let warned = crate::warn_retired_env("AHMA_INSTALL_DIR");
+
+        // SAFETY: see above.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AHMA_INSTALL_DIR", v),
+                None => std::env::remove_var("AHMA_INSTALL_DIR"),
+            }
+        }
+
+        assert!(warned, "a set retired variable must still be warned about");
+        let resolved = resolved.expect("home directory must resolve");
+        assert_ne!(
+            resolved,
+            temp_dir.path(),
+            "AHMA_INSTALL_DIR is retired (R-CFG1.2) and must not steer the install dir"
+        );
+        assert_eq!(
+            resolved,
+            default_install_dir().expect("home directory"),
+            "with no --install-dir the default install dir must be used"
+        );
+    }
+
+    /// `--install-dir` is the replacement for the retired variable and must win even
+    /// when the retired variable is also set.
+    #[test]
+    fn install_dir_flag_wins_over_retired_env_var() {
+        let _g = ENV_MUTEX.lock().unwrap();
+        let env_dir = tempfile::tempdir().unwrap();
+        let flag_dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("AHMA_INSTALL_DIR");
+        // SAFETY: guarded by ENV_MUTEX; nextest isolates each test binary.
+        unsafe { std::env::set_var("AHMA_INSTALL_DIR", env_dir.path()) };
+
+        let resolved = resolve_install_dir(Some(flag_dir.path()));
+
+        // SAFETY: see above.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AHMA_INSTALL_DIR", v),
+                None => std::env::remove_var("AHMA_INSTALL_DIR"),
+            }
+        }
+
+        assert_eq!(
+            resolved.expect("explicit dir always resolves"),
+            flag_dir.path(),
+            "--install-dir must be the only thing that overrides the default"
+        );
+    }
+
     // ENV_MUTEX guard must span the .await so the env var stays set for the whole call.
     // Safe: current-thread tokio test runtime; no re-lock of ENV_MUTEX under the lock.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn test_run_dry_run_install_dir_from_env_var() {
-        // Cover the AHMA_INSTALL_DIR env-var branch in install_dir resolution
-        // (args.install_dir = None → falls back to env var → uses temp dir).
+    async fn test_run_dry_run_without_explicit_install_dir() {
+        // args.install_dir = None → resolve_install_dir falls back to the default.
         let _g = ENV_MUTEX.lock().unwrap();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let dir_str = temp_dir.path().to_str().unwrap().to_string();
-        // SAFETY: guarded by ENV_MUTEX; nextest isolates each binary.
-        unsafe { std::env::set_var("AHMA_INSTALL_DIR", &dir_str) };
         let args = UpdateArgs {
             reference: Some("main".to_string()),
-            install_dir: None, // no explicit dir → fall back to env var
+            install_dir: None,
             force: false,
             install_hooks: false,
             dry_run: true,
@@ -1089,10 +1172,9 @@ mod tests {
         };
         let cfg = crate::shell::cli::AppConfig::default();
         let result = run(args, &cfg).await;
-        unsafe { std::env::remove_var("AHMA_INSTALL_DIR") };
         assert!(
             result.is_ok(),
-            "AHMA_INSTALL_DIR env-var path should work: {result:?}"
+            "dry-run update with the default install dir should succeed: {result:?}"
         );
     }
 

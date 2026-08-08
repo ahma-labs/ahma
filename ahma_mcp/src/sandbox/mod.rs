@@ -28,8 +28,14 @@
 //!   kernel-level containment regardless of which runtime thread spawns it.
 //! - **macOS (Seatbelt)**: Uses the system's `sandbox-exec` utility with a dynamically
 //!   generated SBPL (Sandbox Binary Policy Language) profile.
-//! - **Windows (Job Objects)**: Uses Job Objects to ensure child process cleanup and (in
-//!   development) AppContainer isolation for filesystem gating.
+//! - **Windows (AppContainer + Job Objects)**: A Job Object with kill-on-close bounds the
+//!   process tree, and each command is launched into an AppContainer whose SID has been
+//!   granted access to exactly the locked scopes — the filesystem boundary. Because a
+//!   proc-thread attribute cannot be attached to `std::process::Command` on stable Rust,
+//!   the spawn goes through `ahma.exe` re-entered as a launcher, the same shape as macOS
+//!   wrapping commands in `sandbox-exec`. **Unproven at runtime**: written and
+//!   type-checked cross-platform, never executed; SPEC R6.3.3 stays open until Windows CI
+//!   runs it.
 //!
 //! ## Architecture
 //!
@@ -46,6 +52,7 @@ pub mod credential_reads;
 pub mod denial_scan;
 pub mod display;
 mod error;
+pub mod exec_config;
 pub mod grant_channel;
 pub mod host_detect;
 #[cfg(target_os = "linux")]
@@ -58,8 +65,13 @@ mod scopes;
 #[cfg(target_os = "macos")]
 mod seatbelt;
 mod types;
-#[cfg(target_os = "windows")]
-mod windows;
+/// Windows backend. Compiled on **every** platform, unlike `landlock`/`seatbelt`,
+/// because its argv protocol, container-name derivation, launcher resolution and
+/// crash-recovery journal are ordinary logic that would otherwise only ever be
+/// type-checked — let alone tested — on Windows CI. Every Win32 call inside is
+/// `#[cfg(target_os = "windows")]`; everything else runs in `cargo nextest run`
+/// on the machine the code is written on.
+pub mod windows;
 
 pub use capability_denial::{
     Capability, EnforcingLayer, capability_denial_disclosure, scan_capability_denial,
@@ -78,6 +90,10 @@ pub use credential_reads::{
 pub use denial_scan::{DenialHit, scan_denial, scan_denial_streams};
 pub use display::{ActiveSandbox, ScopeSource, ScopeView};
 pub use error::SandboxError;
+pub use exec_config::{
+    ExecConfigClass, HandoffAllowances, classify as classify_exec_config, deny_write_globs,
+    resolve_git_dirs, set_handoff_allowances,
+};
 pub use grant_channel::{HubGrantNotifier, LoggingGrantNotifier, ScopeGrantNotifier};
 pub use host_detect::{HostSandbox, detect_host_sandbox};
 #[cfg(target_os = "linux")]
@@ -94,5 +110,12 @@ pub use prerequisites::{
 pub use scope_lock::ScopeLockState;
 pub use scopes::normalize_path_lexically;
 pub use types::{SandboxMode, ScopesGuard};
+/// Re-entry hook for the Windows AppContainer launcher. Exported unconditionally
+/// (a no-op off Windows) so `main` can call it without a `cfg` of its own; it
+/// **must** run before CLI parsing. See `sandbox::windows` for why a launcher
+/// process exists at all.
+pub use windows::appcontainer_launcher_hook;
 #[cfg(target_os = "windows")]
-pub use windows::{check_windows_sandbox_available, enforce_windows_sandbox};
+pub use windows::{
+    check_windows_sandbox_available, cleanup_windows_sandbox, enforce_windows_sandbox,
+};

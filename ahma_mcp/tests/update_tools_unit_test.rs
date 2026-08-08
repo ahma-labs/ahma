@@ -1,6 +1,6 @@
-//! Tests for config_watcher.rs: update_tools and start_config_watcher.
+//! Tests for `AhmaMcpService::update_tools`.
 //!
-//! `update_tools` is defined in `mcp_service/config_watcher.rs` which had 0%
+//! `update_tools` is defined in `mcp_service/sandbox_config.rs` which had 0%
 //! coverage because existing mcp_service_mod_unit_test tests manipulated the
 //! underlying HashMap directly rather than calling the service method.
 //! These tests call `AhmaMcpService::update_tools` through the real service

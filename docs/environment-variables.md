@@ -1,18 +1,45 @@
 # Ahma Environment Variables
 
 > [!IMPORTANT]
-> **`AHMA_*` variables in the RETIRED sections below are ignored by the `ahma` binary** (R-CFG1.2),
-> logged as a `WARN` at startup. Configure Ahma via `~/.ahma/settings.toml` or CLI flags instead.
+> **`AHMA_*` variables in the RETIRED sections below are ignored** (R-CFG1.2), logged as a `WARN`.
+> Configure Ahma via `~/.ahma/settings.toml` or CLI flags instead.
 > Run `ahma settings init` to create a pre-documented settings file, or `ahma settings show` to inspect effective values.
-> This does **not** cover the [Terminal Hooks](#terminal-hooks) variables below, which remain live
-> (hooks are invoked directly by the editor, not by `ahma`, so there is no CLI flag to replace them),
-> or variables read by the `scripts/install.sh` / `install.ps1` bootstrap installers, which run
-> before any `ahma` binary exists.
+> This does **not** cover the three [Terminal Hooks](#live--terminal-hooks) variables below, which
+> remain live (hooks are invoked directly by the editor, not by `ahma`, so there is no CLI flag to
+> replace them), or variables read by the `scripts/install.sh` / `install.ps1` bootstrap installers,
+> which run before any `ahma` binary exists.
+
+> [!IMPORTANT]
+> **Retirement binds every binary and every subcommand, not just `ahma serve`.**
+> A variable listed as RETIRED is ignored by `ahma`, by `ahma-tui`, and by subcommands with
+> their own configuration resolution (`ahma update`, `ahma uninstall`) alike. A surface that
+> kept honoring a retired name would give one variable two meanings in one product — setting
+> it would change one binary's behaviour and not the other's, which is worse than either
+> answer on its own. `ahma_common::config::warn_retired_env` is the single function that
+> states the verdict — it lives at the bottom of the dependency graph so every crate can
+> reach it, and it returns only *whether* a variable was set, never its value, so a caller
+> cannot accidentally honor one. Every surface calls it rather than re-reading the variable.
+>
+> **The tables below are enforced, not just documentation.**
+> `ahma_mcp/tests/retired_env_drift_test.rs` parses every RETIRED table here and fails the
+> build if any production source reads one of these names directly. Adding a row extends the
+> guard automatically. This exists because the tables and the code had genuinely drifted:
+> `AHMA_PREFER_MUSL` was listed as retired while `ahma update` still honored it, and
+> `AHMA_LOG_TARGET`, `AHMA_TLS_DIR` and the two `AHMA_INSECURE_SKIP_*` variables each warned
+> in their own words instead of through the shared verdict. Nothing noticed, because the only
+> thing tying the docs to the code was someone remembering.
+>
+> The one deliberate exception is the **bootstrap installers**, `scripts/install.sh`,
+> `scripts/install.ps1` and `scripts/install-local.sh`. They read `AHMA_INSTALL_DIR` because
+> they run *before* any `ahma` binary exists: there is no CLI to pass `--install-dir` to and
+> no settings file to read. Once `ahma` exists, `ahma update --install-dir` is the supported
+> way to install somewhere other than `~/.local/bin`.
 
 ## Variable classification
 
 | Class | Meaning |
 |-------|---------|
+| **LIVE** | Still read and honored. Only the three [terminal-hook](#live--terminal-hooks) variables are in this class. |
 | **RETIRED** | Set by user, **ignored** with a startup `WARN`. Use the CLI flag or `~/.ahma/settings.toml` instead. |
 | **INTERNAL** | Set only by Ahma itself for parent→child process communication. Never set these manually. |
 | **PLATFORM** | Standard OS/ecosystem variables read by Ahma (e.g. `RUST_LOG`, `HOME`). Not `AHMA_*` prefixed. |
@@ -29,10 +56,14 @@ All previously accepted. Now ignored with a `WARN`. Use `~/.ahma/settings.toml` 
 | `AHMA_TOOLS_DIR` | `--tools-dir` CLI flag or `tools.tools_dir` in settings.toml | auto-detect `.ahma/` |
 | `AHMA_TIMEOUT` | `--timeout` flag or `tools.timeout_secs` in settings.toml | `360` |
 | `AHMA_SYNC` | `--sync` flag or `tools.force_sync = true` in settings.toml | `false` |
-| `AHMA_HOT_RELOAD` | `--hot-reload` flag or `tools.hot_reload = true` in settings.toml | `false` |
+| `AHMA_HOT_RELOAD` | none — tool hot-reload was removed entirely (agent-writable tools dir); use the `restart` tool | n/a |
 | `AHMA_SKIP_PROBES` | `--skip-probes` flag or `tools.skip_probes = true` in settings.toml | `false` |
 | `AHMA_MINIMIZE_TOKENS` | `--minimize-tokens` flag or `tools.minimize_tokens = true` in settings.toml | `false` |
 | `AHMA_SMALL_MODEL_HARNESS` | `--small-model-harness` flag or `tools.small_model_harness = true` in settings.toml | `false` |
+
+`AHMA_MINIMIZE_TOKENS` and `AHMA_SMALL_MODEL_HARNESS` are ignored by **both** `ahma` and
+`ahma-tui`. The TUI honored them for a while after `ahma` had already retired them, which
+meant setting one changed the chat client's behaviour but not the server's.
 
 ---
 
@@ -81,6 +112,7 @@ All previously accepted. Now ignored with a `WARN`. Use `~/.ahma/settings.toml` 
 |---|---|
 | `AHMA_HTTP_PORT` | `--port` CLI flag on `serve http` subcommand |
 | `AHMA_UNIX_SOCKET` | `--unix-socket-path` CLI flag or `http.unix_socket_path` in settings.toml |
+| `AHMA_UNIX_SOCKET` (TUI) | `ahma tui --connect unix://<path>`, or the same `http.unix_socket_path` settings key |
 | `AHMA_DISABLE_QUIC` | `--disable-quic` CLI flag or `http.disable_quic = true` in settings.toml |
 | `AHMA_DISABLE_HTTP1_1` | `--disable-http1-1` CLI flag or `http.disable_http1_1 = true` in settings.toml |
 | `AHMA_HANDSHAKE_TIMEOUT` | `--handshake-timeout` CLI flag or `http.handshake_timeout_secs` in settings.toml |
@@ -95,21 +127,22 @@ All previously accepted. Now ignored with a `WARN`. Use `~/.ahma/settings.toml` 
 | `AHMA_INSECURE_SKIP_VERIFY` | `--insecure-skip-verify` CLI flag (**CLI-only** per R-CFG2.3) |
 | `AHMA_INSECURE_SKIP_SIGNATURE` | `--insecure-skip-signature` CLI flag (**CLI-only** per R-CFG2.3) |
 | `AHMA_PREFER_MUSL` | `--prefer-musl` CLI flag on `update` subcommand |
-| `AHMA_INSTALL_DIR` | `--install-dir` CLI flag on `update` subcommand |
+| `AHMA_INSTALL_DIR` | `--install-dir` CLI flag on `update` subcommand (still read by the bootstrap installer scripts — see the note at the top) |
 | `AHMA_INSTANCE_LABEL` | `--instance-label` CLI flag or `instance.label` in settings.toml |
 
 ---
 
-## Terminal Hooks
+## LIVE — Terminal Hooks
 
-These variables are used by hook subprocesses spawned by editors. They are set **before** the hook
-binary runs (by the editor or the user's shell profile) and cannot be replaced by CLI flags since
-hooks are invoked directly by the editor, not by ahma. They remain supported.
+These are the **only** `AHMA_*` variables still honored. They are used by hook subprocesses spawned
+by editors, set **before** the hook binary runs (by the editor or the user's shell profile), and
+cannot be replaced by CLI flags since hooks are invoked directly by the editor, not by ahma.
 
 | Variable | Default | Description |
 |---|---|---|
 | `AHMA_HOOKS` | `auto` | `on` = always sandbox, `off` = pass through, `auto` = sandbox when MCP server detected |
 | `AHMA_DISABLE_HOOKS` | off | Alias for `AHMA_HOOKS=off`. Set to `1` to disable hook routing. |
+| `AHMA_PREFER_OWN_SANDBOX` | off | Set to `1` so a hook applies **ahma's own** sandbox instead of deferring to a detected host sandbox (Cursor, VS Code, Docker). Accepts the double-sandbox and the host's build-cache friction in exchange for ahma being the authority. See SPEC R7 and [security-sandbox.md](security-sandbox.md#nested-sandbox-environments-cursor-vs-code-docker). |
 
 ```bash
 # Temporarily disable hook routing without uninstalling
@@ -145,6 +178,7 @@ AHMA_DISABLE_HOOKS=1
 | `AHMA_DAEMON_SOCK` | Isolates each test process's daemon to a unique Unix socket path |
 | `AHMA_DAEMON_PORT` | Isolates each test process's daemon to a unique TCP port (Windows) |
 | `AHMA_TEST_BINARY` | Locates the compiled test binary for in-process test helpers |
+| `AHMA_TEST_HOME` | Redirects `~` resolution (`ahma_common::config::ahma_home_dir`) at a temp directory so a test can supply its own `~/.ahma/settings.toml`. Compiled in **debug builds only** (`#[cfg(debug_assertions)]`) — a release binary ignores it |
 | `AHMA_TEST_ISOLATION` | Set by test harnesses on spawned ahma binaries: forces private (non-global) bridge/daemon endpoints (SPEC R-ISO.1) |
 | `NEXTEST` / `NEXTEST_RUN_ID` | Set by `cargo nextest`, inherited by spawned binaries; read solely to force the same private-endpoint isolation as `AHMA_TEST_ISOLATION` — the single R-CFG9.2 carve-out (SPEC R-ISO.1) |
 

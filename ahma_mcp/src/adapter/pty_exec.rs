@@ -64,6 +64,9 @@ pub fn pty_available() -> bool {
 /// Mirrors `execute_with_streaming`: emits output lines via the monitor,
 /// spills the complete output, and ends with exactly one terminal status
 /// transition (Completed/Failed/Cancelled/TimedOut).
+///
+/// Returns how it ended so the caller can close the audit log's `tool_call` with
+/// exactly one matching `tool_complete`.
 #[cfg_attr(windows, allow(unused_variables))]
 pub(super) async fn run_pty_operation(
     sandbox: &Sandbox,
@@ -73,7 +76,7 @@ pub(super) async fn run_pty_operation(
     cancellation_token: &tokio_util::sync::CancellationToken,
     op_id: &str,
     monitor: &Arc<OperationMonitor>,
-) {
+) -> (crate::adapter::audit::Outcome, Option<i32>) {
     #[cfg(windows)]
     {
         monitor
@@ -87,6 +90,7 @@ pub(super) async fn run_pty_operation(
                 )),
             )
             .await;
+        (crate::adapter::audit::Outcome::Failed, None)
     }
 
     #[cfg(unix)]
@@ -99,7 +103,7 @@ pub(super) async fn run_pty_operation(
         op_id,
         monitor,
     )
-    .await;
+    .await
 }
 
 #[cfg(unix)]
@@ -268,7 +272,9 @@ mod unix {
         cancellation_token: &tokio_util::sync::CancellationToken,
         op_id: &str,
         monitor: &Arc<OperationMonitor>,
-    ) {
+    ) -> (crate::adapter::audit::Outcome, Option<i32>) {
+        use crate::adapter::audit::Outcome;
+
         let start_time = Instant::now();
 
         let (killer, mut line_rx, mut exit_rx) = match setup_pty(sandbox, command_str, working_dir)
@@ -282,7 +288,7 @@ mod unix {
                         Some(Value::String(format!("Failed to start PTY command: {e}"))),
                     )
                     .await;
-                return;
+                return (Outcome::Failed, None);
             }
         };
 
@@ -305,7 +311,7 @@ mod unix {
                             Some(Value::String("Operation was cancelled".to_string())),
                         )
                         .await;
-                    return;
+                    return (Outcome::Cancelled, None);
                 }
 
                 _ = tokio::time::sleep_until(deadline) => {
@@ -322,7 +328,7 @@ mod unix {
                             ))),
                         )
                         .await;
-                    return;
+                    return (Outcome::TimedOut, None);
                 }
 
                 line = line_rx.recv() => {
@@ -366,6 +372,13 @@ mod unix {
         monitor
             .update_status(op_id, status, Some(final_output))
             .await;
+
+        let outcome = if success {
+            Outcome::Completed
+        } else {
+            Outcome::Failed
+        };
+        (outcome, exit_status)
     }
 }
 

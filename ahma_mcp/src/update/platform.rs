@@ -87,16 +87,15 @@ pub fn detect_platform() -> Result<Platform> {
             other => bail!("Unsupported Linux architecture: {other}"),
         };
 
-        let env_prefer_musl = std::env::var("AHMA_PREFER_MUSL")
-            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
-        if env_prefer_musl {
-            tracing::warn!(
-                "Deprecated: AHMA_PREFER_MUSL environment variable is set. Use the --prefer-musl flag instead."
-            );
-        }
-        let prefer_musl =
-            PREFER_MUSL_OVERRIDE.get().is_some() || env_prefer_musl || detect_linux_musl();
+        // R-CFG1.2 / R-CFG1.2.1: `AHMA_PREFER_MUSL` is RETIRED — warn and ignore.
+        // It was documented as retired while this line still *honored* it, which is
+        // the exact drift R-CFG1.2.1 exists to close: the docs said one thing and
+        // one surface did another. Which libc variant of a binary gets downloaded
+        // and installed is not a decision ambient process state should make.
+        // `--prefer-musl` (via `PREFER_MUSL_OVERRIDE`) is the replacement, and
+        // `detect_linux_musl()` still handles the case automatically.
+        crate::warn_retired_env("AHMA_PREFER_MUSL");
+        let prefer_musl = PREFER_MUSL_OVERRIDE.get().is_some() || detect_linux_musl();
 
         let id = if prefer_musl {
             format!("linux-{arch}-musl")

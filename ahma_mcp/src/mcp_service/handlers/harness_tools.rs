@@ -371,12 +371,23 @@ impl AhmaMcpService {
 
         let narrowing = self.narrow_container_for(path_ref);
         let scopes = self.adapter.sandbox().scopes().to_vec();
+
+        // Auto-executing-config gate: refuses the DenyWrite class outright and
+        // returns the warning the Disclose class must carry back to the caller.
+        let exec_config_notice = crate::file_ops::exec_config_write_guard(&scopes, path_ref)
+            .await
+            .map_err(|e| mcp_internal(e.to_string()))?
+            .map(crate::file_ops::ExecConfigDisclosure::into_notice);
+
         self.file_ops_provider
             .write_file(&scopes, path_ref, content)
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
 
-        Ok(disclose_narrowing(text_result("File written"), narrowing))
+        Ok(disclose_exec_config(
+            disclose_narrowing(text_result("File written"), narrowing),
+            exec_config_notice,
+        ))
     }
 
     pub async fn handle_replace_in_file(
@@ -398,15 +409,24 @@ impl AhmaMcpService {
 
         let narrowing = self.narrow_container_for(Path::new(path));
         let scopes = self.adapter.sandbox().scopes().to_vec();
+
+        let exec_config_notice = crate::file_ops::exec_config_write_guard(&scopes, Path::new(path))
+            .await
+            .map_err(|e| mcp_internal(e.to_string()))?
+            .map(crate::file_ops::ExecConfigDisclosure::into_notice);
+
         let replaced = self
             .file_ops_provider
             .replace_in_file(&scopes, Path::new(path), old_str, new_str)
             .await
             .map_err(|e| mcp_internal(e.to_string()))?;
 
-        Ok(disclose_narrowing(
-            text_result(format!("Replaced {replaced} occurrence(s)")),
-            narrowing,
+        Ok(disclose_exec_config(
+            disclose_narrowing(
+                text_result(format!("Replaced {replaced} occurrence(s)")),
+                narrowing,
+            ),
+            exec_config_notice,
         ))
     }
 
@@ -430,6 +450,20 @@ fn disclose_narrowing(
 ) -> CallToolResult {
     match narrowing {
         Some(n) => super::common::append_note(result, &n.notice()),
+        None => result,
+    }
+}
+
+/// Append the auto-executing-configuration warning produced by
+/// [`crate::file_ops::exec_config_write_guard`].
+///
+/// The write already succeeded — this class is allowed on purpose (see the
+/// `exec_config` module doc on why blocking it would just manufacture permission
+/// fatigue). The warning is the entire mitigation, so it must reach the caller in
+/// the tool result and not only a log line (SPEC R5.4).
+fn disclose_exec_config(result: CallToolResult, notice: Option<String>) -> CallToolResult {
+    match notice {
+        Some(n) => super::common::append_note(result, &n),
         None => result,
     }
 }

@@ -32,7 +32,7 @@ paths that matter:
 | Mechanism | Where | Notes |
 |---|---|---|
 | `notifications/ahma/heartbeat` | `mcp_service/mod.rs` (`KeepAlive::send_enhanced_heartbeat`) | Periodic; payload is `{version, hash, timestamp}` (`ahma_common::keepalive::HeartbeatPayload`). Ahma peers consume it (`is_ahma_peer`); foreign clients ignore it. |
-| `notifications/sandbox/configured` / `failed` | `mcp_service/config_watcher.rs` | Emitted on stdout at sandbox lock/failure, with a structured scope summary (`sandbox/display.rs`). |
+| `notifications/sandbox/configured` / `failed` | `mcp_service/sandbox_config.rs` | Emitted on stdout at sandbox lock/failure, with a structured scope summary (`sandbox/display.rs`). |
 | `notifications/sandbox/terminated` | `shell/modes/server.rs` | Emitted on session teardown. |
 | `notifications/progress` push | `mcp_service/progress_push.rs` | Long-running op output relay. |
 | MCP `elicitation/create` | `handlers/sandbox_grant_tool.rs` | Already used **on the tool-call path** to put a grant decision in front of an external client that supports elicitation. |

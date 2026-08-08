@@ -16,7 +16,7 @@
 - **Output Spill**: The complete redacted output of every async operation is written to `<project log dir>/operations/<operation_id>.log` and advertised as `output_file` in results; the inline result window is bounded for token economy.
 - **Kernel Sandbox**: Implements path-validation rules and platform-specific kernel sandboxing (Landlock on Linux, Seatbelt on macOS, Job Objects on Windows).
 - **Built-in tools**: Provides core internal tools `status`, `await`, `cancel`, and `run_terminal_command` regardless of external configuration.
-- **Hot-Reloading**: Opt-in watching of the tools directory to reload definitions on the fly.
+- **No runtime tool reload**: tool definitions are read once at startup (plus a one-shot load of a connecting client's `<root>/.ahma/`) and are never re-read from disk while the server runs. The tools directory is inside the sandbox scope and therefore agent-writable, and MTDF `command` is a free-form string, so a watcher would let a sandboxed agent repoint an approved tool name at an arbitrary command. The deliberate, auditable reload path is the `restart` builtin.
 - **Supply Chain Audit**: Implements `ahma bundle audit/sign/verify` commands to scan tool definitions for security risks.
 
 ## 3. Non-Functional Requirements

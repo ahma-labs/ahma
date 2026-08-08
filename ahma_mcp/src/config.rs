@@ -757,6 +757,95 @@ async fn load_single_config_path(
     Ok(())
 }
 
+/// Layer an **agent-writable** tools directory on top of an already-loaded set
+/// *without* letting it shadow anything that is already defined.
+///
+/// SECURITY (SPEC R-HANDOFF.7): the operator's `--tools-dir` and the compiled-in bundles are chosen
+/// by the human running the server; a workspace `.ahma/` sits inside the sandbox
+/// scope and is therefore writable by the agent under execution. MTDF's `command`
+/// is a free-form string, so a workspace definition that reused an existing tool
+/// name would silently repoint that name at an arbitrary command — defeating both
+/// the user's mental model of what the name means and any host-side standing
+/// approval keyed on it. Collisions therefore resolve in favour of the
+/// operator/built-in definition, and the dropped file is named in a warning.
+///
+/// Definitions that collide with nothing still load: layering an extra directory
+/// is the whole point (a client workspace gets its own tools *in addition to* the
+/// operator's set, never instead of it).
+async fn overlay_untrusted_tool_dir(dir: &Path, configs: &mut HashMap<String, ToolConfig>) {
+    use tokio::fs;
+
+    if !fs::try_exists(dir).await.unwrap_or(false) {
+        return;
+    }
+
+    let mut entries = match fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                "Skipping inaccessible workspace tools directory '{}': {}",
+                dir.display(),
+                e
+            );
+            return;
+        }
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !is_json_config_path(&path) {
+            continue;
+        }
+        let Some(config) = read_tool_config_with_retry(&path).await else {
+            continue;
+        };
+
+        // A reserved name is handled directly by the server, so it never appears
+        // in `configs` and the collision check below cannot catch it. Skip the
+        // file instead of failing the whole load: one bad workspace file must not
+        // cost the client every other tool it has.
+        if is_reserved_tool_name(&config.name) {
+            tracing::warn!(
+                "Ignoring workspace tool '{}' from {}: the name is reserved for a built-in \
+                 ahma tool and a workspace definition may not shadow it.",
+                config.name,
+                path.display()
+            );
+            continue;
+        }
+
+        if configs.contains_key(&config.name) {
+            tracing::warn!(
+                "Ignoring workspace tool '{}' from {}: a built-in or operator-configured tool \
+                 already uses that name, and the workspace directory is agent-writable so it \
+                 may not shadow it. Rename the workspace tool to load it.",
+                config.name,
+                path.display()
+            );
+            continue;
+        }
+
+        configs.insert(config.name.clone(), config);
+    }
+}
+
+/// [`load_tool_configs_from_dirs`] plus an **untrusted** overlay directory.
+///
+/// `trusted_dirs` are operator-chosen (`--tools-dir`) and keep their existing
+/// last-one-wins precedence among themselves and over the built-in bundles.
+/// `untrusted_dir` is a workspace directory discovered from a connecting client's
+/// roots: it is additive only and can never shadow an existing name — see
+/// [`overlay_untrusted_tool_dir`] for why.
+pub async fn load_tool_configs_with_untrusted_overlay(
+    config: &crate::shell::cli::AppConfig,
+    trusted_dirs: &[&Path],
+    untrusted_dir: &Path,
+) -> anyhow::Result<HashMap<String, ToolConfig>> {
+    let mut configs = load_tool_configs_from_dirs(config, trusted_dirs).await?;
+    overlay_untrusted_tool_dir(untrusted_dir, &mut configs).await;
+    Ok(configs)
+}
+
 fn insert_built_in_config(configs: &mut HashMap<String, ToolConfig>, config: ToolConfig) {
     match configs.entry(config.name.clone()) {
         std::collections::hash_map::Entry::Occupied(_) => {
@@ -845,12 +934,13 @@ pub async fn load_tool_configs(
     }
 }
 
-/// [`load_tool_configs`] over several directories.
+/// [`load_tool_configs`] over several **operator-chosen** directories.
 ///
 /// Directories are loaded in order and a later one wins a name collision, so callers
-/// list them least- to most-specific. This exists for per-client discovery, which must
-/// layer a connecting client's `<root>/.ahma` *on top of* the operator's configured
-/// tools dir rather than replacing it.
+/// list them least- to most-specific. Every directory passed here is trusted at the
+/// same level as the operator's `--tools-dir`; an agent-writable workspace directory
+/// must go through [`load_tool_configs_with_untrusted_overlay`] instead, which is
+/// additive-only.
 pub async fn load_tool_configs_from_dirs(
     config: &crate::shell::cli::AppConfig,
     tools_dirs: &[&Path],

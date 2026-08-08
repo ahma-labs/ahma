@@ -74,10 +74,12 @@ impl LocalTlsConfig {
     /// state. If the variable is set it is warned-about and ignored; use the
     /// `--tls-dir` flag instead.
     pub fn from_env() -> Self {
-        if std::env::var_os("AHMA_TLS_DIR").is_some() {
+        // R-CFG1.2.1: one function states the verdict. The extra sentence about
+        // *why* this one is security-tier stays here, where the risk lives.
+        if crate::config::warn_retired_env("AHMA_TLS_DIR") {
             warn!(
-                "Security env var AHMA_TLS_DIR is set but IGNORED (retired per R-CFG2.3). \
-                 Use the --tls-dir flag instead; redirecting TLS material via the environment is a tamper risk."
+                "AHMA_TLS_DIR is security-tier (R-CFG2.3): redirecting TLS material via ambient \
+                 environment state is a tamper risk. Use the --tls-dir flag."
             );
         }
         if let Some(dir) = TLS_DIR_OVERRIDE.get() {

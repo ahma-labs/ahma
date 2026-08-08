@@ -877,7 +877,7 @@ The harness integrates at the MCP tool-call boundary:
 
 Both switches should be exposed as:
 - CLI flags: `--minimize-tokens` and `--small-model-harness`
-- Environment variables: `AHMA_MINIMIZE_TOKENS=1` and `AHMA_SMALL_MODEL_HARNESS=1`
+- Settings keys: `tools.minimize_tokens` / `tools.small_model_harness` in `~/.ahma/settings.toml`. **Not** environment variables — `AHMA_*` configuration vars are retired and ignored (SPEC R-CFG1.2)
 - MTDF tool-definition overrides (per-tool `"preserve_full_output": true`)
 - Settings file: `ahma_mcp/src/config.rs` additions
 

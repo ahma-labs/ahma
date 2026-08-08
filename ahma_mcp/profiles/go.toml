@@ -6,3 +6,26 @@ deny_write = []
 [[rules]]
 path = "~/.go"
 access = "rx"
+
+# Hostnames this toolchain must reach when `--restrict-network` is on. See the
+# rust profile for the rationale; these widen nothing unless restriction is on.
+#
+# Deliberately absent: `storage.googleapis.com`. Widely-repeated advice says the
+# module mirror redirects downloads there, and allowlisting it would therefore be
+# a prerequisite. It is not: `proxy.golang.org/<mod>/@v/<ver>.zip` answers 200
+# directly (verified against a real module fetch), no cross-host redirect. Since
+# host matching cannot express "one bucket", shipping it would have granted every
+# sandboxed command reach into all of Google Cloud Storage — a general-purpose
+# writable, world-readable object store — to fix a problem that no longer exists.
+#
+# Also absent: `index.golang.org` (a feed of new module versions, consumed by
+# tooling that watches the ecosystem, never by a build) and the direct-VCS hosts
+# `GOPROXY=direct` would need. Add those yourself if your workflow uses them.
+
+[[hosts]]
+host = "proxy.golang.org"
+reason = "the default GOPROXY module mirror; serves module zips itself, without redirecting"
+
+[[hosts]]
+host = "sum.golang.org"
+reason = "the default GOSUMDB checksum database — module authentication fails closed without it"

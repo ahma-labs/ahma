@@ -305,45 +305,6 @@ fn test_input_schema_for_status_tool() {
     assert!(props.contains_key("id"));
 }
 
-// ============= Config Watcher Debounce Tests =============
-
-#[tokio::test]
-async fn test_config_watcher_debounce_logic() {
-    use tokio::sync::mpsc;
-    use tokio::time::{Duration, timeout};
-
-    // Simulate the debounce behavior from start_config_watcher
-    let (tx, mut rx) = mpsc::channel::<()>(1);
-
-    // Spawn task that simulates rapid events
-    let sender = tx.clone();
-    tokio::spawn(async move {
-        // Send multiple events rapidly
-        for _ in 0..5 {
-            let _ = sender.send(()).await;
-            tokio::task::yield_now().await;
-        }
-    });
-
-    // Simulate debounce receiver
-    let debounce_result = timeout(Duration::from_millis(500), async {
-        let mut event_count = 0;
-        if (rx.recv().await).is_some() {
-            event_count += 1;
-            // Drain rapid events
-            while rx.try_recv().is_ok() {
-                event_count += 1;
-            }
-            // Only count as one "debounced" event
-        }
-        event_count
-    })
-    .await;
-
-    // Should have received at least one event
-    assert!(debounce_result.is_ok());
-}
-
 // ============= Tool Config Update Tests =============
 
 #[tokio::test]

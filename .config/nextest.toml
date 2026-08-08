@@ -73,19 +73,11 @@ filter = "binary_id(ahma_http_bridge::bridge_stress_tests)"
 threads-required = 4
 slow-timeout = { period = "240s", terminate-after = 2 }
 
-# NOTE: config_watcher's fs-watching tests were previously serialized here with
-# `threads-required = 1000` because they hung to a 120s hard-kill under a large
-# multi-crate `nextest run`. That was misdiagnosed as OS fs-event "registration
-# contention"; the real cause was a drop-order DEADLOCK in the watcher itself —
-# the fs-event callback used a blocking `mpsc::Sender::blocking_send` on a
-# capacity-1 channel, so under load the notify OS thread parked in the send, and
-# on task teardown the watcher's Drop (which joins that thread) waited on a
-# capacity that never freed. The serialization only reduced machine load enough
-# to make the triggering race rare. Fixed at the source (callback now uses the
-# non-blocking `try_send`, and the polling fallback tracks mtime so detection no
-# longer depends on fs-event delivery), verified with 6 concurrent copies of the
-# suite under CPU load passing with zero hangs. The throttle is therefore removed
-# so these tests run at full parallelism — an honest stress test.
+# NOTE: there are no fs-watching tests to serialize any more. The tool-config
+# directory watcher was removed outright (SPEC R1.4 / R-HANDOFF.7 — the tools
+# directory is agent-writable, so watching it executes a write with no user
+# action), which also retired the drop-order deadlock its notify thread could
+# form under load. Reload happens only through the explicit `restart` tool.
 
 # Many ahma_mcp integration test binaries spawn ahma subprocess.
 # Throttle all integration tests (binary_id "ahma_mcp::*") to prevent
@@ -151,9 +143,6 @@ filter = "binary_id(~ahma_mcp::)"
 threads-required = 2
 retries = 2
 
-# config_watcher fs-watching tests are NOT throttled: the drop-order deadlock
-# that made them hang under load has been fixed at the source (see the note in
-# the default profile), so no serialization or retry crutch is needed.
 
 # ---------------------------------------------------------------------------
 # Coverage profile (cargo llvm-cov) — instrumentation slows tests significantly
@@ -188,9 +177,6 @@ slow-timeout = { period = "600s", terminate-after = 2 }
 filter = "binary_id(~ahma_mcp::)"
 threads-required = 2
 
-# config_watcher fs-watching tests are NOT throttled under coverage either: the
-# drop-order deadlock that made them hang was fixed at the source (see the note
-# in the default profile), so no serialization crutch is needed.
 
 # ---------------------------------------------------------------------------
 # Smoke profile — the PR FAST TIER (.github/workflows/fast-tier.yml)

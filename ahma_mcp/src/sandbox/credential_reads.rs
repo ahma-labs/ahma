@@ -55,6 +55,98 @@ const DEFAULT_DENY_RELATIVE: [&str; 7] = [
     ".netrc",
 ];
 
+/// Container-daemon sockets at fixed, non-home locations.
+///
+/// Reaching a container daemon is a *total* sandbox escape and does not require
+/// breaking anything: talk to `docker.sock`, ask for a `--privileged` container
+/// with `/` bind-mounted, and the daemon — a root process entirely outside the
+/// sandbox — performs the write on your behalf. Nothing in a filesystem policy
+/// scoped to the workspace can see that write happen.
+///
+/// These are denied for **read and write**: a unix-socket client needs to open
+/// the socket node, so removing file access removes the capability.
+const CONTAINER_SOCKET_ABSOLUTE: [&str; 4] = [
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/var/run/containerd/containerd.sock",
+    "/run/podman/podman.sock",
+];
+
+/// Home-relative container sockets with a fixed path.
+const CONTAINER_SOCKET_HOME_RELATIVE: [&str; 1] = [".docker/run/docker.sock"];
+
+/// Home-relative container sockets whose middle path component varies (the VM
+/// instance name), expressed as regex bodies rather than subpaths so a blanket
+/// deny on `~/.colima` / `~/.lima` does not take the whole CLI down with it.
+const CONTAINER_SOCKET_HOME_REGEX: [&str; 2] = [r"/\.colima/.*/docker\.sock$", r"/\.lima/.*/sock$"];
+
+/// Every fixed-path container socket, resolved against `home`.
+///
+/// The order is irrelevant (they are all denies) but is kept stable so profile
+/// text is deterministic and testable.
+pub fn container_socket_denies(home: &Path) -> Vec<PathBuf> {
+    CONTAINER_SOCKET_ABSOLUTE
+        .iter()
+        .map(PathBuf::from)
+        .chain(CONTAINER_SOCKET_HOME_RELATIVE.iter().map(|r| home.join(r)))
+        .collect()
+}
+
+/// Anchored regex bodies for the variable-path container sockets under `home`.
+/// Each is a complete pattern ready to drop into an SBPL `(regex #"…")`.
+pub fn container_socket_deny_regexes(home: &Path) -> Vec<String> {
+    let home_re = regex_escape(&home.to_string_lossy());
+    CONTAINER_SOCKET_HOME_REGEX
+        .iter()
+        .map(|tail| format!("^{home_re}{tail}"))
+        .collect()
+}
+
+/// Anchored regex matching SSH **private** key material in `~/.ssh` (`id_rsa`,
+/// `id_ed25519`, `id_ecdsa_sk`, …).
+///
+/// `~/.ssh` as a whole is deliberately absent from [`DEFAULT_DENY_RELATIVE`] so
+/// that git-over-ssh keeps working, but that left the private keys themselves
+/// readable under the blanket macOS `(allow file-read*)`. Denying only the
+/// `id_*` files keeps `known_hosts` and `config` readable — which is what the
+/// ssh client actually needs from the sandbox — while the key bytes stay out of
+/// reach. The agent can still *use* ssh: `ssh-agent` and the `ssh` binary that
+/// reads the key run outside this profile's read policy for their own purposes.
+pub fn ssh_private_key_deny_regex(home: &Path) -> String {
+    format!(
+        "^{}/\\.ssh/id_[^/]*$",
+        regex_escape(&home.to_string_lossy())
+    )
+}
+
+/// Anchored regex re-allowing SSH **public** keys, which are not secret and are
+/// routinely read (e.g. to print a fingerprint). Must be emitted *after*
+/// [`ssh_private_key_deny_regex`] — SBPL is last-match-wins.
+pub fn ssh_public_key_allow_regex(home: &Path) -> String {
+    format!(
+        "^{}/\\.ssh/id_[^/]*\\.pub$",
+        regex_escape(&home.to_string_lossy())
+    )
+}
+
+/// Escape regex metacharacters so a filesystem path can be embedded in an SBPL
+/// `(regex #"…")` literal. Home directories contain `.` routinely and may
+/// contain `+`, `(`, or `)`; an unescaped `.` would turn the anchor into a
+/// wildcard and widen the rule.
+pub fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        if matches!(
+            ch,
+            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Expand a leading `~` / `~/…` against `home`; otherwise return the path as-is.
 fn expand_tilde(path: &Path, home: &Path) -> PathBuf {
     let s = path.to_string_lossy();
@@ -186,6 +278,65 @@ mod tests {
             !eff.contains(&home.join(".ssh")),
             "allow must override extra deny"
         );
+    }
+
+    #[test]
+    fn container_socket_denies_cover_docker_podman_and_containerd() {
+        let home = Path::new("/home/u");
+        let set = container_socket_denies(home);
+        assert!(set.contains(&PathBuf::from("/var/run/docker.sock")));
+        assert!(set.contains(&PathBuf::from("/run/docker.sock")));
+        assert!(set.contains(&PathBuf::from("/var/run/containerd/containerd.sock")));
+        assert!(set.contains(&PathBuf::from("/run/podman/podman.sock")));
+        assert!(set.contains(&home.join(".docker/run/docker.sock")));
+    }
+
+    #[test]
+    fn container_socket_regexes_are_anchored_at_the_escaped_home() {
+        let home = Path::new("/home/u.name");
+        let res = container_socket_deny_regexes(home);
+        assert!(
+            res.iter().all(|r| r.starts_with("^/home/u\\.name/")),
+            "regexes must be anchored at an escaped home: {res:?}"
+        );
+        assert!(
+            res.iter()
+                .any(|r| r.ends_with(r"/\.colima/.*/docker\.sock$")),
+            "{res:?}"
+        );
+        assert!(
+            res.iter().any(|r| r.ends_with(r"/\.lima/.*/sock$")),
+            "{res:?}"
+        );
+    }
+
+    #[test]
+    fn ssh_regexes_deny_private_keys_and_re_allow_public_ones() {
+        let home = Path::new("/home/u");
+        let deny = ssh_private_key_deny_regex(home);
+        let allow = ssh_public_key_allow_regex(home);
+        assert_eq!(deny, r"^/home/u/\.ssh/id_[^/]*$");
+        assert_eq!(allow, r"^/home/u/\.ssh/id_[^/]*\.pub$");
+
+        // Sanity-check the intent with a real regex engine: `known_hosts` and
+        // `config` must not match the deny, and the allow must cover `.pub`.
+        let deny_re = regex::Regex::new(&deny).expect("deny regex compiles");
+        let allow_re = regex::Regex::new(&allow).expect("allow regex compiles");
+        assert!(deny_re.is_match("/home/u/.ssh/id_ed25519"));
+        assert!(deny_re.is_match("/home/u/.ssh/id_rsa"));
+        assert!(deny_re.is_match("/home/u/.ssh/id_ed25519.pub"));
+        assert!(allow_re.is_match("/home/u/.ssh/id_ed25519.pub"));
+        assert!(!deny_re.is_match("/home/u/.ssh/known_hosts"));
+        assert!(!deny_re.is_match("/home/u/.ssh/config"));
+        // The anchor must not let a look-alike home match.
+        assert!(!deny_re.is_match("/home/uX/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn regex_escape_escapes_metacharacters() {
+        assert_eq!(regex_escape("/home/u.name"), r"/home/u\.name");
+        assert_eq!(regex_escape("a+b(c)"), r"a\+b\(c\)");
+        assert_eq!(regex_escape("plain"), "plain");
     }
 
     #[test]

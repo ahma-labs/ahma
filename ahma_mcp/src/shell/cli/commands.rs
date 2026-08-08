@@ -54,7 +54,6 @@ fn setting_rows(
     row!("lmstudio.model", lmstudio.model);
     row!("tools.timeout_secs", tools.timeout_secs);
     row!("tools.force_sync", tools.force_sync);
-    row!("tools.hot_reload", tools.hot_reload);
     row!("tools.skip_probes", tools.skip_probes);
     row!("sandbox.disable", sandbox.disable);
     row!("sandbox.tmp_access", sandbox.tmp_access);
@@ -767,10 +766,15 @@ fn print_profiles(settings: &ahma_common::config::AhmaSettings) {
     if enabled.is_empty() {
         println!("  (none — every toolchain path must be granted explicitly)");
         println!();
+        // Still owed: with every profile off, "what can a sandboxed command
+        // reach?" has an answer — usually a stark one — and it is exactly the
+        // configuration whose owner most wants it stated.
+        print_network_host_summary(settings);
         return;
     }
 
     let rules = resolved_rules(enabled, settings.sandbox.package_cache_write);
+    let hosts = crate::sandbox::profiles::profile_hosts(enabled);
     for profile in builtin_profiles() {
         if !enabled.iter().any(|n| n == &profile.name) {
             continue;
@@ -784,15 +788,90 @@ fn print_profiles(settings: &ahma_common::config::AhmaSettings) {
             };
             println!("      {}  ({access})", r.path.display());
         }
+        print_profile_hosts(settings, &profile.name, &hosts);
     }
     println!();
     println!("  Disable any of these with `[sandbox] profiles` in the settings file.");
     println!();
 
+    print_network_host_summary(settings);
+
     if let Some(note) = crate::sandbox::profiles::macos_read_disclosure() {
         println!("  ⚠ {note}");
         println!();
     }
+}
+
+/// The host half of one profile's cost (SPEC R-PERM.5.2).
+///
+/// Printed under the profile that grants them, never as a merged list at the
+/// bottom: a reader who does not recognise `proxy.golang.org` has to be able to
+/// see, without cross-referencing anything, that it arrived with the `go` profile
+/// and leaves with it. A profile's paths and its hosts are one answer to one
+/// question ("do I want this toolchain carve-out?"), so they belong in one place.
+///
+/// Whether these are *currently* in effect is stated explicitly, because the
+/// answer is usually "no": egress restriction is opt-in, and a list of hosts with
+/// no indication that nothing is restricting them would be actively misleading in
+/// the reassuring direction.
+fn print_profile_hosts(
+    settings: &ahma_common::config::AhmaSettings,
+    profile: &str,
+    hosts: &[crate::sandbox::profiles::ProfileHost],
+) {
+    let mine: Vec<_> = hosts.iter().filter(|h| h.profile == profile).collect();
+    if mine.is_empty() {
+        return;
+    }
+    let suppressed = !settings.network.profile_hosts
+        || settings
+            .network
+            .deny_profile_hosts
+            .iter()
+            .any(|d| d == profile);
+    let status = if !settings.network.restrict {
+        "not in effect — egress is unrestricted; these apply under --restrict-network"
+    } else if suppressed {
+        "withheld by [network] profile_hosts / deny_profile_hosts"
+    } else {
+        "in effect now"
+    };
+    println!("      network hosts ({status}):");
+    for h in mine {
+        println!("        {}  — {}", h.pattern, h.reason);
+    }
+}
+
+/// The union an operator actually gets, once `[network] allow` is folded in.
+///
+/// The per-profile listing above answers "what does this profile cost?"; this
+/// answers the other question a reader has — "what can a sandboxed command reach
+/// in total, right now?" — which no single profile's entry can.
+fn print_network_host_summary(settings: &ahma_common::config::AhmaSettings) {
+    use crate::egress::{EgressGrantSources, EgressGrants};
+
+    let grants = EgressGrants::compute(EgressGrantSources {
+        operator_allow: &settings.network.allow,
+        enabled_profiles: &settings.sandbox.profiles,
+        profile_hosts: settings.network.profile_hosts,
+        deny_profile_hosts: &settings.network.deny_profile_hosts,
+    });
+
+    if !settings.network.restrict {
+        println!("subprocess network egress: UNRESTRICTED (all hosts reachable).");
+        println!(
+            "  Turn on `--restrict-network` / `[network] restrict` to route subprocesses through"
+        );
+        println!("  the guarded proxy. The profiles above would then make these reachable, and");
+        println!("  nothing else:");
+        println!("{}", grants.disclosure());
+        println!();
+        return;
+    }
+
+    println!("subprocess network egress: RESTRICTED. Reachable hosts, and who granted each:");
+    println!("{}", grants.disclosure());
+    println!();
 }
 
 /// The deferred half of a revoke: applies the change and reports whether it did
@@ -1781,7 +1860,7 @@ mod tests {
         // Full command path: --settings-path routed through SettingsOriginCtx.
         let tmp = TempDir::new().unwrap();
         let file = tmp.path().join("custom-settings.toml");
-        std::fs::write(&file, "[tools]\nhot_reload = true\n").unwrap();
+        std::fs::write(&file, "[tools]\nskip_probes = true\n").unwrap();
         let ctx = SettingsOriginCtx {
             no_settings: false,
             settings_path: Some(file),

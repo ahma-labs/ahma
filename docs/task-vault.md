@@ -69,7 +69,7 @@ Event kinds: `vault_created`, `tool_call`, `tool_complete`, `artifact_written`, 
 
 | Property | Detail |
 |----------|--------|
-| Kernel-enforced scope | Sandbox scope is `workdir/` — writes outside it are OS-rejected |
+| Kernel-enforced scope | Sandbox scope is `workdir/` — writes outside it are OS-rejected on Linux and macOS (not yet on Windows, SPEC R6.3.9). Reads are scoped only on Linux (SPEC R6.2.2) |
 | Inputs are copies | Agent never touches originals — only copies in `inputs/` |
 | Two-phase delete | `trash/` holds staged deletions; permanent removal requires explicit confirmation |
 | Append-only audit | `audit.jsonl` records every operation; events cannot be silently deleted |

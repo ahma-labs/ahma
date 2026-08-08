@@ -40,6 +40,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::egress::host_pattern::HostPattern;
+
 /// What a profile rule grants.
 ///
 /// Three levels, not two, because the distinction is load-bearing: Landlock's
@@ -94,6 +96,20 @@ struct RawRule {
     precreate: bool,
 }
 
+/// One host entry as written in a profile's TOML.
+///
+/// `reason` is mandatory, not decorative. A hostname on its own is unreviewable —
+/// nobody can tell whether `storage.googleapis.com` is load-bearing or cargo-cult
+/// by looking at it — and R-PERM.5.2 requires that a profile's cost be visible
+/// wherever the profile is listed. The reason is what makes the disclosure a
+/// statement a user can actually act on rather than a list of names.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawHost {
+    host: String,
+    reason: String,
+}
+
 /// A profile as written in its TOML file.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +117,12 @@ struct RawProfile {
     name: String,
     description: String,
     rules: Vec<RawRule>,
+    /// Hostnames the toolchain must reach when `--restrict-network` is on.
+    ///
+    /// Absent in a profile whose toolchain fetches nothing (`common`), which is
+    /// why this defaults rather than being required.
+    #[serde(default)]
+    hosts: Vec<RawHost>,
     /// Paths that this profile asserts must **never** become writable. Not a
     /// mechanism — the backends are allow-lists, so a path is unwritable simply
     /// by not being granted — but an *assertion*, checked by tests, so a later
@@ -125,6 +147,24 @@ pub struct ResolvedRule {
     pub precreate: bool,
 }
 
+/// A hostname a profile grants, carrying the profile that granted it.
+///
+/// The provenance is the reason this is a struct rather than a bare
+/// `HostPattern`. A merged, anonymous list of reachable hosts is not refusable:
+/// a user who sees `proxy.golang.org` in an allowlist and writes no Go cannot
+/// tell whether removing it is safe. Naming the granting profile turns the
+/// question into "do I want the `go` profile?", which they can answer
+/// (R-PERM.5.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileHost {
+    /// The profile that contributed this host.
+    pub profile: String,
+    /// The parsed pattern. Validated at load; a malformed entry never gets here.
+    pub pattern: HostPattern,
+    /// Why this toolchain needs it, shown alongside the host in every disclosure.
+    pub reason: String,
+}
+
 /// A loaded, name-addressable profile.
 #[derive(Debug, Clone)]
 pub struct SandboxProfile {
@@ -136,6 +176,8 @@ pub struct SandboxProfile {
     rules: Vec<RawRule>,
     /// Paths this profile asserts must never be writable.
     deny_write: Vec<String>,
+    /// Hostnames it contributes to the egress allowlist under restriction.
+    hosts: Vec<RawHost>,
 }
 
 /// The profiles ahma ships, parsed from the TOML data files in `profiles/`.
@@ -158,6 +200,7 @@ pub fn builtin_profiles() -> Vec<SandboxProfile> {
                 description: raw.description,
                 rules: raw.rules,
                 deny_write: raw.deny_write,
+                hosts: raw.hosts,
             }),
             Err(e) => {
                 // A malformed builtin is a build-time bug, not a user problem; it
@@ -338,6 +381,48 @@ pub fn deny_write_paths(enabled: &[String]) -> Vec<PathBuf> {
         .filter(|p| enabled.iter().any(|n| n == &p.name))
         .flat_map(|p| p.deny_write.iter().filter_map(|s| resolve_path(s)))
         .collect()
+}
+
+/// The hostnames the enabled profiles grant, each carrying the profile that
+/// granted it and why (SPEC R-PERM.5, R-PERM.5.2).
+///
+/// **These are inert unless `--restrict-network` / `[network] restrict` is on.**
+/// With restriction off — still the default — the sandbox permits all egress and
+/// this list is never consulted, so adding a host here widens nothing on a
+/// default install. It only makes the *narrow* configuration usable, which is the
+/// entire point: restricted mode was already kernel-enforced and already correct,
+/// and nobody turned it on because the first `cargo build` failed.
+///
+/// A malformed or blanket (`*`) entry in a shipped profile is dropped with an
+/// error rather than admitted. A profile is enabled by default, so a `*` in one
+/// would be a default-on blanket egress grant arriving through a data file —
+/// exactly the invisible, unrefusable grant profiles exist to eliminate.
+///
+/// Order follows [`builtin_profiles`], not `enabled`, so two machines with the
+/// same profiles enabled disclose the same list in the same order regardless of
+/// how the operator happened to spell their settings file.
+pub fn profile_hosts(enabled: &[String]) -> Vec<ProfileHost> {
+    let mut out = Vec::new();
+    for profile in builtin_profiles() {
+        if !enabled.iter().any(|n| n == &profile.name) {
+            continue;
+        }
+        for raw in &profile.hosts {
+            match HostPattern::parse_profile_host(&raw.host) {
+                Ok(pattern) => out.push(ProfileHost {
+                    profile: profile.name.clone(),
+                    pattern,
+                    reason: raw.reason.clone(),
+                }),
+                Err(e) => tracing::error!(
+                    "sandbox profile '{}' declares an unusable host '{}': {e}; ignoring it",
+                    profile.name,
+                    raw.host
+                ),
+            }
+        }
+    }
+    out
 }
 
 /// The disclosure macOS owes its users (SPEC R-PERM.5.1).
@@ -555,6 +640,76 @@ mod tests {
         assert_eq!(
             from_data, from_settings,
             "[sandbox] profiles default must list exactly the shipped profiles"
+        );
+    }
+
+    #[test]
+    fn each_toolchain_profile_declares_the_hosts_its_toolchain_needs() {
+        // The host list is the network analogue of the path rules: without it,
+        // `--restrict-network` denies cargo its registry and the operator has to
+        // reverse-engineer a CDN topology before their first build succeeds.
+        let hosts = profile_hosts(&names());
+        let of = |p: &str| -> Vec<String> {
+            hosts
+                .iter()
+                .filter(|h| h.profile == p)
+                .map(|h| h.pattern.as_str())
+                .collect()
+        };
+        assert!(of("rust").contains(&"index.crates.io".to_string()));
+        assert!(of("rust").contains(&"static.crates.io".to_string()));
+        assert!(of("node").contains(&"registry.npmjs.org".to_string()));
+        assert!(of("go").contains(&"proxy.golang.org".to_string()));
+        assert!(
+            of("common").is_empty(),
+            "a shared cache directory is not an ecosystem and reaches nothing of its own; \
+             a host here would be granted to everyone, since `common` is on by default"
+        );
+    }
+
+    #[test]
+    fn a_profiles_hosts_travel_with_the_profile() {
+        // Same refusability property the path rules have: one name removed from
+        // `[sandbox] profiles` takes exactly that profile's hosts with it.
+        let without_node: Vec<String> = names().into_iter().filter(|n| n != "node").collect();
+        let hosts = profile_hosts(&without_node);
+        assert!(!hosts.iter().any(|h| h.profile == "node"));
+        assert!(hosts.iter().any(|h| h.profile == "rust"));
+        assert!(profile_hosts(&[]).is_empty());
+    }
+
+    #[test]
+    fn no_shipped_profile_can_grant_blanket_egress() {
+        // A profile is enabled by default, so a `*` in one would be a default-on
+        // blanket grant delivered by a data file — the invisible, unrefusable
+        // grant this whole system exists to eliminate. The parser refuses it; this
+        // asserts the shipped data never tries.
+        for h in profile_hosts(&names()) {
+            assert_ne!(h.pattern, HostPattern::Any, "{} grants '*'", h.profile);
+            assert!(
+                !h.reason.trim().is_empty(),
+                "{} must say why it needs {}",
+                h.profile,
+                h.pattern
+            );
+        }
+    }
+
+    #[test]
+    fn host_declarations_do_not_disturb_the_path_rules() {
+        // Adding hosts to the profile data must be purely additive: the paths a
+        // machine grants are the same before and after, or this "extension"
+        // quietly changed the filesystem sandbox.
+        let cargo = super::resolve_path("${CARGO_HOME:-~/.cargo}").unwrap();
+        let rules = resolved_rules(&names(), true);
+        assert_eq!(
+            rules.iter().find(|r| r.path == cargo).map(|r| r.access),
+            Some(ProfileAccess::Rx)
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.path == cargo.join("registry") && r.access == ProfileAccess::Rw)
         );
     }
 

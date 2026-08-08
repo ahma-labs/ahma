@@ -67,7 +67,6 @@ Run `ahma settings init` to generate this file automatically.
 # request_budget_override_secs = 0 # override the fallback single-request budget (SPEC R2.6.5); 0 = unset, use the built-in default
 # force_progress_notifications = false # send progress to Cursor despite its client-side logging quirk
 # force_sync   = false    # run all tools synchronously instead of async-first
-# hot_reload   = false    # reload tools from disk on change — INSECURE in production
 # skip_probes  = false    # skip availability probes at startup
 
 # ── Sandbox & filesystem security ────────────────────────────────────────────
@@ -76,6 +75,8 @@ Run `ahma settings init` to generate this file automatically.
 # tmp_access   = false    # add system temp dir to sandbox scope
 # disable_temp = false    # block all access to system temp dir (overrides tmp_access)
 # defer        = false    # defer sandbox lock until client provides roots/list
+# allow_git_hooks = false           # let tools write <git dir>/hooks/** (default: denied)
+# allow_project_tool_config = false # let tools write this workspace's .ahma/ (default: denied)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # [logging]
@@ -167,7 +168,6 @@ it to settings.
 |-------------|----------------------|
 | `AHMA_TIMEOUT` | `[tools] timeout_secs` |
 | `AHMA_SYNC` | `[tools] force_sync` |
-| `AHMA_HOT_RELOAD` | `[tools] hot_reload` |
 | `AHMA_SKIP_PROBES` | `[tools] skip_probes` |
 | `AHMA_DISABLE_SANDBOX` | `[sandbox] disable` |
 | `AHMA_TMP_ACCESS` | `[sandbox] tmp_access` |
@@ -238,6 +238,50 @@ Two `[sandbox]` keys are worth knowing:
   design — SPEC R5.4.8).
 
 See [permissions.md](permissions.md) for the full model.
+
+---
+
+## Trust-handoff escape hatches
+
+Some paths inside your workspace are writable by you but *executed by something
+outside ahma's sandbox*. ahma denies writes to those by default (SPEC R-HANDOFF),
+kernel-enforced on macOS. Two of them have real, legitimate uses, so each has a
+narrow opt-in. Both are **off by default** — the opposite polarity from
+`allow_keychain`, which is on by default.
+
+| Key | Flag | Default | What turning it on permits |
+|---|---|---|---|
+| `allow_git_hooks` | `--allow-git-hooks` | `false` | Writes to `<git dir>/hooks/**`, for every *resolved* git directory (worktrees and `git init --separate-git-dir` included). |
+| `allow_project_tool_config` | `--allow-project-tool-config` | `false` | Writes to `<workspace>/.ahma/**`, this project's MTDF tool definitions. |
+
+```toml
+[sandbox]
+allow_git_hooks = true              # e.g. installing a repo's own pre-push guard
+allow_project_tool_config = true    # e.g. developing the tool configs a repo ships
+```
+
+Read the consequence before you enable either:
+
+- **`allow_git_hooks`** — a hook file is discovered by `git` *by convention* and
+  runs with your full user privileges, outside the sandbox, on your next commit,
+  checkout, push, or merge. Nothing prompts you at that point. Enable it for the
+  session in which you are installing a hook you have read, not permanently.
+- **`allow_project_tool_config`** — `.ahma/` defines the commands ahma will
+  itself run, so a tool written under this setting can be invoked by the agent
+  that wrote it. Tool configs still never hot-reload; an edit takes effect only
+  through the explicit `restart` tool.
+
+Either source is enough — the flag widens for one session, the settings key
+widens permanently. There is no `--no-…` counterpart, because the default is
+already "denied". Whenever one is on, ahma logs a warning at startup naming what
+became writable and what executes it (SPEC R7: enforcement is never weakened
+silently), and the write-denial error names the flag and the key so you never
+have to go looking.
+
+Both toggles remove the **kernel** rule as well as the write-tool check, so an
+enabled hatch genuinely works rather than failing later with a bare
+`Operation not permitted`. Turning one on is strictly narrower than
+`[sandbox] disable = true`, which is the outcome these hatches exist to prevent.
 
 ## See also
 

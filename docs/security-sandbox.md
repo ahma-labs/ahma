@@ -1,20 +1,28 @@
 # Security Sandbox
 
-Ahma enforces **kernel-level filesystem sandboxing** by default. The sandbox scope is set once at server startup and cannot be changed — the AI has full access within the scope but zero access outside it, regardless of how commands are constructed.
+Ahma enforces **kernel-level filesystem sandboxing** by default. The sandbox scope is set once at server startup and cannot be changed. What that buys you is **not** one guarantee across all three platforms, and it must not be stated as one (SPEC R6.1.6, R6.2.2, R6.3.9):
+
+| | Writes outside the scope | Reads outside the scope |
+|---|---|---|
+| **Linux** (Landlock) | denied by the kernel | denied by the kernel |
+| **macOS** (Seatbelt) | denied by the kernel | **not confined** — the profile grants blanket read; a credential denylist compensates ([below](#macos-seatbelt)) |
+| **Windows** (Job Objects) | **not confined by path** — process-lifetime containment only; AppContainer is pending | **not confined** |
+
+Within the scope the agent has full access, with deliberate exceptions — see [Writable, but not everything](#writable-but-not-everything-trust-handoff).
 
 ## Why Kernel-Level Sandboxing?
 
 Trust-based security ("do you trust this tool?") doesn't protect against mistakes or manipulation at speed. Kernel-enforced boundaries do:
 
-- **String filters can be bypassed** via path traversal, symlinks, or creative shell expansion. Kernel-level policies cannot.
-- **Blast radius is bounded** — even if an AI agent tries `rm -rf ~`, the kernel rejects any write outside the workspace.
+- **String filters can be bypassed** via path traversal, symlinks, or creative shell expansion. A kernel policy is applied to the syscall, not to the string.
+- **Blast radius is bounded** — on Linux and macOS, an AI agent that tries `rm -rf ~` is stopped by the kernel, not by a pattern match. (On Windows there is no path boundary yet; see [below](#windows-job-objects-appcontainer-pending).)
 - **No runtime overhead** — the policy is applied once at sandbox lock and enforced by the OS.
 
 ## Sandbox Scope
 
-The sandbox scope is the root directory boundary for all filesystem operations:
+The sandbox scope is the root directory boundary — for writes everywhere it is enforced, and for reads on Linux (see the table above):
 
-- **STDIO mode**: Defaults to the current working directory (`--cwd` set by the IDE). In `mcp.json`, set `"cwd": "${workspaceFolder}"` and the sandbox "just works".
+- **STDIO mode**: the IDE reports the workspace through `roots/list`, so setting `"cwd": "${workspaceFolder}"` in `mcp.json` makes the sandbox "just work". The launch directory is not itself trusted as a scope: it becomes the scope only by being *reported* through `roots/list` or *named* explicitly, never by being inferred from where the process started or from project-marker files (SPEC R5.2.1).
 - **HTTP mode**: Set once when the server starts. Configure via:
   1. `--sandbox-scope <path>` CLI flag (highest priority)
   2. `scopes = [...]` in `~/.ahma/settings.toml`
@@ -56,22 +64,27 @@ uname -r                            # check kernel version
 cat /sys/kernel/security/lsm        # verify landlock is active
 ```
 
+A Landlock rule is an allow-list of file descriptors, so the read-only set is expressed as explicitly as the writable one and anything unnamed is unreadable. This is the position the phrase "outside the scope is denied" actually describes, and it holds **only** here (SPEC R6.1.6).
+
 **Older kernels / Raspberry Pi**: Landlock requires kernel ≥ 5.13. On older Pi OS kernels, run with:
 
 ```bash
-export AHMA_DISABLE_SANDBOX=1
-ahma serve stdio
+ahma serve stdio --no-sandbox
 ```
 
-or add `"--disable-sandbox"` to `mcp.json` args.
+or add `"--no-sandbox"` to `mcp.json` args. Disabling enforcement is deliberately CLI-only — `AHMA_DISABLE_SANDBOX` is retired and ignored, because a client-owned config file can carry an environment variable (SPEC R-CFG2.3).
 
 ### macOS (Seatbelt)
 
-On macOS, Ahma uses Apple's built-in `sandbox-exec` with a generated Seatbelt profile (SBPL) that restricts write access to the sandbox scope. No additional installation required.
+On macOS, Ahma uses Apple's built-in `sandbox-exec` with a generated Seatbelt profile (SBPL) that restricts **write** access to the sandbox scope. No additional installation required.
 
 **Requirements**: Any modern macOS version. `sandbox-exec` is built into macOS.
 
-To work around APFS firmlinks the profile grants global file-*read* (writes stay scoped), then denies reads of plaintext credential directories (`~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.netrc`, `~/.ahma`). `~/.ssh` and `~/.config/gh` are **not** denied so git-over-ssh and `gh` keep working; add more via `[sandbox] deny_credential_reads`, or re-allow a default via `[sandbox] allow_credential_reads`.
+**Writes are kernel-scoped; reads are not** (SPEC R6.2.2). On Apple Silicon and macOS 26+, the APFS firmlink / cryptex volume layout means `bash` and `dyld` resolve paths to vnodes that match no traditional `/usr`, `/System`, … subpath prefix — read rules written as subpaths simply never fire, so a profile that tried to scope reads would deny the very commands it exists to protect. The profile therefore emits a bare, unqualified file-*read* allow. This is a platform limitation rather than a grant, which is why it cannot be expressed as a profile and is instead disclosed on every scope surface: the startup banner, `ahma status`, and the TUI scope panel (SPEC R-PERM.5.1).
+
+What keeps secrets unreadable on macOS is therefore an explicit **denylist**, not the scope (SPEC R6.2.3). Each entry is emitted as a `(deny file-read* …)` placed *after* the blanket allow and *before* the workspace-scope allows, so SBPL's last-match-wins ordering keeps them denied by default while an explicit scope grant still wins. The set covers plaintext credential directories, ahma's own control plane, private key material, and container daemon sockets; it is tuned so no common build/test/VCS tool breaks — notably `~/.ssh` as a whole stays readable (git-over-ssh needs `config` and `known_hosts`) while the `~/.ssh/id_*` key files themselves are denied. The effective set is owned by `sandbox/credential_reads.rs`, not by this page: inspect it with `ahma permissions list`, extend it via `[sandbox] deny_credential_reads`, or re-allow a default via `[sandbox] allow_credential_reads`.
+
+> **A denylist is a weaker guarantee than a scope, and is worth reading as one.** A scope denies everything it does not name; a denylist denies only what it *does* name, so any secret nobody thought to enumerate is readable. It is the best available answer on this platform — not an equivalent of the Linux position above.
 
 #### Keychain access (`gh auth` / `git-credential-osxkeychain`)
 
@@ -90,9 +103,44 @@ or per-invocation with `--no-allow-keychain` (and `--allow-keychain` to force it
 
 > **Note on nesting:** if you launch ahma from *inside* another sandbox (e.g. an editor's Bash sandbox), tool subprocesses run under the **intersection** of both profiles — so keychain access ahma grants can still be blocked by the outer sandbox. Start ahma outside that shell, or see [Nested Sandbox Environments](#nested-sandbox-environments-cursor-vs-code-docker).
 
-### Windows (Job Objects + AppContainer)
+### Windows (Job Objects; AppContainer pending)
 
-On Windows, Ahma uses Job Object enforcement (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) at startup, with AppContainer profile DACL grants for per-scope access control. PowerShell (5.1+) is the shell. See [SPEC.md R6.3](../SPEC.md) for status.
+On Windows, Ahma applies a Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) at startup, which guarantees child processes are killed when the server exits. A Job Object does **not** restrict filesystem access by path in either direction — not writes, not reads. Path confinement arrives with per-command AppContainer isolation, which is probed for but not yet spawned through, so the honest position today is **process-lifetime containment and no kernel filesystem boundary** (SPEC R6.3.9). ahma's own path validation still binds the paths ahma resolves, but it cannot bind what a spawned command does with its own syscalls — so the scope shown on Windows is a scope ahma honours, not one the OS enforces.
+
+PowerShell (5.1+) is the shell. See [SPEC.md R6.3](../SPEC.md) for the GA gate this section has to clear.
+
+## Writable, but not everything (trust handoff)
+
+Confining writes is necessary but not sufficient. A file the agent is fully entitled to write — inside the workspace, through an ordinary tool call — can be executed later by something that was never sandboxed at all: your `git` on the next `commit` or `checkout`, your editor's extension host the next time the folder opens, your agent harness's hook engine at the end of a turn. Nothing breaks the sandbox in this class of attack; the boundary is crossed by a component that was never inside it. SPEC **R-HANDOFF** owns the response. The short version is two tiers, deliberately not collapsed into one.
+
+**Deny-write — no question asked.** Some paths inside your own workspace are not writable, because no legitimate agent task writes them:
+
+- **hook directories under the resolved git directory.** Resolved, not spelled: `git worktree add` and `git init --separate-git-dir` move the real git directory somewhere a `.git/hooks` pattern would never match, and a rule that describes a *spelling* rather than the boundary is no rule at all (SPEC R-HANDOFF.2).
+- **the workspace's own `.ahma/` directory** — ahma's MTDF tool definitions. An agent that can author a tool definition can define the command it is then allowed to run. This is also why ahma no longer watches that directory: a watcher would turn writing the file into *running* it with no user action in between, so **tool configuration reloads only through the explicit `restart` tool** (SPEC R-HANDOFF.7).
+- **container daemon sockets**, denied for read and write alike — a `--privileged` container with a host bind mount converts socket access into unrestricted host write access, performed by a daemon entirely outside the sandbox (SPEC R-HANDOFF.6).
+- **the virtualenv-shaped fake-interpreter vector** — a `pyvenv.cfg`, or an executable named `python*` directly under `bin/`/`Scripts/`, which an editor's interpreter discovery runs from an unsandboxed extension host.
+
+A denied write fails with the structured `sandbox_denial` payload naming the path and the reason; nothing is prompted, because there is no judgement call to delegate.
+
+**Two of those denies have an escape hatch, and the error names it.** "No legitimate agent task writes them" is true of the general case and false of two specific, common ones: installing a repository's own pre-push guard (`cp scripts/check-guardrails.sh .git/hooks/pre-push`), and editing the `.ahma/` tool definitions a project ships. A default with no documented way out does not make anyone safer — it makes them disable the sandbox wholesale, which is far worse than a narrow opt-in. So `--allow-git-hooks` / `[sandbox] allow_git_hooks` and `--allow-project-tool-config` / `[sandbox] allow_project_tool_config` exist, both **off by default**, each removing exactly its own path from the deny set *and* from the macOS kernel rules. Enabling either is disclosed with a startup warning naming what became writable and what will execute it (SPEC R7), and the write-denial message names the flag and the settings key so you never have to go looking. See [settings.md](settings.md#trust-handoff-escape-hatches).
+
+**Allow, but say so loudly.** Editor and harness configuration is genuinely something you ask an agent to edit — `.vscode/tasks.json`, `.vscode/launch.json`, `.vscode/settings.json`, `.vscode/mcp.json` and `.cursor/mcp.json`, `.cursor/hooks.json` and the other harness `hooks.json` files, `.cursor/rules/**`, `.claude/settings.json` / `.claude/settings.local.json`, and a repository's own `.git/config`. Blocking these would break "set up my editor for this project"; prompting on each would be exactly the permission fatigue ahma exists to prevent. So the write **succeeds**, and is surfaced as a first-class warning that names the file *and the trigger that will execute it* — "this runs the next time you open this folder" is the load-bearing half, because a filename alone does not tell you a write became a future execution. Membership of either tier lives in `sandbox/exec_config.rs`, not on this page.
+
+**Enforcement is uneven, and you should know where** (SPEC R-HANDOFF.4). The deny-write tier is a hole *inside* an allowed subtree, and platforms differ on whether that is expressible to the kernel at all:
+
+| Platform | Deny-write tier |
+|---|---|
+| **macOS** | kernel-enforced for the fixed-subpath rules — SBPL is last-match-wins, so a `(deny file-write* …)` emitted after the workspace allow genuinely subtracts |
+| **Linux** | **application-layer only.** Landlock's ABI is additive-allow with no deny rule and no ordering, so the hole cannot be expressed to the kernel (SPEC R6.1.7). ahma enforces it in its own file tools, which means it is **bypassable from `run_terminal_command`**: a shell child inherits the workspace-wide write right and can create a hook script directly |
+| **Windows** | no filesystem enforcement yet (SPEC R6.3.9); the application-layer check is the only control |
+
+The shape-matched rules are application-layer on *every* platform by construction: a kernel deny on every `bin/python*` would break a legitimate `python -m venv`.
+
+**The child's environment is part of the same surface.** Variables that cause an unrelated process to load code of the agent's choosing (`BASH_ENV`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES` and family) or that re-point a trusted client at an attacker-chosen endpoint (`DOCKER_HOST`) are stripped from every sandboxed child. `SSH_AUTH_SOCK` is deliberately **kept**: it is a capability to *use* keys, not to read them, and it is what lets git-over-ssh keep working while the key files stay denied (SPEC R-HANDOFF.5).
+
+## Network egress
+
+The filesystem sandbox says nothing about the network, and **egress is unrestricted by default**. Pass `--restrict-network` (or set `[network] restrict = true`) to route sandboxed subprocesses through a guarded local proxy that forwards only the domains in `[network] allow` — deny-all when that list is empty — and refuses private, loopback and cloud-metadata addresses. The README's *What the sandbox does not cover* section states what that restriction is and is not on each platform. The per-vault `egress.allowlist` described under [Task Vaults](#task-vaults) is a separate, vault-only mechanism and does not apply to an ordinary workspace session.
 
 ## Nested Sandbox Environments (Cursor, VS Code, Docker)
 
@@ -147,7 +195,7 @@ When running in HTTP mode (`ahma serve http`), all `/mcp` endpoints are protecte
 }
 ```
 
-- Start the server with `--require-token <token>` or set `AHMA_REQUIRE_TOKEN`.
+- Start the server with `--require-token <token>` (or `auth.require_token` in `~/.ahma/settings.toml`; `AHMA_REQUIRE_TOKEN` is retired and ignored).
 - The `Authorization: Bearer` scheme is **case-insensitive** (RFC 7235 §2.1).
 - The `/health` endpoint is explicitly **exempt** from authentication so orchestrators can probe liveness without credentials.
 - Bearer tokens are compared in **constant time** to prevent timing attacks.
@@ -156,9 +204,7 @@ When running in HTTP mode (`ahma serve http`), all `/mcp` endpoints are protecte
 **Manual override** (when you know the outer environment is safe):
 
 ```bash
-ahma --disable-sandbox
-# or
-export AHMA_DISABLE_SANDBOX=1
+ahma --no-sandbox
 ```
 
 Common `mcp.json` for nested environments (VS Code with workspace scoping):
@@ -191,18 +237,24 @@ By default, ahma grants **write access** to the package-manager fetch directorie
 
 > **Do not use `--sandbox-scope ~/.cargo`**: that flag grants **read-write to the entire cargo home**, including installed binaries and credentials. The built-in `package_cache_write` feature is narrower and safer.
 
-To disable (strictest isolation):
+### What that write access costs you
+
+This is a **disclosed residual risk, not a bug** (SPEC R-HANDOFF.8), and it is the reason the opt-out exists. The package cache is shared by *every* project on the machine. An agent working in project X can edit the extracted source of a cached crate, and that edited code is compiled and executed — as a build script or a proc macro — when you later build an unrelated project Y. No sandbox rule is violated at any point: the write is legitimate, and the execution happens in another session, in another project, possibly weeks later, in a build the agent has no part in.
+
+Auto-narrowing (above) does **not** help here, and reasoning by analogy from it is the trap: narrowing bounds an injected write to one subtree of a container you already authorized, but the cache was never inside the container to begin with.
+
+Related, and worth stating plainly: build scripts and proc macros are ordinary programs that run at build time with the **full write set of the sandbox** — the workspace, the temp scopes, and every writable path an enabled profile granted. Adding a dependency is adding code that runs locally; the sandbox bounds *where* that code can write, never *whether* it runs (SPEC R-HANDOFF.9).
+
+To turn the cross-project channel off — this is the mitigation for the risk above, not a generic hardening knob:
 
 ```bash
 ahma serve stdio --no-package-cache-write
-# or
-AHMA_NO_PACKAGE_CACHE_WRITE=1 ahma serve stdio
 # or in ~/.ahma/settings.toml:
 # [sandbox]
 # package_cache_write = false
 ```
 
-`$CARGO_HOME` is respected; defaults to `~/.cargo`.
+It downgrades those `rw` rules to read-execute rather than dropping them, so the toolchain stays runnable and only `cargo add` / `cargo update` stop working inside the sandbox. `$CARGO_HOME` is respected; defaults to `~/.cargo`.
 
 > **These paths are a *profile*, not a hard-coded exception.** The cargo carve-out
 > above ships as `rust` in `[sandbox] profiles` — data, not code — so you can see
@@ -247,7 +299,7 @@ in-scope without any grant.
 
 ## Temp Directory Access (`--tmp`)
 
-By default, the system temp directory is accessible only via platform-implicit rules. Use `--tmp` (or `AHMA_TMP_ACCESS=1`) to add it as an explicit read/write scope — useful for compilers and build tools.
+By default, the system temp directory is accessible only via platform-implicit rules. Use `--tmp` (or `[sandbox] tmp_access = true`) to add it as an explicit read/write scope — useful for compilers and build tools.
 
 | Flag combination | Behavior |
 |-----------------|----------|
@@ -313,7 +365,7 @@ Or in a single `mcp.json` entry:
 
 | Property | Detail |
 |----------|--------|
-| **Kernel-enforced scope** | The sandbox scope is `<vault>/workdir/` — the kernel rejects writes outside it |
+| **Kernel-enforced scope** | The sandbox scope is `<vault>/workdir/` — writes outside it are rejected by the kernel on Linux and macOS (see the platform table at the top of this page for what *reads* do, and for Windows) |
 | **Inputs are copies** | The agent never touches original files — only copies placed in `inputs/` |
 | **Two-phase delete** | `trash/` holds staged deletions; `purge` requires explicit confirmation |
 | **Append-only audit** | `audit.jsonl` records every tool call, artifact write, and elevation grant |
@@ -368,4 +420,4 @@ NO_PROXY=127.0.0.1,::1,localhost
 
 Requests to domains not in the allowlist receive `407 Proxy Authentication Required` (CONNECT) or `403 Forbidden` (plain HTTP), indistinguishable from a real network failure — the subprocess learns nothing about which domains are blocked.
 
-The kernel FS sandbox prevents the subprocess from modifying `/etc/hosts` or `/etc/resolv.conf`, so DNS rebinding cannot route traffic around the proxy.
+On Linux and macOS the kernel FS sandbox blocks the subprocess from modifying `/etc/hosts` or `/etc/resolv.conf`, closing the DNS-rebinding route around the proxy. On Windows that write is not OS-blocked yet (SPEC R6.3.9), so treat the proxy there as the only control.

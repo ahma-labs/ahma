@@ -552,6 +552,40 @@ impl AhmaConfig {
     }
 }
 
+/// Warn that a **retired** `AHMA_*` configuration variable is set, then ignore it
+/// (SPEC R-CFG1.2), returning only whether it was set.
+///
+/// This lives in `ahma_common` — the crate everything else depends on — because
+/// R-CFG1.2.1 makes retirement a **product** rule: a variable ignored by `ahma`
+/// must be ignored by `ahma-tui`, by `ahma update`, by `ahma uninstall`, and by
+/// MCP tool handlers alike. Every one of those surfaces had, at some point,
+/// spelled the warn-and-ignore verdict in its own words, and every one of them
+/// drifted: the docs said "retired" while the code still read the value, or one
+/// binary honored what another had already dropped. One variable with two
+/// meanings inside one product is worse than either answer alone.
+///
+/// So there is exactly one function that states the verdict, and it is reachable
+/// from the bottom of the dependency graph. `ahma_mcp` re-exports it as
+/// `ahma_mcp::warn_retired_env` for callers already reaching for it there.
+///
+/// The value is **never** returned: callers learn only "was it set", so there is
+/// no way to accidentally honor it. Returning that bit is what lets tests assert
+/// the contract without scraping log output.
+///
+/// Enforced generically by `ahma_mcp/tests/retired_env_drift_test.rs`, which
+/// fails if any production source reads a name the docs list as retired.
+pub fn warn_retired_env(name: &str) -> bool {
+    if std::env::var_os(name).is_some() {
+        warn!(
+            "AHMA env var {name} is set but IGNORED (retired per R-CFG1.2). \
+             Use the equivalent CLI flag or ~/.ahma/settings.toml instead."
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// Resolve the user's home directory for locating the `~/.ahma` directory.
 ///
 /// Identical to [`dirs::home_dir`] in **release** builds. In debug/test builds
@@ -727,11 +761,6 @@ pub struct ToolSettings {
     /// and the result is pushed as a notification.
     /// Default: `false`
     pub force_sync: bool,
-    /// Watch the tools directory for JSON changes and reload tool definitions at runtime.
-    /// **Security warning**: enabling this allows new tools to be injected mid-session.
-    /// Enable only while authoring tool definitions.
-    /// Default: `false`
-    pub hot_reload: bool,
     /// Skip tool availability probes at startup.  Probes detect whether required
     /// executables (e.g. `cargo`, `git`) are installed and hide tools whose
     /// prerequisites are missing.  Skip to reduce startup latency when all tools
@@ -775,7 +804,6 @@ impl Default for ToolSettings {
             request_budget_override_secs: None,
             force_progress_notifications: false,
             force_sync: false,
-            hot_reload: false,
             skip_probes: false,
             tools_dir: None,
             tool_bundles: Vec::new(),
@@ -1033,6 +1061,38 @@ pub struct SandboxSettings {
     /// Default: all built-in profiles
     #[serde(default = "default_sandbox_profiles")]
     pub profiles: Vec<String>,
+    /// Let sandboxed tools write git **hook** directories (`<git dir>/hooks/**`).
+    ///
+    /// Denied by default (SPEC R-HANDOFF.3 tier 1): a hook is a file ahma's
+    /// sandbox permits but `git` — which runs *outside* the sandbox — executes on
+    /// your next commit, checkout, or push. That is the trust-handoff shape, and
+    /// nothing an agent routinely does needs to author a hook.
+    ///
+    /// It is nonetheless a real workflow: installing a pre-push guard from a repo
+    /// script is a documented, sensible thing to ask an agent to do. Turning this
+    /// on removes `<git dir>/hooks` from the deny-write set **and** from the macOS
+    /// Seatbelt deny rules, for every resolved git directory, for the whole
+    /// session — and ahma discloses that loudly at startup (SPEC R7). Prefer the
+    /// one-session `--allow-git-hooks` flag over setting it here permanently.
+    /// Default: `false`
+    #[serde(default)]
+    pub allow_git_hooks: bool,
+    /// Let sandboxed tools write the workspace's own `.ahma/` tool-config
+    /// directory.
+    ///
+    /// Denied by default (SPEC R-HANDOFF.7): `.ahma/` holds the MTDF definitions
+    /// of the commands ahma itself will run, so an agent that can write it can
+    /// define a tool and then call it — trust handoff with ahma as the trusted
+    /// executor.
+    ///
+    /// Turn it on when you are *developing* the tool configs (ahma on ahma, or a
+    /// repo that ships its own `.ahma/`). It removes `<workspace>/.ahma` from the
+    /// deny-write set and from the Seatbelt deny rules for the whole session, and
+    /// is disclosed loudly at startup. Note that configs still never hot-reload
+    /// (R1.4) — an edit takes effect only via the explicit `restart` tool.
+    /// Default: `false`
+    #[serde(default)]
+    pub allow_project_tool_config: bool,
 }
 
 /// Every shipped profile, enabled — the opt-out default (R-PERM.5).
@@ -1109,6 +1169,8 @@ impl Default for SandboxSettings {
             deny_credential_reads: Vec::new(),
             allow_credential_reads: Vec::new(),
             profiles: default_sandbox_profiles(),
+            allow_git_hooks: false,
+            allow_project_tool_config: false,
         }
     }
 }
@@ -1353,18 +1415,74 @@ impl Default for WebSettings {
 /// (`fetch_webpage`); this governs the *subprocesses ahma spawns*. Lives in
 /// `~/.ahma/settings.toml`, outside every sandbox scope, so the agent cannot
 /// grant itself egress.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkSettings {
     /// Route sandboxed subprocesses through the guarded egress proxy. Off by
     /// default (backward-compatible: `(allow network*)`). Also enabled by the
-    /// `--restrict-network` flag. With `restrict = true` and an empty `allow`,
-    /// **all** subprocess egress is denied.
+    /// `--restrict-network` flag. With `restrict = true` and nothing reachable —
+    /// no `allow` entries and no profile hosts — **all** subprocess egress is
+    /// denied.
+    ///
+    /// **This default is deliberate and is not an unfinished job.** Shipped
+    /// profiles now seed the allowlist so restricted mode no longer breaks the
+    /// first `cargo build`, but flipping this to `true` would still break every
+    /// user whose toolchain has no shipped profile — which is most toolchains.
+    /// Defaulting it on is a decision for later, on evidence.
     pub restrict: bool,
     /// Domains subprocesses may reach when `restrict` is on. Syntax matches the
-    /// egress allowlist: exact (`crates.io`), single-level wildcard
-    /// (`*.crates.io`), or `*` for any. Empty means deny-all.
+    /// egress allowlist: exact (`crates.io`) or single-level wildcard
+    /// (`*.crates.io`, which matches `api.crates.io` but neither `crates.io`
+    /// itself nor `a.b.crates.io`). `*` permits everything, which is the same as
+    /// not restricting at all.
+    ///
+    /// This **composes with** the hostnames enabled sandbox profiles contribute
+    /// (see `profile_hosts`); it does not replace them. Entries here are always
+    /// in effect. A malformed entry (a URL, a `host:port`, a non-ASCII name) is
+    /// dropped with a warning rather than stored as a rule that can never fire.
     pub allow: Vec<String>,
+    /// Let enabled sandbox profiles contribute their toolchain's hostnames to the
+    /// egress allowlist when `restrict` is on. Default: `true`.
+    ///
+    /// A profile already declares the *paths* its toolchain needs; this is the
+    /// same pre-answered bundle of grant questions applied to *hosts*, and it is
+    /// the reason turning `restrict` on no longer breaks `cargo build`,
+    /// `npm install`, and `go mod download` on the first command.
+    ///
+    /// Setting this to `false` drops every profile-contributed host while leaving
+    /// every profile's **path** grants intact — the toolchain stays runnable, it
+    /// just cannot reach its registry until you list the hosts yourself. Use
+    /// `deny_profile_hosts` for the same thing one profile at a time.
+    ///
+    /// Inert when `restrict` is off: with no restriction there is no allowlist to
+    /// seed.
+    /// Default: `true`
+    pub profile_hosts: bool,
+    /// Profiles whose hostnames are **not** added to the allowlist, by name.
+    ///
+    /// The per-profile form of `profile_hosts = false`: "I write Go and want
+    /// `~/.go` granted, but this machine must never reach the public module
+    /// mirror." Removing the profile from `[sandbox] profiles` would take the
+    /// paths away too, which is a different — and usually wrong — answer.
+    ///
+    /// Applied on top of `[sandbox] profiles`: a profile that is not enabled
+    /// contributes nothing regardless, and `profile_hosts = false` overrides this
+    /// list entirely.
+    /// Default: empty list
+    pub deny_profile_hosts: Vec<String>,
+}
+
+impl Default for NetworkSettings {
+    fn default() -> Self {
+        Self {
+            // Opt-in. See the field docs: this is a deliberate default, not a
+            // half-finished migration.
+            restrict: false,
+            allow: Vec::new(),
+            profile_hosts: true,
+            deny_profile_hosts: Vec::new(),
+        }
+    }
 }
 
 /// Runtime feature toggles.
@@ -1845,12 +1963,6 @@ impl AhmaSettings {
             d.tools.force_sync.to_string(),
         );
         w.setting(
-            "Reload tools from disk on change — INSECURE in production.",
-            "hot_reload",
-            self.tools.hot_reload.to_string(),
-            d.tools.hot_reload.to_string(),
-        );
-        w.setting(
             "Skip tool-availability probes at startup.",
             "skip_probes",
             self.tools.skip_probes.to_string(),
@@ -1997,6 +2109,18 @@ impl AhmaSettings {
             "profiles",
             toml_str_list(&self.sandbox.profiles),
             toml_str_list(&d.sandbox.profiles),
+        );
+        w.setting(
+            "Let sandboxed tools write git hook dirs (<git dir>/hooks/**). Off by default: a hook you write here runs OUTSIDE the sandbox on your next git operation.",
+            "allow_git_hooks",
+            self.sandbox.allow_git_hooks.to_string(),
+            d.sandbox.allow_git_hooks.to_string(),
+        );
+        w.setting(
+            "Let sandboxed tools write the workspace's own .ahma/ tool configs. Off by default: those files define the commands ahma will run.",
+            "allow_project_tool_config",
+            self.sandbox.allow_project_tool_config.to_string(),
+            d.sandbox.allow_project_tool_config.to_string(),
         );
 
         // ── Logging ──────────────────────────────────────────────────────────
@@ -2154,10 +2278,22 @@ impl AhmaSettings {
             d.network.restrict.to_string(),
         );
         w.setting(
-            "Domains subprocesses may reach when restrict=true (exact, *.wildcard, or *). Empty = deny all egress.",
+            "Domains subprocesses may reach when restrict=true (exact, or *.wildcard = one label). Composes with profile hosts; does not replace them.",
             "allow",
             toml_str_list(&self.network.allow),
             toml_str_list(&d.network.allow),
+        );
+        w.setting(
+            "Let enabled [sandbox] profiles seed the allowlist with their toolchain's hosts (crates.io, registry.npmjs.org, proxy.golang.org, ...). false drops the hosts and keeps the path grants. See `ahma permissions list`.",
+            "profile_hosts",
+            self.network.profile_hosts.to_string(),
+            d.network.profile_hosts.to_string(),
+        );
+        w.setting(
+            "Profiles whose hosts are NOT added, by name — the per-profile form of profile_hosts=false. Path grants are unaffected.",
+            "deny_profile_hosts",
+            toml_str_list(&self.network.deny_profile_hosts),
+            toml_str_list(&d.network.deny_profile_hosts),
         );
 
         // ── Permissions ──────────────────────────────────────────────────────
@@ -2596,7 +2732,6 @@ mod tests {
                 request_budget_override_secs: Some(120),
                 force_progress_notifications: true,
                 force_sync: true,
-                hot_reload: true,
                 skip_probes: true,
                 tools_dir: Some(PathBuf::from("/opt/tools")),
                 tool_bundles: vec!["rust".into(), "git".into()],
@@ -2633,6 +2768,8 @@ mod tests {
                 deny_credential_reads: vec![PathBuf::from("~/.ssh")],
                 allow_credential_reads: vec![PathBuf::from("~/.aws")],
                 profiles: vec!["rust".into()],
+                allow_git_hooks: true,
+                allow_project_tool_config: true,
             },
             logging: LoggingSettings {
                 target: "stderr".into(),
@@ -2670,6 +2807,8 @@ mod tests {
             network: NetworkSettings {
                 restrict: true,
                 allow: vec!["crates.io".into(), "*.crates.io".into()],
+                profile_hosts: false,
+                deny_profile_hosts: vec!["go".into()],
             },
             permissions: crate::permissions::PermissionSettings {
                 tool_approvals: vec![crate::permissions::ToolApproval {
@@ -3178,7 +3317,6 @@ default_model = "llama3.2"
         let s = AhmaSettings::default();
         assert_eq!(s.tools.timeout_secs, 600);
         assert!(!s.tools.force_sync);
-        assert!(!s.tools.hot_reload);
         assert!(!s.tools.skip_probes);
     }
 
@@ -3436,6 +3574,34 @@ persistent_scopes = [
         assert_eq!(s.sandbox.persistent_scopes[1].access, ScopeAccess::Ro);
     }
 
+    /// The two trust-handoff escape hatches are **opt-in**: absent from the file
+    /// they are denied, and each flips independently of the other. Polarity is
+    /// the inverse of `allow_keychain`, so a copy-paste `default_true` would
+    /// silently open both — assert it here rather than trust the attribute.
+    #[test]
+    fn handoff_escape_hatches_default_denied_and_toggle_independently() {
+        let d = SandboxSettings::default();
+        assert!(!d.allow_git_hooks, "git hooks must be denied by default");
+        assert!(
+            !d.allow_project_tool_config,
+            "project .ahma/ must be denied by default"
+        );
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "[sandbox]\nallow_git_hooks = true\n").unwrap();
+        let s = AhmaSettings::load_from(tmp.path());
+        assert!(s.sandbox.allow_git_hooks);
+        assert!(
+            !s.sandbox.allow_project_tool_config,
+            "enabling one hatch must not enable the other"
+        );
+
+        std::fs::write(tmp.path(), "[sandbox]\nallow_project_tool_config = true\n").unwrap();
+        let s = AhmaSettings::load_from(tmp.path());
+        assert!(s.sandbox.allow_project_tool_config);
+        assert!(!s.sandbox.allow_git_hooks);
+    }
+
     #[test]
     fn grant_scope_adds_then_updates_in_place() {
         let mut sb = SandboxSettings::default();
@@ -3493,5 +3659,21 @@ persistent_scopes = [
         // Revoking by the expanded path removes the ~-stored entry.
         assert!(sb.revoke_scope(&home.join("foo")).is_some());
         assert!(sb.persistent_scopes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod removed_key_compat_tests {
+    use super::AhmaSettings;
+
+    /// A settings file left over from before the tools-directory watcher was
+    /// removed (SPEC R1.4 / R-HANDOFF.7) still carries `[tools] hot_reload`.
+    /// Parsing must ignore it rather than fail, so upgrading ahma never leaves a
+    /// user with an unreadable settings file.
+    #[test]
+    fn retired_hot_reload_key_is_ignored_not_fatal() {
+        let s = AhmaSettings::parse("[tools]\nhot_reload = true\nforce_sync = true\n")
+            .expect("a retired key must not make the settings file unparseable");
+        assert!(s.tools.force_sync, "sibling keys must still apply");
     }
 }

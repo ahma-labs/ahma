@@ -106,15 +106,19 @@ GitHub's OIDC service refuses to issue outside of a legitimate workflow run.
 
 ## Offline / air-gapped use
 
-Set `AHMA_INSECURE_SKIP_VERIFY=1` to bypass attestation verification:
+Pass `--insecure-skip-verify` to bypass attestation verification:
 
 ```bash
-AHMA_INSECURE_SKIP_VERIFY=1 ahma update
+ahma update --insecure-skip-verify
 ```
 
-Or use `--insecure-skip-verify` with `ahma update`. This skips the online Sigstore check
-entirely. Use only in air-gapped environments or when the GitHub API and Rekor are
-unreachable.
+This skips the online Sigstore check entirely. Use only in air-gapped environments or
+when the GitHub API and Rekor are unreachable.
+
+Bypassing verification is deliberately a **CLI flag only** — `AHMA_INSECURE_SKIP_VERIFY`
+and `AHMA_INSECURE_SKIP_SIGNATURE` are retired and ignored with a loud warning, because a
+security-tier setting must not be reachable from an environment a config file can set
+(SPEC R-CFG2.3).
 
 Alternatively, build from auditable source:
 ```bash

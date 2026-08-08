@@ -63,3 +63,37 @@ path = "${CARGO_HOME:-~/.cargo}/.package-cache-mutate"
 access = "rw"
 kind = "file"
 precreate = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hostnames this toolchain must reach when `--restrict-network` is on.
+#
+# Same idea as the path rules above, one layer out: a pre-answered bundle of
+# grant questions, so that turning restriction on does not break `cargo build`
+# on the first command. Ignored entirely when restriction is off (the default) —
+# these lines widen nothing on a default install, they only make the *narrow*
+# configuration usable.
+#
+# Every host here was verified against what cargo/rustup actually contact, not
+# copied from a blog post; the `reason` is the verification, kept next to the
+# entry so a future reader can re-check it rather than trust it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[hosts]]
+host = "index.crates.io"
+reason = "sparse registry index — cargo's default dependency-resolution protocol since 1.70"
+
+[[hosts]]
+host = "static.crates.io"
+reason = "crate .crate downloads; the `dl` endpoint named by https://index.crates.io/config.json"
+
+[[hosts]]
+host = "crates.io"
+reason = "registry API (publish, yank, search, owner); the `api` endpoint named by config.json"
+
+[[hosts]]
+host = "static.rust-lang.org"
+reason = "rustup channel manifests and toolchain/component downloads"
+
+[[hosts]]
+host = "github.com"
+reason = "git dependencies over HTTPS, and the legacy git index rust-lang/crates.io-index"

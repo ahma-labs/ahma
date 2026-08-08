@@ -558,7 +558,17 @@ fn disable_claude_plugin(path: &Path, plugin_key: &str, dry_run: bool) -> Result
 // ── Binary teardown ───────────────────────────────────────────────────────────
 
 fn uninstall_binary(dry_run: bool) -> Result<()> {
-    let install_dir = resolve_install_dir()?;
+    uninstall_binary_in(&resolve_install_dir()?, dry_run)
+}
+
+/// Remove the installed binary from `install_dir`.
+///
+/// Split out from [`uninstall_binary`] so tests can point at a temp directory directly
+/// instead of steering the resolution with an environment variable. That mattered: the
+/// only reason these tests used to set `AHMA_INSTALL_DIR` was to keep themselves from
+/// deleting the developer's real `~/.local/bin/ahma`, which made a retired variable
+/// look load-bearing when the real requirement was just an injectable parameter.
+fn uninstall_binary_in(install_dir: &Path, dry_run: bool) -> Result<()> {
     let binary_name = if cfg!(windows) { "ahma.exe" } else { "ahma" };
     let binary_path = install_dir.join(binary_name);
     let old_path = install_dir.join(if cfg!(windows) {
@@ -569,6 +579,7 @@ fn uninstall_binary(dry_run: bool) -> Result<()> {
 
     if dry_run {
         print_dry_run_binary_removal(&[&binary_path, &old_path]);
+        print_custom_install_hint(install_dir);
         return Ok(());
     }
 
@@ -578,7 +589,17 @@ fn uninstall_binary(dry_run: bool) -> Result<()> {
     #[cfg(windows)]
     print_windows_removal_instructions(&binary_path, &old_path);
 
+    print_custom_install_hint(install_dir);
+
     Ok(())
+}
+
+/// Print [`custom_install_hint`] when the running binary lives outside `install_dir`.
+fn print_custom_install_hint(install_dir: &Path) {
+    let exe = std::env::current_exe().ok();
+    if let Some(hint) = custom_install_hint(install_dir, exe.as_deref()) {
+        println!("{hint}");
+    }
 }
 
 /// Print `[dry-run] Would remove ...` for each path that exists.
@@ -630,14 +651,49 @@ fn print_windows_removal_instructions(binary_path: &Path, old_path: &Path) {
 
 /// Resolve the directory where the binary was installed.
 ///
-/// Respects `AHMA_INSTALL_DIR` environment variable, falling back to `~/.local/bin`.
+/// Delegates to [`crate::update::resolve_install_dir`] so uninstall deletes from exactly
+/// the directory update installs into. `AHMA_INSTALL_DIR` is retired (R-CFG1.2) and is
+/// warn-and-ignored there; an env var that decides which binary gets deleted is ambient
+/// input with real teeth.
+///
+/// `ahma uninstall` has no `--install-dir` flag yet, so a non-default installation is
+/// reported rather than removed — see [`custom_install_hint`].
 fn resolve_install_dir() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("AHMA_INSTALL_DIR")
-        && !dir.is_empty()
-    {
-        return Ok(PathBuf::from(dir));
+    crate::update::resolve_install_dir(None)
+}
+
+/// A hint naming the *running* executable when it does not live in `install_dir`.
+///
+/// Replaces the one thing `AHMA_INSTALL_DIR` was genuinely useful for — uninstalling a
+/// binary that was installed somewhere other than `~/.local/bin`. Rather than trusting
+/// the environment to name that directory, ahma reports the path it can actually prove:
+/// the executable currently running. The user deletes it themselves, so nothing outside
+/// the default location is removed on the say-so of an inherited variable.
+///
+/// Returns `None` when the running executable is inside `install_dir` (nothing to add)
+/// or when the current executable path cannot be determined.
+fn custom_install_hint(install_dir: &Path, current_exe: Option<&Path>) -> Option<String> {
+    let exe = current_exe?;
+    let exe_dir = exe.parent()?;
+    // Case-insensitive filesystems still compare case-sensitively via `Path`, so
+    // canonicalize both sides before deciding they differ (AGENTS.md, Windows note).
+    let same = match (
+        dunce::canonicalize(exe_dir),
+        dunce::canonicalize(install_dir),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => exe_dir == install_dir,
+    };
+    if same {
+        return None;
     }
-    crate::update::default_install_dir()
+    Some(format!(
+        "  Note: the ahma you are running is {}, which is outside {}.\n  \
+         `ahma uninstall` only removes the binary from the default install directory; \
+         delete that file yourself if you no longer want it.",
+        exe.display(),
+        install_dir.display()
+    ))
 }
 
 // ── Purge ~/.ahma ─────────────────────────────────────────────────────────────
@@ -1644,14 +1700,18 @@ mod tests {
 
     // ── resolve_install_dir / uninstall_binary ────────────────────────────────
 
+    /// R-CFG1.2: `AHMA_INSTALL_DIR` is retired. `ahma uninstall` must delete from the
+    /// default install directory even when the variable names a different one —
+    /// otherwise an inherited variable decides which binary gets removed.
     #[test]
-    fn resolve_install_dir_honors_env() -> Result<()> {
+    fn resolve_install_dir_ignores_retired_env() -> Result<()> {
         let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempdir()?;
-        let prev = std::env::var("AHMA_INSTALL_DIR").ok();
+        let prev = std::env::var_os("AHMA_INSTALL_DIR");
         // SAFETY: test-only, serialized via ENV_MUTEX.
         unsafe { std::env::set_var("AHMA_INSTALL_DIR", tmp.path()) };
         let dir = resolve_install_dir();
+        let warned = crate::warn_retired_env("AHMA_INSTALL_DIR");
         // SAFETY: restore.
         unsafe {
             match prev {
@@ -1659,79 +1719,94 @@ mod tests {
                 None => std::env::remove_var("AHMA_INSTALL_DIR"),
             }
         }
-        assert_eq!(dir?, tmp.path());
+        assert!(warned, "a set retired variable must still be warned about");
+        let dir = dir?;
+        assert_ne!(
+            dir,
+            tmp.path(),
+            "AHMA_INSTALL_DIR is retired and must not steer uninstall"
+        );
+        assert_eq!(
+            dir,
+            crate::update::default_install_dir()?,
+            "uninstall must target the same directory `ahma update` installs into"
+        );
+        Ok(())
+    }
+
+    /// `ahma uninstall` and `ahma update` must agree on the install directory —
+    /// the two halves of one lifecycle share a single resolution.
+    #[test]
+    fn uninstall_and_update_resolve_the_same_install_dir() -> Result<()> {
+        assert_eq!(
+            resolve_install_dir()?,
+            crate::update::resolve_install_dir(None)?
+        );
         Ok(())
     }
 
     #[test]
     fn uninstall_binary_dry_run_keeps_binary() -> Result<()> {
-        let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempdir()?;
-        let prev = std::env::var("AHMA_INSTALL_DIR").ok();
-        // SAFETY: test-only, serialized via ENV_MUTEX.
-        unsafe { std::env::set_var("AHMA_INSTALL_DIR", tmp.path()) };
         let binary_name = if cfg!(windows) { "ahma.exe" } else { "ahma" };
         let bin = tmp.path().join(binary_name);
         std::fs::write(&bin, "binary").ok();
-        let result = uninstall_binary(true);
-        let still_there = bin.exists();
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AHMA_INSTALL_DIR", v),
-                None => std::env::remove_var("AHMA_INSTALL_DIR"),
-            }
-        }
-        result?;
-        assert!(still_there, "dry-run keeps binary");
+        uninstall_binary_in(tmp.path(), true)?;
+        assert!(bin.exists(), "dry-run keeps binary");
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
     fn uninstall_binary_removes_binary_and_old() -> Result<()> {
-        let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempdir()?;
-        let prev = std::env::var("AHMA_INSTALL_DIR").ok();
-        // SAFETY: test-only, serialized via ENV_MUTEX.
-        unsafe { std::env::set_var("AHMA_INSTALL_DIR", tmp.path()) };
         let bin = tmp.path().join("ahma");
         let old = tmp.path().join("ahma.old");
         std::fs::write(&bin, "binary").ok();
         std::fs::write(&old, "old").ok();
-        let result = uninstall_binary(false);
-        let bin_gone = !bin.exists();
-        let old_gone = !old.exists();
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AHMA_INSTALL_DIR", v),
-                None => std::env::remove_var("AHMA_INSTALL_DIR"),
-            }
-        }
-        result?;
-        assert!(bin_gone, "binary removed");
-        assert!(old_gone, "ahma.old removed");
+        uninstall_binary_in(tmp.path(), false)?;
+        assert!(!bin.exists(), "binary removed");
+        assert!(!old.exists(), "ahma.old removed");
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
     fn uninstall_binary_missing_binary_is_ok() -> Result<()> {
-        let _guard = ENV_MUTEX.lock().unwrap();
         let tmp = tempdir()?;
-        let prev = std::env::var("AHMA_INSTALL_DIR").ok();
-        // SAFETY: test-only, serialized via ENV_MUTEX.
-        unsafe { std::env::set_var("AHMA_INSTALL_DIR", tmp.path()) };
-        let result = uninstall_binary(false);
-        // SAFETY: restore.
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("AHMA_INSTALL_DIR", v),
-                None => std::env::remove_var("AHMA_INSTALL_DIR"),
-            }
-        }
-        result?;
+        uninstall_binary_in(tmp.path(), false)?;
+        Ok(())
+    }
+
+    /// The hint replaces what `AHMA_INSTALL_DIR` was actually useful for: telling a user
+    /// who installed elsewhere which file to delete. It reports the path ahma can prove
+    /// (its own executable) instead of trusting one the environment supplied.
+    #[test]
+    fn custom_install_hint_names_the_running_exe_when_outside_install_dir() -> Result<()> {
+        let install = tempdir()?;
+        let elsewhere = tempdir()?;
+        let exe = elsewhere.path().join("ahma");
+        let hint = custom_install_hint(install.path(), Some(&exe))
+            .expect("an exe outside the install dir must produce a hint");
+        assert!(
+            hint.contains(&exe.display().to_string()),
+            "hint must name the running executable: {hint}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn custom_install_hint_is_silent_for_the_normal_case() -> Result<()> {
+        let install = tempdir()?;
+        let exe = install.path().join("ahma");
+        assert!(
+            custom_install_hint(install.path(), Some(&exe)).is_none(),
+            "no hint when the running exe is already in the install dir"
+        );
+        assert!(
+            custom_install_hint(install.path(), None).is_none(),
+            "no hint when the current exe cannot be determined"
+        );
         Ok(())
     }
 
@@ -1748,11 +1823,8 @@ mod tests {
             &tmp.path().join(".cursor").join("mcp.json"),
             r#"{"mcpServers":{"Ahma":{"type":"stdio"}}}"#,
         );
-        // AHMA_INSTALL_DIR points at temp so binary teardown is harmless.
-        let prev_install = std::env::var("AHMA_INSTALL_DIR").ok();
-        // SAFETY: test-only, serialized via ENV_MUTEX.
-        unsafe { std::env::set_var("AHMA_INSTALL_DIR", tmp.path()) };
-
+        // dry_run = true, so the Binary action only *prints* what it would remove;
+        // it never touches the real install directory. No env steering needed.
         let result = execute_actions(
             &[
                 UninstallAction::Mcp,
@@ -1766,13 +1838,6 @@ mod tests {
         )
         .await;
 
-        // SAFETY: restore.
-        unsafe {
-            match prev_install {
-                Some(v) => std::env::set_var("AHMA_INSTALL_DIR", v),
-                None => std::env::remove_var("AHMA_INSTALL_DIR"),
-            }
-        }
         // Cursor config must be untouched in dry-run.
         let unchanged = std::fs::read_to_string(tmp.path().join(".cursor").join("mcp.json"))?;
         restore_home(prev);

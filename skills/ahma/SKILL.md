@@ -430,7 +430,7 @@ Ahma auto-detects and loads them at startup. Override path via `--tools-dir /pat
 
 Validate tool configs: `ahma tool validate .ahma/`
 
-Hot-reload while authoring (dev only): `ahma serve stdio --hot-reload`
+Tool definitions load once at startup — there is no watch mode. After editing a definition, call the `restart` tool to reload it.
 
 ---
 
@@ -449,7 +449,6 @@ Hot-reload while authoring (dev only): `ahma serve stdio --hot-reload`
 | `--tools-dir` / `tools.tools_dir` | `.ahma/` | Custom tools directory path |
 | `--timeout` / `tools.timeout_secs` | `360` | Default tool timeout (seconds) |
 | `--sync` / `tools.force_sync` | off | Force all tools synchronous |
-| `--hot-reload` / `tools.hot_reload` | off | Reload tool JSON on file change (dev only) |
 | `--no-sandbox` / `sandbox.disable` | off | Disable kernel sandbox (UNSAFE) |
 | `--sandbox-scope` / `sandbox.scopes` | cwd | Sandbox scope paths |
 | `sandbox.container_root` | unset | Directory holding your projects (e.g. `~/github`); scope fallback when the client reports no roots, narrowed to the project in use |

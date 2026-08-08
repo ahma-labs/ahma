@@ -768,15 +768,22 @@ async fn red_team_spawned_child_landlock_enforced_from_worker_thread() {
 /// The escape is a `>` shell redirect inside a free-form command string, which
 /// ahma never parses — so application-level `validate_path` cannot catch it and
 /// blocking depends entirely on the kernel-level sandbox wrapping the spawned
-/// shell.  On Windows that requires AppContainer spawn isolation, which is still
-/// pending (SPEC R6.3.3; `create_appcontainer_command` is currently a stub).
-/// Until that lands, Windows cannot block this escape, so the test is ignored
-/// there rather than asserting a guarantee the platform does not yet provide.
-/// Linux (Landlock) and macOS (Seatbelt) run and enforce it.
+/// shell. Linux (Landlock) and macOS (Seatbelt) run and enforce it.
+///
+/// **Windows status: implemented, unproven.** AppContainer spawn isolation now
+/// exists (`sandbox/windows.rs`: per-session container SID, scope DACL grants,
+/// `STARTUPINFOEX` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` spawn through
+/// the `ahma.exe` launcher). It was written and type-checked on a non-Windows
+/// host and has **never been executed**, so nothing yet demonstrates that it
+/// blocks this escape. The `ignore` therefore stays: per AGENTS.md it comes off
+/// when R6.3.3 lands *and Windows CI proves it*, and only the second half is
+/// outstanding. The next person to touch this should run it on a `windows-latest`
+/// runner, and if it passes, delete the `cfg_attr` and flip SPEC R6.3.3 to done.
 #[tokio::test]
 #[cfg_attr(
     target_os = "windows",
-    ignore = "Requires AppContainer spawn isolation (SPEC R6.3.3), still pending on Windows"
+    ignore = "AppContainer spawn isolation (SPEC R6.3.3) is implemented but has never been \
+              executed; remove this ignore once a windows-latest CI run proves it"
 )]
 async fn red_team_command_write_escape_blocked() {
     init_test_logging();

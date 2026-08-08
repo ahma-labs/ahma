@@ -376,14 +376,6 @@ impl SettingsEditor {
                 security_tier: false,
             },
             SettingItem {
-                key: "tools.hot_reload",
-                label: "Hot reload",
-                description: "Reload tool JSON on file change",
-                value: SettingValue::Bool(t.hot_reload),
-                default_value: SettingValue::Bool(d.hot_reload),
-                security_tier: false,
-            },
-            SettingItem {
                 key: "tools.skip_probes",
                 label: "Skip probes",
                 description: "Skip availability probes at startup",
@@ -460,6 +452,22 @@ impl SettingsEditor {
                 description: "macOS: allow keychain read/write (gh, git-credential-osxkeychain)",
                 value: SettingValue::Bool(s.allow_keychain),
                 default_value: SettingValue::Bool(d.allow_keychain),
+                security_tier: true,
+            },
+            SettingItem {
+                key: "sandbox.allow_git_hooks",
+                label: "Allow git hooks",
+                description: "Let tools write <git dir>/hooks/**; a hook runs OUTSIDE the sandbox",
+                value: SettingValue::Bool(s.allow_git_hooks),
+                default_value: SettingValue::Bool(d.allow_git_hooks),
+                security_tier: true,
+            },
+            SettingItem {
+                key: "sandbox.allow_project_tool_config",
+                label: "Allow project tool config",
+                description: "Let tools write this workspace's .ahma/ MTDF tool definitions",
+                value: SettingValue::Bool(s.allow_project_tool_config),
+                default_value: SettingValue::Bool(d.allow_project_tool_config),
                 security_tier: true,
             },
         ]
@@ -621,20 +629,15 @@ impl SettingsEditor {
             }
             2 => {
                 if let SettingValue::Bool(v) = value {
-                    t.hot_reload = *v;
+                    t.skip_probes = *v;
                 }
             }
             3 => {
                 if let SettingValue::Bool(v) = value {
-                    t.skip_probes = *v;
-                }
-            }
-            4 => {
-                if let SettingValue::Bool(v) = value {
                     t.minimize_tokens = *v;
                 }
             }
-            5 => {
+            4 => {
                 if let SettingValue::Bool(v) = value {
                     t.small_model_harness = *v;
                 }
@@ -655,6 +658,8 @@ impl SettingsEditor {
             3 => s.defer = *v,
             4 => s.package_cache_write = *v,
             5 => s.allow_keychain = *v,
+            6 => s.allow_git_hooks = *v,
+            7 => s.allow_project_tool_config = *v,
             _ => {}
         }
     }
@@ -1104,10 +1109,10 @@ mod tests {
             editor.items_for_category(SettingsCategory::Features).len(),
             6
         );
-        assert_eq!(editor.items_for_category(SettingsCategory::Tools).len(), 6);
+        assert_eq!(editor.items_for_category(SettingsCategory::Tools).len(), 5);
         assert_eq!(
             editor.items_for_category(SettingsCategory::Sandbox).len(),
-            6
+            8
         );
         assert_eq!(
             editor.items_for_category(SettingsCategory::Logging).len(),
@@ -1204,11 +1209,9 @@ mod tests {
         e.apply_tool(2, &SettingValue::Bool(true));
         e.apply_tool(3, &SettingValue::Bool(true));
         e.apply_tool(4, &SettingValue::Bool(true));
-        e.apply_tool(5, &SettingValue::Bool(true));
         let t = &e.settings().tools;
         assert_eq!(t.timeout_secs, 123);
         assert!(t.force_sync);
-        assert!(t.hot_reload);
         assert!(t.skip_probes);
         assert!(t.minimize_tokens);
         assert!(t.small_model_harness);
@@ -1230,6 +1233,9 @@ mod tests {
         e.apply_sandbox(3, &SettingValue::Bool(true));
         e.apply_sandbox(4, &SettingValue::Bool(false));
         e.apply_sandbox(5, &SettingValue::Bool(false));
+        // The two trust-handoff hatches are default-off, so "changed" is `true`.
+        e.apply_sandbox(6, &SettingValue::Bool(true));
+        e.apply_sandbox(7, &SettingValue::Bool(true));
         let s = &e.settings().sandbox;
         assert!(s.disable);
         assert!(s.tmp_access);
@@ -1237,6 +1243,8 @@ mod tests {
         assert!(s.defer);
         assert!(!s.package_cache_write);
         assert!(!s.allow_keychain);
+        assert!(s.allow_git_hooks);
+        assert!(s.allow_project_tool_config);
         // Non-bool early return guard.
         e.apply_sandbox(0, &SettingValue::U64(1));
         assert!(e.settings().sandbox.disable);

@@ -106,8 +106,6 @@ pub struct AppConfig {
     pub force_progress_notifications: bool,
     /// Run all tools synchronously (AHMA_SYNC=1).
     pub force_sync: bool,
-    /// Reload tools from disk when `.ahma/` changes (AHMA_HOT_RELOAD=1).
-    pub hot_reload_tools: bool,
     /// Skip tool availability probes at startup (AHMA_SKIP_PROBES=1).
     pub skip_availability_probes: bool,
     /// Enable output compression and token minimization (AHMA_MINIMIZE_TOKENS=1).
@@ -126,8 +124,22 @@ pub struct AppConfig {
     /// from `--restrict-network` or `[network] restrict`.
     pub restrict_network: bool,
     /// Domains subprocesses may reach when `restrict_network` is on (`[network]
-    /// allow`). Empty means deny-all egress.
+    /// allow`). Composes with the hostnames enabled profiles contribute; it does
+    /// not replace them. Nothing reachable at all means deny-all egress.
     pub network_allow: Vec<String>,
+    /// Let enabled sandbox profiles seed the egress allowlist with their
+    /// toolchain's hostnames (`[network] profile_hosts`, default on). This is
+    /// what makes `--restrict-network` survive a first `cargo build`; turning it
+    /// off drops the hosts and keeps every profile's path grants.
+    pub network_profile_hosts: bool,
+    /// Profiles whose hostnames are withheld from the allowlist by name
+    /// (`[network] deny_profile_hosts`). Path grants are unaffected.
+    pub network_deny_profile_hosts: Vec<String>,
+    /// Sandbox profiles enabled for this session (`[sandbox] profiles`). Carried
+    /// on `AppConfig` because the egress allowlist is seeded from the *same*
+    /// enabled set as the filesystem rules — reading the settings file twice is
+    /// how the two drift apart.
+    pub sandbox_profiles: Vec<String>,
     /// Explicit sandbox scope directories (from --sandbox-scope).
     pub sandbox_scopes: Vec<PathBuf>,
     /// Defer sandbox lock until client provides roots/list (AHMA_SANDBOX_DEFER=1).
@@ -239,7 +251,6 @@ impl Default for AppConfig {
             request_budget_override_secs: None,
             force_progress_notifications: false,
             force_sync: false,
-            hot_reload_tools: false,
             skip_availability_probes: false,
             minimize_tokens: false,
             small_model_harness: false,
@@ -248,6 +259,9 @@ impl Default for AppConfig {
             no_sandbox: false,
             restrict_network: false,
             network_allow: vec![],
+            network_profile_hosts: true,
+            network_deny_profile_hosts: vec![],
+            sandbox_profiles: ahma_common::config::SandboxSettings::default().profiles,
             sandbox_scopes: vec![],
             defer_sandbox: false,
             working_dirs: vec![],
@@ -493,10 +507,10 @@ fn resolve_deferred_scopes(cfg: &AppConfig) -> Result<Option<Vec<PathBuf>>> {
     // bridge forwards its `default_scope` to the subprocess exactly this way
     // (`--sandbox-scope <path> --defer-sandbox`, see ahma_http_bridge peer.rs).
     // Without this, the subprocess starts with zero scopes; when the client
-    // returns -32601 to `roots/list`, config_watcher has no pre-configured scope
+    // returns -32601 to `roots/list`, the roots handler has no pre-configured scope
     // to fall back to and emits `notifications/sandbox/failed`, poisoning the
     // session so every `tools/call` returns HTTP 409 forever. Seeded scopes still
-    // yield to client-provided roots (config_watcher prefers parsed roots), so
+    // yield to client-provided roots (the roots handler prefers parsed roots), so
     // this stays provisional and does not widen any locked scope.
     if !cfg.sandbox_scopes.is_empty() {
         let scopes = canonicalize_configured_scopes(&cfg.sandbox_scopes)?;
@@ -1194,9 +1208,21 @@ pub struct Cli {
     #[arg(long = "no-allow-keychain", global = true)]
     pub no_allow_keychain: bool,
 
-    /// Watch the tools directory for JSON changes and reload tool definitions at runtime.
-    #[arg(long = "hot-reload", global = true)]
-    pub hot_reload: bool,
+    /// Allow sandboxed tools to write git hook directories (`<git dir>/hooks/**`),
+    /// which are denied by default. Needed to install a repo's own pre-push guard
+    /// from inside a session. A hook written now runs OUTSIDE ahma's sandbox on
+    /// your next git operation; ahma discloses this at startup. Unlike
+    /// `--allow-keychain` this is opt-in: the default and the settings default
+    /// are both "denied".
+    #[arg(long = "allow-git-hooks", global = true)]
+    pub allow_git_hooks: bool,
+
+    /// Allow sandboxed tools to write the workspace's own `.ahma/` tool-config
+    /// directory, which is denied by default. Needed when you are developing the
+    /// MTDF tool definitions a repo ships. Those files define the commands ahma
+    /// will run; ahma discloses this at startup. Opt-in, like `--allow-git-hooks`.
+    #[arg(long = "allow-project-tool-config", global = true)]
+    pub allow_project_tool_config: bool,
 
     /// Skip tool availability probes at startup.
     #[arg(long = "skip-probes", global = true)]
@@ -1547,7 +1573,6 @@ pub fn settings_origin_ctx(cli: &Cli) -> SettingsOriginCtx {
             }
         };
         flag(cli.sync, "tools.force_sync");
-        flag(cli.hot_reload, "tools.hot_reload");
         flag(cli.skip_probes, "tools.skip_probes");
         flag(cli.no_sandbox, "sandbox.disable");
         flag(cli.defer_sandbox, "sandbox.defer");
@@ -2508,7 +2533,6 @@ struct ExecutionSettings {
     request_budget_override_secs: Option<u64>,
     force_progress_notifications: bool,
     force_sync: bool,
-    hot_reload_tools: bool,
     skip_availability_probes: bool,
 }
 
@@ -2516,7 +2540,6 @@ fn parse_execution_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) ->
     // R-CFG1.2: preference-tier env vars are RETIRED — warn and ignore.
     warn_retired_env!("AHMA_TIMEOUT");
     warn_retired_env!("AHMA_SYNC");
-    warn_retired_env!("AHMA_HOT_RELOAD");
     warn_retired_env!("AHMA_SKIP_PROBES");
 
     // CLI > settings > compiled-in default.
@@ -2529,7 +2552,6 @@ fn parse_execution_settings(cli: &Cli, s: &ahma_common::config::AhmaSettings) ->
         force_progress_notifications: cli.force_progress_notifications
             || s.tools.force_progress_notifications,
         force_sync: cli.sync || s.tools.force_sync,
-        hot_reload_tools: cli.hot_reload || s.tools.hot_reload,
         skip_availability_probes: cli.skip_probes || s.tools.skip_probes,
     }
 }
@@ -2739,6 +2761,59 @@ fn configure_keychain_and_credential_denies(cli: &Cli, s: &ahma_common::config::
     }
 }
 
+/// Install the trust-handoff escape hatches (SPEC R-HANDOFF.3) and disclose any
+/// that are on.
+///
+/// Polarity is the inverse of `allow_keychain`: both default to **denied**, so
+/// the flag can only *widen*, and `flag || setting` is the whole resolution —
+/// there is no `--no-…` counterpart because there is nothing to force off that
+/// is not already off unless the operator asked for it in their own settings
+/// file (which is outside every sandbox scope, so the agent cannot ask for it
+/// on its own behalf).
+///
+/// The disclosure is the price of the hatch. R7 says ahma never silently
+/// weakens enforcement, and this weakens it in a way whose consequence is not
+/// obvious from the flag name — hence `warn!`, and hence saying *what executes
+/// and when*, not merely which rule was dropped.
+fn configure_handoff_allowances(cli: &Cli, s: &ahma_common::config::AhmaSettings) {
+    let allowances = resolve_handoff_allowances(cli, s);
+    sandbox::set_handoff_allowances(allowances);
+
+    if allowances.git_hooks {
+        tracing::warn!(
+            "Sandbox relaxed: git hook directories are writable by sandboxed tools \
+             ([sandbox] allow_git_hooks = true / --allow-git-hooks). A hook written now \
+             will execute OUTSIDE ahma's sandbox on your next git operation (commit, \
+             checkout, push, merge), with your full user privileges. Both the kernel deny \
+             and the write-tool guard are off for this session; drop the flag or the \
+             setting to restore the default."
+        );
+    }
+    if allowances.project_tool_config {
+        tracing::warn!(
+            "Sandbox relaxed: this workspace's .ahma/ tool-config directory is writable by \
+             sandboxed tools ([sandbox] allow_project_tool_config = true / \
+             --allow-project-tool-config). Those files define the commands ahma itself will \
+             run, so a tool written now can be invoked by the agent that wrote it. Configs \
+             still never hot-reload — an edit takes effect only via the explicit `restart` \
+             tool. Drop the flag or the setting to restore the default."
+        );
+    }
+}
+
+/// `--allow-git-hooks` / `--allow-project-tool-config` widen the default-denied
+/// policy; `[sandbox] allow_git_hooks` / `allow_project_tool_config` do the same
+/// persistently. Either source is enough.
+fn resolve_handoff_allowances(
+    cli: &Cli,
+    s: &ahma_common::config::AhmaSettings,
+) -> sandbox::HandoffAllowances {
+    sandbox::HandoffAllowances {
+        git_hooks: cli.allow_git_hooks || s.sandbox.allow_git_hooks,
+        project_tool_config: cli.allow_project_tool_config || s.sandbox.allow_project_tool_config,
+    }
+}
+
 /// CLI flags win over settings: `--no-allow-keychain` forces off,
 /// `--allow-keychain` forces on even when settings disable it.
 fn resolve_allow_keychain(cli: &Cli, s: &ahma_common::config::AhmaSettings) -> bool {
@@ -2790,6 +2865,10 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
     sandbox::set_secret_env_allow(s.sandbox.env_allow.clone());
 
     configure_keychain_and_credential_denies(cli, &s);
+    // Same startup path, for the same reason: `sandbox::exec_config` and
+    // `sandbox::seatbelt` both read this process-global, so it has to be
+    // installed before any Seatbelt profile is generated or any write is guarded.
+    configure_handoff_allowances(cli, &s);
 
     // ── Tool loading ────────────────────────────────────────────────────────
     // R-CFG1.2: AHMA_TOOLS_DIR is RETIRED — warn and ignore.
@@ -2844,7 +2923,6 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         request_budget_override_secs: exec.request_budget_override_secs,
         force_progress_notifications: exec.force_progress_notifications,
         force_sync: exec.force_sync,
-        hot_reload_tools: exec.hot_reload_tools,
         skip_availability_probes: exec.skip_availability_probes,
         minimize_tokens,
         small_model_harness,
@@ -2853,6 +2931,9 @@ pub fn build_app_config(cli: &Cli) -> AppConfig {
         no_sandbox,
         restrict_network: cli.restrict_network || s.network.restrict,
         network_allow: s.network.allow.clone(),
+        network_profile_hosts: s.network.profile_hosts,
+        network_deny_profile_hosts: s.network.deny_profile_hosts.clone(),
+        sandbox_profiles: s.sandbox.profiles.clone(),
         sandbox_scopes,
         defer_sandbox,
         working_dirs,
@@ -3041,6 +3122,65 @@ mod tests {
         );
     }
 
+    /// The trust-handoff hatches are opt-in from *either* source and default to
+    /// denied. Unlike `allow_keychain` there is no `--no-…` pair, so the
+    /// resolution is a plain OR — assert both halves, and assert they stay
+    /// independent (a copy-paste of the keychain resolver would couple them).
+    #[test]
+    fn handoff_allowances_resolve_from_either_flag_or_settings() {
+        init_test();
+        let mut settings = ahma_common::config::AhmaSettings::default();
+
+        let bare = Cli::parse_from(["ahma", "serve", "stdio"]);
+        let resolved = resolve_handoff_allowances(&bare, &settings);
+        assert!(!resolved.git_hooks && !resolved.project_tool_config);
+
+        let flagged = Cli::parse_from(["ahma", "--allow-git-hooks", "serve", "stdio"]);
+        let resolved = resolve_handoff_allowances(&flagged, &settings);
+        assert!(resolved.git_hooks, "--allow-git-hooks must widen");
+        assert!(!resolved.project_tool_config, "…and only that one");
+
+        let flagged = Cli::parse_from(["ahma", "--allow-project-tool-config", "serve", "stdio"]);
+        let resolved = resolve_handoff_allowances(&flagged, &settings);
+        assert!(resolved.project_tool_config);
+        assert!(!resolved.git_hooks);
+
+        settings.sandbox.allow_git_hooks = true;
+        let resolved = resolve_handoff_allowances(&bare, &settings);
+        assert!(
+            resolved.git_hooks,
+            "[sandbox] allow_git_hooks must widen without any flag"
+        );
+        assert!(!resolved.project_tool_config);
+
+        settings.sandbox.allow_project_tool_config = true;
+        let resolved = resolve_handoff_allowances(&bare, &settings);
+        assert!(resolved.git_hooks && resolved.project_tool_config);
+    }
+
+    /// The resolved policy is what `sandbox::exec_config` and `sandbox::seatbelt`
+    /// read, so installing it has to actually reach the process global.
+    #[test]
+    fn configure_handoff_allowances_installs_the_process_global() {
+        init_test();
+        let settings = ahma_common::config::AhmaSettings::default();
+
+        configure_handoff_allowances(
+            &Cli::parse_from(["ahma", "--allow-git-hooks", "serve", "stdio"]),
+            &settings,
+        );
+        let installed = sandbox::HandoffAllowances::current();
+        assert!(installed.git_hooks);
+        assert!(!installed.project_tool_config);
+
+        // Restore the safe default for anything sharing this process.
+        configure_handoff_allowances(&Cli::parse_from(["ahma", "serve", "stdio"]), &settings);
+        assert_eq!(
+            sandbox::HandoffAllowances::current(),
+            sandbox::HandoffAllowances::default()
+        );
+    }
+
     /// The `--no-sandbox` flag is still honored (the supported override).
     #[test]
     fn no_sandbox_flag_is_honored() {
@@ -3065,7 +3205,6 @@ mod tests {
             request_budget_override_secs: None,
             force_progress_notifications: false,
             force_sync: false,
-            hot_reload_tools: false,
             skip_availability_probes: false,
             minimize_tokens: false,
             small_model_harness: false,
@@ -3074,6 +3213,9 @@ mod tests {
             no_sandbox: false,
             restrict_network: false,
             network_allow: vec![],
+            network_profile_hosts: true,
+            network_deny_profile_hosts: vec![],
+            sandbox_profiles: ahma_common::config::SandboxSettings::default().profiles,
             sandbox_scopes: vec![],
             defer_sandbox: false,
             working_dirs: vec![],
@@ -4308,12 +4450,11 @@ mod tests {
         s.tools.timeout_secs = 42;
         s.tools.await_timeout_secs = 24;
         s.tools.force_sync = true;
-        s.tools.hot_reload = true;
         s.tools.skip_probes = true;
         let exec = parse_execution_settings(&cli, &s);
         assert_eq!(exec.timeout_secs, 42);
         assert_eq!(exec.await_timeout_secs, 24);
-        assert!(exec.force_sync && exec.hot_reload_tools && exec.skip_availability_probes);
+        assert!(exec.force_sync && exec.skip_availability_probes);
     }
 
     #[test]
@@ -4326,7 +4467,6 @@ mod tests {
             "--await-timeout",
             "180",
             "--sync",
-            "--hot-reload",
             "--skip-probes",
             "serve",
             "stdio",
@@ -4335,7 +4475,7 @@ mod tests {
         let exec = parse_execution_settings(&cli, &s);
         assert_eq!(exec.timeout_secs, 120);
         assert_eq!(exec.await_timeout_secs, 180);
-        assert!(exec.force_sync && exec.hot_reload_tools && exec.skip_availability_probes);
+        assert!(exec.force_sync && exec.skip_availability_probes);
     }
 
     // ─── parse_sandbox_settings ──────────────────────────────────────────────

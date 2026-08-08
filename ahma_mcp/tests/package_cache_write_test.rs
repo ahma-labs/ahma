@@ -308,8 +308,13 @@ mod seatbelt_profile_tests {
         )
         .unwrap();
         let profile = profile_for(&sandbox, &scope);
+        // Narrowed from "no `(deny file-read*` at all" to "no credential-shaped
+        // deny": the profile now also carries unconditional container-socket and
+        // SSH-private-key denies, which are not part of the operator-installed
+        // credential list and must be present even when that list is empty.
+        // `(deny file-read* (subpath …))` is the credential rule's exact shape.
         assert!(
-            !profile.contains("(deny file-read*"),
+            !profile.contains("(deny file-read* (subpath"),
             "no credential deny rules expected when none installed.\nProfile:\n{profile}"
         );
     }

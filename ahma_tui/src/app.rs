@@ -1572,30 +1572,30 @@ where
         .unwrap_or(default)
 }
 
-/// Resolve token/context preferences: CLI flag > deprecated env var > settings.
+/// Resolve token/context preferences: CLI flag > settings.
 /// Returns `(minimize_tokens, small_model_harness, context_length)`.
+///
+/// `AHMA_MINIMIZE_TOKENS` and `AHMA_SMALL_MODEL_HARNESS` are **retired** (R-CFG1.2)
+/// and are warn-and-ignored, not read. `ahma_mcp`'s CLI already warned-and-ignored
+/// them while this function still honored them, so the same variable meant two
+/// different things in two binaries of the same product: setting it changed the TUI's
+/// behaviour but not the server's. One variable, one verdict — the replacements are
+/// `--minimize-tokens` / `--small-model-harness` (both already reflected in
+/// `state.token_prefs`) and the matching `[tools]` settings keys.
 #[cfg(feature = "tui")]
 fn resolve_token_prefs(state: &crate::state::AppState) -> (bool, bool, Option<u32>) {
     let settings = ahma_common::config::AhmaSettings::load();
 
-    fn env_bool(name: &str) -> Option<bool> {
-        std::env::var(name).ok().map(|v| {
-            tracing::warn!(
-                "Deprecated: {name} environment variable is set. Use the corresponding CLI flag instead."
-            );
-            v == "1" || v.to_lowercase() == "true"
-        })
-    }
+    ahma_mcp::warn_retired_env("AHMA_MINIMIZE_TOKENS");
+    ahma_mcp::warn_retired_env("AHMA_SMALL_MODEL_HARNESS");
 
     let minimize_tokens = state
         .token_prefs
         .minimize_tokens
-        .or_else(|| env_bool("AHMA_MINIMIZE_TOKENS"))
         .unwrap_or(settings.tools.minimize_tokens);
     let small_model_harness = state
         .token_prefs
         .small_model_harness
-        .or_else(|| env_bool("AHMA_SMALL_MODEL_HARNESS"))
         .unwrap_or(settings.tools.small_model_harness);
     // Explicit --context-length wins; otherwise fall back to the selected
     // provider's declared window (`num_ctx` in ~/.ahma/config.toml) so

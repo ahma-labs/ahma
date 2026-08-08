@@ -48,8 +48,6 @@ To enable session isolation, pass the `--session-isolation` flag when starting t
 ahma serve http --session-isolation
 ```
 
-Alternatively, you can set the `AHMA_SESSION_ISOLATION=1` environment variable.
-
 ## Security Invariants
 
 - **Strict Sandbox Derivation**: The sandbox scope is derived *strictly* from the client's first `roots/list` response.

@@ -57,15 +57,14 @@ cargo nextest run --package ahma --test tool_examples_execution_test
 
 ### 4. Verify Your Configuration Works
 
-After copying and enabling a configuration in `.ahma/`, restart the ahma server to load the new tool. If you are actively iterating on tool definitions, you can instead opt into runtime watching with `--hot-reload`:
+After copying and enabling a configuration in `.ahma/`, restart the ahma server to load the new tool. Tool definitions are read once at startup and are never re-read from disk while the server runs — there is no watch mode. While iterating on a definition, call the `restart` tool (or restart the server) to pick up the edit:
 
 ```bash
-# Safe default: load .ahma configs once at startup
+# Configs in .ahma/ are loaded once, at startup
 ahma serve stdio --tools-dir .ahma
-
-# Tool development only: watch for runtime changes
-ahma serve stdio --tools-dir .ahma --hot-reload
 ```
+
+The tools directory lives inside the sandbox scope, so a running agent can write it; re-reading it at runtime would let that agent repoint an already-approved tool name at any command. `restart` keeps the reload explicit and auditable.
 
 ## Configuration Format
 

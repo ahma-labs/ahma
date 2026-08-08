@@ -34,6 +34,7 @@ impl Sandbox {
         let profile_rules = self.get_macos_profile_rules();
         let temp_rules = self.get_macos_temp_rules();
         let network_rules = self.get_macos_network_rules();
+        let exec_config_deny_rules = self.get_macos_exec_config_deny_rules(working_dir);
 
         let profile = format!(
             r#"(version 1)
@@ -49,7 +50,7 @@ impl Sandbox {
 (allow file-write* (literal "/dev/tty"))
 (allow file-read* (literal "/dev/zero"))
 (allow file-write* (literal "/dev/zero"))
-{network_rules}(allow mach-lookup)
+{exec_config_deny_rules}{network_rules}(allow mach-lookup)
 (allow ipc-posix-shm*)
 "#,
             working_dir = wd_str,
@@ -60,6 +61,7 @@ impl Sandbox {
             scope_rules = scope_rules,
             read_scopes_rules = read_scopes_rules,
             temp_rules = temp_rules,
+            exec_config_deny_rules = exec_config_deny_rules,
             network_rules = network_rules,
         );
 
@@ -87,8 +89,21 @@ impl Sandbox {
     /// SBPL semantics: start from `(allow network*)` (keeps unix sockets, mach,
     /// local binds, DNS-via-mDNSResponder working), deny all outbound IP, then
     /// re-allow the single proxy address. `network-inbound`/`bind` and unix-socket
-    /// egress are intentionally left permitted (local IPC cannot exfiltrate off the
-    /// host on its own).
+    /// egress are intentionally left permitted.
+    ///
+    /// That permission used to be justified with "local IPC cannot exfiltrate off
+    /// the host on its own". **That reasoning is wrong and is not why unix sockets
+    /// stay open.** A container daemon socket is local IPC, and reaching it is a
+    /// complete escape: ask `docker.sock` for a `--privileged` container with a
+    /// host bind mount and a root process entirely outside this profile does the
+    /// write — and can trivially exfiltrate from there. Blanket-denying unix
+    /// sockets would break too much (mDNSResponder, `securityd`, editor IPC), so
+    /// the real defence is per-socket and lives in
+    /// [`Self::get_macos_exec_config_deny_rules`], which denies `file-read*` and
+    /// `file-write*` on the known container sockets. That file-level deny is what
+    /// actually stops it: on macOS `connect(2)` to a unix socket is classified as
+    /// a *network* operation, so `(allow network*)` here would otherwise let the
+    /// connection through no matter what the network rules said.
     fn get_macos_network_rules(&self) -> String {
         match *self.egress_proxy_addr.read().unwrap() {
             None => "(allow network*)\n".to_string(),
@@ -140,6 +155,104 @@ impl Sandbox {
                 canonical.display()
             ));
         }
+        rules
+    }
+
+    /// Kernel enforcement for the "write a file the sandbox permits, let a
+    /// trusted component outside the sandbox run it" escape class
+    /// ([`super::exec_config`]), plus the two capabilities that make the same
+    /// trick reachable without writing a config file at all.
+    ///
+    /// **Ordering is the whole point.** SBPL is last-match-wins, so these rules
+    /// are emitted *after* `{scope_rules}`, after the working-directory
+    /// `(allow file-write* (subpath …))`, and after the temp-dir allows — they
+    /// are the last filesystem word spoken about these paths. Emitting them any
+    /// earlier would let the workspace allow silently re-open them, which is
+    /// exactly the kind of failure that produces a deny rule nobody notices is
+    /// dead. `exec_config_deny_rules_come_after_workspace_allow` asserts the
+    /// byte offsets.
+    ///
+    /// Three groups:
+    ///
+    /// 1. **Auto-executing config** — git hooks under every *resolved* git
+    ///    directory (not the literal spelling `.git`, which
+    ///    `git init --separate-git-dir` defeats) and `<workspace>/.ahma`. Either
+    ///    can be dropped from this set by an operator escape hatch
+    ///    (`[sandbox] allow_git_hooks` / `allow_project_tool_config`, both
+    ///    default-off and both disclosed at startup) — the toggle lives in
+    ///    [`super::exec_config::deny_write_globs`] so the kernel rule and the
+    ///    write-tool guard can never disagree about what is permitted.
+    /// 2. **Container daemon sockets** — see
+    ///    [`Self::get_macos_network_rules`] for why a file-level deny, not a
+    ///    network rule, is what stops this.
+    /// 3. **SSH private keys** — `~/.ssh` stays readable so `known_hosts` and
+    ///    `config` work, but `id_*` is denied and `id_*.pub` re-allowed
+    ///    afterwards (last-match-wins again).
+    ///
+    /// Paths are canonicalized for the same reason as
+    /// [`Self::get_macos_credential_deny_rules`]: Seatbelt's kernel-side subpath
+    /// matcher resolves against the canonical vnode, so a rule naming `/tmp/…`
+    /// never fires on a read of `/private/tmp/…`. Uncanonicalizable paths fall
+    /// back to the raw path rather than being dropped — a deny that cannot be
+    /// resolved yet must not fail open.
+    fn get_macos_exec_config_deny_rules(&self, working_dir: &Path) -> String {
+        let mut rules = String::new();
+
+        // Canonicalize the root before deriving paths from it: `<ws>/.ahma`
+        // usually does not exist yet, so it cannot be canonicalized itself, and a
+        // rule naming `/tmp/ws/.ahma` would never fire against `/private/tmp/ws`.
+        let root = dunce::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf());
+        let git_dirs = super::exec_config::resolve_git_dirs(&root);
+        for deny in super::exec_config::deny_write_globs(&root, &git_dirs) {
+            let canonical = dunce::canonicalize(&deny).unwrap_or(deny);
+            rules.push_str(&format!(
+                "(deny file-write* (subpath \"{}\"))\n",
+                canonical.display()
+            ));
+        }
+
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
+        let home = std::path::Path::new(&home_dir);
+
+        // Each socket gets both spellings. Canonicalizing the socket *node*
+        // fails outright when the daemon isn't running — `/var/run/docker.sock`
+        // would then be emitted raw, and never match, because `/var` is a
+        // symlink to `/private/var` and the kernel matches the canonical vnode.
+        // Canonicalizing the *parent directory* (which does exist) and rejoining
+        // the file name yields a rule that fires the moment the daemon starts,
+        // while keeping the raw spelling for the case where the parent itself is
+        // absent. A socket deny that only works when the socket already exists
+        // is a deny that fails open exactly when it matters.
+        let mut emitted: Vec<std::path::PathBuf> = Vec::new();
+        for sock in super::credential_reads::container_socket_denies(home) {
+            let via_parent = sock.parent().and_then(|p| dunce::canonicalize(p).ok());
+            let candidates = [
+                Some(sock.clone()),
+                via_parent.and_then(|p| sock.file_name().map(|f| p.join(f))),
+            ];
+            for candidate in candidates.into_iter().flatten() {
+                if emitted.contains(&candidate) {
+                    continue;
+                }
+                rules.push_str(&format!(
+                    "(deny file-read* file-write* (literal \"{}\"))\n",
+                    candidate.display()
+                ));
+                emitted.push(candidate);
+            }
+        }
+        for re in super::credential_reads::container_socket_deny_regexes(home) {
+            rules.push_str(&format!(
+                "(deny file-read* file-write* (regex #\"{re}\"))\n"
+            ));
+        }
+
+        rules.push_str(&format!(
+            "(deny file-read* (regex #\"{}\"))\n(allow file-read* (regex #\"{}\"))\n",
+            super::credential_reads::ssh_private_key_deny_regex(home),
+            super::credential_reads::ssh_public_key_allow_regex(home),
+        ));
+
         rules
     }
 
@@ -389,6 +502,221 @@ mod tests {
         assert!(
             !profile.contains("Keychains"),
             "no keychain allow rule when disabled, got:\n{profile}"
+        );
+    }
+
+    /// The exec-config denies are worthless unless they are the *last* word:
+    /// SBPL is last-match-wins, so a `(deny file-write* (subpath ".git/hooks"))`
+    /// emitted before `(allow file-write* (subpath <workspace>))` is emitted but
+    /// dead. Assert on byte offsets, not presence.
+    #[test]
+    fn exec_config_deny_rules_come_after_workspace_allow() {
+        let dir = tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+
+        let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, false, false, false).unwrap();
+        let profile = sb.generate_seatbelt_profile_test(&root);
+
+        let workspace_allow = profile
+            .find(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                root.display()
+            ))
+            .unwrap_or_else(|| panic!("workspace write allow missing:\n{profile}"));
+
+        let hooks_deny = profile
+            .find(&format!(
+                "(deny file-write* (subpath \"{}\"))",
+                root.join(".git/hooks").display()
+            ))
+            .unwrap_or_else(|| panic!("git hooks deny missing:\n{profile}"));
+        assert!(
+            hooks_deny > workspace_allow,
+            "git-hooks deny must come AFTER the workspace allow ({hooks_deny} vs {workspace_allow}):\n{profile}"
+        );
+
+        let ahma_deny = profile
+            .find(&format!(
+                "(deny file-write* (subpath \"{}\"))",
+                root.join(".ahma").display()
+            ))
+            .unwrap_or_else(|| panic!(".ahma deny missing:\n{profile}"));
+        assert!(
+            ahma_deny > workspace_allow,
+            ".ahma deny must come AFTER the workspace allow:\n{profile}"
+        );
+
+        // …and after the temp-dir allows, which are emitted later still.
+        if let Some(temp_allow) = profile.find("(allow file-write* (subpath \"/private/tmp\"))") {
+            assert!(
+                hooks_deny > temp_allow,
+                "exec-config denies must outrank the temp allows too:\n{profile}"
+            );
+        }
+    }
+
+    /// The operator escape hatches must remove the **kernel** rule, not just the
+    /// write-tool guard. If only the application layer relaxed, an
+    /// `--allow-git-hooks` session would still fail with a bare
+    /// `Operation not permitted` from the kernel — the worst possible outcome:
+    /// an opt-in that appears to do nothing.
+    #[test]
+    fn escape_hatches_remove_their_exec_config_deny_rule_from_the_profile() {
+        use super::super::exec_config::{HandoffAllowances, set_handoff_allowances};
+
+        let dir = tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let sb = Sandbox::new(vec![root.clone()], SandboxMode::Test, false, false, false).unwrap();
+
+        let hooks_deny = format!(
+            "(deny file-write* (subpath \"{}\"))",
+            root.join(".git/hooks").display()
+        );
+        let ahma_deny = format!(
+            "(deny file-write* (subpath \"{}\"))",
+            root.join(".ahma").display()
+        );
+
+        // Default policy: both denied.
+        set_handoff_allowances(HandoffAllowances::default());
+        let profile = sb.generate_seatbelt_profile_test(&root);
+        assert!(
+            profile.contains(&hooks_deny),
+            "default denies hooks:\n{profile}"
+        );
+        assert!(
+            profile.contains(&ahma_deny),
+            "default denies .ahma:\n{profile}"
+        );
+
+        // allow_git_hooks drops exactly the hooks rule.
+        set_handoff_allowances(HandoffAllowances {
+            git_hooks: true,
+            project_tool_config: false,
+        });
+        let profile = sb.generate_seatbelt_profile_test(&root);
+        assert!(
+            !profile.contains(&hooks_deny),
+            "allow_git_hooks must drop the kernel deny:\n{profile}"
+        );
+        assert!(
+            profile.contains(&ahma_deny),
+            "…and must not drop the .ahma deny:\n{profile}"
+        );
+
+        // allow_project_tool_config drops exactly the .ahma rule.
+        set_handoff_allowances(HandoffAllowances {
+            git_hooks: false,
+            project_tool_config: true,
+        });
+        let profile = sb.generate_seatbelt_profile_test(&root);
+        assert!(
+            profile.contains(&hooks_deny),
+            "allow_project_tool_config must not drop the hooks deny:\n{profile}"
+        );
+        assert!(
+            !profile.contains(&ahma_deny),
+            "allow_project_tool_config must drop the kernel deny:\n{profile}"
+        );
+
+        // Restore the safe default for any test sharing this process.
+        set_handoff_allowances(HandoffAllowances::default());
+        let profile = sb.generate_seatbelt_profile_test(&root);
+        assert!(profile.contains(&hooks_deny));
+        assert!(profile.contains(&ahma_deny));
+    }
+
+    /// Container daemon sockets are denied at the *file* level. A network rule
+    /// cannot do this job: macOS classifies `connect(2)` to a unix socket as a
+    /// network operation, so `(allow network*)` would let it through.
+    #[test]
+    fn container_daemon_sockets_are_denied_for_read_and_write() {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let profile = sb.generate_seatbelt_profile_test(dir.path());
+
+        for sock in [
+            "/var/run/docker.sock",
+            "/run/docker.sock",
+            "/var/run/containerd/containerd.sock",
+            "/run/podman/podman.sock",
+        ] {
+            // The raw spelling is emitted unconditionally; a canonical-parent
+            // spelling is emitted alongside it when the parent resolves. Both
+            // matter — see the comment on the emission site.
+            assert!(
+                profile.contains(&format!(
+                    "(deny file-read* file-write* (literal \"{sock}\"))"
+                )),
+                "{sock} must be denied for read and write:\n{profile}"
+            );
+            let sock_path = std::path::Path::new(sock);
+            if let Some(parent) = sock_path.parent().and_then(|p| dunce::canonicalize(p).ok()) {
+                let canonical = parent.join(sock_path.file_name().unwrap());
+                assert!(
+                    profile.contains(&format!(
+                        "(deny file-read* file-write* (literal \"{}\"))",
+                        canonical.display()
+                    )),
+                    "the canonical spelling of {sock} must be denied too:\n{profile}"
+                );
+            }
+        }
+        assert!(
+            profile.contains(r"/\.colima/.*/docker\.sock$"),
+            "colima socket regex missing:\n{profile}"
+        );
+        assert!(
+            profile.contains(r"/\.lima/.*/sock$"),
+            "lima socket regex missing:\n{profile}"
+        );
+    }
+
+    /// SSH keeps working (`known_hosts`, `config` readable) but the private key
+    /// bytes are denied, with the `.pub` re-allow emitted afterwards so
+    /// last-match-wins lets public keys through.
+    #[test]
+    fn ssh_private_keys_denied_public_keys_reallowed_in_that_order() {
+        let dir = tempdir().unwrap();
+        let sb = Sandbox::new(
+            vec![dir.path().to_path_buf()],
+            SandboxMode::Test,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let profile = sb.generate_seatbelt_profile_test(dir.path());
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/Shared".to_string());
+        let deny =
+            super::super::credential_reads::ssh_private_key_deny_regex(std::path::Path::new(&home));
+        let allow =
+            super::super::credential_reads::ssh_public_key_allow_regex(std::path::Path::new(&home));
+
+        let deny_at = profile
+            .find(&format!("(deny file-read* (regex #\"{deny}\"))"))
+            .unwrap_or_else(|| panic!("ssh private-key deny missing:\n{profile}"));
+        let allow_at = profile
+            .find(&format!("(allow file-read* (regex #\"{allow}\"))"))
+            .unwrap_or_else(|| panic!("ssh public-key re-allow missing:\n{profile}"));
+        assert!(
+            allow_at > deny_at,
+            "the .pub re-allow must come after the deny (last-match-wins):\n{profile}"
+        );
+        // `~/.ssh` itself is not blanket-denied — git-over-ssh needs known_hosts.
+        assert!(
+            !profile.contains(&format!("(deny file-read* (subpath \"{home}/.ssh\"))")),
+            "~/.ssh must not be denied wholesale:\n{profile}"
         );
     }
 

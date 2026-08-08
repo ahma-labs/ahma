@@ -15,7 +15,9 @@ ahma update --install-hooks    # also install user-scoped terminal hooks
 Use `--force` to reinstall when the version already matches. Use `--dry-run` to preview actions.
 When run interactively, `ahma update` now offers user-scoped terminal hook installation if none are currently managed.
 
-Custom install location: `--install-dir ~/.local/bin` or `AHMA_INSTALL_DIR`.
+Custom install location: `--install-dir ~/.local/bin`. `AHMA_INSTALL_DIR` is retired
+(R-CFG1.2) and ignored by `ahma update` / `ahma uninstall`; only the bootstrap installer
+scripts still read it, because they run before any `ahma` binary exists.
 
 ## First-time install
 
@@ -149,7 +151,7 @@ ahma hooks uninstall --platform cursor --scope project
 
 ## Platform notes
 
-Supported prebuilt release platforms: Linux x86_64/arm64, macOS Apple Silicon, Windows x86_64. Musl builds are available for Linux x86_64 and ARM64 (`AHMA_PREFER_MUSL=1` during platform detection in `ahma update`).
+Supported prebuilt release platforms: Linux x86_64/arm64, macOS Apple Silicon, Windows x86_64. Musl builds are available for Linux x86_64 and ARM64 (`ahma update --prefer-musl`; the `AHMA_PREFER_MUSL` env var is deprecated).
 
 For sandbox behavior and day-to-day usage, see [README.md](../README.md) and [security-sandbox.md](security-sandbox.md).
 
