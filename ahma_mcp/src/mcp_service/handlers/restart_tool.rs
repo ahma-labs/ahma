@@ -280,6 +280,12 @@ mod tests {
     ///
     /// Safety: nextest runs each test in its own process, so setting an env var here
     /// cannot race with other tests in the same binary.
+    ///
+    /// Unix-only: `handle_restart` itself only ever attempts a UDS connection when
+    /// `cfg!(unix)` (see the `socket_path_opt` branch above), so on non-Unix platforms
+    /// the property this test proves — the retired socket is never contacted — holds
+    /// trivially and unreachably, with no cross-platform equivalent to gate instead.
+    #[cfg(unix)]
     #[tokio::test]
     async fn handle_restart_ignores_retired_unix_socket_env_var() {
         // A live UDS bridge that answers POST /restart with 200. Nothing must reach it.
