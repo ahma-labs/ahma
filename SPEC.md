@@ -18,7 +18,7 @@
 | macOS Sandbox (Seatbelt) | tests-pass | Kernel-level FS sandboxing via `sandbox-exec` — **write** confinement only. Reads are unconfined (APFS firmlink limitation, R6.2.2) and controlled by a credential denylist instead (R6.2.3); disclosed at runtime per R-PERM.5.1 |
 | Nested Sandbox Detection | tests-pass | Detects Cursor/VS Code/Docker outer sandboxes; hooks defer to host, MCP stays authoritative, active sandbox always disclosed (R7) |
 | Windows Runtime (PowerShell) | in-progress | Built-in PowerShell (5.1+) runtime; cross-platform path security + file URI; parity tests green |
-| Windows Sandbox backend | in-progress | Job Object enforcement done. AppContainer spawn isolation + scoped DACL grants are **written but never executed** — authored and type-checked on a non-Windows host. R6.3.3 stays open until a `windows-latest` run proves a blocked out-of-scope write |
+| Windows Sandbox backend | in-progress | Job Object enforcement done. AppContainer spawn isolation + scoped DACL grants are written but **a `windows-latest` CI run proved the grant DACL does not take effect** — in-scope writes are denied along with out-of-scope ones. Not wired into the default spawn path until fixed; `create_platform_sandboxed_command` falls back to Job-Object-only on Windows. R6.3.3 stays open |
 | Windows Pre-built Releases | in-progress | `x86_64-pc-windows-msvc`; `.zip` CI artifacts; `install.ps1` |
 | STDIO Mode | tests-pass | Direct MCP server over stdio for IDE integration |
 | HTTP Bridge Mode | tests-pass | HTTP/SSE proxy for web clients |
@@ -495,15 +495,25 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
 > server never runs unsandboxed without explicit `--disable-sandbox` opt-out.
 >
 > **Current status**: Job Object enforcement is implemented in `sandbox/windows.rs`.
-> Per-command **AppContainer spawn isolation and scoped DACL grants are now written**
+> Per-command **AppContainer spawn isolation and scoped DACL grants are written**
 > (per-session container SID, scope grants, `STARTUPINFOEX` +
 > `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` spawn via the `ahma.exe` launcher
-> re-entry) — but they were authored and type-checked on a non-Windows host and have
-> **never been executed**. "Written" is not "works": until a `windows-latest` CI run
-> demonstrates a blocked out-of-scope write, R6.3.3 stays open, R6.3.9's disclosure
-> stays as written, and `red_team_command_write_escape_blocked` stays
-> `#[cfg_attr(windows, ignore)]`. Claiming the boundary before the platform proves it
-> is precisely the failure R6.2.2 and R7.5 exist to prevent.
+> re-entry), and a `windows-latest` CI run has now executed them — and **found the
+> grant DACL does not take effect**: `writes_outside_the_scope_are_blocked_and_
+> inside_still_work` and `cleanup_revokes_and_a_fresh_session_regrants` both fail on
+> the in-scope half (`Access to the path '...' is denied` for a write inside the
+> locked scope). The out-of-scope half incidentally "passes" only because the
+> container denies everything — exactly the "blocks everything, proves nothing"
+> failure mode the gate test's own docstring warns against. Consequently
+> `create_platform_sandboxed_command` does **not** route Windows spawns through
+> `plan_windows_sandboxed_spawn`; it falls back to the plain (Job-Object-contained)
+> `base_command`, matching the platform's pre-R6.3.3 behavior. "Written" is not
+> "works": until a `windows-latest` CI run demonstrates the in-scope write
+> succeeding *and* the out-of-scope write blocked, R6.3.3 stays open, R6.3.9's
+> disclosure stays as written, both integration tests above stay `#[ignore]`, and
+> `red_team_command_write_escape_blocked` stays `#[cfg_attr(windows, ignore)]`.
+> Claiming the boundary before the platform proves it is precisely the failure
+> R6.2.2 and R7.5 exist to prevent.
 
 ##### Architecture decision
 
@@ -526,11 +536,12 @@ The planned implementation uses two mechanisms in order of preference:
   startup, ensuring child processes are killed on server exit. Signature mirrors
   `enforce_landlock_sandbox` (`&[PathBuf]`). _Status: **done** — Job Object with
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` applied; non-fatal if already inside a job._
-- **R6.3.3**: Write attempts outside the sandbox scope **must** be blocked at the OS level.
-  Proof: a test must show that `tools/call` inside the scope succeeds while a write to a
-  path outside the scope fails with a permission error. _Status: **implemented, unproven**
-  — the AppContainer spawn path exists (see the status note above) but has never run on
-  Windows. This requirement is satisfied by the proof, not by the code: it stays open._
+- **R6.3.3**: Write attempts outside the sandbox scope **must** be blocked at the OS level,
+  *and* a write inside the scope **must** still succeed — a sandbox that blocks everything
+  proves nothing. Proof: a test must show both halves. _Status: **implemented, disproven**
+  — the AppContainer spawn path exists (see the status note above) and a `windows-latest`
+  CI run executed it: the in-scope write is denied too, so it is not wired into the default
+  spawn path. This requirement is satisfied by the proof, not by the code: it stays open._
   - **R6.3.3.1**: Two platform limitations of AppContainer are consequences of the design
     rather than defects, and **must** be disclosed on the R5.4 scope surfaces rather than
     worked around silently. **(a)** AppContainer blocks loopback unless the container is

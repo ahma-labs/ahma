@@ -417,32 +417,22 @@ impl Sandbox {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            // Windows: every command is launched into an AppContainer whose SID
-            // has been granted exactly the locked scopes (R6.3.3), on top of the
-            // Job Object process-tree containment applied at startup (R6.3.2).
+            // Windows: `base_command` still gives every spawn the Job Object
+            // process-tree containment applied at startup (R6.3.2), plus the
+            // secret/code-injection env scrub and egress-proxy variables.
             //
-            // The plan is turned into a command via `base_command` rather than
-            // built here, so the Windows path picks up the secret and
-            // code-injection env scrub, the egress-proxy variables and
-            // `kill_on_drop` that Linux and macOS already get. The previous
-            // Windows arm built its own `std::process::Command` and had none of
-            // them — a tool subprocess on Windows inherited ahma's credentials.
-            #[cfg(target_os = "windows")]
-            {
-                let write_scopes = self.scopes().to_vec();
-                let plan = super::windows::plan_windows_sandboxed_spawn(
-                    program,
-                    args,
-                    &write_scopes,
-                    &self.read_scopes(),
-                )?;
-                let launcher = plan.launcher.to_string_lossy().into_owned();
-                let mut cmd = self.base_command(&launcher, &plan.args, working_dir);
-                cmd.envs(plan.env);
-                return Ok(cmd);
-            }
-            // Other non-Linux/macOS platforms (e.g., FreeBSD): run unsandboxed.
-            #[cfg(not(target_os = "windows"))]
+            // AppContainer spawn isolation (R6.3.3) exists in `super::windows`
+            // (`plan_windows_sandboxed_spawn`) but is deliberately NOT wired in
+            // here yet: a windows-latest CI run proved its grant DACL does not
+            // take effect — every subprocess spawned through the launcher was
+            // denied even inside its own locked scope, timing out or failing
+            // basic tool calls (`writes_outside_the_scope_are_blocked_and_
+            // inside_still_work`, `cleanup_revokes_and_a_fresh_session_regrants`,
+            // both now `#[ignore]`d with the failure). Routing every Windows
+            // spawn through a containment layer that fails-broken rather than
+            // fails-safe is worse than not routing it at all, per AGENTS.md:
+            // "don't mark R6.3.3 done until Windows CI proves it" — remove this
+            // comment and call `plan_windows_sandboxed_spawn` here once it does.
             Ok(self.base_command(program, args, working_dir))
         }
     }

@@ -2233,6 +2233,32 @@ mod tests {
         );
     }
 
+    /// On Windows, `restrict_network=true` deliberately returns `None` (SPEC
+    /// R6.3.3.1a: AppContainer blocks loopback, so the proxy would be unreachable
+    /// by the very subprocesses it exists to gate). This is the Windows-side
+    /// counterpart to the non-Windows tests below, which assert the proxy
+    /// *does* start — a property that does not hold, and cannot be observed,
+    /// on this platform.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_maybe_start_egress_proxy_on_windows_returns_none() {
+        let tmp = tempdir().unwrap();
+        let sb = make_test_sandbox(tmp.path());
+        let cfg = AppConfig {
+            restrict_network: true,
+            network_allow: vec!["example.com".to_string()],
+            ..base_cfg()
+        };
+
+        let proxy = maybe_start_egress_proxy(&cfg, &sb, test_net_approval()).await;
+        assert!(
+            proxy.is_none(),
+            "AppContainer and the egress proxy are mutually exclusive (R6.3.3.1a): \
+             restrict_network=true must not start a proxy no subprocess can reach"
+        );
+    }
+
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_maybe_start_egress_proxy_on_empty_allow_starts_proxy() {
         let tmp = tempdir().unwrap();
@@ -2253,6 +2279,7 @@ mod tests {
         assert!(proxy.local_addr.ip().is_loopback());
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn test_maybe_start_egress_proxy_on_with_allowlist_starts_proxy() {
         let tmp = tempdir().unwrap();
@@ -2272,6 +2299,7 @@ mod tests {
         assert!(!proxy.allows("elsewhere.example"));
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn profile_hosts_seed_the_allowlist() {
         // The wiring test for the whole feature: `--restrict-network` with *no*
@@ -2305,6 +2333,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn operator_allow_composes_with_profile_hosts_at_the_proxy() {
         // Guards the natural-but-wrong implementation: "if the operator wrote an
@@ -2334,6 +2363,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn withholding_profile_hosts_leaves_the_operators_own_list_intact() {
         // `[network] profile_hosts = false` is a hardening knob, not a kill
