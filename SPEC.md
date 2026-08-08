@@ -507,10 +507,14 @@ Confining writes is necessary but not sufficient. A write that lands legitimatel
 > failure mode the gate test's own docstring warns against. Consequently
 > `create_platform_sandboxed_command` does **not** route Windows spawns through
 > `plan_windows_sandboxed_spawn`; it falls back to the plain (Job-Object-contained)
-> `base_command`, matching the platform's pre-R6.3.3 behavior. "Written" is not
-> "works": until a `windows-latest` CI run demonstrates the in-scope write
-> succeeding *and* the out-of-scope write blocked, R6.3.3 stays open, R6.3.9's
-> disclosure stays as written, both integration tests above stay `#[ignore]`, and
+> `base_command`, matching the platform's pre-R6.3.3 behavior. With AppContainer
+> disabled, `reads_outside_the_scope_are_blocked` now fails honestly too (it used
+> to pass only because the broken grant denied in-scope reads as well) — all three
+> `windows_sandbox_integration_test::appcontainer` behavioral tests are
+> `#[ignore]`d, citing the CI failure that earned each one. "Written" is not
+> "works": until a `windows-latest` CI run demonstrates the in-scope write and
+> read succeeding *and* the out-of-scope write and read blocked, R6.3.3 stays
+> open, R6.3.9's disclosure stays as written, and
 > `red_team_command_write_escape_blocked` stays `#[cfg_attr(windows, ignore)]`.
 > Claiming the boundary before the platform proves it is precisely the failure
 > R6.2.2 and R7.5 exist to prevent.
