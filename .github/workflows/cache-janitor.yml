@@ -12,21 +12,27 @@ name: Cache Janitor
 # N per cache family, delete the rest.
 #
 # The keep counts are the budget. Steady state must stay under ~7 GiB to leave headroom for a
-# run that saves before the janitor has swept the previous one:
+# run that saves before the janitor has swept the previous one. Sizes below are MEASURED from
+# run 31397218194 where noted, not estimated; the caps only started binding once the variable
+# was renamed from the never-recognised SCCACHE_MAX_SIZE to SCCACHE_CACHE_SIZE:
 #
-#   sccache-test-*        4 legs x 1 GiB   x keep 1 = 4.0 GiB
-#   sccache-coverage-*    1 leg  x 800 MiB x keep 1 = 0.8 GiB
-#   sccache-android-*     1 leg  x 600 MiB x keep 1 = 0.6 GiB
-#   sccache-codeql-*      1 leg  x 600 MiB x keep 1 = 0.6 GiB
-#   gradle-android-build  1 leg            x keep 1 ~ 0.4 GiB
-#   gradle-deps-android   1 leg            x keep 2 ~ 0.3 GiB
-#   cargo-registry-*      4 os/arch x ~90 MiB x keep 2 = 0.7 GiB
+#   sccache-test-*        4 legs x 1 GiB cap  x keep 1 = 4.4 GiB  (tarball ~1.1x the dir)
+#   sccache-coverage-*    1 leg  x 800 MiB    x keep 1 = 0.9 GiB
+#   sccache-android-*     1 leg  x 600 MiB    x keep 1 = 0.7 GiB
+#   sccache-codeql-*      1 leg  x 600 MiB    x keep 1 = 0.2 GiB  (measured 125 MiB; cap is slack)
+#   cargo-registry-*      4 os/arch x ~65 MiB x keep 2 = 0.5 GiB  (measured 58-73 MiB each)
 #                                                        -------
-#                                                        ~7.4 GiB
+#                                                        ~6.7 GiB
 #
-# Nothing else may save a cache without being added to that table. Two workflows are
-# deliberately absent because they never save: fast-tier.yml (PR-only) and the release legs in
-# build.yml.
+# Nothing else may save a cache without being added to that table. Three sources are
+# deliberately absent because they never save: fast-tier.yml (PR-only), the release legs in
+# build.yml, and Gradle -- whose two caches were removed after being shown to have never stored
+# anything (see the note in build.yml's job-android-nextest).
+#
+# Watch item: before the rename, the four test legs ran uncapped and reached ~2 GiB with Rust hit
+# rates of 85-98%. They are now capped at 1 GiB, roughly half their natural working set, so some
+# hit-rate loss is expected. The budget above has ~3 GiB of slack against the 10 GiB quota if the
+# cap needs raising.
 #
 # Why keep 1 for sccache: restore-keys already pick the newest matching prefix, so an older
 # entry is never chosen while a newer one exists. It is safe because saves are `if: always()`
@@ -129,6 +135,7 @@ jobs:
             case "$1" in
               # Lockfile/build-script keyed: cheap, and the previous generation still hits after
               # a revert or on a concurrent branch that has not taken the dep bump.
+              # gradle-deps-* is retained only so a future re-add is handled; nothing writes it.
               cargo-registry-* | gradle-deps-*) echo 2 ;;
               # Run-scoped and large: restore-keys always pick the newest, so one is enough.
               sccache-* | gradle-android-build-*) echo 1 ;;

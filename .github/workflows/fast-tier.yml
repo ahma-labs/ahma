@@ -36,6 +36,15 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_TEST_DEBUG: 0
   CARGO_NET_RETRY: 10
+  # MUST match build.yml's env exactly, or this tier gets 0% Rust cache hits. This one variable
+  # being absent here was the entire cause: it sets [profile.dev.build-override] debug, which
+  # changes the rustc invocation for build scripts and proc macros. sccache's Rust hashing
+  # includes the contents of `--extern` inputs, so a differently-compiled proc-macro artifact
+  # changes the hash of every crate that depends on it -- cascading to a total Rust miss against
+  # a cache that build.yml populated. C/C++ objects stayed at 100% precisely because they do not
+  # depend on Rust proc macros. Before adding any other CARGO_*/RUSTFLAGS here, add it to
+  # build.yml too; a one-sided profile variable silently destroys this tier's cache reuse.
+  CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: false
   RUSTFLAGS: -C debuginfo=0 --cfg reqwest_unstable
   RUST_BACKTRACE: 1
   IS_DEV_BUILD: "true"
@@ -43,7 +52,7 @@ env:
   SCCACHE_DIR: ${{ github.workspace }}/.sccache
   # Must match build.yml's cap: this tier restores build.yml's `-test-` entries, and a smaller
   # cap here would make sccache evict most of what it just downloaded on the first write.
-  SCCACHE_MAX_SIZE: 1G
+  SCCACHE_CACHE_SIZE: 1G
   SCCACHE_DIRECT: "true"
 
 jobs:
@@ -72,16 +81,14 @@ jobs:
       # The cost is real and accepted: a second push to the same PR recompiles the workspace
       # crates it changed. Dependencies still come from main's cache.
       #
-      # MEASURED, and not what you would assume: restoring this cache yields
-      # `Cache hits rate (Rust) 0.00 %` -- 924 Rust misses, 0 hits. All 413 hits are C/C++ and
-      # assembler, i.e. the native build scripts (ring, aws-lc-sys, zstd-sys), which are 100%.
-      # The Rust objects never match because the entry is produced by build.yml's test job,
-      # which compiles a different flag set than this tier's `cargo clippy --all-targets` and
-      # `cargo nextest --no-default-features`; sccache keys on the whole rustc invocation.
-      # So the restore is still worth its ~9s download -- the native deps are the slow part --
-      # but do not expect it to cache Rust. Closing that gap means either giving this tier a
-      # namespace it also writes (which rule 1 forbids) or aligning the flags with build.yml
-      # (which changes what the tier tests). Neither is a caching change; left as follow-up.
+      # This restore yielded `Cache hits rate (Rust) 0.00 %` -- 924 Rust misses, 0 hits, with all
+      # 413 hits being C/C++ and assembler at 100% -- until the missing
+      # CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG was added to this workflow's env above. See the
+      # comment there for the mechanism. The flag differences between this tier's
+      # `cargo clippy --all-targets` / `cargo nextest --no-default-features` and build.yml's
+      # command set were investigated and are NOT the cause: build.yml's own Linux/X64 leg reads
+      # this same entry and got 96.26% Rust, so the entry is good and the reader was wrong.
+      # If Rust hit rate here ever returns to ~0, suspect a new one-sided env var first.
       - name: Restore Cargo registry and git
         uses: actions/cache/restore@v5
         with:

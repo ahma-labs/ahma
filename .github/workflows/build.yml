@@ -44,10 +44,21 @@ permissions:
 # .github/workflows/cache-janitor.yml, which keeps only the newest entry per sccache family.
 # Without it, run-scoped keys thrash the quota harder than the daily scheme did.
 #
-# SCCACHE_MAX_SIZE is the sizing knob and it is load-bearing: at the old 2G the Linux test
-# leg uploaded 2.05 GiB, i.e. it was pinned against the cap and wanted more. It is now sized
-# per job family against the budget above. Raising it is not free -- multiply by the number
-# of saving legs and compare to 10 GiB.
+# SCCACHE_CACHE_SIZE is the sizing knob, and the name matters: **`SCCACHE_MAX_SIZE` is not a
+# real sccache variable**. sccache reads only `SCCACHE_CACHE_SIZE` (src/config.rs, and nothing
+# named SCCACHE_MAX_SIZE appears in that file at all); an unrecognised name silently leaves the
+# default of 10 GiB. This repo set `SCCACHE_MAX_SIZE` for its whole history, so no cap was ever
+# enforced and every local cache was free to grow toward 10 GiB. That -- not the daily rotation
+# -- is the root cause of the original quota saturation, and it also refutes the earlier reading
+# that the Linux leg's 2.05 GiB upload showed it "pinned against a 2G cap": it was simply
+# unbounded. Verified against the measured post-#560 run, where legs overshot their nominal caps
+# (Linux/X64 2276 MiB vs 1 GiB, coverage 1121 vs 800, android 736 vs 600).
+#
+# Caps therefore bind for the FIRST time as of this change. The consequence to watch: the four
+# test legs have a natural working set of ~2 GiB and are now capped at 1 GiB, so sccache will
+# evict roughly half. Rust hit rates were 85-98% when uncapped; if the next main run shows a
+# material drop there is ~3 GiB of headroom in the budget to raise the cap. Raising it is not
+# free -- multiply by the number of saving legs and compare to 10 GiB.
 #
 # Manual cache inspection / reset:
 #   gh cache list --limit 100
@@ -96,7 +107,7 @@ env:
   # 1 GiB is the per-leg budget for the 4-leg test matrix: 4 x 1 GiB is already 40% of the
   # 10 GiB repo quota. Jobs that save less get a lower cap at job level. See the caching
   # strategy note at the top of this file before changing this.
-  SCCACHE_MAX_SIZE: 1G
+  SCCACHE_CACHE_SIZE: 1G
   SCCACHE_DIRECT: "true"
   VSCMD_SKIP_SENDTELEMETRY: 1
 jobs:
@@ -403,7 +414,7 @@ jobs:
       TERM: xterm-256color
       # Below the workflow default: this leg shares the quota with the 4-leg test matrix and
       # only builds -p ahma_mcp --features android, so it needs less.
-      SCCACHE_MAX_SIZE: 600M
+      SCCACHE_CACHE_SIZE: 600M
     steps:
       - uses: actions/checkout@v6
         with:
@@ -421,22 +432,22 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      # Gradle *dependencies* are a function of the build scripts, so an unchanged tree is an
-      # exact hit and never re-uploads -- same reasoning as the lockfile-keyed registry cache.
-      - name: Cache AGP and more Gradle directories
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.gradle/caches/modules-2
-            ~/.gradle/caches/jars-*
-            ~/.gradle/caches/transforms-*
-            ~/.gradle/caches/build-cache-*
-            ~/.gradle/daemon
-            ~/.gradle/wrapper
-          key: gradle-deps-android-${{ runner.os }}-${{ hashFiles('test-data/**/*.gradle*', 'test-data/**/gradle.properties', 'test-data/**/gradle/wrapper/gradle-wrapper.properties') }}
-          restore-keys: |
-            gradle-deps-android-${{ runner.os }}-
-
+      # There are deliberately NO Gradle caches in this job. Two used to exist (`gradle-deeper-*`
+      # for ~/.gradle deps and `gradle-android-build-*` for the sample app's build outputs) and
+      # BOTH were no-ops for this repo's entire history: every run ended with
+      #   Path Validation Error: Path(s) specified in the action for caching do(es) not exist,
+      #   hence no cache is being saved.
+      # and correspondingly no `gradle-*` entry has ever appeared in `gh cache list`. The paths
+      # never materialise because the tests this job runs (`-p ahma_mcp --features android -E
+      # 'test(kotlin) or test(android)'`) do not drive a Gradle build of test-data/, so neither
+      # ~/.gradle nor app/build/* is ever populated. Restoring could not hit either, since
+      # nothing was ever stored. They were pure warning noise plus the false impression that
+      # Gradle work was cached.
+      #
+      # If a real Gradle build is added to this job, re-add caching then -- and verify the save
+      # actually stores by checking for a `gradle-*` key in `gh cache list`, not just a green
+      # step: the save step succeeds even when it stores nothing.
+      #
       # See the registry cache in job-cargo-nextest for why this key has no job-family segment
       # and why registry/src and ~/.cargo/bin are excluded.
       - name: Cache Cargo registry and git
@@ -459,29 +470,6 @@ jobs:
           restore-keys: |
             sccache-android-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
             sccache-android-${{ runner.os }}-${{ runner.arch }}-
-
-      # Caveat: this caches Gradle *output* directories, which grow monotonically no matter how
-      # the key is shaped -- each save is "whatever was restored, plus this run's additions".
-      # Run-scoped keys stop it freezing, but only the janitor's keep-newest-1 bounds the size.
-      - name: Cache Android build artifacts
-        uses: actions/cache/restore@v5
-        id: gradle-build
-        with:
-          path: |
-            ${{ github.workspace }}/.gradle
-            ${{ runner.tool_cache }}/gradle
-            ./test-data/AndoidTestBasicViews/.gradle
-            ./test-data/AndoidTestBasicViews/app/build/intermediates
-            ./test-data/AndoidTestBasicViews/app/build/outputs
-            ./test-data/AndoidTestBasicViews/app/build/kotlin
-            ./test-data/AndoidTestBasicViews/app/build/generated
-            ./test-data/AndoidTestBasicViews/app/build/kspCaches
-            ./test-data/AndoidTestBasicViews/app/build/tmp
-            ./test-data/AndoidTestBasicViews/build/kotlin
-            ./test-data/AndoidTestBasicViews/build/intermediates
-          key: gradle-android-build-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            gradle-android-build-${{ runner.os }}-
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -518,25 +506,6 @@ jobs:
           path: ${{ github.workspace }}/.sccache
           key: ${{ steps.sccache.outputs.cache-primary-key }}
 
-      - name: Save Android build artifacts
-        if: always()
-        continue-on-error: true # a cache save must never redden a green job
-        uses: actions/cache/save@v5
-        with:
-          path: |
-            ${{ github.workspace }}/.gradle
-            ${{ runner.tool_cache }}/gradle
-            ./test-data/AndoidTestBasicViews/.gradle
-            ./test-data/AndoidTestBasicViews/app/build/intermediates
-            ./test-data/AndoidTestBasicViews/app/build/outputs
-            ./test-data/AndoidTestBasicViews/app/build/kotlin
-            ./test-data/AndoidTestBasicViews/app/build/generated
-            ./test-data/AndoidTestBasicViews/app/build/kspCaches
-            ./test-data/AndoidTestBasicViews/app/build/tmp
-            ./test-data/AndoidTestBasicViews/build/kotlin
-            ./test-data/AndoidTestBasicViews/build/intermediates
-          key: ${{ steps.gradle-build.outputs.cache-primary-key }}
-
   #######################################
 
   job-coverage:
@@ -545,7 +514,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     env:
       # Single leg, so it can afford a little more than android but less than a test leg.
-      SCCACHE_MAX_SIZE: 800M
+      SCCACHE_CACHE_SIZE: 800M
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

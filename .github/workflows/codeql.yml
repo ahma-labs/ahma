@@ -29,7 +29,7 @@ env:
   # `cargo check` emits metadata, not codegen, so this namespace is both disjoint from the test
   # matrix's and much smaller. See the caching strategy note at the top of build.yml for how the
   # per-family caps add up against the 10 GiB repo quota.
-  SCCACHE_MAX_SIZE: 600M
+  SCCACHE_CACHE_SIZE: 600M
   SCCACHE_DIRECT: "true"
 
 jobs:
