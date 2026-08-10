@@ -17,22 +17,29 @@ name: Cache Janitor
 # was renamed from the never-recognised SCCACHE_MAX_SIZE to SCCACHE_CACHE_SIZE:
 #
 #   sccache-test-*        4 legs x 1 GiB cap  x keep 1 = 4.4 GiB  (tarball ~1.1x the dir)
-#   sccache-coverage-*    1 leg  x 800 MiB    x keep 1 = 0.9 GiB
+#   sccache-coverage-*    1 leg  x 1300 MiB   x keep 1 = 1.4 GiB  (live set ~1121 MiB; see below)
 #   sccache-android-*     1 leg  x 600 MiB    x keep 1 = 0.7 GiB
 #   sccache-codeql-*      1 leg  x 600 MiB    x keep 1 = 0.2 GiB  (measured 125 MiB; cap is slack)
 #   cargo-registry-*      4 os/arch x ~65 MiB x keep 2 = 0.5 GiB  (measured 58-73 MiB each)
 #                                                        -------
-#                                                        ~6.7 GiB
+#                                                        ~7.2 GiB
 #
 # Nothing else may save a cache without being added to that table. Three sources are
 # deliberately absent because they never save: fast-tier.yml (PR-only), the release legs in
 # build.yml, and Gradle -- whose two caches were removed after being shown to have never stored
 # anything (see the note in build.yml's job-android-nextest).
 #
-# Watch item: before the rename, the four test legs ran uncapped and reached ~2 GiB with Rust hit
-# rates of 85-98%. They are now capped at 1 GiB, roughly half their natural working set, so some
-# hit-rate loss is expected. The budget above has ~3 GiB of slack against the 10 GiB quota if the
-# cap needs raising.
+# Sizing a cap: compare it to the job's LIVE working set, not to what it previously uploaded.
+# Measured on run 31400528803, the first run where caps actually bound:
+#
+#   test legs   2276 -> 1019 MiB (2.22x over cap)  96.26% -> 96.90% Rust   no loss
+#   coverage    1121 ->  800 MiB (1.40x over cap)  95.74% ->  2.82% Rust   COLLAPSE, +23% runtime
+#
+# The overage ratio is not the predictor. The test legs accumulate dead objects from older flag
+# combinations, so eviction discards junk first; nearly all of coverage's cache is live, so
+# eviction cut into objects the same run still needed and then cascaded. A cap below a job's live
+# set does not degrade gracefully -- it falls off a cliff. Coverage was raised to 1300M in
+# response; the test legs, android (600 MiB, 98.85%) and codeql are all comfortably above theirs.
 #
 # Why keep 1 for sccache: restore-keys already pick the newest matching prefix, so an older
 # entry is never chosen while a newer one exists. It is safe because saves are `if: always()`

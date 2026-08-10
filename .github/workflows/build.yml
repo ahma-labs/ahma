@@ -513,8 +513,19 @@ jobs:
     # Only run on main branch pushes, not pull requests
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     env:
-      # Single leg, so it can afford a little more than android but less than a test leg.
-      SCCACHE_CACHE_SIZE: 800M
+      # MUST stay above this job's live working set, measured at ~1121 MiB. It compiles two
+      # distinct flavours into one cache -- a plain `cargo build -p ahma_bin` plus
+      # `cargo llvm-cov nextest`, which adds cfg(coverage) and instrumentation, so those objects
+      # are a disjoint (and larger) set rather than a reuse of the plain ones.
+      #
+      # 800M was measured to be actively harmful: run 31400528803 collapsed to a 2.82% Rust hit
+      # rate (from 95.74%) and the job ran 23% slower, 11.7 -> 14.4 min. Note the trap in
+      # diagnosing this -- the overage ratio is NOT the predictor. Coverage was only 1.40x over
+      # its cap and collapsed, while the ubuntu test leg was 2.22x over and held 96.90%. What
+      # matters is how much of the cache is LIVE: the test legs carry accumulated dead objects
+      # from older flag combinations, so eviction discards junk first, whereas nearly all of this
+      # job's 1121 MiB is needed by the run that just restored it.
+      SCCACHE_CACHE_SIZE: 1300M
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
