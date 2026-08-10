@@ -3,25 +3,56 @@ permissions:
   contents: read
   pages: write
   id-token: write
-# Heavy use of multi-layer caching to speed builds
-# Github Actions caches grow since they do not forget unused files from old versions
+# CACHING STRATEGY
 #
-# We rotate to a new cache every day, loading from the previous day's cache and
-# then saving the fresh cache only containing the current files. We also work off of
-# the 'main' banch. Github caching has special rules to fall back to 'main' from
-# other branches. We also do not make new caches with every push to reduce clutter.
-# There is an inherent performance tradeoff with this approach between slowly making
-# new caches frequently (for example if we build new caches each time the git hash
-# changes) and caches being too stupid to save updates if the name has not changed,
-# thus forcing re-builds of any changes for the rest of the current day. Daily cache
-# rotation is a good compromise.
+# The repo-wide Actions cache quota is 10 GiB, LRU-evicted. Every byte a job saves competes
+# with every other job, so the design constraint is a *steady-state footprint*, not a per-job
+# hit rate. The previous daily-rotation scheme ignored this: one full matrix run saved 23
+# entries totalling ~12 GiB, so it could not hold even a single day, let alone the previous
+# day it was written to fall back to. Release jobs (which save last) evicted the test caches
+# that the next day's test legs were supposed to warm from. Four `sccache-test-*` tarballs
+# alone accounted for ~6.8 GiB.
 #
-# Caches still grow and slow things down. Run the following from command line if you
-# want to delete caches, perhaps different types at different times:
+# Four rules keep it inside the quota. Change any of them and re-check the arithmetic.
+#
+# 1. PR runs consume cache, never produce it. Caches saved on a `pull_request` ref are
+#    visible only to that one PR, yet they bill against the shared 10 GiB and evict main's
+#    entries, which every PR restores from. So fast-tier.yml is restore-only. The cost is
+#    that a second push to the same PR recompiles the workspace crates it changed; deps
+#    still come from main's cache, which is at most one merge stale.
+#
+# 2. Release jobs do not cache sccache at all. They build with `--release`, so they share
+#    zero sccache objects with the test matrix (sccache keys on the whole compiler
+#    invocation), they run only on a version bump, and they are not on any latency-critical
+#    path. Restore-only was considered and rejected: with nobody saving, the entry ages out
+#    within a week and the complexity buys nothing.
+#
+# 3. One registry cache per (Cargo.lock, OS, arch) -- not per job family. Registry content
+#    is a pure function of the lockfile, so the old -test-/-android-/-coverage-/-release-
+#    namespaces stored up to 11 near-identical copies (~1.7 GiB). Lockfile-keyed also means
+#    an exact hit skips the save, so unchanged deps never re-upload.
+#
+# 4. sccache uses restore + save with a per-run key, so it is never write-once. `actions/cache`
+#    skips the save on an exact key hit, which under the old daily key froze cache contents
+#    for the rest of the day: a dependency added at 09:05 was recompiled by every run until
+#    midnight UTC. Splitting into `actions/cache/restore` + `actions/cache/save` keyed on
+#    `<lockfile-hash>-<run_id>-<run_attempt>` makes every run save fresh and restore the
+#    newest matching prefix. The save is `if: always()` so a red run still contributes its
+#    compilation instead of making the retry start over.
+#
+# Rule 4 makes every run mint a new key, so it REQUIRES the janitor in
+# .github/workflows/cache-janitor.yml, which keeps only the newest entry per sccache family.
+# Without it, run-scoped keys thrash the quota harder than the daily scheme did.
+#
+# SCCACHE_MAX_SIZE is the sizing knob and it is load-bearing: at the old 2G the Linux test
+# leg uploaded 2.05 GiB, i.e. it was pinned against the cap and wanted more. It is now sized
+# per job family against the budget above. Raising it is not free -- multiply by the number
+# of saving legs and compare to 10 GiB.
+#
+# Manual cache inspection / reset:
+#   gh cache list --limit 100
+#   gh api repos/:owner/:repo/actions/cache/usage
 #   gh cache delete --all
-#   gh cache delete cargo-
-#   gh cache delete sccache-
-#   gh cache delete gradle-
 #
 # Avoid pull requests- they cause needless double builds. Instead rebase from 'main'
 # to your branch to give priority to your changes. Then rebase from your branch back
@@ -62,7 +93,10 @@ env:
   IS_DEV_BUILD: "true" # Set "true" to speed up builds for CI testing
   RUSTC_WRAPPER: sccache
   SCCACHE_DIR: ${{ github.workspace }}/.sccache
-  SCCACHE_MAX_SIZE: 2G
+  # 1 GiB is the per-leg budget for the 4-leg test matrix: 4 x 1 GiB is already 40% of the
+  # 10 GiB repo quota. Jobs that save less get a lower cap at job level. See the caching
+  # strategy note at the top of this file before changing this.
+  SCCACHE_MAX_SIZE: 1G
   SCCACHE_DIRECT: "true"
   VSCMD_SKIP_SENDTELEMETRY: 1
 jobs:
@@ -117,31 +151,36 @@ jobs:
             }
           }
 
-      - name: Get current day number
-        id: day-number
-        run: echo "day=$(date +%j)" >> "$GITHUB_OUTPUT"
-
+      # Shared across every job in this workflow (rule 3 in the caching note above): registry
+      # content is a pure function of (Cargo.lock, OS, arch), so job family is not part of the
+      # key. `registry/src` is deliberately NOT cached -- cargo re-extracts it from
+      # `registry/cache`, and it is the bulk of the payload (1.5 GiB of extracted sources
+      # against 274 MiB of .crate archives). `~/.cargo/bin` is deliberately NOT cached either:
+      # a restored stale binary satisfies taiki-e/install-action's presence check, silently
+      # pinning an old nextest/sccache.
       - name: Cache Cargo registry and git
         uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/.package-cache
-            ~/.cargo/bin
-          key: cargo-registry-test-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-test-${{ runner.os }}-${{ runner.arch }}-
             cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Cache sccache
-        uses: actions/cache@v5
+      # Restore + save split, not `actions/cache` (rule 4 above): a single `actions/cache` with
+      # a stable key skips the save on an exact hit, freezing cache contents. run_attempt is in
+      # the key because run_id alone is identical across re-runs of the same run.
+      - name: Restore sccache
+        id: sccache
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.sccache
-          key: sccache-test-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+          key: sccache-test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            sccache-test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
             sccache-test-${{ runner.os }}-${{ runner.arch }}-
-            sccache-${{ runner.os }}-${{ runner.arch }}-
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -274,7 +313,22 @@ jobs:
         if: always() && runner.os != 'Windows'
         run: |
           sccache --show-stats || true
-          sccache --stop-server || true
+
+      # Must run on EVERY platform, including Windows (which is excluded from the stats step
+      # above): saving while the server still holds the cache open tars a live directory.
+      - name: Stop sccache server
+        if: always()
+        run: sccache --stop-server || true
+
+      # `if: always()` so a red leg still contributes its compilation -- otherwise the retry
+      # starts from whatever the last green run left behind.
+      - name: Save sccache
+        if: always()
+        continue-on-error: true # a cache save must never redden a green job
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache.outputs.cache-primary-key }}
 
   #######################################
 
@@ -347,6 +401,9 @@ jobs:
     runs-on: macos-latest
     env:
       TERM: xterm-256color
+      # Below the workflow default: this leg shares the quota with the 4-leg test matrix and
+      # only builds -p ahma_mcp --features android, so it needs less.
+      SCCACHE_MAX_SIZE: 600M
     steps:
       - uses: actions/checkout@v6
         with:
@@ -364,10 +421,8 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Get current day number
-        id: day-number
-        run: echo "day=$(date +%j)" >> "$GITHUB_OUTPUT"
-
+      # Gradle *dependencies* are a function of the build scripts, so an unchanged tree is an
+      # exact hit and never re-uploads -- same reasoning as the lockfile-keyed registry cache.
       - name: Cache AGP and more Gradle directories
         uses: actions/cache@v5
         with:
@@ -378,34 +433,39 @@ jobs:
             ~/.gradle/caches/build-cache-*
             ~/.gradle/daemon
             ~/.gradle/wrapper
-          key: gradle-deeper-android-${{ runner.os }}-day${{ steps.day-number.outputs.day }}
+          key: gradle-deps-android-${{ runner.os }}-${{ hashFiles('test-data/**/*.gradle*', 'test-data/**/gradle.properties', 'test-data/**/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: |
-            gradle-deeper-android-${{ runner.os }}-
+            gradle-deps-android-${{ runner.os }}-
 
+      # See the registry cache in job-cargo-nextest for why this key has no job-family segment
+      # and why registry/src and ~/.cargo/bin are excluded.
       - name: Cache Cargo registry and git
         uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/.package-cache
-            ~/.cargo/bin
-          key: cargo-registry-android-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-android-${{ runner.os }}-${{ runner.arch }}-
             cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Cache sccache
-        uses: actions/cache@v5
+      - name: Restore sccache
+        id: sccache
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.sccache
-          key: sccache-android-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+          key: sccache-android-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            sccache-android-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
             sccache-android-${{ runner.os }}-${{ runner.arch }}-
-            sccache-${{ runner.os }}-${{ runner.arch }}-
 
+      # Caveat: this caches Gradle *output* directories, which grow monotonically no matter how
+      # the key is shaped -- each save is "whatever was restored, plus this run's additions".
+      # Run-scoped keys stop it freezing, but only the janitor's keep-newest-1 bounds the size.
       - name: Cache Android build artifacts
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
+        id: gradle-build
         with:
           path: |
             ${{ github.workspace }}/.gradle
@@ -419,7 +479,7 @@ jobs:
             ./test-data/AndoidTestBasicViews/app/build/tmp
             ./test-data/AndoidTestBasicViews/build/kotlin
             ./test-data/AndoidTestBasicViews/build/intermediates
-          key: gradle-android-build-${{ runner.os }}-day${{ steps.day-number.outputs.day }}
+          key: gradle-android-build-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             gradle-android-build-${{ runner.os }}-
 
@@ -445,7 +505,37 @@ jobs:
         if: always()
         run: |
           sccache --show-stats || true
-          sccache --stop-server || true
+
+      - name: Stop sccache server
+        if: always()
+        run: sccache --stop-server || true
+
+      - name: Save sccache
+        if: always()
+        continue-on-error: true # a cache save must never redden a green job
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache.outputs.cache-primary-key }}
+
+      - name: Save Android build artifacts
+        if: always()
+        continue-on-error: true # a cache save must never redden a green job
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ${{ github.workspace }}/.gradle
+            ${{ runner.tool_cache }}/gradle
+            ./test-data/AndoidTestBasicViews/.gradle
+            ./test-data/AndoidTestBasicViews/app/build/intermediates
+            ./test-data/AndoidTestBasicViews/app/build/outputs
+            ./test-data/AndoidTestBasicViews/app/build/kotlin
+            ./test-data/AndoidTestBasicViews/app/build/generated
+            ./test-data/AndoidTestBasicViews/app/build/kspCaches
+            ./test-data/AndoidTestBasicViews/app/build/tmp
+            ./test-data/AndoidTestBasicViews/build/kotlin
+            ./test-data/AndoidTestBasicViews/build/intermediates
+          key: ${{ steps.gradle-build.outputs.cache-primary-key }}
 
   #######################################
 
@@ -453,6 +543,9 @@ jobs:
     runs-on: ubuntu-latest
     # Only run on main branch pushes, not pull requests
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    env:
+      # Single leg, so it can afford a little more than android but less than a test leg.
+      SCCACHE_MAX_SIZE: 800M
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -464,31 +557,30 @@ jobs:
           token: ${{ github.token }}
           persist-credentials: true
 
-      - name: Get current day number
-        id: day-number
-        run: echo "day=$(date +%j)" >> "$GITHUB_OUTPUT"
-
+      # See the registry cache in job-cargo-nextest for why this key has no job-family segment
+      # and why registry/src and ~/.cargo/bin are excluded.
       - name: Cache Cargo registry and git
         uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/.package-cache
-            ~/.cargo/bin
-          key: cargo-registry-coverage-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-coverage-${{ runner.os }}-${{ runner.arch }}-
             cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Cache sccache
-        uses: actions/cache@v5
+      # Keeps its own sccache namespace: llvm-cov instrumentation changes the compiler
+      # invocation, so these objects are disjoint from the test matrix's.
+      - name: Restore sccache
+        id: sccache
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.sccache
-          key: sccache-coverage-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+          key: sccache-coverage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            sccache-coverage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
             sccache-coverage-${{ runner.os }}-${{ runner.arch }}-
-            sccache-${{ runner.os }}-${{ runner.arch }}-
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -606,7 +698,18 @@ jobs:
         if: always()
         run: |
           sccache --show-stats || true
-          sccache --stop-server || true
+
+      - name: Stop sccache server
+        if: always()
+        run: sccache --stop-server || true
+
+      - name: Save sccache
+        if: always()
+        continue-on-error: true # a cache save must never redden a green job
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache.outputs.cache-primary-key }}
 
   #######################################
 
@@ -730,33 +833,32 @@ jobs:
             }
           }
 
-      - name: Get current day number
-        id: day-number
-        run: echo "day=$(date +%j)" >> "$GITHUB_OUTPUT"
-
+      # Registry only, and NOT keyed on matrix.target: the registry is host-side, identical for
+      # every target built on a given runner, so the 4 ubuntu legs share one entry (previously
+      # 6 near-identical copies, ~0.8 GiB). See job-cargo-nextest for the path exclusions.
+      #
+      # Expect "Unable to reserve cache with key ..., another job may be creating this cache"
+      # warnings here on a release run: this job needs only job-release-gate (~10s), so the 4
+      # ubuntu legs start alongside the ubuntu test legs and race to save the now-shared key.
+      # It is benign -- the loser skips the upload and the step still succeeds, and whichever
+      # wins writes identical content, since the key already pins (Cargo.lock, OS, arch). That
+      # content-independence is the whole reason one shared registry entry is safe.
+      #
+      # There is deliberately NO sccache cache here -- rule 2 in the caching note at the top of
+      # this file. Release legs build with `--release`, so they share zero sccache objects with
+      # the test matrix, they run only on a version bump, and they are off the critical path;
+      # their 3 entries cost ~1.2 GiB of a 10 GiB quota that every merge competes for.
+      # RUSTC_WRAPPER stays set so the stats step below still reports, but nothing is uploaded.
       - name: Cache Cargo registry and git
         uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/.package-cache
-            ~/.cargo/bin
-          key: cargo-registry-release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-day${{ steps.day-number.outputs.day }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
-            cargo-registry-release-${{ runner.os }}-${{ runner.arch }}-
             cargo-registry-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Cache sccache
-        if: "!matrix.use_cross"
-        uses: actions/cache@v5
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: sccache-release-${{ matrix.platform }}-day${{ steps.day-number.outputs.day }}
-          restore-keys: |
-            sccache-release-${{ matrix.platform }}-day
-            sccache-release-${{ matrix.platform }}-
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:

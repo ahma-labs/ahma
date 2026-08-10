@@ -26,7 +26,10 @@ env:
   IS_DEV_BUILD: "true"
   RUSTC_WRAPPER: sccache
   SCCACHE_DIR: ${{ github.workspace }}/.sccache
-  SCCACHE_MAX_SIZE: 2G
+  # `cargo check` emits metadata, not codegen, so this namespace is both disjoint from the test
+  # matrix's and much smaller. See the caching strategy note at the top of build.yml for how the
+  # per-family caps add up against the 10 GiB repo quota.
+  SCCACHE_MAX_SIZE: 600M
   SCCACHE_DIRECT: "true"
 
 jobs:
@@ -56,34 +59,32 @@ jobs:
           token: ${{ github.token }}
           persist-credentials: true
 
-      - name: Get current day number
+      # This workflow runs on BOTH push and pull_request, so the save below is gated on `push`.
+      # A cache saved on a PR ref is visible only to that PR but bills against the repo-wide
+      # 10 GiB quota and evicts main's entries -- see rule 1 in the caching strategy note at the
+      # top of build.yml. Restores are unconditional: PRs consume main's cache freely.
+      - name: Restore Cargo registry and git
         if: matrix.language == 'rust'
-        id: day-number
-        run: echo "day=$(date +%j)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Cargo registry and git
-        if: matrix.language == 'rust'
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/.package-cache
-            ~/.cargo/bin
-          key: cargo-registry-codeql-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-codeql-${{ runner.os }}-${{ runner.arch }}-
             cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Cache sccache
+      - name: Restore sccache
+        id: sccache
         if: matrix.language == 'rust'
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.sccache
-          key: sccache-codeql-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+          key: sccache-codeql-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            sccache-codeql-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
             sccache-codeql-${{ runner.os }}-${{ runner.arch }}-
-            sccache-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Setup Rust Toolchain
         if: matrix.language == 'rust'
@@ -129,4 +130,17 @@ jobs:
         if: always() && matrix.language == 'rust'
         run: |
           sccache --show-stats || true
-          sccache --stop-server || true
+
+      - name: Stop sccache server
+        if: always() && matrix.language == 'rust'
+        run: sccache --stop-server || true
+
+      # Push-only, per the note on the restore steps above. The registry cache has no save step
+      # at all in this workflow: build.yml's jobs run on the same push and write it there.
+      - name: Save sccache
+        if: always() && matrix.language == 'rust' && github.event_name == 'push'
+        continue-on-error: true # a cache save must never redden a green job
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: ${{ steps.sccache.outputs.cache-primary-key }}

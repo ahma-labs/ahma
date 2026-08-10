@@ -41,7 +41,9 @@ env:
   IS_DEV_BUILD: "true"
   RUSTC_WRAPPER: sccache
   SCCACHE_DIR: ${{ github.workspace }}/.sccache
-  SCCACHE_MAX_SIZE: 2G
+  # Must match build.yml's cap: this tier restores build.yml's `-test-` entries, and a smaller
+  # cap here would make sccache evict most of what it just downloaded on the first write.
+  SCCACHE_MAX_SIZE: 1G
   SCCACHE_DIRECT: "true"
 
 jobs:
@@ -57,34 +59,48 @@ jobs:
           token: ${{ github.token }}
           persist-credentials: true
 
-      - name: Get current day number
-        id: day-number
-        run: echo "day=$(date +%j)" >> "$GITHUB_OUTPUT"
-
-      # Reuse build.yml's cache keys so the fast tier warms from the same registry + sccache
-      # entries (both are Linux/X64). restore-keys fall back across days and to the merge-gate
-      # caches, maximizing cold-PR hit rate.
-      - name: Cache Cargo registry and git
-        uses: actions/cache@v5
+      # RESTORE-ONLY, both of them. This tier runs on `pull_request`, and a cache saved on a PR
+      # ref is visible only to that one PR -- yet it bills against the repo-wide 10 GiB quota and
+      # LRU-evicts main's entries, which every PR restores from. So one PR's private cache is
+      # bought with every other PR's hit rate. See the caching strategy note at the top of
+      # build.yml (rule 1).
+      #
+      # The keys are build.yml's `-test-` Linux/X64 keys, so a cold PR warms from the last merge
+      # (at most one merge stale). `fail-on-cache-miss` is deliberately NOT set: a total miss
+      # must slow the tier down, never fail it.
+      #
+      # The cost is real and accepted: a second push to the same PR recompiles the workspace
+      # crates it changed. Dependencies still come from main's cache.
+      #
+      # MEASURED, and not what you would assume: restoring this cache yields
+      # `Cache hits rate (Rust) 0.00 %` -- 924 Rust misses, 0 hits. All 413 hits are C/C++ and
+      # assembler, i.e. the native build scripts (ring, aws-lc-sys, zstd-sys), which are 100%.
+      # The Rust objects never match because the entry is produced by build.yml's test job,
+      # which compiles a different flag set than this tier's `cargo clippy --all-targets` and
+      # `cargo nextest --no-default-features`; sccache keys on the whole rustc invocation.
+      # So the restore is still worth its ~9s download -- the native deps are the slow part --
+      # but do not expect it to cache Rust. Closing that gap means either giving this tier a
+      # namespace it also writes (which rule 1 forbids) or aligning the flags with build.yml
+      # (which changes what the tier tests). Neither is a caching change; left as follow-up.
+      - name: Restore Cargo registry and git
+        uses: actions/cache/restore@v5
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/.package-cache
-            ~/.cargo/bin
-          key: cargo-registry-test-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-test-${{ runner.os }}-${{ runner.arch }}-
             cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Cache sccache
-        uses: actions/cache@v5
+      - name: Restore sccache
+        uses: actions/cache/restore@v5
         with:
           path: ${{ github.workspace }}/.sccache
-          key: sccache-test-${{ runner.os }}-${{ runner.arch }}-day${{ steps.day-number.outputs.day }}
+          key: sccache-test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            sccache-test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
             sccache-test-${{ runner.os }}-${{ runner.arch }}-
-            sccache-${{ runner.os }}-${{ runner.arch }}-
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
