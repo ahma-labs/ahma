@@ -740,7 +740,7 @@ impl AhmaMcpService {
             operation_monitor.clone(),
         );
 
-        let progress_push = progress_push::ProgressPushRouter::new();
+        let progress_push = progress_push::ProgressPushRouter::new(operation_monitor.clone());
         progress_push.spawn_forwarder(&operation_monitor);
 
         // Reset roots_received to false so that client roots/list negotiation

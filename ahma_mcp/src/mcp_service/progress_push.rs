@@ -38,14 +38,20 @@ pub struct PushTarget {
 /// Cheap to share — handlers hold an `Arc` and register/unregister targets;
 /// the forwarder task spawned by [`ProgressPushRouter::spawn_forwarder`]
 /// consumes the unified event stream.
-#[derive(Default)]
 pub struct ProgressPushRouter {
     targets: tokio::sync::RwLock<HashMap<String, PushTarget>>,
+    /// Authoritative source for "is this operation still active" (SPEC
+    /// R2.5.3), consulted by [`Self::restore`] — see its docs for why a
+    /// derived signal (e.g. presence in `targets`) isn't safe to use instead.
+    monitor: Arc<OperationMonitor>,
 }
 
 impl ProgressPushRouter {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    pub fn new(monitor: Arc<OperationMonitor>) -> Arc<Self> {
+        Arc::new(Self {
+            targets: tokio::sync::RwLock::new(HashMap::new()),
+            monitor,
+        })
     }
 
     /// Register the client destination for an operation.
@@ -84,6 +90,22 @@ impl ProgressPushRouter {
         self.targets.write().await.remove(op_id);
     }
 
+    /// Atomically hand back and remove whoever is currently registered for a
+    /// terminal event, in a single lock acquisition.
+    ///
+    /// A caller that instead does `get` (to decide who to push to) and a
+    /// later, separate `remove` leaves a window — spanning the network
+    /// `.await` of the push in between — for a concurrent [`Self::redirect`]
+    /// to land unseen: the redirect's write and the stale `remove` don't
+    /// conflict at the type level, so the new target is silently dropped and
+    /// the client now waiting on it never hears the completion (SPEC
+    /// R2.5.3). Reading and removing under one write-lock closes that window:
+    /// whatever `redirect` most recently installed is exactly what this
+    /// returns.
+    async fn claim_terminal(&self, op_id: &str) -> Option<PushTarget> {
+        self.targets.write().await.remove(op_id)
+    }
+
     /// Point an operation's progress at the request that is waiting on it *now*,
     /// returning the target it displaced (SPEC R2.5.3).
     ///
@@ -116,11 +138,30 @@ impl ProgressPushRouter {
     /// Put back a target displaced by [`Self::redirect`]. `None` means the
     /// operation had no target before, so leave it without one.
     ///
-    /// If the entry is already gone, the operation reached a terminal event
-    /// while the await was in flight and the forwarder unregistered it — so
-    /// there is nothing left to send progress *for*, and restoring would leak a
-    /// target for a finished operation that nothing will ever clean up.
+    /// No-ops once the operation is no longer active. This is a *separate*
+    /// task from the one waiting on the operation (`Drop` cannot await, so
+    /// restoration is spawned — see `ProgressRedirect`), racing against the
+    /// forwarder's own [`Self::claim_terminal`] for the same terminal event.
+    /// Checking `targets` for "is there still an entry to restore onto"
+    /// doesn't resolve that race: if this task runs *before* the forwarder's
+    /// claim, the entry is still present and gets overwritten with the
+    /// displaced (retired) target — which `claim_terminal` then hands the
+    /// completion to, addressing it to a request that already returned
+    /// instead of the one SPEC R2.5.3 requires.
+    ///
+    /// `OperationMonitor::get_operation` is the fix: an operation is removed
+    /// from the active map in the same lock scope that transitions it to
+    /// terminal, strictly *before* either the forwarder's broadcast event or
+    /// this task's own await response can observe completion (see
+    /// `OperationMonitor::move_to_history_and_notify`). So by the time this
+    /// runs for an operation that actually finished, `get_operation` is
+    /// guaranteed to already report it gone — regardless of which task the
+    /// scheduler happened to run first — and restoring is skipped in favor of
+    /// leaving the terminal dispatch entirely to `claim_terminal`.
     pub async fn restore(&self, op_id: &str, previous: Option<PushTarget>) {
+        if self.monitor.get_operation(op_id).await.is_none() {
+            return;
+        }
         let mut targets = self.targets.write().await;
         if !targets.contains_key(op_id) {
             return;
@@ -159,21 +200,26 @@ impl ProgressPushRouter {
                 };
 
                 let op_id = event.operation_id().to_string();
-                let target = { router.targets.read().await.get(&op_id).cloned() };
-                if let Some(target) = target {
-                    if let Some((progress, message)) = progress_for_event(&event) {
-                        push_progress(
-                            &target.peer,
-                            target.progress_token.clone(),
-                            progress,
-                            message,
-                            event.is_terminal(),
-                        )
-                        .await;
+                let Some((progress, message)) = progress_for_event(&event) else {
+                    continue;
+                };
+
+                if event.is_terminal() {
+                    // Single atomic get-and-remove — see `claim_terminal` for
+                    // why a separate read-then-remove isn't safe here.
+                    if let Some(target) = router.claim_terminal(&op_id).await {
+                        push_progress(&target.peer, target.progress_token, progress, message, true)
+                            .await;
                     }
-                    if event.is_terminal() {
-                        router.unregister(&op_id).await;
-                    }
+                } else if let Some(target) = { router.targets.read().await.get(&op_id).cloned() } {
+                    push_progress(
+                        &target.peer,
+                        target.progress_token.clone(),
+                        progress,
+                        message,
+                        false,
+                    )
+                    .await;
                 }
             }
         });
@@ -474,23 +520,44 @@ mod tests {
 mod redirect_tests {
     use super::*;
     use crate::client_type::McpClientType;
+    use crate::operation_monitor::{MonitorConfig, Operation, OperationStatus};
     use rmcp::model::NumberOrString;
+    use std::time::Duration;
 
     fn token(n: i64) -> ProgressToken {
         ProgressToken(NumberOrString::Number(n))
     }
 
     /// A real `Peer<RoleServer>` — rmcp's `Peer::new` is crate-private, so the
-    /// in-process harness is the only way to obtain one.
-    async fn server_peer() -> (
+    /// in-process harness is the only way to obtain one. Also stands up a real
+    /// `OperationMonitor`, since `restore()` now consults it directly (see its
+    /// doc comment) rather than inferring liveness from the router's own map.
+    async fn test_router() -> (
         Peer<RoleServer>,
+        Arc<OperationMonitor>,
+        Arc<ProgressPushRouter>,
         crate::test_utils::in_process::InProcessMcp,
     ) {
         let mcp = crate::test_utils::in_process::create_in_process_mcp_empty()
             .await
             .expect("in-process mcp");
         let peer = mcp._server.peer().clone();
-        (peer, mcp)
+        let monitor = Arc::new(OperationMonitor::new(MonitorConfig::with_timeout(
+            Duration::from_secs(30),
+        )));
+        let router = ProgressPushRouter::new(monitor.clone());
+        (peer, monitor, router, mcp)
+    }
+
+    async fn active_op(monitor: &OperationMonitor, id: &str) {
+        monitor
+            .add_operation(Operation::new(
+                id.to_string(),
+                "tool".to_string(),
+                "desc".to_string(),
+                None,
+            ))
+            .await;
     }
 
     #[tokio::test]
@@ -500,8 +567,8 @@ mod redirect_tests {
         // the time anyone calls `await`, so the awaiting client saw no liveness
         // at all on the request it was actually blocked on — 85 seconds of
         // silence in a captured session, after which the client gave up.
-        let (peer, _mcp) = server_peer().await;
-        let router = ProgressPushRouter::new();
+        let (peer, monitor, router, _mcp) = test_router().await;
+        active_op(&monitor, "op_1").await;
 
         router
             .register(
@@ -528,8 +595,9 @@ mod redirect_tests {
             );
         }
 
-        // When the await returns, the completion push (SPEC R2.2) still has to
-        // land, so the displaced target goes back.
+        // When the await returns (still running — a timeout, not a
+        // completion), the completion push (SPEC R2.2) still has to land
+        // eventually, so the displaced target goes back.
         router.restore("op_1", Some(displaced)).await;
         let targets = router.targets.read().await;
         assert_eq!(targets.get("op_1").unwrap().progress_token, token(1));
@@ -539,8 +607,8 @@ mod redirect_tests {
     async fn restoring_nothing_leaves_the_operation_unregistered() {
         // An `await` on an operation nobody registered (no progress token on the
         // original call) must not leave a dangling target behind.
-        let (peer, _mcp) = server_peer().await;
-        let router = ProgressPushRouter::new();
+        let (peer, monitor, router, _mcp) = test_router().await;
+        active_op(&monitor, "op_1").await;
 
         let displaced = router.redirect("op_1", peer, token(2), true).await;
         assert!(displaced.is_none(), "nothing was registered to displace");
@@ -551,11 +619,11 @@ mod redirect_tests {
 
     #[tokio::test]
     async fn an_operation_that_finished_during_the_await_is_not_resurrected() {
-        // The forwarder unregisters on the terminal event. If that lands while
-        // the await is returning, putting the old target back would leave a
-        // target for a finished operation that nothing will ever remove.
-        let (peer, _mcp) = server_peer().await;
-        let router = ProgressPushRouter::new();
+        // The forwarder claims the target on the terminal event. If that lands
+        // while the await is returning, putting the old target back would leave
+        // a target for a finished operation that nothing will ever remove.
+        let (peer, monitor, router, _mcp) = test_router().await;
+        active_op(&monitor, "op_1").await;
 
         router
             .register(
@@ -568,10 +636,79 @@ mod redirect_tests {
             .await;
         let displaced = router.redirect("op_1", peer, token(2), true).await;
 
-        router.unregister("op_1").await; // terminal event arrives
+        monitor
+            .update_status("op_1", OperationStatus::Completed, None)
+            .await; // the operation actually finishes...
+        router.claim_terminal("op_1").await; // ...and the forwarder claims it
+
         router.restore("op_1", displaced).await;
 
         assert_eq!(router.target_count().await, 0, "must stay unregistered");
+    }
+
+    #[tokio::test]
+    async fn restore_does_not_clobber_a_target_the_forwarder_is_about_to_claim() {
+        // REGRESSION: restoration runs on a task spawned from `Drop` (it can't
+        // await), racing independently against the forwarder's own
+        // `claim_terminal` for the very same terminal event — both are woken by
+        // the operation reaching Completed. If restore() ran first and only
+        // checked "is there still a map entry" (there was: the redirect's),
+        // it would overwrite the live redirect target with the retired one,
+        // and the forwarder would then deliver the completion to the request
+        // that already returned instead of the one still waiting (SPEC
+        // R2.5.3). Consulting `OperationMonitor` — which removes the operation
+        // from its active map strictly before either consumer can observe
+        // completion — closes this regardless of which task wins the race.
+        let (peer, monitor, router, _mcp) = test_router().await;
+        active_op(&monitor, "op_1").await;
+
+        router
+            .register(
+                "op_1",
+                peer.clone(),
+                token(1),
+                McpClientType::ClaudeDesktop,
+                true,
+            )
+            .await;
+        let displaced = router.redirect("op_1", peer, token(2), true).await;
+
+        // The operation completes...
+        monitor
+            .update_status("op_1", OperationStatus::Completed, None)
+            .await;
+        // ...and restore() (from the await's Drop-spawned task) wins the race,
+        // running before the forwarder's `claim_terminal`.
+        router.restore("op_1", displaced).await;
+
+        // The redirect target must be exactly what's left for the forwarder to
+        // claim — restore() must not have touched it.
+        let claimed = router.claim_terminal("op_1").await;
+        assert_eq!(
+            claimed.map(|t| t.progress_token),
+            Some(token(2)),
+            "the completion must still go to the request that was waiting, not the retired one"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_terminal_hands_back_and_removes_whatever_is_registered() {
+        let (peer, monitor, router, _mcp) = test_router().await;
+        active_op(&monitor, "op_1").await;
+
+        router
+            .register("op_1", peer, token(1), McpClientType::ClaudeDesktop, true)
+            .await;
+
+        let claimed = router.claim_terminal("op_1").await;
+        assert_eq!(claimed.map(|t| t.progress_token), Some(token(1)));
+        assert_eq!(router.target_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn claim_terminal_is_none_when_nothing_registered() {
+        let (_peer, _monitor, router, _mcp) = test_router().await;
+        assert!(router.claim_terminal("op_1").await.is_none());
     }
 
     #[tokio::test]
@@ -580,8 +717,7 @@ mod redirect_tests {
         // caller resolves `progress_enabled` (normally
         // `AhmaMcpService::effective_supports_progress`, e.g. `false` for
         // Cursor by default) and passes the answer in.
-        let (peer, _mcp) = server_peer().await;
-        let router = ProgressPushRouter::new();
+        let (peer, _monitor, router, _mcp) = test_router().await;
 
         assert!(
             router
