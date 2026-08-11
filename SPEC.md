@@ -1200,16 +1200,16 @@ The `source_command` executes inside the same sandbox scope as all other tools (
 
 ---
 
-### 5.6 Removed tool types (`decompose`, `worker`, `task_tree`)
+### 5.6 Removed tool types (`decompose`, `worker`)
 
-The `decompose`, `worker`, and `task_tree` MTDF tool types were removed. Their
-implementing crates (`ahma_decompose`, `ahma_worker`, and the `ahma_task_tree`
-orchestrator) were deleted because nothing in the shipped product dispatched
-them — no handler was registered and no example config shipped. The generic
-`Extension` tool-type mechanism (a runtime-registered handler resolved from a
-tool's `tool_type` string; see `register_extension_handler` /
-`get_extension_key`) remains available for out-of-tree handlers. Recover the
-removed crates from git history if these roadmap features are revived.
+The `decompose` and `worker` MTDF tool types were removed. Their
+implementing crates (`ahma_decompose`, `ahma_worker`) were deleted because
+nothing in the shipped product dispatched them — no handler was registered and
+no example config shipped. The generic `Extension` tool-type mechanism (a
+runtime-registered handler resolved from a tool's `tool_type` string; see
+`register_extension_handler` / `get_extension_key`) remains available for
+out-of-tree handlers. Recover the removed crates from git history if these
+roadmap features are revived.
 
 ---
 

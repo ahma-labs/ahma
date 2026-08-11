@@ -3522,7 +3522,7 @@ fn handle_model_refreshed(
 
 #[cfg(feature = "tui")]
 fn handle_decomposed_event(
-    steps: Vec<ahma_task_tree::parser::ParsedStep>,
+    steps: Vec<crate::llm_bridge::ParsedStep>,
     state: &mut crate::state::AppState,
 ) {
     for step in steps {

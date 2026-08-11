@@ -47,7 +47,6 @@ dependencies = [
  "ahma_common",
  "ahma_core",
  "ahma_mcp",
- "ahma_task_tree",
  "ahma_tui",
  "anyhow",
  "clap",
@@ -275,20 +274,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ahma_task_tree"
-version = "0.19.3"
-dependencies = [
- "ahma_common",
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "uuid",
- "wiremock",
-]
-
-[[package]]
 name = "ahma_test_support"
 version = "0.19.3"
 
@@ -301,7 +286,6 @@ dependencies = [
  "ahma_http_bridge",
  "ahma_llm_monitor",
  "ahma_mcp",
- "ahma_task_tree",
  "anyhow",
  "async-trait",
  "axum",

@@ -137,7 +137,7 @@ pub struct AhmaMcpService {
     /// Used by `configure_sandbox_from_roots` to detect when the per-client
     /// `.ahma/` differs from the currently-loaded one and reload is needed.
     pub current_tools_dir: Arc<RwLock<Option<std::path::PathBuf>>>,
-    /// Registered handlers for extension tool types (e.g. task_tree, decompose)
+    /// Registered handlers for extension tool types (e.g. decompose)
     pub extension_handlers: Arc<std::sync::RwLock<HashMap<String, Arc<dyn ExtensionToolHandler>>>>,
     /// Custom file operations backend.
     pub file_ops_provider: Arc<dyn FileOpsProvider>,
@@ -1708,7 +1708,7 @@ impl AhmaMcpService {
             *tool_name = std::borrow::Cow::Owned(name);
         }
         // Preserve a `None` payload: handlers distinguish "no arguments" from an
-        // empty object (e.g. task_tree's "Missing arguments payload"). Only
+        // empty object. Only
         // restore args if they existed originally or the pipeline added some.
         if had_args || !args.is_empty() {
             *tool_args = Some(args);

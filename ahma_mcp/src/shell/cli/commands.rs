@@ -315,34 +315,8 @@ fn handle_prompts_show() -> Result<()> {
         println!("## {} -- {}", name, source);
     };
 
-    let local_tt = local_p.task_tree.as_ref();
-    let global_tt = global_p.task_tree.as_ref();
     let local_dec = local_p.decompose.as_ref();
     let global_dec = global_p.decompose.as_ref();
-
-    show_prompt_info(
-        "task_tree.planning",
-        local_tt.and_then(|t| t.planning.as_ref()).is_some(),
-        global_tt.and_then(|t| t.planning.as_ref()).is_some(),
-    );
-    println!("{}", s.planning_prompt());
-    println!();
-
-    show_prompt_info(
-        "task_tree.summarisation",
-        local_tt.and_then(|t| t.summarisation.as_ref()).is_some(),
-        global_tt.and_then(|t| t.summarisation.as_ref()).is_some(),
-    );
-    println!("{}", s.summarisation_prompt());
-    println!();
-
-    show_prompt_info(
-        "task_tree.recovery",
-        local_tt.and_then(|t| t.recovery.as_ref()).is_some(),
-        global_tt.and_then(|t| t.recovery.as_ref()).is_some(),
-    );
-    println!("{}", s.recovery_prompt());
-    println!();
 
     show_prompt_info(
         "decompose.split",
@@ -1962,7 +1936,7 @@ mod tests {
         std::fs::create_dir_all(&global_dir).unwrap();
         std::fs::write(
             global_dir.join("prompts.toml"),
-            "[task_tree]\nplanning = \"global planning\"\n",
+            "[decompose]\nsplit = \"global split\"\n",
         )
         .unwrap();
 
@@ -1973,7 +1947,7 @@ mod tests {
         std::fs::create_dir_all(&local_dir).unwrap();
         std::fs::write(
             local_dir.join("prompts.toml"),
-            "[task_tree]\nsummarisation = \"local summarise\"\n",
+            "[decompose]\nsplit = \"local split\"\n",
         )
         .unwrap();
 

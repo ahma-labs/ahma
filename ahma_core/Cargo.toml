@@ -6,7 +6,7 @@ name = "ahma_core"
 readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
-description = "Core library for embedding ahma's sandbox and MCP service in other Rust applications (MIT OR Apache-2.0). AGPL-licensed feature crates (ahma_task_tree, ahma_tui) are available separately."
+description = "Core library for embedding ahma's sandbox and MCP service in other Rust applications (MIT OR Apache-2.0). AGPL-licensed feature crates (ahma_tui) are available separately."
 
 [lib]
 name = "ahma_core"

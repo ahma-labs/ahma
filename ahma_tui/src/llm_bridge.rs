@@ -52,7 +52,7 @@ pub enum BridgeEvent {
         models: Vec<String>,
     },
     Decomposed {
-        steps: Vec<ahma_task_tree::parser::ParsedStep>,
+        steps: Vec<ParsedStep>,
     },
     WindowOutput {
         window_id: usize,
@@ -362,14 +362,100 @@ pub fn spawn_tool_call_task(
     });
 }
 
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct ParsedStep {
+    pub task: String,
+    pub r#type: String, // "shell_command", "llm_call", "planning"
+    pub command: Option<String>,
+    pub instructions: Option<String>,
+    pub subgoal: Option<String>,
+    pub sandbox_scopes: Option<Vec<String>>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub allowed_domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ParsedPlan {
+    pub steps: Vec<ParsedStep>,
+}
+
+fn clean_json_response(raw: &str) -> String {
+    let mut s = raw.trim();
+    if let Some(stripped) = s.strip_prefix("```json") {
+        s = stripped;
+    } else if let Some(stripped) = s.strip_prefix("```") {
+        s = stripped;
+    }
+    if let Some(stripped) = s.strip_suffix("```") {
+        s = stripped;
+    }
+    s.trim().to_string()
+}
+
+pub fn parse_steps(response: &str) -> anyhow::Result<Vec<ParsedStep>> {
+    let cleaned = clean_json_response(response);
+    let plan: ParsedPlan = serde_json::from_str(&cleaned).map_err(|e| {
+        anyhow::anyhow!("Failed to parse JSON plan from LLM response: {e} ({cleaned})")
+    })?;
+    Ok(plan.steps)
+}
+
+pub fn build_planning_prompt(
+    goal: &str,
+    task_desc: &str,
+    branch_context: &str,
+    max_subtasks: usize,
+) -> String {
+    format!(
+        r#"You are an expert task planner and knowledge worker. Your job is to decompose the current task into at most {max_subtasks} sequential steps.
+
+System Instructions:
+1. Break the task down into distinct, logical, self-contained sub-tasks.
+2. Each step must be one of the following types:
+   - "shell_command": Running a sandboxed terminal command.
+   - "llm_call": A subtask that requires reasoning or parsing text.
+   - "planning": A subtask that requires further planning/decomposition.
+3. Security Scoping Down Rules:
+   - If a step operates on a subdirectory (e.g. "src"), you may narrow down filesystem access by setting `sandbox_scopes` (e.g. `["src"]`).
+   - You may restrict the allowed command prefixes in `allowed_tools` (e.g. `["cargo build", "cargo clippy"]` or `["git diff"]`).
+   - You may restrict outbound network access by setting `allowed_domains` (e.g. `["crates.io", "api.github.com"]`).
+4. Output format: You must output ONLY a valid JSON object matching the schema below. No other markdown formatting except optional json code blocks.
+
+Expected JSON Schema:
+```json
+{{
+  "steps": [
+    {{
+      "task": "description of this step",
+      "type": "shell_command",
+      "command": "cargo check --workspace",
+      "sandbox_scopes": ["optional_subdir"],
+      "allowed_tools": ["cargo"],
+      "allowed_domains": []
+    }},
+    {{
+      "task": "evaluate errors",
+      "type": "llm_call",
+      "instructions": "Look at the check output and identify compile errors."
+    }}
+  ]
+}}
+```
+
+Overall Goal: {goal}
+
+Current Task: {task_desc}
+
+Context (Previous branch outcomes):
+{branch_context}
+
+Decompose this task and output the JSON steps now:"#
+    )
+}
+
 pub fn spawn_decompose_task(client: LlmClient, goal: String, tx: Sender<BridgeEvent>) {
     tokio::spawn(async move {
-        let prompt = ahma_task_tree::prompt::build_planning_prompt(
-            &goal,
-            &goal,
-            "No prior task context available.",
-            5,
-        );
+        let prompt = build_planning_prompt(&goal, &goal, "No prior task context available.", 5);
         let system_msg = serde_json::json!({
             "role": "system",
             "content": "You are a precise task orchestrator. You decompose goals into subtasks and output strictly valid JSON according to the schema provided."
@@ -384,7 +470,7 @@ pub fn spawn_decompose_task(client: LlmClient, goal: String, tx: Sender<BridgeEv
             .await;
         match completion_res {
             Ok(completion) => {
-                let steps_res = ahma_task_tree::parser::parse_steps(&completion.content);
+                let steps_res = parse_steps(&completion.content);
                 match steps_res {
                     Ok(steps) => {
                         let _ = tx.send(BridgeEvent::Decomposed { steps }).await;

@@ -360,7 +360,6 @@ Ahma uses a dual-tier licensing model to keep the core library reusable while en
 | `ahma_llm_monitor` | MIT OR Apache-2.0 | Log-monitoring and LLM client support |
 | `ahma_test_support` | MIT OR Apache-2.0 | Test helpers for workspace crates |
 | `generate_tool_schema` | MIT OR Apache-2.0 | Schema generation utility |
-| `ahma_task_tree` | AGPL-3.0-or-later | Task planning prompt + LLM-plan step parser |
 | `ahma_tui` | AGPL-3.0-or-later | Terminal dashboard and approval flow |
 | `ahma_bin` | AGPL-3.0-or-later | Shipped `ahma` binary |
 

@@ -28,7 +28,6 @@
 //!
 //! | Crate | License | Primitives |
 //! |-------|---------|-----------|
-//! | `ahma_task_tree` | AGPL-3.0-or-later | `parse_steps`, `ParsedStep`, `build_planning_prompt` |
 //! | `ahma_tui` | AGPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
 //!
 //! Linking any of these AGPL crates into a binary means any modified version

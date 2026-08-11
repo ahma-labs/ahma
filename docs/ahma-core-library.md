@@ -31,7 +31,6 @@ those crates.
 
 | Crate | License | Key types |
 |-------|---------|----------|
-| `ahma_task_tree` | AGPL-3.0-or-later | `parse_steps`, `ParsedStep`, `build_planning_prompt` |
 | `ahma_tui` | AGPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
 
 Embedding any of these AGPL crates means any modified version offered to remote users
