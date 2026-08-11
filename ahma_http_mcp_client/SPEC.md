@@ -5,7 +5,7 @@
 
 ## 1. User Story / Problem Statement
 
-*As the Ahma server, I want to connect to remote external HTTP/SSE MCP servers with authentication so that I can dispatch subtasks to third-party endpoints or cluster peers securely.*
+*As the Ahma server, I want to connect to remote external HTTP/SSE MCP servers with authentication so that I can dispatch subtasks to third-party endpoints securely.*
 
 ## 2. Acceptance Criteria
 

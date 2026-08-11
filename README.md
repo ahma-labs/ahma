@@ -303,12 +303,6 @@ Scans for embedded secrets, missing path validation, and prompt-injection payloa
 
 See [docs/bundle-audit.md](docs/bundle-audit.md).
 
-### Local Cluster Scheduler
-
-Routes sub-tasks to `ahma` worker peers on your LAN or Tailscale mesh. Each peer runs its own local model and kernel sandbox. Static peer configuration is functional; mDNS peer discovery is planned.
-
-See [docs/cluster-scheduler.md](docs/cluster-scheduler.md).
-
 ### ahma_core — embedding Ahma in Rust applications
 
 The `ahma_core` crate exposes the sandbox, MCP service, and local-LLM agent runtime as a library for embedding in other Rust applications.
@@ -355,36 +349,36 @@ Ahma is licensed **per crate**, not under a single repository-wide license.
 The root `Cargo.toml` groups crates in one workspace, but each member crate's
 `Cargo.toml` is the authoritative declaration for that crate.
 
-| Crate | License | Role |
+## Licensing Architecture
+
+Ahma uses a dual-tier licensing model to keep the core library reusable while ensuring the end-user product stays open-source.
+
+| Crate | License | Why it is here |
 |---|---|---|
-| `ahma_mcp` | MIT OR Apache-2.0 | MCP server, sandbox, command execution |
-| `ahma_core` | MIT OR Apache-2.0 | Embedding crate for Ahma runtime primitives |
-| `ahma_common` | MIT OR Apache-2.0 | Shared types and utilities |
-| `ahma_http_bridge` | MIT OR Apache-2.0 | Streamable HTTP / stdio bridge |
-| `ahma_http_mcp_client` | MIT OR Apache-2.0 | HTTP MCP client transport |
+| `ahma_mcp` | MIT OR Apache-2.0 | Core MCP service, sandbox, and command execution |
+| `ahma_common` | MIT OR Apache-2.0 | Shared runtime types and configuration |
 | `ahma_llm_monitor` | MIT OR Apache-2.0 | Log-monitoring and LLM client support |
 | `ahma_test_support` | MIT OR Apache-2.0 | Test helpers for workspace crates |
 | `generate_tool_schema` | MIT OR Apache-2.0 | Schema generation utility |
 | `ahma_vault` | AGPL-3.0-or-later | Task vaults and audit trail |
 | `ahma_task_tree` | AGPL-3.0-or-later | Task planning prompt + LLM-plan step parser |
 | `ahma_tui` | AGPL-3.0-or-later | Terminal dashboard and approval flow |
-| `ahma_cluster` | AGPL-3.0-or-later | Networked worker scheduling |
 | `ahma_bin` | AGPL-3.0-or-later | Shipped `ahma` binary |
 
 `MIT OR Apache-2.0` is used for the embeddable libraries, transports, and
 tooling crates so other Rust applications can adopt Ahma's protocol and secure
-execution primitives directly. The Apache side of the dual license adds an
+sandboxing without copyleft obligations on their surrounding application code.
+`ahma_mcp`, `ahma_core`, `ahma_common`, and `ahma_http_mcp_client` carry this dual
+license so developers can embed Ahma's MCP server and sandbox execution primitives directly. The Apache side of the dual license adds an
 explicit patent grant, and the MIT side preserves the standard Rust dual-license
 option used by many libraries.
 
 `AGPL-3.0-or-later` is used for the end-user and network-exposed product crates
 that define the shipped product surface and security-relevant runtime behavior.
-That includes the shipped `ahma` binary and the crates that define vaults,
-cluster scheduling, and the user-facing TUI.
+That includes the shipped `ahma` binary and the crates that define vaults and the user-facing TUI.
 
 ### AGPL + Build Verification: Supply Chain Defense
 
-AGPL and build verification work together as a two-layer supply chain defense:
 
 - **AGPL requires source disclosure**: anyone distributing a modified `ahma` binary or
   running a modified version over a network must publish the corresponding source.
@@ -431,7 +425,7 @@ architecture, manual verification commands, and trust model details.
 |---|---|
 | Embed `ahma_mcp`, `ahma_core`, or `ahma_http_mcp_client` in your own application | Allowed under **MIT OR Apache-2.0** for those crates |
 | Distribute a modified `ahma` binary | Allowed under **AGPL-3.0-or-later** — source must be published |
-| Offer a modified `ahma` service or modified `ahma_cluster` to remote users | Allowed under AGPL — source-availability obligations apply |
+| Offer a modified `ahma` service to remote users | Allowed under AGPL — source-availability obligations apply |
 | Use Ahma internally for local or private workflows | Allowed subject to the applicable crate terms |
 
 ### Security provenance

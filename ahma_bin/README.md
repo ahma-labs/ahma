@@ -25,7 +25,6 @@ crate; this README is a summary.
 | `ahma_vault` | AGPL-3.0-or-later | Task vaults and audit trail |
 | `ahma_decompose` | AGPL-3.0-or-later | Decomposition runtime |
 | `ahma_worker` | AGPL-3.0-or-later | Ephemeral worker execution |
-| `ahma_cluster` | AGPL-3.0-or-later | Networked worker scheduling |
 | `ahma_renewal` | AGPL-3.0-or-later | Renewal / unattended-session controls |
 | `ahma_tui` | AGPL-3.0-or-later | Terminal UI and approval flow |
 

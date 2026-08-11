@@ -180,18 +180,6 @@ pub struct BridgeConfig {
     /// Maximum concurrent sessions allowed.
     pub max_sessions: usize,
 
-    /// Shared HMAC key used to authenticate forwarded MCP calls from cluster
-    /// peers (P3).
-    ///
-    /// When `Some`, requests that carry a valid `X-Ahma-Cluster-Manifest`
-    /// header are authenticated before the normal session flow proceeds.  The
-    /// manifest provides the task ID, tool name, nonce, and issued_at for
-    /// replay-protection.
-    ///
-    /// When `None`, cluster peer forwarding is disabled (all requests must go
-    /// through the regular session handshake).
-    pub cluster_shared_key: Option<Vec<u8>>,
-
     /// Optional [`PeerFactory`] injection point (P5 — test harness).
     ///
     /// When `Some`, each new bridge session uses this factory instead of
@@ -242,7 +230,6 @@ impl Default for BridgeConfig {
             active_sessions: None,
             idle_timeout_secs: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
-            cluster_shared_key: None,
             peer_factory: None,
             bound_port_tx: None,
         }
@@ -270,10 +257,6 @@ impl std::fmt::Debug for BridgeConfig {
             .field("rate_limit_rps", &self.rate_limit_rps)
             .field("rate_limit_burst", &self.rate_limit_burst)
             .field("max_sessions", &self.max_sessions)
-            .field(
-                "cluster_shared_key",
-                &self.cluster_shared_key.as_ref().map(|_| "<redacted>"),
-            )
             .field(
                 "peer_factory",
                 &self.peer_factory.as_ref().map(|_| "<PeerFactory>"),
@@ -307,7 +290,6 @@ impl Clone for BridgeConfig {
             active_sessions: self.active_sessions.clone(),
             idle_timeout_secs: self.idle_timeout_secs,
             max_sessions: self.max_sessions,
-            cluster_shared_key: self.cluster_shared_key.clone(),
             peer_factory: self.peer_factory.clone(),
             // oneshot::Sender is not Clone; cloning a BridgeConfig discards the
             // port notifier. Tests that need the notification should call
@@ -389,13 +371,6 @@ pub struct BridgeState {
     require_token: ArcSwapOption<String>,
     /// The listener configuration, used for cleanup on restart.
     listener_kind: ListenerKind,
-    /// Optional HMAC key for authenticating cluster peer forwarded calls (P3).
-    ///
-    /// When `Some`, the bridge accepts `X-Ahma-Cluster-Manifest` headers and
-    /// verifies them before routing the request.
-    cluster_shared_key: Option<Vec<u8>>,
-    /// Nonce cache for cluster manifest replay protection (P3).
-    cluster_nonce_cache: Arc<crate::cluster_auth::ManifestNonceCache>,
 }
 
 /// Build a CORS layer appropriate for the bind address.
@@ -414,9 +389,6 @@ fn build_cors_layer(bind_addr: &SocketAddr) -> CorsLayer {
         "mcp-session-id".parse().unwrap(),
         "accept".parse().unwrap(),
         "last-event-id".parse().unwrap(),
-        crate::cluster_auth::CLUSTER_MANIFEST_HEADER
-            .parse()
-            .unwrap(),
     ]);
     let expose = tower_http::cors::ExposeHeaders::list(["mcp-session-id"
         .parse::<axum::http::HeaderName>()
@@ -526,110 +498,6 @@ async fn bearer_auth_middleware(
                 .into_response()
         }
     }
-}
-
-// ─── Cluster-manifest authentication middleware ───────────────────────────────
-
-/// Cap on the request body this middleware will buffer to check the
-/// cluster-manifest body binding. Generous enough for any legitimate
-/// `tools/call` payload (e.g. `write_file` content) while bounding memory use
-/// for a malicious or misbehaving peer.
-const MAX_CLUSTER_BODY_BYTES: usize = 16 * 1024 * 1024;
-
-/// Axum middleware that verifies `X-Ahma-Cluster-Manifest` headers (P3).
-///
-/// **When a cluster shared key is configured** and the request carries
-/// `X-Ahma-Cluster-Manifest`, this middleware decodes and verifies the HMAC
-/// signature and rejects replayed nonces.
-///
-/// For `tools/call` requests specifically, the manifest's signature alone
-/// only proves *some* call to `manifest.tool_name` was authorized — not which
-/// arguments. This middleware additionally buffers the body, and when its
-/// JSON-RPC `method` is `"tools/call"`, verifies `manifest.body_hash` against
-/// the exact bytes received (`ClusterManifest::verify_body`) before letting
-/// the request through, then reconstructs the request with the same bytes so
-/// the downstream handler can still read it. Other methods (`initialize`,
-/// `notifications/initialized`, session close) are not body-bound — they
-/// carry no attacker-influenced payload.
-///
-/// Requests **without** the header are passed through unchanged (normal MCP
-/// clients and bearer-token authenticated requests both lack it). Requests
-/// **with** the header but **without** a configured shared key are also rejected
-/// to prevent unsigned cluster calls from slipping through on unconfigured
-/// bridges.
-async fn cluster_auth_middleware(
-    State(state): State<Arc<BridgeState>>,
-    request: axum::extract::Request,
-    next: Next,
-) -> Response {
-    use crate::cluster_auth::{CLUSTER_MANIFEST_HEADER, ClusterManifest};
-
-    let header_value = request
-        .headers()
-        .get(CLUSTER_MANIFEST_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-
-    let Some(header_str) = header_value else {
-        // No cluster manifest — pass through.
-        return next.run(request).await;
-    };
-
-    // A manifest header is present.  Reject immediately if no key is configured
-    // on this bridge — an unsigned forwarded call is always a misconfiguration.
-    let Some(ref key) = state.cluster_shared_key else {
-        debug!("Cluster manifest header present but no shared key configured — rejecting");
-        return (StatusCode::UNAUTHORIZED, "cluster auth not configured").into_response();
-    };
-
-    let manifest =
-        match ClusterManifest::decode_and_verify(&header_str, key, &state.cluster_nonce_cache) {
-            Ok(m) => m,
-            Err(e) => {
-                debug!(error = %e, "Cluster manifest verification failed");
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    format!("cluster auth failed: {e}"),
-                )
-                    .into_response();
-            }
-        };
-
-    // Buffer the body so a `tools/call` request can be bound to the manifest,
-    // then reconstruct the request with the same bytes for the downstream
-    // handler.
-    let (parts, body) = request.into_parts();
-    let bytes = match axum::body::to_bytes(body, MAX_CLUSTER_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(e) => {
-            debug!(error = %e, "Failed to buffer request body for cluster manifest check");
-            return (StatusCode::BAD_REQUEST, "failed to read request body").into_response();
-        }
-    };
-
-    let is_tools_call = serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|v| v.get("method").and_then(Value::as_str).map(str::to_string))
-        .is_some_and(|m| m == "tools/call");
-
-    if is_tools_call && let Err(e) = manifest.verify_body(&bytes) {
-        debug!(error = %e, tool = %manifest.tool_name, "Cluster manifest body binding failed");
-        return (
-            StatusCode::UNAUTHORIZED,
-            format!("cluster auth failed: {e}"),
-        )
-            .into_response();
-    }
-
-    debug!(
-        tool = %manifest.tool_name,
-        issued_at = manifest.issued_at,
-        body_bound = is_tools_call,
-        "Cluster manifest verified"
-    );
-
-    let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
-    next.run(request).await
 }
 
 /// Starts the HTTP bridge server and blocks until shutdown.
@@ -769,8 +637,6 @@ fn build_bridge_state(config: &BridgeConfig) -> Arc<BridgeState> {
         session_manager,
         require_token: ArcSwapOption::new(config.require_token.clone().map(Arc::new)),
         listener_kind: config.listener_kind.clone(),
-        cluster_shared_key: config.cluster_shared_key.clone(),
-        cluster_nonce_cache: Arc::new(crate::cluster_auth::ManifestNonceCache::new()),
     })
 }
 
@@ -846,10 +712,6 @@ fn build_mcp_router(
                 .delete(handle_session_delete),
         )
         .fallback(handle_not_found)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            cluster_auth_middleware,
-        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             bearer_auth_middleware,
@@ -1843,7 +1705,6 @@ mod tests {
             active_sessions: None,
             idle_timeout_secs: None,
             max_sessions: 50,
-            cluster_shared_key: None,
             peer_factory: None,
             bound_port_tx: None,
         };
@@ -1888,8 +1749,6 @@ mod tests {
             session_manager,
             require_token: ArcSwapOption::new(None),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
-            cluster_shared_key: None,
-            cluster_nonce_cache: Arc::new(crate::cluster_auth::ManifestNonceCache::new()),
         })
     }
 
@@ -2628,18 +2487,12 @@ for line in sys.stdin:
             })),
             require_token: ArcSwapOption::new(token.map(|s| Arc::new(s.to_owned()))),
             listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
-            cluster_shared_key: None,
-            cluster_nonce_cache: Arc::new(crate::cluster_auth::ManifestNonceCache::new()),
         });
         let loopback_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
         Router::new()
             .route(HEALTH_PATH, get(health_check))
             .route(MCP_PATH, post(handle_mcp_request))
             .fallback(handle_not_found)
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                cluster_auth_middleware,
-            ))
             .layer(middleware::from_fn_with_state(
                 state.clone(),
                 bearer_auth_middleware,
@@ -2807,198 +2660,6 @@ for line in sys.stdin:
             response.status(),
             StatusCode::UNAUTHORIZED,
             "Uppercase 'BEARER' scheme must be accepted (RFC 7235 case-insensitive)"
-        );
-    }
-
-    // ── Cluster-manifest middleware tests (body binding) ─────────────────────
-
-    /// Build a router with the cluster-auth middleware wired in (mirrors
-    /// `create_app_with_token`, but for `cluster_shared_key`).
-    fn create_app_with_cluster_key(key: Option<&[u8]>) -> Router {
-        let temp_dir = TempDir::new().expect("cluster-auth test: create temp dir");
-        let state = Arc::new(BridgeState {
-            session_manager: Arc::new(SessionManager::new(SessionManagerConfig {
-                server_command: "echo".to_string(),
-                default_scope: Some(temp_dir.path().to_path_buf()),
-                max_sessions: 50,
-                ..Default::default()
-            })),
-            require_token: ArcSwapOption::new(None),
-            listener_kind: ListenerKind::Tcp("127.0.0.1:0".parse().unwrap()),
-            cluster_shared_key: key.map(<[u8]>::to_vec),
-            cluster_nonce_cache: Arc::new(crate::cluster_auth::ManifestNonceCache::new()),
-        });
-        let loopback_addr: SocketAddr = "127.0.0.1:3000".parse().unwrap();
-        Router::new()
-            .route(HEALTH_PATH, get(health_check))
-            .route(MCP_PATH, post(handle_mcp_request))
-            .fallback(handle_not_found)
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                cluster_auth_middleware,
-            ))
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                bearer_auth_middleware,
-            ))
-            .layer(build_cors_layer(&loopback_addr))
-            .with_state(state)
-    }
-
-    fn tools_call_body(tool: &str, args: serde_json::Value) -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool, "arguments": args}
-        }))
-        .unwrap()
-    }
-
-    async fn post_with_manifest_header(
-        app: &Router,
-        body: Vec<u8>,
-        manifest_header: Option<&str>,
-    ) -> StatusCode {
-        let mut builder = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("content-type", "application/json");
-        if let Some(h) = manifest_header {
-            builder = builder.header(crate::cluster_auth::CLUSTER_MANIFEST_HEADER, h);
-        }
-        let response = app
-            .clone()
-            .oneshot(builder.body(Body::from(body)).unwrap())
-            .await
-            .unwrap();
-        response.status()
-    }
-
-    #[tokio::test]
-    async fn cluster_manifest_with_matching_body_hash_is_not_rejected() {
-        use crate::cluster_auth::ClusterManifest;
-
-        let key = b"cluster-secret";
-        let app = create_app_with_cluster_key(Some(key));
-        let body = tools_call_body("run_terminal_command", serde_json::json!({"command": "ls"}));
-        let manifest = ClusterManifest {
-            task_id: "t1".into(),
-            tool_name: "run_terminal_command".into(),
-            scope: None,
-            nonce: String::new(),
-            issued_at: 0,
-            body_hash: Some(ClusterManifest::hash_body(&body)),
-            signature: String::new(),
-        }
-        .sign(key);
-        let header = manifest.to_header_value().unwrap();
-
-        let status = post_with_manifest_header(&app, body, Some(&header)).await;
-        // The middleware must let it through; any downstream failure (no real
-        // subprocess behind `echo`) is a different, later status.
-        assert_ne!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "a manifest whose body_hash matches the request body must not be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn cluster_manifest_with_tampered_body_is_rejected() {
-        use crate::cluster_auth::ClusterManifest;
-
-        let key = b"cluster-secret";
-        let app = create_app_with_cluster_key(Some(key));
-        let signed_body =
-            tools_call_body("run_terminal_command", serde_json::json!({"command": "ls"}));
-        let manifest = ClusterManifest {
-            task_id: "t1".into(),
-            tool_name: "run_terminal_command".into(),
-            scope: None,
-            nonce: String::new(),
-            issued_at: 0,
-            body_hash: Some(ClusterManifest::hash_body(&signed_body)),
-            signature: String::new(),
-        }
-        .sign(key);
-        let header = manifest.to_header_value().unwrap();
-
-        // The manifest header is valid, but the body sent on the wire is not
-        // what was signed — a tamperer (or a mismatched dispatcher) swapped
-        // the arguments after signing.
-        let tampered_body = tools_call_body(
-            "run_terminal_command",
-            serde_json::json!({"command": "rm -rf /"}),
-        );
-
-        let status = post_with_manifest_header(&app, tampered_body, Some(&header)).await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "a tools/call body that doesn't match the manifest's body_hash must be rejected"
-        );
-    }
-
-    #[tokio::test]
-    async fn cluster_manifest_without_body_hash_on_tools_call_is_rejected() {
-        use crate::cluster_auth::ClusterManifest;
-
-        let key = b"cluster-secret";
-        let app = create_app_with_cluster_key(Some(key));
-        let body = tools_call_body("run_terminal_command", serde_json::json!({"command": "ls"}));
-        // Signed with no body_hash at all — a manifest scoped to `tool_name`
-        // only, the pre-body-binding shape.
-        let manifest = ClusterManifest {
-            task_id: "t1".into(),
-            tool_name: "run_terminal_command".into(),
-            scope: None,
-            nonce: String::new(),
-            issued_at: 0,
-            body_hash: None,
-            signature: String::new(),
-        }
-        .sign(key);
-        let header = manifest.to_header_value().unwrap();
-
-        let status = post_with_manifest_header(&app, body, Some(&header)).await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "a tools/call manifest with no body_hash must be rejected, not silently trusted"
-        );
-    }
-
-    #[tokio::test]
-    async fn cluster_manifest_without_body_hash_on_initialize_is_not_rejected() {
-        use crate::cluster_auth::ClusterManifest;
-
-        let key = b"cluster-secret";
-        let app = create_app_with_cluster_key(Some(key));
-        let body = serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {"protocolVersion": "2025-03-26", "capabilities": {}}
-        }))
-        .unwrap();
-        let manifest = ClusterManifest {
-            task_id: "t1".into(),
-            tool_name: "run_terminal_command".into(),
-            scope: None,
-            nonce: String::new(),
-            issued_at: 0,
-            body_hash: None,
-            signature: String::new(),
-        }
-        .sign(key);
-        let header = manifest.to_header_value().unwrap();
-
-        let status = post_with_manifest_header(&app, body, Some(&header)).await;
-        assert_ne!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "initialize carries no attacker-influenced payload and must not require body_hash"
         );
     }
 

@@ -69,8 +69,6 @@
 
 /// HTTP bridge server implementation.
 pub mod bridge;
-/// Cluster peer authentication for forwarded MCP calls (P3).
-pub mod cluster_auth;
 /// Error types for bridge operations.
 pub mod error;
 /// Peer connection abstraction (transport port for bridge sessions).

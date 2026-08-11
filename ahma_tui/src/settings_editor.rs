@@ -321,14 +321,6 @@ impl SettingsEditor {
                 security_tier: false,
             },
             SettingItem {
-                key: "features.cluster",
-                label: "Cluster",
-                description: "Distributed scheduling (requires peer setup)",
-                value: SettingValue::Bool(f.cluster),
-                default_value: SettingValue::Bool(d.cluster),
-                security_tier: false,
-            },
-            SettingItem {
                 key: "features.egress",
                 label: "Egress",
                 description: "Network egress proxy for sandboxed tasks",
@@ -606,10 +598,9 @@ impl SettingsEditor {
         match index {
             0 => f.simplify = *v,
             1 => f.vault = *v,
-            2 => f.cluster = *v,
-            3 => f.egress = *v,
-            4 => f.artifact = *v,
-            5 => f.decompose = *v,
+            2 => f.egress = *v,
+            3 => f.artifact = *v,
+            4 => f.decompose = *v,
             _ => {}
         }
     }
@@ -827,7 +818,7 @@ mod tests {
         let editor = SettingsEditor::default();
         assert_eq!(
             editor.items_for_category(SettingsCategory::Features).len(),
-            6
+            5
         );
         assert!(editor.items_for_category(SettingsCategory::Tools).len() >= 5);
         assert!(editor.items_for_category(SettingsCategory::Sandbox).len() >= 3);
@@ -1062,7 +1053,7 @@ mod tests {
     #[test]
     fn item_navigation_clamps_at_bounds() {
         let mut editor = SettingsEditor::default();
-        // Features has 6 items.
+        // Features has 5 items.
         assert_eq!(editor.selected_item, 0);
         editor.item_up(); // already at top, stays
         assert_eq!(editor.selected_item, 0);
@@ -1070,15 +1061,14 @@ mod tests {
         assert_eq!(editor.selected_item, 1);
         editor.item_down();
         assert_eq!(editor.selected_item, 2);
-        // Walk to the last item (index 5) and try to overshoot.
+        // Walk to the last item (index 4) and try to overshoot.
         editor.item_down();
         editor.item_down();
-        editor.item_down();
-        assert_eq!(editor.selected_item, 5);
-        editor.item_down(); // clamp at last
-        assert_eq!(editor.selected_item, 5);
-        editor.item_up();
         assert_eq!(editor.selected_item, 4);
+        editor.item_down(); // clamp at last
+        assert_eq!(editor.selected_item, 4);
+        editor.item_up();
+        assert_eq!(editor.selected_item, 3);
     }
 
     #[test]
@@ -1107,7 +1097,7 @@ mod tests {
         let editor = SettingsEditor::default();
         assert_eq!(
             editor.items_for_category(SettingsCategory::Features).len(),
-            6
+            5
         );
         assert_eq!(editor.items_for_category(SettingsCategory::Tools).len(), 5);
         assert_eq!(
@@ -1183,13 +1173,11 @@ mod tests {
         let mut e = SettingsEditor::default();
         e.apply_feature(0, &SettingValue::Bool(false));
         e.apply_feature(1, &SettingValue::Bool(true));
-        e.apply_feature(2, &SettingValue::Bool(true));
+        e.apply_feature(2, &SettingValue::Bool(false));
         e.apply_feature(3, &SettingValue::Bool(false));
         e.apply_feature(4, &SettingValue::Bool(false));
-        e.apply_feature(5, &SettingValue::Bool(false));
         assert!(!e.settings().features.simplify);
         assert!(e.settings().features.vault);
-        assert!(e.settings().features.cluster);
         assert!(!e.settings().features.egress);
         assert!(!e.settings().features.artifact);
         assert!(!e.settings().features.decompose);

@@ -18,7 +18,6 @@
 //! | [`local_tls`] | Self-signed TLS certificate generation via `rcgen` |
 //! | [`observability`] | OpenTelemetry tracing initialisation helpers |
 //! | [`peer_factory`] | Transport-agnostic MCP peer factory abstraction (P6) |
-//! | [`peer_transport`] | Peer-transport enum wrapping stdio and HTTP bridge transports |
 //! | [`process_guard`] | RAII guard that kills a child process on drop |
 //! | [`prompts`] | Shared MCP prompt definitions |
 //! | [`sandbox_state`] | Shared sandbox-lock state communicated across process boundaries |
@@ -57,7 +56,6 @@ pub mod observability;
 pub mod op_identity;
 /// Transport-agnostic MCP peer factory abstraction (P6).
 pub mod peer_factory;
-pub mod peer_transport;
 pub mod permissions;
 pub mod process_guard;
 pub mod prompts;

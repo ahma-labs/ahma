@@ -46,7 +46,6 @@ fn setting_rows(
     }
     row!("features.simplify", features.simplify);
     row!("features.vault", features.vault);
-    row!("features.cluster", features.cluster);
     row!("features.egress", features.egress);
     row!("features.artifact", features.artifact);
     row!("features.decompose", features.decompose);

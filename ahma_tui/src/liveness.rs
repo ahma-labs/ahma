@@ -54,7 +54,7 @@ fn mix(seed: u64, a: u64, b: u64) -> u64 {
 /// `frame`. Movement is encoded in how `frame` combines with the coordinate:
 /// the value that was at a cell moves to the neighbouring cell one frame later.
 fn dot(seed: u64, pattern: PanelPattern, frame: u64, col: u64, row: u64) -> bool {
-    // ~45% dot density reads as a busy-but-sparse cluster.
+    // ~45% dot density reads as a busy-but-sparse grid.
     const DENSITY: u64 = 45;
     let h = match pattern {
         PanelPattern::ScrollLeft => mix(seed, frame.wrapping_add(col), row),

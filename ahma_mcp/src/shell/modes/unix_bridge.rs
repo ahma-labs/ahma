@@ -158,7 +158,6 @@ pub async fn run_unix_bridge_mode(config: AppConfig) -> Result<()> {
         active_sessions: None,
         idle_timeout_secs: config.idle_timeout_secs,
         max_sessions: config.max_sessions,
-        cluster_shared_key: None,
         peer_factory: None,
         bound_port_tx: None,
     };

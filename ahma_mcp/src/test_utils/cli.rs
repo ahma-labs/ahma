@@ -162,10 +162,9 @@ pub fn get_binary_path(_package: &str, binary: &str) -> PathBuf {
 ///
 /// Critically, we do **not** rebuild a binary that is already up to date. CI
 /// builds the binary with specific flags (e.g. `--no-default-features`, which
-/// turns off the `cluster`/`vault`/`simplify` default features) before running
+/// turns off the `vault`/`simplify` default features) before running
 /// the suite; an unconditional `cargo build` would silently rebuild it with
-/// *default* features and flip feature-gated behavior (the cluster CLI test
-/// stops skipping and runs against an unintended build). Because CI's binary is
+/// *default* features and flip feature-gated behavior. Because CI's binary is
 /// always built last, the mtime gate treats it as fresh and leaves it untouched.
 ///
 /// When a rebuild *is* needed we build by **bin name only** (`cargo build --bin

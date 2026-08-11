@@ -9,7 +9,6 @@
 //! - **MCP push** — forwards JSON-RPC notifications to the connected client
 //! - **Vault audit** — writes immutable audit records
 //! - **Metrics / observability** — increments counters, records histograms
-//! - **Remote forwarding** — ships events to cluster peers (P3)
 //!
 //! ## Ordering invariant (SPEC R15.3)
 //!

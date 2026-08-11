@@ -34,7 +34,6 @@ those crates.
 | `ahma_vault` | AGPL-3.0-or-later | `TaskVault`, `AuditWriter`, `TrashManager` |
 | `ahma_task_tree` | AGPL-3.0-or-later | `parse_steps`, `ParsedStep`, `build_planning_prompt` |
 | `ahma_tui` | AGPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
-| `ahma_cluster` | **AGPL-3.0-or-later** | `ClusterScheduler`, `WorkerRegistry`, `TaskManifest`, `PeerInfo` |
 
 Embedding any of these AGPL crates means any modified version offered to remote users
 over a network must publish its modified source code (AGPL-3.0 §13).

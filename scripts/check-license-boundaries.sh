@@ -24,7 +24,6 @@ AGPL_CRATES=(
   ahma_vault
   ahma_task_tree
   ahma_tui
-  ahma_cluster
 )
 
 agpl_pattern="^($(IFS='|'; echo "${AGPL_CRATES[*]}")) v"

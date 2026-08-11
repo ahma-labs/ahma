@@ -204,14 +204,14 @@ These are system/process-level conventions that belong in the environment, not a
 
 ## Relationship with `~/.ahma/config.toml`
 
-`~/.ahma/config.toml` is the **provider registry** file — it stores named LLM providers and cluster peers.  
+`~/.ahma/config.toml` is the **provider registry** file — it stores named LLM providers.  
 `~/.ahma/settings.toml` is the **behaviour configuration** file — it stores runtime options.
 
 Both files coexist independently.
 
 | File | Purpose | Managed with |
 |------|---------|-------------|
-| `~/.ahma/config.toml` | LLM providers, cluster peers | `ahma llm add/remove`, `ahma cluster add-peer` |
+| `~/.ahma/config.toml` | LLM providers | `ahma llm add/remove` |
 | `~/.ahma/settings.toml` | Runtime behaviour defaults | `ahma settings init` + text editor |
 
 ---

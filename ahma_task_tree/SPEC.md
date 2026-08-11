@@ -35,7 +35,6 @@ LLM's JSON response back into typed steps.
   registered. See root [SPEC.md §5.6](../SPEC.md) ("Removed tool types") and
   recover the orchestrator from git history if that roadmap feature is
   revived.
-- Scheduling tasks to remote machines (handled by `ahma_cluster`).
 
 ## 4. License
 

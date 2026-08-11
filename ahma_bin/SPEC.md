@@ -17,7 +17,6 @@
   - `tui` — launch terminal user interface
   - `tls init/rotate/status` — manage local self-signed TLS certificates
   - `llm list/add/remove/test` — manage LLM providers in configuration
-  - `cluster list/add-peer/remove/ping/status/discover/announce/cert` — cluster management
 - **PowerShell Check (Windows)**: Emits a startup warning and exits if PowerShell (pwsh) is not present on Windows systems.
 - **Markdown Help**: Emits the full CLI command reference as Markdown when invoked with `--markdown-help`.
 - **Settings Loader**: Reads configurations from `~/.ahma/settings.toml` unless overridden by `--no-settings` or `--settings-path`.

@@ -12,7 +12,7 @@
 | Unified Operation Event Stream | tests-pass | Single `OperationEvent` stream (`ahma_common::event_dispatcher`); `OperationMonitor` is the sole lifecycle emitter; subscribers: MCP progress push, daemon hub, vault audit, TUI |
 | Output Spill Files | tests-pass | Complete per-operation output at `<log dir>/operations/<id>.log`; advertised as `output_file` in results; retention-cleaned |
 | Small-Model Context Harness | tests-pass | `ahma tui` budgets tool results + trims conversation for limited-context local models; `--context-length`, `--small-model-harness`/`--no-small-model-harness` |
-| Feature-Gated Incubating Crates | tests-pass | vault/cluster/simplify/decompose/worker/renewal behind non-default cargo features; graceful `feature_not_compiled` CLI errors |
+| Feature-Gated Incubating Crates | tests-pass | vault/simplify/decompose/worker/renewal behind non-default cargo features; graceful `feature_not_compiled` CLI errors |
 | Latency Regression Guards | tests-pass | Ignored benchmarks guard end-to-end dispatch latency and per-line streaming cost (`latency_guard_test`) |
 | Linux Sandbox (Landlock) | tests-pass | Kernel-level FS sandboxing on Linux 5.13+ |
 | macOS Sandbox (Seatbelt) | tests-pass | Kernel-level FS sandboxing via `sandbox-exec` — **write** confinement only. Reads are unconfined (APFS firmlink limitation, R6.2.2) and controlled by a credential denylist instead (R6.2.3); disclosed at runtime per R-PERM.5.1 |
@@ -45,13 +45,11 @@
 | Live Log Monitoring (LLM) | tests-pass | `tool_type: livelog` routes to LLM analysis pipeline; `ahma_llm_monitor` crate; OpenAI-compatible providers |
 | TUI Dashboard | tests-pass | Terminal user interface for operation monitoring and approvals |
 | Live Task Tree (R24) | tests-pass | Project-scoped caller → subtask tree, current at TUI startup via hub replay with true timestamps; accordion drill-in to live/historic output; client identity via reconnect-to-relabel; operation identity (title/cwd/command/origin/exit_code) computed server-side and carried on the wire (R24.7) |
-| Local Cluster Scheduler | tests-pass | mDNS discovery and signed task dispatch to remote worker peers |
 | Configuration Standard (R-CFG) | in-progress | Flag/settings-file configuration with trust tiers; `AHMA_*` env vars retired as a config source (§3.5). Done: Security-tier `AHMA_*` retirement (warn-and-ignore, R-CFG1.2/R-CFG7.1), settings-file/`--no-settings` resolution, and settings provenance (`ahma settings show --origin`, R-CFG5.1). Pending: project-tier settings file (R-CFG3) |
 | Unified Permissions (R-PERM) | tests-pass | One ledger under `~/.ahma` (fs scopes, web domains, tool approvals; legacy `approvals.json` migrated); question ladder (harness elicitation → TUI modal → fail-closed with paste-able remediation); sandbox profiles replace the hard-coded toolchain carve-outs; hooks enabled per client. User guide: `docs/permissions.md` |
 | Trust-Handoff Hardening (R-HANDOFF) | in-progress | Two-tier posture for writes a *trusted, unsandboxed* component executes later (git hook dirs, editor/harness auto-run config, daemon sockets): deny-write where nothing legitimate writes, allow-plus-loud-disclosure where it does. Kernel-enforced on macOS (last-match-wins SBPL denies); **application-layer only on Linux** (Landlock V1 is additive-allow, R6.1.7) and therefore bypassable from `run_terminal_command`; none on Windows yet. Child env strips code-injection and client-redirect vars, keeps `SSH_AUTH_SOCK`. Cross-project package-cache channel documented as residual risk (R-HANDOFF.8) |
 | Execution Audit Log (R-HANDOFF.10) | tests-pass | Append-only `<log dir>/audit.jsonl` on every execution path (sync, async, PTY, session), in the vault's wire format; `tool_call` before spawn, one `tool_complete` on every terminal path, sandbox denials included; write failures warn and never fail the operation |
 | Profile Network Hosts (R-PERM.5.3) | tests-pass | Sandbox profiles declare the hosts their toolchain needs, each with a reason; union with `[network] allow`, refusable independently of path grants (`[network] profile_hosts` / `deny_profile_hosts`); label-anchored ASCII-only matching. Restriction itself stays opt-in |
-| `ahma cluster remove` | tests-pass | Subcommand to remove worker peers from peers configuration |
 | `ahma setup` / `ahma uninstall` | tests-pass | Interactive wizard installs / removes MCP entries, hooks, skills, binary; symmetric teardown leaves other user config intact |
 | Auto-spawned Bridge Lifecycle | tests-pass | Bridges started by `ahma serve stdio` or `ahma tui` self-terminate after `--idle-timeout` seconds with no connected client; explicitly-started `ahma serve http/unix` remain persistent by default |
 | Binary Code Signing (R-SIGN) | in-progress | macOS ad-hoc binary gets `SIGKILL (Code Signature Invalid)` under heavy-build memory pressure / in-place rebuild → opaque `Connection closed`. Done: atomic out-of-place install + local re-sign in `ahma update` (R-SIGN.2, R-SIGN.1-local); signal-death classification surfaced in the client's JSON-RPC error + panic log-flush (R-SIGN.5). Pending: Developer-ID release signing (R-SIGN.1, blocked on Apple Developer credentials), Windows WDAC/SAC verify (R-SIGN.3) |
@@ -64,8 +62,8 @@ These three AGPL-3.0-or-later crates were removed from the workspace because not
 shipped product invoked them:
 
 - **`ahma_renewal`** — renewal contract for long-running tasks. Had zero dependents and no SPEC.
-- **`ahma_worker`** — ephemeral worker code synthesis. Declared only as an (unused) dependency of `ahma_cluster`.
-- **`ahma_decompose`** — local-LLM decompose orchestration. Declared only as an (unused) dependency of `ahma_cluster`; self-flagged for deprecation in its own `lib.rs`.
+- **`ahma_worker`** — ephemeral worker code synthesis. Had zero dependents.
+- **`ahma_decompose`** — local-LLM decompose orchestration. Had zero dependents; self-flagged for deprecation in its own `lib.rs`.
 
 The related `tool_type: decompose`/`worker` handler stubs inside `ahma_mcp` and the
 `.ahma/decompose.json` example are tracked separately. The sources remain in git history if
@@ -1450,7 +1448,6 @@ Every major feature in ahma **must** have a corresponding page in `docs/` and an
 | Artifacts | [docs/artifacts.md](docs/artifacts.md) | — |
 | Worker synthesis | [docs/worker-synthesis.md](docs/worker-synthesis.md) | §5.7 |
 | Bundle audit | [docs/bundle-audit.md](docs/bundle-audit.md) | — |
-| Cluster scheduler | [docs/cluster-scheduler.md](docs/cluster-scheduler.md) | — |
 | Renewal contract | [docs/renewal-contract.md](docs/renewal-contract.md) | — |
 | ahma_core library | [docs/ahma-core-library.md](docs/ahma-core-library.md) | — |
 
@@ -2426,8 +2423,6 @@ Ahma does not only *ship* skills — it can *run* any skill that follows the
 
 | Area | Item | Notes |
 |------|------|-------|
-| Cluster | **mDNS peer discovery** (`mdns-sd` crate, `_ahma-worker._tcp.local`) | ✓ Completed |
-| Cluster | **Named provider refs in tool files** (`llm_provider_ref: "ollama-local"`) | Avoids duplicating connection details across tool definitions |
 | UX | **`ratatui` TUI** — real-time task dashboard | ✓ Completed (full ratatui TUI implemented) |
 | Economics | **Cost metering** — track token counts + estimated cost per tool call | Aggregate by provider; expose via `ahma tool info --cost-summary` |
 | Security | **Signed bundle index** (`bundle-index.json` with HMAC-SHA256 over manifest) | Prevent silent tampering with downloaded bundles |
@@ -2437,8 +2432,6 @@ Ahma does not only *ship* skills — it can *run* any skill that follows the
 
 | Area | Item | Notes |
 |------|------|-------|
-| Cluster | **Weighted scheduling** — factor GPU model, RAM, historical latency into `load_score_for` | Better affinity for large models |
-| Cluster | **`cluster remove` subcommand** — remove a peer from `peers.json` by ID | ✓ Completed |
 | Security | **OS keyring integration** (`keyring` crate) — store API keys in system credential store instead of env vars | macOS Keychain, GNOME Secrets, Windows Credential Manager |
 | Config | **Encrypted secrets at rest** in `~/.ahma/config.toml` (age encryption) | Fallback when OS keyring is unavailable |
 

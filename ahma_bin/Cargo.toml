@@ -6,12 +6,11 @@ name = "ahma_bin"
 readme.workspace = true
 rust-version.workspace = true
 version.workspace = true
-description = "The ahma binary: wires the MIT ahma_mcp library with the AGPL-licensed feature crates (vault, decompose, task_tree, worker, cluster, renewal, tui)."
+description = "The ahma binary: wires the MIT ahma_mcp library with the AGPL-licensed feature crates (vault, decompose, task_tree, worker, renewal, tui)."
 repository = "https://github.com/paulirotta/ahma"
 homepage = "https://github.com/paulirotta/ahma"
 
-# All first-party copyleft crates (ahma_vault, ahma_task_tree, ahma_tui,
-# ahma_cluster) are AGPL-3.0-or-later. The compiled ahma binary is therefore
+# All first-party copyleft crates (ahma_vault, ahma_task_tree, ahma_tui) are AGPL-3.0-or-later. The compiled ahma binary is therefore
 # AGPL-3.0-or-later. See README for details.
 
 # ── cargo-binstall: fetch the prebuilt, attested release binary ──────────────
@@ -59,22 +58,19 @@ path = "src/main.rs"
 [features]
 # Batteries-included default: all features compiled in.
 # Users building a lean binary can use --no-default-features.
-default = ["cluster", "vault", "simplify"]
-# Local cluster scheduler (`ahma cluster ...`): mDNS discovery, signed dispatch.
-cluster = ["dep:ahma_cluster"]
+default = ["vault", "simplify"]
 # Task vault storage (`ahma vault ...`).
 vault = ["dep:ahma_vault"]
 # Code complexity analysis (`ahma simplify ...`).
 simplify = ["ahma_mcp/simplify"]
 # Everything, including incubating features (now same as default).
-full = ["cluster", "vault", "simplify"]
+full = ["vault", "simplify"]
 
 [dependencies]
 ahma_mcp = { path = "../ahma_mcp" }
 ahma_core = { path = "../ahma_core" }
 ahma_vault = { path = "../ahma_vault", optional = true }
 ahma_task_tree = { path = "../ahma_task_tree" }
-ahma_cluster = { path = "../ahma_cluster", optional = true }
 ahma_tui = { path = "../ahma_tui" }
 ahma_common = { path = "../ahma_common" }
 anyhow.workspace = true

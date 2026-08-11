@@ -101,16 +101,6 @@ curl http://localhost:11434/v1/chat/completions \
   -d '{"model":"llama3.2","messages":[{"role":"user","content":"ping"}],"max_tokens":5}'
 ```
 
-## Using multiple providers in a cluster
-
-In a local cluster, each peer runs its own Ollama instance. Each peer's
-`llm_base_url` is baked into the `TaskManifest` that the coordinator dispatches —
-the coordinator does not need to reach peers' Ollama APIs directly, only their
-`ahma serve http` bridge.
-
-See [docs/cluster-scheduler.md](cluster-scheduler.md) for cluster setup.
-
 ## See also
 
-- [docs/cluster-scheduler.md](cluster-scheduler.md) — distributing tasks across peers
 - [docs/task-vault.md](task-vault.md) — per-task egress allowlist for network calls

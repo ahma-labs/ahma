@@ -5,7 +5,7 @@ resolver = "3"
 # default-members equals members (minus dev-only xtask): a plain `cargo build`
 # builds the whole product. The permissive crates (MIT OR Apache-2.0) form the
 # embeddable engine; the AGPL-3.0-or-later crates are the end-user product
-# surface. ahma_bin gates vault/cluster/simplify behind cargo features.
+# surface. ahma_bin gates vault/simplify behind cargo features.
 default-members = [
     # Permissive crates (MIT OR Apache-2.0)
     "ahma_mcp",
@@ -22,8 +22,6 @@ default-members = [
     "ahma_task_tree",
     "ahma_tui",
     "ahma_bin",
-    # AGPL-3.0-or-later (network-facing cluster scheduler)
-    "ahma_cluster",
 ]
 
 members = [
@@ -42,8 +40,6 @@ members = [
     "ahma_task_tree",
     "ahma_tui",
     "ahma_bin",
-    # AGPL-3.0-or-later (network-facing cluster scheduler)
-    "ahma_cluster",
     # dev-only workspace automation (not published, not in default-members)
     "xtask",
 ]

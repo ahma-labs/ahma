@@ -199,7 +199,6 @@ pub mod validation;
 //   ahma_vault     — task vault, audit log, two-phase trash  (AGPL-3.0-or-later)
 //   ahma_task_tree — recursive task-tree orchestration       (AGPL-3.0-or-later)
 //   ahma_tui       — ratatui TUI control plane               (AGPL-3.0-or-later)
-//   ahma_cluster   — local cluster scheduler (mDNS/QUIC)     (AGPL-3.0-or-later)
 //
 // These crates live in the same workspace and depend on this library;
 // they must NOT be depended on from this crate.

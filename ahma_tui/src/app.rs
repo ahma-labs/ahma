@@ -5035,7 +5035,6 @@ mod tests {
                     num_ctx: None,
                 },
             ],
-            ..AhmaConfig::default()
         };
         assert_eq!(
             cfg.num_ctx_for_base_url("http://localhost:11434/v1"),
