@@ -22,7 +22,6 @@ crate; this README is a summary.
 |---|---|---|
 | `ahma_mcp` | MIT OR Apache-2.0 | Core MCP service, sandbox, and command execution |
 | `ahma_common` | MIT OR Apache-2.0 | Shared runtime types and configuration |
-| `ahma_vault` | AGPL-3.0-or-later | Task vaults and audit trail |
 | `ahma_decompose` | AGPL-3.0-or-later | Decomposition runtime |
 | `ahma_worker` | AGPL-3.0-or-later | Ephemeral worker execution |
 | `ahma_renewal` | AGPL-3.0-or-later | Renewal / unattended-session controls |

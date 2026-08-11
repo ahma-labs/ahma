@@ -881,10 +881,7 @@ pub async fn dispatch_subcommand(cmd: Subcommands, cfg: AppConfig) -> Result<()>
         Subcommands::Serve(serve_args) => dispatch_serve(serve_args, cfg).await,
         Subcommands::Tool(tool_cmd) => dispatch_tool(tool_cmd, cfg).await,
         Subcommands::Vault(_) => {
-            anyhow::bail!(
-                "vault commands are provided by the ahma_bin crate (includes ahma_vault). \
-                 If you are running a custom binary, implement vault dispatch using ahma_vault::TaskVault."
-            )
+            anyhow::bail!("`ahma vault` command is no longer supported.")
         }
         Subcommands::Tui(_) => {
             anyhow::bail!(
@@ -4752,7 +4749,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("vault commands are provided"));
+        assert!(err.to_string().contains("no longer supported"));
     }
 
     #[tokio::test]

@@ -18,7 +18,6 @@ default-members = [
     "ahma_test_support",
     "ahma_harness_tools",
     # AGPL-3.0-or-later crates (end-user product surface)
-    "ahma_vault",
     "ahma_task_tree",
     "ahma_tui",
     "ahma_bin",
@@ -36,7 +35,6 @@ members = [
     "ahma_test_support",
     "ahma_harness_tools",
     # AGPL-3.0-or-later crates (end-user product surface)
-    "ahma_vault",
     "ahma_task_tree",
     "ahma_tui",
     "ahma_bin",

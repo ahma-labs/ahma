@@ -1,6 +1,6 @@
 //! Append-only execution audit log for the default (non-vault) execution path.
 //!
-//! `ahma_vault`'s audit log answers "what happened inside this task vault?".  Its
+//! The task vault audit log answers "what happened inside this task vault?". Its
 //! problem is that a vault is the *rare* case: the overwhelmingly common path is a
 //! plain `run_terminal_command`, which until now left behind operation *output*
 //! (`<project log dir>/operations/<op>.log`) and some `tracing` lifecycle lines —

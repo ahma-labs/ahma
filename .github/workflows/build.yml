@@ -354,7 +354,7 @@ jobs:
         run: |
           echo "--- Testing AGPL product crates"
           cargo nextest run --profile ci --locked \
-            -p ahma_vault -p ahma_cluster \
+            -p ahma_task_tree -p ahma_tui -p ahma_bin \
             -E 'not (test(kotlin) or test(android))'
 
       - name: Cargo Nextest (Landlock red-team, Linux only)

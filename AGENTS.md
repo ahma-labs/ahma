@@ -14,8 +14,8 @@ SPEC, not here and not only in code.
 Standard cargo. Package names use **underscores** (`-p ahma_http_bridge`, not `ahma-http-bridge`).
 Prefer `cargo nextest run` over `cargo test`. Rust edition 2024, MSRV in `Cargo.toml`.
 
-Incubating crates are quarantined behind non-default features (`vault`, `simplify`,
-`full`) and are not in `default-members` — test them directly with `-p`.
+Incubating features are quarantined behind non-default features (`simplify`,
+`full`) — test them directly with `-p`.
 
 ### Definition of done
 

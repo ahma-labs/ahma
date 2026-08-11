@@ -31,7 +31,6 @@ those crates.
 
 | Crate | License | Key types |
 |-------|---------|----------|
-| `ahma_vault` | AGPL-3.0-or-later | `TaskVault`, `AuditWriter`, `TrashManager` |
 | `ahma_task_tree` | AGPL-3.0-or-later | `parse_steps`, `ParsedStep`, `build_planning_prompt` |
 | `ahma_tui` | AGPL-3.0-or-later | `TuiApp`, `TuiEvent`, `run_tui` |
 
@@ -54,24 +53,6 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(300),
     )));
     println!("Sandbox and monitor ready.");
-    Ok(())
-}
-```
-
-## Example: vault + audit (requires ahma_vault, AGPL-3.0-or-later)
-
-Add `ahma_vault = { git = "..." }` to your `Cargo.toml` (AGPL terms apply):
-
-```rust
-use ahma_vault::{TaskVault, audit::AuditWriter};
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let vault = TaskVault::create("my-analysis")?;
-    println!("Vault: {}", vault.path().display());
-    let audit = vault.audit_writer();
-    audit.vault_created(&vault.path().display().to_string(), "my-analysis").await?;
-    println!("Sandbox scope: {}", vault.sandbox_scope().display());
     Ok(())
 }
 ```

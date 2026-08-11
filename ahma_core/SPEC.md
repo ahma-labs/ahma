@@ -18,8 +18,8 @@
 ## 3. Non-Functional Requirements
 
 - **Performance**: Must introduce zero overhead on top of raw `ahma_mcp` executions.
-- **Dependency Isolation**: Must not transitively drag in copyleft AGPL workspace dependencies (like `ahma_vault` or `ahma_tui`).
+- **Dependency Isolation**: Must not transitively drag in copyleft AGPL workspace dependencies (like `ahma_tui`).
 
 ## 4. Out of Scope
 
-- Implementing task vaults or TUI control planes directly (these remain in separate AGPL-licensed crates).
+- Implementing TUI control planes directly (these remain in separate AGPL-licensed crates).

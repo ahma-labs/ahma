@@ -21,7 +21,6 @@ PERMISSIVE_CRATES=(
 
 AGPL_CRATES=(
   ahma_bin
-  ahma_vault
   ahma_task_tree
   ahma_tui
 )

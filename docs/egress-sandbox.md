@@ -99,11 +99,11 @@ list.save(vault.path().join("egress.allowlist"))?;
 ## Using `EgressClient` in Rust code
 
 Internal ahma services that need to make outbound HTTP calls should use
-[`EgressClient`](../ahma_vault/src/egress_client.rs) instead of a raw
+[`EgressClient`](../ahma_mcp/src/egress/client.rs) instead of a raw
 `reqwest::Client`. It enforces the vault's egress policy before every request:
 
 ```rust
-use ahma_vault::{EgressClient, EgressPolicy};
+use ahma_mcp::egress::{EgressClient, EgressPolicy};
 
 let policy = EgressPolicy::from_vault_path(&vault_path);
 let client = EgressClient::new(policy);

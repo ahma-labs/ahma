@@ -5,8 +5,6 @@
 use anyhow::{Context, Result};
 use clap::Parser as _;
 
-#[cfg(feature = "vault")]
-use ahma_mcp::shell::cli::VaultCommand;
 use ahma_mcp::shell::cli::{
     Cli, LlmCommand, Subcommands, TlsCommand, build_app_config, dispatch_subcommand, load_settings,
 };
@@ -238,51 +236,7 @@ fn dispatch_vault(
     #[allow(unused_variables)] args: ahma_mcp::shell::VaultArgs,
     #[allow(unused_variables)] settings: &ahma_common::config::AhmaSettings,
 ) -> Result<()> {
-    #[cfg(not(feature = "vault"))]
-    return feature_not_compiled("vault", "vault");
-
-    #[cfg(feature = "vault")]
-    if !settings.features.vault {
-        return feature_disabled_at_runtime("vault", "vault");
-    }
-
-    #[cfg(feature = "vault")]
-    match args.command {
-        VaultCommand::Create(create_args) => {
-            let vault = ahma_vault::TaskVault::create(&create_args.slug)
-                .context("Failed to create task vault")?;
-            println!("{}", vault.path().display());
-            tracing::info!(
-                "Task vault created: {} (sandbox scope: {})",
-                vault.path().display(),
-                vault.sandbox_scope().display()
-            );
-            Ok(())
-        }
-        VaultCommand::List => {
-            let home =
-                ahma_common::config::ahma_home_dir().context("Cannot determine home directory")?;
-            let tasks_dir = home.join(".ahma").join("tasks");
-            if !tasks_dir.exists() {
-                println!("No vaults found ({})", tasks_dir.display());
-                return Ok(());
-            }
-            let mut entries: Vec<_> = std::fs::read_dir(&tasks_dir)?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-                .collect();
-            entries.sort_by_key(|e| e.path());
-            if entries.is_empty() {
-                println!("No task vaults found.");
-            } else {
-                println!("Task vaults in {}:", tasks_dir.display());
-                for entry in entries {
-                    println!("  {}", entry.file_name().to_string_lossy());
-                }
-            }
-            Ok(())
-        }
-    }
+    anyhow::bail!("`ahma vault` command is no longer supported.")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

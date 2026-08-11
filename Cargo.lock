@@ -49,7 +49,6 @@ dependencies = [
  "ahma_mcp",
  "ahma_task_tree",
  "ahma_tui",
- "ahma_vault",
  "anyhow",
  "clap",
  "clap-markdown",
@@ -322,23 +321,6 @@ dependencies = [
  "tracing",
  "tui-textarea-2",
  "uuid",
-]
-
-[[package]]
-name = "ahma_vault"
-version = "0.19.3"
-dependencies = [
- "anyhow",
- "chrono",
- "dirs",
- "rand 0.10.1",
- "reqwest 0.13.4",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]
