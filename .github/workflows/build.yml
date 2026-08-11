@@ -78,6 +78,21 @@ permissions:
 # not hit rate**. ghac issues roughly one HTTP request per compilation unit against a rate-limited
 # service; the tarball restore it replaces moved 2.2 GiB at ~260 MB/s in about 9s.
 #
+# RUN 1 RESULT (31466661927), and why the job is currently in a diagnostic configuration: the
+# plumbing works and the gate fails. ghac was genuinely live (`cache_location` read `ghac, ...`)
+# and 1664 objects stored, but 303 of 1967 writes failed, 15.4%. It is NOT the read-only
+# degradation below: cache_errors, cache_read_errors and cache_timeouts were all 0 and most writes
+# landed, so it is partial failure against a healthy backend, which is the shape of the documented
+# rate limit. Two numbers to carry forward: `avg cache write` 0.516s exceeded `avg compiler`
+# 0.431s, so storing an object cost more than producing it; and the other legs on that run were
+# normal (ubuntu 10 min against a 10.9 min baseline), so the 19.2 min was ghac's, not the fleet's.
+#
+# Run 1 could not say WHY those 303 failed, so job-coverage now sets SCCACHE_ERROR_LOG / SCCACHE_LOG
+# / SCCACHE_LOG_MILLIS and treats write errors as a warning, to get one run that explains itself.
+# Both of those come back out once it has. Note that a clean run here does NOT clear the finding:
+# run 1 is the run that writes the most, so it is the worst case for throttling, and every later
+# run writes only what changed. Fewer writes attempted is not the same as a working backend.
+#
 # Every ghac failure mode is silent, which is why the verify step in job-coverage asserts rather
 # than prints. Read against sccache v0.17.0 + opendal 0.55.0:
 #   - Rate limited: documented as "the build will continue, but the storage might not be
@@ -573,6 +588,24 @@ jobs:
       # and `bail!`s on anything else, and `Config::load()` propagates that, so sccache refuses to
       # start rather than quietly ignoring the setting.
       SCCACHE_GHA_ENABLED: "on"
+      # DIAGNOSTIC RUN (run 2). Run 1 (31466661927) failed 303 of 1967 writes, 15.4%, against a
+      # backend that was otherwise healthy: 1664 writes landed and cache_errors, cache_read_errors
+      # and cache_timeouts were all 0. Run 1 could not say WHY, because sccache logs write failures
+      # at `debug!` and discards its server's stderr unless SCCACHE_ERROR_LOG is set. These three
+      # variables are what make the next run answer that, and they come back out once it has.
+      #
+      # SCCACHE_LOG is an env_logger filter, hence the per-target override: the sccache-side message
+      # lives at `debug!` in sccache::server, while opendal's LoggingLayer reports the underlying
+      # HTTP failure at warn/error, and the two together give a status code. Global debug is not
+      # used deliberately -- it is mostly per-request trace noise. SCCACHE_LOG_MILLIS is not
+      # cosmetic: it is what lets the per-minute failure histogram in the verify step separate a
+      # burst (rate limiting) from failures spread evenly across the run (conflicts).
+      #
+      # The third variable, SCCACHE_ERROR_LOG, is set in "Configure deterministic tooling env"
+      # instead of here: it needs a runner-temp path, and neither the `runner` context nor
+      # $RUNNER_TEMP expands in a job-level `env:` block.
+      SCCACHE_LOG: warn,sccache::server=debug
+      SCCACHE_LOG_MILLIS: "1"
       # The workflow-level `SCCACHE_CACHE_SIZE: 1G` is inert here: with ghac configured,
       # `storage_from_config` returns the remote backend and never builds the disk cache, so there
       # is no local directory for a cap to bound. On revert, restore `SCCACHE_CACHE_SIZE: 1300M`.
@@ -666,6 +699,11 @@ jobs:
             echo "PAGER=cat"
             echo "LC_ALL=C"
             echo "LANG=C"
+            # ghac diagnostic run -- see the SCCACHE_LOG comment in this job's env block for why
+            # this one is here. It must land before the first cargo invocation, because sccache
+            # redirects stderr once, when the server starts, and the server is started lazily by
+            # the first compile. Outside the workspace so it cannot reach the coverage artifacts.
+            echo "SCCACHE_ERROR_LOG=$RUNNER_TEMP/sccache-server.log"
           } >> "$GITHUB_ENV"
 
       # sccache is version-pinned HERE and nowhere else in this repo, because ghac is the only
@@ -810,9 +848,14 @@ jobs:
           requests=$(jq -r '.stats.compile_requests' sccache-stats.json)
           writes=$(jq -r '.stats.cache_writes' sccache-stats.json)
           timeouts=$(jq -r '.stats.cache_timeouts' sccache-stats.json)
-          # cache_errors is a PerLanguageCount (a map), the other two are scalars.
-          errors=$(jq -r '.stats.cache_read_errors + .stats.cache_write_errors
+          # Write errors are counted separately from the rest: run 1 showed they are the one
+          # failure under diagnosis, and lumping them in would mask a genuinely new fault.
+          # cache_errors is a PerLanguageCount (a map); the rest are scalars.
+          write_errors=$(jq -r '.stats.cache_write_errors' sccache-stats.json)
+          errors=$(jq -r '.stats.cache_read_errors
                           + ([.stats.cache_errors.counts[]] | add // 0)' sccache-stats.json)
+          # Every miss attempts a write, so total misses is the write-error denominator.
+          misses_all=$(jq -r '[.stats.cache_misses.counts[]] | add // 0' sccache-stats.json)
           # "Rust" is sccache's own language key (CompilerKind::lang_kind), so these are directly
           # comparable to the "Cache hits rate (Rust)" rows in the #562/#563 baseline tables.
           hits=$(jq -r '.stats.cache_hits.counts.Rust // 0' sccache-stats.json)
@@ -820,18 +863,20 @@ jobs:
           rate=$(awk -v h="$hits" -v m="$misses" 'BEGIN { t=h+m; printf "%.2f", (t ? 100*h/t : 0) }')
 
           {
-            echo "### sccache (ghac spike, #562)"
+            echo "### sccache (ghac spike, #562) -- diagnostic run"
             echo
-            echo "| metric | value |"
-            echo "|---|---|"
-            echo "| backend | \`$loc\` |"
-            echo "| compile requests | $requests |"
-            echo "| Rust hit rate | ${rate}% ($hits hit / $misses miss) |"
-            echo "| cache writes | $writes |"
-            echo "| cache errors | $errors |"
-            echo "| cache timeouts | $timeouts |"
+            echo "| metric | value | run 1 (31466661927) | tarball baseline |"
+            echo "|---|---|---|---|"
+            echo "| backend | \`$loc\` | ghac | disk + tarball |"
+            echo "| compile requests | $requests | 2507 | |"
+            echo "| Rust hit rate | ${rate}% ($hits hit / $misses miss) | 0.94% | 80.69% |"
+            echo "| cache writes | $writes | 1664 | |"
+            echo "| **cache write errors** | **$write_errors** of $misses_all | 303 of 1967 (15.4%) | 0 |"
+            echo "| cache read/general errors | $errors | 0 | 0 |"
+            echo "| cache timeouts | $timeouts | 0 | 0 |"
             echo
-            echo "Tarball baseline (run 31404259524): 80.69% Rust, 11.7 min. Compare WALL CLOCK."
+            echo "Tarball baseline (run 31404259524): 80.69% Rust, 11.7 min wall clock. Run 1 was"
+            echo "19.2 min but cold, so **this** run is the first comparable wall clock."
           } >> "$GITHUB_STEP_SUMMARY"
 
           failed=0
@@ -845,8 +890,51 @@ jobs:
           esac
 
           if [ "$errors" -ne 0 ]; then
-            echo "::error::sccache reported $errors cache errors. Under ghac this is how a rate-limited or credential-less backend surfaces: it degrades to read-only and every put returns 'Cannot write to read-only storage'."
+            echo "::error::sccache reported $errors cache read/general errors. These were 0 on run 1, so this is a NEW failure mode, not the write-error one under diagnosis."
             failed=1
+          fi
+
+          # Write errors are a WARNING for this diagnostic run only, and only because run 1 already
+          # established what they are: partial failure against a live backend, not the read-only
+          # degradation. Restore them to `failed=1` once the cause below is known -- leaving them
+          # non-fatal permanently would hand the spike back the invisible failure mode it exists to
+          # catch. The "misses with zero writes" check below is the backstop meanwhile: it still
+          # fails the job if the write path stops working entirely.
+          if [ "$write_errors" -ne 0 ]; then
+            echo "::warning::sccache failed $write_errors of $((misses_all)) cache writes. Non-fatal for this diagnostic run; see the breakdown below."
+
+            if [ -s "$SCCACHE_ERROR_LOG" ]; then
+              # URLs and object paths are stripped everywhere below, for two reasons at once.
+              # Secrecy: ghac blob uploads go to pre-signed URLs whose query carries a SAS token,
+              # `core.setSecret` cannot mask what it never saw, and this repo is public. Legibility:
+              # the URL and path vary per object, so leaving them in makes every one of the 303
+              # failures unique and `uniq -c` reports 303 counts of 1 instead of the histogram this
+              # step exists to produce. The status code and error kind, which are the diagnosis,
+              # both survive. `sed -E` rather than a BRE with `\?`: that is a GNU extension BSD sed
+              # does not take, and a pattern that silently matches nothing here would be read as
+              # "no URLs were logged".
+              redact() { sed -E -e 's#https?://[^ ,]*#<url-redacted>#g' -e 's#path=[^ ]*#path=<object>#g'; }
+              # env_logger's format is `[<timestamp> <LEVEL> <target>] <message>`, so dropping the
+              # leading bracket group is the other half of making identical failures collapse.
+              strip_prefix() { sed -E 's/^\[[^]]*\] //'; }
+
+              echo "--- distinct cache-write failures, most frequent first ---"
+              grep -F 'Error executing cache write' "$SCCACHE_ERROR_LOG" \
+                | strip_prefix | redact | sort | uniq -c | sort -rn | head -20 || true
+
+              echo "--- other warn/error lines (opendal reports the HTTP status here) ---"
+              grep -E '\b(WARN|ERROR)\b' "$SCCACHE_ERROR_LOG" \
+                | grep -vF 'Error executing cache write' \
+                | strip_prefix | redact | sort | uniq -c | sort -rn | head -20 || true
+
+              # The question this run exists to answer. Clustered into one or two minutes means a
+              # rate limit; spread evenly across the whole run means per-object conflicts.
+              echo "--- cache-write failures per minute (burst = rate limit, spread = conflicts) ---"
+              grep -F 'Error executing cache write' "$SCCACHE_ERROR_LOG" \
+                | sed -n 's/^\[\([0-9-]*T[0-9]*:[0-9]*\).*/\1/p' | uniq -c || true
+            else
+              echo "::warning::SCCACHE_ERROR_LOG ($SCCACHE_ERROR_LOG) is missing or empty, so this run produced no diagnosis. The server redirects stderr only when the variable is set before it starts."
+            fi
           fi
 
           # The residual silent case: read-only reached some other way, so nothing is ever
