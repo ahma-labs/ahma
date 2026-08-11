@@ -60,6 +60,55 @@ permissions:
 # material drop there is ~3 GiB of headroom in the budget to raise the cap. Raising it is not
 # free -- multiply by the number of saving legs and compare to 10 GiB.
 #
+# ----------------------------------------------------------------------------------------------
+# IN PROGRESS: ghac spike on job-coverage (#562). Everything above still describes the other jobs.
+#
+# `job-coverage` alone no longer uses the tarball model. It uses sccache's native GitHub Actions
+# backend (`SCCACHE_GHA_ENABLED=on`), which stores each compilation object as its own Actions
+# cache entry instead of tarring SCCACHE_DIR into one. For that one job, rule 4, the
+# SCCACHE_CACHE_SIZE cap and the janitor's keep-N row are all inert: `storage_from_config` returns
+# the ghac backend and never constructs the disk cache, so there is no local directory to bound
+# and no single entry to supersede. It was picked as the guinea pig because it is a single leg on
+# nobody's critical path whose live working set was characterised precisely by #564.
+#
+# Baseline to beat, from run 31404259524, the last full tarball run:
+#   80.69% Rust hit rate, 1 GiB restored / 1103 MiB saved, 11.7 min wall clock.
+# That hit rate is mid-recovery from the 800M incident below, not steady state; the pre-incident
+# figure was 95.74%. The 11.7 min was already back to pre-incident, so **wall clock decides this,
+# not hit rate**. ghac issues roughly one HTTP request per compilation unit against a rate-limited
+# service; the tarball restore it replaces moved 2.2 GiB at ~260 MB/s in about 9s.
+#
+# Every ghac failure mode is silent, which is why the verify step in job-coverage asserts rather
+# than prints. Read against sccache v0.17.0 + opendal 0.55.0:
+#   - Rate limited: documented as "the build will continue, but the storage might not be
+#     performed".
+#   - Write probe fails: `RemoteStorage::check` tolerates the error and returns
+#     `CacheMode::ReadOnly`, after which every put returns "Cannot write to read-only storage".
+#     That does land in `cache_write_errors`, which is what makes it detectable at all.
+#   - Read fails: `RemoteStorage::get` downgrades any unexpected error to `Cache::Miss` with a
+#     `warn!`. A dead cache is indistinguishable from a cold one except by hit rate.
+#   - Credentials missing: sccache keeps using the disk cache and the job silently keeps
+#     measuring the model this spike is supposed to be replacing. Hence the `cache_location`
+#     assertion.
+#
+# Reverting is one env var plus three steps: drop SCCACHE_GHA_ENABLED and the credential-export
+# step from job-coverage, restore its Restore/Save sccache steps and its `SCCACHE_CACHE_SIZE:
+# 1300M`. The janitor still keeps the last `sccache-coverage-*` tarball for exactly that reason,
+# so a revert is not a cold start.
+#
+# Rollout gate: migrate the other families only after >= 3 consecutive main runs with
+# equal-or-better wall clock, zero cache errors, AND no growth in repo-wide cache usage. ghac
+# objects bill against the same 10 GiB quota as the tarballs, but unlike a tarball they are NOT
+# capped by anything this repo controls -- GitHub's LRU and its 7-day-unused eviction are the only
+# bounds, so the steady state is "live set + one week of churn" rather than a number in the budget
+# table. cache-janitor.yml already prints repo-wide usage in its step summary after every run of
+# this workflow; that is the number to watch.
+#
+# If it wins: delete cache-janitor.yml, delete the SCCACHE_CACHE_SIZE budget table, and reduce
+# this note to the ghac setup plus rule 1, which `SCCACHE_GHA_RW_MODE=READ_ONLY` would then
+# enforce directly in fast-tier.yml rather than by the convention of omitting a save step.
+# ----------------------------------------------------------------------------------------------
+#
 # Manual cache inspection / reset:
 #   gh cache list --limit 100
 #   gh api repos/:owner/:repo/actions/cache/usage
@@ -513,19 +562,32 @@ jobs:
     # Only run on main branch pushes, not pull requests
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     env:
-      # MUST stay above this job's live working set, measured at ~1121 MiB. It compiles two
-      # distinct flavours into one cache -- a plain `cargo build -p ahma_bin` plus
-      # `cargo llvm-cov nextest`, which adds cfg(coverage) and instrumentation, so those objects
-      # are a disjoint (and larger) set rather than a reuse of the plain ones.
+      # ghac spike (#562) -- see the section at the end of the caching note at the top of this
+      # file. This is deliberately the ONLY switch. `SCCACHE_GHA_VERSION` (the manual purge knob)
+      # is not set here and must not be: sccache enables ghac on that variable's mere presence and
+      # skips reading SCCACHE_GHA_ENABLED entirely, so setting it would create a second, hidden
+      # way for ghac to be on while the line below says it is off.
       #
-      # 800M was measured to be actively harmful: run 31400528803 collapsed to a 2.82% Rust hit
-      # rate (from 95.74%) and the job ran 23% slower, 11.7 -> 14.4 min. Note the trap in
-      # diagnosing this -- the overage ratio is NOT the predictor. Coverage was only 1.40x over
-      # its cap and collapsed, while the ubuntu test leg was 2.22x over and held 96.90%. What
-      # matters is how much of the cache is LIVE: the test legs carry accumulated dead objects
-      # from older flag combinations, so eviction discards junk first, whereas nearly all of this
-      # job's 1121 MiB is needed by the run that just restored it.
-      SCCACHE_CACHE_SIZE: 1300M
+      # `on` is what sccache's docs use. Unlike SCCACHE_MAX_SIZE in #561, a wrong value here
+      # cannot fail silently: `bool_from_env_var` accepts true/on/1/false/off/0 case-insensitively
+      # and `bail!`s on anything else, and `Config::load()` propagates that, so sccache refuses to
+      # start rather than quietly ignoring the setting.
+      SCCACHE_GHA_ENABLED: "on"
+      # The workflow-level `SCCACHE_CACHE_SIZE: 1G` is inert here: with ghac configured,
+      # `storage_from_config` returns the remote backend and never builds the disk cache, so there
+      # is no local directory for a cap to bound. On revert, restore `SCCACHE_CACHE_SIZE: 1300M`.
+      #
+      # That number is not arbitrary and must not be re-derived from scratch. It MUST stay above
+      # this job's live working set, measured at ~1121 MiB. The job compiles two distinct flavours
+      # into one cache -- a plain `cargo build -p ahma_bin` plus `cargo llvm-cov nextest`, which
+      # adds cfg(coverage) and instrumentation, so those objects are a disjoint (and larger) set
+      # rather than a reuse of the plain ones. 800M was measured to be actively harmful: run
+      # 31400528803 collapsed to a 2.82% Rust hit rate (from 95.74%) and ran 23% slower, 11.7 ->
+      # 14.4 min. Note the trap in diagnosing that -- the overage ratio is NOT the predictor.
+      # Coverage was only 1.40x over its cap and collapsed, while the ubuntu test leg was 2.22x
+      # over and held 96.90%. What matters is how much of the cache is LIVE: the test legs carry
+      # accumulated dead objects from older flag combinations, so eviction discards junk first,
+      # whereas nearly all of this job's 1121 MiB is needed by the run that just restored it.
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -550,17 +612,45 @@ jobs:
           restore-keys: |
             cargo-registry-${{ runner.os }}-${{ runner.arch }}-
 
-      # Keeps its own sccache namespace: llvm-cov instrumentation changes the compiler
-      # invocation, so these objects are disjoint from the test matrix's.
-      - name: Restore sccache
-        id: sccache
-        uses: actions/cache/restore@v5
+      # There is no Restore/Save sccache pair here any more; ghac writes each object individually
+      # as it is compiled (#562). What ghac does need is credentials, and the runner exposes those
+      # only to JavaScript actions, not to `run:` steps -- hence github-script + exportVariable.
+      #
+      # ACTIONS_CACHE_SERVICE_V2 is load-bearing and is NOT in the requirement list in #562.
+      # opendal picks the API version from that variable alone (`get_cache_service_version`:
+      # non-empty -> V2, empty -> V1) and only V2 reads ACTIONS_RESULTS_URL; V1 tries
+      # ACTIONS_CACHE_URL first and talks to the retired `_apis/artifactcache` endpoints. Export
+      # the URL and token without it and sccache lands on the dead v1 service, fails every write,
+      # degrades to read-only and stays green -- #561's exact shape. So this step asserts on all
+      # three inputs rather than defaulting them to "" the way opendal's own README snippet does;
+      # an empty ACTIONS_CACHE_URL is worse than an unset one, because V1's `or_else` fallback to
+      # ACTIONS_RESULTS_URL only fires when the variable is absent, not when it is set to empty.
+      - name: Export Actions cache credentials for sccache (ghac)
+        uses: actions/github-script@v9
         with:
-          path: ${{ github.workspace }}/.sccache
-          key: sccache-coverage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            sccache-coverage-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
-            sccache-coverage-${{ runner.os }}-${{ runner.arch }}-
+          script: |
+            const url = process.env.ACTIONS_RESULTS_URL;
+            const token = process.env.ACTIONS_RUNTIME_TOKEN;
+            if (!url || !token) {
+              core.setFailed(
+                'ACTIONS_RESULTS_URL / ACTIONS_RUNTIME_TOKEN are not visible to this action, so ' +
+                'sccache cannot reach the ghac backend. It would silently fall back to the disk ' +
+                'cache. See the ghac section of the caching note in this workflow.');
+              return;
+            }
+            core.setSecret(token);
+            core.exportVariable('ACTIONS_RESULTS_URL', url);
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', token);
+            // Forced on rather than defaulted off: v1 is decommissioned on github.com, so an
+            // absent flag can only mean the runner stopped advertising it, never that v1 is the
+            // right choice here. Warn so the reason is in the log if this ever starts happening.
+            if (!process.env.ACTIONS_CACHE_SERVICE_V2) {
+              core.warning(
+                'ACTIONS_CACHE_SERVICE_V2 was not set by the runner; forcing it on so opendal ' +
+                'uses the v2 cache service. If ghac reads/writes start failing, check whether ' +
+                'the runner renamed this flag.');
+            }
+            core.exportVariable('ACTIONS_CACHE_SERVICE_V2', process.env.ACTIONS_CACHE_SERVICE_V2 || 'true');
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -578,10 +668,18 @@ jobs:
             echo "LANG=C"
           } >> "$GITHUB_ENV"
 
+      # sccache is version-pinned HERE and nowhere else in this repo, because ghac is the only
+      # backend where the version is load-bearing. Two reasons: the ghac backend needs >= v0.11.0
+      # (v0.10.0 spoke ghac API v2, v0.11.0 moved to v4 and the docs say earlier versions
+      # "probably will not work"), and sccache namespaces its ghac objects as `sccache-v{VERSION}`
+      # -- so an unpinned upgrade silently cold-starts the cache and would be read as a spike
+      # regression. `@0.17` tracks the 0.17.x series; taiki-e/install-action has no ">=" syntax,
+      # so a series pin is how a floor is expressed. The other jobs stay unpinned deliberately:
+      # their tarballs do not carry the version in the key.
       - name: Install cargo-nextest, cargo-llvm-cov and sccache
         uses: taiki-e/install-action@v2
         with:
-          tool: nextest,cargo-llvm-cov,sccache
+          tool: nextest,cargo-llvm-cov,sccache@0.17
 
       - name: Install cargo-ndk
         run: |
@@ -674,22 +772,100 @@ jobs:
         continue-on-error: true
         uses: actions/deploy-pages@v5
 
-      - name: Show sccache stats
+      # The ghac spike's instrument (#562). This DOES fail the job, which is a deliberate break
+      # with the `continue-on-error: true # a cache save must never redden a green job` convention
+      # used by the tarball steps elsewhere in this file. That convention is right when the cache
+      # is pure optimisation; here the cache is the thing under test, and every way ghac can fail
+      # leaves the job green (see the ghac section of the caching note). A spike whose failure
+      # mode is invisible measures nothing. If this reddens main it is a CI finding, not a code
+      # regression: revert the spike as described in that note.
+      #
+      # Asserted on the JSON form, not the text: `--show-stats` output has no stable grammar, and
+      # #561 is the standing reminder that a plausible-looking config that never took effect looks
+      # exactly like one that did. `cache_location` is the proof it took effect -- it reads
+      # "ghac, name: sccache-vX.Y.Z, prefix: /sccache" only when the remote backend is live, and
+      # falls back to a disk path otherwise.
+      #
+      # Placed after the Pages deploy so a cache verdict never costs the coverage report. Note
+      # `sccache --stop-server` is gone with the tarball: cache writes are awaited inside the
+      # compile request, so the stats are complete once cargo exits, and there is no live
+      # directory left to tar.
+      - name: Verify ghac backend and report sccache stats
         if: always()
         run: |
-          sccache --show-stats || true
+          set -euo pipefail
 
-      - name: Stop sccache server
-        if: always()
-        run: sccache --stop-server || true
+          # `if: always()` means this also runs when the job died before the toolchain was
+          # installed. Report nothing rather than stacking a second, misleading failure on top of
+          # the real one. Once sccache exists, every command below is allowed to be fatal.
+          if ! command -v sccache >/dev/null 2>&1; then
+            echo "sccache is not installed; the job failed before it ran. Nothing to verify."
+            exit 0
+          fi
 
-      - name: Save sccache
-        if: always()
-        continue-on-error: true # a cache save must never redden a green job
-        uses: actions/cache/save@v5
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: ${{ steps.sccache.outputs.cache-primary-key }}
+          sccache --show-stats
+          sccache --show-stats --stats-format=json > sccache-stats.json
+
+          loc=$(jq -r '.cache_location' sccache-stats.json)
+          requests=$(jq -r '.stats.compile_requests' sccache-stats.json)
+          writes=$(jq -r '.stats.cache_writes' sccache-stats.json)
+          timeouts=$(jq -r '.stats.cache_timeouts' sccache-stats.json)
+          # cache_errors is a PerLanguageCount (a map), the other two are scalars.
+          errors=$(jq -r '.stats.cache_read_errors + .stats.cache_write_errors
+                          + ([.stats.cache_errors.counts[]] | add // 0)' sccache-stats.json)
+          # "Rust" is sccache's own language key (CompilerKind::lang_kind), so these are directly
+          # comparable to the "Cache hits rate (Rust)" rows in the #562/#563 baseline tables.
+          hits=$(jq -r '.stats.cache_hits.counts.Rust // 0' sccache-stats.json)
+          misses=$(jq -r '.stats.cache_misses.counts.Rust // 0' sccache-stats.json)
+          rate=$(awk -v h="$hits" -v m="$misses" 'BEGIN { t=h+m; printf "%.2f", (t ? 100*h/t : 0) }')
+
+          {
+            echo "### sccache (ghac spike, #562)"
+            echo
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "| backend | \`$loc\` |"
+            echo "| compile requests | $requests |"
+            echo "| Rust hit rate | ${rate}% ($hits hit / $misses miss) |"
+            echo "| cache writes | $writes |"
+            echo "| cache errors | $errors |"
+            echo "| cache timeouts | $timeouts |"
+            echo
+            echo "Tarball baseline (run 31404259524): 80.69% Rust, 11.7 min. Compare WALL CLOCK."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=0
+
+          case "$loc" in
+            ghac*) ;;
+            *)
+              echo "::error::sccache is not using the ghac backend (cache_location: $loc). SCCACHE_GHA_ENABLED did not take effect, so this run measured the disk cache."
+              failed=1
+              ;;
+          esac
+
+          if [ "$errors" -ne 0 ]; then
+            echo "::error::sccache reported $errors cache errors. Under ghac this is how a rate-limited or credential-less backend surfaces: it degrades to read-only and every put returns 'Cannot write to read-only storage'."
+            failed=1
+          fi
+
+          # The residual silent case: read-only reached some other way, so nothing is ever
+          # written and nothing is ever counted as an error either. Misses without writes is the
+          # signature. Guarded on misses so a 100%-hit run is not treated as a failure.
+          if [ "$misses" -gt 0 ] && [ "$writes" -eq 0 ]; then
+            echo "::error::sccache recorded $misses Rust misses but wrote 0 objects. The ghac backend is not storing anything."
+            failed=1
+          fi
+
+          # Reported, not fatal. A timeout is a miss caused by a slow cache, which is exactly what
+          # throttling looks like -- but it is also the one signal that can move for reasons
+          # outside this repo, and reddening main on it would be flaky. It shows in the summary
+          # table above; if it climbs across runs, that is the spike failing.
+          if [ "$timeouts" -ne 0 ]; then
+            echo "::warning::sccache reported $timeouts cache timeouts. Under ghac this is the throttling signal; watch it across runs."
+          fi
+
+          exit "$failed"
 
   #######################################
 

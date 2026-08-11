@@ -17,17 +17,34 @@ name: Cache Janitor
 # was renamed from the never-recognised SCCACHE_MAX_SIZE to SCCACHE_CACHE_SIZE:
 #
 #   sccache-test-*        4 legs x 1 GiB cap  x keep 1 = 4.4 GiB  (tarball ~1.1x the dir)
-#   sccache-coverage-*    1 leg  x 1300 MiB   x keep 1 = 1.4 GiB  (live set ~1121 MiB; see below)
+#   sccache-coverage-*    frozen, see below              1.4 GiB  (live set ~1121 MiB)
 #   sccache-android-*     1 leg  x 600 MiB    x keep 1 = 0.7 GiB
 #   sccache-codeql-*      1 leg  x 600 MiB    x keep 1 = 0.2 GiB  (measured 125 MiB; cap is slack)
 #   cargo-registry-*      4 os/arch x ~65 MiB x keep 2 = 0.5 GiB  (measured 58-73 MiB each)
+#   sccache ghac objects  uncapped, see below            ~1.1 GiB + a week of churn
 #                                                        -------
-#                                                        ~7.2 GiB
+#                                                        ~7.2 GiB + ghac
 #
 # Nothing else may save a cache without being added to that table. Three sources are
 # deliberately absent because they never save: fast-tier.yml (PR-only), the release legs in
 # build.yml, and Gradle -- whose two caches were removed after being shown to have never stored
 # anything (see the note in build.yml's job-android-nextest).
+#
+# THE GHAC SPIKE (#562) CHANGES TWO ROWS. Read the ghac section of the caching note in build.yml
+# first.
+#
+# `sccache-coverage-*` is frozen, not gone. job-coverage no longer saves a tarball, so keep 1 now
+# preserves one stale entry indefinitely rather than rotating a fresh one. That is deliberate: it
+# is the revert insurance policy, and it costs 1.4 GiB of a budget that is under quota anyway.
+# Delete it (`gh cache delete <key>`) once the spike is judged either way, and drop the row.
+#
+# ghac objects bill against the SAME 10 GiB quota, one entry per compilation object rather than
+# one per job. This job cannot bound them and does not try: `family_of` reduces each object key to
+# itself (the keys carry no `-<digits>` or 64-hex tail to strip), so every object is a family of
+# one, `keep_for`'s unknown-family default of 2 keeps it, and nothing is deleted. Structurally
+# safe, but it means the only bound on ghac growth is GitHub's own LRU plus its 7-day-unused
+# eviction. Expect the "Before: N entries" line below to jump from ~11 to a few thousand, and
+# watch the GiB figure rather than the count -- that number is the spike's quota verdict.
 #
 # Sizing a cap: compare it to the job's LIVE working set, not to what it previously uploaded.
 # Measured on run 31400528803, the first run where caps actually bound:
