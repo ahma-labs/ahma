@@ -17,34 +17,45 @@ name: Cache Janitor
 # was renamed from the never-recognised SCCACHE_MAX_SIZE to SCCACHE_CACHE_SIZE:
 #
 #   sccache-test-*        4 legs x 1 GiB cap  x keep 1 = 4.4 GiB  (tarball ~1.1x the dir)
-#   sccache-coverage-*    frozen, see below              1.4 GiB  (live set ~1121 MiB)
 #   sccache-android-*     1 leg  x 600 MiB    x keep 1 = 0.7 GiB
 #   sccache-codeql-*      1 leg  x 600 MiB    x keep 1 = 0.2 GiB  (measured 125 MiB; cap is slack)
 #   cargo-registry-*      4 os/arch x ~65 MiB x keep 2 = 0.5 GiB  (measured 58-73 MiB each)
-#   sccache ghac objects  uncapped, see below            ~1.1 GiB + a week of churn
+#   sccache ghac objects  uncapped, see below            1.10 GiB (measured, 2014 objects)
 #                                                        -------
-#                                                        ~7.2 GiB + ghac
+#                                                        ~6.9 GiB
 #
 # Nothing else may save a cache without being added to that table. Three sources are
 # deliberately absent because they never save: fast-tier.yml (PR-only), the release legs in
 # build.yml, and Gradle -- whose two caches were removed after being shown to have never stored
 # anything (see the note in build.yml's job-android-nextest).
 #
-# THE GHAC SPIKE (#562) CHANGES TWO ROWS. Read the ghac section of the caching note in build.yml
-# first.
+# THE GHAC SPIKE (#562) REPLACED THE sccache-coverage-* ROW. Read the ghac section of the caching
+# note in build.yml first.
 #
-# `sccache-coverage-*` is frozen, not gone. job-coverage no longer saves a tarball, so keep 1 now
-# preserves one stale entry indefinitely rather than rotating a fresh one. That is deliberate: it
-# is the revert insurance policy, and it costs 1.4 GiB of a budget that is under quota anyway.
-# Delete it (`gh cache delete <key>`) once the spike is judged either way, and drop the row.
+# `sccache-coverage-*` is gone, and the way it went is the lesson. This table briefly claimed the
+# row was "frozen": job-coverage had stopped saving, so keep-1 would hold the last tarball
+# indefinitely as revert insurance. By the spike's second run there were zero such entries. This
+# job did not delete it -- keep-1 never deletes a family's only entry -- GitHub's LRU did, while
+# the repo was still under quota. The moment job-coverage stopped RESTORING that tarball it became
+# the least-recently-used entry in the repo, and ~2000 new ghac entries supplied the pressure.
 #
-# ghac objects bill against the SAME 10 GiB quota, one entry per compilation object rather than
-# one per job. This job cannot bound them and does not try: `family_of` reduces each object key to
+# So: keep-N preserves entries that are being READ. It cannot preserve one that nothing touches,
+# and no keep count anywhere in this file will change that. Never treat a cache no job restores as
+# a fallback that will still be there later.
+#
+# ghac objects bill against the SAME 10 GiB quota, one entry per compilation object rather than one
+# per job. This job cannot bound them and does not try: `family_of` reduces each object key to
 # itself (the keys carry no `-<digits>` or 64-hex tail to strip), so every object is a family of
 # one, `keep_for`'s unknown-family default of 2 keeps it, and nothing is deleted. Structurally
-# safe, but it means the only bound on ghac growth is GitHub's own LRU plus its 7-day-unused
-# eviction. Expect the "Before: N entries" line below to jump from ~11 to a few thousand, and
-# watch the GiB figure rather than the count -- that number is the spike's quota verdict.
+# safe, and measured at 2014 objects totalling 1.10 GiB (avg 572 KiB) after two runs -- under the
+# 1.4 GiB tarball it replaced, because per-object LRU stores the live set rather than a snapshot
+# plus its dead weight. The only bound on its growth is still GitHub's own LRU plus the
+# 7-day-unused eviction, so it is worth re-reading occasionally rather than assuming.
+#
+# The "Before: N entries" line below now counts a few thousand rather than ~11. Watch the GiB, not
+# the count, and read it AFTER a sweep: run-scoped tarball keys leave a second copy of several
+# families pending until this job runs, which is what made usage read 8.31 GiB immediately after
+# the spike's run 2 while ghac's share of that was 1.10 GiB.
 #
 # Sizing a cap: compare it to the job's LIVE working set, not to what it previously uploaded.
 # Measured on run 31400528803, the first run where caps actually bound:
