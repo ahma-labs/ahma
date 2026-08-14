@@ -212,7 +212,6 @@ async fn run_ratatui(
                             } else {
                                 let action = map_key(
                                     key,
-                                    state.mode,
                                     state.focus,
                                     &state.modal,
                                     state.log_filter_active,
@@ -354,8 +353,16 @@ fn handle_action(action: crate::keymap::Action, state: &mut crate::state::AppSta
 
     match action {
         Action::Quit => state.should_quit = true,
-        Action::Tab => state.focus = state.focus.cycle_next(),
-        Action::BackTab => state.focus = state.focus.cycle_prev(),
+        Action::Tab => {
+            state.focus = state
+                .focus
+                .cycle_next_active(state.tasks_window_open, state.log_window_open)
+        }
+        Action::BackTab => {
+            state.focus = state
+                .focus
+                .cycle_prev_active(state.tasks_window_open, state.log_window_open)
+        }
         Action::ToggleHelp => state.toggle_help(),
         Action::FocusChat => {
             // Esc backs out one level: restore a zoomed pane first, then
@@ -2143,7 +2150,6 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
     let cmd = cmd.trim();
     if handle_window_nav_commands(cmd, state)
         || handle_basic_nav_command(cmd, state)
-        || handle_mode_nav_command(cmd, state)
         || handle_mcp_nav_command(cmd, state)
         || handle_minimize_nav_command(cmd, state)
         || handle_agent_nav_command(cmd, state)
@@ -2154,7 +2160,7 @@ fn dispatch_nav_command(cmd: &str, state: &mut crate::state::AppState) {
         || handle_provider_admin_command(cmd, state)
         || handle_picker_nav_command(cmd, state)
         || handle_run_nav_command(cmd, state)
-        || handle_monitor_nav_command(cmd, state)
+        || handle_log_file_nav_command(cmd, state)
         || handle_analyze_nav_command(cmd, state)
         || handle_skills_nav_command(cmd, state)
     {
@@ -2430,12 +2436,28 @@ fn handle_basic_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bo
             state.chat.compact(4);
             push_assistant_message(state, "Context window compacted (kept 4 latest turns).");
         }
-        "/operations" => set_mode_and_focus(
-            state,
-            crate::state::Mode::Monitor,
-            crate::state::Focus::OpsDag,
-        ),
-        "/logs" => set_mode_and_focus(state, crate::state::Mode::Monitor, crate::state::Focus::Log),
+        "/tasks" => {
+            if !state.tasks_window_open {
+                state.tasks_window_open = true;
+                state.focus = crate::state::Focus::OpsDag;
+            } else if state.focus == crate::state::Focus::OpsDag {
+                state.tasks_window_open = false;
+                state.focus = crate::state::Focus::Chat;
+            } else {
+                state.focus = crate::state::Focus::OpsDag;
+            }
+        }
+        "/log" => {
+            if !state.log_window_open {
+                state.log_window_open = true;
+                state.focus = crate::state::Focus::Log;
+            } else if state.focus == crate::state::Focus::Log {
+                state.log_window_open = false;
+                state.focus = crate::state::Focus::Chat;
+            } else {
+                state.focus = crate::state::Focus::Log;
+            }
+        }
         _ => return false,
     }
 
@@ -2451,26 +2473,6 @@ fn handle_settings_nav_command(cmd: &str, state: &mut crate::state::AppState) ->
     true
 }
 
-#[cfg(feature = "tui")]
-fn handle_mode_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
-    match cmd {
-        "/mode chat" => {
-            set_mode_and_focus(state, crate::state::Mode::Chat, crate::state::Focus::Chat)
-        }
-        // Focus the task tree — the pane the user came to see. (This used to
-        // focus the removed AiActivity pane, so the first keystrokes landed
-        // in a pane that was never drawn.)
-        "/mode monitor" => set_mode_and_focus(
-            state,
-            crate::state::Mode::Monitor,
-            crate::state::Focus::OpsDag,
-        ),
-        _ => return false,
-    }
-
-    true
-}
-
 /// Startup "it just works" behavior (SPEC R24.2): if the hub replay reveals
 /// live work for this project — an MCP client (Claude Code, Cursor, …) already
 /// running operations — switch straight to the monitor task tree so the user
@@ -2478,9 +2480,9 @@ fn handle_mode_nav_command(cmd: &str, state: &mut crate::state::AppState) -> boo
 /// only until the first keystroke, and only fires while still in chat mode.
 #[cfg(feature = "tui")]
 fn maybe_auto_open_task_view(state: &mut crate::state::AppState) {
-    use crate::state::{Mode, OpStatus};
+    use crate::state::OpStatus;
 
-    if !state.auto_view_pending || state.mode == Mode::Monitor {
+    if !state.auto_view_pending || state.tasks_window_open {
         return;
     }
     let project = state.project_root.as_deref();
@@ -2497,18 +2499,9 @@ fn maybe_auto_open_task_view(state: &mut crate::state::AppState) {
     });
     if has_live_project_work {
         state.auto_view_pending = false;
-        set_mode_and_focus(state, Mode::Monitor, crate::state::Focus::OpsDag);
+        state.tasks_window_open = true;
+        state.focus = crate::state::Focus::OpsDag;
     }
-}
-
-#[cfg(feature = "tui")]
-fn set_mode_and_focus(
-    state: &mut crate::state::AppState,
-    mode: crate::state::Mode,
-    focus: crate::state::Focus,
-) {
-    state.mode = mode;
-    state.focus = focus;
 }
 
 #[cfg(feature = "tui")]
@@ -4472,16 +4465,16 @@ fn parse_monitor_path_and_prompt(rest: &str) -> (String, String) {
 }
 
 #[cfg(feature = "tui")]
-fn handle_monitor_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
-    if !cmd.starts_with("/monitor file ") {
+fn handle_log_file_nav_command(cmd: &str, state: &mut crate::state::AppState) -> bool {
+    if !cmd.starts_with("/log file ") {
         return false;
     }
 
-    let rest = cmd.strip_prefix("/monitor file ").unwrap().trim();
+    let rest = cmd.strip_prefix("/log file ").unwrap().trim();
     let (path, prompt) = parse_monitor_path_and_prompt(rest);
 
     if path.is_empty() {
-        push_assistant_message(state, "Usage: /monitor file <path> [prompt]");
+        push_assistant_message(state, "Usage: /log file <path> [prompt]");
         return true;
     }
 
@@ -4895,7 +4888,7 @@ fn determine_scrolled_panel(state: &crate::state::AppState) -> &'static str {
         }
     }
 
-    if state.mode == crate::state::Mode::Monitor && state.focus == crate::state::Focus::Log {
+    if state.focus == crate::state::Focus::Log {
         "log"
     } else {
         "chat"
@@ -5715,13 +5708,13 @@ mod tests {
         assert_eq!(state.zoomed, None);
     }
 
-    /// `/mode monitor` must land focus on a pane that is actually drawn.
+    /// `/tasks` opens the tasks window and sets focus.
     #[test]
-    fn mode_monitor_focuses_task_tree() {
-        use crate::state::{AppState, Focus, Mode};
+    fn tasks_command_opens_tasks_window() {
+        use crate::state::{AppState, Focus};
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
-        assert!(super::handle_mode_nav_command("/mode monitor", &mut state));
-        assert_eq!(state.mode, Mode::Monitor);
+        assert!(super::handle_basic_nav_command("/tasks", &mut state));
+        assert!(state.tasks_window_open);
         assert_eq!(state.focus, Focus::OpsDag);
     }
 

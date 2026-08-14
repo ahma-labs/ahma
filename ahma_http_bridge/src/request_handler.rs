@@ -302,7 +302,17 @@ pub async fn handle_session_isolated_request(
     tracing::Span::current().record("session_id", session_id.as_deref().unwrap_or(""));
     debug!(method = ?method, session_id = ?session_id, has_id = payload.get("id").is_some(), "Incoming MCP request");
 
-    if method == Some("initialize") && session_id.is_none() {
+    if method == Some("initialize") {
+        if let Some(ref id) = session_id
+            && session_manager.session_exists(id)
+        {
+            let _ = session_manager
+                .terminate_session(
+                    id,
+                    crate::session::SessionTerminationReason::ClientRequested,
+                )
+                .await;
+        }
         return handle_initialize(&session_manager, &payload).await;
     }
     if let Some(session_id) = session_id {
@@ -1177,7 +1187,17 @@ pub async fn handle_session_isolated_request_sse(
     debug!(method = ?method, session_id = ?session_id, has_id, "Incoming MCP POST SSE request");
 
     // Initialize: create session, forward, return SSE with response
-    if method == Some("initialize") && session_id.is_none() {
+    if method == Some("initialize") {
+        if let Some(ref id) = session_id
+            && session_manager.session_exists(id)
+        {
+            let _ = session_manager
+                .terminate_session(
+                    id,
+                    crate::session::SessionTerminationReason::ClientRequested,
+                )
+                .await;
+        }
         return handle_initialize_sse(&session_manager, &payload).await;
     }
 
@@ -1926,6 +1946,65 @@ mod tests {
         let resp = handle_initialize_sse(&mgr, &payload).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_json(resp).await["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn isolated_request_initialize_with_stale_session_header_routes_to_initialize() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let resp =
+            handle_session_isolated_request(mgr, headers_with_session("stale-id"), payload).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn isolated_sse_request_initialize_with_stale_session_header_routes_to_initialize() {
+        let mgr = keepalive_manager();
+        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let resp =
+            handle_session_isolated_request_sse(mgr, headers_with_session("stale-id"), payload)
+                .await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body_json(resp).await["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn isolated_request_initialize_with_existing_session_terminates_old_session() {
+        let mgr = keepalive_manager();
+        let existing_id = mgr.create_session().await.expect("create session");
+        assert!(mgr.session_exists(&existing_id));
+
+        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let _ = handle_session_isolated_request(
+            mgr.clone(),
+            headers_with_session(&existing_id),
+            payload,
+        )
+        .await;
+        assert!(
+            !mgr.session_exists(&existing_id),
+            "old session must be terminated on initialize"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_sse_request_initialize_with_existing_session_terminates_old_session() {
+        let mgr = keepalive_manager();
+        let existing_id = mgr.create_session().await.expect("create session");
+        assert!(mgr.session_exists(&existing_id));
+
+        let payload = json!({"jsonrpc": "2.0", "method": "initialize", "params": {}});
+        let _ = handle_session_isolated_request_sse(
+            mgr.clone(),
+            headers_with_session(&existing_id),
+            payload,
+        )
+        .await;
+        assert!(
+            !mgr.session_exists(&existing_id),
+            "old session must be terminated on initialize"
+        );
     }
 
     // ─── create_session_or_error ────────────────────────────────────────

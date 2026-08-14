@@ -1,11 +1,8 @@
 //! # ahma_tui — Terminal dashboard and chat interface
 //!
-//! A `ratatui`-based terminal UI with two modes:
-//!
-//! * **Chat mode** (default) — multi-line input sends messages to a local LLM;
-//!   `/` opens a Claude Code-style command navigator for all ahma features.
-//! * **Monitor mode** — 4-pane dashboard for watching active operations,
-//!   viewing logs, and handling approval gates.
+//! A `ratatui`-based terminal UI providing a unified chat and dashboard interface:
+//! multi-line input sends messages to a local LLM, `/` opens a command
+//! navigator, and slash commands (e.g. `/tasks`, `/log`) open full-width sub-window views.
 //!
 //! ## License
 //!

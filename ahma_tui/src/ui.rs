@@ -17,7 +17,7 @@ use ratatui::{
     },
 };
 
-use crate::state::{AppState, ChatEntry, ClickTarget, Focus, Mode, NavCommand};
+use crate::state::{AppState, ChatEntry, ClickTarget, Focus, NavCommand};
 use crate::theme::Theme;
 
 // ─── Top-level draw ───────────────────────────────────────────────────────────
@@ -34,10 +34,7 @@ pub fn draw(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // them. (The overlays clear again, to drop the layer they cover.)
     state.click_targets.borrow_mut().clear();
 
-    match state.mode {
-        Mode::Chat => draw_chat_layout(frame, state, theme),
-        Mode::Monitor => draw_monitor_layout(frame, state, theme),
-    }
+    draw_chat_layout(frame, state, theme);
 
     // Overlays drawn on top of whichever layout is active. At most one user
     // overlay is open (SPEC R23); the palette is rendered inline in the layout,
@@ -236,6 +233,52 @@ fn format_duration_short(ms: u64) -> String {
     }
 }
 
+#[cfg(feature = "tui")]
+fn append_collapsed_running_spans(
+    spans: &mut Vec<Span<'_>>,
+    w: &crate::state::TuiWindow,
+    area_width: usize,
+    theme: &Theme,
+    status_style: Style,
+) {
+    spans.push(Span::styled(
+        format!("[Running {}] ", window_running_panel(w, theme.unicode)),
+        status_style,
+    ));
+    spans.push(Span::styled(w.label.clone(), theme.normal()));
+    if let Some(tail) = w.last_output_line() {
+        let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let budget = area_width.saturating_sub(used + format!(" x{}", w.id).len());
+        if budget > 4 {
+            let sep = if theme.unicode { " — " } else { " - " };
+            spans.push(Span::styled(
+                format!("{sep}{}", truncate(tail, budget.saturating_sub(sep.len()))),
+                theme.dim(),
+            ));
+        }
+    }
+}
+
+#[cfg(feature = "tui")]
+fn append_collapsed_terminal_spans(
+    spans: &mut Vec<Span<'_>>,
+    w: &crate::state::TuiWindow,
+    theme: &Theme,
+    status_style: Style,
+) {
+    spans.push(Span::styled(
+        format!("{} ", status_glyph(w.status, theme.unicode)),
+        status_style,
+    ));
+    if let Some(ms) = w.duration_ms {
+        spans.push(Span::styled(
+            format!("{} ", format_duration_short(ms)),
+            theme.dim(),
+        ));
+    }
+    spans.push(Span::styled(w.label.clone(), theme.dim()));
+}
+
 /// A collapsed window is one line. Running rows keep full contrast, animate,
 /// and carry a live tail of the latest output so "what is it doing" is visible
 /// without expanding. Terminal rows compress to a dim glyph + duration + title
@@ -252,34 +295,9 @@ fn draw_collapsed_window(
         Span::styled(format!("{} ", w.id), theme.normal()),
     ];
     if w.status == crate::state::WindowStatus::Running {
-        spans.push(Span::styled(
-            format!("[Running {}] ", window_running_panel(w, theme.unicode)),
-            status_style,
-        ));
-        spans.push(Span::styled(w.label.clone(), theme.normal()));
-        if let Some(tail) = w.last_output_line() {
-            let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-            let budget = (area.width as usize).saturating_sub(used + format!(" x{}", w.id).len());
-            if budget > 4 {
-                let sep = if theme.unicode { " — " } else { " - " };
-                spans.push(Span::styled(
-                    format!("{sep}{}", truncate(tail, budget.saturating_sub(sep.len()))),
-                    theme.dim(),
-                ));
-            }
-        }
+        append_collapsed_running_spans(&mut spans, w, area.width as usize, theme, status_style);
     } else {
-        spans.push(Span::styled(
-            format!("{} ", status_glyph(w.status, theme.unicode)),
-            status_style,
-        ));
-        if let Some(ms) = w.duration_ms {
-            spans.push(Span::styled(
-                format!("{} ", format_duration_short(ms)),
-                theme.dim(),
-            ));
-        }
-        spans.push(Span::styled(w.label.clone(), theme.dim()));
+        append_collapsed_terminal_spans(&mut spans, w, theme, status_style);
     }
 
     let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
@@ -732,18 +750,8 @@ fn draw_windows_layout(
 }
 
 #[cfg(feature = "tui")]
-fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
-    let full = frame.area();
-    let approval_h: u16 = if let Some(gate) = &state.approval {
-        // +2 for the rounded border (top/bottom). 2 content lines normally,
-        // or 2 + blank + up to 9 diff lines when a diff is attached.
-        if gate.diff.is_some() { 14 } else { 4 }
-    } else {
-        0
-    };
-
-    // Input height target: 1-6 lines based on wrapped content
-    let inner_width = full.width.saturating_sub(2);
+fn compute_chat_input_height(state: &AppState, full_width: u16) -> u16 {
+    let inner_width = full_width.saturating_sub(2);
     let wrapped_line_count = state
         .chat_input_line_count(inner_width as usize)
         .clamp(1, 6);
@@ -756,7 +764,97 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
         .get()
         .round()
         .clamp(1.0, 6.0) as u16;
-    let input_h = input_lines + 2; // borders
+    input_lines + 2 // borders
+}
+
+#[cfg(feature = "tui")]
+fn draw_zoomed_chat_pane(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    chat_a: Rect,
+    zoom: Focus,
+) {
+    match zoom {
+        Focus::OpsDag => {
+            state.ops_area.set(chat_a);
+            draw_ops_dag(frame, state, theme, chat_a);
+        }
+        Focus::Log => {
+            state.log_area.set(chat_a);
+            draw_log(frame, state, theme, chat_a);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(feature = "tui")]
+fn draw_unzoomed_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme, chat_a: Rect) {
+    let mut constraints = Vec::new();
+    let show_tasks = state.tasks_window_open;
+    let show_log = state.log_window_open;
+
+    if show_tasks {
+        let tasks_h = (chat_a.height / 3).clamp(6, 16);
+        constraints.push(Constraint::Length(tasks_h));
+    }
+    if show_log {
+        let log_h = (chat_a.height / 3).clamp(6, 16);
+        constraints.push(Constraint::Length(log_h));
+    }
+    constraints.push(Constraint::Min(4));
+
+    let areas = Layout::vertical(constraints).split(chat_a);
+    let mut idx = 0;
+    if show_tasks {
+        let area = areas[idx];
+        idx += 1;
+        state.ops_area.set(area);
+        draw_ops_dag(frame, state, theme, area);
+    } else {
+        state.ops_area.set(Rect::default());
+    }
+    if show_log {
+        let area = areas[idx];
+        idx += 1;
+        state.log_area.set(area);
+        draw_log(frame, state, theme, area);
+    } else {
+        state.log_area.set(Rect::default());
+    }
+
+    let chat_content_area = areas[idx];
+    state.chat_area.set(chat_content_area);
+
+    let visible_count = state.windows.iter().filter(|w| w.visible).count();
+    let (history_area, windows_area, layouts) = if visible_count > 0 {
+        let max_w_h = chat_content_area.height.saturating_sub(4);
+        let layouts = compute_window_layouts(&state.windows, max_w_h);
+        let total_w_h: u16 = layouts.iter().filter(|l| l.visible).map(|l| l.height).sum();
+        let [h_area, w_area] =
+            Layout::vertical([Constraint::Min(4), Constraint::Length(total_w_h)])
+                .areas(chat_content_area);
+        (h_area, w_area, layouts)
+    } else {
+        (chat_content_area, Rect::default(), vec![])
+    };
+
+    draw_chat_history(frame, state, theme, history_area);
+    draw_windows_layout(frame, state, theme, windows_area, &layouts);
+}
+
+#[cfg(feature = "tui")]
+fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
+    let full = frame.area();
+    let approval_h: u16 = if let Some(gate) = &state.approval {
+        // +2 for the rounded border (top/bottom). 2 content lines normally,
+        // or 2 + blank + up to 9 diff lines when a diff is attached.
+        if gate.diff.is_some() { 14 } else { 4 }
+    } else {
+        0
+    };
+
+    let input_h = compute_chat_input_height(state, full.width);
 
     let [header_a, chat_a, approval_a, input_a, footer_a] = Layout::vertical([
         Constraint::Length(1),
@@ -772,21 +870,11 @@ fn draw_chat_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
     // Clear window_rects at start of drawing
     state.window_rects.borrow_mut().clear();
 
-    let visible_count = state.windows.iter().filter(|w| w.visible).count();
-    let (history_area, windows_area, layouts) = if visible_count > 0 {
-        let max_w_h = chat_a.height.saturating_sub(4);
-        let layouts = compute_window_layouts(&state.windows, max_w_h);
-        let total_w_h: u16 = layouts.iter().filter(|l| l.visible).map(|l| l.height).sum();
-        let [h_area, w_area] =
-            Layout::vertical([Constraint::Min(4), Constraint::Length(total_w_h)]).areas(chat_a);
-        (h_area, w_area, layouts)
+    if let Some(zoom) = state.zoomed {
+        draw_zoomed_chat_pane(frame, state, theme, chat_a, zoom);
     } else {
-        (chat_a, Rect::default(), vec![])
-    };
-
-    draw_chat_history(frame, state, theme, history_area);
-
-    draw_windows_layout(frame, state, theme, windows_area, &layouts);
+        draw_unzoomed_chat_layout(frame, state, theme, chat_a);
+    }
 
     if state.approval.is_some() {
         draw_approval(frame, state, theme, approval_a);
@@ -856,6 +944,28 @@ fn get_mcp_connection_counts(
 }
 
 #[cfg(feature = "tui")]
+fn max_header_workspace_len(width: u16) -> usize {
+    if width > 120 {
+        35
+    } else if width > 100 {
+        25
+    } else {
+        15
+    }
+}
+
+#[cfg(feature = "tui")]
+fn format_external_tools_part(state: &AppState) -> String {
+    let (http_count, stdio_count) = get_mcp_connection_counts(&state.mcp_connections.servers);
+    let external_tools = state.mcp_connections.aggregate_tool_names().len();
+    if http_count > 0 || stdio_count > 0 {
+        format!(" · ext (http:{http_count} stdio:{stdio_count}) / {external_tools} tools")
+    } else {
+        String::new()
+    }
+}
+
+#[cfg(feature = "tui")]
 fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
     let mcp_label = get_mcp_label(state.mcp_enabled, state.unicode);
     let (health_char, health_style) =
@@ -865,21 +975,8 @@ fn draw_chat_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         get_daemon_indicator(state.daemon_healthy, state.unicode, theme);
     let daemon_span = Span::styled(daemon_char, daemon_style);
 
-    let (http_count, stdio_count) = get_mcp_connection_counts(&state.mcp_connections.servers);
-    let external_tools = state.mcp_connections.aggregate_tool_names().len();
-    let external_part = if http_count > 0 || stdio_count > 0 {
-        format!(" · ext (http:{http_count} stdio:{stdio_count}) / {external_tools} tools")
-    } else {
-        String::new()
-    };
-
-    let max_path_len = if area.width > 120 {
-        35
-    } else if area.width > 100 {
-        25
-    } else {
-        15
-    };
+    let external_part = format_external_tools_part(state);
+    let max_path_len = max_header_workspace_len(area.width);
     let workspace_short = shorten_path(&state.workspace, max_path_len);
     let sandbox_style = sandbox_status_style(&state.sandbox_status, theme);
     let sandbox_part = if !state.workspace.is_empty() {
@@ -1580,27 +1677,31 @@ fn input_text_paragraph(theme: &Theme, rendered_lines: &[String]) -> Paragraph<'
 
 #[cfg(feature = "tui")]
 fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    // Mode indicator at the left.
-    let mode_label = match state.mode {
-        Mode::Chat => "CHAT",
-        Mode::Monitor => "MONITOR",
-    };
+    let mode_label = "AHMA";
 
-    // Mode-specific key hints.
-    let keys: &[(&str, &str)] = match state.mode {
-        Mode::Chat => &[
+    let keys: &[(&str, &str)] = match state.focus {
+        Focus::OpsDag => &[
+            ("↑↓", "nav ops"),
+            ("Space", "fold/unfold"),
+            ("Tab", "cycle panels"),
+            ("Esc", "focus chat"),
+            ("/quit", "quit"),
+        ],
+        Focus::Log => &[
+            ("↑↓", "scroll"),
+            ("w", "wrap"),
+            ("l", "files"),
+            ("Tab", "cycle panels"),
+            ("Esc", "focus chat"),
+            ("/quit", "quit"),
+        ],
+        _ => &[
             ("Enter", "send"),
             ("Shift+Enter", "newline"),
             ("/", "commands"),
-            ("Tab", "monitor panels"),
+            ("/tasks", "tasks view"),
+            ("/log", "log view"),
             ("/quit", "quit"),
-        ],
-        Mode::Monitor => &[
-            ("↑↓", "navigate ops"),
-            ("Tab", "cycle panels"),
-            ("Enter", "send chat"),
-            ("/mode chat", "chat view"),
-            ("q", "quit"),
         ],
     };
 
@@ -1617,112 +1718,6 @@ fn draw_chat_footer(frame: &mut Frame, state: &AppState, theme: &Theme, area: Re
         Paragraph::new(Line::from(spans)).style(theme.footer()),
         area,
     );
-}
-
-// ─── Monitor layout ───────────────────────────────────────────────────────────
-
-#[cfg(feature = "tui")]
-fn draw_monitor_layout(frame: &mut Frame, state: &AppState, theme: &Theme) {
-    let full = frame.area();
-    // A zoomed pane owns the whole screen between header and footer.
-    if let Some(zoom) = state.zoomed {
-        let [header_a, pane_a, footer_a] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
-        .areas(full);
-
-        draw_chat_header(frame, state, theme, header_a);
-        match zoom {
-            Focus::OpsDag => draw_ops_dag(frame, state, theme, pane_a),
-            _ => draw_log(frame, state, theme, pane_a),
-        }
-        draw_chat_footer(frame, state, theme, footer_a);
-        return;
-    }
-
-    let approval_h: u16 = if let Some(gate) = &state.approval {
-        // +2 for the rounded border (top/bottom). 2 content lines normally,
-        // or 2 + blank + up to 9 diff lines when a diff is attached.
-        if gate.diff.is_some() { 14 } else { 4 }
-    } else {
-        0
-    };
-
-    // Input height target: 1-6 lines based on wrapped content
-    let inner_width = full.width.saturating_sub(2);
-    let wrapped_line_count = state
-        .chat_input_line_count(inner_width as usize)
-        .clamp(1, 6);
-    state
-        .chat_input_height_target
-        .set(wrapped_line_count as f64);
-
-    let input_lines = state
-        .chat_input_height_current
-        .get()
-        .round()
-        .clamp(1.0, 6.0) as u16;
-    let input_h = input_lines + 2; // borders
-
-    // Activity feed: recent op started/finished transitions across all
-    // instances. Hidden until the first event arrives.
-    let events_h: u16 = if state.events.is_empty() {
-        0
-    } else {
-        (state.events.len() as u16 + 2).clamp(3, 9)
-    };
-
-    let [
-        header_a,
-        monitor_a,
-        approval_a,
-        events_a,
-        chat_history_a,
-        input_a,
-        footer_a,
-    ] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Percentage(50),
-        Constraint::Length(approval_h),
-        Constraint::Length(events_h),
-        Constraint::Min(4),
-        Constraint::Length(input_h),
-        Constraint::Length(1),
-    ])
-    .areas(full);
-
-    draw_chat_header(frame, state, theme, header_a);
-
-    // Left panel is Operations (40% width), Right panel is vertical split of Detail (50% height) and Logs (50% height)
-    let [ops_a, right_panel_a] =
-        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-            .areas(monitor_a);
-
-    let [detail_a, log_a] =
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .areas(right_panel_a);
-
-    draw_ops_dag(frame, state, theme, ops_a);
-    draw_detail(frame, state, theme, detail_a);
-    draw_log(frame, state, theme, log_a);
-
-    if state.approval.is_some() {
-        draw_approval(frame, state, theme, approval_a);
-    }
-
-    if events_h > 0 {
-        draw_activity_feed(frame, state, theme, events_a);
-    }
-
-    draw_chat_history(frame, state, theme, chat_history_a);
-    draw_input_box(frame, state, theme, input_a);
-    draw_chat_footer(frame, state, theme, footer_a);
-
-    if state.palette().is_some() {
-        draw_palette(frame, state, theme, full);
-    }
 }
 
 /// Recent operation transitions across all connected instances — monitor
@@ -2187,8 +2182,68 @@ fn draw_header(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
 // ─── Operations DAG ───────────────────────────────────────────────────────────
 
 #[cfg(feature = "tui")]
+#[allow(clippy::too_many_arguments)]
+fn draw_task_tree_row(
+    frame: &mut Frame,
+    state: &AppState,
+    theme: &Theme,
+    row: &crate::task_tree::TreeRow,
+    row_idx: usize,
+    row_area: Rect,
+    is_selected: bool,
+) {
+    use crate::task_tree::RowKind;
+    match &row.kind {
+        RowKind::Instance {
+            label,
+            detail,
+            counts,
+            collapsed,
+            ..
+        } => draw_instance_tree_row(
+            frame,
+            state,
+            theme,
+            row_idx,
+            row_area,
+            is_selected,
+            label,
+            detail,
+            counts,
+            *collapsed,
+        ),
+        RowKind::Group {
+            label, collapsed, ..
+        } => draw_group_tree_row(
+            frame,
+            state,
+            theme,
+            row_idx,
+            row_area,
+            is_selected,
+            label,
+            *collapsed,
+        ),
+        RowKind::Output { text, .. } => {
+            draw_output_tree_row(frame, state, theme, row_idx, row_area, row.depth, text)
+        }
+        RowKind::Op { op_index, expanded } => draw_op_tree_row(
+            frame,
+            state,
+            theme,
+            row_idx,
+            row_area,
+            row.depth,
+            *op_index,
+            *expanded,
+            is_selected,
+        ),
+    }
+}
+
+#[cfg(feature = "tui")]
 fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) {
-    use crate::task_tree::{RowKind, TreeOptions, build_rows};
+    use crate::task_tree::{TreeOptions, build_rows};
 
     let focused = state.focus == Focus::OpsDag;
     let border_style = if focused {
@@ -2264,53 +2319,7 @@ fn draw_ops_dag(frame: &mut Frame, state: &AppState, theme: &Theme, area: Rect) 
         let row = &rows[row_idx];
         let row_area = Rect::new(inner.x, inner.y + i as u16, row_width, 1);
         let is_selected = row_idx == selected;
-
-        match &row.kind {
-            RowKind::Instance {
-                label,
-                detail,
-                counts,
-                collapsed,
-                ..
-            } => draw_instance_tree_row(
-                frame,
-                state,
-                theme,
-                row_idx,
-                row_area,
-                is_selected,
-                label,
-                detail,
-                counts,
-                *collapsed,
-            ),
-            RowKind::Group {
-                label, collapsed, ..
-            } => draw_group_tree_row(
-                frame,
-                state,
-                theme,
-                row_idx,
-                row_area,
-                is_selected,
-                label,
-                *collapsed,
-            ),
-            RowKind::Output { text, .. } => {
-                draw_output_tree_row(frame, state, theme, row_idx, row_area, row.depth, text)
-            }
-            RowKind::Op { op_index, expanded } => draw_op_tree_row(
-                frame,
-                state,
-                theme,
-                row_idx,
-                row_area,
-                row.depth,
-                *op_index,
-                *expanded,
-                is_selected,
-            ),
-        }
+        draw_task_tree_row(frame, state, theme, row, row_idx, row_area, is_selected);
     }
 
     draw_scrollbar(frame, theme, rows.len(), display_rows, scroll, inner);
@@ -4534,7 +4543,7 @@ mod tests {
         // `n` operations under one instance header; the pane shows 8 rows.
         let render = |n: usize| -> Vec<Option<Color>> {
             let mut state = AppState::new("http://localhost:3000", "HTTP", true);
-            state.mode = Mode::Monitor;
+            state.tasks_window_open = true;
             for i in 0..n {
                 let mut op = crate::state::Operation::new(
                     format!("op_{i}"),
@@ -4621,7 +4630,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         let theme = Theme::new(true);
         let mut state = AppState::new("http://localhost:3000", "HTTP", true);
-        state.mode = Mode::Monitor;
+        state.tasks_window_open = true;
 
         // A target left over from an earlier frame, at a rect nothing occupies.
         state.click_targets.borrow_mut().push((

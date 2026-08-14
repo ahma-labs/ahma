@@ -69,3 +69,57 @@ async fn test_initialize_missing_protocol_version_fails_fast() {
         "Expected message to mention missing protocolVersion. Got: {msg}"
     );
 }
+
+#[tokio::test]
+async fn test_initialize_with_stale_session_header_succeeds() {
+    let server = spawn_test_server()
+        .await
+        .expect("Failed to spawn test server");
+    let client = common::make_h2_client();
+
+    let initialize_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "test-stale-session-init", "version": "1.0"}
+        }
+    });
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client
+            .post(format!("{}/mcp", server.base_url()))
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .header("mcp-session-id", "stale-nonexistent-session-id-12345")
+            .json(&initialize_req)
+            .send(),
+    )
+    .await
+    .expect("Request should complete within timeout")
+    .expect("HTTP request should complete");
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "Initialize with stale session header must succeed with HTTP 200"
+    );
+
+    let session_header = resp
+        .headers()
+        .get("mcp-session-id")
+        .or_else(|| resp.headers().get("Mcp-Session-Id"))
+        .expect("Initialize response must contain mcp-session-id header");
+
+    let new_session_id = session_header
+        .to_str()
+        .expect("valid session id header string");
+    assert_ne!(
+        new_session_id, "stale-nonexistent-session-id-12345",
+        "A fresh session ID must be generated"
+    );
+    assert!(!new_session_id.is_empty(), "Session ID must not be empty");
+}

@@ -19,18 +19,6 @@ pub const LOG_RING_CAP: usize = 500;
 pub const STDOUT_TAIL_CAP: usize = 100;
 pub const CHAT_HISTORY_CAP: usize = 200;
 
-// ─── TUI mode ─────────────────────────────────────────────────────────────────
-
-/// Top-level mode of the TUI.  Switched with `/mode chat` / `/mode monitor`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Mode {
-    /// Chat-first interface: multi-line input → LLM, `/` opens command navigator.
-    #[default]
-    Chat,
-    /// Original 4-pane monitoring dashboard (AI Activity, Ops DAG, Detail, Log).
-    Monitor,
-}
-
 // ─── Liveness State Machine ───────────────────────────────────────────────────
 
 /// State of the turn's streaming liveness indicator. Each state maps to a
@@ -276,8 +264,6 @@ pub fn builtin_commands() -> Vec<NavCommand> {
     const CMDS: &[(&str, &str)] = &[
         ("/help", "show keyboard reference"),
         ("/?", "show keyboard reference (alias)"),
-        ("/mode chat", "switch to chat interface"),
-        ("/mode monitor", "switch to monitor dashboard"),
         ("/provider", "select LLM provider"),
         ("/model", "select model for current provider"),
         (
@@ -301,8 +287,12 @@ pub fn builtin_commands() -> Vec<NavCommand> {
         ),
         ("/tools", "list available ahma tools"),
         ("/skills", "list Agent Skills invocable with /<name>"),
-        ("/operations", "jump to operations panel"),
-        ("/logs", "jump to log panel"),
+        ("/tasks", "open tasks view window"),
+        ("/log", "open log view window"),
+        (
+            "/log file <path> [prompt]",
+            "start background log monitor on file",
+        ),
         ("/approve", "approve pending gate"),
         ("/reject", "reject pending gate"),
         ("/clear", "clear chat & finished windows (logs kept)"),
@@ -515,23 +505,59 @@ pub enum Focus {
 }
 
 impl Focus {
-    /// Cycle through monitor panels (skips Chat — return there with Esc).
-    pub fn cycle_next(self) -> Self {
+    /// Cycle through active panels.
+    pub fn cycle_next_active(self, tasks_open: bool, log_open: bool) -> Self {
         match self {
-            Self::Chat => Self::OpsDag,
-            Self::OpsDag => Self::Log,
+            Self::Chat => {
+                if tasks_open {
+                    Self::OpsDag
+                } else if log_open {
+                    Self::Log
+                } else {
+                    Self::Chat
+                }
+            }
+            Self::OpsDag => {
+                if log_open {
+                    Self::Log
+                } else {
+                    Self::Chat
+                }
+            }
             Self::Log => Self::Chat,
             Self::Palette => Self::Chat,
         }
     }
 
-    pub fn cycle_prev(self) -> Self {
+    pub fn cycle_prev_active(self, tasks_open: bool, log_open: bool) -> Self {
         match self {
-            Self::Chat => Self::Log,
+            Self::Chat => {
+                if log_open {
+                    Self::Log
+                } else if tasks_open {
+                    Self::OpsDag
+                } else {
+                    Self::Chat
+                }
+            }
+            Self::Log => {
+                if tasks_open {
+                    Self::OpsDag
+                } else {
+                    Self::Chat
+                }
+            }
             Self::OpsDag => Self::Chat,
-            Self::Log => Self::OpsDag,
             Self::Palette => Self::Chat,
         }
+    }
+
+    pub fn cycle_next(self) -> Self {
+        self.cycle_next_active(true, true)
+    }
+
+    pub fn cycle_prev(self) -> Self {
+        self.cycle_prev_active(true, true)
     }
 
     /// Panes that can be maximised to the full screen with `z`.
@@ -1329,8 +1355,9 @@ pub struct AppState {
     pub tools_list: Vec<crate::mcp_connections::ToolInfo>,
     pub mcp_connections: McpConnectionManager,
 
-    // ── Chat ──
-    pub mode: Mode,
+    // ── Windows & Panels ──
+    pub tasks_window_open: bool,
+    pub log_window_open: bool,
     pub chat: ChatHistory,
     /// Current text in the multi-line input box.
     #[cfg(feature = "tui")]
@@ -1786,7 +1813,8 @@ impl AppState {
             tools_list: vec![],
             mcp_connections,
 
-            mode: Mode::default(),
+            tasks_window_open: false,
+            log_window_open: false,
             chat: ChatHistory::default(),
             chat_input: TextArea::default(),
             llm_label,
