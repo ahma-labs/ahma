@@ -185,6 +185,18 @@ fn persist_resolved_grant(
 // Internal loop
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Compute the next reconnect back-off delay in seconds: doubles the current
+/// delay, capped at 30s. Shared by every wait in `run_reporter_loop` so the
+/// growth/cap policy lives in exactly one place. Deliberately a plain doubling
+/// helper rather than `retry::RetryConfig`: the loop already threads its
+/// back-off as a running `u64` seconds value (used directly in
+/// `Duration::from_secs` and in log messages), while `RetryConfig` is built
+/// around an attempt counter plus `Duration` — adopting it here would mean
+/// converting state shape for no behavioral benefit.
+fn next_backoff_secs(current: u64) -> u64 {
+    (current * 2).min(30)
+}
+
 /// Main reporter loop.  Runs until the process exits.
 async fn run_reporter_loop(
     monitor: Arc<OperationMonitor>,
@@ -215,7 +227,7 @@ async fn run_reporter_loop(
         if let Err(e) = ensure_daemon_running().await {
             warn!("daemon_reporter: daemon unavailable ({e}); retry in {backoff_secs}s");
             tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-            backoff_secs = (backoff_secs * 2).min(30);
+            backoff_secs = next_backoff_secs(backoff_secs);
             continue;
         }
 
@@ -225,7 +237,7 @@ async fn run_reporter_loop(
             Err(e) => {
                 debug!("daemon_reporter: connect failed ({e}); retry in {backoff_secs}s");
                 tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(30);
+                backoff_secs = next_backoff_secs(backoff_secs);
                 continue;
             }
         };
@@ -492,7 +504,7 @@ async fn run_reporter_loop(
 
         // Back-off before reconnect attempt.
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-        backoff_secs = (backoff_secs * 2).min(30);
+        backoff_secs = next_backoff_secs(backoff_secs);
     }
 }
 

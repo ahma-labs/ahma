@@ -95,9 +95,9 @@ async fn main() -> Result<()> {
     check_powershell_available();
 
     match subcommand {
-        Subcommands::Vault(vault_args) => {
+        Subcommands::Vault(_) => {
             tracing::info!("Dispatching vault subcommand");
-            dispatch_vault(vault_args, &settings_for_log)
+            anyhow::bail!("`ahma vault` command is no longer supported.")
         }
         Subcommands::Tui(tui_args) => {
             tracing::info!("Starting TUI control plane");
@@ -203,40 +203,6 @@ fn dispatch_tls(args: ahma_mcp::shell::TlsArgs) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Graceful degradation when an incubating feature is compiled out: the
-/// subcommand still parses, but explains how to get a build that includes it.
-///
-/// This is distinct from [`feature_disabled_at_runtime`]: editing
-/// `settings.toml` cannot enable a feature that was never compiled in, so the
-/// message must point at the build flags instead.
-#[allow(dead_code)]
-fn feature_not_compiled(subcommand: &str, feature: &str) -> Result<()> {
-    anyhow::bail!(
-        "`ahma {subcommand}` is not included in this build.\n\
-         It is an incubating feature, compiled in with:\n\
-         \n    cargo install --path ahma_bin --features {feature}\n\
-         \n(or `--features full` for all incubating features)"
-    )
-}
-
-/// Graceful message when a compiled-in feature is turned off via settings.
-#[allow(dead_code)]
-fn feature_disabled_at_runtime(subcommand: &str, setting: &str) -> Result<()> {
-    anyhow::bail!(
-        "`ahma {subcommand}` is disabled in your settings.\n\
-         Enable it in ~/.ahma/settings.toml:\n\
-         \n    [features]\n    {setting} = true\n\
-         \nOr toggle it interactively with: ahma tui → /settings"
-    )
-}
-
-fn dispatch_vault(
-    #[allow(unused_variables)] args: ahma_mcp::shell::VaultArgs,
-    #[allow(unused_variables)] settings: &ahma_common::config::AhmaSettings,
-) -> Result<()> {
-    anyhow::bail!("`ahma vault` command is no longer supported.")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

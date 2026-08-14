@@ -49,6 +49,25 @@ pub struct WebFetchResult {
     pub text: String,
 }
 
+/// Check `canonical` against a set of already-canonicalized scope roots,
+/// returning an error if it falls outside all of them. Shared by the sync
+/// and async validators, which differ only in how they canonicalize the
+/// scopes (`std::fs` vs `tokio::fs`) before calling this.
+fn check_allowed(canonical: &Path, canonical_scopes: &[PathBuf]) -> Result<()> {
+    let allowed = canonical_scopes
+        .iter()
+        .any(|scope| canonical.starts_with(scope));
+
+    if !allowed {
+        return Err(anyhow!(
+            "Path '{}' is outside allowed scopes",
+            canonical.display()
+        ));
+    }
+
+    Ok(())
+}
+
 fn validate_path_in_scopes_sync(path: &Path, scopes: &[PathBuf]) -> Result<PathBuf> {
     let canonical = if path.exists() {
         std::fs::canonicalize(path)
@@ -66,18 +85,12 @@ fn validate_path_in_scopes_sync(path: &Path, scopes: &[PathBuf]) -> Result<PathB
         return Ok(canonical);
     }
 
-    let allowed = scopes.iter().any(|s| {
-        std::fs::canonicalize(s)
-            .map(|scope| canonical.starts_with(scope))
-            .unwrap_or(false)
-    });
+    let canonical_scopes: Vec<PathBuf> = scopes
+        .iter()
+        .filter_map(|s| std::fs::canonicalize(s).ok())
+        .collect();
 
-    if !allowed {
-        return Err(anyhow!(
-            "Path '{}' is outside allowed scopes",
-            canonical.display()
-        ));
-    }
+    check_allowed(&canonical, &canonical_scopes)?;
 
     Ok(canonical)
 }
@@ -101,24 +114,14 @@ async fn validate_path_in_scopes_async(path: &Path, scopes: &[PathBuf]) -> Resul
         return Ok(canonical);
     }
 
-    let mut allowed = false;
+    let mut canonical_scopes = Vec::with_capacity(scopes.len());
     for s in scopes {
-        if tokio::fs::canonicalize(s)
-            .await
-            .map(|scope| canonical.starts_with(scope))
-            .unwrap_or(false)
-        {
-            allowed = true;
-            break;
+        if let Ok(scope) = tokio::fs::canonicalize(s).await {
+            canonical_scopes.push(scope);
         }
     }
 
-    if !allowed {
-        return Err(anyhow!(
-            "Path '{}' is outside allowed scopes",
-            canonical.display()
-        ));
-    }
+    check_allowed(&canonical, &canonical_scopes)?;
 
     Ok(canonical)
 }
@@ -228,6 +231,30 @@ pub fn file_search(scopes: &[PathBuf], base_dir: &Path, pattern: &str) -> Result
     Ok(out)
 }
 
+/// True if `path` (relative to `safe_base`) satisfies the optional include-glob.
+/// A `None` glob matches every path.
+fn path_matches_include(
+    path: &Path,
+    safe_base: &Path,
+    include_glob: Option<&glob::Pattern>,
+) -> bool {
+    let Some(g) = include_glob else {
+        return true;
+    };
+    let rel = path.strip_prefix(safe_base).unwrap_or(path);
+    g.matches_path(rel)
+}
+
+/// True if `line` satisfies the search query: regex match when `regex` is
+/// supplied, otherwise a case-insensitive substring match against the
+/// pre-lowercased query.
+fn line_matches_query(line: &str, regex: Option<&Regex>, query_lower: &str) -> bool {
+    match regex {
+        Some(r) => r.is_match(line),
+        None => line.to_lowercase().contains(query_lower),
+    }
+}
+
 pub fn grep_search(
     scopes: &[PathBuf],
     base_dir: &Path,
@@ -256,15 +283,8 @@ pub fn grep_search(
 
     for entry in WalkDir::new(&safe_base).into_iter().flatten() {
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file() || !path_matches_include(path, &safe_base, include_glob.as_ref()) {
             continue;
-        }
-
-        if let Some(g) = &include_glob {
-            let rel = path.strip_prefix(&safe_base).unwrap_or(path);
-            if !g.matches_path(rel) {
-                continue;
-            }
         }
 
         let content = match std::fs::read_to_string(path) {
@@ -273,21 +293,17 @@ pub fn grep_search(
         };
 
         for (idx, line) in content.lines().enumerate() {
-            let hit = if let Some(r) = &regex {
-                r.is_match(line)
-            } else {
-                line.to_lowercase().contains(&query_lower)
-            };
+            if !line_matches_query(line, regex.as_ref(), &query_lower) {
+                continue;
+            }
 
-            if hit {
-                matches.push(GrepMatch {
-                    path: path.to_string_lossy().to_string(),
-                    line_number: idx + 1,
-                    line: line.to_string(),
-                });
-                if matches.len() >= max {
-                    return Ok(matches);
-                }
+            matches.push(GrepMatch {
+                path: path.to_string_lossy().to_string(),
+                line_number: idx + 1,
+                line: line.to_string(),
+            });
+            if matches.len() >= max {
+                return Ok(matches);
             }
         }
     }

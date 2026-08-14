@@ -167,9 +167,25 @@ impl McpConnectionManager {
 
     pub async fn refresh_tools(&mut self) {
         self.tools_by_server.clear();
-        for server in self.servers.iter().filter(|s| s.enabled).cloned() {
-            if let Ok(tools) = self.fetch_server_tools(&server).await {
-                self.tools_by_server.insert(server.name.clone(), tools);
+        // Each server's fetch is an independent network/subprocess round-trip
+        // (HTTP init+`tools/list`, or stdio spawn+`list_tools`); fetching them
+        // concurrently keeps wall-clock time from scaling with the number of
+        // configured servers instead of summing it. `this` is a shared
+        // reference (Copy), so every future borrows `self` immutably rather
+        // than moving it, and the mutable `tools_by_server` insert below only
+        // happens after all fetches have resolved.
+        let this: &Self = self;
+        let fetches =
+            this.servers
+                .iter()
+                .filter(|s| s.enabled)
+                .map(|server| async move {
+                    (server.name.clone(), this.fetch_server_tools(server).await)
+                });
+        let results = futures::future::join_all(fetches).await;
+        for (name, result) in results {
+            if let Ok(tools) = result {
+                self.tools_by_server.insert(name, tools);
             }
         }
     }

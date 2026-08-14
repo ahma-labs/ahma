@@ -4904,53 +4904,74 @@ fn page_size_for_height(height: u16) -> f64 {
 #[cfg(feature = "tui")]
 fn handle_page_up_down(up: bool, state: &mut crate::state::AppState) {
     // A full-screen detail overlay captures paging while open.
+    if page_overlay_scroll(up, state) {
+        return;
+    }
+
+    if determine_scrolled_panel(state) == "chat" {
+        page_chat_scroll(up, state);
+    } else {
+        page_log_scroll(up, state);
+    }
+}
+
+/// Pages a full-screen detail overlay's scroll offset, if one is open.
+/// Returns `false` (and does nothing) when no overlay is capturing paging.
+#[cfg(feature = "tui")]
+fn page_overlay_scroll(up: bool, state: &mut crate::state::AppState) -> bool {
     let detail_max = state.detail_max_scroll.get();
     let overlay_scroll = match &mut state.modal {
         crate::state::ModalState::OperationDetail(d) => Some(&mut d.scroll),
         crate::state::ModalState::LogLineDetail(d) => Some(&mut d.scroll),
         _ => None,
     };
-    if let Some(scroll) = overlay_scroll {
-        let page = 10;
-        *scroll = if up {
-            scroll.saturating_sub(page)
-        } else {
-            (*scroll + page).min(detail_max)
-        };
+    let Some(scroll) = overlay_scroll else {
+        return false;
+    };
+    let page = 10;
+    *scroll = if up {
+        scroll.saturating_sub(page)
+    } else {
+        (*scroll + page).min(detail_max)
+    };
+    true
+}
+
+/// Chat: up scrolls forward (higher offset), down scrolls back.
+#[cfg(feature = "tui")]
+fn page_chat_scroll(up: bool, state: &mut crate::state::AppState) {
+    let page_size = page_size_for_height(state.chat_area.get().height);
+    let max_scroll = state.chat_max_scroll.get() as f64;
+    let current = state.chat_scroll_target.get();
+    let new_target = if up {
+        (current + page_size).min(max_scroll)
+    } else {
+        (current - page_size).max(0.0)
+    };
+    state.chat_scroll_target.set(new_target);
+}
+
+/// Log: up scrolls back (lower offset), down scrolls forward.
+#[cfg(feature = "tui")]
+fn page_log_scroll(up: bool, state: &mut crate::state::AppState) {
+    let page_size = page_size_for_height(state.log_area.get().height);
+    let max_scroll = state.log_max_scroll.get() as f64;
+    if up {
+        // Detach follow and page up from the current bottom.
+        state.detach_log_follow();
+        let current = state.log_scroll_target.get();
+        state.log_scroll_target.set((current - page_size).max(0.0));
         return;
     }
-
-    let panel = determine_scrolled_panel(state);
-
-    if panel == "chat" {
-        // Chat: up scrolls forward (higher offset), down scrolls back.
-        let page_size = page_size_for_height(state.chat_area.get().height);
-        let max_scroll = state.chat_max_scroll.get() as f64;
-        let current = state.chat_scroll_target.get();
-        let new_target = if up {
-            (current + page_size).min(max_scroll)
-        } else {
-            (current - page_size).max(0.0)
-        };
-        state.chat_scroll_target.set(new_target);
-    } else {
-        // Log: up scrolls back (lower offset), down scrolls forward.
-        let page_size = page_size_for_height(state.log_area.get().height);
-        let max_scroll = state.log_max_scroll.get() as f64;
-        if up {
-            // Detach follow and page up from the current bottom.
-            state.detach_log_follow();
-            let current = state.log_scroll_target.get();
-            state.log_scroll_target.set((current - page_size).max(0.0));
-        } else if !state.log_follow {
-            let current = state.log_scroll_target.get();
-            let new_target = (current + page_size).min(max_scroll);
-            state.log_scroll_target.set(new_target);
-            // Paging down to the bottom re-engages tail-follow.
-            if new_target >= max_scroll {
-                state.log_follow = true;
-            }
-        }
+    if state.log_follow {
+        return;
+    }
+    let current = state.log_scroll_target.get();
+    let new_target = (current + page_size).min(max_scroll);
+    state.log_scroll_target.set(new_target);
+    // Paging down to the bottom re-engages tail-follow.
+    if new_target >= max_scroll {
+        state.log_follow = true;
     }
 }
 

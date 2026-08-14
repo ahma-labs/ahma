@@ -695,17 +695,24 @@ fn is_ahma_hooks_active() -> bool {
 /// `Some(true)` = forced on, `Some(false)` = forced off, `None` = auto.
 static HOOKS_MODE_OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
 
+/// Parse an on/off flag value shared by the `--hooks` CLI flag and the
+/// `AHMA_HOOKS` env var, so the two entry points can never drift out of sync
+/// on which synonyms they accept. Returns `None` for `"auto"` and anything
+/// else unrecognised.
+fn parse_on_off_flag(value: &str) -> Option<bool> {
+    match value.to_lowercase().as_str() {
+        "off" | "0" | "false" | "no" => Some(false),
+        "on" | "1" | "true" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
 /// Set hooks behaviour from the `--hooks on|off|auto` CLI flag.
 /// Call once, early in startup. Takes precedence over `AHMA_HOOKS` /
 /// `AHMA_DISABLE_HOOKS` (which remain supported because hook subprocesses
 /// can only be configured through the environment).
 pub fn set_hooks_mode_override(mode: &str) {
-    let parsed = match mode.to_lowercase().as_str() {
-        "off" | "0" | "false" | "no" => Some(false),
-        "on" | "1" | "true" | "yes" => Some(true),
-        _ => None, // "auto" and anything else
-    };
-    let _ = HOOKS_MODE_OVERRIDE.set(parsed);
+    let _ = HOOKS_MODE_OVERRIDE.set(parse_on_off_flag(mode));
 }
 
 /// Testable core of [`is_ahma_hooks_active`].
@@ -728,12 +735,13 @@ fn describe_activation(active_mcps: &[PathBuf]) -> (bool, String) {
             format!("--hooks {} flag", if *forced { "on" } else { "off" }),
         );
     }
-    if let Ok(val) = std::env::var("AHMA_HOOKS") {
-        match val.to_lowercase().as_str() {
-            "off" | "0" | "false" | "no" => return (false, "AHMA_HOOKS=off".to_string()),
-            "on" | "1" | "true" | "yes" => return (true, "AHMA_HOOKS=on".to_string()),
-            _ => {}
-        }
+    if let Ok(val) = std::env::var("AHMA_HOOKS")
+        && let Some(forced) = parse_on_off_flag(&val)
+    {
+        return (
+            forced,
+            format!("AHMA_HOOKS={}", if forced { "on" } else { "off" }),
+        );
     }
     if std::env::var("AHMA_DISABLE_HOOKS")
         .ok()

@@ -573,27 +573,53 @@ impl Adapter {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let child = match cmd.spawn() {
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
             }
         };
-        // Capture the pid before `wait_with_output` consumes `child`.
-        #[cfg(unix)]
-        let child_pid = child.id();
 
-        let output_res = tokio::time::timeout(timeout, child.wait_with_output()).await;
+        // Read stdout/stderr concurrently with `wait()` (not after `wait()`
+        // returns) so a chatty child can't fill the pipe buffer and deadlock —
+        // the same guarantee `wait_with_output()` gave us. We can no longer use
+        // `wait_with_output()` itself, though: it consumes `child` by value, and
+        // on timeout the cancelled future would drop (and silently orphan) the
+        // child instead of letting us route the kill through the shared
+        // `kill_process_tree` chokepoint below, so `child` has to stay owned
+        // here.
+        let stdout_pipe = child.stdout.take().expect("stdout piped");
+        let stderr_pipe = child.stderr.take().expect("stderr piped");
+        let stdout_task: JoinHandle<std::io::Result<Vec<u8>>> = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut stdout_pipe = stdout_pipe;
+            tokio::io::AsyncReadExt::read_to_end(&mut stdout_pipe, &mut buf).await?;
+            Ok(buf)
+        });
+        let stderr_task: JoinHandle<std::io::Result<Vec<u8>>> = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut stderr_pipe = stderr_pipe;
+            tokio::io::AsyncReadExt::read_to_end(&mut stderr_pipe, &mut buf).await?;
+            Ok(buf)
+        });
 
-        let output = match output_res {
+        let wait_res = tokio::time::timeout(timeout, child.wait()).await;
+
+        let output = match wait_res {
             Err(_) => {
-                // Kill the entire process group so build descendants don't orphan.
-                #[cfg(unix)]
-                if let Some(pid) = child_pid {
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGKILL);
-                    }
+                // Kill the entire process group so build descendants don't
+                // orphan — the same cross-crate chokepoint
+                // (`shell_pool::kill_process_tree`) the async streaming path
+                // uses, which additionally confirms the reap and supports
+                // Windows Job Objects.
+                if !kill_process_tree(&mut child).await {
+                    tracing::warn!(
+                        "run_sync_prepared: operation {} timed out but its process did not reap cleanly",
+                        op_id
+                    );
                 }
+                stdout_task.abort();
+                stderr_task.abort();
                 return SyncRun {
                     outcome: audit::Outcome::TimedOut,
                     exit_code: None,
@@ -606,7 +632,26 @@ impl Adapter {
             Ok(Err(e)) => {
                 return SyncRun::failed(anyhow::anyhow!("Command execution failed: {}", e));
             }
-            Ok(Ok(output)) => output,
+            Ok(Ok(status)) => {
+                // The child has exited, so its pipes are at (or imminently
+                // reaching) EOF; these joins are not a second wait for the
+                // process itself.
+                let stdout = stdout_task
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                let stderr = stderr_task
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                }
+            }
         };
 
         // A non-zero exit may be a runtime sandbox denial the kernel did not name;

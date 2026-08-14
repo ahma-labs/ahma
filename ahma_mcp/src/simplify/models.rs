@@ -122,13 +122,19 @@ impl FunctionHotspot {
                 hotspots.push(Self::from_space_entry(entry));
             }
         });
+        Self::sort_and_truncate(&mut hotspots);
+        hotspots
+    }
+
+    /// Sorts hotspots by cognitive complexity descending, then truncates to
+    /// [`MAX_HOTSPOTS`].
+    fn sort_and_truncate(hotspots: &mut Vec<FunctionHotspot>) {
         hotspots.sort_by(|a, b| {
             b.cognitive
                 .partial_cmp(&a.cognitive)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         hotspots.truncate(Self::MAX_HOTSPOTS);
-        hotspots
     }
 
     fn from_space_entry(entry: &SpaceEntry) -> FunctionHotspot {
@@ -191,12 +197,7 @@ impl FunctionHotspot {
             }
         }
         let mut hotspots: Vec<FunctionHotspot> = map.into_values().collect();
-        hotspots.sort_by(|a, b| {
-            b.cognitive
-                .partial_cmp(&a.cognitive)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        hotspots.truncate(Self::MAX_HOTSPOTS);
+        Self::sort_and_truncate(&mut hotspots);
         hotspots
     }
 }

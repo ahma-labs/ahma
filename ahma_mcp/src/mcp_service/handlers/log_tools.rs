@@ -30,13 +30,20 @@ impl AhmaMcpService {
         _args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
         let log_dir = project_log_dir();
-        let scopes = self.adapter.sandbox().scopes();
+        // Materialize the scopes into an owned Vec before the `.await` below —
+        // `ScopesGuard` wraps a `std::sync::RwLockReadGuard`, which is not `Send`,
+        // so it must not be held live across an await point.
+        let scopes: Vec<PathBuf> = {
+            let guard = self.adapter.sandbox().scopes();
+            guard.to_vec()
+        };
         let exceptions = if let Some(primary) = scopes.first() {
             crate::sandbox::load_exceptions(primary)
         } else {
             vec![]
         };
         let sources = collect_log_sources(&log_dir, &scopes, &exceptions)
+            .await
             .map_err(|e| mcp_internal(e.to_string()))?;
         let json = serde_json::to_string_pretty(&sources).unwrap_or_else(|_| "[]".to_string());
         Ok(text_result(json))
@@ -61,13 +68,14 @@ impl AhmaMcpService {
         let log_dir = project_log_dir();
         let symlink_path = log_dir.join(file_name);
 
-        if !symlink_path.exists() {
+        if !tokio::fs::try_exists(&symlink_path).await.unwrap_or(false) {
             return Err(mcp_invalid_params(format!(
                 "Log file '{file_name}' does not exist"
             )));
         }
 
-        let meta = std::fs::symlink_metadata(&symlink_path)
+        let meta = tokio::fs::symlink_metadata(&symlink_path)
+            .await
             .map_err(|e| mcp_internal(format!("Failed to read symlink metadata: {e}")))?;
 
         if !meta.file_type().is_symlink() {
@@ -76,10 +84,12 @@ impl AhmaMcpService {
             )));
         }
 
-        let target = std::fs::read_link(&symlink_path)
+        let target = tokio::fs::read_link(&symlink_path)
+            .await
             .map_err(|e| mcp_internal(format!("Failed to read symlink target: {e}")))?;
 
-        let canonical_target = dunce::canonicalize(log_dir.join(&target))
+        let canonical_target = canonicalize_dunce(log_dir.join(&target))
+            .await
             .map_err(|e| mcp_internal(format!("Failed to canonicalize target path: {e}")))?;
 
         let primary_root = self
@@ -107,7 +117,7 @@ impl AhmaMcpService {
         args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
         let log_dir = project_log_dir();
-        let file = require_safe_log_path(&args, &log_dir)?;
+        let file = require_safe_log_path(&args, &log_dir).await?;
 
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
         let limit = args
@@ -119,6 +129,7 @@ impl AhmaMcpService {
         let raw = args.get("raw").and_then(Value::as_bool).unwrap_or(false);
 
         let content = read_log_window(&file, offset, limit, raw)
+            .await
             .map_err(|e| mcp_internal(format!("Failed to read {}: {e}", file.display())))?;
 
         Ok(text_result(content))
@@ -130,7 +141,7 @@ impl AhmaMcpService {
         args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
         let log_dir = project_log_dir();
-        let file = require_safe_log_path(&args, &log_dir)?;
+        let file = require_safe_log_path(&args, &log_dir).await?;
 
         let pattern = args
             .get("pattern")
@@ -149,6 +160,7 @@ impl AhmaMcpService {
             .unwrap_or(false);
 
         let results = search_log_file(&file, pattern, max_results, raw, case_sensitive)
+            .await
             .map_err(|e| mcp_internal(format!("Search failed on {}: {e}", file.display())))?;
 
         Ok(text_result(results))
@@ -270,7 +282,10 @@ pub fn logs_approve_schema() -> Arc<Map<String, Value>> {
 /// Validates and resolves a caller-supplied log file name into a safe absolute path.
 ///
 /// Rejects absolute paths, path separators, and traversals that escape the log directory.
-fn require_safe_log_path(args: &Map<String, Value>, log_dir: &Path) -> Result<PathBuf, McpError> {
+async fn require_safe_log_path(
+    args: &Map<String, Value>,
+    log_dir: &Path,
+) -> Result<PathBuf, McpError> {
     let file_name = args
         .get("file")
         .and_then(Value::as_str)
@@ -287,7 +302,7 @@ fn require_safe_log_path(args: &Map<String, Value>, log_dir: &Path) -> Result<Pa
 
     // Canonicalize both and ensure candidate is inside log_dir.
     // If the log_dir doesn't exist yet, return a descriptive error.
-    let canonical_dir = std::fs::canonicalize(log_dir).map_err(|_| {
+    let canonical_dir = tokio::fs::canonicalize(log_dir).await.map_err(|_| {
         mcp_internal(format!(
             "Log directory '{}' does not exist",
             log_dir.display()
@@ -295,15 +310,18 @@ fn require_safe_log_path(args: &Map<String, Value>, log_dir: &Path) -> Result<Pa
     })?;
 
     // For the candidate we canonicalize the parent (since the file may or may not exist).
-    let canonical_candidate = if candidate.exists() {
-        std::fs::canonicalize(&candidate).map_err(|e| mcp_internal(e.to_string()))?
+    let canonical_candidate = if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+        tokio::fs::canonicalize(&candidate)
+            .await
+            .map_err(|e| mcp_internal(e.to_string()))?
     } else {
         // File doesn't exist — still validate the parent is safe.
         let parent = candidate
             .parent()
             .ok_or_else(|| mcp_internal("Could not determine parent directory"))?;
-        let canonical_parent =
-            std::fs::canonicalize(parent).map_err(|_| mcp_internal("Invalid path"))?;
+        let canonical_parent = tokio::fs::canonicalize(parent)
+            .await
+            .map_err(|_| mcp_internal("Invalid path"))?;
         if !canonical_parent.starts_with(&canonical_dir) {
             return Err(mcp_invalid_params(format!(
                 "Log file '{file_name}' is outside the log directory"
@@ -335,13 +353,21 @@ pub struct LogFileInfo {
     pub is_approved: bool,
 }
 
+/// Canonicalizes `path` via `dunce::canonicalize` on a blocking task, since
+/// `dunce` has no async API (mirrors `path_security::canonicalize_simplified`).
+async fn canonicalize_dunce(path: PathBuf) -> std::io::Result<PathBuf> {
+    tokio::task::spawn_blocking(move || dunce::canonicalize(path))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 /// Scans the log directory and returns metadata for each log file.
-fn collect_log_sources(
+async fn collect_log_sources(
     log_dir: &Path,
     scopes: &[PathBuf],
     exceptions: &[PathBuf],
 ) -> anyhow::Result<Vec<LogFileInfo>> {
-    if !log_dir.exists() {
+    if !tokio::fs::try_exists(log_dir).await.unwrap_or(false) {
         return Ok(vec![]);
     }
 
@@ -349,65 +375,74 @@ fn collect_log_sources(
     // (e.g. ahma.log → ahma.log.2026-06-15). A symlink whose resolved target
     // stays inside this directory is always safe regardless of sandbox scope —
     // it was created by ahma's own rotation code, not an external actor.
-    let canonical_log_dir = dunce::canonicalize(log_dir).unwrap_or_else(|_| log_dir.to_path_buf());
+    let canonical_log_dir = canonicalize_dunce(log_dir.to_path_buf())
+        .await
+        .unwrap_or_else(|_| log_dir.to_path_buf());
 
-    let mut sources: Vec<LogFileInfo> = std::fs::read_dir(log_dir)?
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let meta = std::fs::symlink_metadata(&path).ok()?;
+    let mut sources: Vec<LogFileInfo> = Vec::new();
+    let mut read_dir = tokio::fs::read_dir(log_dir).await?;
+    while let Ok(Some(entry)) = read_dir.next_entry().await {
+        let path = entry.path();
+        let Ok(meta) = tokio::fs::symlink_metadata(&path).await else {
+            continue;
+        };
 
-            let is_symlink = meta.file_type().is_symlink();
-            let mut symlink_target = None;
-            let mut is_approved = true;
+        let is_symlink = meta.file_type().is_symlink();
+        let mut symlink_target = None;
+        let mut is_approved = true;
 
-            if is_symlink {
-                if let Ok(target) = std::fs::read_link(&path) {
-                    symlink_target = Some(target.display().to_string());
-                    if let Ok(canonical_target) = dunce::canonicalize(log_dir.join(&target)) {
-                        // Symlink pointing within the managed log directory is always
-                        // approved — apply the sandbox check only for targets that escape it.
-                        if canonical_target.starts_with(&canonical_log_dir) {
-                            is_approved = true;
-                        } else {
-                            is_approved = crate::sandbox::is_target_allowed(
-                                &canonical_target,
-                                scopes,
-                                exceptions,
-                            );
-                        }
+        if is_symlink {
+            if let Ok(target) = tokio::fs::read_link(&path).await {
+                symlink_target = Some(target.display().to_string());
+                if let Ok(canonical_target) = canonicalize_dunce(log_dir.join(&target)).await {
+                    // Symlink pointing within the managed log directory is always
+                    // approved — apply the sandbox check only for targets that escape it.
+                    if canonical_target.starts_with(&canonical_log_dir) {
+                        is_approved = true;
                     } else {
-                        is_approved = false;
+                        is_approved = crate::sandbox::is_target_allowed(
+                            &canonical_target,
+                            scopes,
+                            exceptions,
+                        );
                     }
                 } else {
                     is_approved = false;
                 }
+            } else {
+                is_approved = false;
             }
+        }
 
-            // For size/modified use the real file metadata (follows symlink).
-            let real_meta = std::fs::metadata(&path).ok()?;
-            if !real_meta.is_file() {
-                return None;
-            }
+        // For size/modified use the real file metadata (follows symlink).
+        let Ok(real_meta) = tokio::fs::metadata(&path).await else {
+            continue;
+        };
+        if !real_meta.is_file() {
+            continue;
+        }
 
-            let modified = real_meta.modified().ok().and_then(|t| {
-                let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-                // Format as ISO-8601 UTC using chrono.
-                let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)?;
-                Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-            });
+        let modified = real_meta.modified().ok().and_then(|t| {
+            let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            // Format as ISO-8601 UTC using chrono.
+            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)?;
+            Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        });
 
-            Some(LogFileInfo {
-                name: path.file_name()?.to_string_lossy().to_string(),
-                path: path.display().to_string(),
-                size_bytes: real_meta.len(),
-                modified,
-                is_symlink,
-                symlink_target,
-                is_approved,
-            })
-        })
-        .collect();
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+
+        sources.push(LogFileInfo {
+            name: name.to_string_lossy().to_string(),
+            path: path.display().to_string(),
+            size_bytes: real_meta.len(),
+            modified,
+            is_symlink,
+            symlink_target,
+            is_approved,
+        });
+    }
 
     // Sort: symlinks first, then by modified descending (most recent first).
     sources.sort_by(|a, b| {
@@ -420,16 +455,38 @@ fn collect_log_sources(
 }
 
 /// Reads `limit` lines starting at `offset` from the given file.
-fn read_log_window(path: &Path, offset: usize, limit: usize, raw: bool) -> anyhow::Result<String> {
-    use std::io::{BufRead, BufReader};
-    let file = std::fs::File::open(path)?;
-    let reader = BufReader::new(file);
-    let lines: Vec<String> = reader
-        .lines()
-        .skip(offset)
-        .take(limit)
-        .map(|l| l.unwrap_or_default())
-        .collect();
+async fn read_log_window(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+    raw: bool,
+) -> anyhow::Result<String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let file = tokio::fs::File::open(path).await?;
+    let mut line_stream = BufReader::new(file).lines();
+
+    // Mirrors the previous `.skip(offset).take(limit)` semantics: every yielded
+    // line (including ones that failed to decode, which become an empty string,
+    // matching the prior `.unwrap_or_default()`) counts toward the offset.
+    let mut lines: Vec<String> = Vec::new();
+    let mut index = 0usize;
+    while lines.len() < limit {
+        match line_stream.next_line().await {
+            Ok(Some(line)) => {
+                if index >= offset {
+                    lines.push(line);
+                }
+                index += 1;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                if index >= offset {
+                    lines.push(String::new());
+                }
+                index += 1;
+            }
+        }
+    }
 
     let output = if raw {
         lines.join("\n")
@@ -444,16 +501,16 @@ fn read_log_window(path: &Path, offset: usize, limit: usize, raw: bool) -> anyho
 }
 
 /// Searches `path` for lines containing `pattern`, returning up to `max_results` matches.
-fn search_log_file(
+async fn search_log_file(
     path: &Path,
     pattern: &str,
     max_results: usize,
     raw: bool,
     case_sensitive: bool,
 ) -> anyhow::Result<String> {
-    use std::io::{BufRead, BufReader};
-    let file = std::fs::File::open(path)?;
-    let reader = BufReader::new(file);
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let file = tokio::fs::File::open(path).await?;
+    let mut line_stream = BufReader::new(file).lines();
 
     let needle = if case_sensitive {
         pattern.to_owned()
@@ -462,8 +519,13 @@ fn search_log_file(
     };
 
     let mut results = Vec::with_capacity(max_results.min(100));
-    for (line_no, line) in reader.lines().enumerate() {
-        let line = line.unwrap_or_default();
+    let mut line_no = 0usize;
+    loop {
+        let line = match line_stream.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(_) => String::new(),
+        };
         let haystack = if case_sensitive {
             line.clone()
         } else {
@@ -480,6 +542,7 @@ fn search_log_file(
                 break;
             }
         }
+        line_no += 1;
     }
 
     if results.is_empty() {
@@ -504,11 +567,11 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn test_collect_log_sources() {
+    #[tokio::test]
+    async fn test_collect_log_sources() {
         let dir = tempdir().unwrap();
         // empty dir
-        let sources = collect_log_sources(dir.path(), &[], &[]).unwrap();
+        let sources = collect_log_sources(dir.path(), &[], &[]).await.unwrap();
         assert!(sources.is_empty());
 
         // write some files
@@ -519,7 +582,7 @@ mod tests {
         std::fs::write(&f1, "hello").unwrap();
         std::fs::write(&f2, "world").unwrap();
 
-        let sources = collect_log_sources(dir.path(), &[], &[]).unwrap();
+        let sources = collect_log_sources(dir.path(), &[], &[]).await.unwrap();
         assert_eq!(sources.len(), 2);
         // Assert we have both filenames
         let names: Vec<String> = sources.iter().map(|s| s.name.clone()).collect();
@@ -531,8 +594,8 @@ mod tests {
     /// be approved even when no sandbox scopes are configured.  Its target stays
     /// inside the same managed log directory, so it cannot be an exfil vector.
     #[cfg(unix)]
-    #[test]
-    fn managed_symlink_within_log_dir_is_always_approved() {
+    #[tokio::test]
+    async fn managed_symlink_within_log_dir_is_always_approved() {
         use std::os::unix::fs::symlink;
         let dir = tempdir().unwrap();
         let dated = dir.path().join("ahma.log.2026-06-15");
@@ -541,7 +604,7 @@ mod tests {
         symlink("ahma.log.2026-06-15", dir.path().join("ahma.log")).unwrap();
 
         // Empty scopes: without fix A this would set is_approved=false.
-        let sources = collect_log_sources(dir.path(), &[], &[]).unwrap();
+        let sources = collect_log_sources(dir.path(), &[], &[]).await.unwrap();
         let symlink_entry = sources.iter().find(|s| s.name == "ahma.log").unwrap();
         assert!(
             symlink_entry.is_symlink,
@@ -556,8 +619,8 @@ mod tests {
     /// A symlink in the log directory whose target escapes to an external path must
     /// still require scope/exception approval (the security check is preserved).
     #[cfg(unix)]
-    #[test]
-    fn symlink_escaping_log_dir_requires_scope_approval() {
+    #[tokio::test]
+    async fn symlink_escaping_log_dir_requires_scope_approval() {
         use std::os::unix::fs::symlink;
         let log_dir = tempdir().unwrap();
         let external = tempdir().unwrap();
@@ -568,7 +631,7 @@ mod tests {
         symlink(&external_file, log_dir.path().join("escape.log")).unwrap();
 
         // No scopes, no exceptions → must be blocked.
-        let sources = collect_log_sources(log_dir.path(), &[], &[]).unwrap();
+        let sources = collect_log_sources(log_dir.path(), &[], &[]).await.unwrap();
         let entry = sources.iter().find(|s| s.name == "escape.log");
         if let Some(entry) = entry {
             assert!(
@@ -580,58 +643,68 @@ mod tests {
         // that is also a safe outcome.
     }
 
-    #[test]
-    fn test_read_log_window() {
+    #[tokio::test]
+    async fn test_read_log_window() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("test.log");
         std::fs::write(&file, "line 1\npassword=secret123\nline 3").unwrap();
 
         // test normal read (redacted)
-        let content = read_log_window(&file, 0, 10, false).unwrap();
+        let content = read_log_window(&file, 0, 10, false).await.unwrap();
         assert!(content.contains("line 1"));
         assert!(content.contains("password="));
         assert!(!content.contains("secret123")); // should be redacted
         assert!(content.contains("line 3"));
 
         // test raw read
-        let content_raw = read_log_window(&file, 0, 10, true).unwrap();
+        let content_raw = read_log_window(&file, 0, 10, true).await.unwrap();
         assert!(content_raw.contains("secret123")); // should not be redacted
 
         // test offset/limit
-        let window = read_log_window(&file, 1, 1, true).unwrap();
+        let window = read_log_window(&file, 1, 1, true).await.unwrap();
         assert_eq!(window, "password=secret123");
     }
 
-    #[test]
-    fn test_search_log_file() {
+    #[tokio::test]
+    async fn test_search_log_file() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("test.log");
         std::fs::write(&file, "Apple\nbanana\npassword=secret").unwrap();
 
         // Case insensitive search
-        let res = search_log_file(&file, "apple", 10, false, false).unwrap();
+        let res = search_log_file(&file, "apple", 10, false, false)
+            .await
+            .unwrap();
         assert!(res.contains("Apple"));
 
         // Case sensitive search
-        let res_sens = search_log_file(&file, "apple", 10, false, true).unwrap();
+        let res_sens = search_log_file(&file, "apple", 10, false, true)
+            .await
+            .unwrap();
         assert!(res_sens.contains("No lines matching"));
 
         // Limit results
         std::fs::write(&file, "apple\napple\napple").unwrap();
-        let res_limit = search_log_file(&file, "apple", 2, false, false).unwrap();
+        let res_limit = search_log_file(&file, "apple", 2, false, false)
+            .await
+            .unwrap();
         assert!(res_limit.contains("2 match(es)"));
 
         // Redaction
         std::fs::write(&file, "password=secret").unwrap();
-        let res_redact = search_log_file(&file, "password", 10, false, false).unwrap();
+        let res_redact = search_log_file(&file, "password", 10, false, false)
+            .await
+            .unwrap();
         assert!(!res_redact.contains("secret"));
 
-        let res_raw = search_log_file(&file, "password", 10, true, false).unwrap();
+        let res_raw = search_log_file(&file, "password", 10, true, false)
+            .await
+            .unwrap();
         assert!(res_raw.contains("secret"));
     }
 
-    #[test]
-    fn test_require_safe_log_path() {
+    #[tokio::test]
+    async fn test_require_safe_log_path() {
         let dir = tempdir().unwrap();
         let log_dir = dir.path();
         let file_path = log_dir.join("test.log");
@@ -643,20 +716,20 @@ mod tests {
         // 1. Safe path inside
         let mut args = Map::new();
         args.insert("file".to_string(), Value::String("test.log".to_string()));
-        let res = require_safe_log_path(&args, &canonical_dir);
+        let res = require_safe_log_path(&args, &canonical_dir).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), std::fs::canonicalize(&file_path).unwrap());
 
         // 2. Absolute path rejection
         let mut args = Map::new();
         args.insert("file".to_string(), Value::String("/etc/passwd".to_string()));
-        let res = require_safe_log_path(&args, &canonical_dir);
+        let res = require_safe_log_path(&args, &canonical_dir).await;
         assert!(res.is_err());
 
         // 3. Traversal rejection (starts with dot or contains slashes)
         let mut args = Map::new();
         args.insert("file".to_string(), Value::String("../passwd".to_string()));
-        let res = require_safe_log_path(&args, &canonical_dir);
+        let res = require_safe_log_path(&args, &canonical_dir).await;
         assert!(res.is_err());
 
         // 4. Missing file returns error
@@ -665,7 +738,7 @@ mod tests {
             "file".to_string(),
             Value::String("nonexistent.log".to_string()),
         );
-        let res = require_safe_log_path(&args, &canonical_dir);
+        let res = require_safe_log_path(&args, &canonical_dir).await;
         assert!(res.is_err());
         assert!(res.unwrap_err().message.contains("does not exist"));
     }
@@ -804,23 +877,25 @@ mod tests {
     // require_safe_log_path — additional branches
     // ─────────────────────────────────────────────────────────────────────
 
-    #[test]
-    fn require_safe_log_path_missing_arg_errors() {
+    #[tokio::test]
+    async fn require_safe_log_path_missing_arg_errors() {
         let dir = tempdir().unwrap();
         let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
         let args = Map::new(); // no "file" key
-        let err = require_safe_log_path(&args, &canonical_dir).unwrap_err();
+        let err = require_safe_log_path(&args, &canonical_dir)
+            .await
+            .unwrap_err();
         assert!(err.message.contains("'file' parameter is required"));
     }
 
-    #[test]
-    fn require_safe_log_path_nonexistent_log_dir_errors() {
+    #[tokio::test]
+    async fn require_safe_log_path_nonexistent_log_dir_errors() {
         // A valid plain filename but the log directory itself does not exist.
         let dir = tempdir().unwrap();
         let missing = dir.path().join("does-not-exist-subdir");
         let mut args = Map::new();
         args.insert("file".to_string(), Value::String("ahma.log".to_string()));
-        let err = require_safe_log_path(&args, &missing).unwrap_err();
+        let err = require_safe_log_path(&args, &missing).await.unwrap_err();
         assert!(
             err.message.contains("does not exist"),
             "expected missing-log-dir error, got: {}",
@@ -832,8 +907,8 @@ mod tests {
     /// must be rejected as "outside the log directory" (covers the existing-file
     /// canonicalisation escape branch).
     #[cfg(unix)]
-    #[test]
-    fn require_safe_log_path_existing_symlink_escaping_dir_rejected() {
+    #[tokio::test]
+    async fn require_safe_log_path_existing_symlink_escaping_dir_rejected() {
         use std::os::unix::fs::symlink;
         let log_dir = tempdir().unwrap();
         let external = tempdir().unwrap();
@@ -844,7 +919,9 @@ mod tests {
         let canonical_dir = std::fs::canonicalize(log_dir.path()).unwrap();
         let mut args = Map::new();
         args.insert("file".to_string(), Value::String("escape.log".to_string()));
-        let err = require_safe_log_path(&args, &canonical_dir).unwrap_err();
+        let err = require_safe_log_path(&args, &canonical_dir)
+            .await
+            .unwrap_err();
         assert!(
             err.message.contains("outside the log directory"),
             "expected outside-dir rejection, got: {}",
@@ -856,33 +933,37 @@ mod tests {
     // read_log_window / search_log_file — additional edge cases
     // ─────────────────────────────────────────────────────────────────────
 
-    #[test]
-    fn read_log_window_offset_beyond_eof_and_zero_limit() {
+    #[tokio::test]
+    async fn read_log_window_offset_beyond_eof_and_zero_limit() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("edge.log");
         std::fs::write(&file, "a\nb\nc").unwrap();
 
         // Offset past the end → empty string.
-        let beyond = read_log_window(&file, 100, 10, true).unwrap();
+        let beyond = read_log_window(&file, 100, 10, true).await.unwrap();
         assert_eq!(beyond, "");
 
         // Zero limit → no lines.
-        let none = read_log_window(&file, 0, 0, false).unwrap();
+        let none = read_log_window(&file, 0, 0, false).await.unwrap();
         assert_eq!(none, "");
     }
 
-    #[test]
-    fn search_log_file_no_match_and_special_chars() {
+    #[tokio::test]
+    async fn search_log_file_no_match_and_special_chars() {
         let dir = tempdir().unwrap();
         let file = dir.path().join("special.log");
         std::fs::write(&file, "value = (a+b)*c\nplain line").unwrap();
 
         // Absent pattern → "No lines matching".
-        let miss = search_log_file(&file, "zzz-not-here", 10, true, false).unwrap();
+        let miss = search_log_file(&file, "zzz-not-here", 10, true, false)
+            .await
+            .unwrap();
         assert!(miss.contains("No lines matching"));
 
         // Regex-special chars are treated literally (substring match).
-        let hit = search_log_file(&file, "(a+b)*c", 10, true, false).unwrap();
+        let hit = search_log_file(&file, "(a+b)*c", 10, true, false)
+            .await
+            .unwrap();
         assert!(hit.contains("1 match(es)"));
         assert!(hit.contains("(a+b)*c"));
     }
@@ -891,18 +972,18 @@ mod tests {
     // collect_log_sources — additional branches
     // ─────────────────────────────────────────────────────────────────────
 
-    #[test]
-    fn collect_log_sources_missing_dir_returns_empty() {
+    #[tokio::test]
+    async fn collect_log_sources_missing_dir_returns_empty() {
         let dir = tempdir().unwrap();
         let missing = dir.path().join("no-such-dir");
-        let sources = collect_log_sources(&missing, &[], &[]).unwrap();
+        let sources = collect_log_sources(&missing, &[], &[]).await.unwrap();
         assert!(sources.is_empty());
     }
 
     /// A dangling symlink (target does not resolve) is reported but not approved.
     #[cfg(unix)]
-    #[test]
-    fn collect_log_sources_dangling_symlink_not_approved() {
+    #[tokio::test]
+    async fn collect_log_sources_dangling_symlink_not_approved() {
         use std::os::unix::fs::symlink;
         let dir = tempdir().unwrap();
         // Also include a real file so the dir is non-trivial.
@@ -913,7 +994,7 @@ mod tests {
         )
         .unwrap();
 
-        let sources = collect_log_sources(dir.path(), &[], &[]).unwrap();
+        let sources = collect_log_sources(dir.path(), &[], &[]).await.unwrap();
         // The dangling symlink's real metadata cannot be read, so the entry is
         // dropped entirely (std::fs::metadata follows the broken link and fails).
         // The real file must still be present and approved.

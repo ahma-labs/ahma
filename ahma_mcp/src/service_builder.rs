@@ -50,8 +50,6 @@ pub struct BuiltService {
     pub operation_monitor: Arc<OperationMonitor>,
     /// How long to wait for in-flight operations during graceful shutdown.
     pub shutdown_timeout: Duration,
-    /// Number of tool configurations that passed availability checks.
-    pub loaded_tools_count: usize,
     /// The final tool configurations after availability filtering.
     ///
     /// Provided for callers (e.g. CLI mode) that need direct config access
@@ -224,7 +222,6 @@ impl<'a> ServiceBuilder<'a> {
 
         log_loaded_tools(&configs, config.tools_dir.as_deref());
 
-        let loaded_tools_count = configs.len();
         let configs_for_output = configs.clone();
 
         let mut service = AhmaMcpService::new(
@@ -264,7 +261,6 @@ impl<'a> ServiceBuilder<'a> {
             adapter,
             operation_monitor,
             shutdown_timeout,
-            loaded_tools_count,
             configs: configs_for_output,
         })
     }
@@ -634,17 +630,6 @@ mod tests {
     // ─── BuiltService fields ─────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_built_service_loaded_tools_count_matches_configs_len() {
-        let temp = tempdir().unwrap();
-        let sandbox = make_test_sandbox(temp.path().to_path_buf());
-        let config = make_test_config();
-
-        let built = ServiceBuilder::new(&config, sandbox).build().await.unwrap();
-
-        assert_eq!(built.loaded_tools_count, built.configs.len());
-    }
-
-    #[tokio::test]
     async fn test_built_service_configs_contains_run_terminal_command() {
         let temp = tempdir().unwrap();
         let sandbox = make_test_sandbox(temp.path().to_path_buf());
@@ -746,7 +731,7 @@ mod tests {
             "custom echo tool should be loaded from tools_dir"
         );
         // At minimum: echo + run_terminal_command
-        assert!(built.loaded_tools_count >= 2);
+        assert!(built.configs.len() >= 2);
     }
 
     #[tokio::test]

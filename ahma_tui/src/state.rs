@@ -316,6 +316,20 @@ pub fn builtin_commands() -> Vec<NavCommand> {
         .collect()
 }
 
+/// Advance `selected` by one step through a list of length `len`, wrapping
+/// around at either end. Returns `selected` unchanged when `len == 0` (empty
+/// list has no valid index to move to).
+fn wrapping_step(selected: usize, len: usize, forward: bool) -> usize {
+    if len == 0 {
+        return selected;
+    }
+    if forward {
+        (selected + 1) % len
+    } else {
+        selected.checked_sub(1).unwrap_or(len - 1)
+    }
+}
+
 /// State for the `/` command navigator overlay.
 #[derive(Debug, Clone, Default)]
 pub struct CommandNavigator {
@@ -376,17 +390,11 @@ impl CommandNavigator {
     }
 
     pub fn select_next(&mut self) {
-        let n = self.completions.len();
-        if n > 0 {
-            self.selected = (self.selected + 1) % n;
-        }
+        self.selected = wrapping_step(self.selected, self.completions.len(), true);
     }
 
     pub fn select_prev(&mut self) {
-        let n = self.completions.len();
-        if n > 0 {
-            self.selected = self.selected.checked_sub(1).unwrap_or(n - 1);
-        }
+        self.selected = wrapping_step(self.selected, self.completions.len(), false);
     }
 
     /// Apply the selected completion to the input field (TAB).
@@ -444,17 +452,11 @@ impl PickerState {
     }
 
     pub fn select_next(&mut self) {
-        let n = self.filtered_items().len();
-        if n > 0 {
-            self.selected = (self.selected + 1) % n;
-        }
+        self.selected = wrapping_step(self.selected, self.filtered_items().len(), true);
     }
 
     pub fn select_prev(&mut self) {
-        let n = self.filtered_items().len();
-        if n > 0 {
-            self.selected = self.selected.checked_sub(1).unwrap_or(n - 1);
-        }
+        self.selected = wrapping_step(self.selected, self.filtered_items().len(), false);
     }
 
     pub fn filter_push(&mut self, c: char) {

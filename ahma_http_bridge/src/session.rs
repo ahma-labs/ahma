@@ -297,22 +297,11 @@ impl Session {
             return;
         }
         self.mcp_initialized_notify.notified().await;
-
-        // Double check in case of race/spurious wakeup
-        if !self.is_mcp_initialized() {
-            // This is rare but possible; the caller might want to loop
-            // For now, simpler to just return as the notify implies state change
-        }
-    }
-
-    /// Check if subprocess has applied sandbox scopes (Active state)
-    pub fn is_sandbox_applied(&self) -> bool {
-        self.sandbox_state_machine.is_active()
     }
 
     /// Wait for sandbox application
     pub async fn wait_for_sandbox_applied(&self) {
-        if self.is_sandbox_applied() {
+        if self.is_sandbox_locked() {
             return;
         }
         let _ = self.sandbox_state_machine.wait_for_active().await;
@@ -2083,7 +2072,6 @@ mod session_logic_tests {
             SandboxState::AwaitingRoots
         ));
         assert!(!session.is_sandbox_locked());
-        assert!(!session.is_sandbox_applied());
 
         let scope = std::env::temp_dir().join("locked_proj");
         session
@@ -2091,7 +2079,6 @@ mod session_logic_tests {
             .transition_to_active_with_scopes(vec![scope.clone()])
             .unwrap();
         assert!(session.is_sandbox_locked());
-        assert!(session.is_sandbox_applied());
         assert!(matches!(
             session.current_sandbox_state(),
             SandboxState::Active { .. }

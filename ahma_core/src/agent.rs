@@ -413,12 +413,43 @@ async fn maybe_compact_conversation(
     }
 }
 
-async fn call_mcp_sampling_routed(
-    mcp: &McpChatConfig,
-    target_label: &str,
-    messages: Vec<serde_json::Value>,
-    system_prompt: Option<&str>,
-) -> Result<ahma_llm_monitor::client::ChatCompletionResponse, String> {
+/// Convert internal `{role, content}` chat messages into the MCP sampling
+/// wire format, where content is a typed `{type: "text", text}` object.
+fn to_mcp_content_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    messages
+        .into_iter()
+        .map(|msg| {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            serde_json::json!({
+                "role": role,
+                "content": {
+                    "type": "text",
+                    "text": content
+                }
+            })
+        })
+        .collect()
+}
+
+/// Concatenate the text of every `"text"`-typed content item in an MCP
+/// sampling result's `content` array.
+fn extract_sampling_completion_text(content_arr: &[serde_json::Value]) -> String {
+    let mut completion_text = String::new();
+    for item in content_arr {
+        if item.get("type").and_then(|t| t.as_str()) == Some("text")
+            && let Some(text) = item.get("text").and_then(|t| t.as_str())
+        {
+            completion_text.push_str(text);
+        }
+    }
+    completion_text
+}
+
+/// Build the reqwest client and the `/mcp` URL to reach it, handling the
+/// `unix://` base-url convention (a local Unix domain socket) separately
+/// from a normal HTTP(S) base URL.
+fn build_sampling_client(mcp: &McpChatConfig) -> Result<(reqwest::Client, String), String> {
     let builder = reqwest::Client::builder();
     let (request_base_url, builder) = if let Some(path) = mcp.base_url.strip_prefix("unix://") {
         #[cfg(unix)]
@@ -435,20 +466,19 @@ async fn call_mcp_sampling_routed(
     };
     let client = builder.build().map_err(|e| e.to_string())?;
     let url = format!("{}/mcp", request_base_url);
+    Ok((client, url))
+}
+
+async fn call_mcp_sampling_routed(
+    mcp: &McpChatConfig,
+    target_label: &str,
+    messages: Vec<serde_json::Value>,
+    system_prompt: Option<&str>,
+) -> Result<ahma_llm_monitor::client::ChatCompletionResponse, String> {
+    let (client, url) = build_sampling_client(mcp)?;
     let session_id = get_or_create_session(&client, &url, mcp).await?;
 
-    let mut mcp_messages = Vec::new();
-    for msg in messages {
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        mcp_messages.push(serde_json::json!({
-            "role": role,
-            "content": {
-                "type": "text",
-                "text": content
-            }
-        }));
-    }
+    let mcp_messages = to_mcp_content_messages(messages);
 
     let request_id = format!("route_tui_{}", uuid::Uuid::new_v4());
     let mut params = serde_json::json!({
@@ -501,14 +531,7 @@ async fn call_mcp_sampling_routed(
         .and_then(|c| c.as_array())
         .ok_or_else(|| "Missing or invalid content in result".to_string())?;
 
-    let mut completion_text = String::new();
-    for item in content_arr {
-        if item.get("type").and_then(|t| t.as_str()) == Some("text")
-            && let Some(text) = item.get("text").and_then(|t| t.as_str())
-        {
-            completion_text.push_str(text);
-        }
-    }
+    let completion_text = extract_sampling_completion_text(content_arr);
 
     // MCP sampling's stopReason: "endTurn" | "stopSequence" | "maxTokens" | ….
     // Normalize to the same "length" convention used for the direct HTTP
@@ -2057,7 +2080,7 @@ impl ahma_mcp::PromptRunner for CorePromptRunner {
         // Default the provider/model to the model the user last selected in
         // `ahma tui` (persisted in settings.agent). Prefer the resolved base URL
         // so we don't depend on the TUI's provider label matching a config name.
-        let settings = ahma_common::config::AhmaSettings::load();
+        let settings = ahma_common::config::AhmaSettings::load_async().await;
         let provider = provider.or_else(|| {
             settings
                 .agent
@@ -2133,7 +2156,7 @@ async fn build_agent_run_context(
         .cloned()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let settings = ahma_common::config::AhmaSettings::load();
+    let settings = ahma_common::config::AhmaSettings::load_async().await;
     let mcp_connections = service.mcp_connections.read().await.clone();
 
     let local_mcp_base_url = {

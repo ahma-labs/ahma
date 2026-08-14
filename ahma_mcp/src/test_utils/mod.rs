@@ -32,6 +32,18 @@ pub use in_process::{build_test_service, build_test_service_with_configs};
 
 // Helper function to check if a tool is disabled (used by macros)
 pub fn is_tool_disabled(tool_name: &str) -> bool {
+    let workspace_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("Failed to get workspace root")
+        .to_path_buf();
+    is_tool_disabled_in(tool_name, &workspace_dir)
+}
+
+/// Same check as [`is_tool_disabled`], but reading tool configs from an
+/// explicit workspace directory rather than the real repo tree — lets tests
+/// exercise the config-file path against a `tempfile::tempdir()` instead of
+/// racing other concurrent tests that touch the real `.ahma/` directory.
+fn is_tool_disabled_in(tool_name: &str, workspace_dir: &std::path::Path) -> bool {
     // Check environment variable first (e.g., AHMA_DISABLE_TOOL_GH=true)
     let env_var = format!("AHMA_DISABLE_TOOL_{}", tool_name.to_uppercase());
     if std::env::var(&env_var)
@@ -41,29 +53,16 @@ pub fn is_tool_disabled(tool_name: &str) -> bool {
         return true;
     }
 
-    let workspace_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("Failed to get workspace root")
-        .to_path_buf();
+    let config_path = workspace_dir
+        .join(".ahma")
+        .join(format!("{}.json", tool_name));
 
-    // Paths to check for tool configuration
-    let config_paths = [
-        workspace_dir
-            .join(".ahma")
-            .join(format!("{}.json", tool_name)),
-        workspace_dir
-            .join(".ahma")
-            .join(format!("{}.json", tool_name)),
-    ];
-
-    for config_path in config_paths {
-        if config_path.exists()
-            && let Ok(content) = std::fs::read_to_string(&config_path)
-        {
-            // Simple check for "enabled": false
-            if content.contains(r#""enabled": false"#) || content.contains(r#""enabled":false"#) {
-                return true;
-            }
+    if config_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&config_path)
+    {
+        // Simple check for "enabled": false
+        if content.contains(r#""enabled": false"#) || content.contains(r#""enabled":false"#) {
+            return true;
         }
     }
 
@@ -161,7 +160,6 @@ macro_rules! skip_if_disabled_async {
 mod tests {
     use super::*;
     use std::env;
-    use std::path::Path;
 
     #[test]
     fn test_is_tool_disabled_env_true() {
@@ -200,34 +198,24 @@ mod tests {
 
     #[test]
     fn test_is_tool_disabled_config_enabled_false() {
-        let workspace_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let ahma_dir = workspace_dir.join(".ahma");
-        let tool_name = format!("__cov_disabled_{}", std::process::id());
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let ahma_dir = workspace_dir.path().join(".ahma");
+        let tool_name = "__cov_disabled__";
         let config_path = ahma_dir.join(format!("{}.json", tool_name));
-        let content = r#"{"enabled": false}"#;
-        let _ = std::fs::create_dir_all(&ahma_dir);
-        let restore = std::fs::write(&config_path, content).is_ok();
-        let result = is_tool_disabled(&tool_name);
-        if restore {
-            let _ = std::fs::remove_file(&config_path);
-        }
-        assert!(result);
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+        std::fs::write(&config_path, r#"{"enabled": false}"#).unwrap();
+        assert!(is_tool_disabled_in(tool_name, workspace_dir.path()));
     }
 
     #[test]
     fn test_is_tool_disabled_config_enabled_false_no_space() {
-        let workspace_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let ahma_dir = workspace_dir.join(".ahma");
-        let tool_name = format!("__cov_nospace_{}", std::process::id());
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let ahma_dir = workspace_dir.path().join(".ahma");
+        let tool_name = "__cov_nospace__";
         let config_path = ahma_dir.join(format!("{}.json", tool_name));
-        let content = r#"{"enabled":false}"#;
-        let _ = std::fs::create_dir_all(&ahma_dir);
-        let restore = std::fs::write(&config_path, content).is_ok();
-        let result = is_tool_disabled(&tool_name);
-        if restore {
-            let _ = std::fs::remove_file(&config_path);
-        }
-        assert!(result);
+        std::fs::create_dir_all(&ahma_dir).unwrap();
+        std::fs::write(&config_path, r#"{"enabled":false}"#).unwrap();
+        assert!(is_tool_disabled_in(tool_name, workspace_dir.path()));
     }
 
     #[test]

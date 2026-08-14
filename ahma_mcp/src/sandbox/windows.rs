@@ -808,6 +808,55 @@ impl AppContainerSession {
 static APPCONTAINER_SESSION: std::sync::Mutex<Option<AppContainerSession>> =
     std::sync::Mutex::new(None);
 
+/// Grant `session.sid` access to every scope in `wanted` that is not already
+/// covered by AppContainer's default `ALL APPLICATION PACKAGES` read+execute,
+/// recording each one actually touched in `session.granted`. Split out of
+/// [`ensure_appcontainer`] so that function's fresh-session build path reads
+/// as "grant, then handle failure" instead of a loop nested inside it.
+#[cfg(target_os = "windows")]
+fn grant_scopes(
+    session: &mut AppContainerSession,
+    wanted: &[(PathBuf, u32)],
+    system_dirs: &[PathBuf],
+    name: &str,
+) -> anyhow::Result<()> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for (path, mask) in wanted {
+        if seen.contains(path) {
+            continue;
+        }
+        seen.push(path.clone());
+        if appcontainer_has_default_read(path, system_dirs) {
+            tracing::debug!(
+                "AppContainer already has default read+execute on '{}' (ALL APPLICATION \
+                 PACKAGES); not touching its ACL",
+                path.display()
+            );
+            continue;
+        }
+        if !path.exists() {
+            tracing::debug!(
+                "sandbox scope '{}' does not exist yet; nothing to grant",
+                path.display()
+            );
+            continue;
+        }
+        grant_path_to_sid(path, &session.sid, *mask).map_err(|e| {
+            // Fail loud (SPEC R7): a scope we could not grant is a scope the
+            // tool cannot use, and continuing would look like a sandbox that
+            // works.
+            anyhow::anyhow!(
+                "could not grant AppContainer '{name}' access to sandbox scope '{}': {e:#}. \
+                 ahma will not run commands it cannot confine; use --no-sandbox to run \
+                 without kernel enforcement.",
+                path.display()
+            )
+        })?;
+        session.granted.push(path.clone());
+    }
+    Ok(())
+}
+
 /// Create (or reuse) the AppContainer for these scopes and make sure its SID has
 /// exactly the access those scopes describe. Returns the container name and the
 /// per-container folder Windows allocated for it.
@@ -877,45 +926,7 @@ fn ensure_appcontainer(
         .collect();
     session.journal = write_grant_journal(&name, &planned);
 
-    let mut seen: Vec<PathBuf> = Vec::new();
-    let outcome = (|| -> anyhow::Result<()> {
-        for (path, mask) in &wanted {
-            if seen.contains(path) {
-                continue;
-            }
-            seen.push(path.clone());
-            if appcontainer_has_default_read(path, &system_dirs) {
-                tracing::debug!(
-                    "AppContainer already has default read+execute on '{}' (ALL APPLICATION \
-                     PACKAGES); not touching its ACL",
-                    path.display()
-                );
-                continue;
-            }
-            if !path.exists() {
-                tracing::debug!(
-                    "sandbox scope '{}' does not exist yet; nothing to grant",
-                    path.display()
-                );
-                continue;
-            }
-            grant_path_to_sid(path, &session.sid, *mask).map_err(|e| {
-                // Fail loud (SPEC R7): a scope we could not grant is a scope the
-                // tool cannot use, and continuing would look like a sandbox that
-                // works.
-                anyhow::anyhow!(
-                    "could not grant AppContainer '{name}' access to sandbox scope '{}': {e:#}. \
-                     ahma will not run commands it cannot confine; use --no-sandbox to run \
-                     without kernel enforcement.",
-                    path.display()
-                )
-            })?;
-            session.granted.push(path.clone());
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = outcome {
+    if let Err(e) = grant_scopes(&mut session, &wanted, &system_dirs, &name) {
         // A half-granted session is the one state nothing else cleans up: the
         // journal names this live process, so the startup sweep skips it, and no
         // session is stored for teardown to find. Undo the partial work here or
@@ -1163,28 +1174,24 @@ fn write_grant_journal(container: &str, paths: &[PathBuf]) -> Option<PathBuf> {
     }
 }
 
-/// Revoke ACL grants journalled by processes that are no longer running.
-///
-/// The container name is shared by every session on the same scope, so a journal
-/// is only acted on once no *live* journal still names its container — otherwise
-/// cleaning up after a crashed session would strip a running session's access.
 #[cfg(target_os = "windows")]
-fn sweep_orphaned_grants() {
-    let Some(dir) = grant_journal_dir() else {
-        return;
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
-    };
+struct GrantJournalEntry {
+    file: PathBuf,
+    container: String,
+    paths: Vec<PathBuf>,
+    alive: bool,
+}
 
-    struct Journal {
-        file: PathBuf,
-        container: String,
-        paths: Vec<PathBuf>,
-        alive: bool,
-    }
-
-    let mut journals: Vec<Journal> = Vec::new();
+/// Read every `*.grants` journal in `dir`, decoding each into a
+/// [`GrantJournalEntry`] and tagging whether the process that wrote it is
+/// still alive. Malformed journals (no container name) are deleted on sight
+/// rather than surfaced — there is nothing else useful to do with them.
+#[cfg(target_os = "windows")]
+fn read_grant_journals(dir: &Path) -> Vec<GrantJournalEntry> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut journals = Vec::new();
     for entry in entries.flatten() {
         let file = entry.path();
         if file.extension().and_then(|e| e.to_str()) != Some("grants") {
@@ -1205,13 +1212,62 @@ fn sweep_orphaned_grants() {
             continue;
         };
         let alive = pid != std::process::id() && process_is_running(pid);
-        journals.push(Journal {
+        journals.push(GrantJournalEntry {
             file,
             container,
             paths,
             alive,
         });
     }
+    journals
+}
+
+/// Revoke every ACE a stale journal recorded and delete both the profile and
+/// the journal file. Assumes the caller has already confirmed no live
+/// journal still shares this container.
+#[cfg(target_os = "windows")]
+fn revoke_stale_journal(journal: &GrantJournalEntry) {
+    let sid = match derive_container_sid(&journal.container) {
+        Ok(sid) => sid,
+        Err(e) => {
+            tracing::warn!(
+                "cannot derive SID for stale AppContainer '{}': {e:#}",
+                journal.container
+            );
+            return;
+        }
+    };
+    for path in &journal.paths {
+        if let Err(e) = revoke_path_from_sid(path, &sid) {
+            tracing::warn!(
+                "could not revoke stale AppContainer grant on '{}': {e:#}",
+                path.display()
+            );
+        }
+    }
+    unsafe {
+        let name = to_wide(&journal.container);
+        let _ = DeleteAppContainerProfile(name.as_ptr());
+    }
+    let _ = std::fs::remove_file(&journal.file);
+    tracing::info!(
+        "swept {} orphaned AppContainer grant(s) left by a previous run ('{}')",
+        journal.paths.len(),
+        journal.container
+    );
+}
+
+/// Revoke ACL grants journalled by processes that are no longer running.
+///
+/// The container name is shared by every session on the same scope, so a journal
+/// is only acted on once no *live* journal still names its container — otherwise
+/// cleaning up after a crashed session would strip a running session's access.
+#[cfg(target_os = "windows")]
+fn sweep_orphaned_grants() {
+    let Some(dir) = grant_journal_dir() else {
+        return;
+    };
+    let journals = read_grant_journals(&dir);
 
     let live_containers: Vec<String> = journals
         .iter()
@@ -1227,34 +1283,7 @@ fn sweep_orphaned_grants() {
             );
             continue;
         }
-        let sid = match derive_container_sid(&journal.container) {
-            Ok(sid) => sid,
-            Err(e) => {
-                tracing::warn!(
-                    "cannot derive SID for stale AppContainer '{}': {e:#}",
-                    journal.container
-                );
-                continue;
-            }
-        };
-        for path in &journal.paths {
-            if let Err(e) = revoke_path_from_sid(path, &sid) {
-                tracing::warn!(
-                    "could not revoke stale AppContainer grant on '{}': {e:#}",
-                    path.display()
-                );
-            }
-        }
-        unsafe {
-            let name = to_wide(&journal.container);
-            let _ = DeleteAppContainerProfile(name.as_ptr());
-        }
-        let _ = std::fs::remove_file(&journal.file);
-        tracing::info!(
-            "swept {} orphaned AppContainer grant(s) left by a previous run ('{}')",
-            journal.paths.len(),
-            journal.container
-        );
+        revoke_stale_journal(journal);
     }
 }
 

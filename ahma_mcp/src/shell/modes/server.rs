@@ -912,7 +912,33 @@ pub(crate) fn build_background_bridge_args(config: &AppConfig) -> Vec<String> {
 
 /// Open a capture file for bridge output, writing `banner` as its first line.
 /// Returns `None` (and logs a warning) if the file can't be created or opened.
-fn open_capture_file(path: &std::path::Path, banner: &str) -> Option<std::fs::File> {
+///
+/// Async variant used on the server-startup path (`spawn_background_bridge`), which
+/// runs in a `tokio` task and must never block the executor with `std::fs` I/O
+/// (AGENTS.md: "Never `std::fs` or blocking I/O in an async fn").
+async fn open_capture_file(path: &std::path::Path, banner: &str) -> Option<std::fs::File> {
+    let result: std::io::Result<std::fs::File> = async {
+        tokio::fs::write(path, banner).await?;
+        let f = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .await?;
+        Ok(f.into_std().await)
+    }
+    .await;
+    match result {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::warn!("Failed to create bridge capture at {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// Sync counterpart of [`open_capture_file`], kept for genuinely sync callers
+/// (unit tests below run outside any async runtime).
+#[cfg(test)]
+fn open_capture_file_sync(path: &std::path::Path, banner: &str) -> Option<std::fs::File> {
     match std::fs::write(path, banner)
         .and_then(|_| std::fs::OpenOptions::new().append(true).open(path))
     {
@@ -985,11 +1011,11 @@ async fn spawn_background_bridge(
         std::process::id()
     );
 
-    match open_capture_file(&stdout_path, &spawn_banner) {
+    match open_capture_file(&stdout_path, &spawn_banner).await {
         Some(f) => cmd.stdout(f),
         None => cmd.stdout(std::process::Stdio::null()),
     };
-    match open_capture_file(&stderr_path, &spawn_banner) {
+    match open_capture_file(&stderr_path, &spawn_banner).await {
         Some(f) => cmd.stderr(f),
         None => cmd.stderr(std::process::Stdio::null()),
     };
@@ -1176,8 +1202,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
         adapter,
         operation_monitor,
         shutdown_timeout,
-        loaded_tools_count,
-        configs: _configs,
+        configs: loaded_configs,
     } = ServiceBuilder::new(&config, sandbox.clone())
         .with_permission_broker(permission_broker)
         .build()
@@ -1246,7 +1271,7 @@ pub async fn run_server_mode(config: AppConfig, sandbox: Arc<sandbox::Sandbox>) 
             .tools_dir
             .as_ref()
             .map_or_else(|| "<none>".to_string(), |dir| dir.display().to_string()),
-        loaded_tools_count,
+        loaded_configs.len(),
     );
 
     if !is_test {
@@ -1778,7 +1803,7 @@ mod tests {
         let path = tmp.path().join("capture.log");
         let banner = "# banner line\n";
 
-        let file = open_capture_file(&path, banner);
+        let file = open_capture_file_sync(&path, banner);
         assert!(file.is_some(), "valid path must yield Some(file)");
         drop(file);
 
@@ -1796,7 +1821,7 @@ mod tests {
         let path = tmp.path().join("capture.log");
         let banner = "HEADER\n";
 
-        let mut file = open_capture_file(&path, banner).expect("expected Some(file)");
+        let mut file = open_capture_file_sync(&path, banner).expect("expected Some(file)");
         // The returned handle is opened in append mode; writes land after the banner.
         file.write_all(b"more\n").unwrap();
         drop(file);
@@ -1811,7 +1836,7 @@ mod tests {
         // Parent directory does not exist → std::fs::write fails → None.
         let path = tmp.path().join("no_such_dir").join("capture.log");
         assert!(
-            open_capture_file(&path, "banner").is_none(),
+            open_capture_file_sync(&path, "banner").is_none(),
             "path inside a non-existent directory must return None"
         );
     }

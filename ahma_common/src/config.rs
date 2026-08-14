@@ -324,14 +324,20 @@ impl AhmaConfig {
         Self::add_provider_to(&path, entry)
     }
 
+    /// Read `path` as an [`AhmaConfig`] for editing, defaulting to an empty
+    /// config if the file doesn't exist yet.
+    fn read_config_for_edit(path: &Path) -> Result<AhmaConfig> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => toml::from_str(&contents)
+                .map_err(|e| anyhow::anyhow!("Failed to parse {}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AhmaConfig::default()),
+            Err(e) => anyhow::bail!("Failed to read {}: {e}", path.display()),
+        }
+    }
+
     /// [`Self::add_provider`] against an explicit path (for tests).
     pub fn add_provider_to(path: &Path, entry: ProviderEntry) -> Result<()> {
-        let mut cfg: AhmaConfig = match std::fs::read_to_string(path) {
-            Ok(contents) => toml::from_str(&contents)
-                .map_err(|e| anyhow::anyhow!("Failed to parse {}: {e}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => AhmaConfig::default(),
-            Err(e) => anyhow::bail!("Failed to read {}: {e}", path.display()),
-        };
+        let mut cfg = Self::read_config_for_edit(path)?;
         if cfg.providers.iter().any(|p| p.name == entry.name) {
             anyhow::bail!(
                 "A provider named '{}' already exists in {}",
@@ -355,12 +361,7 @@ impl AhmaConfig {
 
     /// [`Self::set_provider_num_ctx`] against an explicit path (for tests).
     pub fn set_provider_num_ctx_to(path: &Path, name: &str, num_ctx: Option<u32>) -> Result<()> {
-        let mut cfg: AhmaConfig = match std::fs::read_to_string(path) {
-            Ok(contents) => toml::from_str(&contents)
-                .map_err(|e| anyhow::anyhow!("Failed to parse {}: {e}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => AhmaConfig::default(),
-            Err(e) => anyhow::bail!("Failed to read {}: {e}", path.display()),
-        };
+        let mut cfg = Self::read_config_for_edit(path)?;
         let entry = cfg
             .providers
             .iter_mut()

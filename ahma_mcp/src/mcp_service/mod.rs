@@ -967,9 +967,11 @@ impl AhmaMcpService {
             .collect()
     }
 
-    /// Resolves guidance-augmented description for a tool config by key.
-    fn tool_description(&self, tool_config: &ToolConfig, key: &str) -> String {
-        let mut description = tool_config.description.clone();
+    /// Prepends the resolved guidance block (if any) to `base`. Shared by
+    /// [`Self::tool_description`] and [`Self::tool_description_text`], which
+    /// differ only in where `base` comes from.
+    fn apply_guidance(&self, tool_config: &ToolConfig, key: &str, base: &str) -> String {
+        let mut description = base.to_string();
         if let Some(guidance_config) = self.guidance.as_ref() {
             let default_key = key.to_string();
             let gk = tool_config.guidance_key.as_ref().unwrap_or(&default_key);
@@ -980,17 +982,14 @@ impl AhmaMcpService {
         description
     }
 
+    /// Resolves guidance-augmented description for a tool config by key.
+    fn tool_description(&self, tool_config: &ToolConfig, key: &str) -> String {
+        self.apply_guidance(tool_config, key, &tool_config.description)
+    }
+
     /// Builds a guidance-augmented description from explicit text.
     fn tool_description_text(&self, tool_config: &ToolConfig, key: &str, base: &str) -> String {
-        let mut description = base.to_string();
-        if let Some(guidance_config) = self.guidance.as_ref() {
-            let default_key = key.to_string();
-            let gk = tool_config.guidance_key.as_ref().unwrap_or(&default_key);
-            if let Some(guidance_text) = guidance_config.guidance_blocks.get(gk) {
-                description = format!("{}\n\n{}", guidance_text, description);
-            }
-        }
-        description
+        self.apply_guidance(tool_config, key, base)
     }
 
     /// Resolves a flattened tool name (e.g., `"file-tools_hello"`) to a parent
@@ -1016,16 +1015,29 @@ impl AhmaMcpService {
 
     /// Names that are always hard-wired in the protocol layer and must not
     /// appear in user/bundled configs (we skip duplicates here).
+    ///
+    /// This MUST stay in sync with [`Self::builtin_tools`], the canonical
+    /// source of truth for the built-in tool set. It cannot simply be
+    /// derived from `builtin_tools()` because both use sites (below, and
+    /// `harness_guard_preprocess`) need a `&'static [&'static str]`/`&str`
+    /// slice cheaply and repeatedly (the latter inside per-call name
+    /// healing), whereas `builtin_tools()` rebuilds full `Tool` values
+    /// (including JSON schemas) on every call. This list has drifted from
+    /// `builtin_tools()` twice before (see the comment on `builtin_tools`);
+    /// `hardcoded_tools_match_builtin_tools` below asserts the two name sets
+    /// are identical so a third drift fails CI instead of silently
+    /// under-filtering/under-healing tool names.
     const HARDCODED_TOOLS: &'static [&'static str] = &[
         "await",
         "status",
         "run_terminal_command",
-        "cancel",
         "logs_list",
         "logs_approve",
         "logs_read",
         "logs_search",
         "restart",
+        "cancel",
+        "sandbox_grant",
         "read_file",
         "list_dir",
         "file_search",
@@ -1035,6 +1047,7 @@ impl AhmaMcpService {
         "replace_in_file",
         "agent",
         "todo_write",
+        "log_monitor",
     ];
 
     /// Returns true if a configured tool should be exposed to the client
@@ -1123,21 +1136,14 @@ impl AhmaMcpService {
         // forwarder cannot see them — push start/final progress directly.
         let push_enabled =
             progress_token.is_some() && self.effective_supports_progress(client_type);
-        if let Some(token) = progress_token.clone()
-            && push_enabled
-        {
-            progress_push::push_progress(
-                &peer,
-                token,
-                0.0,
-                format!(
-                    "{base_command}: {}",
-                    Self::sync_tool_progress_description(base_command, working_directory)
-                ),
-                false,
-            )
-            .await;
-        }
+        self.push_sync_start_progress(
+            push_enabled,
+            progress_token.clone(),
+            &peer,
+            base_command,
+            working_directory,
+        )
+        .await;
 
         let result = self
             .adapter
@@ -1154,24 +1160,17 @@ impl AhmaMcpService {
         self.emit_vault_tool_complete(&id, result.is_ok(), duration_ms)
             .await;
 
-        if let Some(token) = progress_token
-            && push_enabled
-        {
-            let (success, full_output) = match &result {
-                Ok(output) => (true, output.clone()),
-                Err(e) => (false, format!("Error: {}", e)),
-            };
-            let message = progress_push::sync_final_message(
-                &id,
-                base_command,
-                &Self::sync_tool_progress_description(base_command, working_directory),
-                working_directory,
-                success,
-                duration_ms,
-                &full_output,
-            );
-            progress_push::push_progress(&peer, token, 100.0, message, true).await;
-        }
+        self.push_sync_final_progress(
+            push_enabled,
+            progress_token,
+            &peer,
+            &id,
+            base_command,
+            working_directory,
+            duration_ms,
+            &result,
+        )
+        .await;
 
         match result {
             Ok(output) => Ok(handlers::common::text_result(output)),
@@ -1181,6 +1180,73 @@ impl AhmaMcpService {
                 Err(handlers::common::mcp_internal(error_message))
             }
         }
+    }
+
+    /// Pushes the initial 0% progress notification for a sync tool call, when
+    /// the caller both supplied a progress token and supports progress pushes.
+    /// No-op otherwise.
+    async fn push_sync_start_progress(
+        &self,
+        push_enabled: bool,
+        progress_token: Option<rmcp::model::ProgressToken>,
+        peer: &Peer<RoleServer>,
+        base_command: &str,
+        working_directory: &str,
+    ) {
+        if !push_enabled {
+            return;
+        }
+        let Some(token) = progress_token else {
+            return;
+        };
+        progress_push::push_progress(
+            peer,
+            token,
+            0.0,
+            format!(
+                "{base_command}: {}",
+                Self::sync_tool_progress_description(base_command, working_directory)
+            ),
+            false,
+        )
+        .await;
+    }
+
+    /// Pushes the terminal 100% progress notification for a sync tool call,
+    /// under the same gating as [`Self::push_sync_start_progress`]. No-op
+    /// otherwise.
+    #[allow(clippy::too_many_arguments)]
+    async fn push_sync_final_progress(
+        &self,
+        push_enabled: bool,
+        progress_token: Option<rmcp::model::ProgressToken>,
+        peer: &Peer<RoleServer>,
+        id: &str,
+        base_command: &str,
+        working_directory: &str,
+        duration_ms: u64,
+        result: &Result<String, anyhow::Error>,
+    ) {
+        if !push_enabled {
+            return;
+        }
+        let Some(token) = progress_token else {
+            return;
+        };
+        let (success, full_output) = match result {
+            Ok(output) => (true, output.clone()),
+            Err(e) => (false, format!("Error: {}", e)),
+        };
+        let message = progress_push::sync_final_message(
+            id,
+            base_command,
+            &Self::sync_tool_progress_description(base_command, working_directory),
+            working_directory,
+            success,
+            duration_ms,
+            &full_output,
+        );
+        progress_push::push_progress(peer, token, 100.0, message, true).await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3288,6 +3354,29 @@ mod tests {
 
         let normal = cfg_from(json!({"name": "ok", "description": "d", "command": "c"}));
         assert!(service.is_config_visible_to_client(&normal));
+    }
+
+    /// Guards against the exact drift this was hand-fixed twice for: someone
+    /// adds/renames a builtin in `builtin_tools()` (the canonical list) and
+    /// forgets the separately hand-maintained `HARDCODED_TOOLS` constant, so
+    /// dedup filtering and harness-guard name healing silently fall out of
+    /// sync with the actual tool set.
+    #[tokio::test]
+    async fn hardcoded_tools_match_builtin_tools() {
+        let service = make_service().await;
+        let builtin_names: std::collections::HashSet<String> = service
+            .builtin_tools()
+            .into_iter()
+            .map(|t| t.name.into_owned())
+            .collect();
+        let hardcoded_names: std::collections::HashSet<String> = AhmaMcpService::HARDCODED_TOOLS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            builtin_names, hardcoded_names,
+            "HARDCODED_TOOLS has drifted from builtin_tools() — keep them in sync"
+        );
     }
 
     #[tokio::test]
