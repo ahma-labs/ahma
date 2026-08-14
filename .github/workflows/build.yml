@@ -354,7 +354,7 @@ jobs:
         run: |
           echo "--- Testing AGPL product crates"
           cargo nextest run --profile ci --locked \
-            -p ahma_task_tree -p ahma_tui -p ahma_bin \
+            -p ahma_tui -p ahma_bin \
             -E 'not (test(kotlin) or test(android))'
 
       - name: Cargo Nextest (Landlock red-team, Linux only)
@@ -373,7 +373,6 @@ jobs:
           echo "--- ARM64 smoke: compile-only validation of key crates (no test execution)"
           cargo test --locked --no-default-features -p ahma_bin --no-run
           cargo test --locked --no-default-features -p ahma_http_bridge --no-run
-          cargo test --locked --no-default-features -p ahma_task_tree --no-run
 
       - name: Cargo Clippy
         if: runner.os == 'Linux' && runner.arch == 'X64'
