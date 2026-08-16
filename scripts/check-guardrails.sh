@@ -180,6 +180,48 @@ if ! grep -q 'failure-output = "immediate"' .config/nextest.toml; then
 fi
 echo "OK Nextest diagnostics config looks good"
 
+echo "=== Guardrail: nextest override ordering (narrow before broad) ==="
+# nextest resolves each setting from the FIRST matching override in file order,
+# not the most specific one. A narrow binary_id() override listed BELOW the
+# broad package() override it refines is silently dead config — this is how the
+# bridge_stress_tests slow-timeouts stopped applying. Assert the order holds.
+for profile in default ci; do
+  narrow=$(grep -n "^\[\[profile\.${profile}\.overrides\]\]" -A1 .config/nextest.toml \
+    | grep 'binary_id(ahma_http_bridge::bridge_stress_tests)' | head -1 | cut -d- -f1)
+  broad=$(grep -n "^\[\[profile\.${profile}\.overrides\]\]" -A1 .config/nextest.toml \
+    | grep 'package(ahma_http_bridge)' | head -1 | cut -d- -f1)
+  if [ -z "$narrow" ] || [ -z "$broad" ]; then
+    echo "FAIL profile.${profile}: expected both a bridge_stress_tests and a package(ahma_http_bridge) override"
+    exit 1
+  fi
+  if [ "$narrow" -gt "$broad" ]; then
+    echo "FAIL profile.${profile}: binary_id(ahma_http_bridge::bridge_stress_tests) (line $narrow) must come BEFORE package(ahma_http_bridge) (line $broad)"
+    echo "     nextest takes the first matching override per setting, so the narrow one is dead where it is."
+    exit 1
+  fi
+done
+echo "OK Nextest override ordering is narrow-before-broad"
+
+echo "=== Guardrail: subprocess/network suites may retry on CI ==="
+# RETRY POLICY (see .config/nextest.toml header): every suite that crosses a
+# process or network boundary gets retries on the CI + coverage profiles, so a
+# scheduler stall on a cold 2-CPU runner cannot redden main on its own.
+for filter in 'package(ahma_http_bridge)' 'binary_id(~ahma_mcp::)' 'binary_id(~ahma_tui::)'; do
+  for profile in ci coverage; do
+    if ! awk -v f="$filter" -v p="\\\\[\\\\[profile.${profile}.overrides\\\\]\\\\]" '
+      $0 ~ p {inblock=1; hasfilter=0; next}
+      /^\[\[/ || /^\[profile/ {inblock=0}
+      inblock && index($0, f) {hasfilter=1}
+      inblock && hasfilter && /^retries = [1-9]/ {found=1}
+      END {exit !found}
+    ' .config/nextest.toml; then
+      echo "FAIL profile.${profile}: '${filter}' must set retries >= 1 (see RETRY POLICY in .config/nextest.toml)"
+      exit 1
+    fi
+  done
+done
+echo "OK Subprocess/network suites carry retries on ci and coverage"
+
 echo "=== Guardrail: target directory stale cache auto-clean ==="
 cargo xtask clean-stale --max-age-days 3 --max-size-gb 30
 

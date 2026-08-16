@@ -107,6 +107,17 @@ rather than trying to choose it.
 - **Never hardcode timeouts.** Windows runners are 3–5× slower. Use
   `ahma_common::timeouts::{TestTimeouts, TimeoutCategory}` — semantic categories
   (`Handshake`, `ToolCall`, `SandboxReady`, …), `scale_secs()`, `poll_interval()`.
+- **Retries are granted by mechanism, not by incident.** A suite gets `retries` on the
+  `ci`/`coverage` profiles when its tests cross a **process or network boundary** and so
+  depend on OS scheduling — today `package(ahma_http_bridge)`, `binary_id(~ahma_mcp::)`,
+  `binary_id(~ahma_tui::)`. Lib unit tests never do: an in-process test that flakes is a
+  real bug, and a retry would hide it. Add a new suite by structural filter, and justify
+  it by the boundary it crosses, not by "it failed once". Full rationale in
+  `.config/nextest.toml`; both rules are enforced by `scripts/check-guardrails.sh`.
+- **In `.config/nextest.toml`, list narrow overrides above the broad ones they refine.**
+  nextest resolves each setting from the **first** matching override in file order — not
+  the most specific. A `binary_id()` override sitting below the `package()` override it
+  refines is silently dead config.
 - **Never hardcode `/tmp`, `/var/folders`, `/dev/null`.** Use `test_utils::path_helpers`:
   `test_temp_path`, `test_out_of_scope_path`, `test_blocked_device_path`, `test_abs`, `test_root`.
 - **Never hardcode `/bin/sh`, `/bin/bash`, or bash redirection** (`>&2`, `2>&1`) in command
