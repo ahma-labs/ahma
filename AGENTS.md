@@ -42,12 +42,24 @@ trades a real, repeated compile-time cost (no benefit on CI's fresh, non-increme
 a runtime speedup only local dev sessions actually reuse — it once pushed the Windows CI job over
 its 40-minute budget. To keep `target/` bloat bounded during long development sessions:
 
-* Run `cargo xtask clean-stale` (or `cargo xtask clean-stale --max-age-days 3`) to prune stale
-  incremental compilation sessions. It only touches `target/*/incremental/` — cargo bumps a
-  dependency artifact's mtime only when it recompiles it, so age-pruning `deps/`/`build/` would
-  evict rarely-rebuilt but still-valid caches and force pointless relinks; `incremental/` is the
-  one directory where age genuinely means staleness.
-* Use `cargo xtask clean-stale --dry-run` to preview artifacts before deletion.
+* `cargo xtask clean-stale` (default) prunes `target/*/incremental/` sessions older than 3 days,
+  plus coverage counters (`*.profraw`/`*.profdata`) and `target/tmp/` at any age. It leaves
+  `deps/`/`build/`/`.fingerprint/` alone on purpose: cargo bumps an artifact's mtime only when it
+  recompiles it, so a rarely-rebuilt dependency looks old while still being exactly what the next
+  build links against, and evicting it buys a pointless relink.
+* **The default reclaims nothing inside an active session** — everything it is willing to touch
+  is younger than the cutoff. On a workspace `target/` that had grown to 17.5 GB in one day, the
+  default freed 0 bytes. When you are actually short of disk, you need one of:
+  * `--aggressive` — also prunes `deps/`, `build/`, `.fingerprint/` and `examples/`. Combined
+    with `--max-age-days 0` this took that same tree from 17.51 GB to 0.27 GB. The next build
+    is a full rebuild; that is the trade, and it is safe in kind — cargo detects a missing
+    output even when the fingerprint is fresh, and recompiles.
+  * `--max-size-gb N` — a hard ceiling. After the age pass it keeps removing oldest-first until
+    `target/` fits, and says so if it cannot get there. This is the only option that *bounds*
+    growth rather than reacting to it; prefer it for long sessions.
+* Use `--dry-run` to preview. Every run reports `target/`'s total size before and after, because
+  unbounded growth is otherwise invisible until a build dies on a full disk.
+* Don't run any of this concurrently with a build or test run.
 
 ### When to route through ahma vs native tools
 

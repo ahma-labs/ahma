@@ -49,7 +49,7 @@ echo "=== Running cargo check --workspace --locked ==="
 cargo check --workspace --locked
 
 echo "=== Auto-cleaning target directory stale cache ==="
-cargo xtask clean-stale --max-age-days 3
+cargo xtask clean-stale --max-age-days 3 --max-size-gb 30
 
 echo "OK Pre-push checks passed"
 

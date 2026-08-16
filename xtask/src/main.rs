@@ -6,6 +6,7 @@
 //!   bump-version X.Y.Z      Update the workspace version across all version-bearing files.
 //!   bump-android-version    Increment the Android Play versionCode and sync versionName from Cargo.
 //!   safe-update [options]   Upgrade workspace deps that are ≥14 days old and have no known advisories.
+//!   clean-stale [options]   Prune target/ build artifacts, by age or against a size ceiling.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -48,8 +49,12 @@ fn main() {
             eprintln!(
                 "                             Upgrade deps that are ≥14 days old and advisory-clean"
             );
-            eprintln!("  clean-stale [--dry-run] [--max-age-days N]");
-            eprintln!("                             Prune target/ artifacts older than N days");
+            eprintln!(
+                "  clean-stale [--dry-run] [--max-age-days N] [--aggressive] [--max-size-gb N]"
+            );
+            eprintln!(
+                "                             Prune target/ build artifacts; --help for details"
+            );
             process::exit(1);
         }
         None => {
@@ -64,8 +69,12 @@ fn main() {
             eprintln!(
                 "                             Upgrade deps that are ≥14 days old and advisory-clean"
             );
-            eprintln!("  clean-stale [--dry-run] [--max-age-days N]");
-            eprintln!("                             Prune target/ artifacts older than N days");
+            eprintln!(
+                "  clean-stale [--dry-run] [--max-age-days N] [--aggressive] [--max-size-gb N]"
+            );
+            eprintln!(
+                "                             Prune target/ build artifacts; --help for details"
+            );
             process::exit(1);
         }
     }
@@ -842,36 +851,69 @@ fn candidate_row(
 // clean-stale — prune target/ artifacts untouched for >= N days
 // ---------------------------------------------------------------------------
 
-/// Clean stale target artifacts (orphaned binaries, old incremental session data, build dirs older than max_age_days).
+const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// What `clean-stale` was asked to do.
+struct CleanOpts {
+    dry_run: bool,
+    max_age_days: u64,
+    /// Also age-prune `deps/`, `build/`, `.fingerprint/` and `examples/`, accepting that the
+    /// next build relinks. See `prune_profile` for why this is opt-in.
+    aggressive: bool,
+    /// Hard ceiling on `target/`. Prunes oldest-first past the age cutoff until met.
+    max_size_gb: Option<f64>,
+}
+
+#[derive(Default)]
+struct CleanReport {
+    removed_count: usize,
+    bytes_reclaimed: u64,
+}
+
+/// One removable thing: a file, or a directory removed whole.
+struct Candidate {
+    path: PathBuf,
+    size: u64,
+    modified: std::time::SystemTime,
+    is_dir: bool,
+}
+
+/// Clean stale build artifacts from `target/` without destroying caches the next build needs.
 fn clean_stale(args: &[String]) {
-    let mut dry_run = false;
-    let mut max_age_days: u64 = 3;
+    let mut opts = CleanOpts {
+        dry_run: false,
+        max_age_days: 3,
+        aggressive: false,
+        max_size_gb: None,
+    };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--dry-run" => dry_run = true,
+            "--dry-run" => opts.dry_run = true,
+            "--aggressive" => opts.aggressive = true,
             "--max-age-days" => {
                 i += 1;
-                max_age_days = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                opts.max_age_days = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
                     eprintln!("ERROR: --max-age-days requires a numeric argument");
                     process::exit(1);
                 });
             }
+            "--max-size-gb" => {
+                i += 1;
+                let v: f64 = args.get(i).and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("ERROR: --max-size-gb requires a numeric argument");
+                    process::exit(1);
+                });
+                // Rejects NaN and infinity as well as zero/negative: a non-finite budget
+                // would make the size pass either a no-op or an unbounded delete loop.
+                if !v.is_finite() || v <= 0.0 {
+                    eprintln!("ERROR: --max-size-gb must be a positive, finite number");
+                    process::exit(1);
+                }
+                opts.max_size_gb = Some(v);
+            }
             "--help" | "-h" => {
-                println!("cargo xtask clean-stale [options]");
-                println!();
-                println!(
-                    "Clean stale build artifacts from target/ directory without destroying active caches."
-                );
-                println!();
-                println!("Options:");
-                println!(
-                    "  --dry-run             Print artifacts that would be removed without deleting"
-                );
-                println!(
-                    "  --max-age-days <N>    Remove artifacts untouched for ≥ N days (default: 3)"
-                );
-                println!("  -h, --help            Show this help message");
+                print_clean_stale_help();
                 process::exit(0);
             }
             other => {
@@ -883,95 +925,301 @@ fn clean_stale(args: &[String]) {
         i += 1;
     }
 
-    let root = workspace_root();
-    let target_dir = root.join("target");
+    let target_dir = workspace_root().join("target");
     if !target_dir.exists() {
         println!("No target directory found at {}", target_dir.display());
         return;
     }
 
     println!("=== cargo xtask clean-stale ===");
-    if dry_run {
+    if opts.dry_run {
         println!("(dry-run — no files will be deleted)");
     }
-    println!("Pruning target artifacts modified > {max_age_days} days ago…");
 
-    let now = std::time::SystemTime::now();
-    let cutoff = now
-        .checked_sub(std::time::Duration::from_secs(max_age_days * 86400))
-        .unwrap_or(now);
+    let size_before = dir_size(&target_dir);
+    // Report the total unconditionally: unbounded `target/` growth is easy to miss until a
+    // build dies on a full disk, and `clean-stale` is the one command routinely pointed at it.
+    println!(
+        "target/ is {:.2} GB before cleaning.",
+        size_before as f64 / BYTES_PER_GB
+    );
 
-    let mut removed_count = 0usize;
-    let mut bytes_reclaimed = 0u64;
+    let report = clean_target(&target_dir, &opts);
 
-    // Only `incremental/` is safe to prune by mtime: cargo regenerates it transparently and its
-    // age directly reflects staleness (old rustc/session data that will never be reused).
-    // `deps/` and `build/` are NOT safe to age-prune the same way — cargo only bumps a
-    // dependency artifact's mtime when it recompiles it, so a stable, rarely-rebuilt dependency
-    // can be "old" while still being exactly what the current build links against. Deleting it
-    // forces a pointless, expensive relink on the next build, working against the whole point of
-    // this command.
-    let profiles = ["debug", "release"];
-    for profile in &profiles {
-        let incr_dir = target_dir.join(profile).join("incremental");
-        if incr_dir.exists() {
-            prune_directory(
-                &incr_dir,
-                cutoff,
-                dry_run,
-                &mut removed_count,
-                &mut bytes_reclaimed,
-            );
-        }
-    }
+    let reclaimed_gb = report.bytes_reclaimed as f64 / BYTES_PER_GB;
+    let verb = if opts.dry_run {
+        "Dry run complete: would remove"
+    } else {
+        "Clean complete: removed"
+    };
+    println!(
+        "{verb} {} files/directories ({reclaimed_gb:.2} GB).",
+        report.removed_count
+    );
 
-    let reclaimed_mb = bytes_reclaimed as f64 / (1024.0 * 1024.0);
-    if dry_run {
+    if opts.dry_run {
         println!(
-            "Dry run complete: would remove {removed_count} files/directories ({reclaimed_mb:.2} MB)."
+            "target/ would be {:.2} GB.",
+            (size_before.saturating_sub(report.bytes_reclaimed)) as f64 / BYTES_PER_GB
         );
     } else {
         println!(
-            "Clean complete: removed {removed_count} stale files/directories ({reclaimed_mb:.2} MB reclaimed)."
+            "target/ is now {:.2} GB.",
+            dir_size(&target_dir) as f64 / BYTES_PER_GB
         );
+    }
+
+    // A budget that could not be met is a real result, not a rounding error: say so rather
+    // than letting a "Clean complete" line imply the ceiling now holds.
+    if let Some(budget_gb) = opts.max_size_gb {
+        let after = size_before.saturating_sub(report.bytes_reclaimed) as f64 / BYTES_PER_GB;
+        if after > budget_gb {
+            println!(
+                "NOTE: could not reach the {budget_gb:.2} GB budget — {after:.2} GB remains in \
+                 artifacts this command will not touch. Use `cargo clean` to reclaim the rest."
+            );
+        }
     }
 }
 
-fn prune_directory(
-    dir: &Path,
-    cutoff: std::time::SystemTime,
-    dry_run: bool,
-    removed_count: &mut usize,
-    bytes_reclaimed: &mut u64,
-) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+fn print_clean_stale_help() {
+    println!("cargo xtask clean-stale [options]");
+    println!();
+    println!("Prune build artifacts from target/ without destroying caches the next build needs.");
+    println!();
+    println!("Options:");
+    println!("  --dry-run             Print what would be removed without deleting");
+    println!("  --max-age-days <N>    Age cutoff for pruning (default: 3; 0 prunes everything");
+    println!("                        in the eligible set regardless of age)");
+    println!("  --aggressive          Also prune deps/, build/, .fingerprint/ and examples/.");
+    println!("                        Reclaims far more, at the cost of a full rebuild.");
+    println!("  --max-size-gb <N>     Hard ceiling on target/. After the age pass, keep");
+    println!("                        removing oldest-first until target/ fits in N GB.");
+    println!("  -h, --help            Show this help message");
+    println!();
+    println!("Always removed, regardless of age: coverage counters (*.profraw/*.profdata)");
+    println!("and the target/tmp scratch directory.");
+    println!();
+    println!("Do not run this while a build or test run is in progress.");
+}
 
+/// Prune `target_dir` per `opts`. Separated from `clean_stale` so tests can drive it against a
+/// synthetic tree instead of the workspace's real `target/`.
+fn clean_target(target_dir: &Path, opts: &CleanOpts) -> CleanReport {
+    let now = std::time::SystemTime::now();
+    let cutoff = now
+        .checked_sub(std::time::Duration::from_secs(
+            opts.max_age_days.saturating_mul(86400),
+        ))
+        .unwrap_or(now);
+
+    let mut report = CleanReport::default();
+    let profiles = discover_profile_dirs(target_dir);
+
+    // 1. Pure garbage, removed at any age. `.profraw` files are per-process raw coverage
+    //    counters that are dead the moment they are merged into a report, and they accumulate
+    //    one-per-test-process; `target/tmp` is scratch space.
+    remove_coverage_counters(target_dir, opts, &mut report);
+    for profile in &profiles {
+        remove_coverage_counters(profile, opts, &mut report);
+    }
+    let tmp_dir = target_dir.join("tmp");
+    if tmp_dir.is_dir() {
+        for entry in read_dir_sorted(&tmp_dir) {
+            remove_candidate(&entry, opts, &mut report);
+        }
+    }
+
+    // 2. Age pass over every profile directory.
+    for profile in &profiles {
+        prune_profile(profile, cutoff, opts, &mut report);
+    }
+
+    // 3. Size pass: if a ceiling was given and the age pass did not reach it, keep going
+    //    oldest-first. This is what actually bounds `target/` — an age cutoff alone does not,
+    //    because a single day of rebuilds can add many GB that are all "new".
+    if let Some(budget_gb) = opts.max_size_gb {
+        let budget_bytes = (budget_gb * BYTES_PER_GB) as u64;
+        enforce_size_budget(target_dir, budget_bytes, opts, &mut report);
+    }
+
+    report
+}
+
+/// Directories under `target/` that hold build output. Discovered rather than hardcoded to
+/// `debug`/`release` so custom cargo profiles and `llvm-cov-target/` (a full duplicate build
+/// tree left behind by `cargo llvm-cov`) are cleaned too.
+fn discover_profile_dirs(target_dir: &Path) -> Vec<PathBuf> {
+    fn is_profile_dir(p: &Path) -> bool {
+        p.join(".fingerprint").is_dir() || p.join("incremental").is_dir()
+    }
+
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(target_dir) else {
+        return found;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
-        let metadata = match fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-
-        let modified = metadata
-            .modified()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if modified < cutoff {
-            let size = dir_or_file_size(&path, &metadata);
-            *bytes_reclaimed += size;
-            *removed_count += 1;
-
-            if dry_run {
-                println!("  [dry-run] Would remove: {}", path.display());
-            } else if metadata.is_dir() {
-                let _ = fs::remove_dir_all(&path);
-            } else {
-                let _ = fs::remove_file(&path);
+        if !path.is_dir() {
+            continue;
+        }
+        if is_profile_dir(&path) {
+            found.push(path);
+            continue;
+        }
+        // One level down, for wrappers like `llvm-cov-target/debug` and cross-compilation
+        // output at `target/<triple>/<profile>`.
+        if let Ok(nested) = fs::read_dir(&path) {
+            for sub in nested.flatten() {
+                let sub_path = sub.path();
+                if sub_path.is_dir() && is_profile_dir(&sub_path) {
+                    found.push(sub_path);
+                }
             }
         }
+    }
+    found.sort();
+    found
+}
+
+fn remove_coverage_counters(dir: &Path, opts: &CleanOpts, report: &mut CleanReport) {
+    for candidate in read_dir_sorted(dir) {
+        if candidate.is_dir {
+            continue;
+        }
+        let is_counter = candidate
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "profraw" || e == "profdata");
+        if is_counter {
+            remove_candidate(&candidate, opts, report);
+        }
+    }
+}
+
+/// Age-prune one profile directory.
+///
+/// `incremental/` is always eligible: cargo regenerates it transparently and its age directly
+/// reflects staleness.
+///
+/// `deps/`, `build/`, `.fingerprint/` and `examples/` are eligible only under `--aggressive`,
+/// because mtime does not mean staleness there — cargo bumps an artifact's mtime only when it
+/// recompiles it, so a stable, rarely-rebuilt dependency looks "old" while still being exactly
+/// what the current build links against. Removing it forces a rebuild that the default mode
+/// exists to avoid. Under `--aggressive` that rebuild is the accepted price of the space, and
+/// it is safe in kind: cargo treats every one of these as a cache and reconstructs whatever is
+/// missing, including a `.fingerprint` entry whose output was deleted (or vice versa).
+fn prune_profile(
+    profile: &Path,
+    cutoff: std::time::SystemTime,
+    opts: &CleanOpts,
+    report: &mut CleanReport,
+) {
+    let mut prunable = vec!["incremental"];
+    if opts.aggressive {
+        prunable.extend_from_slice(&["deps", "build", ".fingerprint", "examples"]);
+    }
+
+    for name in prunable {
+        let dir = profile.join(name);
+        if !dir.is_dir() {
+            continue;
+        }
+        for candidate in read_dir_sorted(&dir) {
+            if candidate.modified < cutoff {
+                remove_candidate(&candidate, opts, report);
+            }
+        }
+    }
+}
+
+/// Remove oldest-first until `target/` fits in `budget_bytes`.
+fn enforce_size_budget(
+    target_dir: &Path,
+    budget_bytes: u64,
+    opts: &CleanOpts,
+    report: &mut CleanReport,
+) {
+    let mut current = dir_size(target_dir).saturating_sub(if opts.dry_run {
+        // Nothing was actually deleted in a dry run, so discount what the age pass claimed
+        // in order to model the real post-clean size.
+        report.bytes_reclaimed
+    } else {
+        0
+    });
+    if current <= budget_bytes {
+        return;
+    }
+
+    // The size pass may remove artifacts the current build still wants. That is the explicit
+    // bargain of a hard ceiling, so it spans the full prunable set rather than the narrow
+    // default one.
+    let mut candidates = Vec::new();
+    for profile in discover_profile_dirs(target_dir) {
+        for name in ["incremental", "deps", "build", ".fingerprint", "examples"] {
+            let dir = profile.join(name);
+            if dir.is_dir() {
+                candidates.extend(read_dir_sorted(&dir));
+            }
+        }
+    }
+    candidates.sort_by_key(|c| c.modified);
+
+    for candidate in candidates {
+        if current <= budget_bytes {
+            break;
+        }
+        let size = candidate.size;
+        remove_candidate(&candidate, opts, report);
+        current = current.saturating_sub(size);
+    }
+}
+
+/// Immediate children of `dir` as removal candidates, in a deterministic order.
+fn read_dir_sorted(dir: &Path) -> Vec<Candidate> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Candidate> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            Some(Candidate {
+                size: dir_or_file_size(&path, &metadata),
+                modified: metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                is_dir: metadata.is_dir(),
+                path,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+fn remove_candidate(candidate: &Candidate, opts: &CleanOpts, report: &mut CleanReport) {
+    if !candidate.path.exists() {
+        return;
+    }
+    report.bytes_reclaimed += candidate.size;
+    report.removed_count += 1;
+
+    if opts.dry_run {
+        println!("  [dry-run] Would remove: {}", candidate.path.display());
+    } else if candidate.is_dir {
+        let _ = fs::remove_dir_all(&candidate.path);
+    } else {
+        let _ = fs::remove_file(&candidate.path);
+    }
+}
+
+fn dir_size(path: &Path) -> u64 {
+    match fs::symlink_metadata(path) {
+        Ok(m) => dir_or_file_size(path, &m),
+        Err(_) => 0,
     }
 }
 
@@ -983,7 +1231,9 @@ fn dir_or_file_size(path: &Path, metadata: &fs::Metadata) -> u64 {
         let mut total = 0u64;
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.flatten() {
-                if let Ok(m) = entry.metadata() {
+                // `symlink_metadata` so a symlink counts as its own small entry rather than
+                // the size of whatever it points at, which may be outside target/ entirely.
+                if let Ok(m) = fs::symlink_metadata(entry.path()) {
                     total += dir_or_file_size(&entry.path(), &m);
                 }
             }
@@ -1445,6 +1695,341 @@ fn format_apply_summary(results: &[ApplyResult]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod clean_stale_tests {
+    use super::{CleanOpts, clean_target, discover_profile_dirs};
+    use std::fs;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+    use tempfile::TempDir;
+
+    fn opts() -> CleanOpts {
+        CleanOpts {
+            dry_run: false,
+            max_age_days: 3,
+            aggressive: false,
+            max_size_gb: None,
+        }
+    }
+
+    /// Backdate `path`'s mtime. Works for directories as well as files, which matters because
+    /// pruning keys on the mtime of the entry it removes — and the entries that dominate
+    /// `incremental/` are directories, not files.
+    ///
+    /// Opened read-only deliberately: a directory cannot be opened for writing on Unix, and
+    /// setting timestamps needs no write access on either platform.
+    fn set_age(path: &Path, age_days: u64) {
+        let when = SystemTime::now() - Duration::from_secs(age_days * 86400);
+
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Opening a directory handle at all requires backup semantics on Windows.
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .unwrap()
+        };
+        #[cfg(not(windows))]
+        let file = fs::File::open(path).unwrap();
+
+        file.set_modified(when).unwrap();
+    }
+
+    /// Write `bytes` of content at `path`, then stamp it — and every directory created for it
+    /// below `root` — `age_days` old.
+    fn make_file(root: &Path, relative: &str, bytes: usize, age_days: u64) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, vec![b'x'; bytes]).unwrap();
+        set_age(&path, age_days);
+
+        // Backdate the ancestor directories too, stopping at root: an aged file inside a
+        // freshly-created session directory is not what cargo leaves behind, and pruning
+        // looks at the directory.
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if d == root {
+                break;
+            }
+            set_age(d, age_days);
+            dir = d.parent();
+        }
+    }
+
+    /// A minimal but realistically-shaped `target/debug`.
+    fn make_target(root: &Path) {
+        make_file(root, "debug/incremental/sess-old/data.bin", 1024, 30);
+        make_file(root, "debug/deps/libfoo-abc123.rlib", 2048, 30);
+        make_file(root, "debug/.fingerprint/foo-abc123/lib-foo", 16, 30);
+        make_file(root, "debug/examples/demo-abc123", 512, 30);
+        make_file(root, "debug/build/foo-abc123/output", 64, 30);
+    }
+
+    #[test]
+    fn default_mode_prunes_incremental_but_spares_deps() {
+        // The default is deliberately narrow: mtime means staleness for `incremental/`, but a
+        // rarely-rebuilt dependency in `deps/` is "old" and still exactly what the next build
+        // links against. Pruning it by age would force the relink this command exists to avoid.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        make_target(root);
+
+        clean_target(root, &opts());
+
+        assert!(
+            !root.join("debug/incremental/sess-old").exists(),
+            "stale incremental session must be pruned"
+        );
+        assert!(
+            root.join("debug/deps/libfoo-abc123.rlib").exists(),
+            "deps/ must survive the default mode"
+        );
+        assert!(
+            root.join("debug/.fingerprint/foo-abc123/lib-foo").exists(),
+            ".fingerprint/ must survive the default mode"
+        );
+        assert!(
+            root.join("debug/examples/demo-abc123").exists(),
+            "examples/ must survive the default mode"
+        );
+    }
+
+    #[test]
+    fn aggressive_mode_prunes_the_wider_set() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        make_target(root);
+
+        let report = clean_target(
+            root,
+            &CleanOpts {
+                aggressive: true,
+                ..opts()
+            },
+        );
+
+        for relative in [
+            "debug/incremental/sess-old",
+            "debug/deps/libfoo-abc123.rlib",
+            "debug/.fingerprint/foo-abc123",
+            "debug/examples/demo-abc123",
+            "debug/build/foo-abc123",
+        ] {
+            assert!(
+                !root.join(relative).exists(),
+                "--aggressive must prune {relative}"
+            );
+        }
+        assert_eq!(report.removed_count, 5);
+        assert_eq!(report.bytes_reclaimed, 1024 + 2048 + 16 + 512 + 64);
+    }
+
+    #[test]
+    fn age_cutoff_spares_recent_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        make_file(root, "debug/incremental/fresh/data.bin", 1024, 0);
+        make_file(root, "debug/incremental/stale/data.bin", 1024, 30);
+
+        clean_target(root, &opts());
+
+        assert!(root.join("debug/incremental/fresh").exists());
+        assert!(!root.join("debug/incremental/stale").exists());
+    }
+
+    #[test]
+    fn coverage_counters_are_removed_at_any_age() {
+        // `.profraw` files are per-process raw counters, dead once merged, and `cargo llvm-cov`
+        // leaves one per test process. Age is irrelevant to whether they are garbage.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        make_file(root, "debug/default_12345.profraw", 4096, 0);
+        make_file(root, "debug/merged.profdata", 4096, 0);
+        make_file(root, "debug/incremental/keep/data.bin", 8, 0);
+        make_file(root, "debug/deps/libfoo-abc.rlib", 8, 0);
+
+        clean_target(root, &opts());
+
+        assert!(!root.join("debug/default_12345.profraw").exists());
+        assert!(!root.join("debug/merged.profdata").exists());
+        assert!(
+            root.join("debug/deps/libfoo-abc.rlib").exists(),
+            "removing counters must not widen into deps/"
+        );
+    }
+
+    #[test]
+    fn tmp_scratch_is_emptied() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        make_file(root, "tmp/scratch.bin", 256, 0);
+        make_file(root, "debug/deps/libfoo-abc.rlib", 8, 0);
+
+        clean_target(root, &opts());
+
+        assert!(!root.join("tmp/scratch.bin").exists());
+        assert!(
+            root.join("tmp").exists(),
+            "the tmp dir itself should remain"
+        );
+    }
+
+    #[test]
+    fn profile_discovery_finds_custom_and_nested_profiles() {
+        // Hardcoding debug/release missed both custom cargo profiles and `llvm-cov-target/`,
+        // which is a full duplicate build tree left behind by `cargo llvm-cov`.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        make_file(root, "debug/incremental/a/x", 8, 0);
+        make_file(root, "ci/incremental/a/x", 8, 0);
+        make_file(root, "llvm-cov-target/debug/incremental/a/x", 8, 0);
+        make_file(
+            root,
+            "x86_64-unknown-linux-gnu/release/deps/libfoo.rlib",
+            8,
+            0,
+        );
+        fs::create_dir_all(root.join("x86_64-unknown-linux-gnu/release/.fingerprint")).unwrap();
+        make_file(root, "not-a-profile/readme.txt", 8, 0);
+
+        let found = discover_profile_dirs(root);
+
+        for expected in [
+            "debug",
+            "ci",
+            "llvm-cov-target/debug",
+            "x86_64-unknown-linux-gnu/release",
+        ] {
+            assert!(
+                found.contains(&root.join(expected)),
+                "expected to discover {expected}, got {found:?}"
+            );
+        }
+        assert!(!found.contains(&root.join("not-a-profile")));
+    }
+
+    #[test]
+    fn size_budget_removes_oldest_first_until_it_fits() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // Four 1 MiB rlibs, all recent enough that the age pass leaves them alone.
+        let mib = 1024 * 1024;
+        for (name, age) in [("a", 4u64), ("b", 3), ("c", 2), ("d", 1)] {
+            make_file(root, &format!("debug/deps/lib{name}.rlib"), mib, age);
+        }
+        fs::create_dir_all(root.join("debug/.fingerprint")).unwrap();
+
+        // Budget of 2.5 MiB against 4 MiB present: the two oldest must go, the two newest stay.
+        let report = clean_target(
+            root,
+            &CleanOpts {
+                max_age_days: 3650,
+                max_size_gb: Some(2.5 / 1024.0),
+                ..opts()
+            },
+        );
+
+        assert!(
+            !root.join("debug/deps/liba.rlib").exists(),
+            "oldest goes first"
+        );
+        assert!(!root.join("debug/deps/libb.rlib").exists());
+        assert!(root.join("debug/deps/libc.rlib").exists());
+        assert!(
+            root.join("debug/deps/libd.rlib").exists(),
+            "newest must survive once the budget is met"
+        );
+        assert_eq!(report.removed_count, 2);
+    }
+
+    #[test]
+    fn size_budget_is_a_no_op_when_already_under() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        make_file(root, "debug/deps/libfoo.rlib", 1024, 30);
+        fs::create_dir_all(root.join("debug/.fingerprint")).unwrap();
+
+        let report = clean_target(
+            root,
+            &CleanOpts {
+                max_age_days: 3650,
+                max_size_gb: Some(1.0),
+                ..opts()
+            },
+        );
+
+        assert!(root.join("debug/deps/libfoo.rlib").exists());
+        assert_eq!(report.removed_count, 0);
+    }
+
+    #[test]
+    fn dry_run_reports_without_deleting() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        make_target(root);
+
+        let report = clean_target(
+            root,
+            &CleanOpts {
+                dry_run: true,
+                aggressive: true,
+                ..opts()
+            },
+        );
+
+        assert_eq!(
+            report.removed_count, 5,
+            "dry run still accounts for the work"
+        );
+        assert!(report.bytes_reclaimed > 0);
+        for relative in [
+            "debug/incremental/sess-old",
+            "debug/deps/libfoo-abc123.rlib",
+            "debug/.fingerprint/foo-abc123",
+            "debug/examples/demo-abc123",
+            "debug/build/foo-abc123",
+        ] {
+            assert!(
+                root.join(relative).exists(),
+                "dry run must not delete {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn dry_run_size_budget_does_not_double_count_the_age_pass() {
+        // Regression guard: the size pass measures the tree on disk, but in a dry run nothing
+        // has been deleted yet. Without discounting what the age pass already claimed, it
+        // would see the original size and queue the same artifacts a second time.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mib = 1024 * 1024;
+        make_file(root, "debug/incremental/stale/data.bin", 3 * mib, 30);
+        make_file(root, "debug/deps/libfoo.rlib", mib, 30);
+        fs::create_dir_all(root.join("debug/.fingerprint")).unwrap();
+
+        // 4 MiB on disk; the age pass alone accounts for the 3 MiB incremental session,
+        // which already brings the modelled size under a 2 MiB budget.
+        let report = clean_target(
+            root,
+            &CleanOpts {
+                dry_run: true,
+                max_size_gb: Some(2.0 / 1024.0),
+                ..opts()
+            },
+        );
+
+        assert_eq!(
+            report.removed_count, 1,
+            "the age pass alone met the budget; deps/ must not be queued too"
+        );
+        assert_eq!(report.bytes_reclaimed, 3 * mib as u64);
+    }
 }
 
 #[cfg(test)]

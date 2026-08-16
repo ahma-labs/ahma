@@ -181,7 +181,7 @@ fi
 echo "OK Nextest diagnostics config looks good"
 
 echo "=== Guardrail: target directory stale cache auto-clean ==="
-cargo xtask clean-stale --max-age-days 3
+cargo xtask clean-stale --max-age-days 3 --max-size-gb 30
 
 echo ""
 echo "OK All guardrails passed for phase: $PHASE"
